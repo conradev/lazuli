@@ -255,7 +255,7 @@ fn uart_transfer_write(sys: &mut System) {
     let value = sys.external.channel0.immediate;
 
     for byte in value.to_be_bytes() {
-        if byte == 0x1B {
+        if !sys.config.uart_escape && byte == 0x1B {
             continue;
         }
 

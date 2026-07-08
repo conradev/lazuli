@@ -61,4 +61,7 @@ pub struct Config {
     /// Whether to start running the emulator right away
     #[arg(short, long, default_value_t = false)]
     pub run: bool,
+    /// Whether to include escape characters in UART writes to stdout
+    #[arg(long, default_value_t = false)]
+    pub uart_escape: bool,
 }

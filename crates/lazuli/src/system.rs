@@ -45,6 +45,7 @@ pub struct Config {
     pub ipl: Option<Vec<u8>>,
     pub sideload: Option<Executable>,
     pub perform_efb_copies: bool,
+    pub uart_escape: bool,
 }
 
 /// System modules.

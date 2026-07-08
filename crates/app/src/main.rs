@@ -152,6 +152,7 @@ impl App {
                 ipl,
                 sideload: executable,
                 perform_efb_copies: cfg.efb_ram_copies,
+                uart_escape: cfg.uart_escape,
             },
         );
 
