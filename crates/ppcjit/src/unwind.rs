@@ -1,9 +1,9 @@
 #[cfg(unix)]
 mod unix {
-    use cranelift::codegen::gimli::RunTimeEndian;
-    use cranelift::codegen::gimli::write::{Address, EhFrame, EndianVec, FrameTable, Writer};
-    use cranelift::codegen::isa::TargetIsa;
-    use cranelift::codegen::isa::unwind::UnwindInfo;
+    use cranelift_codegen::gimli::RunTimeEndian;
+    use cranelift_codegen::gimli::write::{Address, EhFrame, EndianVec, FrameTable, Writer};
+    use cranelift_codegen::isa::TargetIsa;
+    use cranelift_codegen::isa::unwind::UnwindInfo;
 
     unsafe extern "C" {
         fn __register_frame(fde: *const u8);
@@ -58,8 +58,8 @@ mod unix {
 
 #[cfg(not(unix))]
 mod dummy {
-    use cranelift::codegen::isa::TargetIsa;
-    use cranelift::codegen::isa::unwind::UnwindInfo;
+    use cranelift_codegen::isa::TargetIsa;
+    use cranelift_codegen::isa::unwind::UnwindInfo;
 
     pub struct UnwindHandle;
 

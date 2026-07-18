@@ -129,7 +129,7 @@ gxtex = { path = "./crates/gxtex" }
 jitalloc = { path = "./crates/jitalloc" }
 jitclif = { path = "./crates/jitclif" }
 lazuli = { path = "./crates/lazuli" }
-ppcjit = { path = "./crates/ppcjit" }
+ppcjit = { path = "./crates/ppcjit", default-features = false }
 dspint = { path = "./crates/dspint" }
 vtxjit = { path = "./crates/vtxjit" }
 cores = { path = "./crates/cores" }

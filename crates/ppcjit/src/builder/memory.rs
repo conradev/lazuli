@@ -1,9 +1,11 @@
-use cranelift::codegen::ir;
-use cranelift::prelude::InstBuilder;
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::condcodes::IntCC;
 use gekko::disasm::Ins;
 use gekko::{Exception, GPR, InsExt, SPR};
 
 use super::BlockBuilder;
+use crate::ExitMode;
 use crate::builder::{Action, InstructionInfo, MEMFLAGS, MEMFLAGS_READONLY};
 
 pub trait ReadWriteAble {
@@ -62,6 +64,61 @@ impl ReadWriteAble for i64 {
 
 /// Helpers
 impl BlockBuilder<'_> {
+    fn extend_to_pointer_type(&mut self, value: ir::Value) -> ir::Value {
+        if self.bd.func.dfg.value_type(value) == self.consts.ptr_type {
+            value
+        } else {
+            self.bd.ins().uextend(self.consts.ptr_type, value)
+        }
+    }
+
+    fn portable_mem_load<P: ReadWriteAble>(&mut self, addr: ir::Value) -> ir::Value {
+        let lut_index = self.bd.ins().ushr_imm(addr, 17);
+        let lut_index = self.extend_to_pointer_type(lut_index);
+        let lut_offset = self
+            .bd
+            .ins()
+            .imul_imm(lut_index, self.consts.ptr_type.bytes() as i64);
+        let lut_ptr = self.bd.ins().iadd(self.consts.fmem_ptr, lut_offset);
+        let page = self
+            .bd
+            .ins()
+            .load(self.consts.ptr_type, MEMFLAGS_READONLY, lut_ptr, 0);
+        let offset = self.bd.ins().band_imm(addr, (1 << 17) - 1);
+        let offset = self.extend_to_pointer_type(offset);
+        let ptr = self.bd.ins().iadd(page, offset);
+        let value = self.bd.ins().load(P::IR_TYPE, MEMFLAGS, ptr, 0);
+
+        if P::IR_TYPE == ir::types::I8 {
+            value
+        } else {
+            self.bd.ins().bswap(value)
+        }
+    }
+
+    fn portable_mem_store<P: ReadWriteAble>(&mut self, addr: ir::Value, value: ir::Value) {
+        let lut_index = self.bd.ins().ushr_imm(addr, 17);
+        let lut_index = self.extend_to_pointer_type(lut_index);
+        let lut_offset = self
+            .bd
+            .ins()
+            .imul_imm(lut_index, self.consts.ptr_type.bytes() as i64);
+        let lut_ptr = self.bd.ins().iadd(self.consts.fmem_ptr, lut_offset);
+        let page = self
+            .bd
+            .ins()
+            .load(self.consts.ptr_type, MEMFLAGS_READONLY, lut_ptr, 0);
+        let offset = self.bd.ins().band_imm(addr, ((1u64 << 17) - 1) as i64);
+        let offset = self.extend_to_pointer_type(offset);
+        let ptr = self.bd.ins().iadd(page, offset);
+        let value = if P::IR_TYPE == ir::types::I8 {
+            value
+        } else {
+            self.bd.ins().bswap(value)
+        };
+        self.bd.ins().store(MEMFLAGS, value, ptr, 0);
+    }
+
     pub fn slow_mem_load<P: ReadWriteAble>(&mut self, addr: ir::Value) -> ir::Value {
         let func = P::read_hook(self);
         let stack_slot_addr =
@@ -125,9 +182,16 @@ impl BlockBuilder<'_> {
     }
 
     pub fn mem_load<P: ReadWriteAble>(&mut self, addr: ir::Value) -> ir::Value {
+        if self.frontend.exit_mode == ExitMode::ReturnExecuted {
+            return self.portable_mem_load::<P>(addr);
+        }
+
         let lut_index = self.bd.ins().ushr_imm(addr, 17);
-        let lut_index = self.bd.ins().uextend(self.consts.ptr_type, lut_index);
-        let lut_offset = self.bd.ins().imul_imm(lut_index, size_of::<usize>() as i64);
+        let lut_index = self.extend_to_pointer_type(lut_index);
+        let lut_offset = self
+            .bd
+            .ins()
+            .imul_imm(lut_index, self.consts.ptr_type.bytes() as i64);
 
         let lut_ptr = self.bd.ins().iadd(self.consts.fmem_ptr, lut_offset);
         let ptr = self
@@ -148,7 +212,7 @@ impl BlockBuilder<'_> {
         // fast
         self.switch_to_bb(fast_block);
         let offset = self.bd.ins().band_imm(addr, (1 << 17) - 1);
-        let offset = self.bd.ins().uextend(self.consts.ptr_type, offset);
+        let offset = self.extend_to_pointer_type(offset);
         let ptr = self.bd.ins().iadd(ptr, offset);
         let value = self.bd.ins().load(P::IR_TYPE, MEMFLAGS, ptr, 0);
         let value = if P::IR_TYPE != ir::types::I8 {
@@ -175,9 +239,17 @@ impl BlockBuilder<'_> {
     }
 
     pub fn mem_store<P: ReadWriteAble>(&mut self, addr: ir::Value, value: ir::Value) {
+        if self.frontend.exit_mode == ExitMode::ReturnExecuted {
+            self.portable_mem_store::<P>(addr, value);
+            return;
+        }
+
         let lut_index = self.bd.ins().ushr_imm(addr, 17);
-        let lut_index = self.bd.ins().uextend(self.consts.ptr_type, lut_index);
-        let lut_offset = self.bd.ins().imul_imm(lut_index, size_of::<usize>() as i64);
+        let lut_index = self.extend_to_pointer_type(lut_index);
+        let lut_offset = self
+            .bd
+            .ins()
+            .imul_imm(lut_index, self.consts.ptr_type.bytes() as i64);
 
         let lut_ptr = self.bd.ins().iadd(self.consts.fmem_ptr, lut_offset);
         let ptr = self
@@ -197,7 +269,7 @@ impl BlockBuilder<'_> {
         // fast
         self.switch_to_bb(fast_block);
         let offset = self.bd.ins().band_imm(addr, ((1u64 << 17) - 1) as i64);
-        let offset = self.bd.ins().uextend(self.consts.ptr_type, offset);
+        let offset = self.extend_to_pointer_type(offset);
         let ptr = self.bd.ins().iadd(ptr, offset);
         let value_bswap = if P::IR_TYPE != ir::types::I8 {
             self.bd.ins().bswap(value)
@@ -218,7 +290,7 @@ impl BlockBuilder<'_> {
     }
 
     /// Reads a quantized value. Returns the value and the type size.
-    fn mem_load_quant(&mut self, addr: ir::Value, gqr: ir::Value) -> (ir::Value, ir::Value) {
+    fn slow_mem_load_quant(&mut self, addr: ir::Value, gqr: ir::Value) -> (ir::Value, ir::Value) {
         let stack_slot_addr =
             self.bd
                 .ins()
@@ -256,7 +328,12 @@ impl BlockBuilder<'_> {
     }
 
     /// Writes a quantized value. Returns the type size.
-    fn mem_store_quant(&mut self, addr: ir::Value, gqr: ir::Value, value: ir::Value) -> ir::Value {
+    fn slow_mem_store_quant(
+        &mut self,
+        addr: ir::Value,
+        gqr: ir::Value,
+        value: ir::Value,
+    ) -> ir::Value {
         let inst = self.bd.ins().call(
             self.hooks.write_quant,
             &[self.consts.ctx_ptr, addr, gqr, value],
@@ -281,6 +358,376 @@ impl BlockBuilder<'_> {
 
         self.switch_to_bb(continue_block);
         self.bd.ins().uextend(ir::types::I32, size)
+    }
+
+    fn quantized_scale_factor(
+        &mut self,
+        gqr: ir::Value,
+        field_shift: i64,
+        inverse: bool,
+    ) -> ir::Value {
+        let scale = self.bd.ins().ushr_imm(gqr, field_shift);
+        let scale = self.bd.ins().band_imm(scale, 0x3f);
+        let scale = self.bd.ins().ishl_imm(scale, 26);
+        let shift = self.bd.ins().iconst(ir::types::I32, 26);
+        let scale = self.bd.ins().sshr(scale, shift);
+        let exponent_bias = self.bd.ins().iconst(ir::types::I32, 1023);
+        let exponent = if inverse {
+            let inverse_scale = self.bd.ins().ineg(scale);
+            self.bd.ins().iadd(exponent_bias, inverse_scale)
+        } else {
+            self.bd.ins().iadd(exponent_bias, scale)
+        };
+        let exponent = self.bd.ins().sextend(ir::types::I64, exponent);
+        let fraction_unit = self.bd.ins().iconst(ir::types::I64, 1i64 << 52);
+        let bits = self.bd.ins().imul(exponent, fraction_unit);
+        self.bd
+            .ins()
+            .bitcast(ir::types::F64, ir::MemFlags::new(), bits)
+    }
+
+    fn portable_quantized_load_float(&mut self, pointer: ir::Value) -> ir::Value {
+        let bits = self.bd.ins().load(ir::types::I32, MEMFLAGS, pointer, 0);
+        let bits = self.bd.ins().bswap(bits);
+        let value = self
+            .bd
+            .ins()
+            .bitcast(ir::types::F32, ir::MemFlags::new(), bits);
+        self.bd.ins().fpromote(ir::types::F64, value)
+    }
+
+    fn portable_quantized_load_integer<P: ReadWriteAble>(
+        &mut self,
+        pointer: ir::Value,
+        signed: bool,
+        factor: ir::Value,
+    ) -> ir::Value {
+        let value = self.bd.ins().load(P::IR_TYPE, MEMFLAGS, pointer, 0);
+        let value = if signed {
+            self.bd.ins().sextend(ir::types::I32, value)
+        } else {
+            self.bd.ins().uextend(ir::types::I32, value)
+        };
+        let value = if signed {
+            self.bd.ins().fcvt_from_sint(ir::types::F64, value)
+        } else {
+            self.bd.ins().fcvt_from_uint(ir::types::F64, value)
+        };
+        self.bd.ins().fmul(value, factor)
+    }
+
+    fn mem_load_quant(&mut self, addr: ir::Value, gqr: ir::Value) -> (ir::Value, ir::Value) {
+        if self.frontend.exit_mode != ExitMode::ReturnExecutedWithSlowMemory {
+            return self.slow_mem_load_quant(addr, gqr);
+        }
+
+        let lut_index = self.bd.ins().ushr_imm(addr, 17);
+        let lut_index = self.extend_to_pointer_type(lut_index);
+        let lut_offset = self
+            .bd
+            .ins()
+            .imul_imm(lut_index, self.consts.ptr_type.bytes() as i64);
+        let lut_ptr = self.bd.ins().iadd(self.consts.fmem_ptr, lut_offset);
+        let page = self
+            .bd
+            .ins()
+            .load(self.consts.ptr_type, MEMFLAGS_READONLY, lut_ptr, 0);
+
+        let fast_block = self.bd.create_block();
+        let slow_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(slow_block);
+        self.bd.append_block_param(continue_block, ir::types::F64);
+        self.bd.append_block_param(continue_block, ir::types::I32);
+        self.bd.ins().brif(page, fast_block, &[], slow_block, &[]);
+        self.bd.seal_block(fast_block);
+
+        self.switch_to_bb(fast_block);
+        let offset = self.bd.ins().band_imm(addr, (1 << 17) - 1);
+        let offset = self.extend_to_pointer_type(offset);
+        let pointer = self.bd.ins().iadd(page, offset);
+        let quant_type = self.bd.ins().ushr_imm(gqr, 16);
+        let quant_type = self.bd.ins().band_imm(quant_type, 7);
+        let factor = self.quantized_scale_factor(gqr, 24, true);
+
+        let float_block = self.bd.create_block();
+        let check_u8_block = self.bd.create_block();
+        let u8_block = self.bd.create_block();
+        let check_u16_block = self.bd.create_block();
+        let u16_block = self.bd.create_block();
+        let check_i8_block = self.bd.create_block();
+        let i8_block = self.bd.create_block();
+        let check_i16_block = self.bd.create_block();
+        let i16_block = self.bd.create_block();
+
+        let is_float = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 0);
+        self.bd
+            .ins()
+            .brif(is_float, float_block, &[], check_u8_block, &[]);
+        self.bd.seal_block(float_block);
+        self.bd.seal_block(check_u8_block);
+
+        self.switch_to_bb(float_block);
+        let value = self.portable_quantized_load_float(pointer);
+        let size = self.bd.ins().iconst(ir::types::I32, 4);
+        self.bd.ins().jump(
+            continue_block,
+            &[ir::BlockArg::Value(value), ir::BlockArg::Value(size)],
+        );
+
+        self.switch_to_bb(check_u8_block);
+        let is_u8 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 4);
+        self.bd
+            .ins()
+            .brif(is_u8, u8_block, &[], check_u16_block, &[]);
+        self.bd.seal_block(u8_block);
+        self.bd.seal_block(check_u16_block);
+
+        self.switch_to_bb(u8_block);
+        let value = self.portable_quantized_load_integer::<i8>(pointer, false, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 1);
+        self.bd.ins().jump(
+            continue_block,
+            &[ir::BlockArg::Value(value), ir::BlockArg::Value(size)],
+        );
+
+        self.switch_to_bb(check_u16_block);
+        let is_u16 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 5);
+        self.bd
+            .ins()
+            .brif(is_u16, u16_block, &[], check_i8_block, &[]);
+        self.bd.seal_block(u16_block);
+        self.bd.seal_block(check_i8_block);
+
+        self.switch_to_bb(u16_block);
+        let value = self.portable_quantized_load_integer::<i16>(pointer, false, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 2);
+        self.bd.ins().jump(
+            continue_block,
+            &[ir::BlockArg::Value(value), ir::BlockArg::Value(size)],
+        );
+
+        self.switch_to_bb(check_i8_block);
+        let is_i8 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 6);
+        self.bd
+            .ins()
+            .brif(is_i8, i8_block, &[], check_i16_block, &[]);
+        self.bd.seal_block(i8_block);
+        self.bd.seal_block(check_i16_block);
+
+        self.switch_to_bb(i8_block);
+        let value = self.portable_quantized_load_integer::<i8>(pointer, true, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 1);
+        self.bd.ins().jump(
+            continue_block,
+            &[ir::BlockArg::Value(value), ir::BlockArg::Value(size)],
+        );
+
+        self.switch_to_bb(check_i16_block);
+        let is_i16 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 7);
+        self.bd.ins().brif(is_i16, i16_block, &[], slow_block, &[]);
+        self.bd.seal_block(i16_block);
+        self.bd.seal_block(slow_block);
+
+        self.switch_to_bb(i16_block);
+        let value = self.portable_quantized_load_integer::<i16>(pointer, true, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 2);
+        self.bd.ins().jump(
+            continue_block,
+            &[ir::BlockArg::Value(value), ir::BlockArg::Value(size)],
+        );
+
+        self.switch_to_bb(slow_block);
+        let (value, size) = self.slow_mem_load_quant(addr, gqr);
+        self.bd.ins().jump(
+            continue_block,
+            &[ir::BlockArg::Value(value), ir::BlockArg::Value(size)],
+        );
+
+        self.bd.seal_block(continue_block);
+        self.switch_to_bb(continue_block);
+        let parameters = self.bd.block_params(continue_block);
+        (parameters[0], parameters[1])
+    }
+
+    fn portable_quantized_store_float(&mut self, pointer: ir::Value, value: ir::Value) {
+        let value = self.bd.ins().fdemote(ir::types::F32, value);
+        let bits = self
+            .bd
+            .ins()
+            .bitcast(ir::types::I32, ir::MemFlags::new(), value);
+        let bits = self.bd.ins().bswap(bits);
+        self.bd.ins().store(MEMFLAGS, bits, pointer, 0);
+    }
+
+    fn portable_quantized_store_integer<P: ReadWriteAble>(
+        &mut self,
+        pointer: ir::Value,
+        value: ir::Value,
+        signed: bool,
+        minimum: i32,
+        maximum: i32,
+        factor: ir::Value,
+    ) {
+        let scaled = self.bd.ins().fmul(value, factor);
+        let converted = if signed {
+            self.bd.ins().fcvt_to_sint_sat(ir::types::I32, scaled)
+        } else {
+            self.bd.ins().fcvt_to_uint_sat(ir::types::I32, scaled)
+        };
+        let converted = if signed {
+            let below =
+                self.bd
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThan, converted, i64::from(minimum));
+            let minimum = self.bd.ins().iconst(ir::types::I32, i64::from(minimum));
+            self.bd.ins().select(below, minimum, converted)
+        } else {
+            converted
+        };
+        let above = self.bd.ins().icmp_imm(
+            if signed {
+                IntCC::SignedGreaterThan
+            } else {
+                IntCC::UnsignedGreaterThan
+            },
+            converted,
+            i64::from(maximum),
+        );
+        let maximum = self.bd.ins().iconst(ir::types::I32, i64::from(maximum));
+        let converted = self.bd.ins().select(above, maximum, converted);
+        let stored = self.bd.ins().ireduce(P::IR_TYPE, converted);
+        let stored = if P::IR_TYPE == ir::types::I8 {
+            stored
+        } else {
+            self.bd.ins().bswap(stored)
+        };
+        self.bd.ins().store(MEMFLAGS, stored, pointer, 0);
+    }
+
+    fn mem_store_quant(&mut self, addr: ir::Value, gqr: ir::Value, value: ir::Value) -> ir::Value {
+        if self.frontend.exit_mode != ExitMode::ReturnExecutedWithSlowMemory {
+            return self.slow_mem_store_quant(addr, gqr, value);
+        }
+
+        let lut_index = self.bd.ins().ushr_imm(addr, 17);
+        let lut_index = self.extend_to_pointer_type(lut_index);
+        let lut_offset = self
+            .bd
+            .ins()
+            .imul_imm(lut_index, self.consts.ptr_type.bytes() as i64);
+        let lut_ptr = self.bd.ins().iadd(self.consts.fmem_ptr, lut_offset);
+        let page = self
+            .bd
+            .ins()
+            .load(self.consts.ptr_type, MEMFLAGS_READONLY, lut_ptr, 0);
+
+        let fast_block = self.bd.create_block();
+        let slow_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(slow_block);
+        self.bd.append_block_param(continue_block, ir::types::I32);
+        self.bd.ins().brif(page, fast_block, &[], slow_block, &[]);
+        self.bd.seal_block(fast_block);
+
+        self.switch_to_bb(fast_block);
+        let offset = self.bd.ins().band_imm(addr, (1 << 17) - 1);
+        let offset = self.extend_to_pointer_type(offset);
+        let pointer = self.bd.ins().iadd(page, offset);
+        let quant_type = self.bd.ins().band_imm(gqr, 7);
+        let factor = self.quantized_scale_factor(gqr, 8, false);
+
+        let float_block = self.bd.create_block();
+        let check_u8_block = self.bd.create_block();
+        let u8_block = self.bd.create_block();
+        let check_u16_block = self.bd.create_block();
+        let u16_block = self.bd.create_block();
+        let check_i8_block = self.bd.create_block();
+        let i8_block = self.bd.create_block();
+        let check_i16_block = self.bd.create_block();
+        let i16_block = self.bd.create_block();
+
+        let is_float = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 0);
+        self.bd
+            .ins()
+            .brif(is_float, float_block, &[], check_u8_block, &[]);
+        self.bd.seal_block(float_block);
+        self.bd.seal_block(check_u8_block);
+
+        self.switch_to_bb(float_block);
+        self.portable_quantized_store_float(pointer, value);
+        let size = self.bd.ins().iconst(ir::types::I32, 4);
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(size)]);
+
+        self.switch_to_bb(check_u8_block);
+        let is_u8 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 4);
+        self.bd
+            .ins()
+            .brif(is_u8, u8_block, &[], check_u16_block, &[]);
+        self.bd.seal_block(u8_block);
+        self.bd.seal_block(check_u16_block);
+
+        self.switch_to_bb(u8_block);
+        self.portable_quantized_store_integer::<i8>(pointer, value, false, 0, 255, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 1);
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(size)]);
+
+        self.switch_to_bb(check_u16_block);
+        let is_u16 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 5);
+        self.bd
+            .ins()
+            .brif(is_u16, u16_block, &[], check_i8_block, &[]);
+        self.bd.seal_block(u16_block);
+        self.bd.seal_block(check_i8_block);
+
+        self.switch_to_bb(u16_block);
+        self.portable_quantized_store_integer::<i16>(pointer, value, false, 0, 65535, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 2);
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(size)]);
+
+        self.switch_to_bb(check_i8_block);
+        let is_i8 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 6);
+        self.bd
+            .ins()
+            .brif(is_i8, i8_block, &[], check_i16_block, &[]);
+        self.bd.seal_block(i8_block);
+        self.bd.seal_block(check_i16_block);
+
+        self.switch_to_bb(i8_block);
+        self.portable_quantized_store_integer::<i8>(pointer, value, true, -128, 127, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 1);
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(size)]);
+
+        self.switch_to_bb(check_i16_block);
+        let is_i16 = self.bd.ins().icmp_imm(IntCC::Equal, quant_type, 7);
+        self.bd.ins().brif(is_i16, i16_block, &[], slow_block, &[]);
+        self.bd.seal_block(i16_block);
+        self.bd.seal_block(slow_block);
+
+        self.switch_to_bb(i16_block);
+        self.portable_quantized_store_integer::<i16>(pointer, value, true, -32768, 32767, factor);
+        let size = self.bd.ins().iconst(ir::types::I32, 2);
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(size)]);
+
+        self.switch_to_bb(slow_block);
+        let size = self.slow_mem_store_quant(addr, gqr, value);
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(size)]);
+
+        self.bd.seal_block(continue_block);
+        self.switch_to_bb(continue_block);
+        self.bd.block_params(continue_block)[0]
     }
 }
 

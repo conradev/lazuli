@@ -8,6 +8,23 @@ license = "GPL-3.0-only"
 [lints]
 workspace = true
 
+[features]
+default = ["native"]
+native = [
+    "cranelift-codegen/enable-serde",
+    "cranelift-codegen/host-arch",
+    "cranelift-codegen/unwind",
+    "dep:cranelift-native",
+    "dep:fjall",
+    "dep:jitalloc",
+    "dep:jitclif",
+    "dep:rmp-serde",
+    "dep:serde",
+    "dep:serde_bytes",
+    "dep:twox-hash",
+    "dep:zstd",
+]
+
 [dev-dependencies]
 insta.workspace = true
 cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
@@ -15,20 +32,22 @@ powerpc-asm = "0.4"
 
 [dependencies]
 gekko.workspace = true
-jitalloc.workspace = true
-jitclif.workspace = true
+jitalloc = { workspace = true, optional = true }
+jitclif = { workspace = true, optional = true }
 
 bitos.workspace = true
-cranelift.workspace = true
+cranelift-codegen = { version = "0.130", default-features = false, features = ["std"] }
+cranelift-frontend = { version = "0.130", default-features = false, features = ["std"] }
+cranelift-native = { version = "0.130", optional = true }
 easyerr.workspace = true
 rustc-hash.workspace = true
-serde.workspace = true
+serde = { workspace = true, optional = true }
 strum.workspace = true
 tracing.workspace = true
-twox-hash.workspace = true
+twox-hash = { workspace = true, optional = true }
 zerocopy.workspace = true
-zstd.workspace = true
+zstd = { workspace = true, optional = true }
 
-fjall = { version = "3", default-features = false }
-rmp-serde = "1.3.1"
-serde_bytes = "0.11"
+fjall = { version = "3", default-features = false, optional = true }
+rmp-serde = { version = "1.3.1", optional = true }
+serde_bytes = { version = "0.11", optional = true }

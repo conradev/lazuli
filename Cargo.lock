@@ -3973,8 +3973,9 @@ name = "ppcjit"
 version = "0.1.0"
 dependencies = [
  "bitos",
- "cranelift",
  "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-native",
  "easyerr",
  "fjall",
  "gekko",

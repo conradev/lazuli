@@ -2,45 +2,60 @@
 #![feature(maybe_uninit_array_assume_init)]
 
 mod builder;
+#[cfg(feature = "native")]
 mod cache;
+#[cfg(feature = "native")]
 mod module;
 mod sequence;
+#[cfg(feature = "native")]
 mod unwind;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod test;
+#[cfg(test)]
+mod translation_test;
 
 pub mod block;
 pub mod hooks;
 
-use std::alloc::Layout;
-use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::Arc;
+#[cfg(feature = "native")]
+use std::{alloc::Layout, path::PathBuf, sync::Arc};
 
-use cranelift::codegen::entity::PrimaryMap;
-use cranelift::codegen::ir::InstBuilder;
-use cranelift::codegen::isa::{CallConv, TargetIsa};
-use cranelift::codegen::settings::Configurable;
-use cranelift::codegen::{self, ir};
-use cranelift::{frontend, native};
+#[cfg(feature = "native")]
+use cranelift_codegen::entity::PrimaryMap;
+#[cfg(feature = "native")]
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::isa::CallConv;
+#[cfg(feature = "native")]
+use cranelift_codegen::isa::TargetIsa;
+#[cfg(feature = "native")]
+use cranelift_codegen::settings::Configurable;
+use cranelift_codegen::{self as codegen, ir};
+use cranelift_frontend as frontend;
+#[cfg(feature = "native")]
+use cranelift_native as native;
 use easyerr::{Error, ResultExt};
 use gekko::disasm::Ins;
+#[cfg(feature = "native")]
 use gekko::{Cpu, Exception};
+#[cfg(feature = "native")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "native")]
+pub use crate::block::Block;
+#[cfg(feature = "native")]
 use crate::block::{BlockFn, Meta, Trampoline};
 use crate::builder::BlockBuilder;
+#[cfg(feature = "native")]
 use crate::cache::{ArtifactKey, Cache};
-use crate::hooks::{Context, HookKind, Hooks};
+#[cfg(feature = "native")]
+use crate::hooks::{Context, HookKind, HookSignatures, Hooks};
+#[cfg(feature = "native")]
 use crate::module::Module;
+pub use crate::sequence::Sequence;
+#[cfg(feature = "native")]
 use crate::unwind::UnwindHandle;
-
-#[rustfmt::skip]
-pub use crate::{
-    block::Block,
-    sequence::Sequence,
-};
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CodegenSettings {
@@ -65,6 +80,142 @@ impl Default for CodegenSettings {
     }
 }
 
+/// How translated blocks leave the generated function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitMode {
+    /// Call the native runtime exit hook and optionally tail-link to another compiled block.
+    Native,
+    /// Return the packed execution counters directly to the caller.
+    ///
+    /// The returned `i32` stores the instruction count in bits 0..16 and the cycle count in bits
+    /// 16..32, matching [`block::Executed`]. The exit reason is reflected in the flushed CPU state,
+    /// most importantly the program counter. Calls required by individual instruction semantics
+    /// can still appear in the CLIF and must be implemented or rejected by the consumer. Guest
+    /// memory accesses use the supplied fast-memory LUT directly, so every accessed page must have
+    /// a valid entry; this mode does not emit the native slow-memory fallback.
+    ReturnExecuted,
+    /// Return packed execution counters and branch to runtime hooks for unmapped fast-memory pages.
+    ReturnExecutedWithSlowMemory,
+}
+
+/// Target-independent inputs needed by the PowerPC-to-CLIF frontend.
+#[derive(Debug, Clone)]
+pub struct TranslationConfig {
+    /// PowerPC semantic/code generation settings.
+    pub settings: CodegenSettings,
+    /// The pointer type used for context, register, and fast-memory pointers.
+    pub pointer_type: ir::Type,
+    /// Calling convention used by runtime hooks and by portable returned blocks.
+    pub call_conv: CallConv,
+    /// How generated blocks exit.
+    pub exit_mode: ExitMode,
+}
+
+impl TranslationConfig {
+    /// Creates a frontend configuration.
+    pub fn new(
+        settings: CodegenSettings,
+        pointer_type: ir::Type,
+        call_conv: CallConv,
+        exit_mode: ExitMode,
+    ) -> Self {
+        Self {
+            settings,
+            pointer_type,
+            call_conv,
+            exit_mode,
+        }
+    }
+
+    fn block_signature(&self) -> ir::Signature {
+        let returns = match self.exit_mode {
+            ExitMode::Native => vec![],
+            ExitMode::ReturnExecuted | ExitMode::ReturnExecutedWithSlowMemory => {
+                vec![ir::AbiParam::new(ir::types::I32)]
+            }
+        };
+
+        ir::Signature {
+            // ctx, regs, fastmem
+            params: vec![ir::AbiParam::new(self.pointer_type); 3],
+            returns,
+            call_conv: match self.exit_mode {
+                ExitMode::Native => CallConv::Tail,
+                ExitMode::ReturnExecuted | ExitMode::ReturnExecutedWithSlowMemory => self.call_conv,
+            },
+        }
+    }
+}
+
+/// How a target-independent translation ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationExit {
+    /// The instruction iterator ended without a terminal instruction.
+    Fallthrough,
+    /// A branch ended the translated block.
+    Branch(block::BranchMeta),
+    /// A non-branch instruction requested a synchronous runtime exit.
+    Synchronous,
+}
+
+/// The target-independent result of translating PowerPC instructions to Cranelift IR.
+pub struct Translation {
+    /// Generated CLIF function.
+    pub function: ir::Function,
+    /// Instructions consumed by the frontend.
+    pub sequence: Sequence,
+    /// Maximum cycles executed by the translated region.
+    pub cycles: u16,
+    /// Static reason the translated region ends.
+    pub exit: TranslationExit,
+}
+
+/// Reusable PowerPC-to-CLIF translator.
+pub struct Translator {
+    config: TranslationConfig,
+    func_ctx: frontend::FunctionBuilderContext,
+}
+
+impl Translator {
+    /// Creates a translator for the given target-independent frontend environment.
+    pub fn new(config: TranslationConfig) -> Self {
+        Self {
+            config,
+            func_ctx: frontend::FunctionBuilderContext::new(),
+        }
+    }
+
+    /// Returns this translator's frontend configuration.
+    pub fn config(&self) -> &TranslationConfig {
+        &self.config
+    }
+
+    /// Translates instructions up to a terminal instruction or the end of the iterator.
+    pub fn translate(
+        &mut self,
+        instructions: impl Iterator<Item = Ins>,
+    ) -> Result<Translation, BuildError> {
+        let mut function = ir::Function::new();
+        function.signature = self.config.block_signature();
+
+        let func_builder = frontend::FunctionBuilder::new(&mut function, &mut self.func_ctx);
+        let builder = BlockBuilder::new(&self.config, func_builder);
+
+        let (sequence, cycles, exit) = builder.build(instructions).context(BuildCtx::Builder)?;
+        if sequence.is_empty() {
+            return Err(BuildError::EmptyBlock);
+        }
+
+        Ok(Translation {
+            function,
+            sequence,
+            cycles,
+            exit,
+        })
+    }
+}
+
+#[cfg(feature = "native")]
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// Codegen settings
@@ -75,6 +226,7 @@ pub struct Settings {
     pub cache_path: Option<PathBuf>,
 }
 
+#[cfg(feature = "native")]
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -94,6 +246,7 @@ const NAMESPACE_EXIT_DATA: u32 = 2;
 
 const INTERNAL_RAISE_EXCEPTION: u32 = 0;
 
+#[cfg(feature = "native")]
 struct Codegen {
     settings: CodegenSettings,
     exit_data_layout: Layout,
@@ -103,6 +256,7 @@ struct Codegen {
     code_ctx: codegen::Context,
 }
 
+#[cfg(feature = "native")]
 impl Codegen {
     fn new(
         isa: codegen::isa::Builder,
@@ -289,20 +443,16 @@ impl Codegen {
 }
 
 /// A JIT compiler, producing [`Block`]s.
+#[cfg(feature = "native")]
 pub struct Jit {
     codegen: Codegen,
-    func_ctx: frontend::FunctionBuilderContext,
+    translator: Translator,
     cache: Option<Cache>,
     compiled_count: u64,
     trampoline: Trampoline,
 }
 
-struct Translated {
-    func: ir::Function,
-    sequence: Sequence,
-    cycles: u16,
-}
-
+#[cfg(feature = "native")]
 #[derive(Clone, Serialize, Deserialize)]
 struct Artifact {
     user_named_funcs: PrimaryMap<ir::UserExternalNameRef, ir::UserExternalName>,
@@ -327,6 +477,7 @@ pub enum BuildError {
     },
 }
 
+#[cfg(feature = "native")]
 impl Jit {
     /// Compiles and returns a trampoline to call blocks.
     fn trampoline(
@@ -352,7 +503,8 @@ impl Jit {
         let default = codegen.isa.default_call_conv();
 
         // extract regs ptr
-        let get_regs_sig = builder.import_signature(Hooks::get_registers_sig(ptr_type, default));
+        let get_regs_sig =
+            builder.import_signature(HookSignatures::get_registers(ptr_type, default));
         let get_registers = builder
             .ins()
             .iconst(ptr_type, codegen.hooks.get_registers as usize as i64);
@@ -362,7 +514,7 @@ impl Jit {
         let regs_ptr = builder.inst_results(inst)[0];
 
         // extract fastmem ptr
-        let get_fmem_sig = builder.import_signature(Hooks::get_fastmem_sig(ptr_type, default));
+        let get_fmem_sig = builder.import_signature(HookSignatures::get_fastmem(ptr_type, default));
         let get_fmem = builder
             .ins()
             .iconst(ptr_type, codegen.hooks.get_fastmem as usize as i64);
@@ -388,14 +540,25 @@ impl Jit {
 
     /// Creates a new [`Jit`] instance with the given ISA.
     pub(crate) fn with_isa(isa: codegen::isa::Builder, settings: Settings, hooks: Hooks) -> Self {
-        let mut codegen = Codegen::new(isa, settings.codegen, settings.exit_data_layout, hooks);
+        let mut codegen = Codegen::new(
+            isa,
+            settings.codegen.clone(),
+            settings.exit_data_layout,
+            hooks,
+        );
         let mut func_ctx = frontend::FunctionBuilderContext::new();
         let cache = settings.cache_path.map(Cache::new);
         let trampoline = Self::trampoline(&mut codegen, &mut func_ctx);
+        let translator = Translator::new(TranslationConfig::new(
+            settings.codegen,
+            codegen.isa.pointer_type(),
+            codegen.isa.default_call_conv(),
+            ExitMode::Native,
+        ));
 
         Self {
             codegen,
-            func_ctx,
+            translator,
             cache,
             compiled_count: 0,
             trampoline,
@@ -411,37 +574,14 @@ impl Jit {
         Self::with_isa(isa_builder, settings, hooks)
     }
 
-    /// Translates a sequence of instructions into a cranelift function.
-    fn translate(
-        &mut self,
-        instructions: impl Iterator<Item = Ins>,
-    ) -> Result<Translated, BuildError> {
-        let mut func = ir::Function::new();
-        func.signature = self.codegen.block_signature();
-
-        let func_builder = frontend::FunctionBuilder::new(&mut func, &mut self.func_ctx);
-        let builder = BlockBuilder::new(&mut self.codegen, func_builder);
-
-        let (sequence, cycles) = builder.build(instructions).context(BuildCtx::Builder)?;
-        if sequence.is_empty() {
-            return Err(BuildError::EmptyBlock);
-        }
-
-        Ok(Translated {
-            func,
-            sequence,
-            cycles,
-        })
-    }
-
     /// Builds an artifact from the given instructions (up until a terminal instruction or the end of
     /// the iterator).
     pub(crate) fn build_artifact(
         &mut self,
         instructions: impl Iterator<Item = Ins>,
     ) -> Result<(Artifact, Meta), BuildError> {
-        let translated = self.translate(instructions)?;
-        let func = translated.func;
+        let translated = self.translator.translate(instructions)?;
+        let func = translated.function;
         let sequence = translated.sequence;
         let pattern = sequence.detect_pattern();
 

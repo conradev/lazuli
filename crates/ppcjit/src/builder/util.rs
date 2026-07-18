@@ -1,5 +1,7 @@
-use cranelift::codegen::ir;
-use cranelift::prelude::{FloatCC, FunctionBuilder, InstBuilder, IntCC};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_frontend::FunctionBuilder;
 use gekko::disasm::{Ins, ParsedIns};
 use gekko::{Reg, SPR};
 use zerocopy::IntoBytes;
@@ -158,7 +160,7 @@ impl BlockBuilder<'_> {
 
     /// Rounds each lane in a F64X2 to single point precision (according to the codegen settings).
     pub fn round_to_single(&mut self, value: ir::Value) -> ir::Value {
-        if self.codegen.settings.round_to_single {
+        if self.frontend.settings.round_to_single {
             let single = self.bd.ins().fvdemote(value);
             self.bd.ins().fvpromote_low(single)
         } else {

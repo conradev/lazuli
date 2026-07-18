@@ -1,6 +1,6 @@
-use cranelift::codegen::ir;
-use cranelift::codegen::ir::InstBuilder;
-use cranelift::codegen::isa::CallConv;
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::isa::CallConv;
 use gekko::disasm::Ins;
 use gekko::{Exception, Reg, SPR};
 
@@ -48,7 +48,7 @@ impl BlockBuilder<'_> {
 
     /// Checks whether floating point operations are enabled in MSR and raises an exception if not.
     pub fn check_floats(&mut self) {
-        if self.floats_checked || self.codegen.settings.force_fpu {
+        if self.floats_checked || self.frontend.settings.force_fpu {
             return;
         }
         self.floats_checked = true;
@@ -77,7 +77,7 @@ impl BlockBuilder<'_> {
     }
 
     pub fn sc(&mut self, _: Ins) -> InstructionInfo {
-        if self.codegen.settings.nop_syscalls {
+        if self.frontend.settings.nop_syscalls {
             return self.nop(Action::Exit);
         }
 
