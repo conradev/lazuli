@@ -343,7 +343,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     button:hover, .button:hover { background: #2a3038; }
-    button:focus-visible, .button:focus-visible, input:focus-visible, summary:focus-visible {
+    button:focus-visible, .button:focus-visible, .disc-picker:focus-within,
+    input:focus-visible, summary:focus-visible {
       outline: 2px solid #a8c7ff;
       outline-offset: 2px;
     }
@@ -385,7 +386,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       letter-spacing: 0.04em;
     }
 
-    #disc-file { position: fixed; inline-size: 1px; block-size: 1px; opacity: 0; }
+    .disc-picker {
+      position: relative;
+      overflow: hidden;
+    }
+
+    #disc-file {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
+    }
 
     #disc-status {
       overflow: hidden;
@@ -521,8 +534,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         <span aria-hidden="true">·</span>
         <span id="disc-status">ready</span>
       </div>
-      <label class="button primary" for="disc-file">Open ISO or CISO</label>
-      <input id="disc-file" type="file" accept=".iso,.ciso,.cso,application/octet-stream">
+      <label class="button primary disc-picker">
+        Open ISO or CISO
+        <input id="disc-file" type="file" aria-label="Open ISO or CISO" accept=".iso,.ciso,.cso,application/octet-stream">
+      </label>
     </header>
 
     <div class="stage">
