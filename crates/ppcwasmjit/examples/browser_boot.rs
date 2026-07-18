@@ -954,9 +954,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     const timeBaseOffset = __TB_OFFSET__;
     const dmaUpperOffset = __DMAU_OFFSET__;
     const dmaLowerOffset = __DMAL_OFFSET__;
+    function readRunnerLimit(searchParams, name) {
+      const value = searchParams.get(name);
+      return value === null ? Number.POSITIVE_INFINITY : Number(value);
+    }
     const searchParams = new URLSearchParams(globalThis.runnerSearch);
-    dispatchLimit = Number(searchParams.get("dispatches") ?? 10000);
-    cycleLimit = Number(searchParams.get("cycles") ?? Number.POSITIVE_INFINITY);
+    dispatchLimit = readRunnerLimit(searchParams, "dispatches");
+    cycleLimit = readRunnerLimit(searchParams, "cycles");
     const runnerSliceMs = Math.max(1, Number(searchParams.get("sliceMs") ?? 12));
     let runnerRestMs = Math.max(0, Number(searchParams.get("restMs") ?? 2));
     let runnerRenderEvery = Math.max(

@@ -66,3 +66,19 @@ test("structural loop recognition remains available before compilation", () => {
   assert.equal(context.isRecognizedLoopPc(0x5000), true);
   assert.equal(context.isRecognizedLoopPc(0x6000), false);
 });
+
+test("runner budgets are unbounded unless the debug URL supplies them", () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(extractFunction("readRunnerLimit"), context, {
+    filename: "browser_boot.scheduler.js",
+  });
+
+  const defaults = new URLSearchParams();
+  assert.equal(context.readRunnerLimit(defaults, "dispatches"), Number.POSITIVE_INFINITY);
+  assert.equal(context.readRunnerLimit(defaults, "cycles"), Number.POSITIVE_INFINITY);
+
+  const finite = new URLSearchParams("dispatches=350000&cycles=100000000");
+  assert.equal(context.readRunnerLimit(finite, "dispatches"), 350000);
+  assert.equal(context.readRunnerLimit(finite, "cycles"), 100000000);
+});
