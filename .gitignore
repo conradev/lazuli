@@ -6,3 +6,4 @@ log.log
 *.ciso
 *.iso
 *.cso
+/web/dist

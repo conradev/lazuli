@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Gekko">
+  <rect width="512" height="512" rx="112" fill="#111318"/>
+  <path d="M384 149c-35-32-76-48-124-48-91 0-160 66-160 155s69 155 160 155c52 0 99-20 134-56V239H256v65h70v21c-18 14-39 21-64 21-52 0-91-38-91-90s39-90 91-90c29 0 54 10 75 30z" fill="#e8edf7"/>
+</svg>
