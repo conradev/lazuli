@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Deploy web
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-gekko-free
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Z threads=4 -Z share-generics=y
+
+jobs:
+  deploy:
+    name: Build and deploy gekko.free
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        run: rustup target add wasm32-unknown-unknown
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.7.7
+      - name: Build browser compiler
+        run: cargo build --release --target wasm32-unknown-unknown -p ppcwasmjit
+      - name: Generate generic frontend
+        run: >-
+          cargo run --release -p ppcwasmjit --example browser_boot --
+          target/gekko-web/index.html
+          target/wasm32-unknown-unknown/release/ppcwasmjit.wasm
+      - name: Build static release
+        run: >-
+          node tools/build_web.mjs
+          --app target/gekko-web/index.html
+          --wasm target/wasm32-unknown-unknown/release/ppcwasmjit.wasm
+          --output web/dist
+          --commit "$GITHUB_SHA"
+      - name: Test static release
+        run: node --test tools/build_web.test.mjs web/sw.test.mjs
+      - name: Deploy static assets
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deploy
+          wranglerVersion: "4.112.0"

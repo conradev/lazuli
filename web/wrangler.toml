@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+name = "gekko-free"
+compatibility_date = "2026-07-17"
+workers_dev = false
+preview_urls = false
+
+[[routes]]
+pattern = "gekko.free"
+custom_domain = true
+
+[assets]
+directory = "./dist"
+html_handling = "none"
+not_found_handling = "none"
