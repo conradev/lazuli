@@ -3,3 +3,6 @@
 profile.json.gz
 log.log
 *.wav
+*.ciso
+*.iso
+*.cso
