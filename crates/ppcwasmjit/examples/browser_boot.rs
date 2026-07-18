@@ -613,6 +613,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     let serialLastPublishedChannels = 0;
     let serialLastUpdatedChannels = 0;
     let serialLastEnabledChannels = 0;
+    const cpStatusReadIdle = 0x0004;
+    const cpStatusCommandIdle = 0x0008;
     const siTransferStart = 0x00000001;
     const siReadStatusInterruptMask = 0x08000000;
     const siReadStatusInterrupt = 0x10000000;
@@ -3058,8 +3060,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function readCommandProcessorStatus() {
+      const idleMask = cpStatusReadIdle | cpStatusCommandIdle;
+      const pendingStagingBytes = view.getUint32(gxFifoStagingMeta, true);
+      const idle = pendingStagingBytes === 0 && gxDecodeBuffer.length === 0;
+      const stored = view.getUint16(mmio, false) & ~idleMask;
+      return stored | (idle ? idleMask : 0);
+    }
+
     function readInteger(address, pointer, size) {
       const logical = address >>> 0;
+      if (logical === 0xcc000000 && size === 2) {
+        view.setUint16(pointer, readCommandProcessorStatus(), true);
+        return 1;
+      }
       if (logical === 0xcc006c08 && size === 4) {
         updateAudioSampleCounter(cycles);
       }
