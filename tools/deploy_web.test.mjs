@@ -8,7 +8,7 @@ test("deployment serves static assets without a request handler", async () => {
   const wrangler = await readFile(new URL("../web/wrangler.toml", import.meta.url), "utf8");
   assert.doesNotMatch(wrangler, /^main\s*=/m);
   assert.match(wrangler, /^\[assets\]$/m);
-  assert.match(wrangler, /^html_handling\s*=\s*"none"$/m);
+  assert.match(wrangler, /^html_handling\s*=\s*"auto-trailing-slash"$/m);
 });
 
 test("deployment pins the verified Wrangler release", async () => {
