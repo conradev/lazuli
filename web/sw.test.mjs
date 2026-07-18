@@ -4,8 +4,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  APP_PATH,
   META_CACHE,
   backendResponse,
+  frontendResponse,
   readActiveRelease,
   stageRelease,
 } from "./sw.js";
@@ -205,6 +207,34 @@ test("reuses unchanged content-addressed backend chunks across releases", async 
   assert.deepEqual(requests, [second.release.frontend.url]);
   assert.ok(storage.caches.has(firstRecord.cacheName), "the immediately previous release is retained");
   assert.ok(storage.caches.has(secondRecord.cacheName));
+});
+
+test("serves changing frontend releases from one stable app URL", async () => {
+  assert.equal(APP_PATH, "/app.html");
+  const storage = new MemoryCacheStorage();
+  const first = await makeRelease(1);
+  const firstRecord = await stageRelease(first.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(first.responses),
+    origin: ORIGIN,
+    cacheSuffix: "first",
+  });
+  assert.equal(
+    await (await frontendResponse(firstRecord, storage, ORIGIN)).text(),
+    "<p>release 1</p>",
+  );
+
+  const second = await makeRelease(2);
+  const secondRecord = await stageRelease(second.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(second.responses),
+    origin: ORIGIN,
+    cacheSuffix: "second",
+  });
+  const response = await frontendResponse(secondRecord, storage, ORIGIN);
+  assert.equal(await response.text(), "<p>release 2</p>");
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("Content-Type"), "text/html; charset=utf-8");
 });
 
 test("post-commit cleanup failure cannot invalidate the active release", async () => {

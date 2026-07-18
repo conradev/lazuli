@@ -108,6 +108,12 @@ test("public shell does not forward debug runner parameters", async () => {
   assert.doesNotMatch(shell, /url\.search\s*=\s*location\.search/);
 });
 
+test("public shell keeps the upload surface at one stable URL", async () => {
+  const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+  assert.match(shell, /new URL\("\/app\.html", location\.href\)/);
+  assert.doesNotMatch(shell, /new URL\(release\.frontend\.url/);
+});
+
 test("web app has no notification or push surface", async () => {
   const sources = await Promise.all([
     "../web/index.html",

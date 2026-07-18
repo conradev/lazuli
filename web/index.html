@@ -98,7 +98,7 @@
       release = staged.release;
       saved ||= !staged.ok;
 
-      const url = new URL(release.frontend.url, location.href);
+      const url = new URL("/app.html", location.href);
       app.addEventListener("load", () => {
         status.hidden = true;
         app.hidden = false;
