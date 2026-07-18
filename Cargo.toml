@@ -8,6 +8,7 @@ members = [
     "crates/gxtex",
     "crates/jitalloc",
     "crates/jitclif",
+    "crates/clifwasm",
     "crates/lazuli",
     "crates/ppcjit",
     "crates/dspint",
@@ -30,6 +31,7 @@ default-members = [
     "crates/gxtex",
     "crates/jitalloc",
     "crates/jitclif",
+    "crates/clifwasm",
     "crates/lazuli",
     "crates/ppcjit",
     "crates/dspint",
@@ -128,6 +130,7 @@ color = { path = "./crates/color" }
 gxtex = { path = "./crates/gxtex" }
 jitalloc = { path = "./crates/jitalloc" }
 jitclif = { path = "./crates/jitclif" }
+clifwasm = { path = "./crates/clifwasm" }
 lazuli = { path = "./crates/lazuli" }
 ppcjit = { path = "./crates/ppcjit", default-features = false }
 dspint = { path = "./crates/dspint" }
@@ -181,6 +184,8 @@ twox-hash = { version = "2.1", default-features = false, features = [
     "xxhash3_128",
     "std",
 ] }
+wasm-encoder = "0.244"
+wasmparser = "0.244"
 wesl = { git = "https://github.com/wgsl-tooling-wg/wesl-rs", default-features = false, features = [
     "eval",
     "naga-ext",
