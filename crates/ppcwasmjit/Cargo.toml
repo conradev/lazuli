@@ -1,0 +1,24 @@
+[package]
+name = "ppcwasmjit"
+description = "JIT for Gekko PowerPC code targeting WebAssembly"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+clifwasm.workspace = true
+cranelift-codegen = { version = "0.130", default-features = false, features = ["std"] }
+gekko.workspace = true
+ppcjit.workspace = true
+wasm-encoder.workspace = true
+
+[dev-dependencies]
+disks.workspace = true
+ppcjit = { workspace = true, features = ["native"] }
+wasmparser.workspace = true

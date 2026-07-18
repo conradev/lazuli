@@ -4006,6 +4006,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ppcwasmjit"
+version = "0.1.0"
+dependencies = [
+ "clifwasm",
+ "cranelift-codegen",
+ "disks",
+ "gekko",
+ "ppcjit",
+ "wasm-encoder",
+ "wasmparser",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
