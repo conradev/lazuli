@@ -45,7 +45,14 @@ jobs:
           --output web/dist
           --commit "$GITHUB_SHA"
       - name: Test static release
-        run: node --test tools/build_web.test.mjs web/sw.test.mjs
+        run: >-
+          node --test
+          tools/browser_boot_*.test.mjs
+          tools/browser_disc_source.test.mjs
+          tools/build_web.test.mjs
+          tools/deploy_web.test.mjs
+          tools/web_dist.test.mjs
+          web/sw.test.mjs
       - name: Deploy static assets
         uses: cloudflare/wrangler-action@v3
         with:
