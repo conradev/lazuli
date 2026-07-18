@@ -99,7 +99,6 @@
       saved ||= !staged.ok;
 
       const url = new URL(release.frontend.url, location.href);
-      url.search = location.search;
       app.addEventListener("load", () => {
         status.hidden = true;
         app.hidden = false;

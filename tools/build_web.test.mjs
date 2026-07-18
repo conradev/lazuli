@@ -26,7 +26,18 @@ test("builds a deterministic GPL release from a generic generated frontend", asy
   const sourceAnchor = '<a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a>';
   await writeFile(
     appPath,
-    `<!doctype html><body>${sourceAnchor}<script>new URL("/ppcwasmjit.wasm", location.href)</script></body>`,
+    `<!doctype html><body>${sourceAnchor}<main class="shell" data-surface="debug">
+<!-- LAZULI DEBUG UI START -->
+<div id="runner-controls">
+<button id="pause-runner">Pause</button>
+<button id="resume-runner">Resume</button>
+</div>
+<!-- LAZULI DEBUG UI END -->
+<main>Play</main>
+<!-- LAZULI DEBUG UI START -->
+<details id="diagnostics"><button id="stop-runner">Stop</button></details>
+<!-- LAZULI DEBUG UI END -->
+<script>new URL("/ppcwasmjit.wasm", location.href)</script></main></body>`,
   );
   const wasm = Buffer.alloc(WASM_CHUNK_SIZE * 2 + 17);
   for (let index = 0; index < wasm.length; index += 1) wasm[index] = index * 31 & 0xff;
@@ -55,6 +66,11 @@ test("builds a deterministic GPL release from a generic generated frontend", asy
   assert.match(frontend, new RegExp(`/tree/${commit}`));
   assert.match(frontend, /GPL-3\.0-only/);
   assert.doesNotMatch(frontend, /href="https:\/\/github\.com\/conradev\/lazuli"/);
+  assert.doesNotMatch(frontend, /(?:Pause|Resume|Stop|Options and diagnostics)/);
+  assert.doesNotMatch(frontend, /id="(?:runner-controls|pause-runner|resume-runner|diagnostics|stop-runner)"/);
+  assert.match(frontend, /data-surface="release"/);
+  assert.doesNotMatch(frontend, /data-surface="debug"/);
+  assert.match(frontend, /<main>Play<\/main>/);
 
   const firstManifest = await readFile(join(outputPath, "release.json"), "utf8");
   const secondRelease = await buildWeb({ appPath, wasmPath, outputPath, commit });
@@ -69,6 +85,25 @@ test("rejects a non-exact source revision", async () => {
     buildWeb({ appPath: "missing", wasmPath: "missing", outputPath: "dist", commit: "HEAD" }),
     /lowercase 40-character Git commit/,
   );
+});
+
+test("local harness retains controls removed from the public frontend", async () => {
+  const harness = await readFile(
+    new URL("../crates/ppcwasmjit/examples/browser_boot.rs", import.meta.url),
+    "utf8",
+  );
+  assert.match(harness, /id="pause-runner"[^>]*>Pause<\/button>/);
+  assert.match(harness, /id="resume-runner"[^>]*>Resume<\/button>/);
+  assert.match(harness, /id="diagnostics"/);
+  assert.match(harness, /id="stop-runner"[^>]*>Stop<\/button>/);
+  assert.match(harness, /data-surface="debug"/);
+  assert.equal(harness.match(/<!-- LAZULI DEBUG UI START -->/g)?.length, 2);
+  assert.equal(harness.match(/<!-- LAZULI DEBUG UI END -->/g)?.length, 2);
+});
+
+test("public shell does not forward debug runner parameters", async () => {
+  const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+  assert.doesNotMatch(shell, /url\.search\s*=\s*location\.search/);
 });
 
 test("web app has no notification or push surface", async () => {
