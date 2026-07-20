@@ -550,7 +550,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           <input id="extend-cycles" type="number" aria-label="Additional cycles" min="1" step="100000000" value="100000000">
           <input id="extend-dispatches" type="number" aria-label="Additional dispatches" min="1" step="1000000" placeholder="auto dispatches">
           <button id="extend-runner" type="button">Extend limits</button>
-          <input id="runner-rest-ms" type="number" aria-label="Rest milliseconds" min="0" max="1000" step="1" value="2">
+          <input id="runner-rest-ms" type="number" aria-label="Rest milliseconds" min="0" max="1000" step="1" value="0">
           <button id="apply-throttle" type="button">Apply rest</button>
           <input id="runner-render-every" type="number" aria-label="Render interval" min="1" max="1000" step="1" value="1">
           <button id="apply-presentation" type="button">Apply render interval</button>
@@ -963,11 +963,15 @@ const TEMPLATE: &str = r##"<!doctype html>
     const timeBaseOffset = __TB_OFFSET__;
     const dmaUpperOffset = __DMAU_OFFSET__;
     const dmaLowerOffset = __DMAL_OFFSET__;
+    function readRunnerLimit(searchParams, name) {
+      const value = searchParams.get(name);
+      return value === null ? Number.POSITIVE_INFINITY : Number(value);
+    }
     const searchParams = new URLSearchParams(globalThis.runnerSearch);
-    dispatchLimit = Number(searchParams.get("dispatches") ?? 10000);
-    cycleLimit = Number(searchParams.get("cycles") ?? Number.POSITIVE_INFINITY);
+    dispatchLimit = readRunnerLimit(searchParams, "dispatches");
+    cycleLimit = readRunnerLimit(searchParams, "cycles");
     const runnerSliceMs = Math.max(1, Number(searchParams.get("sliceMs") ?? 12));
-    let runnerRestMs = Math.max(0, Number(searchParams.get("restMs") ?? 2));
+    let runnerRestMs = Math.max(0, Number(searchParams.get("restMs") ?? 0));
     let runnerRenderEvery = Math.max(
       1,
       Math.min(1000, Math.floor(Number(searchParams.get("renderEvery") ?? 1)))
@@ -979,6 +983,27 @@ const TEMPLATE: &str = r##"<!doctype html>
     const stopOnFirstDsi = searchParams.get("stopOnFirstDsi") === "1";
     let runnerYieldDeadline = Date.now() + runnerSliceMs;
     let runnerBlocksUntilYield = runnerBlockChunk;
+
+    function runnerRestWhenDue(now) {
+      return now >= runnerYieldDeadline ? runnerRestMs : null;
+    }
+    function createRunnerYieldScheduler(channel = new MessageChannel()) {
+      const pending = [];
+      channel.port1.onmessage = () => {
+        const resolve = pending.shift();
+        if (resolve !== undefined) resolve();
+      };
+      return restMs => {
+        if (restMs > 0) {
+          return new Promise(resolve => setTimeout(resolve, restMs));
+        }
+        return new Promise(resolve => {
+          pending.push(resolve);
+          channel.port2.postMessage(0);
+        });
+      };
+    }
+    const yieldRunnerTask = createRunnerYieldScheduler();
     const recentPcs = [];
     const regionsByPc = new Map();
     const regionCandidateHits = new Map();
@@ -6191,16 +6216,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
         runnerBlocksUntilYield -= Math.max(1, executedBlocks);
         if (runnerBlocksUntilYield <= 0) {
-          const sliceElapsed = Date.now() >= runnerYieldDeadline;
-          const rest = sliceElapsed ? runnerRestMs : 0;
-          await new Promise(resolve => setTimeout(resolve, rest));
-          if (rest !== 0) {
-            accelerations.set(
-              "workerRestYields",
-              (accelerations.get("workerRestYields") ?? 0) + 1
-            );
+          const rest = runnerRestWhenDue(Date.now());
+          if (rest !== null) {
+            await yieldRunnerTask(rest);
+            if (rest !== 0) {
+              accelerations.set(
+                "workerRestYields",
+                (accelerations.get("workerRestYields") ?? 0) + 1
+              );
+            }
+            runnerYieldDeadline = Date.now() + runnerSliceMs;
           }
-          if (sliceElapsed) runnerYieldDeadline = Date.now() + runnerSliceMs;
           runnerBlocksUntilYield = runnerBlockChunk;
         }
       }
@@ -6422,7 +6448,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       globalThis.lazuliCycleRunner.extendCycles(cycles, dispatches);
     });
     const runnerRestInput = document.querySelector("#runner-rest-ms");
-    runnerRestInput.value = new URLSearchParams(location.search).get("restMs") ?? "2";
+    runnerRestInput.value = new URLSearchParams(location.search).get("restMs") ?? "0";
     document.querySelector("#apply-throttle").addEventListener("click", () => {
       globalThis.lazuliCycleRunner.setRestMs(Number(runnerRestInput.value));
     });
