@@ -886,6 +886,15 @@ const TEMPLATE: &str = r##"<!doctype html>
     let runnerStopRequested = false;
     let runnerSnapshotRequested = false;
     let runnerResume = null;
+    let rendererFrameSequence = 0;
+    const rendererFramesInFlight = new Set();
+    let rendererBackpressureResume = null;
+    let rendererBackpressureWaits = 0;
+    let rendererFramesAcknowledged = 0;
+    let rendererFrameFailures = 0;
+    let rendererFrameHighWater = 0;
+    let rendererFrameResultMisses = 0;
+    let rendererFailure = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -1002,6 +1011,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       const message = event.data;
       if (message?.type === "controller") {
         enqueueControllerState(message);
+      } else if (
+        message?.type === "renderer-frame-complete"
+        || message?.type === "renderer-frame-failed"
+      ) {
+        completeRendererFrame(message);
+      } else if (message?.type === "renderer-failed") {
+        recordRendererFailure(message.error);
       } else if (message?.type === "run-control") {
         if (message.action === "pause") {
           runnerPaused = true;
@@ -1051,11 +1067,52 @@ const TEMPLATE: &str = r##"<!doctype html>
           runnerStopRequested = true;
           runnerPaused = false;
           runnerResume?.();
+          rendererBackpressureResume?.();
         } else if (message.action === "snapshot") {
           runnerSnapshotRequested = true;
         }
       }
     });
+
+    function postRendererFrame(type, frame) {
+      const rendererSequence = ++rendererFrameSequence;
+      rendererFramesInFlight.add(rendererSequence);
+      rendererFrameHighWater = Math.max(
+        rendererFrameHighWater,
+        rendererFramesInFlight.size
+      );
+      try {
+        postMessage({ type, frame, rendererSequence });
+      } catch (error) {
+        rendererFramesInFlight.delete(rendererSequence);
+        throw error;
+      }
+    }
+
+    function completeRendererFrame(message) {
+      const rendererSequence = Number(message.rendererSequence);
+      if (
+        !Number.isSafeInteger(rendererSequence)
+        || !rendererFramesInFlight.delete(rendererSequence)
+      ) {
+        rendererFrameResultMisses += 1;
+        return;
+      }
+      if (message.type === "renderer-frame-failed") {
+        rendererFrameFailures += 1;
+        recordRendererFailure(message.error);
+      } else {
+        rendererFramesAcknowledged += 1;
+        if (rendererFramesInFlight.size === 0) rendererBackpressureResume?.();
+      }
+    }
+
+    function recordRendererFailure(error) {
+      if (rendererFailure === null) {
+        rendererFailure = String(error || "WebGPU renderer failed");
+      }
+      rendererBackpressureResume?.();
+    }
 
     function controllerPacketForPoll(channel = 0) {
       const queued = controllerQueue.shift();
@@ -3630,13 +3687,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (collectedGeometry) {
           if (gxSkippedFrameClearColor !== null) {
             postMessage({ type: "efb-clear", clearColor: gxSkippedFrameClearColor });
-        const raster0 = decoded.rasterColors?.[0]
-          ?? decoded.colors[0].map(value => value / 255);
-        const raster1 = decoded.rasterColors?.[1]
-          ?? decoded.colors[1].map(value => value / 255);
             gxSkippedFrameClearColor = null;
           }
-          postMessage({ type: "texture-copy", frame });
+          postRendererFrame("texture-copy", frame);
           gxTextureCopyFramesPresented += 1;
         } else if (frame.clear) {
           postMessage({ type: "efb-clear", clearColor: frame.clearColor });
@@ -6479,6 +6532,15 @@ const TEMPLATE: &str = r##"<!doctype html>
             restMs: runnerRestMs,
             blockChunk: runnerBlockChunk,
             renderEvery: runnerRenderEvery,
+            rendererSync: {
+              posted: rendererFrameSequence,
+              acknowledged: rendererFramesAcknowledged,
+              failed: rendererFrameFailures,
+              inFlight: rendererFramesInFlight.size,
+              highWater: rendererFrameHighWater,
+              waits: rendererBackpressureWaits,
+              resultMisses: rendererFrameResultMisses,
+            },
           },
         },
         recentPcs: recentPcs.map(value => hex32(value)),
@@ -6839,12 +6901,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       statusDataset.status = status;
       output.textContent = JSON.stringify(report, null, 2);
       console.log("BROWSER_BOOT_" + status.toUpperCase(), report);
-        viTiming?.displayEnabled ? nextViPresentCycle : null,
     }
 
     async function honorRunnerControl() {
       if (runnerStopRequested) {
-        finish("progress", {
+        await finishAfterRendererDrain("progress", {
           stage: "operator-stop",
           pc: hex32(pc),
           instructions,
@@ -6861,7 +6922,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
       runnerResume = null;
       if (runnerStopRequested) {
-        finish("progress", {
+        await finishAfterRendererDrain("progress", {
           stage: "operator-stop",
           pc: hex32(pc),
           instructions,
@@ -6873,6 +6934,38 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       statusDataset.status = "running";
       runnerYieldDeadline = Date.now() + runnerSliceMs;
+    }
+
+    async function honorRendererBackpressure(waitWhileStopping = false) {
+      while (
+        rendererFramesInFlight.size !== 0
+        && rendererFailure === null
+        && (waitWhileStopping || !runnerStopRequested)
+      ) {
+        rendererBackpressureWaits += 1;
+        await new Promise(resolve => {
+          rendererBackpressureResume = resolve;
+        });
+        rendererBackpressureResume = null;
+      }
+      if (rendererFailure !== null) {
+        finish("stopped", {
+          stage: "renderer",
+          pc: hex32(pc),
+          error: rendererFailure,
+          instructions,
+          cycles,
+          dispatches,
+          compiledBlocks: blocks.size,
+        });
+        throw Symbol.for("reported");
+      }
+      runnerYieldDeadline = Date.now() + runnerSliceMs;
+    }
+
+    async function finishAfterRendererDrain(status, details) {
+      await honorRendererBackpressure(true);
+      finish(status, details);
     }
 
     function publishRunnerSnapshot() {
@@ -6962,6 +7055,9 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       for (;;) {
         if (runnerSnapshotRequested) publishRunnerSnapshot();
+        if (rendererFramesInFlight.size !== 0 || rendererFailure !== null) {
+          await honorRendererBackpressure();
+        }
         if (runnerPaused || runnerStopRequested) await honorRunnerControl();
         const reachedLimit = cycles >= cycleLimit
           ? "cycle-limit"
@@ -6987,7 +7083,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           try {
             block = compileBlock(compiler, inputPointer, pc);
           } catch (error) {
-            finish("stopped", {
+            await finishAfterRendererDrain("stopped", {
               stage,
               pc: "0x" + pc.toString(16).padStart(8, "0"),
               instruction: "0x" + fetchWord(pc).toString(16).padStart(8, "0"),
@@ -7071,7 +7167,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             executedCycles = executed >>> 16;
             executedBlocks = 1;
           } catch (error) {
-            finish("stopped", {
+            await finishAfterRendererDrain("stopped", {
               stage,
               pc: "0x" + pc.toString(16).padStart(8, "0"),
               instruction: "0x" + fetchWord(pc).toString(16).padStart(8, "0"),
@@ -7095,8 +7191,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         cycles = observedCycles;
         dispatches += executedBlocks;
         if (stopOnFirstDsi && firstDsi !== null) {
-            xfbFramesCaptured: gxXfbFramesCaptured,
-          finish("stopped", {
+          await finishAfterRendererDrain("stopped", {
             stage: "first-dsi",
             pc: firstDsi.pc,
             instructions,
@@ -7158,7 +7253,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
 
         if (pc === 0) {
-          finish("stopped", {
+          await finishAfterRendererDrain("stopped", {
             stage: "terminal-pc",
             pc: "0x00000000",
             instructions,
@@ -7169,7 +7264,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           throw Symbol.for("reported");
         }
         if (samePcCount >= 256 && diskTransfer === null && aramTransfer === null) {
-          finish("progress", {
+          await finishAfterRendererDrain("progress", {
             stage: "stable-loop",
             pc: "0x" + pc.toString(16).padStart(8, "0"),
             instructions,
