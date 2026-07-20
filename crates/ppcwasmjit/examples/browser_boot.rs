@@ -1748,9 +1748,50 @@ const TEMPLATE: &str = r##"<!doctype html>
         + row[2] * vector[2] + row[3] * vector[3];
     }
 
-    function gxTransformTexCoord(rawTextureCoords, matrixIndex, texgenIndex) {
+    function gxNormalize3(vector) {
+      if (vector === null || vector === undefined || vector.length < 3) return null;
+      const length = Math.hypot(vector[0], vector[1], vector[2]);
+      if (!Number.isFinite(length) || length < 1e-12) return [0, 0, 0];
+      return [vector[0] / length, vector[1] / length, vector[2] / length];
+    }
+
+    function gxTransformPosition(position, matrixIndex) {
+      if ((matrixIndex + 2) * 4 + 3 >= 0x100) return null;
+      const matrix = Array.from({ length: 12 }, (_unused, index) =>
+        gxXfFloat(matrixIndex * 4 + index)
+      );
+      if (matrix.some(value => !Number.isFinite(value)) || matrix.every(value => value === 0)) {
+        return null;
+      }
+      const [x, y, z] = position;
+      return [
+        matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3],
+        matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7],
+        matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11],
+      ];
+    }
+
+    function gxTransformNormal(vector, matrixIndex) {
+      if (vector === null || vector === undefined) return null;
+      const base = 0x400 + (matrixIndex % 32) * 3;
+      if (base + 8 >= gxXfRegisters.length) return null;
+      const matrix = Array.from({ length: 9 }, (_unused, index) =>
+        gxXfFloat(base + index)
+      );
+      if (matrix.some(value => !Number.isFinite(value)) || matrix.every(value => value === 0)) {
+        return null;
+      }
+      return gxNormalize3([
+        matrix[0] * vector[0] + matrix[1] * vector[1] + matrix[2] * vector[2],
+        matrix[3] * vector[0] + matrix[4] * vector[1] + matrix[5] * vector[2],
+        matrix[6] * vector[0] + matrix[7] * vector[1] + matrix[8] * vector[2],
+      ]);
+    }
+
+    function gxTransformTexCoord(attributes, matrixIndex, texgenIndex) {
       if (texgenIndex < 0 || texgenIndex >= 8) return null;
       const texgenCount = gxXfRegisters[0x103f] & 0xf;
+      if (texgenIndex >= texgenCount) return null;
       const info = gxXfRegisters[0x1040 + texgenIndex] >>> 0;
       const projection = (info >>> 1) & 1;
       const inputForm = (info >>> 2) & 1;
@@ -2031,6 +2072,200 @@ const TEMPLATE: &str = r##"<!doctype html>
       gxTextureCopyCaptureArms += 1;
       gxTextureCopyCaptureThroughXfb = Math.max(
         gxTextureCopyCaptureThroughXfb,
+    function gxDecodeNormalAttribute(
+      source, cursor, status, elements, format, separateIndices
+    ) {
+      const empty = next => ({
+        cursor: next,
+        normal: null,
+        tangent: null,
+        binormal: null,
+        skipped: false,
+      });
+      if (status === 0) return empty(cursor);
+      const componentBytes = gxComponentBytes(format);
+      const scale = format <= 1 ? 2 ** -6 : format <= 3 ? 2 ** -14 : 1;
+      const vectorCount = elements === 0 ? 1 : 3;
+      const readVector = (data, offset) => {
+        const vector = Array.from({ length: 3 }, (_unused, component) =>
+          gxReadComponent(data, offset + component * componentBytes, format) * scale
+        );
+        return vector.every(Number.isFinite) ? vector : null;
+      };
+      let next = cursor;
+      let vectors = [];
+      if (status === 1) {
+        vectors = Array.from({ length: vectorCount }, (_unused, index) =>
+          readVector(source, cursor + index * 3 * componentBytes)
+        );
+        next += vectorCount * 3 * componentBytes;
+      } else {
+        const indexBytes = status === 2 ? 1 : 2;
+        const indexCount = vectorCount === 3 && separateIndices ? 3 : 1;
+        const indexes = Array.from({ length: indexCount }, () => {
+          const index = indexBytes === 1 ? source[next] : gxReadU16(source, next);
+          next += indexBytes;
+          return index;
+        });
+        const sentinel = indexBytes === 1 ? 0xff : 0xffff;
+        if (indexes.some(index => index === sentinel)) {
+          return { ...empty(next), skipped: true };
+        }
+        const base = gxCpRegisters[0xa1] >>> 0;
+        const stride = gxCpRegisters[0xb1] & 0xff;
+        if (indexCount === 3) {
+          vectors = indexes.map(index => {
+            const pointer = ramPointer((base + index * stride) >>> 0, 3 * componentBytes);
+            return pointer === null ? null : readVector(bytes, pointer);
+          });
+        } else {
+          const pointer = ramPointer(
+            (base + indexes[0] * stride) >>> 0,
+            vectorCount * 3 * componentBytes
+          );
+          vectors = pointer === null
+            ? Array(vectorCount).fill(null)
+            : Array.from({ length: vectorCount }, (_unused, index) =>
+              readVector(bytes, pointer + index * 3 * componentBytes)
+            );
+        }
+      }
+      if (vectors.some(vector => vector === null)) {
+        return { ...empty(next), skipped: true };
+      }
+      return {
+        cursor: next,
+        normal: vectors[0],
+        binormal: vectors[1] ?? null,
+        tangent: vectors[2] ?? null,
+        skipped: false,
+      };
+    }
+
+    function gxXfColor(address) {
+      const value = gxXfRegisters[address] >>> 0;
+      return [
+        (value >>> 24) / 255,
+        ((value >>> 16) & 0xff) / 255,
+        ((value >>> 8) & 0xff) / 255,
+        (value & 0xff) / 255,
+      ];
+    }
+
+    function gxXfLight(index) {
+      const base = 0x603 + index * 0x10;
+      if (base + 12 >= gxXfRegisters.length) return null;
+      const light = {
+        color: gxXfColor(base),
+        cosAtten: Array.from({ length: 3 }, (_unused, component) =>
+          gxXfFloat(base + 1 + component)
+        ),
+        distAtten: Array.from({ length: 3 }, (_unused, component) =>
+          gxXfFloat(base + 4 + component)
+        ),
+        position: Array.from({ length: 3 }, (_unused, component) =>
+          gxXfFloat(base + 7 + component)
+        ),
+        direction: Array.from({ length: 3 }, (_unused, component) =>
+          gxXfFloat(base + 10 + component)
+        ),
+      };
+      return Object.values(light).flat().every(Number.isFinite) ? light : null;
+    }
+
+    function gxDot3(left, right) {
+      return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
+    }
+
+    function gxVectorSubtract(left, right) {
+      return [left[0] - right[0], left[1] - right[1], left[2] - right[2]];
+    }
+
+    function gxLightDiffuse(control, light, position, normal) {
+      const mode = (control >>> 7) & 3;
+      if (mode === 0 || mode === 3) return 1;
+      const vertexToLight = gxVectorSubtract(light.position, position);
+      const length = Math.hypot(...vertexToLight);
+      const value = length < 1e-12 ? 0 : gxDot3(vertexToLight, normal) / length;
+      return mode === 2 ? Math.max(value, 0) : value;
+    }
+
+    function gxPolynomial(coefficients, value) {
+      return coefficients[0] + value * coefficients[1] + value * value * coefficients[2];
+    }
+
+    function gxLightPosition(control, light, position, normal) {
+      if ((control & (1 << 9)) === 0) return 1;
+      let angularValue;
+      let distanceValue;
+      if ((control & (1 << 10)) === 0) {
+        const lightDirection = gxNormalize3(light.position) ?? [0, 0, 0];
+        const normalDotLight = gxDot3(normal, lightDirection);
+        angularValue = normalDotLight > 0
+          ? Math.max(gxDot3(normal, light.direction), 0)
+          : 0;
+        distanceValue = angularValue;
+      } else {
+        const vertexToLight = gxVectorSubtract(light.position, position);
+        const direction = gxNormalize3(vertexToLight) ?? [0, 0, 0];
+        angularValue = Math.max(gxDot3(direction, light.direction), 0);
+        distanceValue = Math.hypot(...vertexToLight);
+      }
+      const numerator = Math.max(gxPolynomial(light.cosAtten, angularValue), 0);
+      const denominator = gxPolynomial(light.distAtten, distanceValue);
+      return Math.abs(denominator) < 1e-12 ? 0 : numerator / denominator;
+    }
+
+    function gxChannelLightEnabled(control, lightIndex) {
+      return lightIndex < 4
+        ? ((control >>> (2 + lightIndex)) & 1) !== 0
+        : ((control >>> (11 + lightIndex - 4)) & 1) !== 0;
+    }
+
+    function gxLightChannelComponent(
+      control, component, material, ambient, vertexColor, position, normal
+    ) {
+      const materialValue = (control & 1) !== 0 ? vertexColor[component] : material[component];
+      if ((control & 2) === 0) return materialValue;
+      let lightFunction = (control & (1 << 6)) !== 0
+        ? vertexColor[component]
+        : ambient[component];
+      for (let lightIndex = 0; lightIndex < 8; lightIndex += 1) {
+        if (!gxChannelLightEnabled(control, lightIndex)) continue;
+        const light = gxXfLight(lightIndex);
+        if (light === null) continue;
+        lightFunction += light.color[component]
+          * gxLightDiffuse(control, light, position, normal)
+          * gxLightPosition(control, light, position, normal);
+      }
+      return materialValue * Math.max(0, Math.min(1, lightFunction));
+    }
+
+    function gxLightRasterChannels(position, normal, colors) {
+      const transformedNormal = normal ?? [0, 0, 0];
+      return Array.from({ length: 2 }, (_unused, channel) => {
+        const vertexColor = colors[channel].map(value => value / 255);
+        const material = gxXfColor(0x100c + channel);
+        const ambient = gxXfColor(0x100a + channel);
+        const colorControl = gxXfRegisters[0x100e + channel] >>> 0;
+        const alphaControl = gxXfRegisters[0x1010 + channel] >>> 0;
+        return [
+          gxLightChannelComponent(
+            colorControl, 0, material, ambient, vertexColor, position, transformedNormal
+          ),
+          gxLightChannelComponent(
+            colorControl, 1, material, ambient, vertexColor, position, transformedNormal
+          ),
+          gxLightChannelComponent(
+            colorControl, 2, material, ambient, vertexColor, position, transformedNormal
+          ),
+          gxLightChannelComponent(
+            alphaControl, 3, material, ambient, vertexColor, position, transformedNormal
+          ),
+        ];
+      });
+    }
+
         gxXfbCopyCount + 4
       );
       gxCollectFrameGeometry = true;
@@ -2747,17 +2982,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxProjectPosition(position, matrixIndex) {
-      if ((matrixIndex + 2) * 4 + 3 >= 0x100) return null;
-      const matrix = Array.from({ length: 12 }, (_unused, index) =>
-        gxXfFloat(matrixIndex * 4 + index)
-      );
-      if (matrix.some(value => !Number.isFinite(value)) || matrix.every(value => value === 0)) {
-        return null;
-      }
-      const [x, y, z] = position;
-      const viewX = matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3];
-      const viewY = matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7];
-      const viewZ = matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11];
+      const viewPosition = gxTransformPosition(position, matrixIndex);
+      if (viewPosition === null) return null;
+      const [viewX, viewY, viewZ] = viewPosition;
       const projection = Array.from({ length: 6 }, (_unused, index) =>
         gxXfFloat(0x1020 + index)
       );
@@ -2845,16 +3072,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       const normalStatus = gxAttributeStatus(1);
       const normalElements = (vat0 >>> 9) & 1;
       const normalFormat = (vat0 >>> 10) & 7;
-      if (normalStatus === 1) {
-        cursor += (normalElements === 0 ? 3 : 9) * gxComponentBytes(normalFormat);
-      } else if (normalStatus >= 2) {
-        const indexBytes = normalStatus === 2 ? 1 : 2;
-        cursor += normalElements !== 0 && (vat0 & 0x80000000) !== 0
-          ? indexBytes * 3
-          : indexBytes;
-      }
+      const normalAttribute = gxDecodeNormalAttribute(
+        source,
+        cursor,
+        normalStatus,
+        normalElements,
+        normalFormat,
+        normalElements !== 0 && (vat0 & 0x80000000) !== 0
+      );
+      cursor = normalAttribute.cursor;
+      if (normalAttribute.skipped) return { cursor, skipped: true };
 
-      let color = [0xff, 0xff, 0xff, 0xff];
+      const colors = Array.from({ length: 2 }, () => [0xff, 0xff, 0xff, 0xff]);
       for (let colorIndex = 0; colorIndex < 2; colorIndex += 1) {
         const status = gxAttributeStatus(2 + colorIndex);
         const format = (vat0 >>> (14 + colorIndex * 4)) & 7;
@@ -2902,14 +3131,21 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
       const texCoords = textureMatrices.map((matrixIndex, texgenIndex) =>
-        gxTransformTexCoord(rawTextureCoords, matrixIndex, texgenIndex)
+        gxTransformTexCoord(texgenAttributes, matrixIndex, texgenIndex)
       );
 
       const projected = gxProjectPosition(position, positionMatrix);
       return {
         cursor,
         projected,
-        color,
+        colors,
+        rasterColors,
+        normal,
+        tangent,
+        binormal,
+        rawNormal: normalAttribute.normal,
+        rawTangent: normalAttribute.tangent,
+        rawBinormal: normalAttribute.binormal,
         texCoords,
         rawTextureCoords,
         textureMatrices,
@@ -3090,6 +3326,22 @@ const TEMPLATE: &str = r##"<!doctype html>
         ? 256 / Math.max(1, yScaleRaw)
         : yScaleRaw / 256;
       const copyToXfb = (trigger & 0x4000) !== 0;
+      const viewPosition = gxTransformPosition(position, positionMatrix);
+      const projected = gxProjectPosition(position, positionMatrix);
+      const normal = gxTransformNormal(normalAttribute.normal, positionMatrix);
+      const tangent = gxTransformNormal(normalAttribute.tangent, positionMatrix);
+      const binormal = gxTransformNormal(normalAttribute.binormal, positionMatrix);
+      const rasterColors = viewPosition === null
+        ? colors.map(color => color.map(value => value / 255))
+        : gxLightRasterChannels(viewPosition, normal, colors);
+      const texgenAttributes = {
+        position,
+        normal: normalAttribute.normal,
+        tangent: normalAttribute.tangent,
+        binormal: normalAttribute.binormal,
+        colors: rasterColors,
+        rawTextureCoords,
+      };
       const viTop = viXfbAddress(0x201c);
       const viBottom = viXfbAddress(0x2024);
       const frame = {
@@ -3166,6 +3418,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (collectedGeometry) {
           if (gxSkippedFrameClearColor !== null) {
             postMessage({ type: "efb-clear", clearColor: gxSkippedFrameClearColor });
+        const raster0 = decoded.rasterColors?.[0]
+          ?? decoded.colors[0].map(value => value / 255);
+        const raster1 = decoded.rasterColors?.[1]
+          ?? decoded.colors[1].map(value => value / 255);
             gxSkippedFrameClearColor = null;
           }
           postMessage({ type: "texture-copy", frame });
@@ -3238,6 +3494,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           const size = gxReadU32(source, offset + 5);
           gxDisplayListBytes += size;
           if (!inDisplayList) {
+        rasterColors: rasterColorSets.map(colors => colors.slice(0, 4)),
+        normals: normalSet.slice(0, 4),
             const pointer = ramPointer(address, size);
             if (pointer === null) {
               gxDisplayListErrors += 1;
