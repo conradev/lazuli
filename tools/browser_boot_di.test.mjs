@@ -77,7 +77,20 @@ function makeContext() {
     mmio: 0,
     cpu: 0x8000,
     msrOffset: 0,
+    cycles: 0,
+    cycleLimit: Number.POSITIVE_INFINITY,
+    viCpuCyclesPerSecond: 486_000_000,
+    viTiming: null,
+    nextViCycle: null,
+    nextSerialPollCycle: null,
+    nextDecrementerCycle: null,
     diskTransfer: null,
+    serialTransfer: null,
+    peFinishCycle: null,
+    dspScheduledMail: null,
+    nextDspAudioDmaInterruptCycle: null,
+    nextDspAudioDmaCycle: null,
+    aramTransfer: null,
     diskReadBytes: 0,
     diskHashedBytes: 0,
     diskReadHash: 0,
@@ -104,6 +117,10 @@ function makeContext() {
     diskAudioLength: 0,
     diskAudioNextStart: 0,
     diskAudioNextLength: 0,
+    nextDiskAudioCycle: null,
+    aiSampleCounter: 0,
+    aiLastCycle: 0,
+    aiInterruptDelivered: false,
     diskCommandCounts: new Map(),
     diskCommandTrace: [],
     interruptDeliveries: 0,
@@ -116,6 +133,10 @@ function makeContext() {
     raiseException() {
       context.interruptDeliveries += 1;
     },
+    ensureViSchedule() {},
+    nextAudioSampleCycle() {
+      return null;
+    },
   };
   vm.createContext(context);
   vm.runInContext(
@@ -124,8 +145,16 @@ function makeContext() {
       "writeDiskStatus",
       "diskCommandName",
       "recordDiskCommand",
+      "audioCyclesPerSample",
+      "updateAudioSampleCounter",
+      "writeAudioControl",
+      "diskAudioTiming",
+      "updateDiskAudioSchedule",
+      "advanceDiskAudioBlock",
+      "serviceDiskAudio",
       "beginDiskCommand",
       "serviceDisk",
+      "nextRuntimeEventCycle",
     ].map(extractFunction).join("\n\n"),
     context,
     { filename: "browser_boot.di.js" },
@@ -216,6 +245,109 @@ test("DI streaming commands configure, start, query, and stop DTK state", () => 
   assert.equal(context.diskAudioEnabled, false);
   assert.equal(context.deviceEvents.get("diskAudioConfig"), 2);
   assert.equal(context.diskCommandCounts.get("audio-status"), 4);
+});
+
+test("DTK advances in scheduler-visible GameCube audio batches", () => {
+  const context = makeContext();
+  const { view } = context;
+  view.setUint32(0x6c00, 3, false); // Playing at the GC streaming 48 KHz rate.
+
+  runCommand(context, 0xe401000a, 0, 0, 1000);
+  runCommand(context, 0xe1000000, 0x00005ff0, 0x00010000, 200000);
+
+  const timing = context.diskAudioTiming();
+  assert.equal(timing.blocksPerBatch, 6);
+  assert.equal(timing.cyclesPerBlock, 283248);
+  assert.equal(timing.cyclesPerBatch, 1699488);
+  assert.equal(context.nextDiskAudioCycle, 1899488);
+  assert.equal(context.nextRuntimeEventCycle(false), context.nextDiskAudioCycle);
+
+  context.serviceDisk(context.nextDiskAudioCycle - 1);
+  assert.equal(context.diskAudioPosition, 0x00017fc0);
+  context.serviceDisk(context.nextDiskAudioCycle);
+  assert.equal(context.diskAudioPosition, 0x00018080);
+  assert.equal(context.deviceEvents.get("diskAudioBatch"), 1);
+  assert.equal(context.deviceEvents.get("diskAudioBlock"), 6);
+
+  runCommand(context, 0xe2010000, 0, 0, 1900000);
+  assert.equal(view.getUint32(0x6020, false), 0x00006000);
+
+  view.setUint32(0x6c00, 1, false);
+  assert.deepEqual(
+    { ...context.diskAudioTiming() },
+    { blocksPerBatch: 4, cyclesPerBlock: 424872, cyclesPerBatch: 1699488 },
+  );
+});
+
+test("DTK applies a queued track at the current track boundary", () => {
+  const context = makeContext();
+  const { view } = context;
+  view.setUint32(0x6c00, 3, false);
+
+  runCommand(context, 0xe401000a, 0, 0, 1000);
+  runCommand(context, 0xe1000000, 0x00004000, 0x00000020, 200000);
+  const firstBatchCycle = context.nextDiskAudioCycle;
+  runCommand(context, 0xe1000000, 0x00008000, 0x00001000, 400000);
+
+  assert.equal(context.nextDiskAudioCycle, firstBatchCycle, "queueing reset DTK cadence");
+  context.serviceDisk(firstBatchCycle);
+
+  assert.equal(context.diskAudioStart, 0x00020000);
+  assert.equal(context.diskAudioLength, 0x00001000);
+  assert.equal(context.diskAudioPosition, 0x000200a0);
+  assert.equal(context.diskAudioStreaming, true);
+  assert.equal(context.deviceEvents.get("diskAudioTrackBoundary"), 1);
+});
+
+test("DTK stop-at-track-end stops on the next boundary and cancels its event", () => {
+  const context = makeContext();
+  const { view } = context;
+  view.setUint32(0x6c00, 3, false);
+
+  runCommand(context, 0xe401000a, 0, 0, 1000);
+  runCommand(context, 0xe1000000, 0x00004000, 0x00000020, 200000);
+  const firstBatchCycle = context.nextDiskAudioCycle;
+  runCommand(context, 0xe1000000, 0, 0, 400000);
+  assert.equal(context.diskAudioStopAtTrackEnd, true);
+
+  context.serviceDisk(firstBatchCycle);
+
+  assert.equal(context.diskAudioStreaming, false);
+  assert.equal(context.diskAudioStopAtTrackEnd, false);
+  assert.equal(context.diskAudioPosition, 0x00010000);
+  assert.equal(context.nextDiskAudioCycle, null);
+  assert.equal(context.deviceEvents.get("diskAudioBlock"), 1);
+  assert.equal(context.deviceEvents.get("diskAudioStoppedAtTrackEnd"), 1);
+
+  runCommand(context, 0xe2000000, 0, 0, 2000000);
+  assert.equal(view.getUint32(0x6020, false), 0);
+});
+
+test("DTK waits for AI playback and follows pause and resume", () => {
+  const context = makeContext();
+  const { view } = context;
+
+  runCommand(context, 0xe401000a, 0, 0, 1000);
+  runCommand(context, 0xe1000000, 0x00004000, 0x00001000, 200000);
+  assert.equal(context.nextDiskAudioCycle, null);
+
+  context.cycles = 300000;
+  context.writeAudioControl(3);
+  assert.equal(context.nextDiskAudioCycle, 1999488);
+  assert.equal(context.nextRuntimeEventCycle(false), 1999488);
+
+  context.cycles = 400000;
+  context.writeAudioControl(2);
+  assert.equal(context.nextDiskAudioCycle, null);
+  context.serviceDisk(3000000);
+  assert.equal(context.diskAudioPosition, 0x00010000);
+  assert.equal(view.getUint32(0x6c00, false) & 1, 0);
+});
+
+test("DTK diagnostics explicitly identify hardware-state-only output", () => {
+  assert.match(source, /nextDiskAudioCycle,\n\s+serialTransfer/);
+  assert.match(source, /nextCycle: nextDiskAudioCycle,\n\s+\.\.\.diskAudioTiming\(\),/);
+  assert.match(source, /output: "hardware-state-only"/);
 });
 
 test("DI seek, stop-motor, and request-error commands complete without DMA", () => {

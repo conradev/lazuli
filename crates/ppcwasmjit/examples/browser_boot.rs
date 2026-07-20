@@ -1159,6 +1159,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let diskAudioLength = 0;
     let diskAudioNextStart = 0;
     let diskAudioNextLength = 0;
+    let nextDiskAudioCycle = null;
     const diskCommandCounts = new Map();
     const diskCommandTrace = [];
     let regionRunning = false;
@@ -3373,6 +3374,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if ((next & 0x08) === 0) aiInterruptDelivered = false;
       view.setUint32(mmio + 0x6c00, next >>> 0, false);
+      const playStateChanged = wasPlaying !== ((next & 1) !== 0);
+      const streamRateChanged = ((current ^ next) & 2) !== 0;
+      updateDiskAudioSchedule(cycles, playStateChanged || streamRateChanged);
     }
 
     function dspAudioDmaCyclesPerBlock() {
@@ -4716,6 +4720,91 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (diskCommandTrace.length > 64) diskCommandTrace.shift();
     }
 
+    function diskAudioTiming() {
+      const control = view.getUint32(mmio + 0x6c00, false);
+      const streamingAt48KHz = (control & 2) !== 0;
+      const blocksPerBatch = streamingAt48KHz ? 6 : 4;
+      const sampleRateDivisor = streamingAt48KHz ? 2248 : 3372;
+      const cyclesPerBlock = (
+        viCpuCyclesPerSecond * sampleRateDivisor * 28 / 108_000_000
+      );
+      return {
+        blocksPerBatch,
+        cyclesPerBlock,
+        cyclesPerBatch: blocksPerBatch * cyclesPerBlock,
+      };
+    }
+
+    function updateDiskAudioSchedule(observedCycles, force) {
+      const playing = (view.getUint32(mmio + 0x6c00, false) & 1) !== 0;
+      if (!diskAudioStreaming || !playing) {
+        nextDiskAudioCycle = null;
+        return;
+      }
+      if (force || nextDiskAudioCycle === null) {
+        nextDiskAudioCycle = Math.ceil(observedCycles + diskAudioTiming().cyclesPerBatch);
+      }
+    }
+
+    function advanceDiskAudioBlock() {
+      if (diskAudioPosition >= diskAudioStart + diskAudioLength) {
+        diskAudioPosition = diskAudioNextStart;
+        diskAudioStart = diskAudioNextStart;
+        diskAudioLength = diskAudioNextLength;
+        deviceEvents.set(
+          "diskAudioTrackBoundary",
+          (deviceEvents.get("diskAudioTrackBoundary") ?? 0) + 1
+        );
+
+        if (diskAudioStopAtTrackEnd) {
+          diskAudioStopAtTrackEnd = false;
+          diskAudioStreaming = false;
+          deviceEvents.set(
+            "diskAudioStoppedAtTrackEnd",
+            (deviceEvents.get("diskAudioStoppedAtTrackEnd") ?? 0) + 1
+          );
+          return false;
+        }
+      }
+
+      diskAudioPosition += 32;
+      return true;
+    }
+
+    function serviceDiskAudio(observedCycles) {
+      // Keep DTK hardware state moving without reading or decoding disc ADPCM in this harness.
+      while (nextDiskAudioCycle !== null && observedCycles >= nextDiskAudioCycle) {
+        const scheduledCycle = nextDiskAudioCycle;
+        const playing = (view.getUint32(mmio + 0x6c00, false) & 1) !== 0;
+        if (!diskAudioStreaming || !playing) {
+          nextDiskAudioCycle = null;
+          break;
+        }
+
+        const timing = diskAudioTiming();
+        let processedBlocks = 0;
+        while (
+          processedBlocks < timing.blocksPerBatch
+          && diskAudioStreaming
+          && advanceDiskAudioBlock()
+        ) {
+          processedBlocks += 1;
+        }
+        deviceEvents.set(
+          "diskAudioBatch",
+          (deviceEvents.get("diskAudioBatch") ?? 0) + 1
+        );
+        deviceEvents.set(
+          "diskAudioBlock",
+          (deviceEvents.get("diskAudioBlock") ?? 0) + processedBlocks
+        );
+
+        nextDiskAudioCycle = diskAudioStreaming
+          ? Math.ceil(scheduledCycle + timing.cyclesPerBatch)
+          : null;
+      }
+    }
+
     function beginDiskCommand(observedCycles) {
       const command0 = view.getUint32(mmio + 0x6008, false);
       const command1 = view.getUint32(mmio + 0x600c, false);
@@ -4815,6 +4904,7 @@ const TEMPLATE: &str = r##"<!doctype html>
               break;
             }
             if (audioSubcommand === 0x00) {
+              const wasStreaming = diskAudioStreaming;
               const offset = command1 * 4;
               const length = command2;
               if (offset === 0 && length === 0) {
@@ -4829,6 +4919,10 @@ const TEMPLATE: &str = r##"<!doctype html>
                   diskAudioStreaming = true;
                 }
               }
+              updateDiskAudioSchedule(
+                observedCycles,
+                !wasStreaming && diskAudioStreaming
+              );
               details = { subcommand: audioSubcommand, offset, length };
               deviceEvents.set(
                 "diskAudioStreamStart",
@@ -4837,6 +4931,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             } else if (audioSubcommand === 0x01) {
               diskAudioStopAtTrackEnd = false;
               diskAudioStreaming = false;
+              updateDiskAudioSchedule(observedCycles, false);
               details = { subcommand: audioSubcommand };
               deviceEvents.set(
                 "diskAudioStreamStop",
@@ -4885,6 +4980,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           case 0xe3:
             diskAudioStopAtTrackEnd = false;
             diskAudioStreaming = false;
+            updateDiskAudioSchedule(observedCycles, false);
             diskDriveState = 4;
             view.setUint32(mmio + 0x6020, 0, false);
             deviceEvents.set("diskStopMotor", (deviceEvents.get("diskStopMotor") ?? 0) + 1);
@@ -4896,6 +4992,7 @@ const TEMPLATE: &str = r##"<!doctype html>
               diskAudioStopAtTrackEnd = false;
               diskAudioStreaming = false;
             }
+            updateDiskAudioSchedule(observedCycles, false);
             details = {
               enabled: diskAudioEnabled,
               bufferLength: diskAudioBufferLength,
@@ -4927,6 +5024,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function serviceDisk(observedCycles) {
+      serviceDiskAudio(observedCycles);
       let control = view.getUint32(mmio + 0x601c, false);
       if (diskTransfer === null && (control & 1) !== 0) {
         beginDiskCommand(observedCycles);
@@ -5234,6 +5332,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         nextSerialPollCycle,
         nextDecrementerCycle,
         diskTransfer?.completionCycle ?? null,
+        nextDiskAudioCycle,
         serialTransfer?.completionCycle ?? null,
         peFinishCycle,
         dspScheduledMail?.completionCycle ?? null,
@@ -5558,6 +5657,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             length: diskAudioLength,
             nextStart: diskAudioNextStart,
             nextLength: diskAudioNextLength,
+            nextCycle: nextDiskAudioCycle,
+            ...diskAudioTiming(),
+            output: "hardware-state-only",
           },
         },
         controller: {
@@ -5694,6 +5796,13 @@ const TEMPLATE: &str = r##"<!doctype html>
             cyclesPerBlock: dspAudioDmaCyclesPerBlock(),
             nextInterruptCycle: nextDspAudioDmaInterruptCycle,
             nextCycle: nextDspAudioDmaCycle,
+          },
+          diskAudio: {
+            streaming: diskAudioStreaming,
+            position: diskAudioPosition,
+            nextCycle: nextDiskAudioCycle,
+            ...diskAudioTiming(),
+            output: "hardware-state-only",
           },
           aramTransfer,
           nextViCycle,

@@ -174,6 +174,7 @@ test("DSP audio DMA is a runtime scheduler candidate and is included in reports"
     cycles: 100,
     decrementerPending: false,
     diskTransfer: null,
+    nextDiskAudioCycle: null,
     dspScheduledMail: null,
     ensureViSchedule() {},
     nextAudioSampleCycle: () => null,
