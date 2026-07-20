@@ -5,12 +5,28 @@ const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_CHUNK_BYTES = 64 * 1024;
 const NETWORK_CHUNK_BYTES = 256 * 1024;
 const DEFAULT_PARALLEL_CHUNKS = 4;
+const BI2_DISC_OFFSET = 0x440;
+const BI2_SIZE = 0x2000;
+const MEM1_BASE = 0x80000000;
 const MEM1_BYTES = 24 * 1024 * 1024;
+const MEM1_CACHED_END = MEM1_BASE + MEM1_BYTES;
 const MAX_DOL_BYTES = 32 * 1024 * 1024;
-// Disc boot normally lets the apploader establish the low-memory arena. The
-// browser harness loads the boot DOL directly, so retain Lazuli's IPL-HLE arena
-// floor and only move it upward for executables with a larger static layout.
-export const GC_IPL_HLE_ARENA_LOW = 0x8042e260;
+// Mirror the retail apploader's top-down layout. It reserves the maximum FST
+// size at the end of cached MEM1, then places BI2 in the 8 KiB immediately
+// below the FST.
+export function discBootMemoryLayout(fstMaxSize) {
+  if (!Number.isSafeInteger(fstMaxSize) || fstMaxSize < 12) {
+    throw new Error("disc FST is too small");
+  }
+  const fstReserved = Math.ceil(fstMaxSize / 32) * 32;
+  const fstAddress = MEM1_CACHED_END - fstReserved;
+  const bi2Address = fstAddress - BI2_SIZE;
+  if (bi2Address < MEM1_BASE) throw new Error("disc boot data does not fit in MEM1");
+  return {
+    bi2Address,
+    fstAddress,
+  };
+}
 
 function checkRange(offset, length) {
   if (!Number.isSafeInteger(offset) || offset < 0) {
@@ -374,7 +390,6 @@ export function inspectDolLayout(dol, options = {}) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const sections = [];
   let dolSize = 0x100;
-  let arenaLow = GC_IPL_HLE_ARENA_LOW;
   for (let index = 0; index < 18; index += 1) {
     const fileOffset = u32(view, index * 4);
     const target = u32(view, 0x48 + index * 4);
@@ -389,16 +404,13 @@ export function inspectDolLayout(dol, options = {}) {
     const range = canonicalMem1Range(target, size, `DOL section ${index}`);
     sections.push({ fileOffset, index, size, ...range });
     dolSize = Math.max(dolSize, fileEnd);
-    arenaLow = Math.max(arenaLow, range.end);
   }
   const bssTarget = u32(view, 0xd8);
   const bssSize = u32(view, 0xdc);
   const bss = canonicalMem1Range(bssTarget, bssSize, "DOL BSS");
-  if (bss !== null) arenaLow = Math.max(arenaLow, bss.end);
   const entry = u32(view, 0xe0);
   canonicalMem1Range(entry, 4, "DOL entrypoint");
   return {
-    arenaLow: Math.ceil(arenaLow / 32) * 32,
     bss,
     bssSize,
     bssTarget,
@@ -416,10 +428,14 @@ export async function readDiscBoot(source) {
   const fstOffset = u32(view, 0x424);
   const fstSize = u32(view, 0x428);
   const fstMaxSize = Math.max(fstSize, u32(view, 0x42c));
+  if (fstSize < 12) throw new Error("disc FST is too small");
   if (fstSize > MEM1_BYTES || fstMaxSize > MEM1_BYTES) {
     throw new Error("disc FST exceeds MEM1");
   }
   if (source.size !== null && source.size !== undefined) {
+    if (BI2_DISC_OFFSET > source.size - BI2_SIZE) {
+      throw new Error("BI2 exceeds disc image");
+    }
     if (bootOffset > source.size - 0x100) throw new Error("DOL header exceeds disc image");
     if (fstOffset > source.size - fstSize) throw new Error("FST exceeds disc image");
   }
@@ -428,7 +444,8 @@ export async function readDiscBoot(source) {
   if (source.size !== null && source.size !== undefined && bootOffset > source.size - dolSize) {
     throw new Error("DOL exceeds disc image");
   }
-  const [dol, fst] = await Promise.all([
+  const [bi2, dol, fst] = await Promise.all([
+    source.read(BI2_DISC_OFFSET, BI2_SIZE),
     source.read(bootOffset, dolSize),
     source.read(fstOffset, fstSize),
   ]);
@@ -442,24 +459,22 @@ export async function readDiscBoot(source) {
   const label = title === ""
     ? `${identifier} Rev.${String(revision).padStart(2, "0")}`
     : `${title} (${identifier} Rev.${String(revision).padStart(2, "0")})`;
-  const fstAddress = 0x817fe8c0 - Math.ceil(fstMaxSize / 32) * 32;
-  if (fstAddress < 0x80000000 || fstAddress + fstMaxSize > 0x81800000) {
-    throw new Error("disc FST does not fit in MEM1");
-  }
-  const fstEnd = fstAddress + fstMaxSize;
-  const overlapsFst = (start, size) =>
-    size !== 0 && start < fstEnd && fstAddress < start + size;
+  const { bi2Address, fstAddress } = discBootMemoryLayout(fstMaxSize);
+  const bootDataEnd = fstAddress + Math.ceil(fstMaxSize / 32) * 32;
+  const overlapsBootData = (start, size) =>
+    size !== 0 && start < bootDataEnd && bi2Address < start + size;
   for (const section of dolLayout.sections) {
-    if (overlapsFst(section.start, section.size)) {
-      throw new Error(`disc FST overlaps DOL section ${section.index}`);
+    if (overlapsBootData(section.start, section.size)) {
+      throw new Error(`disc boot data overlaps DOL section ${section.index}`);
     }
   }
-  if (dolLayout.bss !== null && overlapsFst(dolLayout.bss.start, dolLayout.bssSize)) {
-    throw new Error("disc FST overlaps DOL BSS");
+  if (dolLayout.bss !== null && overlapsBootData(dolLayout.bss.start, dolLayout.bssSize)) {
+    throw new Error("disc boot data overlaps DOL BSS");
   }
   return {
-    arenaLow: dolLayout.arenaLow,
     audioStreaming: header[8],
+    bi2,
+    bi2Address,
     discId: header[6],
     dol,
     fst,

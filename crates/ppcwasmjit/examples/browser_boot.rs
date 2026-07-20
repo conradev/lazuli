@@ -24,6 +24,8 @@ const GX_FIFO_STAGING_DATA_PTR: usize = GX_FIFO_STAGING_META_PTR + 16;
 const GX_FIFO_STAGING_CAPACITY: usize = 256 * 1024;
 const FASTMEM_PAGE_SHIFT: u32 = 17;
 const FASTMEM_LUT_COUNT: usize = 1 << 15;
+const DISC_BI2_OFFSET: u64 = 0x440;
+const DISC_BI2_SIZE: usize = 0x2000;
 const DISC_SOURCE_RUNTIME: &str = include_str!("browser_disc_source.mjs");
 
 trait ReadSeek: Read + Seek {}
@@ -32,6 +34,7 @@ impl<T: Read + Seek> ReadSeek for T {}
 
 struct DiscBootInfo {
     audio_streaming: u8,
+    bi2: Vec<u8>,
     disc_id: u8,
     filesystem: Vec<u8>,
     filesystem_max_size: u32,
@@ -48,6 +51,7 @@ impl DiscBootInfo {
     fn empty() -> Self {
         Self {
             audio_streaming: 0,
+            bi2: Vec::new(),
             disc_id: 0,
             filesystem: Vec::new(),
             filesystem_max_size: 0x24,
@@ -69,6 +73,7 @@ impl DiscBootInfo {
             .to_owned();
         Self {
             audio_streaming: 0,
+            bi2: Vec::new(),
             disc_id: 0,
             filesystem: Vec::new(),
             filesystem_max_size: 0x24,
@@ -115,6 +120,18 @@ fn read_disc_boot_info(path: &PathBuf) -> DiscBootInfo {
     let mut reader = open_disc(path);
     let header = iso::Header::read_be(&mut reader)
         .unwrap_or_else(|error| panic!("failed to parse disc header {}: {error}", path.display()));
+    assert!(
+        header.filesystem_size >= 12,
+        "disc FST is too small in {}",
+        path.display()
+    );
+    reader
+        .seek(SeekFrom::Start(DISC_BI2_OFFSET))
+        .unwrap_or_else(|error| panic!("failed to seek disc BI2 {}: {error}", path.display()));
+    let mut bi2 = vec![0; DISC_BI2_SIZE];
+    reader
+        .read_exact(&mut bi2)
+        .unwrap_or_else(|error| panic!("failed to read disc BI2 {}: {error}", path.display()));
     reader
         .seek(SeekFrom::Start(header.filesystem_offset as u64))
         .unwrap_or_else(|error| panic!("failed to seek disc FST {}: {error}", path.display()));
@@ -139,6 +156,7 @@ fn read_disc_boot_info(path: &PathBuf) -> DiscBootInfo {
 
     DiscBootInfo {
         audio_streaming: header.meta.audio_streaming,
+        bi2,
         disc_id: header.meta.disk_id,
         filesystem,
         filesystem_max_size: header.max_filesystem_size.max(header.filesystem_size),
@@ -194,7 +212,6 @@ fn main() {
         (None, Some(path)) => DiscBootInfo::standalone(path),
         (None, None) => DiscBootInfo::empty(),
     };
-    let fst_address = 0x817f_e8c0_u32 - disc.filesystem_max_size.next_multiple_of(32);
     let gpr_offsets = (0_u8..32)
         .map(|index| GPR::new(index).offset().to_string())
         .collect::<Vec<_>>()
@@ -229,8 +246,8 @@ fn main() {
             if has_boot_asset { "true" } else { "false" },
         )
         .replace("__HAS_DISC__", if has_disc { "true" } else { "false" })
+        .replace("__BI2__", &hex(&disc.bi2))
         .replace("__FST__", &hex(&disc.filesystem))
-        .replace("__FST_ADDRESS__", &fst_address.to_string())
         .replace("__FST_MAX_SIZE__", &disc.filesystem_max_size.to_string())
         .replace("__GPR_OFFSETS__", &gpr_offsets)
         .replace("__DOL_NAME__", &js_string(&dol_name))
@@ -877,13 +894,15 @@ const TEMPLATE: &str = r##"<!doctype html>
     let boot;
     if (discSourceConfig.kind === "boot-assets") {
       const fallbackDol = await fetchBinary(globalThis.dolUrl, "boot DOL");
+      const fallbackBootLayout = discBootMemoryLayout(__FST_MAX_SIZE__);
       boot = {
-        arenaLow: inspectDolLayout(fallbackDol).arenaLow,
         audioStreaming: __AUDIO_STREAMING__,
+        bi2: decode("__BI2__"),
+        bi2Address: fallbackBootLayout.bi2Address,
         discId: __DISC_ID__,
         dol: fallbackDol,
         fst: decode("__FST__"),
-        fstAddress: __FST_ADDRESS__,
+        fstAddress: fallbackBootLayout.fstAddress,
         fstMaxSize: __FST_MAX_SIZE__,
         gameCode: __GAME_CODE__,
         identifier: __GAME_IDENTIFIER__,
@@ -898,8 +917,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       boot = await readDiscBoot(discSource);
     }
     let compilerWasm = await compilerWasmPromise;
-    let { dol, fst } = boot;
-    const { fstAddress, fstMaxSize } = boot;
+    let { bi2, dol, fst } = boot;
+    const { bi2Address, fstAddress, fstMaxSize } = boot;
+    const bi2Bytes = bi2.length;
     const dolBytes = dol.length;
     const fstBytes = fst.length;
     const compilerWasmBytes = compilerWasm.length;
@@ -3625,14 +3645,24 @@ const TEMPLATE: &str = r##"<!doctype html>
       writePhysical32(0x24, 1);
       writePhysical32(0x28, 0x01800000);
       writePhysical32(0x2c, 0x10000005);
-      writePhysical32(0x30, boot.arenaLow);
+      // The retail apploader clears ArenaLo before handing control to the
+      // game. Its OSInit then substitutes the executable's linked arena
+      // boundary; publishing the IPL-HLE arena here needlessly shrinks the
+      // game's heaps.
+      writePhysical32(0x30, 0);
       writePhysical32(0x34, fstAddress);
       writePhysical32(0x38, fstAddress);
       writePhysical32(0x3c, fstMaxSize);
       writePhysical32(0xcc, boot.tvMode);
       writePhysical32(0xd0, 0x01000000);
+      writePhysical32(0xf4, bi2Address);
       writePhysical32(0xf8, 0x09a7ec80);
       writePhysical32(0xfc, 0x1cf7c580);
+    }
+
+    function loadBootData() {
+      bytes.set(bi2, ram + physicalOffset(bi2Address));
+      bytes.set(fst, ram + physicalOffset(fstAddress));
     }
 
     function fetchWord(pc) {
@@ -4992,6 +5022,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           },
         },
         recentPcs: recentPcs.map(value => hex32(value)),
+        bi2Address: "0x" + bi2Address.toString(16).padStart(8, "0"),
+        bi2Bytes,
         dolBytes,
         fstBytes,
         fstAddress: "0x" + fstAddress.toString(16).padStart(8, "0"),
@@ -5361,6 +5393,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     try {
       bytes.fill(0, ram, ram + ramSize);
       bytes.fill(0, mmio, mmio + mmioSize);
+      // PI cause bit 16 is the active-low physical reset button input. Games
+      // treat a cleared bit as a held reset button and eventually call
+      // OSResetSystem, so power-on must expose the released state.
+      view.setUint32(mmio + 0x3000, 0x00010000, false);
       view.setUint16(mmio + 0x5016, 1, false);
       pushDspMail(0x8071feed, false, "initialize");
       deviceEvents.set("dspInitialize", (deviceEvents.get("dspInitialize") ?? 0) + 1);
@@ -5372,7 +5408,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxFifoStagingData + gxFifoStagingCapacity
       );
       initializeLowMemory();
-      bytes.set(fst, ram + physicalOffset(fstAddress));
+      loadBootData();
       const bssTarget = dolU32(0xd8);
       const bssSize = dolU32(0xdc);
       if (bssSize !== 0) {
@@ -5388,8 +5424,10 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       const { instance: compilerInstance } = await WebAssembly.instantiate(compilerWasm, {});
       compilerWasm = null;
+      boot.bi2 = null;
       boot.dol = null;
       boot.fst = null;
+      bi2 = null;
       dol = null;
       fst = null;
       const compiler = compilerInstance.exports;
@@ -6117,6 +6155,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       canvas.height = texture.height;
       const context = canvas.getContext("2d");
       const pixels = texture.pixels instanceof Uint8ClampedArray
+      // PI cause bit 16 is the active-low physical reset button input. Games
+      // treat a cleared bit as a held reset button and eventually call
+      // OSResetSystem, so power-on must expose the released state.
+      view.setUint32(mmio + 0x3000, 0x00010000, false);
         ? texture.pixels
         : new Uint8ClampedArray(texture.pixels);
       context.putImageData(new ImageData(pixels, texture.width, texture.height), 0, 0);

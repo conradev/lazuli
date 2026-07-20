@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   CisoDiscSource,
+  discBootMemoryLayout,
   HttpRangeByteSource,
   openDiscSource,
   parseCisoHeader,
@@ -21,6 +22,8 @@ function writeAscii(bytes, offset, value) {
 function makeRawDisc() {
   const bytes = new Uint8Array(4 * 1024 * 1024);
   const view = new DataView(bytes.buffer);
+  const bi2Offset = 0x440;
+  const bi2Size = 0x2000;
   const bootOffset = 0x10000;
   const fstOffset = 0x22000;
   const fstSize = 0x40;
@@ -38,6 +41,13 @@ function makeRawDisc() {
   view.setUint32(0x428, fstSize, false);
   view.setUint32(0x42c, fstMaxSize, false);
 
+  for (let index = 0; index < bi2Size; index += 1) {
+    bytes[bi2Offset + index] = (index * 13) & 0xff;
+  }
+  view.setUint32(bi2Offset, 0, false);
+  view.setUint32(bi2Offset + 4, 0, false);
+  view.setUint32(bi2Offset + 0x20, 1, false);
+
   const dol = new DataView(bytes.buffer, bootOffset, 0x120);
   dol.setUint32(0x00, 0x100, false);
   dol.setUint32(0x48, 0x80004000, false);
@@ -52,7 +62,15 @@ function makeRawDisc() {
     bytes[fstOffset + index] = 0x40 + index;
   }
 
-  return { bytes, bootOffset, fstOffset, fstSize, fstMaxSize };
+  return {
+    bi2Offset,
+    bi2Size,
+    bootOffset,
+    bytes,
+    fstOffset,
+    fstSize,
+    fstMaxSize,
+  };
 }
 
 function makeCiso(blockSize, logicalBlocks, present) {
@@ -91,9 +109,14 @@ test("local File loading parses boot metadata without reading the whole ISO", as
   assert.equal(boot.audioStreaming, 1);
   assert.equal(boot.streamBufferSize, 0x20);
   assert.equal(boot.makerCode, 0x3850);
-  assert.equal(boot.arenaLow, 0x8042e260);
   assert.equal(boot.fstMaxSize, fixture.fstMaxSize);
-  assert.equal(boot.fstAddress, 0x817fe840);
+  assert.equal(boot.fstAddress, 0x817fff80);
+  assert.equal(boot.bi2Address, 0x817fdf80);
+  assert.equal(boot.bi2Address + fixture.bi2Size, boot.fstAddress);
+  assert.deepEqual(
+    boot.bi2,
+    fixture.bytes.slice(fixture.bi2Offset, fixture.bi2Offset + fixture.bi2Size),
+  );
   assert.deepEqual(
     boot.dol,
     fixture.bytes.slice(fixture.bootOffset, fixture.bootOffset + 0x120),
@@ -110,6 +133,49 @@ test("local File loading parses boot metadata without reading the whole ISO", as
   assert.equal(description.bytesRead, 3 * 64 * 1024);
   assert.ok(description.bytesRead < fixture.bytes.length / 10);
   assert.equal(description.cache.maximumBytes, 8 * 1024 * 1024);
+});
+
+test("boot layout reserves maximum FST space above BI2", () => {
+  assert.deepEqual(discBootMemoryLayout(0x60b0), {
+    bi2Address: 0x817f7f40,
+    fstAddress: 0x817f9f40,
+  });
+  assert.equal(0x817f7f40 + 0x2000, 0x817f9f40);
+  assert.equal(0x817f9f40 + Math.ceil(0x60b0 / 32) * 32, 0x81800000);
+});
+
+test("boot layout rejects an undersized FST", async () => {
+  assert.throws(() => discBootMemoryLayout(0), /disc FST is too small/);
+
+  const fixture = makeRawDisc();
+  new DataView(fixture.bytes.buffer).setUint32(0x428, 0, false);
+  await assert.rejects(
+    readDiscBoot(await openDiscSource({
+      kind: "file",
+      file: new File([fixture.bytes], "empty-fst.iso"),
+    })),
+    /disc FST is too small/,
+  );
+});
+
+test("boot parsing requests exactly the apploader BI2 range", async () => {
+  const fixture = makeRawDisc();
+  const reads = [];
+  const source = {
+    size: fixture.bytes.length,
+    async read(offset, length) {
+      reads.push({ offset, length });
+      return fixture.bytes.slice(offset, offset + length);
+    },
+  };
+
+  const boot = await readDiscBoot(source);
+
+  assert.deepEqual(
+    reads.filter(({ offset }) => offset === fixture.bi2Offset),
+    [{ offset: fixture.bi2Offset, length: fixture.bi2Size }],
+  );
+  assert.equal(new DataView(boot.bi2.buffer).getUint32(0x20, false), 1);
 });
 
 test("boot parsing rejects DOL destinations that spill past MEM1", async () => {
