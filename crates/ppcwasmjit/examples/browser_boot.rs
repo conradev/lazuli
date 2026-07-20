@@ -4228,6 +4228,39 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function inspectPadStatus(address) {
+      const pointer = ramPointer(address, 12);
+      if (pointer === null) return null;
+      return {
+        address: hex32(address >>> 0),
+        buttons: view.getUint16(pointer, false),
+        stickX: view.getInt8(pointer + 2),
+        stickY: view.getInt8(pointer + 3),
+        cStickX: view.getInt8(pointer + 4),
+        cStickY: view.getInt8(pointer + 5),
+        triggerL: view.getUint8(pointer + 6),
+        triggerR: view.getUint8(pointer + 7),
+        analogA: view.getUint8(pointer + 8),
+        analogB: view.getUint8(pointer + 9),
+        error: view.getInt8(pointer + 10),
+      };
+    }
+
+    function inspectSuperMonkeyBallPad0() {
+      if (boot.identifier !== "GMBE8P") return null;
+      // GMBE8P's input_main stores five consecutive PADStatus snapshots for
+      // controller zero. Character Select tests the pressed/new snapshot.
+      const controllerInfo = 0x801f3b70;
+      return {
+        controllerInfo: hex32(controllerInfo),
+        held: inspectPadStatus(controllerInfo),
+        previous: inspectPadStatus(controllerInfo + 0x0c),
+        pressed: inspectPadStatus(controllerInfo + 0x18),
+        released: inspectPadStatus(controllerInfo + 0x24),
+        repeat: inspectPadStatus(controllerInfo + 0x30),
+      };
+    }
+
     function guestU32(address) {
       const pointer = ramPointer(address, 4);
       return pointer === null ? null : view.getUint32(pointer, false);
@@ -4236,6 +4269,47 @@ const TEMPLATE: &str = r##"<!doctype html>
     function guestU16(address) {
       const pointer = ramPointer(address, 2);
       return pointer === null ? null : view.getUint16(pointer, false);
+    }
+
+    function guestS32(address) {
+      const pointer = ramPointer(address, 4);
+      return pointer === null ? null : view.getInt32(pointer, false);
+    }
+
+    function guestS16(address) {
+      const pointer = ramPointer(address, 2);
+      return pointer === null ? null : view.getInt16(pointer, false);
+    }
+
+    function inspectSuperMonkeyBallGameState() {
+      if (boot.identifier !== "GMBE8P") return null;
+
+      // Retail GMBE8P's READY-main routine at 0x80012e6c unconditionally
+      // counts modeCtrl.submodeTimer down unless gamePauseStatus & 0x0a is
+      // nonzero. Expose the exact gate and transition request so a snapshot
+      // can distinguish the normal 360-frame first-attempt fly-in from a
+      // genuinely stalled stage start.
+      const modeControl = 0x801eec20;
+      const gamePauseStatusAddress = 0x802f1ee0;
+      const gameSubmodeRequestAddress = 0x802f1b8c;
+      const gameSubmodeAddress = 0x802f1b8e;
+      const pauseStatus = guestU32(gamePauseStatusAddress);
+      const submodeTimer = guestS32(modeControl);
+      const submodeRequest = guestS16(gameSubmodeRequestAddress);
+      const submode = guestS16(gameSubmodeAddress);
+      return {
+        modeControl: hex32(modeControl),
+        gamePauseStatusAddress: hex32(gamePauseStatusAddress),
+        gameSubmodeRequestAddress: hex32(gameSubmodeRequestAddress),
+        gameSubmodeAddress: hex32(gameSubmodeAddress),
+        pauseStatus: hex32(pauseStatus),
+        readyPauseGateActive: pauseStatus === null ? null : (pauseStatus & 0x0a) !== 0,
+        submodeTimer,
+        submodeRequest,
+        submode,
+        readyMain: submode === 0x31,
+        playRequested: submodeRequest === 0x32 || submode >= 0x32,
+      };
     }
 
     function hex32(value) {
@@ -6026,8 +6100,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           lastPublishedChannels: serialLastPublishedChannels,
           lastUpdatedChannels: serialLastUpdatedChannels,
           lastEnabledChannels: serialLastEnabledChannels,
+          guestPad: inspectSuperMonkeyBallPad0(),
           ...controllerState,
         },
+        guestGame: inspectSuperMonkeyBallGameState(),
         serialInterface: {
           transferInterruptAcknowledgements: serialTransferInterruptAcknowledgements,
           noResponseByChannel: [...serialNoResponseByChannel],
@@ -6068,7 +6144,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             "r" + index,
             "0x" + readGpr(index).toString(16).padStart(8, "0"),
           ])),
-          stackWords: inspectRamWords(readGpr(1), 32),
+          // Keep enough of the active frame to include ABI save areas from
+          // larger variadic diagnostics such as OSPanic.
+          stackWords: inspectRamWords(readGpr(1), 64),
         },
         mmioState: {
           commandProcessor: Object.fromEntries(
@@ -6662,8 +6740,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     function resetPresentation() {
       gxTextureCanvasCache.clear();
       gxEfbTextureCopyCache.clear();
+          guestPad: inspectSuperMonkeyBallPad0(),
       gxEfbTextureScaleCache.clear();
       gxClearEfb([0, 0, 0, 0]);
+        guestGame: inspectSuperMonkeyBallGameState(),
       displayContext.fillStyle = "#000";
       displayContext.fillRect(0, 0, display.width, display.height);
       output.textContent = "STARTING";
