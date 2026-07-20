@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-export const RELEASE_SCHEMA = 1;
+export const RELEASE_SCHEMA = 2;
+export const LEGACY_RELEASE_SCHEMA = 1;
 export const WASM_CHUNK_SIZE = 1024 * 1024;
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
@@ -20,11 +21,19 @@ function checkAsset(asset, label) {
 }
 
 export function releaseIdentityPayload(release) {
-  return {
+  const identity = {
     schema: release.schema,
     source: release.source,
     frontend: release.frontend,
     backend: release.backend,
+  };
+  if (release.schema < 2) return identity;
+  return {
+    schema: identity.schema,
+    source: identity.source,
+    frontend: identity.frontend,
+    renderer: release.renderer,
+    backend: identity.backend,
   };
 }
 
@@ -34,9 +43,9 @@ export async function sha256Hex(value) {
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function validateRelease(release) {
+async function validateReleaseSchema(release, schema) {
   check(release !== null && typeof release === "object", "manifest is not an object");
-  check(release.schema === RELEASE_SCHEMA, "unsupported schema");
+  check(release.schema === schema, "unsupported schema");
   check(HASH_PATTERN.test(release.releaseId), "release ID is invalid");
 
   const source = release.source;
@@ -57,6 +66,17 @@ export async function validateRelease(release) {
   );
 
   checkAsset(release.frontend, "frontend");
+  if (schema >= 2) {
+    check(release.renderer !== null && typeof release.renderer === "object", "renderer is missing");
+    checkAsset(release.renderer.javascript, "renderer JavaScript");
+    check(release.renderer.javascript.url.endsWith(".js"), "renderer JavaScript URL is invalid");
+    checkAsset(release.renderer.wasm, "renderer wasm");
+    check(release.renderer.wasm.url.endsWith(".wasm"), "renderer wasm URL is invalid");
+    check(
+      release.renderer.javascript.url !== release.renderer.wasm.url,
+      "renderer assets are not distinct",
+    );
+  }
   check(release.backend !== null && typeof release.backend === "object", "backend is missing");
   check(release.backend.url === "/ppcwasmjit.wasm", "backend URL is invalid");
   check(HASH_PATTERN.test(release.backend.sha256), "backend hash is invalid");
@@ -84,8 +104,24 @@ export async function validateRelease(release) {
   return release;
 }
 
+export function validateRelease(release) {
+  return validateReleaseSchema(release, RELEASE_SCHEMA);
+}
+
+export function validateStoredRelease(release) {
+  check(
+    release?.schema === RELEASE_SCHEMA || release?.schema === LEGACY_RELEASE_SCHEMA,
+    "unsupported stored schema",
+  );
+  return validateReleaseSchema(release, release.schema);
+}
+
 export function releaseAssets(release) {
-  return [release.frontend, ...release.backend.chunks];
+  return [
+    release.frontend,
+    ...(release.schema >= 2 ? [release.renderer.javascript, release.renderer.wasm] : []),
+    ...release.backend.chunks,
+  ];
 }
 
 export async function verifyAssetBytes(asset, bytes) {

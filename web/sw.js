@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import {
+  RELEASE_SCHEMA,
   releaseAssets,
   validateRelease,
+  validateStoredRelease,
   verifyAssetBytes,
 } from "./release.mjs";
 
-export const BOOTSTRAP_CACHE = "gekko-bootstrap-v1";
+export const BOOTSTRAP_CACHE = "gekko-bootstrap-v2";
 export const META_CACHE = "gekko-meta-v1";
 export const RELEASE_CACHE_PREFIX = "gekko-release-";
 export const ACTIVE_RECORD_PATH = "/.gekko/active-release";
 export const STAGE_RELEASE_PATH = "/.gekko/stage-release";
+export const WORKER_STATUS_PATH = "/.gekko/worker-status";
 export const APP_PATH = "/app.html";
 
 const BOOTSTRAP_ASSETS = [
@@ -35,7 +38,7 @@ export async function readActiveRelease(cacheStorage, origin) {
   if (response === undefined) return null;
   try {
     const record = await response.json();
-    await validateRelease(record.release);
+    await validateStoredRelease(record.release);
     const expectedPrefix = `${RELEASE_CACHE_PREFIX}${record.release.releaseId}-`;
     if (typeof record.cacheName !== "string" || !record.cacheName.startsWith(expectedPrefix)) {
       return null;
@@ -154,6 +157,9 @@ export async function backendResponse(
   origin = self.location.origin,
   fetcher = fetch,
 ) {
+  if (record?.release?.schema !== RELEASE_SCHEMA) {
+    throw new Error(`release schema ${RELEASE_SCHEMA} is required to serve the browser compiler`);
+  }
   const cache = await cacheStorage.open(record.cacheName);
   const responses = [];
   for (const chunk of record.release.backend.chunks) {
@@ -198,6 +204,9 @@ export async function frontendResponse(
   origin = self.location.origin,
   fetcher = fetch,
 ) {
+  if (record?.release?.schema !== RELEASE_SCHEMA) {
+    throw new Error(`release schema ${RELEASE_SCHEMA} is required to serve the frontend`);
+  }
   const asset = record.release.frontend;
   const cache = await cacheStorage.open(record.cacheName);
   const url = absoluteUrl(asset.url, origin);
@@ -219,7 +228,9 @@ export async function frontendResponse(
 
 async function networkFirstBootstrap(request) {
   const cache = await caches.open(BOOTSTRAP_CACHE);
-  const canonical = absoluteUrl("/index.html", self.location.origin);
+  const requested = new URL(request.url);
+  const path = requested.pathname === "/" ? "/index.html" : requested.pathname;
+  const canonical = absoluteUrl(path, self.location.origin);
   try {
     const response = await fetch(new Request(request, { cache: "no-store" }));
     if (!response.ok) throw new Error(`bootstrap fetch failed: HTTP ${response.status}`);
@@ -252,20 +263,34 @@ async function networkFirstRelease(request) {
   }
 }
 
-async function cachedReleaseAsset(request) {
+export async function cachedReleaseAsset(
+  request,
+  cacheStorage = caches,
+  origin = self.location.origin,
+  fetcher = fetch,
+) {
   const requested = new URL(request.url);
-  const canonical = absoluteUrl(requested.pathname, self.location.origin);
-  const active = await readActiveRelease(caches, self.location.origin);
-  if (active !== null) {
-    const response = await (await caches.open(active.cacheName)).match(canonical);
-    if (response !== undefined) return response;
+  const canonical = absoluteUrl(requested.pathname, origin);
+  const active = await readActiveRelease(cacheStorage, origin);
+  const unavailable = () => new Response("No compatible release asset is active.", {
+    status: 503,
+    headers: { "Cache-Control": "no-store" },
+  });
+  if (active?.release?.schema !== RELEASE_SCHEMA) return unavailable();
+  const asset = releaseAssets(active.release)
+    .find(candidate => absoluteUrl(candidate.url, origin) === canonical);
+  if (asset === undefined) return unavailable();
+
+  const cache = await cacheStorage.open(active.cacheName);
+  let response = await cache.match(canonical);
+  if (response !== undefined) return response;
+  try {
+    await fetchAndCacheAsset(asset, cache, null, fetcher, origin);
+    response = await cache.match(canonical);
+  } catch {
+    return unavailable();
   }
-  for (const cacheName of await caches.keys()) {
-    if (!cacheName.startsWith(RELEASE_CACHE_PREFIX) || cacheName === active?.cacheName) continue;
-    const response = await (await caches.open(cacheName)).match(canonical);
-    if (response !== undefined) return response;
-  }
-  return fetch(request);
+  return response ?? unavailable();
 }
 
 async function stageReleaseRequest(request) {
@@ -292,14 +317,30 @@ async function stageReleaseRequest(request) {
   }
 }
 
-async function handleFetch(request) {
+export function workerStatusResponse() {
+  return new Response(JSON.stringify({ releaseSchema: RELEASE_SCHEMA }), {
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+    },
+  });
+}
+
+export async function handleFetch(request) {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return fetch(request);
+  if (url.pathname === WORKER_STATUS_PATH && request.method === "GET") {
+    return workerStatusResponse();
+  }
   if (url.pathname === STAGE_RELEASE_PATH && request.method === "POST") {
     return stageReleaseRequest(request);
   }
   if (request.method !== "GET") return fetch(request);
-  if (url.pathname === "/" || url.pathname === "/index.html") {
+  if (
+    url.pathname === "/"
+    || url.pathname === "/index.html"
+    || BOOTSTRAP_ASSETS.includes(url.pathname)
+  ) {
     return networkFirstBootstrap(request);
   }
   if (url.pathname === "/release.json") return networkFirstRelease(request);
