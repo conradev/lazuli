@@ -254,7 +254,7 @@ mod tests {
     use cranelift_codegen::ir::{self, InstBuilder, InstructionData, Opcode};
     use cranelift_codegen::isa::CallConv;
     use gekko::disasm::{Extensions, Ins};
-    use gekko::{Address, CondReg, Cpu, FloatControlReg, GPR, QuantReg, Reg, SPR};
+    use gekko::{Address, CondReg, Cpu, FPR, FloatControlReg, FloatPair, GPR, QuantReg, Reg, SPR};
     use ppcjit::block::{BlockFn, Executed as NativeExecuted, ExitReason as NativeExitReason};
     use ppcjit::hooks::{Context as NativeContext, ExitData, Hooks};
     use ppcjit::{CodegenSettings, ExitMode, FastmemLut, TranslationConfig, Translator};
@@ -343,6 +343,21 @@ mod tests {
 
     fn mcrfs(crfd: u8, crfs: u8) -> Ins {
         let code = 63 << 26 | u32::from(crfd) << 23 | u32::from(crfs) << 18 | 64 << 1;
+        Ins::new(code, Extensions::gekko_broadway())
+    }
+
+    fn creqv(crbd: u8, crba: u8, crbb: u8) -> Ins {
+        let code = 19 << 26
+            | u32::from(crbd) << 21
+            | u32::from(crba) << 16
+            | u32::from(crbb) << 11
+            | 289 << 1;
+        Ins::new(code, Extensions::gekko_broadway())
+    }
+
+    fn fnabs(frt: u8, frb: u8, record: bool) -> Ins {
+        let code =
+            63 << 26 | u32::from(frt) << 21 | u32::from(frb) << 11 | 136 << 1 | u32::from(record);
         Ins::new(code, Extensions::gekko_broadway())
     }
 
@@ -864,6 +879,181 @@ if (fpscr !== (Number(expectedFpscr) >>> 0)) throw new Error(`bad FPSCR: 0x${fps
                 &native.cpu.pc.value().to_string(),
                 &expected_cr.to_string(),
                 &expected_fpscr.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "node failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn condition_register_equivalence_runs_in_native_and_webassembly_jits() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+            return;
+        }
+
+        // The second instruction is the SDK's `crset` alias (creqv bit, bit, bit), which used to
+        // leave an i8 bxor-immediate outside the portable lowerer's supported CLIF subset.
+        let sequence = [creqv(6, 2, 3), creqv(7, 7, 7)];
+        let initial_cr = (1 << (31 - 2)) | (1 << (31 - 6));
+        let expected_cr = (1 << (31 - 2)) | (1 << (31 - 7));
+        let block = Jit::new().build(sequence).unwrap();
+        Validator::new().validate_all(block.wasm()).unwrap();
+
+        let native = execute_with_native_jit_initialized(&sequence, 0x8000_1000, 0, |state| {
+            state.cpu.user.cr = CondReg::from_bits(initial_cr);
+        });
+        assert_eq!(native.cpu.user.cr.to_bits(), expected_cr);
+
+        let wasm = block
+            .wasm()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let script = r#"
+const [wasmHex, pcOffset, crOffset, initialCr, expectedExecuted, expectedPc, expectedCr] = process.argv.slice(1);
+const memory = new WebAssembly.Memory({ initial: 1 });
+const view = new DataView(memory.buffer);
+const cpu = 64;
+view.setUint32(cpu + Number(pcOffset), 0x80001000, true);
+view.setUint32(cpu + Number(crOffset), Number(initialCr), true);
+const { instance } = await WebAssembly.instantiate(Buffer.from(wasmHex, "hex"), { lazuli: { memory } });
+const executed = instance.exports.run(0, cpu, 0) >>> 0;
+if (executed !== (Number(expectedExecuted) >>> 0)) throw new Error(`bad execution metadata: 0x${executed.toString(16)}`);
+const pc = view.getUint32(cpu + Number(pcOffset), true);
+if (pc !== (Number(expectedPc) >>> 0)) throw new Error(`bad pc: 0x${pc.toString(16)}`);
+const cr = view.getUint32(cpu + Number(crOffset), true);
+if (cr !== (Number(expectedCr) >>> 0)) throw new Error(`bad CR: 0x${cr.toString(16)}`);
+"#;
+        let output = Command::new("node")
+            .args([
+                "--input-type=module",
+                "--eval",
+                script,
+                &wasm,
+                &Reg::PC.offset().to_string(),
+                &Reg::CR.offset().to_string(),
+                &initial_cr.to_string(),
+                &block.metadata().executed.pack().to_string(),
+                &native.cpu.pc.value().to_string(),
+                &expected_cr.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "node failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn fnabs_sets_sign_without_changing_fpscr_in_native_and_webassembly_jits() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+            return;
+        }
+
+        let sequence = [fnabs(2, 1, false), fnabs(4, 3, true)];
+        let initial_cr = u32::MAX;
+        let block = Jit::new().build(sequence).unwrap();
+        Validator::new().validate_all(block.wasm()).unwrap();
+        let native = execute_with_native_jit_initialized(&sequence, 0x8000_1000, 0, |state| {
+            state.cpu.supervisor.config.msr = state
+                .cpu
+                .supervisor
+                .config
+                .msr
+                .clone()
+                .with_float_available(true);
+            state.cpu.user.cr = CondReg::from_bits(initial_cr);
+            state.cpu.user.fpscr = FloatControlReg::from_bits(0);
+            state.cpu.user.fpr[1] = FloatPair([3.5, -99.0]);
+            state.cpu.user.fpr[3] = FloatPair([-2.25, 4.0]);
+        });
+        assert_eq!(native.cpu.user.fpr[2], FloatPair([-3.5, -3.5]));
+        assert_eq!(native.cpu.user.fpr[4], FloatPair([-2.25, -2.25]));
+        assert_eq!(native.cpu.user.fpscr.to_bits(), 0);
+        assert_eq!(native.cpu.user.cr.to_bits(), 0xf0ff_ffff);
+
+        let wasm = block
+            .wasm()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let expected_f2 = [
+            native.cpu.user.fpr[2][0].to_bits(),
+            native.cpu.user.fpr[2][1].to_bits(),
+        ];
+        let expected_f4 = [
+            native.cpu.user.fpr[4][0].to_bits(),
+            native.cpu.user.fpr[4][1].to_bits(),
+        ];
+        let script = r#"
+const [wasmHex, pcOffset, msrOffset, crOffset, fpscrOffset, f1Offset, f2Offset, f3Offset, f4Offset, initialMsr, initialCr, expectedExecuted, expectedPc, expectedCr, expectedFpscr, expectedF2a, expectedF2b, expectedF4a, expectedF4b] = process.argv.slice(1);
+const memory = new WebAssembly.Memory({ initial: 1 });
+const view = new DataView(memory.buffer);
+const cpu = 64;
+view.setUint32(cpu + Number(pcOffset), 0x80001000, true);
+view.setUint32(cpu + Number(msrOffset), Number(initialMsr), true);
+view.setUint32(cpu + Number(crOffset), Number(initialCr), true);
+view.setUint32(cpu + Number(fpscrOffset), 0, true);
+view.setFloat64(cpu + Number(f1Offset), 3.5, true);
+view.setFloat64(cpu + Number(f1Offset) + 8, -99.0, true);
+view.setFloat64(cpu + Number(f3Offset), -2.25, true);
+view.setFloat64(cpu + Number(f3Offset) + 8, 4.0, true);
+const { instance } = await WebAssembly.instantiate(Buffer.from(wasmHex, "hex"), {
+  lazuli: { memory },
+  lazuli_hooks: { user_1_0() { throw new Error("unexpected floating-point exception"); } },
+});
+const executed = instance.exports.run(0, cpu, 0) >>> 0;
+if (executed !== (Number(expectedExecuted) >>> 0)) throw new Error(`bad execution metadata: 0x${executed.toString(16)}`);
+const pc = view.getUint32(cpu + Number(pcOffset), true);
+if (pc !== (Number(expectedPc) >>> 0)) throw new Error(`bad pc: 0x${pc.toString(16)}`);
+const cr = view.getUint32(cpu + Number(crOffset), true);
+if (cr !== (Number(expectedCr) >>> 0)) throw new Error(`bad CR: 0x${cr.toString(16)}`);
+const fpscr = view.getUint32(cpu + Number(fpscrOffset), true);
+if (fpscr !== (Number(expectedFpscr) >>> 0)) throw new Error(`bad FPSCR: 0x${fpscr.toString(16)}`);
+for (const [offset, expected] of [
+  [Number(f2Offset), BigInt(expectedF2a)],
+  [Number(f2Offset) + 8, BigInt(expectedF2b)],
+  [Number(f4Offset), BigInt(expectedF4a)],
+  [Number(f4Offset) + 8, BigInt(expectedF4b)],
+]) {
+  const actual = view.getBigUint64(cpu + offset, true);
+  if (actual !== expected) throw new Error(`bad FPR bits at ${offset}: 0x${actual.toString(16)}`);
+}
+"#;
+        let output = Command::new("node")
+            .args([
+                "--input-type=module",
+                "--eval",
+                script,
+                &wasm,
+                &Reg::PC.offset().to_string(),
+                &Reg::MSR.offset().to_string(),
+                &Reg::CR.offset().to_string(),
+                &Reg::FPSCR.offset().to_string(),
+                &FPR::R1.offset().to_string(),
+                &FPR::R2.offset().to_string(),
+                &FPR::R3.offset().to_string(),
+                &FPR::R4.offset().to_string(),
+                &native.cpu.supervisor.config.msr.to_bits().to_string(),
+                &initial_cr.to_string(),
+                &block.metadata().executed.pack().to_string(),
+                &native.cpu.pc.value().to_string(),
+                &native.cpu.user.cr.to_bits().to_string(),
+                &native.cpu.user.fpscr.to_bits().to_string(),
+                &expected_f2[0].to_string(),
+                &expected_f2[1].to_string(),
+                &expected_f4[0].to_string(),
+                &expected_f4[1].to_string(),
             ])
             .output()
             .unwrap();
