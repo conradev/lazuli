@@ -252,6 +252,453 @@ pub struct WebGpuRenderer {
     tev_draw_bindings: Vec<CachedTevDrawBinding>,
 }
 
+#[wasm_bindgen]
+impl WebGpuRenderer {
+    pub async fn create(canvas: HtmlCanvasElement) -> Result<WebGpuRenderer, JsValue> {
+        Self::create_inner(canvas)
+            .await
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    pub fn reset(&mut self) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        self.clear_segment();
+        self.texture_cache.clear();
+        self.efb_copy_cache.clear();
+        self.xfb_cache.clear();
+        self.clear_efb(0, 0, 0)
+    }
+
+    pub fn clear_efb(&self, red: u8, green: u8, blue: u8) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("browser EFB clear encoder"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("browser EFB clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.efb_color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(red) / 255.0,
+                            g: f64::from(green) / 255.0,
+                            b: f64::from(blue) / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.efb_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
+        self.ensure_healthy()
+    }
+
+    pub fn begin_segment(&mut self) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        self.clear_segment();
+        Ok(())
+    }
+
+    pub fn check_health(&self) -> Result<(), JsValue> {
+        self.ensure_healthy()
+    }
+
+    pub fn has_decoded_texture(&self, key: &str, width: u32, height: u32) -> bool {
+        decoded_texture_cache_hit(
+            width,
+            height,
+            self.texture_cache
+                .get(key)
+                .map(|texture| (texture.width, texture.height)),
+        )
+    }
+
+    pub fn drain(&self) -> Promise {
+        let queue = self.queue.clone();
+        let failure_state = self.failure_state.clone();
+        future_to_promise(async move {
+            ensure_renderer_healthy(&failure_state)?;
+            QueueDrain::new(&queue).await;
+            ensure_renderer_healthy(&failure_state)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+}
+
+impl WebGpuRenderer {
+    async fn create_inner(canvas: HtmlCanvasElement) -> Result<Self, String> {
+        let descriptor = wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        };
+        let instance = wgpu::Instance::new(descriptor);
+        let surface = instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            .map_err(|error| format!("failed to create WebGPU canvas surface: {error}"))?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: Some(&surface),
+            })
+            .await
+            .map_err(|error| format!("WebGPU is required: {error}"))?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Lazuli browser WebGPU device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::defaults().using_resolution(adapter.limits()),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .map_err(|error| format!("failed to create WebGPU device: {error}"))?;
+        let failure_state = RendererFailureState::default();
+        let uncaptured_failure_state = failure_state.clone();
+        device.on_uncaptured_error(Arc::new(move |error| {
+            uncaptured_failure_state.record(format!("uncaptured WebGPU error: {error}"));
+        }));
+        let lost_failure_state = failure_state.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            let message = message.trim();
+            let detail = if message.is_empty() {
+                format!("WebGPU device lost ({reason:?})")
+            } else {
+                format!("WebGPU device lost ({reason:?}): {message}")
+            };
+            lost_failure_state.record(detail);
+        });
+        let capabilities = surface.get_capabilities(&adapter);
+        let surface_format = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .or_else(|| capabilities.formats.first().copied())
+            .ok_or_else(|| "WebGPU canvas surface exposes no texture formats".to_owned())?;
+        let present_mode = capabilities
+            .present_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode == wgpu::PresentMode::Fifo)
+            .ok_or_else(|| "WebGPU canvas surface does not support FIFO presentation".to_owned())?;
+        let alpha_mode = capabilities
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode == wgpu::CompositeAlphaMode::Opaque)
+            .or_else(|| capabilities.alpha_modes.first().copied())
+            .ok_or_else(|| "WebGPU canvas surface exposes no alpha modes".to_owned())?;
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: canvas.width().max(1),
+            height: canvas.height().max(1),
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode,
+            view_formats: vec![],
+        };
+        surface.configure(&device, &surface_config);
+
+        let efb_color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("browser EFB color"),
+            size: wgpu::Extent3d {
+                width: EFB_WIDTH,
+                height: EFB_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let efb_color_view = efb_color.create_view(&wgpu::TextureViewDescriptor::default());
+        let efb_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("browser EFB depth"),
+            size: wgpu::Extent3d {
+                width: EFB_WIDTH,
+                height: EFB_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let efb_depth_view = efb_depth.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let tev_draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("browser GX per-fragment TEV draw layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mut tev_texture_layout_entries = Vec::with_capacity(1 + MAX_TEV_TEXTURES * 2);
+        tev_texture_layout_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+        for map in 0..MAX_TEV_TEXTURES {
+            tev_texture_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: map as u32 + 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            });
+        }
+        for map in 0..MAX_TEV_TEXTURES {
+            tev_texture_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: map as u32 + 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+        }
+        let tev_texture_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("browser GX per-fragment TEV layout"),
+                entries: &tev_texture_layout_entries,
+            });
+        let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("browser XFB presentation layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let samplers = create_samplers(&device);
+        let pipelines = create_pipelines(
+            &device,
+            &tev_draw_layout,
+            &tev_texture_layout,
+            &present_layout,
+            surface_format,
+        );
+
+        let white_texture = upload_texture(
+            &device,
+            &queue,
+            "browser solid white texture",
+            1,
+            1,
+            &[255, 255, 255, 255],
+            0,
+        )?;
+        let renderer = Self {
+            canvas,
+            surface,
+            device,
+            queue,
+            failure_state,
+            surface_config,
+            efb_color,
+            efb_color_view,
+            _efb_depth: efb_depth,
+            efb_depth_view,
+            tev_draw_layout,
+            tev_texture_layout,
+            present_layout,
+            samplers,
+            white_texture,
+            texture_cache: HashMap::new(),
+            efb_copy_cache: HashMap::new(),
+            xfb_cache: HashMap::new(),
+            pipelines,
+            tev_vertices: Vec::new(),
+            commands: Vec::new(),
+            tev_draw_binding_indices: HashMap::new(),
+            tev_draw_bindings: Vec::new(),
+        };
+        renderer
+            .clear_efb(0, 0, 0)
+            .map_err(|error| error.as_string().unwrap_or_else(|| format!("{error:?}")))?;
+        Ok(renderer)
+    }
+
+    fn upload_texture(
+        &self,
+        label: &str,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        generation: u32,
+    ) -> Result<CachedTexture, JsValue> {
+        upload_texture(
+            &self.device,
+            &self.queue,
+            label,
+            width,
+            height,
+            pixels,
+            generation,
+        )
+        .map_err(|error| JsValue::from_str(&error))
+    }
+
+    fn ensure_healthy(&self) -> Result<(), JsValue> {
+        ensure_renderer_healthy(&self.failure_state)
+    }
+
+    fn flush_geometry(&mut self) -> wgpu::CommandEncoder {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("browser GX geometry encoder"),
+            });
+        if self.commands.is_empty() {
+            self.clear_segment();
+            return encoder;
+        }
+        let tev_vertex_buffer = (!self.tev_vertices.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("browser GX per-fragment TEV vertices"),
+                    contents: bytemuck::cast_slice(&self.tev_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        let tev_pipeline_keys = self
+            .commands
+            .iter()
+            .map(|command| command.state.pipeline)
+            .collect::<HashSet<_>>();
+        for key in tev_pipeline_keys {
+            self.pipelines.prepare_tev_geometry(&self.device, key);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("browser GX geometry pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.efb_color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.efb_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            for command in &self.commands {
+                let vertex_buffer = tev_vertex_buffer
+                    .as_ref()
+                    .expect("TEV draw has a TEV vertex buffer");
+                let binding = &self.tev_draw_bindings[command.state.binding];
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_pipeline(&self.pipelines.tev_geometry[&command.state.pipeline]);
+                pass.set_bind_group(0, &binding.alpha_bind_group, &[]);
+                pass.set_bind_group(1, &binding.tev_bind_group, &[]);
+                pass.set_scissor_rect(
+                    command.state.scissor.x,
+                    command.state.scissor.y,
+                    command.state.scissor.width,
+                    command.state.scissor.height,
+                );
+                pass.draw(command.vertices.clone(), 0..1);
+            }
+        }
+        self.tev_vertices.clear();
+        self.commands.clear();
+        self.tev_draw_binding_indices.clear();
+        self.tev_draw_bindings.clear();
+        encoder
+    }
+
+    fn clear_segment(&mut self) {
+        self.tev_vertices.clear();
+        self.commands.clear();
+        self.tev_draw_binding_indices.clear();
+        self.tev_draw_bindings.clear();
+    }
+
+    fn resize_surface(&mut self, width: u32, height: u32) {
+        if self.surface_config.width == width && self.surface_config.height == height {
+            return;
+        }
+        self.canvas.set_width(width);
+        self.canvas.set_height(height);
+        self.surface_config.width = width;
+        self.surface_config.height = height;
+        self.surface.configure(&self.device, &self.surface_config);
+    }
+}
+
 impl PipelineKey {
     fn from_gx(primitive: Primitive, z_mode: u32, blend_mode: u32, cull_mode: u8) -> Self {
         let depth_enabled = z_mode & 1 != 0;
