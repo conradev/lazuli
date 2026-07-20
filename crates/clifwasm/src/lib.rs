@@ -868,8 +868,16 @@ fn lower_instruction(
                     | Opcode::UshrImm
             ) =>
         {
-            require_i32_value(function, arg)?;
-            require_single_i32_result(function, inst)?;
+            let ty = function.dfg.value_type(arg);
+            if single_result_type(function, inst)? != ty {
+                return Err(LowerError::InvalidInstruction(opcode));
+            }
+            let narrow_bitwise =
+                matches!(opcode, Opcode::BandImm | Opcode::BorImm | Opcode::BxorImm)
+                    && matches!(ty, ir::types::I8 | ir::types::I16);
+            if ty != ir::types::I32 && !narrow_bitwise {
+                return Err(LowerError::UnsupportedType(ty));
+            }
             get_value(function, locals, arg, wasm)?;
             wasm.instruction(&Instruction::I32Const(imm.bits() as i32));
             wasm.instruction(&match opcode {
@@ -883,6 +891,15 @@ fn lower_instruction(
                 Opcode::UshrImm => Instruction::I32ShrU,
                 _ => unreachable!(),
             });
+            // Narrow CLIF integers occupy Wasm i32 locals. Restore their width after an immediate
+            // bitwise operation so later comparisons cannot observe high bits from the immediate.
+            if ty == ir::types::I8 {
+                wasm.instruction(&Instruction::I32Const(0xff));
+                wasm.instruction(&Instruction::I32And);
+            } else if ty == ir::types::I16 {
+                wasm.instruction(&Instruction::I32Const(0xffff));
+                wasm.instruction(&Instruction::I32And);
+            }
             set_result(function, locals, inst, wasm)?;
             Control::None
         }
@@ -2235,5 +2252,36 @@ mod tests {
                 maximum: Some(1),
             })
         ));
+    }
+
+    #[test]
+    fn lowers_narrow_bitwise_immediates_through_i32_storage() {
+        let mut clif = ir::Function::new();
+        clif.signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I32));
+        clif.signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I32));
+
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut clif, &mut context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let input = builder.block_params(entry)[0];
+        let narrow = builder.ins().ireduce(ir::types::I8, input);
+        let inverted = builder.ins().bxor_imm(narrow, 0xff);
+        let result = builder.ins().uextend(ir::types::I32, inverted);
+        builder.ins().return_(&[result]);
+        builder.finalize();
+
+        let wasm = function(
+            &clif,
+            &ModuleConfig::new("portable.compiler", "heap", "execute"),
+        )
+        .unwrap();
+        Validator::new().validate_all(&wasm).unwrap();
     }
 }
