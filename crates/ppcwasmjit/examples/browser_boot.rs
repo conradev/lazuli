@@ -664,41 +664,44 @@ const TEMPLATE: &str = r##"<!doctype html>
     let serialInterruptLevelActive = false;
     let serialInterruptLevelChanges = 0;
     let serialInterruptLevelReason = null;
+    function enqueueControllerState(message) {
+      if (message.sequence <= controllerSequence) return;
+      controllerSequence = message.sequence;
+      const queued = {
+        sequence: message.sequence,
+        state: message.state,
+      };
+      const previous = controllerQueue.at(-1);
+      if (previous !== undefined && previous.state.buttons === queued.state.buttons) {
+        controllerQueue[controllerQueue.length - 1] = queued;
+        controllerQueueCoalesces += 1;
+      } else if (
+        controllerQueue.length === 0
+        && controllerState.buttons === queued.state.buttons
+      ) {
+        controllerState = queued.state;
+        controllerAppliedSequence = queued.sequence;
+        controllerQueueCoalesces += 1;
+      } else if (controllerQueue.length < controllerQueueCapacity) {
+        controllerQueue.push(queued);
+        controllerQueueHighWater = Math.max(
+          controllerQueueHighWater,
+          controllerQueue.length
+        );
+      } else {
+        // Button-edge ordering is a correctness boundary. Surface bounded
+        // queue exhaustion instead of silently merging or dropping input.
+        controllerQueueOverflows += 1;
+        runnerStopRequested = true;
+        runnerPaused = false;
+        runnerSnapshotRequested = true;
+        statusDataset.controllerQueue = "overflow";
+      }
+    }
     addEventListener("message", event => {
       const message = event.data;
       if (message?.type === "controller") {
-        if (message.sequence <= controllerSequence) return;
-        controllerSequence = message.sequence;
-        const queued = {
-          sequence: message.sequence,
-          state: message.state,
-        };
-        const previous = controllerQueue.at(-1);
-        if (previous !== undefined && previous.state.buttons === queued.state.buttons) {
-          controllerQueue[controllerQueue.length - 1] = queued;
-          controllerQueueCoalesces += 1;
-        } else if (
-          controllerQueue.length === 0
-          && controllerState.buttons === queued.state.buttons
-        ) {
-          controllerState = queued.state;
-          controllerAppliedSequence = queued.sequence;
-          controllerQueueCoalesces += 1;
-        } else if (controllerQueue.length < controllerQueueCapacity) {
-          controllerQueue.push(queued);
-          controllerQueueHighWater = Math.max(
-            controllerQueueHighWater,
-            controllerQueue.length
-          );
-        } else {
-          // Button-edge ordering is a correctness boundary. Surface bounded
-          // queue exhaustion instead of silently merging or dropping input.
-          controllerQueueOverflows += 1;
-          runnerStopRequested = true;
-          runnerPaused = false;
-          runnerSnapshotRequested = true;
-          statusDataset.controllerQueue = "overflow";
-        }
+        enqueueControllerState(message);
       } else if (message?.type === "run-control") {
         if (message.action === "pause") {
           runnerPaused = true;
@@ -811,6 +814,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         controllerState.stickY,
         ...low,
       ];
+    }
+
+    function postControllerPollAcknowledgement(packet) {
+      const buttons = ((packet[0] << 8) | packet[1]) & ~padUseOrigin;
+      if (buttons !== 0) {
+        globalThis.postMessage?.({
+          type: "controller-poll",
+          buttons,
+          sequence: controllerAppliedSequence,
+        });
+      }
+      return buttons;
     }
     __DISC_SOURCE_RUNTIME__
 
@@ -4487,7 +4502,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           bytes.set([0x09, 0x00, 0x00], mmio + 0x6480);
           return serialTransferOutcome.success;
         case 0x40: {
-          bytes.set(controllerPacketForPoll(channel), mmio + 0x6480);
+          const packet = controllerPacketForPoll(channel);
+          bytes.set(packet, mmio + 0x6480);
+          postControllerPollAcknowledgement(packet);
           return serialTransferOutcome.success;
         }
         case 0x41:
@@ -4567,7 +4584,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           "serialPollPublished",
           (deviceEvents.get("serialPollPublished") ?? 0) + 1
         );
-        const buttons = ((packet[0] << 8) | packet[1]) & ~padUseOrigin;
+        const buttons = postControllerPollAcknowledgement(packet);
         const signature = packet.join(",");
         if (signature !== serialLastPollSignature) {
           serialLastPollSignature = signature;
@@ -6469,13 +6486,78 @@ const TEMPLATE: &str = r##"<!doctype html>
     let controllerPulseButtons = 0;
     const controllerPointers = new Map();
     const controllerPulseTimers = new Map();
-    function pulseControllerButton(button, duration = 250) {
-      controllerPulseButtons |= button;
+    const controllerPulseStates = new Map();
+    const controllerMinimumPointerPressMs = 250;
+    // A human tap spans several 60 Hz game updates. Express that minimum in
+    // guest SI publications so slow renderer backpressure cannot collapse it
+    // into the single frame where an animated menu first notices the press.
+    const controllerMinimumPulsePolls = 3;
+    // A stalled guest must not turn a semantic click into long-lived input.
+    const controllerPulseMaximumHoldMs = 2_000;
+    function finishControllerPulse(button, pulse) {
+      if (controllerPulseStates.get(button) !== pulse) return;
+      clearTimeout(controllerPulseTimers.get(button));
+      controllerPulseTimers.delete(button);
+      controllerPulseStates.delete(button);
+      controllerPulseButtons &= ~button;
+      publishControllerState();
+    }
+    function scheduleControllerPulseTimer(button, pulse, duration) {
       clearTimeout(controllerPulseTimers.get(button));
       controllerPulseTimers.set(button, setTimeout(() => {
-        controllerPulseButtons &= ~button;
-        controllerPulseTimers.delete(button);
-      }, duration));
+        if (controllerPulseStates.get(button) !== pulse) return;
+        if (!pulse.minimumElapsed) {
+          pulse.minimumElapsed = true;
+          if (pulse.pollsRemaining > 0 && pulse.watchdogDelay > 0) {
+            scheduleControllerPulseTimer(button, pulse, pulse.watchdogDelay);
+            return;
+          }
+        }
+        finishControllerPulse(button, pulse);
+      }, Math.max(0, duration)));
+    }
+    function pulseControllerButton(
+      button,
+      duration = 250,
+      minimumPolls = controllerMinimumPulsePolls
+    ) {
+      const previous = controllerPulseStates.get(button);
+      if (previous !== undefined) finishControllerPulse(button, previous);
+      controllerPulseButtons |= button;
+      publishControllerState();
+      const minimumDuration = Math.min(
+        controllerPulseMaximumHoldMs,
+        Math.max(0, Number(duration) || 0)
+      );
+      const pulse = {
+        minimumElapsed: false,
+        pollsRemaining: Math.max(0, minimumPolls),
+        sequence: controllerSequence,
+        watchdogDelay: controllerPulseMaximumHoldMs - minimumDuration,
+      };
+      controllerPulseStates.set(button, pulse);
+      scheduleControllerPulseTimer(button, pulse, minimumDuration);
+    }
+    function acknowledgeControllerPoll(buttons, sequence) {
+      if (!Number.isSafeInteger(sequence)) return;
+      for (const active of controllerPointers.values()) {
+        if ((buttons & active.button) !== 0 && sequence >= active.sequence) {
+          active.polls += 1;
+        }
+      }
+      for (const [button, pulse] of controllerPulseStates) {
+        if (
+          pulse.pollsRemaining <= 0
+          || (buttons & button) === 0
+          || sequence < pulse.sequence
+        ) {
+          continue;
+        }
+        pulse.pollsRemaining -= 1;
+        if (pulse.pollsRemaining === 0 && pulse.minimumElapsed) {
+          finishControllerPulse(button, pulse);
+        }
+      }
     }
     globalThis.lazuliController = {
       pulseUp(duration) { pulseControllerButton(0x0008, duration); },
@@ -6486,28 +6568,58 @@ const TEMPLATE: &str = r##"<!doctype html>
       pulseB(duration) { pulseControllerButton(0x0200, duration); },
       pulseStart(duration) { pulseControllerButton(0x1000, duration); },
     };
-    function releaseControllerPointer(event) {
+    function releaseControllerPointer(event, preserveShortPress = false) {
       const active = controllerPointers.get(event.pointerId);
       if (active === undefined) return;
+      if (preserveShortPress) {
+        const elapsed = Number(event.timeStamp) - active.startedAt;
+        const remaining = controllerMinimumPointerPressMs - (
+          Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : 0
+        );
+        const remainingPolls = Math.max(
+          0,
+          controllerMinimumPulsePolls - active.polls
+        );
+        if (remaining > 0 || remainingPolls > 0) {
+          pulseControllerButton(active.button, remaining, remainingPolls);
+        }
+      }
       controllerPointers.delete(event.pointerId);
       if (active.element.hasPointerCapture?.(event.pointerId)) {
         active.element.releasePointerCapture(event.pointerId);
       }
+      publishControllerState();
+    }
+    function completeControllerPointer(event) {
+      releaseControllerPointer(event, true);
     }
     function bindControllerButton(selector, button, pulse) {
       const element = document.querySelector(selector);
       element.style.touchAction = "none";
       element.addEventListener("pointerdown", event => {
         if (event.button !== 0) return;
-        controllerPointers.set(event.pointerId, { button, element });
+        const existingPulse = controllerPulseStates.get(button);
+        if (existingPulse !== undefined) {
+          finishControllerPulse(button, existingPulse);
+        }
+        const active = {
+          button,
+          element,
+          polls: 0,
+          sequence: controllerSequence,
+          startedAt: Number(event.timeStamp),
+        };
+        controllerPointers.set(event.pointerId, active);
         try {
           element.setPointerCapture(event.pointerId);
         } catch (_error) {
           // Window-level release listeners below cover unsupported capture.
         }
+        publishControllerState();
+        active.sequence = controllerSequence;
         if (event.pointerType !== "mouse") event.preventDefault();
       });
-      element.addEventListener("pointerup", releaseControllerPointer);
+      element.addEventListener("pointerup", completeControllerPointer);
       element.addEventListener("pointercancel", releaseControllerPointer);
       element.addEventListener("lostpointercapture", releaseControllerPointer);
       element.addEventListener("click", event => {
@@ -6548,12 +6660,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       const button = keyboardButtonMap.get(event.code);
       if (button === undefined || hasNativeKeyboardAction(event.target)) return;
       keyboardButtons |= button;
+      publishControllerState();
       event.preventDefault();
     });
     addEventListener("keyup", event => {
       const button = keyboardButtonMap.get(event.code);
       if (button === undefined) return;
       keyboardButtons &= ~button;
+      publishControllerState();
       if (!hasNativeKeyboardAction(event.target)) event.preventDefault();
     });
     function clearControllerInput() {
@@ -6561,6 +6675,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       controllerPulseButtons = 0;
       for (const timer of controllerPulseTimers.values()) clearTimeout(timer);
       controllerPulseTimers.clear();
+      controllerPulseStates.clear();
       const activePointers = [...controllerPointers.entries()];
       controllerPointers.clear();
       for (const [pointerId, active] of activePointers) {
@@ -6568,6 +6683,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           active.element.releasePointerCapture(pointerId);
         }
       }
+      publishControllerState();
     }
     addEventListener("blur", clearControllerInput);
     document.addEventListener("visibilitychange", () => {
@@ -6580,11 +6696,18 @@ const TEMPLATE: &str = r##"<!doctype html>
     function buttonPressed(gamepad, index) {
       return gamepad?.buttons[index]?.pressed === true;
     }
-    function sampleController() {
+    function digitalAxisByte(buttons, negativeButton, positiveButton) {
+      const negative = (buttons & negativeButton) !== 0;
+      const positive = (buttons & positiveButton) !== 0;
+      if (negative === positive) return 0x80;
+      return negative ? 0x01 : 0xff;
+    }
+    function publishControllerState() {
       const gamepad = Array.from(navigator.getGamepads?.() ?? [])
         .find(candidate => candidate?.connected) ?? null;
-      let buttons = keyboardButtons | controllerPulseButtons;
-      for (const active of controllerPointers.values()) buttons |= active.button;
+      let virtualButtons = keyboardButtons | controllerPulseButtons;
+      for (const active of controllerPointers.values()) virtualButtons |= active.button;
+      let buttons = virtualButtons;
       if (buttonPressed(gamepad, 14)) buttons |= 0x0001;
       if (buttonPressed(gamepad, 15)) buttons |= 0x0002;
       if (buttonPressed(gamepad, 13)) buttons |= 0x0004;
@@ -6597,10 +6720,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (buttonPressed(gamepad, 2)) buttons |= 0x0400;
       if (buttonPressed(gamepad, 3)) buttons |= 0x0800;
       if (buttonPressed(gamepad, 9)) buttons |= 0x1000;
+      const virtualDirections = virtualButtons & 0x000f;
       const state = {
         buttons,
-        stickX: axisByte(gamepad?.axes[0]),
-        stickY: axisByte(gamepad?.axes[1], true),
+        stickX: (virtualDirections & 0x0003) !== 0
+          ? digitalAxisByte(virtualDirections, 0x0001, 0x0002)
+          : axisByte(gamepad?.axes[0]),
+        stickY: (virtualDirections & 0x000c) !== 0
+          ? digitalAxisByte(virtualDirections, 0x0004, 0x0008)
+          : axisByte(gamepad?.axes[1], true),
         cStickX: axisByte(gamepad?.axes[2]),
         cStickY: axisByte(gamepad?.axes[3], true),
         triggerL: Math.round((gamepad?.buttons[6]?.value ?? 0) * 0xff),
@@ -6614,6 +6742,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         controllerSequence += 1;
         worker?.postMessage({ type: "controller", sequence: controllerSequence, state });
       }
+      return state;
+    }
+    function sampleController() {
+      publishControllerState();
       requestAnimationFrame(sampleController);
     }
     sampleController();
@@ -6838,7 +6970,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     function handleWorkerMessage(event) {
       const message = event.data;
-      if (message?.type === "dataset") {
+      if (message?.type === "controller-poll") {
+        acknowledgeControllerPoll(message.buttons, message.sequence);
+      } else if (message?.type === "dataset") {
         document.body.dataset[message.name] = message.value;
         if (message.name === "status") runnerStatus.textContent = message.value;
       } else if (message?.type === "efb-clear") {
