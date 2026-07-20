@@ -35,8 +35,7 @@ function extractFunctions(name) {
 }
 
 const declarations = extractFunctions("createWeightedLruCache");
-assert.equal(declarations.length, 2, "worker and presentation caches share the helper");
-assert.equal(declarations[0], declarations[1], "weighted LRU implementations diverged");
+assert.equal(declarations.length, 1, "the worker owns the sole CPU-side texture cache");
 
 const context = { Map, Math, Number };
 vm.createContext(context);
