@@ -3,9 +3,15 @@
 
 import { rename, writeFile } from "node:fs/promises";
 
+import {
+  readCheckpointManifest,
+  verifyCheckpointReport,
+} from "./browser_boot_checkpoint.mjs";
+
 function parseArguments(argv) {
   const options = {
     endpoint: "http://127.0.0.1:9222",
+    expect: null,
     extendCycles: null,
     extendDispatches: undefined,
     pollMs: 250,
@@ -33,6 +39,9 @@ function parseArguments(argv) {
         break;
       case "--extend-dispatches":
         options.extendDispatches = Number(value());
+        break;
+      case "--expect":
+        options.expect = value();
         break;
       case "--output":
         options.output = value();
@@ -283,8 +292,20 @@ function parseReport(text) {
   }
 }
 
+function verifyExpectedCheckpoint(report, options, manifest) {
+  if (manifest === null) return;
+  const checkpoint = verifyCheckpointReport(report, manifest);
+  report.headlessCapture.checkpoint = {
+    expectedManifest: options.expect,
+    sha256: checkpoint.sha256,
+  };
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
+  const expectedManifest = options.expect === null
+    ? null
+    : await readCheckpointManifest(options.expect);
   const target = await pageTarget(options.endpoint);
   const session = new DevToolsSession(target.webSocketDebuggerUrl);
   await session.connect();
@@ -311,6 +332,7 @@ async function main() {
           reuse: reuseCapture,
           url: state.url,
         };
+        verifyExpectedCheckpoint(report, options, expectedManifest);
         await persist(options.output, report);
         return;
       }
@@ -334,6 +356,7 @@ async function main() {
             timedOut: true,
             url: state.url,
           };
+          verifyExpectedCheckpoint(report, options, expectedManifest);
           await persist(options.output, report);
           process.exitCode = 124;
           return;
