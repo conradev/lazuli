@@ -7355,12 +7355,54 @@ const TEMPLATE: &str = r##"<!doctype html>
       output.textContent = failure;
       throw new Error(failure, { cause: error });
     }
+    function newRendererHostMetrics() {
+      return {
+        operations: { enqueued: 0, pending: 0, highWater: 0 },
+        workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
+        wall: { workerStartToLastReportMs: null },
+      };
+    }
+    let rendererHostMetrics = newRendererHostMetrics();
+    let rendererWorkerStartedAt = performance.now();
+    function resetRendererHostMetrics() {
+      rendererHostMetrics = newRendererHostMetrics();
+      rendererWorkerStartedAt = performance.now();
+    }
+    function receivedArrayBufferBytes(frame) {
+      const buffers = new Set();
+      const retain = value => {
+        if (value instanceof ArrayBuffer) buffers.add(value);
+        else if (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) {
+          buffers.add(value.buffer);
+        }
+      };
+      for (const draw of frame.geometry?.draws ?? []) {
+        retain(draw.vertices);
+        retain(draw.tevState);
+        for (const texture of draw.textures ?? []) retain(texture?.pixels);
+      }
+      let bytes = 0;
+      for (const buffer of buffers) bytes += buffer.byteLength;
+      return bytes;
+    }
     let rendererOperationTail = Promise.resolve();
-    function enqueueRendererOperation(operation) {
+    function appendRendererOperation(operation) {
       const pending = rendererOperationTail.then(operation, operation);
       rendererOperationTail = pending.then(
         () => undefined,
         () => undefined
+      );
+      return pending;
+    }
+    function enqueueRendererOperation(operation) {
+      const metrics = rendererHostMetrics.operations;
+      metrics.enqueued += 1;
+      metrics.pending += 1;
+      metrics.highWater = Math.max(metrics.highWater, metrics.pending);
+      const pending = appendRendererOperation(operation);
+      pending.then(
+        () => { metrics.pending -= 1; },
+        () => { metrics.pending -= 1; }
       );
       return pending;
     }
@@ -7397,40 +7439,97 @@ const TEMPLATE: &str = r##"<!doctype html>
         unique: colors.size,
       };
     }
+    async function readSelectedXfb() {
+      if (!webGpuRenderer.has_presented_xfb()) return null;
+      const capture = await webGpuRenderer.read_presented_xfb_rgba();
+      const rgba = capture.rgba instanceof Uint8Array
+        ? capture.rgba
+        : new Uint8Array(capture.rgba);
+      const width = Number(capture.width);
+      const height = Number(capture.height);
+      const rgb = summarizePresentedXfbRgba(rgba, width, height);
+      const rgbaSha256 = await sha256Hex(rgba);
+      return {
+        address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
+        generation: Number(capture.generation),
+        row: Number(capture.row),
+        format: String(capture.format),
+        layout: String(capture.layout),
+        sourceRow: Number(capture.sourceRow),
+        width,
+        height,
+        textureWidth: Number(capture.textureWidth),
+        textureHeight: Number(capture.textureHeight),
+        logicalWidth: Number(capture.logicalWidth),
+        logicalHeight: Number(capture.logicalHeight),
+        displayWidth: Number(capture.displayWidth),
+        displayHeight: Number(capture.displayHeight),
+        rgbaByteLength: rgba.byteLength,
+        rgbaSha256,
+        rgb,
+      };
+    }
     function captureSelectedXfb() {
-      return enqueueRendererOperation(async () => {
-        await drainWebGpuRenderer();
-        if (!webGpuRenderer.has_presented_xfb()) return null;
-        const capture = await webGpuRenderer.read_presented_xfb_rgba();
-        const rgba = capture.rgba instanceof Uint8Array
-          ? capture.rgba
-          : new Uint8Array(capture.rgba);
-        const width = Number(capture.width);
-        const height = Number(capture.height);
-        const rgb = summarizePresentedXfbRgba(rgba, width, height);
-        const rgbaSha256 = await sha256Hex(rgba);
-        return {
-          address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
-          generation: Number(capture.generation),
-          row: Number(capture.row),
-          format: String(capture.format),
-          layout: String(capture.layout),
-          sourceRow: Number(capture.sourceRow),
-          width,
-          height,
-          textureWidth: Number(capture.textureWidth),
-          textureHeight: Number(capture.textureHeight),
-          logicalWidth: Number(capture.logicalWidth),
-          logicalHeight: Number(capture.logicalHeight),
-          displayWidth: Number(capture.displayWidth),
-          displayHeight: Number(capture.displayHeight),
-          rgbaByteLength: rgba.byteLength,
-          rgbaSha256,
-          rgb,
-        };
+      return appendRendererOperation(readSelectedXfb);
+    }
+    function snapshotRendererPerformance() {
+      const webgpu = webGpuRenderer.diagnostics();
+      const wasmBridgeCalls = [
+        "beginSegmentCalls",
+        "checkHealthCalls",
+        "clearEfbCalls",
+        "copyTextureCalls",
+        "copyXfbCalls",
+        "decodedTextureQueries",
+        "drainCalls",
+        "presentXfbCalls",
+        "pushTevDrawCalls",
+      ].reduce((total, key) => total + Number(webgpu[key] ?? 0), 0);
+      const typedArrayBytes = [
+        "sourceVertexBytes",
+        "tevStateBytes",
+        "textureMetadataBytes",
+        "texturePixelBytes",
+      ].reduce((total, key) => total + Number(webgpu[key] ?? 0), 0);
+      return {
+        scope: "current-worker",
+        wasmBridge: { calls: wasmBridgeCalls, typedArrayBytes },
+        queue: {
+          drains: Number(webgpu.drainCalls ?? 0),
+          submits: Number(webgpu.queueSubmissions ?? 0),
+        },
+        resources: {
+          bindGroups: Number(webgpu.bindGroupsCreated ?? 0),
+          buffers: Number(webgpu.buffersCreated ?? 0),
+          renderPipelines: Number(webgpu.renderPipelinesCreated ?? 0),
+          textures: Number(webgpu.texturesCreated ?? 0),
+        },
+        operations: { ...rendererHostMetrics.operations },
+        workerMessages: { ...rendererHostMetrics.workerMessages },
+        workload: {
+          expandedVertexBytes: Number(webgpu.expandedVertexBytes ?? 0),
+          textureUploadBytes: Number(webgpu.textureUploadBytes ?? 0),
+          textureWrites: Number(webgpu.textureWrites ?? 0),
+        },
+        wall: { ...rendererHostMetrics.wall },
+        webgpu,
+      };
+    }
+    function captureRendererPerformance() {
+      return appendRendererOperation(snapshotRendererPerformance);
+    }
+    function captureRendererTerminal() {
+      return appendRendererOperation(async () => {
+        const metrics = snapshotRendererPerformance();
+        const selectedXfb = await readSelectedXfb();
+        return { metrics, selectedXfb };
       });
     }
-    globalThis.lazuliRendererDiagnostics = Object.freeze({ captureSelectedXfb });
+    globalThis.lazuliRendererDiagnostics = Object.freeze({
+      capturePerformance: captureRendererPerformance,
+      captureSelectedXfb,
+      captureTerminal: captureRendererTerminal,
+    });
     function gxClearEfb(clearColor) {
       const [red, green, blue] = clearColor;
       webGpuRenderer.clear_efb(red, green, blue);
@@ -7454,15 +7553,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       return enqueueRendererOperation(async () => {
         webGpuRenderer.reset();
         await drainWebGpuRenderer();
+        webGpuRenderer.reset_diagnostics();
       }).catch(handleRendererError);
     }
 
     function startWorker(discConfig, label) {
-      if (worker !== null) {
+      const replacingWorker = worker !== null;
+      if (replacingWorker) {
         worker.terminate();
         URL.revokeObjectURL(workerUrl);
         resetPresentation();
+      } else {
+        webGpuRenderer.reset_diagnostics();
       }
+      resetRendererHostMetrics();
       const workerDiscConfig = discConfig.kind === "file"
         ? { kind: "file-message" }
         : discConfig;
@@ -7901,6 +8005,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
     function queueGxGeometry(frame) {
+      rendererHostMetrics.workerMessages.gxFrames += 1;
+      rendererHostMetrics.workerMessages.drawCalls += frame.geometry.draws.length;
+      rendererHostMetrics.workerMessages.receivedArrayBufferBytes +=
+        receivedArrayBufferBytes(frame);
       webGpuRenderer.begin_segment();
       for (const draw of frame.geometry.draws) queueGxDraw(draw);
     }
@@ -8046,6 +8154,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
         });
       } else if (message?.type === "finish") {
+        rendererHostMetrics.wall.workerStartToLastReportMs = Math.max(
+          0,
+          performance.now() - rendererWorkerStartedAt
+        );
         output.textContent = message.text;
       }
     }

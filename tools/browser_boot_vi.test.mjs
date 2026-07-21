@@ -312,6 +312,7 @@ test("main thread caches XFB copies and presents only on VI messages", async () 
   const workerMessages = [];
   const context = evaluateFunctions(
     [
+      "appendRendererOperation",
       "enqueueRendererOperation",
       "handleRendererFrame",
       "handleRendererOperation",
@@ -323,6 +324,9 @@ test("main thread caches XFB copies and presents only on VI messages", async () 
       gxClearEfb() {},
       handleRendererError(error) { throw error; },
       output: { textContent: "" },
+      rendererHostMetrics: {
+        operations: { enqueued: 0, pending: 0, highWater: 0 },
+      },
       rendererOperationTail: Promise.resolve(),
       queueGxGeometry(frame) { calls.push(["geometry", frame.index]); },
       runnerStatus: { textContent: "" },

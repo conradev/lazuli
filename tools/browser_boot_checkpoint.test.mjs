@@ -33,6 +33,42 @@ import {
   reportsForConsensus,
 } from "./browser_boot_checkpoint_fixture.mjs";
 
+const RENDERER_PERFORMANCE_MAXIMUM = Object.freeze({
+  wasmBridgeCalls: 984,
+  wasmBridgeTypedArrayBytes: 11_222_288,
+  queueSubmissions: 468,
+  bindGroups: 700,
+  buffers: 839,
+  renderPipelines: 3,
+  textures: 8,
+});
+
+function attachRendererMetrics(report, overrides = {}) {
+  report.rendering.metrics = {
+    scope: "current-worker",
+    wasmBridge: {
+      calls: overrides.wasmBridgeCalls ?? 984,
+      typedArrayBytes: overrides.wasmBridgeTypedArrayBytes ?? 11_222_288,
+    },
+    queue: { submits: overrides.queueSubmissions ?? 468 },
+    resources: {
+      bindGroups: overrides.bindGroups ?? 700,
+      buffers: overrides.buffers ?? 839,
+      renderPipelines: overrides.renderPipelines ?? 3,
+      textures: overrides.textures ?? 8,
+    },
+  };
+  return report;
+}
+
+function manifestWithRendererBudget(reports) {
+  const manifest = createCheckpointManifest(reports);
+  manifest.performance = {
+    rendererMaximum: { ...RENDERER_PERFORMANCE_MAXIMUM },
+  };
+  return manifest;
+}
+
 test("three clean reports bless one host-independent checkpoint manifest", () => {
   const reports = reportsForConsensus();
   const candidates = reports.map(report => createCheckpointCandidate(report));
@@ -93,6 +129,71 @@ test("checkpoint mismatches name the first meaningful state path", () => {
     () => verifyCheckpointReport(changedPixels, manifest),
     error => error instanceof CheckpointMismatchError
       && error.path === "$state.rendering.selectedXfb.rgbaSha256",
+  );
+});
+
+test("renderer budgets bound host resource churn without changing the golden", () => {
+  const reports = reportsForConsensus().map(report => attachRendererMetrics(report));
+  const manifest = manifestWithRendererBudget(reports);
+  assert.equal(validateCheckpointManifest(manifest), manifest);
+  assert.equal(verifyCheckpointReport(reports[0], manifest).sha256, manifest.sha256);
+
+  const improved = structuredClone(reports[1]);
+  improved.rendering.metrics.wasmBridge.calls -= 1;
+  improved.rendering.metrics.resources.bindGroups -= 100;
+  improved.rendering.metrics.resources.textures -= 4;
+  assert.equal(verifyCheckpointReport(improved, manifest).sha256, manifest.sha256);
+
+  const regressed = structuredClone(reports[2]);
+  regressed.rendering.metrics.resources.textures += 1;
+  assert.throws(
+    () => verifyCheckpointReport(regressed, manifest),
+    error => error instanceof CheckpointValidationError
+      && error.path === "$.rendering.metrics.resources.textures"
+      && /expected at most 8, got 9/.test(error.message),
+  );
+});
+
+test("renderer budgets reject missing report metrics and malformed maxima", () => {
+  const reports = reportsForConsensus().map(report => attachRendererMetrics(report));
+  const manifest = manifestWithRendererBudget(reports);
+  delete reports[0].rendering.metrics.wasmBridge.calls;
+  assert.throws(
+    () => verifyCheckpointReport(reports[0], manifest),
+    error => error instanceof CheckpointValidationError
+      && error.path === "$.rendering.metrics.wasmBridge.calls",
+  );
+
+  const missing = structuredClone(reports[1]);
+  delete missing.rendering.metrics;
+  assert.throws(
+    () => verifyCheckpointReport(missing, manifest),
+    error => error instanceof CheckpointValidationError
+      && error.path === "$.rendering.metrics",
+  );
+
+  const wrongScope = structuredClone(reports[2]);
+  wrongScope.rendering.metrics.scope = "process-lifetime";
+  assert.throws(
+    () => verifyCheckpointReport(wrongScope, manifest),
+    error => error instanceof CheckpointValidationError
+      && error.path === "$.rendering.metrics.scope",
+  );
+
+  const malformed = structuredClone(manifest);
+  malformed.performance.rendererMaximum.textures = -1;
+  assert.throws(
+    () => validateCheckpointManifest(malformed),
+    error => error instanceof CheckpointValidationError
+      && error.path === "$manifest.performance.rendererMaximum.textures",
+  );
+
+  const misspelled = structuredClone(manifest);
+  misspelled.performance.rendererMaximum.texture = 8;
+  assert.throws(
+    () => validateCheckpointManifest(misspelled),
+    error => error instanceof CheckpointValidationError
+      && error.path === "$manifest.performance.rendererMaximum.texture",
   );
 });
 

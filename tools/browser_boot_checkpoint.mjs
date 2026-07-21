@@ -38,6 +38,119 @@ export {
 
 const MISSING = Symbol("missing checkpoint value");
 
+const RENDERER_MAXIMUM_METRICS = Object.freeze([
+  Object.freeze({
+    name: "wasmBridgeCalls",
+    path: Object.freeze(["wasmBridge", "calls"]),
+  }),
+  Object.freeze({
+    name: "wasmBridgeTypedArrayBytes",
+    path: Object.freeze(["wasmBridge", "typedArrayBytes"]),
+  }),
+  Object.freeze({
+    name: "queueSubmissions",
+    path: Object.freeze(["queue", "submits"]),
+  }),
+  Object.freeze({
+    name: "bindGroups",
+    path: Object.freeze(["resources", "bindGroups"]),
+  }),
+  Object.freeze({
+    name: "buffers",
+    path: Object.freeze(["resources", "buffers"]),
+  }),
+  Object.freeze({
+    name: "renderPipelines",
+    path: Object.freeze(["resources", "renderPipelines"]),
+  }),
+  Object.freeze({
+    name: "textures",
+    path: Object.freeze(["resources", "textures"]),
+  }),
+]);
+
+function rejectUnexpectedCheckpointFields(value, allowed, path) {
+  const allowedFields = new Set(allowed);
+  for (const field of Object.keys(value)) {
+    if (!allowedFields.has(field)) {
+      checkpointValidationFailure(
+        checkpointChildPath(path, field),
+        "unexpected checkpoint manifest field",
+      );
+    }
+  }
+}
+
+function validateRendererPerformanceBudget(manifest) {
+  if (!Object.hasOwn(manifest, "performance")) return null;
+  const performance = requireCheckpointObject(
+    manifest.performance,
+    "$manifest.performance",
+  );
+  rejectUnexpectedCheckpointFields(
+    performance,
+    ["rendererMaximum"],
+    "$manifest.performance",
+  );
+  const rendererMaximum = requireCheckpointObject(
+    performance.rendererMaximum,
+    "$manifest.performance.rendererMaximum",
+  );
+  rejectUnexpectedCheckpointFields(
+    rendererMaximum,
+    RENDERER_MAXIMUM_METRICS.map(metric => metric.name),
+    "$manifest.performance.rendererMaximum",
+  );
+  for (const metric of RENDERER_MAXIMUM_METRICS) {
+    requireCheckpointNonNegativeInteger(
+      rendererMaximum[metric.name],
+      `$manifest.performance.rendererMaximum.${metric.name}`,
+    );
+  }
+  return rendererMaximum;
+}
+
+function rendererMetric(reportMetrics, path) {
+  let value = reportMetrics;
+  for (const field of path) value = value?.[field];
+  return value;
+}
+
+function verifyRendererPerformanceBudget(report, manifest) {
+  if (!Object.hasOwn(manifest, "performance")) return;
+  const rendererMaximum = manifest.performance.rendererMaximum;
+  const reportMetrics = requireCheckpointObject(
+    report.rendering?.metrics,
+    "$.rendering.metrics",
+  );
+  if (reportMetrics.scope !== "current-worker") {
+    checkpointValidationFailure(
+      "$.rendering.metrics.scope",
+      `expected "current-worker", got ${describeCheckpointValue(reportMetrics.scope)}`,
+    );
+  }
+  for (const group of ["wasmBridge", "queue", "resources"]) {
+    requireCheckpointObject(
+      reportMetrics[group],
+      `$.rendering.metrics.${group}`,
+    );
+  }
+  for (const metric of RENDERER_MAXIMUM_METRICS) {
+    const path = `$.rendering.metrics.${metric.path.join(".")}`;
+    const actual = requireCheckpointNonNegativeInteger(
+      rendererMetric(reportMetrics, metric.path),
+      path,
+    );
+    const maximum = rendererMaximum[metric.name];
+    if (actual > maximum) {
+      checkpointValidationFailure(
+        path,
+        `expected at most ${maximum}, got ${actual}`,
+      );
+    }
+  }
+}
+
 function describeDifferenceValue(value) {
   return value === MISSING ? "<missing>" : describeCheckpointValue(value);
 }
@@ -177,6 +290,7 @@ export function validateCheckpointManifest(manifest) {
       `at least ${manifest.run.cleanRunsRequired} clean runs are required`,
     );
   }
+  validateRendererPerformanceBudget(manifest);
   requireCheckpointObject(manifest.state, "$manifest.state");
   const normalizedState = normalizeCheckpointState(
     manifest.state,
@@ -258,6 +372,7 @@ export function verifyCheckpointReport(report, manifest) {
       candidate.sha256,
     );
   }
+  verifyRendererPerformanceBudget(report, manifest);
   return { sha256: candidate.sha256, state: candidate.state };
 }
 

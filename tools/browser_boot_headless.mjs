@@ -293,16 +293,17 @@ function parseReport(text) {
 }
 
 async function captureRendering(session, state) {
-  const selectedXfb = await session.evaluate(`(async () => {
+  const capture = await session.evaluate(`(async () => {
     const diagnostics = globalThis.lazuliRendererDiagnostics;
-    if (typeof diagnostics?.captureSelectedXfb !== "function") {
+    if (typeof diagnostics?.captureTerminal !== "function") {
       throw new Error("Lazuli renderer diagnostics are unavailable");
     }
-    return diagnostics.captureSelectedXfb();
+    return await diagnostics.captureTerminal();
   })()`);
   return {
     backend: state.dataset.renderer ?? null,
-    selectedXfb,
+    metrics: capture.metrics,
+    selectedXfb: capture.selectedXfb,
   };
 }
 
@@ -337,7 +338,8 @@ async function main() {
   try {
     await session.send("Runtime.enable");
     await session.send("Page.enable");
-    const deadline = Date.now() + options.timeoutMs;
+    const runStartedAt = Date.now();
+    const deadline = runStartedAt + options.timeoutMs;
     let reuseCapture = null;
     if (options.reuse) {
       reuseCapture = await extendExistingRun(session, options, deadline);
@@ -350,7 +352,11 @@ async function main() {
       state = await pageState(session);
       const report = parseReport(state.result);
       if (report !== null) {
+        const reportDetectedAt = Date.now();
         await attachHeadlessCapture(session, state, report, {
+          performance: {
+            headlessRunToReportMs: reportDetectedAt - runStartedAt,
+          },
           reuse: reuseCapture,
         });
         verifyExpectedCheckpoint(report, options, expectedManifest);
@@ -369,7 +375,11 @@ async function main() {
         state = await pageState(session);
         const report = parseReport(state.result);
         if (report !== null) {
+          const reportDetectedAt = Date.now();
           await attachHeadlessCapture(session, state, report, {
+            performance: {
+              headlessRunToReportMs: reportDetectedAt - runStartedAt,
+            },
             reuse: reuseCapture,
             timedOut: true,
           });

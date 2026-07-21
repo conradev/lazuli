@@ -35,6 +35,9 @@ function evaluate(names, values = {}) {
     Number,
     Object,
     Promise,
+    rendererHostMetrics: {
+      operations: { enqueued: 0, pending: 0, highWater: 0 },
+    },
     Set,
     String,
     Uint8Array,
@@ -88,13 +91,13 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
   ]);
   const context = evaluate(
     [
-      "enqueueRendererOperation",
+      "appendRendererOperation",
       "sha256Hex",
       "summarizePresentedXfbRgba",
+      "readSelectedXfb",
       "captureSelectedXfb",
     ],
     {
-      drainWebGpuRenderer() { calls.push("drain"); },
       rendererOperationTail,
       webGpuRenderer: {
         has_presented_xfb() { calls.push("has"); return true; },
@@ -127,7 +130,12 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
   assert.deepEqual(calls, []);
   releaseRenderer();
   const capture = await pending;
-  assert.deepEqual(calls, ["drain", "has", "read"]);
+  assert.deepEqual(calls, ["has", "read"]);
+  assert.deepEqual(context.rendererHostMetrics.operations, {
+    enqueued: 0,
+    pending: 0,
+    highWater: 0,
+  });
   assert.equal(capture.address, "0x01200500");
   assert.equal(capture.rgbaByteLength, 8);
   assert.equal(capture.rgbaSha256, createHash("sha256").update(rgba).digest("hex"));
@@ -144,13 +152,13 @@ test("selected XFB capture reports no image after a renderer reset", async () =>
   let reads = 0;
   const context = evaluate(
     [
-      "enqueueRendererOperation",
+      "appendRendererOperation",
       "sha256Hex",
       "summarizePresentedXfbRgba",
+      "readSelectedXfb",
       "captureSelectedXfb",
     ],
     {
-      drainWebGpuRenderer() {},
       rendererOperationTail: Promise.resolve(),
       webGpuRenderer: {
         has_presented_xfb() { return false; },

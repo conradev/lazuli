@@ -47,6 +47,24 @@ test("projection reacts to guest, device, VI, and selected-XFB visual state", ()
   }
 });
 
+test("host renderer metrics do not enter the deterministic checkpoint digest", () => {
+  const report = checkpointReport();
+  const digest = createCheckpointCandidate(report).sha256;
+  report.rendering.metrics = {
+    operations: { enqueued: 328, highWater: 1, pending: 0 },
+    queue: { drains: 328, submits: 471 },
+    resources: { bindGroups: 15_000, buffers: 15_000, renderPipelines: 9, textures: 147 },
+    scope: "current-worker",
+    wall: { workerStartToLastReportMs: 12_345.67 },
+    wasmBridge: { calls: 16_535, typedArrayBytes: 9_244_800 },
+  };
+
+  assert.equal(createCheckpointCandidate(report).sha256, digest);
+  report.rendering.metrics.queue.drains = 1;
+  report.rendering.metrics.wall.workerStartToLastReportMs = 999_999;
+  assert.equal(createCheckpointCandidate(report).sha256, digest);
+});
+
 test("checkpoint hard gates fail at the actionable report path", () => {
   const cases = [
     ["status", report => { report.status = "running"; }, "$.status"],

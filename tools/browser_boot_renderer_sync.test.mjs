@@ -73,6 +73,12 @@ function workerHarness() {
   return { context, messages, reports };
 }
 
+function rendererOperationMetrics() {
+  return {
+    operations: { enqueued: 0, pending: 0, highWater: 0 },
+  };
+}
+
 test("renderer copies are sequenced and acknowledged without dropping work", () => {
   const { context, messages } = workerHarness();
   const frame = { index: 7 };
@@ -176,6 +182,7 @@ test("main thread acknowledges a frame only after the WebGPU drain resolves", as
   const context = {
     Number,
     Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
     rendererOperationTail: Promise.resolve(),
     drainWebGpuRenderer() {
       return new Promise(resolve => { resolveDrain = resolve; });
@@ -185,7 +192,7 @@ test("main thread acknowledges a frame only after the WebGPU drain resolves", as
   };
   vm.createContext(context);
   vm.runInContext(
-    ["enqueueRendererOperation", "handleRendererFrame"]
+    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
       .map(extractFunction)
       .join("\n\n"),
     context,
@@ -212,6 +219,7 @@ test("deferred WebGPU failures reject the frame instead of acknowledging it", as
   const context = {
     Number,
     Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
     rendererOperationTail: Promise.resolve(),
     drainWebGpuRenderer() {
       return Promise.reject(new Error("WebGPU device lost (Unknown)"));
@@ -223,7 +231,7 @@ test("deferred WebGPU failures reject the frame instead of acknowledging it", as
   };
   vm.createContext(context);
   vm.runInContext(
-    ["enqueueRendererOperation", "handleRendererFrame"]
+    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
       .map(extractFunction)
       .join("\n\n"),
     context,
@@ -252,6 +260,7 @@ test("a replaced worker cannot receive a stale WebGPU frame completion", async (
   const context = {
     Number,
     Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
     rendererOperationTail: Promise.resolve(),
     drainWebGpuRenderer() {
       return new Promise(resolve => { resolveDrain = resolve; });
@@ -261,7 +270,7 @@ test("a replaced worker cannot receive a stale WebGPU frame completion", async (
   };
   vm.createContext(context);
   vm.runInContext(
-    ["enqueueRendererOperation", "handleRendererFrame"]
+    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
       .map(extractFunction)
       .join("\n\n"),
     context,
@@ -295,6 +304,7 @@ test("unawaited VI frames remain serialized behind WebGPU drains", async () => {
   const context = {
     Number,
     Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
     rendererOperationTail: Promise.resolve(),
     worker: currentWorker,
     drainWebGpuRenderer() {
@@ -308,7 +318,7 @@ test("unawaited VI frames remain serialized behind WebGPU drains", async () => {
   };
   vm.createContext(context);
   vm.runInContext(
-    ["enqueueRendererOperation", "handleRendererFrame"]
+    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
       .map(extractFunction)
       .join("\n\n"),
     context,
@@ -347,11 +357,13 @@ test("disc resets wait behind pending WebGPU presentation work", async () => {
   const context = {
     Number,
     Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
     rendererOperationTail: Promise.resolve(),
     worker: currentWorker,
     output: { textContent: "" },
     webGpuRenderer: {
       reset() { calls.push("reset"); },
+      reset_diagnostics() {},
     },
     drainWebGpuRenderer() {
       drainCount += 1;
@@ -364,7 +376,12 @@ test("disc resets wait behind pending WebGPU presentation work", async () => {
   };
   vm.createContext(context);
   vm.runInContext(
-    ["enqueueRendererOperation", "handleRendererFrame", "resetPresentation"]
+    [
+      "appendRendererOperation",
+      "enqueueRendererOperation",
+      "handleRendererFrame",
+      "resetPresentation",
+    ]
       .map(extractFunction)
       .join("\n\n"),
     context,
@@ -392,12 +409,19 @@ test("a failed queued operation does not poison later WebGPU work", async () => 
   const calls = [];
   const context = {
     Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
     rendererOperationTail: Promise.resolve(),
   };
   vm.createContext(context);
-  vm.runInContext(extractFunction("enqueueRendererOperation"), context, {
+  vm.runInContext(
+    ["appendRendererOperation", "enqueueRendererOperation"]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+    {
     filename: "browser_boot.renderer-sync.queue-recovery.js",
-  });
+    },
+  );
 
   const failure = context.enqueueRendererOperation(() => {
     calls.push("failed");
@@ -407,6 +431,81 @@ test("a failed queued operation does not poison later WebGPU work", async () => 
   await context.enqueueRendererOperation(() => { calls.push("recovered"); });
 
   assert.deepEqual(calls, ["failed", "recovered"]);
+});
+
+test("a failed diagnostic operation does not poison or account later work", async () => {
+  const calls = [];
+  const context = {
+    Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
+    rendererOperationTail: Promise.resolve(),
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    ["appendRendererOperation", "enqueueRendererOperation"]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+    { filename: "browser_boot.renderer-sync.diagnostic-recovery.js" },
+  );
+
+  await assert.rejects(
+    context.appendRendererOperation(() => {
+      calls.push("diagnostic");
+      throw new Error("readback failure");
+    }),
+    /readback failure/,
+  );
+  await context.enqueueRendererOperation(() => { calls.push("runtime"); });
+
+  assert.deepEqual(calls, ["diagnostic", "runtime"]);
+  assert.deepEqual(context.rendererHostMetrics.operations, {
+    enqueued: 1,
+    pending: 0,
+    highWater: 1,
+  });
+});
+
+test("renderer operation metrics include queued work and settle after failures", async () => {
+  let releaseFirst;
+  const context = {
+    Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
+    rendererOperationTail: Promise.resolve(),
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    ["appendRendererOperation", "enqueueRendererOperation"]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+    {
+    filename: "browser_boot.renderer-sync.metrics.js",
+    },
+  );
+
+  const first = context.enqueueRendererOperation(
+    () => new Promise(resolve => { releaseFirst = resolve; }),
+  );
+  const second = context.enqueueRendererOperation(
+    () => Promise.reject(new Error("expected failure")),
+  );
+  await Promise.resolve();
+  assert.deepEqual(context.rendererHostMetrics.operations, {
+    enqueued: 2,
+    pending: 2,
+    highWater: 2,
+  });
+
+  releaseFirst();
+  await first;
+  await assert.rejects(second, /expected failure/);
+  await Promise.resolve();
+  assert.deepEqual(context.rendererHostMetrics.operations, {
+    enqueued: 2,
+    pending: 0,
+    highWater: 2,
+  });
 });
 
 test("guest execution waits for renderer completion before another block", () => {
