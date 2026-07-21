@@ -615,6 +615,16 @@ const TEMPLATE: &str = r##"<!doctype html>
     let serialLastEnabledChannels = 0;
     const cpStatusReadIdle = 0x0004;
     const cpStatusCommandIdle = 0x0008;
+    const diBreakRequest = 0x00000001;
+    const diInterruptMasks = 0x0000002a;
+    const diInterruptStatuses = 0x00000054;
+    const diDeviceErrorInterrupt = 0x00000004;
+    const diTransferInterrupt = 0x00000010;
+    const diMinimumCommandLatencyCycles = 145800;
+    const diErrorInvalidCommand = 0x00052000;
+    const diErrorNoAudioBuffer = 0x00052001;
+    const diErrorInvalidAudioCommand = 0x00052401;
+    const piDiskInterruptCause = 0x00000004;
     const siTransferStart = 0x00000001;
     const siReadStatusInterruptMask = 0x08000000;
     const siReadStatusInterrupt = 0x10000000;
@@ -1117,7 +1127,6 @@ const TEMPLATE: &str = r##"<!doctype html>
     let nextDecrementerCycle = null;
     let decrementerPending = false;
     let diskTransfer = null;
-    let diskInterruptDelivered = false;
     let serialTransfer = null;
     let aiSampleCounter = 0;
     let aiLastCycle = 0;
@@ -1139,6 +1148,19 @@ const TEMPLATE: &str = r##"<!doctype html>
     let diskReadBytes = 0;
     let diskReadHash = 0x811c9dc5;
     let diskHashedBytes = 0;
+    let diskLastError = 0;
+    let diskDriveState = 0;
+    let diskAudioEnabled = boot.audioStreaming !== 0;
+    let diskAudioBufferLength = boot.streamBufferSize;
+    let diskAudioStreaming = false;
+    let diskAudioStopAtTrackEnd = false;
+    let diskAudioPosition = 0;
+    let diskAudioStart = 0;
+    let diskAudioLength = 0;
+    let diskAudioNextStart = 0;
+    let diskAudioNextLength = 0;
+    const diskCommandCounts = new Map();
+    const diskCommandTrace = [];
     let regionRunning = false;
     let regionContinuableHookCalls = 0;
     const hookFunctions = {
@@ -3259,6 +3281,35 @@ const TEMPLATE: &str = r##"<!doctype html>
       recomputeSerialInterruptLevel("control-write");
     }
 
+    function recomputeDiskInterruptLevel() {
+      const status = view.getUint32(mmio + 0x6000, false);
+      const active = ((status & 0x04) !== 0 && (status & 0x02) !== 0)
+        || ((status & 0x10) !== 0 && (status & 0x08) !== 0)
+        || ((status & 0x40) !== 0 && (status & 0x20) !== 0);
+      const beforeCause = view.getUint32(mmio + 0x3000, false);
+      const cause = (
+        active
+          ? beforeCause | piDiskInterruptCause
+          : beforeCause & ~piDiskInterruptCause
+      ) >>> 0;
+      view.setUint32(mmio + 0x3000, cause, false);
+      return active;
+    }
+
+    function writeDiskStatus(value) {
+      const current = view.getUint32(mmio + 0x6000, false);
+      const written = value >>> 0;
+      const statuses = (current & diInterruptStatuses)
+        & ~(written & diInterruptStatuses);
+      const next = (
+        statuses
+        | (written & diInterruptMasks)
+        | (written & diBreakRequest)
+      ) >>> 0;
+      view.setUint32(mmio + 0x6000, next, false);
+      recomputeDiskInterruptLevel();
+    }
+
     function writePixelEngineControl(value) {
       const written = value & 0xffff;
       if ((written & 0x08) !== 0) {
@@ -3552,6 +3603,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if (logical === 0xcc006438 && size === 4) {
         writeSerialStatus(value);
+        return 1;
+      }
+      if (logical === 0xcc006000 && size === 4) {
+        writeDiskStatus(value);
         return 1;
       }
       if (logical === 0xcc00100a && size === 2) {
@@ -4626,59 +4681,255 @@ const TEMPLATE: &str = r##"<!doctype html>
       return transfer.promise;
     }
 
+    function diskCommandName(opcode) {
+      switch (opcode) {
+        case 0x12: return "identify";
+        case 0xa8: return "read";
+        case 0xab: return "seek";
+        case 0xe0: return "request-error";
+        case 0xe1: return "audio-stream";
+        case 0xe2: return "audio-status";
+        case 0xe3: return "stop-motor";
+        case 0xe4: return "audio-config";
+        default: return "unsupported";
+      }
+    }
+
+    function recordDiskCommand(observedCycles, transfer, details) {
+      details ??= {};
+      const name = diskCommandName(transfer.opcode);
+      diskCommandCounts.set(name, (diskCommandCounts.get(name) ?? 0) + 1);
+      deviceEvents.set("diskCommand", (deviceEvents.get("diskCommand") ?? 0) + 1);
+      const outcomeEvent = transfer.interruptStatus === diDeviceErrorInterrupt
+        ? "diskCommandDeviceError"
+        : "diskCommandAccepted";
+      deviceEvents.set(outcomeEvent, (deviceEvents.get(outcomeEvent) ?? 0) + 1);
+      diskCommandTrace.push({
+        cycle: observedCycles,
+        opcode: "0x" + transfer.opcode.toString(16).padStart(2, "0"),
+        name,
+        outcome: transfer.interruptStatus === diDeviceErrorInterrupt
+          ? "device-error"
+          : "transfer-complete",
+        ...details,
+      });
+      if (diskCommandTrace.length > 64) diskCommandTrace.shift();
+    }
+
+    function beginDiskCommand(observedCycles) {
+      const command0 = view.getUint32(mmio + 0x6008, false);
+      const command1 = view.getUint32(mmio + 0x600c, false);
+      const command2 = view.getUint32(mmio + 0x6010, false);
+      const opcode = command0 >>> 24;
+      const dmaBase = view.getUint32(mmio + 0x6014, false);
+      const dmaLength = view.getUint32(mmio + 0x6018, false);
+      let details = {};
+
+      if (opcode !== 0xe0) diskLastError = 0;
+
+      if (opcode === 0x12) {
+        const target = ramPointer(dmaBase, dmaLength);
+        check(target !== null && dmaLength === 32, "invalid DI identify DMA target");
+        bytes.set([
+          0x00, 0x00, 0x00, 0x00,
+          0x20, 0x02, 0x04, 0x02,
+          0x61, 0x00, 0x00, 0x00,
+        ], target);
+        bytes.fill(0, target + 12, target + dmaLength);
+        diskTransfer = {
+          opcode,
+          completionCycle: observedCycles + 10000,
+          ready: true,
+          interruptStatus: diTransferInterrupt,
+        };
+        deviceEvents.set("diskIdentify", (deviceEvents.get("diskIdentify") ?? 0) + 1);
+      } else if (opcode === 0xa8) {
+        const offset = command1 * 4;
+        const length = command2;
+        const target = ramPointer(dmaBase, dmaLength);
+        check(target !== null && dmaLength === length, "invalid DI read DMA target");
+        const transfer = {
+          opcode,
+          offset,
+          length,
+          dmaBase,
+          completionCycle: observedCycles + 10000,
+          ready: false,
+          interruptStatus: diTransferInterrupt,
+          error: null,
+          data: null,
+          promise: null,
+          waited: false,
+        };
+        diskTransfer = transfer;
+        details = { offset, length };
+        deviceEvents.set("diskRead", (deviceEvents.get("diskRead") ?? 0) + 1);
+        transfer.promise = Promise.resolve()
+          .then(() => {
+            if (discSource === null) throw new Error("disc read requested without a disc source");
+            return discSource.read(offset, length);
+          })
+          .then(data => {
+            if (diskTransfer !== transfer) return;
+            if (data.length !== length) throw new Error("short browser disc read");
+            transfer.data = data;
+            transfer.ready = true;
+          })
+          .catch(error => {
+            transfer.error = String(error?.message ?? error);
+            transfer.ready = true;
+          });
+      } else {
+        const transfer = {
+          opcode,
+          completionCycle: observedCycles + diMinimumCommandLatencyCycles,
+          ready: true,
+          interruptStatus: diTransferInterrupt,
+        };
+        const audioSubcommand = (command0 >>> 16) & 0xff;
+
+        switch (opcode) {
+          case 0xab: {
+            const offset = command1 * 4;
+            transfer.offset = offset;
+            details = { offset };
+            deviceEvents.set("diskSeek", (deviceEvents.get("diskSeek") ?? 0) + 1);
+            break;
+          }
+          case 0xe0: {
+            const result = (((diskDriveState & 0xff) << 24) | (diskLastError & 0x00ffffff)) >>> 0;
+            view.setUint32(mmio + 0x6020, result, false);
+            diskLastError = 0;
+            details = { result: "0x" + result.toString(16).padStart(8, "0") };
+            deviceEvents.set(
+              "diskRequestError",
+              (deviceEvents.get("diskRequestError") ?? 0) + 1
+            );
+            break;
+          }
+          case 0xe1: {
+            if (!diskAudioEnabled) {
+              diskLastError = diErrorNoAudioBuffer;
+              transfer.interruptStatus = diDeviceErrorInterrupt;
+              details = { subcommand: audioSubcommand, reason: "audio-disabled" };
+              break;
+            }
+            if (audioSubcommand === 0x00) {
+              const offset = command1 * 4;
+              const length = command2;
+              if (offset === 0 && length === 0) {
+                diskAudioStopAtTrackEnd = true;
+              } else if (!diskAudioStopAtTrackEnd) {
+                diskAudioNextStart = offset;
+                diskAudioNextLength = length;
+                if (!diskAudioStreaming) {
+                  diskAudioStart = offset;
+                  diskAudioLength = length;
+                  diskAudioPosition = offset;
+                  diskAudioStreaming = true;
+                }
+              }
+              details = { subcommand: audioSubcommand, offset, length };
+              deviceEvents.set(
+                "diskAudioStreamStart",
+                (deviceEvents.get("diskAudioStreamStart") ?? 0) + 1
+              );
+            } else if (audioSubcommand === 0x01) {
+              diskAudioStopAtTrackEnd = false;
+              diskAudioStreaming = false;
+              details = { subcommand: audioSubcommand };
+              deviceEvents.set(
+                "diskAudioStreamStop",
+                (deviceEvents.get("diskAudioStreamStop") ?? 0) + 1
+              );
+            } else {
+              diskLastError = diErrorInvalidAudioCommand;
+              transfer.interruptStatus = diDeviceErrorInterrupt;
+              details = { subcommand: audioSubcommand, reason: "invalid-audio-command" };
+            }
+            break;
+          }
+          case 0xe2: {
+            let result = 0;
+            if (!diskAudioEnabled) {
+              diskLastError = diErrorNoAudioBuffer;
+              transfer.interruptStatus = diDeviceErrorInterrupt;
+              details = { subcommand: audioSubcommand, reason: "audio-disabled" };
+              break;
+            }
+            if (audioSubcommand === 0x00) {
+              result = diskAudioStreaming ? 1 : 0;
+            } else if (audioSubcommand === 0x01) {
+              result = (diskAudioPosition & 0xffff8000) >>> 2;
+            } else if (audioSubcommand === 0x02) {
+              result = Math.floor(diskAudioStart / 4) >>> 0;
+            } else if (audioSubcommand === 0x03) {
+              result = diskAudioLength >>> 0;
+            } else {
+              diskLastError = diErrorInvalidAudioCommand;
+              transfer.interruptStatus = diDeviceErrorInterrupt;
+              details = { subcommand: audioSubcommand, reason: "invalid-audio-status" };
+              break;
+            }
+            view.setUint32(mmio + 0x6020, result, false);
+            details = {
+              subcommand: audioSubcommand,
+              result: "0x" + result.toString(16).padStart(8, "0"),
+            };
+            deviceEvents.set(
+              "diskAudioStatus",
+              (deviceEvents.get("diskAudioStatus") ?? 0) + 1
+            );
+            break;
+          }
+          case 0xe3:
+            diskAudioStopAtTrackEnd = false;
+            diskAudioStreaming = false;
+            diskDriveState = 4;
+            view.setUint32(mmio + 0x6020, 0, false);
+            deviceEvents.set("diskStopMotor", (deviceEvents.get("diskStopMotor") ?? 0) + 1);
+            break;
+          case 0xe4:
+            diskAudioEnabled = ((command0 >>> 16) & 1) !== 0;
+            diskAudioBufferLength = command0 & 0x0f;
+            if (!diskAudioEnabled) {
+              diskAudioStopAtTrackEnd = false;
+              diskAudioStreaming = false;
+            }
+            details = {
+              enabled: diskAudioEnabled,
+              bufferLength: diskAudioBufferLength,
+            };
+            deviceEvents.set(
+              "diskAudioConfig",
+              (deviceEvents.get("diskAudioConfig") ?? 0) + 1
+            );
+            break;
+          default:
+            diskLastError = diErrorInvalidCommand;
+            transfer.interruptStatus = diDeviceErrorInterrupt;
+            details = { reason: "unsupported-opcode" };
+            deviceEvents.set(
+              "diskUnsupportedCommand",
+              (deviceEvents.get("diskUnsupportedCommand") ?? 0) + 1
+            );
+            break;
+        }
+        diskTransfer = transfer;
+      }
+
+      recordDiskCommand(observedCycles, diskTransfer, {
+        command0: "0x" + command0.toString(16).padStart(8, "0"),
+        command1: "0x" + command1.toString(16).padStart(8, "0"),
+        command2: "0x" + command2.toString(16).padStart(8, "0"),
+        ...details,
+      });
+    }
+
     function serviceDisk(observedCycles) {
       let control = view.getUint32(mmio + 0x601c, false);
       if (diskTransfer === null && (control & 1) !== 0) {
-        const command0 = view.getUint32(mmio + 0x6008, false);
-        const opcode = command0 >>> 24;
-        const dmaBase = view.getUint32(mmio + 0x6014, false);
-        const dmaLength = view.getUint32(mmio + 0x6018, false);
-        if (opcode === 0x12) {
-          const target = ramPointer(dmaBase, dmaLength);
-          check(target !== null && dmaLength === 32, "invalid DI identify DMA target");
-          bytes.set([
-            0x00, 0x00, 0x00, 0x00,
-            0x20, 0x02, 0x04, 0x02,
-            0x61, 0x00, 0x00, 0x00,
-          ], target);
-          bytes.fill(0, target + 12, target + dmaLength);
-          diskTransfer = { opcode, completionCycle: observedCycles + 10000, ready: true };
-          deviceEvents.set("diskIdentify", (deviceEvents.get("diskIdentify") ?? 0) + 1);
-        } else if (opcode === 0xa8) {
-          const offset = view.getUint32(mmio + 0x600c, false) * 4;
-          const length = view.getUint32(mmio + 0x6010, false);
-          const target = ramPointer(dmaBase, dmaLength);
-          check(target !== null && dmaLength === length, "invalid DI read DMA target");
-          const transfer = {
-            opcode,
-            offset,
-            length,
-            dmaBase,
-            completionCycle: observedCycles + 10000,
-            ready: false,
-            error: null,
-            data: null,
-            promise: null,
-            waited: false,
-          };
-          diskTransfer = transfer;
-          deviceEvents.set("diskRead", (deviceEvents.get("diskRead") ?? 0) + 1);
-          transfer.promise = Promise.resolve()
-            .then(() => {
-              if (discSource === null) throw new Error("disc read requested without a disc source");
-              return discSource.read(offset, length);
-            })
-            .then(data => {
-              if (diskTransfer !== transfer) return;
-              if (data.length !== length) throw new Error("short browser disc read");
-              transfer.data = data;
-              transfer.ready = true;
-            })
-            .catch(error => {
-              transfer.error = String(error?.message ?? error);
-              transfer.ready = true;
-            });
-        }
+        beginDiskCommand(observedCycles);
       }
 
       if (
@@ -4706,39 +4957,33 @@ const TEMPLATE: &str = r##"<!doctype html>
         view.setUint32(mmio + 0x6018, 0, false);
         view.setUint32(
           mmio + 0x6000,
-          view.getUint32(mmio + 0x6000, false) | 0x10,
+          view.getUint32(mmio + 0x6000, false) | diskTransfer.interruptStatus,
           false
         );
+        if (diskTransfer.interruptStatus === diDeviceErrorInterrupt) {
+          deviceEvents.set(
+            "diskDeviceError",
+            (deviceEvents.get("diskDeviceError") ?? 0) + 1
+          );
+        }
         deviceEvents.set("diskComplete", (deviceEvents.get("diskComplete") ?? 0) + 1);
         diskTransfer = null;
-        diskInterruptDelivered = false;
       }
 
-      let status = view.getUint32(mmio + 0x6000, false);
-      let active = ((status & 0x04) !== 0 && (status & 0x02) !== 0)
-        || ((status & 0x10) !== 0 && (status & 0x08) !== 0)
-        || ((status & 0x40) !== 0 && (status & 0x20) !== 0);
-      let cause = view.getUint32(mmio + 0x3000, false);
-      cause = active ? cause | 0x00000004 : cause & ~0x00000004;
-      view.setUint32(mmio + 0x3000, cause, false);
+      const active = recomputeDiskInterruptLevel();
 
       const mask = view.getUint32(mmio + 0x3004, false);
       const msr = view.getUint32(cpu + msrOffset, true);
-      if (active && (mask & 0x00000004) !== 0 && (msr & 0x00008000) !== 0) {
-        if (!diskInterruptDelivered) {
-          diskInterruptDelivered = true;
-          deviceEvents.set(
-            "diskInterrupt",
-            (deviceEvents.get("diskInterrupt") ?? 0) + 1
-          );
-          raiseException(cpu, 0x0500);
-        } else {
-          status &= ~0x54;
-          view.setUint32(mmio + 0x6000, status, false);
-          view.setUint32(mmio + 0x3000, cause & ~0x00000004, false);
-          diskInterruptDelivered = false;
-          active = false;
-        }
+      if (
+        active
+        && (mask & piDiskInterruptCause) !== 0
+        && (msr & 0x00008000) !== 0
+      ) {
+        deviceEvents.set(
+          "diskInterrupt",
+          (deviceEvents.get("diskInterrupt") ?? 0) + 1
+        );
+        raiseException(cpu, 0x0500);
       }
     }
 
@@ -5297,6 +5542,23 @@ const TEMPLATE: &str = r##"<!doctype html>
           bytes: diskReadBytes,
           hashedBytes: diskHashedBytes,
           hash: "0x" + diskReadHash.toString(16).padStart(8, "0"),
+        },
+        diskCommands: {
+          counts: Object.fromEntries(diskCommandCounts),
+          lastError: "0x" + diskLastError.toString(16).padStart(8, "0"),
+          driveState: diskDriveState,
+          trace: diskCommandTrace,
+          audio: {
+            enabled: diskAudioEnabled,
+            bufferLength: diskAudioBufferLength,
+            streaming: diskAudioStreaming,
+            stopAtTrackEnd: diskAudioStopAtTrackEnd,
+            position: diskAudioPosition,
+            start: diskAudioStart,
+            length: diskAudioLength,
+            nextStart: diskAudioNextStart,
+            nextLength: diskAudioNextLength,
+          },
         },
         controller: {
           sequence: controllerSequence,
