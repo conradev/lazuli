@@ -1,0 +1,284 @@
+{
+  "schema": "lazuli-browser-boot-checkpoint-v1",
+  "algorithm": "sha256",
+  "fields": [
+    "/status",
+    "/stage",
+    "/title",
+    "/disc/identifier",
+    "/disc/revision",
+    "/limits/cycles",
+    "/limits/dispatches",
+    "/cycles",
+    "/instructions",
+    "/dispatches",
+    "/pc",
+    "/cpuState/pc",
+    "/cpuState/msr",
+    "/cpuState/lr",
+    "/cpuState/ctr",
+    "/cpuState/srr0",
+    "/cpuState/srr1",
+    "/cpuState/gpr",
+    "/cpuState/signature",
+    "/guestGame",
+    "/execution/scheduler/renderEvery",
+    "/execution/scheduler/rendererSync/posted",
+    "/execution/scheduler/rendererSync/acknowledged",
+    "/execution/scheduler/rendererSync/failed",
+    "/execution/scheduler/rendererSync/inFlight",
+    "/execution/scheduler/rendererSync/highWater",
+    "/execution/scheduler/rendererSync/resultMisses",
+    "/gxFifo/bytes",
+    "/gxFifo/hash",
+    "/gxFifo/decoder/commands",
+    "/gxFifo/decoder/cpLoads",
+    "/gxFifo/decoder/xfLoads",
+    "/gxFifo/decoder/indexedXfLoads",
+    "/gxFifo/decoder/bpLoads",
+    "/gxFifo/decoder/displayLists",
+    "/gxFifo/decoder/displayListBytes",
+    "/gxFifo/decoder/primitives",
+    "/gxFifo/decoder/vertices",
+    "/gxFifo/decoder/unknownOpcodes",
+    "/gxFifo/decoder/xfbCopyCount",
+    "/gxFifo/decoder/textureCopyCount",
+    "/diskReads/hashedBytes",
+    "/diskReads/hash",
+    "/exceptions/counts",
+    "/controller/pendingButtons",
+    "/controller/lastPolledButtons",
+    "/controller/guestPad",
+    "/mmioState/viInterruptModel/presentationCount",
+    "/mmioState/viInterruptModel/lastPresentationCycle",
+    "/mmioState/viInterruptModel/lastPresentationField",
+    "/mmioState/viInterruptModel/lastPresentationAddress"
+  ],
+  "id": "smb-usa/no-input/cycles-1500000000/render-every-1",
+  "game": {
+    "title": "Super Monkey Ball (GMBE8P Rev.00)",
+    "identifier": "GMBE8P",
+    "revision": 0,
+    "image": {
+      "algorithm": "sha256",
+      "format": "ciso",
+      "sha256": "441a0eadc85afb501e2a3db5af2ee81d4783b96a58f6a2df2605f5c33dcb6202"
+    }
+  },
+  "checkpoint": {
+    "status": "paused",
+    "stage": "cycle-limit",
+    "limits": {
+      "cycles": 1500000000,
+      "dispatches": null
+    },
+    "cycles": 1500000000,
+    "pc": "0x800c90e0"
+  },
+  "run": {
+    "cleanRunsRequired": 3,
+    "cycles": 1500000000,
+    "inputs": [],
+    "renderEvery": 1,
+    "renderer": "wgpu-webgpu"
+  },
+  "sha256": "a2b8a34b7ae54b7b082dff62001aa12c9d48be0c04f507989ad33863c824b4eb",
+  "state": {
+    "status": "paused",
+    "stage": "cycle-limit",
+    "title": "Super Monkey Ball (GMBE8P Rev.00)",
+    "disc": {
+      "identifier": "GMBE8P",
+      "revision": 0
+    },
+    "limits": {
+      "cycles": 1500000000,
+      "dispatches": null
+    },
+    "cycles": 1500000000,
+    "instructions": 227341066,
+    "dispatches": 20393752,
+    "pc": "0x800c90e0",
+    "cpuState": {
+      "pc": "0x800c90e0",
+      "msr": "0x00009032",
+      "lr": "0x800c90e0",
+      "ctr": "0x00000000",
+      "srr0": "0x800c90e0",
+      "srr1": "0x00009032",
+      "gpr": {
+        "r0": "0x00000000",
+        "r1": "0x80306c20",
+        "r10": "0x00001000",
+        "r11": "0x00000000",
+        "r12": "0x00000000",
+        "r13": "0x802f81e0",
+        "r14": "0x00000000",
+        "r15": "0x00000000",
+        "r16": "0x00000000",
+        "r17": "0x00000000",
+        "r18": "0x00000000",
+        "r19": "0x00000000",
+        "r2": "0x802fa800",
+        "r20": "0x00000000",
+        "r21": "0x00000000",
+        "r22": "0x00000000",
+        "r23": "0x00000000",
+        "r24": "0x00000000",
+        "r25": "0x00000000",
+        "r26": "0x00000000",
+        "r27": "0x00000000",
+        "r28": "0x00000000",
+        "r29": "0x00000000",
+        "r3": "0x00000000",
+        "r30": "0x00000000",
+        "r31": "0x802c6e78",
+        "r4": "0x00009032",
+        "r5": "0x00000000",
+        "r6": "0x00001032",
+        "r7": "0x00000000",
+        "r8": "0xfffffff4",
+        "r9": "0x0000000c"
+      },
+      "signature": "0xcc536b5b"
+    },
+    "guestGame": {
+      "gamePauseStatusAddress": "0x802f1ee0",
+      "gameSubmodeAddress": "0x802f1b8e",
+      "gameSubmodeRequestAddress": "0x802f1b8c",
+      "modeControl": "0x801eec20",
+      "pauseStatus": "0x00000000",
+      "playRequested": false,
+      "readyMain": false,
+      "readyPauseGateActive": false,
+      "submode": 6,
+      "submodeRequest": -1,
+      "submodeTimer": 0
+    },
+    "execution": {
+      "scheduler": {
+        "renderEvery": 1,
+        "rendererSync": {
+          "posted": 328,
+          "acknowledged": 328,
+          "failed": 0,
+          "inFlight": 0,
+          "highWater": 1,
+          "resultMisses": 0
+        }
+      }
+    },
+    "gxFifo": {
+      "bytes": 1437615,
+      "hash": "0x63f324ac",
+      "decoder": {
+        "commands": 171886,
+        "cpLoads": 1733,
+        "xfLoads": 1870,
+        "indexedXfLoads": 0,
+        "bpLoads": 143894,
+        "displayLists": 0,
+        "displayListBytes": 0,
+        "primitives": 15268,
+        "vertices": 30816,
+        "unknownOpcodes": 0,
+        "xfbCopyCount": 143,
+        "textureCopyCount": 0
+      }
+    },
+    "diskReads": {
+      "hashedBytes": 1048576,
+      "hash": "0x691e18d1"
+    },
+    "exceptions": {
+      "counts": {
+        "0x0500": 3541,
+        "0x0800": 764,
+        "0x0c00": 1175
+      }
+    },
+    "controller": {
+      "pendingButtons": 0,
+      "lastPolledButtons": 0,
+      "guestPad": {
+        "controllerInfo": "0x801f3b70",
+        "held": {
+          "address": "0x801f3b70",
+          "analogA": 0,
+          "analogB": 0,
+          "buttons": 0,
+          "cStickX": 0,
+          "cStickY": 0,
+          "error": 0,
+          "stickX": 0,
+          "stickY": 0,
+          "triggerL": 0,
+          "triggerR": 0
+        },
+        "pressed": {
+          "address": "0x801f3b88",
+          "analogA": 0,
+          "analogB": 0,
+          "buttons": 0,
+          "cStickX": 0,
+          "cStickY": 0,
+          "error": 0,
+          "stickX": 0,
+          "stickY": 0,
+          "triggerL": 0,
+          "triggerR": 0
+        },
+        "previous": {
+          "address": "0x801f3b7c",
+          "analogA": 0,
+          "analogB": 0,
+          "buttons": 0,
+          "cStickX": 0,
+          "cStickY": 0,
+          "error": 0,
+          "stickX": 0,
+          "stickY": 0,
+          "triggerL": 0,
+          "triggerR": 0
+        },
+        "released": {
+          "address": "0x801f3b94",
+          "analogA": 0,
+          "analogB": 0,
+          "buttons": 0,
+          "cStickX": 0,
+          "cStickY": 0,
+          "error": 0,
+          "stickX": 0,
+          "stickY": 0,
+          "triggerL": 0,
+          "triggerR": 0
+        },
+        "repeat": {
+          "address": "0x801f3ba0",
+          "analogA": 0,
+          "analogB": 0,
+          "buttons": 0,
+          "cStickX": 0,
+          "cStickY": 0,
+          "error": 0,
+          "stickX": 0,
+          "stickY": 0,
+          "triggerL": 0,
+          "triggerR": 0
+        }
+      }
+    },
+    "mmioState": {
+      "viInterruptModel": {
+        "presentationCount": 185,
+        "lastPresentationCycle": 1493528434,
+        "lastPresentationField": "top",
+        "lastPresentationAddress": "0x00392c80"
+      }
+    }
+  },
+  "consensus": {
+    "cleanRuns": 3
+  }
+}
