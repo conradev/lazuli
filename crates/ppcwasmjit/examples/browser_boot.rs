@@ -1385,7 +1385,6 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxFrameDrawVertices = 0;
     let gxFrameSkippedPrimitives = 0;
     let gxCollectFrameGeometry = true;
-    const gxFrameVertexLimit = 20_000;
     let gxXfbCopyCount = 0;
     let gxTextureCopyCount = 0;
     let gxTextureCopyFramesPresented = 0;
@@ -1412,6 +1411,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxVertexDecodeErrors = 0;
     let gxUnknownOpcodes = 0;
     let gxTextureDecodes = 0;
+    gxBpRegisters[0xf3] = 0x003f0000;
     let gxTextureCacheHits = 0;
     let gxTextureDecodedBytes = 0;
     let gxTextureDecodeErrors = 0;
@@ -2789,8 +2789,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         return null;
       }
       const scissorOffset = gxBpRegisters[0x59];
-      const scissorX = (scissorOffset >>> 10) & 0x3ff;
-      const scissorY = scissorOffset & 0x3ff;
+      const scissorX = scissorOffset & 0x3ff;
+      const scissorY = (scissorOffset >>> 10) & 0x3ff;
       return [
         clipX / clipW * viewport[0] + viewport[3] - scissorX * 2,
         clipY / clipW * viewport[1] + viewport[4] - scissorY * 2,
@@ -2951,10 +2951,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         textureMatrices = decoded.textureMatrices;
       }
       if (!complete || vertices.length === 0) return;
-      if (gxFrameDrawVertices + vertexCount > gxFrameVertexLimit) {
-        gxDroppedVertices += vertexCount;
-        return;
-      }
       gxFrameDrawVertices += vertexCount;
       const textureResult = gxTextureForDraw(vertices, texCoordSets);
       const texCoordIndex = textureResult?.texCoordIndex
@@ -3210,6 +3206,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           commandBytes = 9;
         } else if (opcode === 0x61) {
           commandBytes = 5;
+        clipW,
         } else if ((opcode & 0xc0) === 0x80) {
           if (end - offset < 3) break;
           const vertices = gxReadU16(source, offset + 1);
@@ -3354,6 +3351,43 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMailQueue.length = 0;
       dspCurrentMail = null;
       dspCpuMailbox = 0;
+    function gxDrawPipelineState() {
+      const topLeft = gxBpRegisters[0x20] >>> 0;
+      const bottomRight = gxBpRegisters[0x21] >>> 0;
+      const offset = gxBpRegisters[0x59] >>> 0;
+      const topLeftX = Math.max(0, ((topLeft >>> 12) & 0x7ff) - 342);
+      const topLeftY = Math.max(0, (topLeft & 0x7ff) - 342);
+      const width = Math.max(
+        0,
+        ((bottomRight >>> 12) & 0x7ff) - ((topLeft >>> 12) & 0x7ff)
+      ) + 1;
+      const height = Math.max(
+        0,
+        (bottomRight & 0x7ff) - (topLeft & 0x7ff)
+      ) + 1;
+      const offsetX = (offset & 0x3ff) * 2 - 342;
+      const offsetY = ((offset >>> 10) & 0x3ff) * 2 - 342;
+      const scissorX = Math.min(640, Math.max(0, topLeftX - offsetX));
+      const scissorY = Math.min(528, Math.max(0, topLeftY - offsetY));
+      return {
+        zMode: gxBpRegisters[0x40] >>> 0,
+        blendMode: gxBpRegisters[0x41] >>> 0,
+        alphaTest: gxBpRegisters[0xf3] >>> 0,
+        cullMode: (gxBpRegisters[0x00] >>> 14) & 3,
+        scissorX,
+        scissorY,
+        scissorWidth: Math.min(width, 640 - scissorX),
+        scissorHeight: Math.min(height, 528 - scissorY),
+      };
+    }
+
+    function gxDrawTexCoords(textureResult, selectedTexCoords) {
+      // Missing or unusable texcoords make gxTextureForDraw deliberately
+      // return null. Keep those primitives untextured instead of forwarding
+      // one null placeholder per vertex as a malformed UV array.
+      return textureResult === null ? [] : selectedTexCoords.flat();
+    }
+
       dspRomParameter = null;
       dspMode = "rom";
       dspUcodeBooted = false;
