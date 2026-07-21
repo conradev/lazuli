@@ -21,8 +21,8 @@ use crate::{
     EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState, SamplerIdentity,
     SelectedTexture, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
     clipped_copy_extent, decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state,
-    gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy,
-    rgba8_texture_byte_len, select_texture, xfb_source_rect,
+    gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture, rgba8_texture_byte_len,
+    select_texture, xfb_copy_matches_selection, xfb_source_rect,
 };
 
 const PRESENT_SHADER: &str = "
@@ -794,26 +794,28 @@ impl WebGpuRenderer {
     pub fn present_xfb(
         &mut self,
         selected_address: u32,
+        expected_generation: u32,
+        selected_row: u32,
         output_width: u32,
         output_height: u32,
     ) -> Result<bool, JsValue> {
         self.ensure_healthy()?;
-        if selected_address == 0 {
+        if selected_address == 0 || expected_generation == 0 {
             return Ok(false);
         }
-        let Some((texture_view, cached_width, cached_height, selected_row)) = ({
-            let entries = self.xfb_cache.values().collect::<Vec<_>>();
-            let metadata = entries.iter().map(|copy| copy.metadata).collect::<Vec<_>>();
-            resolve_xfb_copy(&metadata, selected_address).map(|(index, row)| {
-                let copy = entries[index];
-                (
-                    copy.view.clone(),
-                    copy.output_width,
-                    copy.output_height,
-                    row,
+        let Some((texture_view, cached_width, cached_height)) = self
+            .xfb_cache
+            .values()
+            .find(|copy| {
+                xfb_copy_matches_selection(
+                    copy.metadata,
+                    selected_address,
+                    expected_generation,
+                    selected_row,
                 )
             })
-        }) else {
+            .map(|copy| (copy.view.clone(), copy.output_width, copy.output_height))
+        else {
             return Ok(false);
         };
         let Some(rect) = xfb_source_rect(selected_row, cached_height) else {

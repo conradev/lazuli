@@ -4970,10 +4970,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       const cyclesPerHalfLine = cyclesPerSample * hlw;
       const oddHalfLines = 3 * equ + oddPrb + 2 * acv + oddPsb;
       const evenHalfLines = 3 * equ + evenPrb + 2 * acv + evenPsb;
-      const totalHalfLines = oddHalfLines + evenHalfLines;
+      const singleField = (displayControl & 4) !== 0;
+      const totalHalfLines = oddHalfLines + (singleField ? 0 : evenHalfLines);
       const valid = hlw !== 0
         && oddHalfLines !== 0
-        && evenHalfLines !== 0
+        && (singleField || evenHalfLines !== 0)
         && Number.isSafeInteger(cyclesPerHalfLine)
         && cyclesPerHalfLine > 0;
       return {
@@ -4995,6 +4996,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           clock: "0x" + clock.toString(16).padStart(4, "0"),
         },
         displayEnabled: (displayControl & 1) !== 0,
+        singleField,
         equ,
         acv,
         hlw,
@@ -5017,6 +5019,8 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function viActiveFieldTargets(timing) {
       const top = 3 * timing.equ + timing.oddPrb;
+      const topTarget = { field: "top", halfLine: top, registerOffset: 0x201c };
+      if (timing.singleField) return [topTarget];
       const topEnd = top + 2 * timing.acv;
       // Match the VI's odd/even PSB pacing adjustment when determining the
       // first active half-line of the bottom field.
@@ -5029,7 +5033,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         unwrappedBottom % timing.totalHalfLines + timing.totalHalfLines
       ) % timing.totalHalfLines;
       return [
-        { field: "top", halfLine: top, registerOffset: 0x201c },
+        topTarget,
         { field: "bottom", halfLine: bottom, registerOffset: 0x2024 },
       ];
     }
@@ -5272,7 +5276,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         const frame = gxXfbCopies[index];
         if (!frame.captured) continue;
         const row = gxXfbCopyRowOffset(frame, address);
-        if (row !== null) return { frame, row };
+        if (row !== null && row <= 1) return { frame, row };
       }
       return null;
     }
@@ -5303,6 +5307,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             width: dimensions.width,
             height: dimensions.height,
             copyIndex: resolved?.frame.index ?? 0,
+            copyRow: resolved?.row ?? 0,
           });
           gxFramesPresented += 1;
           viPresentationCount += 1;
@@ -7943,6 +7948,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         return handleRendererFrame(message, () =>
           webGpuRenderer.present_xfb(
             frame.address,
+            frame.copyIndex,
+            frame.copyRow,
             Math.max(0, Math.min(1024, frame.width)),
             Math.max(0, Math.min(1024, frame.height))
           ),
@@ -7953,6 +7960,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           document.body.dataset.viField = frame.field;
           document.body.dataset.viXfbAddress =
             "0x" + frame.address.toString(16).padStart(8, "0");
+          document.body.dataset.viCopyIndex = String(frame.copyIndex);
+          document.body.dataset.viCopyRow = String(frame.copyRow);
           document.body.dataset.viFields = String(
             Number(document.body.dataset.viFields ?? 0) + 1
           );

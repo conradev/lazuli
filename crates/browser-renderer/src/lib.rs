@@ -327,6 +327,11 @@ pub(crate) struct XfbCopyMetadata {
     pub generation: u32,
 }
 
+// TFBL/BFBL may select adjacent scanlines of one retained XFB.  Larger
+// address deltas can also look like rows of an unrelated double buffer; a
+// texture-only presentation cannot represent those aliases safely.
+const MAX_XFB_FIELD_ROW_OFFSET: u32 = 1;
+
 pub(crate) fn xfb_row_offset(copy: XfbCopyMetadata, address: u32) -> Option<u32> {
     let delta = address.checked_sub(copy.destination)?;
     if copy.stride == 0 || delta % copy.stride != 0 {
@@ -337,6 +342,19 @@ pub(crate) fn xfb_row_offset(copy: XfbCopyMetadata, address: u32) -> Option<u32>
     (row < copy.height).then_some(row)
 }
 
+pub(crate) fn xfb_copy_matches_selection(
+    copy: XfbCopyMetadata,
+    address: u32,
+    generation: u32,
+    row: u32,
+) -> bool {
+    generation != 0
+        && copy.generation == generation
+        && row <= MAX_XFB_FIELD_ROW_OFFSET
+        && xfb_row_offset(copy, address) == Some(row)
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_xfb_copy(copies: &[XfbCopyMetadata], address: u32) -> Option<(usize, u32)> {
     copies
         .iter()
@@ -352,13 +370,14 @@ pub(crate) fn resolve_xfb_copy(copies: &[XfbCopyMetadata], address: u32) -> Opti
                 .filter_map(|(index, copy)| {
                     xfb_row_offset(copy, address).map(|row| (index, row, copy.generation))
                 })
+                .filter(|(_, row, _)| *row <= MAX_XFB_FIELD_ROW_OFFSET)
                 .max_by_key(|(_, _, generation)| *generation)
                 .map(|(index, row, _)| (index, row))
         })
 }
 
 pub(crate) fn xfb_source_rect(row: u32, height: u32) -> Option<[f32; 4]> {
-    if height == 0 || row >= height {
+    if height == 0 || row > MAX_XFB_FIELD_ROW_OFFSET || row >= height {
         return None;
     }
 
@@ -408,7 +427,8 @@ mod tests {
         SelectedTexture, TextureAddressMode, XfbCopyMetadata, alpha_compare, alpha_test_passes,
         clipped_copy_extent, decoded_texture_cache_hit, decoded_texture_is_available,
         gx_blend_state, gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture,
-        resolve_xfb_copy, select_texture, valid_rgba8_texture, xfb_row_offset, xfb_source_rect,
+        resolve_xfb_copy, select_texture, valid_rgba8_texture, xfb_copy_matches_selection,
+        xfb_row_offset, xfb_source_rect,
     };
 
     const BASE: u32 = 0x0120_0000;
@@ -451,6 +471,32 @@ mod tests {
     }
 
     #[test]
+    fn vi_rejects_deep_row_aliases_between_retained_double_buffers() {
+        const SMB_HEIGHT: u32 = 448;
+        let copies = [XfbCopyMetadata {
+            destination: 0x0030_7180,
+            stride: STRIDE,
+            height: SMB_HEIGHT,
+            generation: 12,
+        }];
+
+        assert_eq!(0x0039_2c80 - 0x0030_7180, (SMB_HEIGHT - 1) * STRIDE);
+        assert_eq!(resolve_xfb_copy(&copies, 0x0039_2c80), None);
+        assert_eq!(xfb_source_rect(SMB_HEIGHT - 1, SMB_HEIGHT), None);
+    }
+
+    #[test]
+    fn xfb_presentation_requires_the_worker_selected_generation_and_field_row() {
+        let copy = copy(BASE, 12);
+        assert!(xfb_copy_matches_selection(copy, BASE, 12, 0));
+        assert!(xfb_copy_matches_selection(copy, BASE + STRIDE, 12, 1));
+        assert!(!xfb_copy_matches_selection(copy, BASE, 11, 0));
+        assert!(!xfb_copy_matches_selection(copy, BASE, 0, 0));
+        assert!(!xfb_copy_matches_selection(copy, BASE + STRIDE, 12, 0));
+        assert!(!xfb_copy_matches_selection(copy, BASE + STRIDE * 2, 12, 2));
+    }
+
+    #[test]
     fn xfb_source_rect_starts_at_the_selected_vi_row() {
         let assert_rect = |actual: [f32; 4], expected: [f32; 4]| {
             for (actual, expected) in actual.into_iter().zip(expected) {
@@ -462,8 +508,7 @@ mod tests {
         let bottom = xfb_source_rect(1, 480).unwrap();
         assert_rect(bottom, [0.0, 1.0 / 480.0, 1.0, 479.0 / 480.0]);
 
-        let final_row = xfb_source_rect(479, 480).unwrap();
-        assert_rect(final_row, [0.0, 479.0 / 480.0, 1.0, 1.0 / 480.0]);
+        assert_eq!(xfb_source_rect(479, 480), None);
     }
 
     #[test]
