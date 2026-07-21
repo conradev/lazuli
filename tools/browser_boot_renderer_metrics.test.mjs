@@ -216,8 +216,15 @@ test("renderer performance waits for queued work without accounting itself", asy
 
 test("terminal capture snapshots metrics before its serialized XFB readback", async () => {
   const calls = [];
+  const originalTemporalFrames = [];
+  const replacementTemporalFrames = [{
+    ordinal: 1,
+    presentation: {},
+    selectedXfb: null,
+  }];
   let release;
-  const context = {
+  let context;
+  context = {
     Promise,
     rendererOperationTail: new Promise(resolve => { release = resolve; }),
     snapshotRendererPerformance() {
@@ -226,8 +233,15 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
     },
     async readSelectedXfb() {
       calls.push("read");
+      context.temporalSelectedXfbFrames = replacementTemporalFrames;
       return { rgbaSha256: "abc" };
     },
+    summarizeTemporalSelectedXfb(frames) {
+      calls.push("temporal");
+      return { captured: frames.length, capacity: 8 };
+    },
+    temporalSelectedXfbCapacity: 8,
+    temporalSelectedXfbFrames: originalTemporalFrames,
   };
   vm.createContext(context);
   vm.runInContext(
@@ -244,8 +258,13 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
   assert.deepEqual(JSON.parse(JSON.stringify(await pending)), {
     metrics: { calls: 17 },
     selectedXfb: { rgbaSha256: "abc" },
+    temporalSelectedXfb: {
+      capacity: 8,
+      frames: [],
+      oracle: { captured: 0, capacity: 8 },
+    },
   });
-  assert.deepEqual(calls, ["metrics", "read"]);
+  assert.deepEqual(calls, ["metrics", "read", "temporal"]);
 });
 
 test("headless capture uses one awaited terminal diagnostic", () => {

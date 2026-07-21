@@ -896,6 +896,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererFrameResultMisses = 0;
     let rendererFailure = null;
     let rendererResidentTextureKeys = new Set();
+    const smbTemporalXfbCaptureCapacity = 8;
+    let smbTemporalXfbCapturesPosted = 0;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -1080,6 +1082,22 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
     });
+
+    function claimSmbTemporalXfbCapture() {
+      const step = controllerScenario?.definition.steps[controllerScenario.stepIndex] ?? null;
+      if (
+        controllerScenario?.id !== "smb-ready-play"
+        || step?.id !== "post-play-presented"
+        || smbTemporalXfbCapturesPosted >= smbTemporalXfbCaptureCapacity
+      ) return null;
+      smbTemporalXfbCapturesPosted += 1;
+      return {
+        scenario: controllerScenario.id,
+        step: step.id,
+        ordinal: smbTemporalXfbCapturesPosted,
+        capacity: smbTemporalXfbCaptureCapacity,
+      };
+    }
 
     function postRendererFrame(type, frame, transfer = []) {
       const rendererSequence = ++rendererFrameSequence;
@@ -2463,6 +2481,8 @@ const TEMPLATE: &str = r##"<!doctype html>
                 && sample.xfbCaptured === true
                 && sample.xfbCapturedAtCycle > playCycle
                 && sample.xfbDisplayedAtCycle > playCycle
+                && sample.temporalXfbCapturesPosted
+                  >= sample.temporalXfbCaptureCapacity
                 && sample.rendererFramesAcknowledged > playState.rendererFramesAcknowledged
                 && sample.rendererFramesInFlight === 0
                 && sample.rendererFailed === false;
@@ -6150,6 +6170,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         xfbCaptured: lastPresentedCopy?.captured ?? null,
         xfbCapturedAtCycle: lastPresentedCopy?.capturedAtCycle ?? null,
         xfbDisplayedAtCycle: lastPresentedCopy?.displayedAtCycle ?? null,
+        temporalXfbCaptureCapacity: smbTemporalXfbCaptureCapacity,
+        temporalXfbCapturesPosted: smbTemporalXfbCapturesPosted,
         rendererFramesAcknowledged,
         rendererFramesInFlight: rendererFramesInFlight.size,
         rendererFailed: rendererFailure !== null,
@@ -6661,6 +6683,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           const address = viXfbAddress(target.registerOffset);
           const dimensions = viOutputDimensions();
           const resolved = gxResolveXfbCopy(address);
+          const temporalXfbCapture = claimSmbTemporalXfbCapture();
           if (resolved !== null) {
             resolved.frame.displayed = true;
             resolved.frame.displayedAtCycle = scheduledCycle;
@@ -6674,6 +6697,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             height: dimensions.height,
             copyIndex: resolved?.frame.index ?? 0,
             copyRow: resolved?.row ?? 0,
+            ...(temporalXfbCapture === null ? {} : { temporalXfbCapture }),
           });
           gxFramesPresented += 1;
           viPresentationCount += 1;
@@ -8763,9 +8787,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     let rendererHostMetrics = newRendererHostMetrics();
     let rendererWorkerStartedAt = performance.now();
+    const temporalSelectedXfbCapacity = 8;
+    let temporalSelectedXfbFrames = [];
     function resetRendererHostMetrics() {
       rendererHostMetrics = newRendererHostMetrics();
       rendererWorkerStartedAt = performance.now();
+      temporalSelectedXfbFrames = [];
     }
     let rendererOperationTail = Promise.resolve();
     function appendRendererOperation(operation) {
@@ -8791,6 +8818,25 @@ const TEMPLATE: &str = r##"<!doctype html>
     async function sha256Hex(bytes) {
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
       return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+    }
+    function presentedXfbRgbBytes(rgba, width, height) {
+      if (
+        !(rgba instanceof Uint8Array)
+        || !Number.isSafeInteger(width)
+        || !Number.isSafeInteger(height)
+        || width <= 0
+        || height <= 0
+        || rgba.byteLength !== width * height * 4
+      ) {
+        throw new Error("WebGPU XFB readback has an invalid tight RGBA8 layout");
+      }
+      const rgb = new Uint8Array(width * height * 3);
+      for (let source = 0, destination = 0; source < rgba.byteLength; source += 4) {
+        rgb[destination++] = rgba[source];
+        rgb[destination++] = rgba[source + 1];
+        rgb[destination++] = rgba[source + 2];
+      }
+      return rgb;
     }
     function summarizePresentedXfbRgba(rgba, width, height) {
       if (
@@ -8830,7 +8876,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       const width = Number(capture.width);
       const height = Number(capture.height);
       const rgb = summarizePresentedXfbRgba(rgba, width, height);
-      const rgbaSha256 = await sha256Hex(rgba);
+      const [rgbaSha256, rgbSha256] = await Promise.all([
+        sha256Hex(rgba),
+        sha256Hex(presentedXfbRgbBytes(rgba, width, height)),
+      ]);
       return {
         address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
         generation: Number(capture.generation),
@@ -8848,7 +8897,148 @@ const TEMPLATE: &str = r##"<!doctype html>
         displayHeight: Number(capture.displayHeight),
         rgbaByteLength: rgba.byteLength,
         rgbaSha256,
+        rgbSha256,
         rgb,
+      };
+    }
+    async function captureTemporalSelectedXfb(
+      message,
+      presented,
+      frames = temporalSelectedXfbFrames
+    ) {
+      const rendererSequence = Number(message.rendererSequence);
+      const frame = message.frame;
+      const request = frame?.temporalXfbCapture;
+      const ordinal = Number(request?.ordinal);
+      const capacity = Number(request?.capacity);
+      const address = Number(frame?.address);
+      const copyIndex = Number(frame?.copyIndex);
+      const copyRow = Number(frame?.copyRow);
+      const width = Number(frame?.width);
+      const height = Number(frame?.height);
+      if (
+        message?.type !== "vi-present"
+        || request?.scenario !== "smb-ready-play"
+        || request?.step !== "post-play-presented"
+        || typeof presented !== "boolean"
+        || !Number.isSafeInteger(rendererSequence)
+        || !Number.isSafeInteger(ordinal)
+        || ordinal !== frames.length + 1
+        || capacity !== temporalSelectedXfbCapacity
+        || frames.length >= temporalSelectedXfbCapacity
+        || (frame?.field !== "top" && frame?.field !== "bottom")
+        || !Number.isSafeInteger(address)
+        || address < 0
+        || address > 0xffff_ffff
+        || !Number.isSafeInteger(copyIndex)
+        || copyIndex < 0
+        || !Number.isSafeInteger(copyRow)
+        || copyRow < 0
+        || copyRow > 1
+        || !Number.isSafeInteger(width)
+        || width <= 0
+        || width > 1024
+        || !Number.isSafeInteger(height)
+        || height <= 0
+        || height > 1024
+      ) {
+        throw new Error("invalid temporal selected-XFB capture request");
+      }
+      const selectedXfb = await readSelectedXfb();
+      const capture = {
+        scenario: request.scenario,
+        step: request.step,
+        ordinal,
+        rendererSequence,
+        presentation: {
+          selected: Boolean(presented),
+          field: frame.field,
+          address: "0x" + address.toString(16).padStart(8, "0"),
+          copyIndex,
+          copyRow,
+          width,
+          height,
+        },
+        selectedXfb,
+      };
+      frames.push(capture);
+      return capture;
+    }
+    function summarizeTemporalSelectedXfb(frames) {
+      const classified = frames.map(frame => {
+        const selected = frame.selectedXfb;
+        const pixels = selected === null ? 0 : selected.width * selected.height;
+        const matchesPresentation = selected !== null
+          && selected.address === frame.presentation.address
+          && selected.generation === frame.presentation.copyIndex
+          && selected.row === frame.presentation.copyRow
+          && selected.displayWidth === frame.presentation.width
+          && selected.displayHeight === frame.presentation.height;
+        return {
+          ordinal: frame.ordinal,
+          rendererSequence: frame.rendererSequence,
+          copyIndex: frame.presentation.copyIndex,
+          generation: selected?.generation ?? null,
+          rgbaSha256: selected?.rgbaSha256 ?? null,
+          rgbSha256: selected?.rgbSha256 ?? null,
+          selected: frame.presentation.selected && selected !== null,
+          matchesPresentation,
+          monochrome: selected !== null && selected.rgb.unique === 1,
+          allBlack: selected !== null && selected.rgb.black === pixels,
+          allWhite: selected !== null && selected.rgb.white === pixels,
+        };
+      });
+      const rgbaHashes = classified
+        .map(frame => frame.rgbaSha256)
+        .filter(hash => hash !== null);
+      const rgbHashes = classified
+        .map(frame => frame.rgbSha256)
+        .filter(hash => hash !== null);
+      const monochrome = classified.filter(frame => frame.monochrome);
+      const blackWhite = classified.filter(frame => frame.allBlack || frame.allWhite);
+      const adjacentFramesAlternate = (candidates, key) => candidates.length >= 2
+        && candidates.every((frame, index) => index === 0
+          || frame[key] !== candidates[index - 1][key]);
+      const blackAndWhiteAlternate = candidates => candidates.length >= 2
+        && candidates.every((frame, index) => index === 0
+          || frame.allBlack !== candidates[index - 1].allBlack);
+      return {
+        captured: classified.length,
+        capacity: temporalSelectedXfbCapacity,
+        complete: classified.length === temporalSelectedXfbCapacity,
+        distinctRgbaHashes: new Set(rgbaHashes).size,
+        distinctRgbHashes: new Set(rgbHashes).size,
+        distinctGenerations: new Set(classified
+          .map(frame => frame.generation)
+          .filter(generation => generation !== null)).size,
+        distinctCopyIndices: new Set(classified.map(frame => frame.copyIndex)).size,
+        missingOrUnselectedOrdinals: classified
+          .filter(frame => !frame.selected)
+          .map(frame => frame.ordinal),
+        mismatchedPresentationOrdinals: classified
+          .filter(frame => frame.selected && !frame.matchesPresentation)
+          .map(frame => frame.ordinal),
+        generationRegressions: classified
+          .filter((frame, index) => index !== 0
+            && frame.generation !== null
+            && classified[index - 1].generation !== null
+            && frame.generation < classified[index - 1].generation)
+          .map(frame => frame.ordinal),
+        copyIndexRegressions: classified
+          .filter((frame, index) => index !== 0
+            && frame.copyIndex < classified[index - 1].copyIndex)
+          .map(frame => frame.ordinal),
+        monochromeOrdinals: monochrome.map(frame => frame.ordinal),
+        blackOrdinals: classified.filter(frame => frame.allBlack).map(frame => frame.ordinal),
+        whiteOrdinals: classified.filter(frame => frame.allWhite).map(frame => frame.ordinal),
+        allFramesMonochrome: classified.length !== 0
+          && monochrome.length === classified.length,
+        alternatingMonochromePair: monochrome.length === classified.length
+          && new Set(rgbHashes).size === 2
+          && adjacentFramesAlternate(classified, "rgbSha256"),
+        blackWhiteAlternating: blackWhite.length === classified.length
+          && blackAndWhiteAlternate(classified),
+        frames: classified,
       };
     }
     function captureSelectedXfb() {
@@ -8889,10 +9079,22 @@ const TEMPLATE: &str = r##"<!doctype html>
       return appendRendererOperation(snapshotRendererPerformance);
     }
     function captureRendererTerminal() {
+      const temporalFrames = temporalSelectedXfbFrames;
       return appendRendererOperation(async () => {
         const metrics = snapshotRendererPerformance();
         const selectedXfb = await readSelectedXfb();
-        return { metrics, selectedXfb };
+        const temporalSelectedXfb = {
+          capacity: temporalSelectedXfbCapacity,
+          frames: temporalFrames.map(frame => ({
+            ...frame,
+            presentation: { ...frame.presentation },
+            selectedXfb: frame.selectedXfb === null
+              ? null
+              : { ...frame.selectedXfb, rgb: { ...frame.selectedXfb.rgb } },
+          })),
+          oracle: summarizeTemporalSelectedXfb(temporalFrames),
+        };
+        return { metrics, selectedXfb, temporalSelectedXfb };
       });
     }
     globalThis.lazuliRendererDiagnostics = Object.freeze({
@@ -9368,6 +9570,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     function handleRendererFrame(message, render, sourceWorker = worker) {
       const rendererSequence = Number(message.rendererSequence);
+      const temporalFrames = message.frame?.temporalXfbCapture === undefined
+        ? null
+        : temporalSelectedXfbFrames;
       const isCurrentWorker = () => worker === sourceWorker;
       const fail = error => {
         if (!isCurrentWorker()) return { ok: false, value: null };
@@ -9390,8 +9595,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         } catch (error) {
           return fail(error);
         }
-        return drainWebGpuRenderer().then(() => {
+        return (async () => {
+          await drainWebGpuRenderer();
           if (!isCurrentWorker()) return { ok: false, value: null };
+          if (message.frame?.temporalXfbCapture !== undefined) {
+            await captureTemporalSelectedXfb(message, value, temporalFrames);
+            if (!isCurrentWorker()) return { ok: false, value: null };
+          }
           if (Number.isSafeInteger(rendererSequence)) {
             const completion = {
               type: "renderer-frame-complete",
@@ -9403,7 +9613,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             sourceWorker?.postMessage(completion);
           }
           return { ok: true, value };
-        }, fail);
+        })().catch(fail);
       });
     }
     function handleRendererOperation(render, sourceWorker = worker) {

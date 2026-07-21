@@ -47,6 +47,7 @@ test("headless capture exposes --expect and verifies before persistence", () => 
     source,
     /typeof diagnostics\?\.captureTerminal !== "function"[\s\S]*?return await diagnostics\.captureTerminal\(\);/,
   );
+  assert.match(source, /temporalSelectedXfb: capture\.temporalSelectedXfb/);
   assert.equal(
     source.match(/headlessRunToReportMs: reportDetectedAt - runStartedAt/g)?.length,
     2,

@@ -94,6 +94,8 @@ function neutralSample(overrides = {}) {
     xfbCaptured: null,
     xfbCapturedAtCycle: null,
     xfbDisplayedAtCycle: null,
+    temporalXfbCaptureCapacity: 8,
+    temporalXfbCapturesPosted: 0,
     rendererFramesAcknowledged: 0,
     rendererFramesInFlight: 0,
     rendererFailed: false,
@@ -144,6 +146,42 @@ test("SMB scenario declares the exact B, Start x2, A x6 route", () => {
     () => context.selectControllerScenario("smb-ready-play", "GMBE8P", 0, 1),
     /requires disc revision 0, got 1/,
   );
+});
+
+test("SMB temporal XFB capture is bounded to the final scenario step", () => {
+  const context = {
+    controllerScenario: null,
+    smbTemporalXfbCaptureCapacity: 8,
+    smbTemporalXfbCapturesPosted: 0,
+  };
+  vm.createContext(context);
+  vm.runInContext(extractFunction("claimSmbTemporalXfbCapture"), context, {
+    filename: "browser_boot.smb-temporal-xfb.js",
+  });
+
+  assert.equal(context.claimSmbTemporalXfbCapture(), null);
+  context.controllerScenario = {
+    id: "smb-ready-play",
+    stepIndex: 0,
+    definition: { steps: [{ id: "play-main" }, { id: "post-play-presented" }] },
+  };
+  assert.equal(context.claimSmbTemporalXfbCapture(), null);
+  context.controllerScenario.stepIndex = 1;
+  const captures = Array.from(
+    { length: 8 },
+    () => context.claimSmbTemporalXfbCapture(),
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(captures)), Array.from(
+    { length: 8 },
+    (_unused, index) => ({
+      scenario: "smb-ready-play",
+      step: "post-play-presented",
+      ordinal: index + 1,
+      capacity: 8,
+    }),
+  ));
+  assert.equal(context.claimSmbTemporalXfbCapture(), null);
+  assert.equal(context.smbTemporalXfbCapturesPosted, 8);
 });
 
 test("SMB title gates wait for stable retail input acceptance", () => {
@@ -335,6 +373,7 @@ test("SMB completion requires a newly captured XFB presented after PLAY", () => 
     xfbCaptured: true,
     xfbCapturedAtCycle: 8_400,
     xfbDisplayedAtCycle: 8_500,
+    temporalXfbCapturesPosted: 8,
     rendererFramesAcknowledged: 20,
   });
   const context = definitionHarness(sample);
@@ -355,6 +394,9 @@ test("SMB completion requires a newly captured XFB presented after PLAY", () => 
   const presented = definition.steps.at(-1);
 
   assert.equal(presented.ready(sample, scenario), true);
+  sample.temporalXfbCapturesPosted = 7;
+  assert.equal(presented.ready(sample, scenario), false);
+  sample.temporalXfbCapturesPosted = 8;
   sample.gxXfbCopyCount = 17;
   assert.equal(presented.ready(sample, scenario), false);
   sample.gxXfbCopyCount = 18;
@@ -411,6 +453,8 @@ test("SMB scenario samples exact guest state and selected XFB provenance", () =>
     rendererFramesAcknowledged: 44,
     rendererFramesInFlight: new Set(),
     rendererFailure: null,
+    smbTemporalXfbCaptureCapacity: 8,
+    smbTemporalXfbCapturesPosted: 8,
   };
   vm.createContext(context);
   vm.runInContext([
@@ -502,6 +546,8 @@ test("SMB scenario samples exact guest state and selected XFB provenance", () =>
     xfbCaptured: true,
     xfbCapturedAtCycle: 700,
     xfbDisplayedAtCycle: 800,
+    temporalXfbCaptureCapacity: 8,
+    temporalXfbCapturesPosted: 8,
     rendererFramesAcknowledged: 44,
     rendererFramesInFlight: 0,
     rendererFailed: false,

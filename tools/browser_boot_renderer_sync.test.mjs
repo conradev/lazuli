@@ -279,6 +279,107 @@ test("main thread acknowledges a frame only after the WebGPU drain resolves", as
   }]);
 });
 
+test("temporal XFB readback completes before its VI frame acknowledgement", async () => {
+  const calls = [];
+  const messages = [];
+  let resolveCapture;
+  const currentWorker = { postMessage(message) { messages.push(message); } };
+  const context = {
+    Number,
+    Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
+    rendererOperationTail: Promise.resolve(),
+    drainWebGpuRenderer() {
+      calls.push("drain");
+      return Promise.resolve();
+    },
+    captureTemporalSelectedXfb(message, presented) {
+      calls.push(`capture:${message.rendererSequence}:${presented}`);
+      return new Promise(resolve => { resolveCapture = resolve; });
+    },
+    temporalSelectedXfbFrames: [],
+    handleRendererError(error) { throw error; },
+    worker: currentWorker,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+    { filename: "browser_boot.renderer-sync.temporal-xfb.js" },
+  );
+
+  const pending = context.handleRendererFrame({
+    type: "vi-present",
+    rendererSequence: 9,
+    frame: { temporalXfbCapture: { ordinal: 1 } },
+  }, () => true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ["drain", "capture:9:true"]);
+  assert.deepEqual(messages, []);
+
+  resolveCapture();
+  await pending;
+  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
+    type: "renderer-frame-complete",
+    rendererSequence: 9,
+  }]);
+});
+
+test("a replaced worker cannot leak a pending temporal capture into the next run", async () => {
+  const messages = [];
+  const oldFrames = [];
+  const replacementFrames = [];
+  let finishCapture;
+  const oldWorker = { postMessage(message) { messages.push(message); } };
+  const replacementWorker = { postMessage() {} };
+  const context = {
+    Number,
+    Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
+    rendererOperationTail: Promise.resolve(),
+    drainWebGpuRenderer() { return Promise.resolve(); },
+    captureTemporalSelectedXfb(_message, _presented, frames) {
+      return new Promise(resolve => {
+        finishCapture = () => {
+          frames.push({ ordinal: 1 });
+          resolve();
+        };
+      });
+    },
+    temporalSelectedXfbFrames: oldFrames,
+    handleRendererError(error) { throw error; },
+    worker: oldWorker,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+    { filename: "browser_boot.renderer-sync.temporal-worker-replacement.js" },
+  );
+
+  const pending = context.handleRendererFrame({
+    type: "vi-present",
+    rendererSequence: 10,
+    frame: { temporalXfbCapture: { ordinal: 1 } },
+  }, () => true);
+  await new Promise(resolve => setImmediate(resolve));
+  context.temporalSelectedXfbFrames = replacementFrames;
+  context.worker = replacementWorker;
+  finishCapture();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(await pending)), {
+    ok: false,
+    value: null,
+  });
+  assert.deepEqual(oldFrames, [{ ordinal: 1 }]);
+  assert.deepEqual(replacementFrames, []);
+  assert.deepEqual(messages, []);
+});
+
 test("deferred WebGPU failures reject the frame instead of acknowledging it", async () => {
   const messages = [];
   const visibleErrors = [];

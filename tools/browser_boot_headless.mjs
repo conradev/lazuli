@@ -334,6 +334,7 @@ async function captureRendering(session, state) {
     backend: state.dataset.renderer ?? null,
     metrics: capture.metrics,
     selectedXfb: capture.selectedXfb,
+    temporalSelectedXfb: capture.temporalSelectedXfb,
   };
 }
 
