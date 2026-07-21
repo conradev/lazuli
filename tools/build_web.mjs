@@ -17,6 +17,26 @@ const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_REPOSITORY = "https://github.com/conradev/lazuli";
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const STATIC_FILES = ["index.html", "app.webmanifest", "icon.svg", "release.mjs", "sw.js"];
+const DEBUG_UI_START = "<!-- LAZULI DEBUG UI START -->";
+const DEBUG_UI_END = "<!-- LAZULI DEBUG UI END -->";
+const DEBUG_ONLY_IDS = [
+  "runner-controls",
+  "pause-runner",
+  "resume-runner",
+  "diagnostics",
+  "disc-url",
+  "load-disc-url",
+  "extend-cycles",
+  "extend-dispatches",
+  "extend-runner",
+  "runner-rest-ms",
+  "apply-throttle",
+  "runner-render-every",
+  "apply-presentation",
+  "snapshot-runner",
+  "stop-runner",
+  "result",
+];
 
 function check(condition, message) {
   if (!condition) throw new Error(message);
@@ -56,7 +76,30 @@ function sourceMetadata(repository, commit) {
   };
 }
 
+function withoutDebugUi(html) {
+  let result = html;
+  let sections = 0;
+  while (result.includes(DEBUG_UI_START)) {
+    const start = result.indexOf(DEBUG_UI_START);
+    const end = result.indexOf(DEBUG_UI_END, start + DEBUG_UI_START.length);
+    check(end !== -1, "generated frontend has an unterminated debug UI section");
+    result = result.slice(0, start) + result.slice(end + DEBUG_UI_END.length);
+    sections += 1;
+  }
+  check(sections > 0, "generated frontend has no debug UI sections");
+  check(!result.includes(DEBUG_UI_END), "generated frontend has an unmatched debug UI boundary");
+  const debugSurface = 'data-surface="debug"';
+  check(result.includes(debugSurface), "generated frontend is not marked as a debug surface");
+  result = result.replace(debugSurface, 'data-surface="release"');
+  check(!result.includes(debugSurface), "generated frontend contains multiple debug surfaces");
+  for (const id of DEBUG_ONLY_IDS) {
+    check(!result.includes(`id="${id}"`), `public frontend still contains ${id}`);
+  }
+  return result;
+}
+
 function licensedFrontend(html, source) {
+  html = withoutDebugUi(html);
   const sourceAnchor = '<a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a>';
   check(html.includes(sourceAnchor), "generated frontend does not contain the expected source link");
   check(html.includes('new URL("/ppcwasmjit.wasm", location.href)'), "generated frontend has no browser compiler URL");

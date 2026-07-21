@@ -365,6 +365,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       grid-template-rows: auto minmax(0, 1fr) auto auto auto;
     }
 
+    .shell > * { min-width: 0; }
+
+    .shell[data-surface="release"] {
+      grid-template-rows: auto minmax(0, 1fr) auto auto;
+    }
+
     header, .status-group, .source-actions, #runner-controls, #controller-controls,
     .advanced-grid, footer {
       display: flex;
@@ -431,6 +437,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       gap: 0.8rem;
     }
 
+    .shell[data-surface="release"] .play-controls {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
     #runner-controls, #controller-controls { flex-wrap: wrap; }
     #controller-controls { justify-content: center; }
     #controller-controls button { min-width: 2.75rem; }
@@ -444,6 +454,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     details {
+      min-width: 0;
+      overflow: hidden;
       border: 1px solid #292e36;
       border-radius: 0.65rem;
       background: rgba(20, 23, 28, 0.92);
@@ -456,7 +468,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       font-size: 0.85rem;
     }
 
-    .details-body { padding: 0 0.75rem 0.75rem; }
+    .details-body {
+      min-width: 0;
+      padding: 0 0.75rem 0.75rem;
+    }
     .source-actions, .advanced-grid { flex-wrap: wrap; }
 
     input[type="url"], input[type="number"] {
@@ -472,6 +487,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     input[type="number"] { width: 9rem; }
 
     #result {
+      width: 100%;
+      max-width: 100%;
       overflow: auto;
       max-height: 24rem;
       margin: 0.75rem 0 0;
@@ -479,6 +496,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       padding: 0.75rem 0 0;
       color: #aeb7c4;
       font: 0.72rem/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-wrap: anywhere;
       white-space: pre-wrap;
     }
 
@@ -497,13 +515,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       #disc-status { max-width: calc(100vw - 4rem); }
       #display { width: 100%; max-height: none; }
       .play-controls { grid-template-columns: 1fr; }
+      .shell[data-surface="release"] .play-controls { grid-template-columns: 1fr; }
       #runner-controls, #controller-controls { justify-content: center; }
       .key-help { display: none; }
     }
   </style>
 </head>
 <body>
-  <main class="shell">
+  <main class="shell" data-surface="debug">
     <header>
       <h1>Gekko</h1>
       <div class="status-group" aria-live="polite">
@@ -523,10 +542,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     </div>
 
     <div class="play-controls">
+      <!-- LAZULI DEBUG UI START -->
       <div id="runner-controls">
         <button id="pause-runner" type="button">Pause</button>
         <button id="resume-runner" type="button">Resume</button>
       </div>
+      <!-- LAZULI DEBUG UI END -->
       <div id="controller-controls" aria-label="Controller">
         <button id="controller-left" type="button" aria-label="Left">←</button>
         <button id="controller-up" type="button" aria-label="Up">↑</button>
@@ -539,6 +560,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       <p class="key-help">Arrows · Z / X · Enter</p>
     </div>
 
+    <!-- LAZULI DEBUG UI START -->
     <details id="diagnostics">
       <summary>Options and diagnostics</summary>
       <div class="details-body">
@@ -560,6 +582,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         <pre id="result" data-testid="browser-boot-result">RUNNING</pre>
       </div>
     </details>
+    <!-- LAZULI DEBUG UI END -->
 
     <footer>
       <span>Runs locally in this browser</span>
@@ -6264,7 +6287,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
   </script>
   <script type="module">
-    const output = document.querySelector("#result");
+    const output = document.querySelector("#result") ?? { textContent: "" };
     const display = document.querySelector("#display");
     const runnerStatus = document.querySelector("#runner-status");
     let displayContext = display.getContext("2d");
@@ -6347,6 +6370,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       return cache;
     }
     const source = document.querySelector("#runner-source").textContent;
+    const debugSurface = document.querySelector(".shell").dataset.surface === "debug";
     const defaultDiscSourceConfig = __HAS_DISC__
       ? {
           kind: "logical-range-endpoint",
@@ -6379,7 +6403,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         ? { kind: "file-message" }
         : discConfig;
       const bootstrap = [
-        `globalThis.runnerSearch = ${JSON.stringify(location.search)};`,
+        `globalThis.runnerSearch = ${JSON.stringify(debugSurface ? location.search : "")};`,
         `globalThis.discSourceConfig = ${JSON.stringify(workerDiscConfig)};`,
         `globalThis.dolUrl = ${JSON.stringify(new URL("/boot.dol", location.href).href)};`,
         `globalThis.compilerWasmUrl = ${JSON.stringify(new URL("/ppcwasmjit.wasm", location.href).href)};`,
@@ -6434,53 +6458,56 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (file === undefined) return;
       startWorker({ kind: "file", file }, `local: ${file.name}`);
     });
-    const discUrlInput = document.querySelector("#disc-url");
-    function loadDiscUrl() {
-      try {
-        const url = new URL(discUrlInput.value.trim());
-        if (url.protocol !== "http:" && url.protocol !== "https:") {
-          throw new Error("unsupported protocol");
+    const pauseRunnerButton = document.querySelector("#pause-runner");
+    if (pauseRunnerButton !== null) {
+      const discUrlInput = document.querySelector("#disc-url");
+      function loadDiscUrl() {
+        try {
+          const url = new URL(discUrlInput.value.trim());
+          if (url.protocol !== "http:" && url.protocol !== "https:") {
+            throw new Error("unsupported protocol");
+          }
+          startWorker({ kind: "http-range", url: url.href }, `network: ${url.host}`);
+        } catch (_error) {
+          discStatus.textContent = "enter a valid HTTP URL";
+          discUrlInput.focus();
         }
-        startWorker({ kind: "http-range", url: url.href }, `network: ${url.host}`);
-      } catch (_error) {
-        discStatus.textContent = "enter a valid HTTP URL";
-        discUrlInput.focus();
       }
+      document.querySelector("#load-disc-url").addEventListener("click", loadDiscUrl);
+      discUrlInput.addEventListener("keydown", event => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        loadDiscUrl();
+      });
+      pauseRunnerButton.addEventListener("click", () => {
+        globalThis.lazuliCycleRunner.pause();
+      });
+      document.querySelector("#resume-runner").addEventListener("click", () => {
+        globalThis.lazuliCycleRunner.resume();
+      });
+      document.querySelector("#extend-runner").addEventListener("click", () => {
+        const cycles = Number(document.querySelector("#extend-cycles").value);
+        const dispatchText = document.querySelector("#extend-dispatches").value.trim();
+        const dispatches = dispatchText === "" ? undefined : Number(dispatchText);
+        globalThis.lazuliCycleRunner.extendCycles(cycles, dispatches);
+      });
+      const runnerRestInput = document.querySelector("#runner-rest-ms");
+      runnerRestInput.value = new URLSearchParams(location.search).get("restMs") ?? "0";
+      document.querySelector("#apply-throttle").addEventListener("click", () => {
+        globalThis.lazuliCycleRunner.setRestMs(Number(runnerRestInput.value));
+      });
+      const runnerRenderInput = document.querySelector("#runner-render-every");
+      runnerRenderInput.value = new URLSearchParams(location.search).get("renderEvery") ?? "1";
+      document.querySelector("#apply-presentation").addEventListener("click", () => {
+        globalThis.lazuliCycleRunner.setRenderEvery(Number(runnerRenderInput.value));
+      });
+      document.querySelector("#snapshot-runner").addEventListener("click", () => {
+        globalThis.lazuliCycleRunner.snapshot();
+      });
+      document.querySelector("#stop-runner").addEventListener("click", () => {
+        globalThis.lazuliCycleRunner.stop();
+      });
     }
-    document.querySelector("#load-disc-url").addEventListener("click", loadDiscUrl);
-    discUrlInput.addEventListener("keydown", event => {
-      if (event.key !== "Enter") return;
-      event.preventDefault();
-      loadDiscUrl();
-    });
-    document.querySelector("#pause-runner").addEventListener("click", () => {
-      globalThis.lazuliCycleRunner.pause();
-    });
-    document.querySelector("#resume-runner").addEventListener("click", () => {
-      globalThis.lazuliCycleRunner.resume();
-    });
-    document.querySelector("#extend-runner").addEventListener("click", () => {
-      const cycles = Number(document.querySelector("#extend-cycles").value);
-      const dispatchText = document.querySelector("#extend-dispatches").value.trim();
-      const dispatches = dispatchText === "" ? undefined : Number(dispatchText);
-      globalThis.lazuliCycleRunner.extendCycles(cycles, dispatches);
-    });
-    const runnerRestInput = document.querySelector("#runner-rest-ms");
-    runnerRestInput.value = new URLSearchParams(location.search).get("restMs") ?? "0";
-    document.querySelector("#apply-throttle").addEventListener("click", () => {
-      globalThis.lazuliCycleRunner.setRestMs(Number(runnerRestInput.value));
-    });
-    const runnerRenderInput = document.querySelector("#runner-render-every");
-    runnerRenderInput.value = new URLSearchParams(location.search).get("renderEvery") ?? "1";
-    document.querySelector("#apply-presentation").addEventListener("click", () => {
-      globalThis.lazuliCycleRunner.setRenderEvery(Number(runnerRenderInput.value));
-    });
-    document.querySelector("#snapshot-runner").addEventListener("click", () => {
-      globalThis.lazuliCycleRunner.snapshot();
-    });
-    document.querySelector("#stop-runner").addEventListener("click", () => {
-      globalThis.lazuliCycleRunner.stop();
-    });
     let controllerSequence = 0;
     let lastControllerPacket = "";
     let keyboardButtons = 0;
