@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use bytemuck::{Pod, Zeroable};
-use js_sys::{Array, Float32Array, Promise, Uint8Array, Uint32Array};
+use js_sys::{Array, Float32Array, Object, Promise, Reflect, Uint8Array, Uint32Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -20,9 +20,10 @@ use crate::tev::{
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState, SamplerIdentity,
     SelectedTexture, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
-    clipped_copy_extent, decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state,
-    gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture, rgba8_texture_byte_len,
-    select_texture, xfb_copy_matches_selection, xfb_source_rect,
+    clipped_copy_extent, compact_xfb_readback_rows, decoded_texture_cache_hit,
+    decoded_texture_is_available, gx_blend_state, gx_sampler_identity, merge_contiguous_draw_range,
+    require_tev_texture, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
+    xfb_readback_layout, xfb_source_rect,
 };
 
 const PRESENT_SHADER: &str = "
@@ -164,11 +165,27 @@ struct CachedTexture {
 }
 
 struct CachedXfb {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     metadata: XfbCopyMetadata,
+    source_width: u32,
+    source_height: u32,
     output_width: u32,
     output_height: u32,
+}
+
+#[derive(Clone)]
+struct PresentedXfb {
+    texture: wgpu::Texture,
+    selected_address: u32,
+    generation: u32,
+    selected_row: u32,
+    source_width: u32,
+    source_height: u32,
+    logical_width: u32,
+    logical_height: u32,
+    display_width: u32,
+    display_height: u32,
 }
 
 struct Pipelines {
@@ -186,6 +203,55 @@ struct QueueDrainState {
 
 struct QueueDrain {
     state: Arc<Mutex<QueueDrainState>>,
+}
+
+#[derive(Default)]
+struct BufferMapState {
+    result: Option<Result<(), String>>,
+    waker: Option<Waker>,
+}
+
+struct BufferMap {
+    state: Arc<Mutex<BufferMapState>>,
+}
+
+impl BufferMap {
+    fn new(buffer: &wgpu::Buffer) -> Self {
+        let state = Arc::new(Mutex::new(BufferMapState::default()));
+        let callback_state = state.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let waker = {
+                    let mut state = callback_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.result = Some(result.map_err(|error| error.to_string()));
+                    state.waker.take()
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        Self { state }
+    }
+}
+
+impl Future for BufferMap {
+    type Output = Result<(), String>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(result) = state.result.take() {
+            Poll::Ready(result)
+        } else {
+            state.waker = Some(context.waker().clone());
+            Poll::Pending
+        }
+    }
 }
 
 impl QueueDrain {
@@ -245,6 +311,7 @@ pub struct WebGpuRenderer {
     texture_cache: HashMap<String, CachedTexture>,
     efb_copy_cache: HashMap<u32, CachedTexture>,
     xfb_cache: HashMap<u32, CachedXfb>,
+    last_presented_xfb: Option<PresentedXfb>,
     pipelines: Pipelines,
     tev_vertices: Vec<TevVertex>,
     commands: Vec<DrawCommand>,
@@ -266,6 +333,7 @@ impl WebGpuRenderer {
         self.texture_cache.clear();
         self.efb_copy_cache.clear();
         self.xfb_cache.clear();
+        self.last_presented_xfb = None;
         self.clear_efb(0, 0, 0)
     }
 
@@ -338,6 +406,113 @@ impl WebGpuRenderer {
             QueueDrain::new(&queue).await;
             ensure_renderer_healthy(&failure_state)?;
             Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    pub fn has_presented_xfb(&self) -> bool {
+        self.last_presented_xfb.is_some()
+    }
+
+    pub fn read_presented_xfb_rgba(&self) -> Promise {
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        let failure_state = self.failure_state.clone();
+        let presented = self.last_presented_xfb.clone();
+        future_to_promise(async move {
+            ensure_renderer_healthy(&failure_state)?;
+            let presented =
+                presented.ok_or_else(|| JsValue::from_str("no WebGPU XFB has been presented"))?;
+            let layout = xfb_readback_layout(
+                presented.source_width,
+                presented.source_height,
+                presented.logical_height,
+                presented.selected_row,
+            )
+            .ok_or_else(|| JsValue::from_str("presented WebGPU XFB has no readable pixels"))?;
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("browser presented XFB readback"),
+                size: layout.buffer_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("browser presented XFB readback encoder"),
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &presented.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: layout.source_row,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(layout.padded_bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: layout.width,
+                    height: layout.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            BufferMap::new(&buffer)
+                .await
+                .map_err(|error| JsValue::from_str(&format!("WebGPU XFB map failed: {error}")))?;
+            let pixels = {
+                let mapped = buffer.slice(..).get_mapped_range();
+                let pixels = compact_xfb_readback_rows(&mapped, layout);
+                drop(mapped);
+                buffer.unmap();
+                pixels.ok_or_else(|| JsValue::from_str("WebGPU XFB map returned truncated rows"))?
+            };
+            ensure_renderer_healthy(&failure_state)?;
+
+            let result = Object::new();
+            Reflect::set(
+                &result,
+                &JsValue::from_str("format"),
+                &JsValue::from_str("rgba8unorm"),
+            )?;
+            Reflect::set(
+                &result,
+                &JsValue::from_str("layout"),
+                &JsValue::from_str("top-left-row-major-tight"),
+            )?;
+            for (name, value) in [
+                ("address", presented.selected_address),
+                ("generation", presented.generation),
+                ("row", presented.selected_row),
+                ("sourceRow", layout.source_row),
+                ("width", layout.width),
+                ("height", layout.height),
+                ("textureWidth", presented.source_width),
+                ("textureHeight", presented.source_height),
+                ("logicalWidth", presented.logical_width),
+                ("logicalHeight", presented.logical_height),
+                ("displayWidth", presented.display_width),
+                ("displayHeight", presented.display_height),
+            ] {
+                Reflect::set(
+                    &result,
+                    &JsValue::from_str(name),
+                    &JsValue::from_f64(f64::from(value)),
+                )?;
+            }
+            Reflect::set(
+                &result,
+                &JsValue::from_str("rgba"),
+                &Uint8Array::from(pixels.as_slice()),
+            )?;
+            Ok(result.into())
         })
     }
 
@@ -733,7 +908,9 @@ impl WebGpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         encoder.copy_texture_to_texture(
@@ -764,7 +941,7 @@ impl WebGpuRenderer {
         self.xfb_cache.insert(
             destination,
             CachedXfb {
-                _texture: texture,
+                texture,
                 view,
                 metadata: XfbCopyMetadata {
                     destination,
@@ -772,6 +949,8 @@ impl WebGpuRenderer {
                     height: xfb_height.max(1),
                     generation,
                 },
+                source_width: width,
+                source_height,
                 output_width: xfb_width.max(1),
                 output_height: xfb_height.max(1),
             },
@@ -803,7 +982,15 @@ impl WebGpuRenderer {
         if selected_address == 0 || expected_generation == 0 {
             return Ok(false);
         }
-        let Some((texture_view, cached_width, cached_height)) = self
+        let Some((
+            texture,
+            texture_view,
+            metadata,
+            source_width,
+            source_height,
+            cached_width,
+            cached_height,
+        )) = self
             .xfb_cache
             .values()
             .find(|copy| {
@@ -814,7 +1001,17 @@ impl WebGpuRenderer {
                     selected_row,
                 )
             })
-            .map(|copy| (copy.view.clone(), copy.output_width, copy.output_height))
+            .map(|copy| {
+                (
+                    copy.texture.clone(),
+                    copy.view.clone(),
+                    copy.metadata,
+                    copy.source_width,
+                    copy.source_height,
+                    copy.output_width,
+                    copy.output_height,
+                )
+            })
         else {
             return Ok(false);
         };
@@ -916,6 +1113,18 @@ impl WebGpuRenderer {
         }
         self.queue.submit([encoder.finish()]);
         output.present();
+        self.last_presented_xfb = Some(PresentedXfb {
+            texture,
+            selected_address,
+            generation: metadata.generation,
+            selected_row,
+            source_width,
+            source_height,
+            logical_width: cached_width,
+            logical_height: cached_height,
+            display_width: output_width,
+            display_height: output_height,
+        });
         self.ensure_healthy()?;
         Ok(true)
     }
@@ -1148,6 +1357,7 @@ impl WebGpuRenderer {
             texture_cache: HashMap::new(),
             efb_copy_cache: HashMap::new(),
             xfb_cache: HashMap::new(),
+            last_presented_xfb: None,
             pipelines,
             tev_vertices: Vec::new(),
             commands: Vec::new(),
