@@ -62,6 +62,7 @@ jobs:
           node --test
           tools/browser_boot_*.test.mjs
           tools/browser_disc_source.test.mjs
+          tools/browser_public_warioware_smoke.test.mjs
           tools/build_web.test.mjs
           tools/deploy_web.test.mjs
           tools/web_dist.test.mjs

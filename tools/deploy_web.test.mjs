@@ -19,6 +19,17 @@ test("deployment pins the verified Wrangler release", async () => {
   assert.match(workflow, /^\s+wranglerVersion:\s*"4\.112\.0"$/m);
 });
 
+test("deployment retains the public WarioWare release gate", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/deploy-web.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /^\s+tools\/browser_public_warioware_smoke\.test\.mjs$/m,
+  );
+});
+
 test("deployment builds pinned wasm-bindgen browser renderer assets before the frontend", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/deploy-web.yml", import.meta.url),
