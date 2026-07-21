@@ -222,6 +222,7 @@ test("controller packets use PAD_USE_ORIGIN and exact mode packing", () => {
 test("RDSTINT is derived, W1C-reasserted, and PI-mask-correct", () => {
   const context = makeContext(levelFunctions);
   const { view } = context;
+  view.setUint32(0x3000, 0x00010000, false);
   view.setUint32(0x6438, 0x20200000, false);
   view.setUint32(0x6434, context.siReadStatusInterruptMask, false);
   assert.equal(context.recomputeSerialInterruptLevel("seed"), true);
@@ -241,6 +242,7 @@ test("RDSTINT is derived, W1C-reasserted, and PI-mask-correct", () => {
   context.recomputeSerialInterruptLevel("last-cleared");
   assert.equal(view.getUint32(0x6434, false) & 0x10000000, 0);
   assert.equal(view.getUint32(0x3000, false) & 8, 0);
+  assert.equal(view.getUint32(0x3000, false) & 0x00010000, 0x00010000);
 });
 
 test("COMERR is read-only and TCINT is write-one-to-clear", () => {
