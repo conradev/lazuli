@@ -3,6 +3,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod packet;
 pub(crate) mod tev;
 
 pub(crate) const EFB_WIDTH: u32 = 640;
