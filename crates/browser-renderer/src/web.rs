@@ -340,6 +340,583 @@ impl WebGpuRenderer {
             Ok(JsValue::UNDEFINED)
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_tev_draw(
+        &mut self,
+        topology: u8,
+        source_vertices: Float32Array,
+        source_tev_state: Uint8Array,
+        texture_keys: Array,
+        texture_metadata: Uint32Array,
+        texture_pixels: Array,
+        z_mode: u32,
+        blend_mode: u32,
+        alpha_test: u32,
+        cull_mode: u8,
+        scissor_x: u32,
+        scissor_y: u32,
+        scissor_width: u32,
+        scissor_height: u32,
+    ) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        let source_vertices = source_vertices.to_vec();
+        let tev_state = source_tev_state.to_vec();
+        let texture_metadata = texture_metadata.to_vec();
+        let vertex_count = validate_draw_transport(
+            source_vertices.len(),
+            tev_state.len(),
+            texture_keys.length() as usize,
+            texture_metadata.len(),
+            texture_pixels.length() as usize,
+        )
+        .map_err(|error| JsValue::from_str(&error))?;
+        debug_assert_eq!(tev_state.len(), TEV_DRAW_STATE_BYTES);
+        debug_assert_eq!(texture_metadata.len(), TEV_TEXTURE_METADATA_WORDS);
+
+        let expanded = expanded_indices(topology, vertex_count)
+            .ok_or_else(|| JsValue::from_str("unsupported GX primitive topology"))?;
+        if expanded.is_empty() {
+            return Ok(());
+        }
+        let primitive = match topology {
+            5 | 6 => Primitive::Lines,
+            7 => Primitive::Points,
+            _ => Primitive::Triangles,
+        };
+        let pipeline = PipelineKey::from_gx(primitive, z_mode, blend_mode, cull_mode);
+        let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
+        else {
+            return Ok(());
+        };
+        if pipeline.cull == CullMode::All {
+            return Ok(());
+        }
+
+        let required_maps =
+            required_texture_maps(&tev_state).map_err(|error| JsValue::from_str(&error))?;
+        let mut keys = Vec::with_capacity(MAX_TEV_TEXTURES);
+        let mut pixels = Vec::with_capacity(MAX_TEV_TEXTURES);
+        for map in 0..MAX_TEV_TEXTURES {
+            let key = texture_keys.get(map as u32).as_string().ok_or_else(|| {
+                JsValue::from_str(&format!("TEV texture key {map} is not a string"))
+            })?;
+            let pixels_value = texture_pixels.get(map as u32);
+            if !pixels_value.is_instance_of::<Uint8Array>() {
+                return Err(JsValue::from_str(&format!(
+                    "TEV texture pixels {map} are not a Uint8Array"
+                )));
+            }
+            keys.push(key);
+            pixels.push(pixels_value.unchecked_into::<Uint8Array>());
+        }
+
+        let mut selected = [SelectedTexture::White; MAX_TEV_TEXTURES];
+        for map in 0..MAX_TEV_TEXTURES {
+            if !required_maps[map] {
+                continue;
+            }
+            let metadata = map * 5;
+            let address = texture_metadata[metadata];
+            let generation = texture_metadata[metadata + 1];
+            let width = texture_metadata[metadata + 2];
+            let height = texture_metadata[metadata + 3];
+            let cached_dimensions = self
+                .texture_cache
+                .get(&keys[map])
+                .map(|texture| (texture.width, texture.height));
+            let decoded_is_valid = decoded_texture_is_available(
+                width,
+                height,
+                pixels[map].length() as usize,
+                cached_dimensions,
+            )
+            .map_err(|error| {
+                JsValue::from_str(&format!("TEV texture map {map} key {}: {error}", keys[map]))
+            })?;
+            selected[map] = require_tev_texture(
+                map,
+                true,
+                select_texture(
+                    generation,
+                    self.efb_copy_cache
+                        .get(&address)
+                        .map(|texture| texture.generation),
+                    decoded_is_valid,
+                ),
+            )
+            .map_err(|error| JsValue::from_str(&error))?;
+        }
+
+        let protected_keys = selected
+            .iter()
+            .enumerate()
+            .filter(|(_, selected)| **selected == SelectedTexture::Decoded)
+            .map(|(map, _)| keys[map].clone())
+            .collect::<HashSet<_>>();
+        for map in 0..MAX_TEV_TEXTURES {
+            if selected[map] != SelectedTexture::Decoded
+                || self.texture_cache.contains_key(&keys[map])
+            {
+                continue;
+            }
+            let metadata = map * 5;
+            let pixels = pixels[map].to_vec();
+            let texture = self.upload_texture(
+                &format!("GX TEV texture {}", keys[map]),
+                texture_metadata[metadata + 2],
+                texture_metadata[metadata + 3],
+                &pixels,
+                0,
+            )?;
+            if self.texture_cache.len() >= 128
+                && let Some(key) = self
+                    .texture_cache
+                    .keys()
+                    .find(|key| !protected_keys.contains(*key))
+                    .cloned()
+            {
+                self.texture_cache.remove(&key);
+            }
+            self.texture_cache.insert(keys[map].clone(), texture);
+        }
+
+        let texture_identities = std::array::from_fn(|map| {
+            let metadata = map * 5;
+            match selected[map] {
+                SelectedTexture::EfbCopy => TextureBindingIdentity::EfbCopy {
+                    address: texture_metadata[metadata],
+                    generation: texture_metadata[metadata + 1],
+                },
+                SelectedTexture::Decoded => TextureBindingIdentity::Decoded(keys[map].clone()),
+                SelectedTexture::White => TextureBindingIdentity::White,
+            }
+        });
+        let sampler_identities =
+            std::array::from_fn(|map| gx_sampler_identity(texture_metadata[map * 5 + 4]));
+        let binding_key = TevBindingKey {
+            textures: texture_identities,
+            samplers: sampler_identities,
+            state: tev_state.clone(),
+            alpha_test: alpha_test & 0x00ff_ffff,
+        };
+        let binding = if let Some(binding) = self.tev_draw_binding_indices.get(&binding_key) {
+            *binding
+        } else {
+            let alpha_uniform = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("browser GX TEV alpha-test state"),
+                    contents: bytemuck::bytes_of(&DrawUniform {
+                        alpha_test: binding_key.alpha_test,
+                        _padding: [0; 3],
+                    }),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let alpha_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("browser GX TEV alpha-test bind group"),
+                layout: &self.tev_draw_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: alpha_uniform.as_entire_binding(),
+                }],
+            });
+            let tev_uniform = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("browser GX per-fragment TEV state"),
+                    contents: &tev_state,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let texture_views = (0..MAX_TEV_TEXTURES)
+                .map(|map| {
+                    let metadata = map * 5;
+                    match selected[map] {
+                        SelectedTexture::EfbCopy => {
+                            &self.efb_copy_cache[&texture_metadata[metadata]].view
+                        }
+                        SelectedTexture::Decoded => &self.texture_cache[&keys[map]].view,
+                        SelectedTexture::White => &self.white_texture.view,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let samplers = sampler_identities.map(|identity| &self.samplers[&identity]);
+            let mut entries = Vec::with_capacity(1 + MAX_TEV_TEXTURES * 2);
+            entries.push(wgpu::BindGroupEntry {
+                binding: 0,
+                resource: tev_uniform.as_entire_binding(),
+            });
+            for (map, view) in texture_views.into_iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: map as u32 + 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+            }
+            for (map, sampler) in samplers.into_iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: map as u32 + 9,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                });
+            }
+            let tev_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("browser GX per-fragment TEV bind group"),
+                layout: &self.tev_texture_layout,
+                entries: &entries,
+            });
+            let binding = self.tev_draw_bindings.len();
+            self.tev_draw_bindings.push(CachedTevDrawBinding {
+                _alpha_uniform: alpha_uniform,
+                alpha_bind_group,
+                _tev_uniform: tev_uniform,
+                tev_bind_group,
+            });
+            self.tev_draw_binding_indices.insert(binding_key, binding);
+            binding
+        };
+
+        let start = self.tev_vertices.len() as u32;
+        for index in expanded {
+            let offset = index * TEV_VERTEX_FLOATS;
+            self.tev_vertices.push(TevVertex {
+                position: source_vertices[offset..offset + 4]
+                    .try_into()
+                    .expect("validated TEV position"),
+                raster0: source_vertices[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("validated TEV raster channel zero"),
+                raster1: source_vertices[offset + 8..offset + 12]
+                    .try_into()
+                    .expect("validated TEV raster channel one"),
+                tex_coords: std::array::from_fn(|coord| {
+                    let start = offset + 12 + coord * 3;
+                    source_vertices[start..start + 3]
+                        .try_into()
+                        .expect("validated TEV texture coordinate")
+                }),
+            });
+        }
+        let end = self.tev_vertices.len() as u32;
+        let state = DrawCommandState {
+            pipeline,
+            scissor,
+            binding,
+        };
+        let vertices = start..end;
+        if let Some(previous) = self.commands.last_mut()
+            && merge_contiguous_draw_range(
+                &mut previous.vertices,
+                &previous.state,
+                vertices.clone(),
+                &state,
+            )
+        {
+            return Ok(());
+        }
+        self.commands.push(DrawCommand { vertices, state });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_texture(
+        &mut self,
+        source_x: u32,
+        source_y: u32,
+        width: u32,
+        height: u32,
+        destination: u32,
+        generation: u32,
+        clear: bool,
+        clear_red: u8,
+        clear_green: u8,
+        clear_blue: u8,
+    ) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        let mut encoder = self.flush_geometry();
+        let Some((width, height)) = clipped_copy_extent(source_x, source_y, width, height) else {
+            self.queue.submit([encoder.finish()]);
+            return self.ensure_healthy();
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("browser EFB texture copy"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.efb_color,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: source_x,
+                    y: source_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.queue.submit([encoder.finish()]);
+        self.efb_copy_cache.insert(
+            destination,
+            CachedTexture {
+                _texture: texture,
+                view,
+                generation,
+                width,
+                height,
+            },
+        );
+        if self.efb_copy_cache.len() > 64
+            && let Some(address) = self.efb_copy_cache.keys().next().copied()
+            && address != destination
+        {
+            self.efb_copy_cache.remove(&address);
+        }
+        if clear {
+            self.clear_efb(clear_red, clear_green, clear_blue)?;
+        }
+        self.ensure_healthy()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_xfb(
+        &mut self,
+        source_x: u32,
+        source_y: u32,
+        width: u32,
+        source_height: u32,
+        xfb_width: u32,
+        xfb_height: u32,
+        destination: u32,
+        stride: u32,
+        generation: u32,
+        clear: bool,
+        clear_red: u8,
+        clear_green: u8,
+        clear_blue: u8,
+    ) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        let mut encoder = self.flush_geometry();
+        let Some((width, source_height)) =
+            clipped_copy_extent(source_x, source_y, width, source_height)
+        else {
+            self.queue.submit([encoder.finish()]);
+            return self.ensure_healthy();
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("browser XFB copy"),
+            size: wgpu::Extent3d {
+                width,
+                height: source_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.efb_color,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: source_x,
+                    y: source_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height: source_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.queue.submit([encoder.finish()]);
+        self.xfb_cache.insert(
+            destination,
+            CachedXfb {
+                _texture: texture,
+                view,
+                metadata: XfbCopyMetadata {
+                    destination,
+                    stride,
+                    height: xfb_height.max(1),
+                    generation,
+                },
+                output_width: xfb_width.max(1),
+                output_height: xfb_height.max(1),
+            },
+        );
+        if self.xfb_cache.len() > 16
+            && let Some(address) = self
+                .xfb_cache
+                .iter()
+                .min_by_key(|(_, copy)| copy.metadata.generation)
+                .map(|(address, _)| *address)
+        {
+            self.xfb_cache.remove(&address);
+        }
+        if clear {
+            self.clear_efb(clear_red, clear_green, clear_blue)?;
+        }
+        self.ensure_healthy()
+    }
+
+    pub fn present_xfb(
+        &mut self,
+        selected_address: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Result<bool, JsValue> {
+        self.ensure_healthy()?;
+        if selected_address == 0 {
+            return Ok(false);
+        }
+        let Some((texture_view, cached_width, cached_height, selected_row)) = ({
+            let entries = self.xfb_cache.values().collect::<Vec<_>>();
+            let metadata = entries.iter().map(|copy| copy.metadata).collect::<Vec<_>>();
+            resolve_xfb_copy(&metadata, selected_address).map(|(index, row)| {
+                let copy = entries[index];
+                (
+                    copy.view.clone(),
+                    copy.output_width,
+                    copy.output_height,
+                    row,
+                )
+            })
+        }) else {
+            return Ok(false);
+        };
+        let Some(rect) = xfb_source_rect(selected_row, cached_height) else {
+            return Ok(false);
+        };
+        let output_width = if output_width == 0 {
+            cached_width
+        } else {
+            output_width
+        }
+        .clamp(1, 1024);
+        let output_height = if output_height == 0 {
+            cached_height
+        } else {
+            output_height
+        }
+        .clamp(1, 1024);
+        self.resize_surface(output_width, output_height);
+        let output = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Err(JsValue::from_str("WebGPU surface acquisition timed out"));
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return Err(JsValue::from_str("WebGPU surface is occluded"));
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                return Err(JsValue::from_str("WebGPU surface is outdated"));
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(JsValue::from_str("WebGPU surface was lost"));
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(JsValue::from_str("WebGPU surface validation failed"));
+            }
+        };
+        let output_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let rect_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("browser XFB source rectangle"),
+                contents: bytemuck::cast_slice(&rect),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser XFB presentation bind group"),
+            layout: &self.present_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        &self.samplers[&SamplerIdentity {
+                            mag_filter: true,
+                            min_filter: true,
+                            address_u: TextureAddressMode::ClampToEdge,
+                            address_v: TextureAddressMode::ClampToEdge,
+                        }],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: rect_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("browser XFB presentation encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("browser XFB presentation pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipelines.present);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        output.present();
+        self.ensure_healthy()?;
+        Ok(true)
+    }
 }
 
 impl WebGpuRenderer {
