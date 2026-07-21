@@ -1422,6 +1422,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxTlutLoads = 0;
     let gxTlutBytes = 0;
     let gxTlutErrors = 0;
+    let gxXfbFramesCaptured = 0;
     let gxFramesPresented = 0;
     let gxFramesSkipped = 0;
     let gxSkippedFrameClearColor = null;
@@ -1452,12 +1453,17 @@ const TEMPLATE: &str = r##"<!doctype html>
     let viEpochCycle = 0;
     let viEpochHalfLine = 0;
     let nextViCycle = null;
+    let nextViPresentCycle = null;
     let nextSerialPollCycle = null;
     let viLastEventCycle = null;
     let viLastEventInterval = null;
     let viTimingReschedules = 0;
     let viMissedHalfLines = 0;
     let viPiDeliveries = 0;
+    let viPresentationCount = 0;
+    let viLastPresentationCycle = null;
+    let viLastPresentationField = null;
+    let viLastPresentationAddress = 0;
     const viComparatorMatches = [0, 0, 0, 0];
     const viStatusAssertions = [0, 0, 0, 0];
     const viInterruptAcknowledgements = [0, 0, 0, 0];
@@ -1820,8 +1826,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       return status === 2 ? 1 : 2;
     }
 
-    function viXfbAddress(offset) {
-      const value = view.getUint32(mmio + offset, false);
+    function viXfbAddressFromRaw(value, topValue) {
       const base = value & 0x00ffffff;
       const top = view.getUint32(mmio + 0x201c, false);
       return (top & 0x10000000) !== 0 ? (base << 5) >>> 0 : base;
@@ -3091,19 +3096,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       const copyToXfb = (trigger & 0x4000) !== 0;
       const viTop = viXfbAddress(0x201c);
       const viBottom = viXfbAddress(0x2024);
-      if (copyToXfb) {
-        for (let frameIndex = gxXfbCopies.length - 1; frameIndex >= 0; frameIndex -= 1) {
-          const previousFrame = gxXfbCopies[frameIndex];
-          const selected = previousFrame.destination === viTop
-            || previousFrame.destination === viBottom
-            || (previousFrame.destination + previousFrame.stride) >>> 0 === viBottom;
-          if (selected) {
-            previousFrame.displayed = true;
-            previousFrame.displayedAtCopy = gxXfbCopyCount + 1;
-            break;
-          }
-        }
-      }
       const frame = {
         index: copyToXfb ? gxXfbCopyCount + 1 : gxTextureCopyCount + 1,
         sourceX: source & 0x3ff,
@@ -3129,12 +3121,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           draws: gxFrameDraws,
         },
       };
-      frame.selectedAtCopy = frame.destination === frame.viTop || frame.destination === frame.viBottom;
-      frame.displayed = frame.selectedAtCopy;
+      frame.displayed = false;
       if (copyToXfb) {
         gxXfbCopyCount += 1;
         gxXfbCopies.push({
           ...frame,
+          captured: gxCollectFrameGeometry,
           geometry: {
             drawCalls: frame.geometry.drawCalls,
             vertices: frame.geometry.vertices,
@@ -3150,8 +3142,8 @@ const TEMPLATE: &str = r##"<!doctype html>
             postMessage({ type: "efb-clear", clearColor: gxSkippedFrameClearColor });
             gxSkippedFrameClearColor = null;
           }
-          postMessage({ type: "frame", frame });
-          gxFramesPresented += 1;
+          postRendererFrame("xfb-copy", frame);
+          gxXfbFramesCaptured += 1;
         }
         gxFrameDraws = [];
         gxFrameDrawVertices = 0;
@@ -3652,6 +3644,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function writePixelEngineControl(value) {
+          captured: gxCollectFrameGeometry,
       const written = value & 0xffff;
       if ((written & 0x08) !== 0) {
         peFinishSignal = false;
@@ -4506,6 +4499,42 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function viActiveFieldTargets(timing) {
+      const top = 3 * timing.equ + timing.oddPrb;
+      const topEnd = top + 2 * timing.acv;
+      // Match the VI's odd/even PSB pacing adjustment when determining the
+      // first active half-line of the bottom field.
+      const unwrappedBottom = topEnd
+        + timing.oddPsb
+        + 3 * timing.equ
+        + timing.evenPrb
+        - (timing.oddPsb - timing.evenPsb);
+      const bottom = (
+        unwrappedBottom % timing.totalHalfLines + timing.totalHalfLines
+      ) % timing.totalHalfLines;
+      return [
+        { field: "top", halfLine: top, registerOffset: 0x201c },
+        { field: "bottom", halfLine: bottom, registerOffset: 0x2024 },
+      ];
+    }
+
+    function decodeViOutputDimensions(pictureConfiguration, displayControl, activeLines) {
+      const width = ((pictureConfiguration >>> 8) & 0x7f) * 16;
+      const nonInterlaced = (displayControl & 4) !== 0;
+      return {
+        width,
+        height: activeLines * (nonInterlaced ? 1 : 2),
+      };
+    }
+
+    function viOutputDimensions() {
+      return decodeViOutputDimensions(
+        view.getUint16(mmio + 0x2048, false),
+        view.getUint16(mmio + 0x2002, false),
+        viTiming?.acv ?? 0
+      );
+    }
+
     function viCurrentHalfLine(observedCycles) {
       if (viTiming === null) return null;
       const elapsed = Math.max(
@@ -4549,6 +4578,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         .map(offset => viComparatorTarget(view.getUint32(mmio + offset, false)))
         .filter(target => target !== null)
         .map(target => viCycleForHalfLineAfter(target, observedCycles));
+      return candidates.length === 0 ? null : Math.min(...candidates);
+    }
+
+    function nextViPresentationCycleAfter(observedCycles) {
+      if (viTiming === null || !viTiming.displayEnabled) return null;
+      const candidates = viActiveFieldTargets(viTiming).map(target =>
+        viCycleForHalfLineAfter(target.halfLine, observedCycles)
+      );
       return candidates.length === 0 ? null : Math.min(...candidates);
     }
 
@@ -4629,6 +4666,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         viComparatorSignature = null;
         viSerialPollSignature = null;
         nextViCycle = null;
+        nextViPresentCycle = null;
         nextSerialPollCycle = null;
         return;
       }
@@ -4644,6 +4682,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         viComparatorSignature = currentViComparatorSignature();
         viSerialPollSignature = view.getUint32(mmio + 0x6430, false);
         nextViCycle = nextViComparatorCycle(observedCycles);
+        nextViPresentCycle = nextViPresentationCycleAfter(observedCycles);
         nextSerialPollCycle = nextViSerialPollCycle(observedCycles);
         viTimingReschedules += 1;
         traceVi("timing-reschedule", observedCycles, {
@@ -4699,6 +4738,71 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
 
+    function gxXfbCopyRowOffset(frame, address) {
+      if (address < frame.destination) return null;
+      const delta = address - frame.destination;
+      if (delta === 0) return 0;
+      if (frame.stride === 0 || delta % frame.stride !== 0) return null;
+      const row = delta / frame.stride;
+      return row < frame.height ? row : null;
+    }
+
+    function gxResolveXfbCopy(address) {
+      for (let index = gxXfbCopies.length - 1; index >= 0; index -= 1) {
+        const frame = gxXfbCopies[index];
+        if (frame.captured && frame.destination === address) return { frame, row: 0 };
+      }
+      for (let index = gxXfbCopies.length - 1; index >= 0; index -= 1) {
+        const frame = gxXfbCopies[index];
+        if (!frame.captured) continue;
+        const row = gxXfbCopyRowOffset(frame, address);
+        if (row !== null) return { frame, row };
+      }
+      return null;
+    }
+
+    function serviceVideoPresentation(observedCycles) {
+      while (nextViPresentCycle !== null && nextViPresentCycle <= observedCycles) {
+        const scheduledCycle = nextViPresentCycle;
+        const halfLine = viCurrentHalfLine(scheduledCycle);
+        const target = viActiveFieldTargets(viTiming)
+          .find(candidate => candidate.halfLine === halfLine);
+        if (target !== undefined) {
+          const address = viXfbAddress(target.registerOffset);
+          const dimensions = viOutputDimensions();
+          const resolved = gxResolveXfbCopy(address);
+          if (resolved !== null) {
+            resolved.frame.displayed = true;
+            resolved.frame.displayedAtCycle = scheduledCycle;
+            resolved.frame.displayedField = target.field;
+            resolved.frame.displayedRow = resolved.row;
+          }
+          postMessage({
+            type: "vi-present",
+            field: target.field,
+            address,
+            width: dimensions.width,
+            height: dimensions.height,
+            copyIndex: resolved?.frame.index ?? 0,
+          });
+          gxFramesPresented += 1;
+          viPresentationCount += 1;
+          viLastPresentationCycle = scheduledCycle;
+          viLastPresentationField = target.field;
+          viLastPresentationAddress = address;
+          deviceEvents.set("viField", (deviceEvents.get("viField") ?? 0) + 1);
+          traceVi("present", observedCycles, {
+            scheduledCycle,
+            field: target.field,
+            address: hex32(address),
+            copyIndex: resolved?.frame.index ?? null,
+            copyRow: resolved?.row ?? null,
+          });
+        }
+        nextViPresentCycle = nextViPresentationCycleAfter(scheduledCycle);
+      }
+    }
+
     function serviceVideoInterrupt(observedCycles) {
       detectViAcknowledgements(observedCycles);
 
@@ -4731,7 +4835,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           viLastEventInterval = scheduledCycle - viLastEventCycle;
         }
         viLastEventCycle = scheduledCycle;
-        deviceEvents.set("viField", (deviceEvents.get("viField") ?? 0) + 1);
+        deviceEvents.set("viCompare", (deviceEvents.get("viCompare") ?? 0) + 1);
         traceVi("compare", observedCycles, {
           scheduledCycle,
           lateness,
@@ -4862,6 +4966,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       serviceDsp(observedCycles);
       serviceSerial(observedCycles);
       servicePixelEngine(observedCycles);
+      serviceVideoPresentation(observedCycles);
       serviceVideoInterrupt(observedCycles);
       serviceDisk(observedCycles);
       serviceDecrementer(observedCycles);
@@ -5745,6 +5850,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       ensureViSchedule(cycles);
       const candidates = [
         viTiming?.displayEnabled ? nextViCycle : null,
+        viTiming?.displayEnabled ? nextViPresentCycle : null,
         nextSerialPollCycle,
         nextDecrementerCycle,
         diskTransfer?.completionCycle ?? null,
@@ -5987,6 +6093,7 @@ const TEMPLATE: &str = r##"<!doctype html>
               tlutErrors: gxTlutErrors,
             },
             xfbCopyCount: gxXfbCopyCount,
+            xfbFramesCaptured: gxXfbFramesCaptured,
             framesPresented: gxFramesPresented,
             framesSkipped: gxFramesSkipped,
             skippedGeometryPrimitives: gxSkippedGeometryPrimitives,
@@ -6182,6 +6289,11 @@ const TEMPLATE: &str = r##"<!doctype html>
             missedHalfLines: viMissedHalfLines,
             lastEventCycle: viLastEventCycle,
             lastEventInterval: viLastEventInterval,
+            presentationCount: viPresentationCount,
+            nextPresentationCycle: nextViPresentCycle,
+            lastPresentationCycle: viLastPresentationCycle,
+            lastPresentationField: viLastPresentationField,
+            lastPresentationAddress: hex32(viLastPresentationAddress),
             serialPoll: {
               raw: hex32(view.getUint32(mmio + 0x6430, false)),
               xLines: (view.getUint32(mmio + 0x6430, false) >>> 16) & 0x03ff,
@@ -6265,6 +6377,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       statusDataset.status = status;
       output.textContent = JSON.stringify(report, null, 2);
       console.log("BROWSER_BOOT_" + status.toUpperCase(), report);
+        viTiming?.displayEnabled ? nextViPresentCycle : null,
     }
 
     async function honorRunnerControl() {
@@ -6520,6 +6633,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         cycles = observedCycles;
         dispatches += executedBlocks;
         if (stopOnFirstDsi && firstDsi !== null) {
+            xfbFramesCaptured: gxXfbFramesCaptured,
           finish("stopped", {
             stage: "first-dsi",
             pc: firstDsi.pc,
@@ -6714,6 +6828,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
         get maximumWeight() {
           return maximumWeight;
+            presentationCount: viPresentationCount,
+            nextPresentationCycle: nextViPresentCycle,
+            lastPresentationCycle: viLastPresentationCycle,
+            lastPresentationField: viLastPresentationField,
+            lastPresentationAddress: hex32(viLastPresentationAddress),
         },
         get size() {
           return entries.size;
