@@ -1,3 +1,660 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+
 pub(crate) mod tev;
+
+pub(crate) const EFB_WIDTH: u32 = 640;
+pub(crate) const EFB_HEIGHT: u32 = 528;
+
+#[derive(Clone, Default)]
+pub(crate) struct RendererFailureState {
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl RendererFailureState {
+    pub(crate) fn record(&self, failure: String) {
+        let mut current = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.is_none() {
+            *current = Some(failure);
+        }
+    }
+
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TextureBindingIdentity {
+    White,
+    Decoded(String),
+    EfbCopy { address: u32, generation: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TextureAddressMode {
+    ClampToEdge,
+    Repeat,
+    MirrorRepeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SamplerIdentity {
+    pub(crate) mag_filter: bool,
+    pub(crate) min_filter: bool,
+    pub(crate) address_u: TextureAddressMode,
+    pub(crate) address_v: TextureAddressMode,
+}
+
+pub(crate) fn gx_sampler_identity(mode0: u32) -> SamplerIdentity {
+    let address_mode = |value| match value & 3 {
+        1 => TextureAddressMode::Repeat,
+        2 => TextureAddressMode::MirrorRepeat,
+        // GX treats the reserved wrap value three as clamp.
+        _ => TextureAddressMode::ClampToEdge,
+    };
+    SamplerIdentity {
+        mag_filter: mode0 & (1 << 4) != 0,
+        min_filter: mode0 & (1 << 7) != 0,
+        address_u: address_mode(mode0),
+        address_v: address_mode(mode0 >> 2),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedTexture {
+    EfbCopy,
+    Decoded,
+    White,
+}
+
+pub(crate) fn select_texture(
+    requested_generation: u32,
+    cached_generation: Option<u32>,
+    decoded_is_valid: bool,
+) -> SelectedTexture {
+    if requested_generation != 0 && cached_generation == Some(requested_generation) {
+        SelectedTexture::EfbCopy
+    } else if decoded_is_valid {
+        SelectedTexture::Decoded
+    } else {
+        SelectedTexture::White
+    }
+}
+
+pub(crate) fn require_tev_texture(
+    map: usize,
+    required: bool,
+    selected: SelectedTexture,
+) -> Result<SelectedTexture, String> {
+    if required && selected == SelectedTexture::White {
+        Err(format!(
+            "TEV texture map {map} is enabled but has neither valid decoded pixels nor a matching EFB generation"
+        ))
+    } else {
+        Ok(selected)
+    }
+}
+
+pub(crate) fn rgba8_texture_byte_len(width: u32, height: u32) -> Option<usize> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    width.checked_mul(height)?.checked_mul(4)
+}
+
+pub(crate) fn valid_rgba8_texture(width: u32, height: u32, byte_len: usize) -> bool {
+    width != 0
+        && height != 0
+        && rgba8_texture_byte_len(width, height).is_some_and(|expected| expected == byte_len)
+}
+
+pub(crate) fn decoded_texture_cache_hit(
+    width: u32,
+    height: u32,
+    cached_dimensions: Option<(u32, u32)>,
+) -> bool {
+    cached_dimensions == Some((width, height))
+}
+
+pub(crate) fn decoded_texture_is_available(
+    width: u32,
+    height: u32,
+    byte_len: usize,
+    cached_dimensions: Option<(u32, u32)>,
+) -> Result<bool, String> {
+    if let Some((cached_width, cached_height)) = cached_dimensions {
+        if (cached_width, cached_height) != (width, height) {
+            return Err(format!(
+                "cached RGBA8 texture is {cached_width}x{cached_height}, but the draw requests {width}x{height}"
+            ));
+        }
+        if byte_len == 0 || valid_rgba8_texture(width, height, byte_len) {
+            return Ok(true);
+        }
+    } else if byte_len == 0 {
+        return Ok(false);
+    } else if valid_rgba8_texture(width, height, byte_len) {
+        return Ok(true);
+    }
+
+    let expected = rgba8_texture_byte_len(width, height).map_or_else(
+        || "an unrepresentable number of".to_owned(),
+        |bytes| bytes.to_string(),
+    );
+    Err(format!(
+        "invalid RGBA8 texture {width}x{height}: expected {expected} bytes, got {byte_len}"
+    ))
+}
+
+pub(crate) fn clipped_copy_extent(
+    source_x: u32,
+    source_y: u32,
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32)> {
+    let available_width = EFB_WIDTH.checked_sub(source_x)?;
+    let available_height = EFB_HEIGHT.checked_sub(source_y)?;
+    let width = width.min(available_width);
+    let height = height.min(available_height);
+    (width != 0 && height != 0).then_some((width, height))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxBlendFactor {
+    Zero,
+    One,
+    Source,
+    OneMinusSource,
+    SourceAlpha,
+    OneMinusSourceAlpha,
+    Destination,
+    OneMinusDestination,
+    DestinationAlpha,
+    OneMinusDestinationAlpha,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxBlendOperation {
+    Add,
+    ReverseSubtract,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxBlendState {
+    pub enabled: bool,
+    pub source: GxBlendFactor,
+    pub destination: GxBlendFactor,
+    pub operation: GxBlendOperation,
+    pub color_write: bool,
+    pub alpha_write: bool,
+}
+
+pub(crate) fn gx_blend_state(blend_mode: u32) -> GxBlendState {
+    let blend_enabled = blend_mode & 1 != 0;
+    let logic_enabled = blend_mode & (1 << 1) != 0;
+    let (source, destination, operation) = if logic_enabled {
+        logic_blend_approx(((blend_mode >> 12) & 0xf) as u8)
+    } else if !blend_enabled {
+        (
+            GxBlendFactor::One,
+            GxBlendFactor::Zero,
+            GxBlendOperation::Add,
+        )
+    } else if blend_mode & (1 << 11) != 0 {
+        (
+            GxBlendFactor::One,
+            GxBlendFactor::One,
+            GxBlendOperation::ReverseSubtract,
+        )
+    } else {
+        (
+            source_blend_factor(((blend_mode >> 8) & 7) as u8),
+            destination_blend_factor(((blend_mode >> 5) & 7) as u8),
+            GxBlendOperation::Add,
+        )
+    };
+
+    GxBlendState {
+        enabled: blend_enabled || logic_enabled,
+        source,
+        destination,
+        operation,
+        color_write: blend_mode & (1 << 3) != 0,
+        alpha_write: blend_mode & (1 << 4) != 0,
+    }
+}
+
+fn source_blend_factor(value: u8) -> GxBlendFactor {
+    match value & 7 {
+        0 => GxBlendFactor::Zero,
+        1 => GxBlendFactor::One,
+        2 => GxBlendFactor::Destination,
+        3 => GxBlendFactor::OneMinusDestination,
+        4 => GxBlendFactor::SourceAlpha,
+        5 => GxBlendFactor::OneMinusSourceAlpha,
+        6 => GxBlendFactor::DestinationAlpha,
+        _ => GxBlendFactor::OneMinusDestinationAlpha,
+    }
+}
+
+fn destination_blend_factor(value: u8) -> GxBlendFactor {
+    match value & 7 {
+        0 => GxBlendFactor::Zero,
+        1 => GxBlendFactor::One,
+        2 => GxBlendFactor::Source,
+        3 => GxBlendFactor::OneMinusSource,
+        4 => GxBlendFactor::SourceAlpha,
+        5 => GxBlendFactor::OneMinusSourceAlpha,
+        6 => GxBlendFactor::DestinationAlpha,
+        _ => GxBlendFactor::OneMinusDestinationAlpha,
+    }
+}
+
+fn logic_blend_approx(value: u8) -> (GxBlendFactor, GxBlendFactor, GxBlendOperation) {
+    use {GxBlendFactor as Factor, GxBlendOperation as Operation};
+
+    match value & 0xf {
+        0x0 => (Factor::Zero, Factor::Zero, Operation::Add),
+        0x1 => (Factor::Zero, Factor::Source, Operation::Add),
+        0x2 => (Factor::OneMinusSource, Factor::Zero, Operation::Add),
+        0x3 => (Factor::One, Factor::Zero, Operation::Add),
+        0x4 => (Factor::Zero, Factor::OneMinusSource, Operation::Add),
+        0x5 => (Factor::Zero, Factor::One, Operation::Add),
+        0x6 => (
+            Factor::OneMinusDestination,
+            Factor::OneMinusSource,
+            Operation::Add,
+        ),
+        0x7 => (Factor::One, Factor::OneMinusSource, Operation::Add),
+        0x8 => (
+            Factor::OneMinusSource,
+            Factor::OneMinusDestination,
+            Operation::Add,
+        ),
+        0x9 => (Factor::OneMinusSource, Factor::Source, Operation::Add),
+        0xa => (
+            Factor::OneMinusDestination,
+            Factor::OneMinusDestination,
+            Operation::Add,
+        ),
+        0xb => (Factor::One, Factor::OneMinusDestination, Operation::Add),
+        0xc => (
+            Factor::OneMinusSource,
+            Factor::OneMinusSource,
+            Operation::Add,
+        ),
+        0xd => (Factor::OneMinusSource, Factor::One, Operation::Add),
+        0xe => (
+            Factor::OneMinusDestination,
+            Factor::OneMinusSource,
+            Operation::Add,
+        ),
+        _ => (Factor::One, Factor::One, Operation::Add),
+    }
+}
+
+pub(crate) fn merge_contiguous_draw_range<State: PartialEq>(
+    previous_range: &mut Range<u32>,
+    previous_state: &State,
+    next_range: Range<u32>,
+    next_state: &State,
+) -> bool {
+    if previous_state != next_state
+        || previous_range.start >= previous_range.end
+        || previous_range.end != next_range.start
+        || next_range.start >= next_range.end
+    {
+        return false;
+    }
+
+    previous_range.end = next_range.end;
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct XfbCopyMetadata {
+    pub destination: u32,
+    pub stride: u32,
+    pub height: u32,
+    pub generation: u32,
+}
+
+pub(crate) fn xfb_row_offset(copy: XfbCopyMetadata, address: u32) -> Option<u32> {
+    let delta = address.checked_sub(copy.destination)?;
+    if copy.stride == 0 || delta % copy.stride != 0 {
+        return (delta == 0).then_some(0);
+    }
+
+    let row = delta / copy.stride;
+    (row < copy.height).then_some(row)
+}
+
+pub(crate) fn resolve_xfb_copy(copies: &[XfbCopyMetadata], address: u32) -> Option<(usize, u32)> {
+    copies
+        .iter()
+        .enumerate()
+        .filter(|(_, copy)| copy.destination == address)
+        .max_by_key(|(_, copy)| copy.generation)
+        .map(|(index, _)| (index, 0))
+        .or_else(|| {
+            copies
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(index, copy)| {
+                    xfb_row_offset(copy, address).map(|row| (index, row, copy.generation))
+                })
+                .max_by_key(|(_, _, generation)| *generation)
+                .map(|(index, row, _)| (index, row))
+        })
+}
+
+pub(crate) fn xfb_source_rect(row: u32, height: u32) -> Option<[f32; 4]> {
+    if height == 0 || row >= height {
+        return None;
+    }
+
+    // The VI framebuffer address can select a scanline within a retained GX
+    // copy (BFBL commonly selects row one). Crop away preceding rows while
+    // keeping the rectangle inside the cached copy's normalized bounds.
+    let start_y = row as f32 / height as f32;
+    Some([0.0, start_y, 1.0, 1.0 - start_y])
+}
+
+#[cfg(test)]
+pub(crate) fn alpha_compare(value: u8, reference: u8, comparison: u8) -> bool {
+    match comparison & 7 {
+        0 => false,
+        1 => value < reference,
+        2 => value == reference,
+        3 => value <= reference,
+        4 => value > reference,
+        5 => value != reference,
+        6 => value >= reference,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn alpha_test_passes(test: u32, value: u8) -> bool {
+    let first = alpha_compare(value, test as u8, (test >> 16) as u8);
+    let second = alpha_compare(value, (test >> 8) as u8, (test >> 19) as u8);
+    match (test >> 22) & 3 {
+        0 => first && second,
+        1 => first || second,
+        2 => first != second,
+        _ => first == second,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod web;
+
+#[cfg(target_arch = "wasm32")]
+pub use web::WebGpuRenderer;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState,
+        SelectedTexture, TextureAddressMode, XfbCopyMetadata, alpha_compare, alpha_test_passes,
+        clipped_copy_extent, decoded_texture_cache_hit, decoded_texture_is_available,
+        gx_blend_state, gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture,
+        resolve_xfb_copy, select_texture, valid_rgba8_texture, xfb_row_offset, xfb_source_rect,
+    };
+
+    const BASE: u32 = 0x0120_0000;
+    const STRIDE: u32 = 0x500;
+
+    fn copy(destination: u32, generation: u32) -> XfbCopyMetadata {
+        XfbCopyMetadata {
+            destination,
+            stride: STRIDE,
+            height: 480,
+            generation,
+        }
+    }
+
+    #[test]
+    fn xfb_rows_resolve_top_and_bottom_field_addresses() {
+        let metadata = copy(BASE, 7);
+        assert_eq!(xfb_row_offset(metadata, BASE), Some(0));
+        assert_eq!(xfb_row_offset(metadata, BASE + STRIDE), Some(1));
+        assert_eq!(
+            xfb_row_offset(metadata, BASE + STRIDE * metadata.height),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_xfb_destination_wins_over_an_older_copy_alias() {
+        let copies = [copy(BASE, 9), copy(BASE + STRIDE, 3)];
+        assert_eq!(resolve_xfb_copy(&copies, BASE + STRIDE), Some((1, 0)));
+    }
+
+    #[test]
+    fn vi_can_switch_between_retained_double_buffers() {
+        let second = BASE + STRIDE * 480;
+        let copies = [copy(BASE, 10), copy(second, 11)];
+        assert_eq!(resolve_xfb_copy(&copies, BASE), Some((0, 0)));
+        assert_eq!(resolve_xfb_copy(&copies, BASE + STRIDE), Some((0, 1)));
+        assert_eq!(resolve_xfb_copy(&copies, second), Some((1, 0)));
+        assert_eq!(resolve_xfb_copy(&copies, second + STRIDE), Some((1, 1)));
+    }
+
+    #[test]
+    fn xfb_source_rect_starts_at_the_selected_vi_row() {
+        let assert_rect = |actual: [f32; 4], expected: [f32; 4]| {
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < f32::EPSILON);
+            }
+        };
+        assert_rect(xfb_source_rect(0, 480).unwrap(), [0.0, 0.0, 1.0, 1.0]);
+
+        let bottom = xfb_source_rect(1, 480).unwrap();
+        assert_rect(bottom, [0.0, 1.0 / 480.0, 1.0, 479.0 / 480.0]);
+
+        let final_row = xfb_source_rect(479, 480).unwrap();
+        assert_rect(final_row, [0.0, 479.0 / 480.0, 1.0, 1.0 / 480.0]);
+    }
+
+    #[test]
+    fn xfb_source_rect_rejects_rows_outside_the_copy() {
+        assert_eq!(xfb_source_rect(0, 0), None);
+        assert_eq!(xfb_source_rect(480, 480), None);
+    }
+
+    #[test]
+    fn gx_alpha_comparisons_match_the_eight_hardware_operations() {
+        let cases = [false, false, true, true, false, false, true, true];
+        for (comparison, expected) in cases.into_iter().enumerate() {
+            assert_eq!(
+                alpha_compare(12, 12, comparison as u8),
+                expected,
+                "comparison {comparison}"
+            );
+        }
+        assert!(alpha_compare(11, 12, 1));
+        assert!(alpha_compare(13, 12, 4));
+        assert!(alpha_compare(13, 12, 5));
+    }
+
+    #[test]
+    fn gx_alpha_test_combines_comparisons_with_each_logic_operation() {
+        let encode = |first: u8, second: u8, logic: u8| {
+            u32::from(first) << 16 | u32::from(second) << 19 | u32::from(logic) << 22
+        };
+        assert!(!alpha_test_passes(encode(7, 0, 0), 255));
+        assert!(alpha_test_passes(encode(7, 0, 1), 255));
+        assert!(alpha_test_passes(encode(7, 0, 2), 255));
+        assert!(!alpha_test_passes(encode(7, 0, 3), 255));
+    }
+
+    #[test]
+    fn required_tev_textures_never_silently_fall_back_to_white() {
+        let failure = require_tev_texture(5, true, SelectedTexture::White).unwrap_err();
+        assert!(failure.contains("TEV texture map 5 is enabled"));
+        assert!(failure.contains("matching EFB generation"));
+        assert_eq!(
+            require_tev_texture(5, false, SelectedTexture::White),
+            Ok(SelectedTexture::White)
+        );
+        assert_eq!(
+            require_tev_texture(5, true, SelectedTexture::Decoded),
+            Ok(SelectedTexture::Decoded)
+        );
+        assert_eq!(
+            require_tev_texture(5, true, SelectedTexture::EfbCopy),
+            Ok(SelectedTexture::EfbCopy)
+        );
+    }
+
+    #[test]
+    fn consecutive_draw_ranges_merge_only_when_state_and_boundaries_match() {
+        let state = (7_u8, 12_u8);
+        let mut range = 0..6;
+        assert!(merge_contiguous_draw_range(
+            &mut range,
+            &state,
+            6..12,
+            &state
+        ));
+        assert_eq!(range, 0..12);
+
+        assert!(!merge_contiguous_draw_range(
+            &mut range,
+            &state,
+            15..18,
+            &state
+        ));
+        assert!(!merge_contiguous_draw_range(
+            &mut range,
+            &state,
+            12..18,
+            &(7, 13)
+        ));
+        assert_eq!(range, 0..12);
+    }
+
+    #[test]
+    fn efb_generation_miss_prefers_valid_decoded_pixels_over_white() {
+        assert_eq!(select_texture(8, Some(7), true), SelectedTexture::Decoded);
+        assert_eq!(select_texture(8, None, true), SelectedTexture::Decoded);
+        assert_eq!(select_texture(8, None, false), SelectedTexture::White);
+        assert_eq!(select_texture(8, Some(8), true), SelectedTexture::EfbCopy);
+    }
+
+    #[test]
+    fn decoded_rgba8_pixels_must_exactly_cover_a_nonempty_texture() {
+        assert!(valid_rgba8_texture(4, 3, 48));
+        assert!(!valid_rgba8_texture(4, 3, 47));
+        assert!(!valid_rgba8_texture(4, 3, 49));
+        assert!(!valid_rgba8_texture(0, 3, 0));
+        assert!(!valid_rgba8_texture(4, 0, 0));
+    }
+
+    #[test]
+    fn decoded_texture_cache_hits_can_omit_the_rgba8_payload() {
+        assert_eq!(
+            decoded_texture_is_available(4, 3, 0, Some((4, 3))),
+            Ok(true)
+        );
+        assert_eq!(decoded_texture_is_available(4, 3, 0, None), Ok(false));
+        assert_eq!(decoded_texture_is_available(4, 3, 48, None), Ok(true));
+    }
+
+    #[test]
+    fn decoded_texture_cache_queries_match_both_dimensions() {
+        assert!(decoded_texture_cache_hit(4, 3, Some((4, 3))));
+        assert!(!decoded_texture_cache_hit(4, 3, Some((3, 4))));
+        assert!(!decoded_texture_cache_hit(4, 3, None));
+    }
+
+    #[test]
+    fn decoded_texture_cache_keys_have_immutable_dimensions() {
+        let failure = decoded_texture_is_available(4, 3, 0, Some((3, 4))).unwrap_err();
+        assert!(failure.contains("cached RGBA8 texture is 3x4"));
+        assert!(failure.contains("draw requests 4x3"));
+    }
+
+    #[test]
+    fn gx_sampler_state_preserves_filter_and_both_wrap_modes() {
+        let sampler = gx_sampler_identity(1 | (2 << 2) | (1 << 4) | (1 << 7));
+        assert!(sampler.mag_filter);
+        assert!(sampler.min_filter);
+        assert_eq!(sampler.address_u, TextureAddressMode::Repeat);
+        assert_eq!(sampler.address_v, TextureAddressMode::MirrorRepeat);
+
+        let reserved = gx_sampler_identity(3 | (3 << 2));
+        assert!(!reserved.mag_filter);
+        assert!(!reserved.min_filter);
+        assert_eq!(reserved.address_u, TextureAddressMode::ClampToEdge);
+        assert_eq!(reserved.address_v, TextureAddressMode::ClampToEdge);
+    }
+
+    #[test]
+    fn malformed_redundant_texture_payloads_are_rejected() {
+        let failure = decoded_texture_is_available(4, 3, 47, Some((4, 3))).unwrap_err();
+        assert!(failure.contains("expected 48 bytes, got 47"));
+    }
+
+    #[test]
+    fn efb_copy_extent_clips_at_edges_and_rejects_empty_or_invalid_origins() {
+        assert_eq!(clipped_copy_extent(639, 527, 8, 8), Some((1, 1)));
+        assert_eq!(
+            clipped_copy_extent(0, 0, EFB_WIDTH, EFB_HEIGHT),
+            Some((640, 528))
+        );
+        assert_eq!(clipped_copy_extent(EFB_WIDTH, 0, 1, 1), None);
+        assert_eq!(clipped_copy_extent(0, EFB_HEIGHT, 1, 1), None);
+        assert_eq!(clipped_copy_extent(EFB_WIDTH + 1, 0, 1, 1), None);
+        assert_eq!(clipped_copy_extent(0, EFB_HEIGHT + 1, 1, 1), None);
+        assert_eq!(clipped_copy_extent(0, 0, 0, 1), None);
+        assert_eq!(clipped_copy_extent(0, 0, 1, 0), None);
+    }
+
+    #[test]
+    fn logic_op_without_ordinary_blending_still_enables_its_approximation() {
+        let state = gx_blend_state((1 << 1) | (0x6 << 12) | (1 << 3) | (1 << 4));
+        assert!(state.enabled);
+        assert_eq!(state.source, GxBlendFactor::OneMinusDestination);
+        assert_eq!(state.destination, GxBlendFactor::OneMinusSource);
+        assert_eq!(state.operation, GxBlendOperation::Add);
+        assert!(state.color_write);
+        assert!(state.alpha_write);
+    }
+
+    #[test]
+    fn every_logic_approximation_uses_a_webgpu_legal_add_operation() {
+        for logic_operation in 0..=0xf {
+            let state = gx_blend_state((1 << 1) | (logic_operation << 12));
+            assert!(state.enabled, "logic operation {logic_operation:#x}");
+            assert_eq!(
+                state.operation,
+                GxBlendOperation::Add,
+                "logic operation {logic_operation:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_failure_state_preserves_the_first_device_error() {
+        let state = RendererFailureState::default();
+        let callback = state.clone();
+        callback.record("WebGPU device lost: adapter reset".to_owned());
+        state.record("uncaptured WebGPU validation error".to_owned());
+
+        assert_eq!(
+            state.failure().as_deref(),
+            Some("WebGPU device lost: adapter reset")
+        );
+    }
+}
