@@ -20,4 +20,16 @@ test("headless capture exposes --expect and verifies before persistence", () => 
     source,
     /verifyExpectedCheckpoint\(report, options, expectedManifest\);\s*await persist/,
   );
+  assert.equal(
+    source.match(/await attachHeadlessCapture\(session, state, report,/g)?.length,
+    2,
+  );
+  assert.match(
+    source,
+    /report\.rendering = await captureRendering\(session, state\);[\s\S]*?report\.headlessCapture =/,
+  );
+  assert.match(
+    source,
+    /return diagnostics\.captureSelectedXfb\(\);/,
+  );
 });

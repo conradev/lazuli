@@ -1521,6 +1521,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     let viLastPresentationCycle = null;
     let viLastPresentationField = null;
     let viLastPresentationAddress = 0;
+    let viLastPresentationCopyIndex = 0;
+    let viLastPresentationCopyRow = 0;
     const viComparatorMatches = [0, 0, 0, 0];
     const viStatusAssertions = [0, 0, 0, 0];
     const viInterruptAcknowledgements = [0, 0, 0, 0];
@@ -3615,6 +3617,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const viBottom = viXfbAddress(0x2024);
       const frame = {
         index: copyToXfb ? gxXfbCopyCount + 1 : gxTextureCopyCount + 1,
+        capturedAtCycle: cycles,
         sourceX: source & 0x3ff,
         sourceY: (source >>> 10) & 0x3ff,
         width: (dimensions & 0x3ff) + 1,
@@ -5314,6 +5317,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           viLastPresentationCycle = scheduledCycle;
           viLastPresentationField = target.field;
           viLastPresentationAddress = address;
+          viLastPresentationCopyIndex = resolved?.frame.index ?? 0;
+          viLastPresentationCopyRow = resolved?.row ?? 0;
           deviceEvents.set("viField", (deviceEvents.get("viField") ?? 0) + 1);
           traceVi("present", observedCycles, {
             scheduledCycle,
@@ -6827,6 +6832,8 @@ const TEMPLATE: &str = r##"<!doctype html>
             lastPresentationCycle: viLastPresentationCycle,
             lastPresentationField: viLastPresentationField,
             lastPresentationAddress: hex32(viLastPresentationAddress),
+            lastPresentationCopyIndex: viLastPresentationCopyIndex,
+            lastPresentationCopyRow: viLastPresentationCopyRow,
             serialPoll: {
               raw: hex32(view.getUint32(mmio + 0x6430, false)),
               xLines: (view.getUint32(mmio + 0x6430, false) >>> 16) & 0x03ff,
@@ -7357,6 +7364,73 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       return pending;
     }
+    async function sha256Hex(bytes) {
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+    }
+    function summarizePresentedXfbRgba(rgba, width, height) {
+      if (
+        !(rgba instanceof Uint8Array)
+        || !Number.isSafeInteger(width)
+        || !Number.isSafeInteger(height)
+        || width <= 0
+        || height <= 0
+        || rgba.byteLength !== width * height * 4
+      ) {
+        throw new Error("WebGPU XFB readback has an invalid tight RGBA8 layout");
+      }
+      let black = 0;
+      let white = 0;
+      const colors = new Set();
+      for (let offset = 0; offset < rgba.byteLength; offset += 4) {
+        const red = rgba[offset];
+        const green = rgba[offset + 1];
+        const blue = rgba[offset + 2];
+        colors.add((red << 16) | (green << 8) | blue);
+        if (red === 0 && green === 0 && blue === 0) black += 1;
+        else if (red === 255 && green === 255 && blue === 255) white += 1;
+      }
+      return {
+        black,
+        white,
+        other: width * height - black - white,
+        unique: colors.size,
+      };
+    }
+    function captureSelectedXfb() {
+      return enqueueRendererOperation(async () => {
+        await drainWebGpuRenderer();
+        if (!webGpuRenderer.has_presented_xfb()) return null;
+        const capture = await webGpuRenderer.read_presented_xfb_rgba();
+        const rgba = capture.rgba instanceof Uint8Array
+          ? capture.rgba
+          : new Uint8Array(capture.rgba);
+        const width = Number(capture.width);
+        const height = Number(capture.height);
+        const rgb = summarizePresentedXfbRgba(rgba, width, height);
+        const rgbaSha256 = await sha256Hex(rgba);
+        return {
+          address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
+          generation: Number(capture.generation),
+          row: Number(capture.row),
+          format: String(capture.format),
+          layout: String(capture.layout),
+          sourceRow: Number(capture.sourceRow),
+          width,
+          height,
+          textureWidth: Number(capture.textureWidth),
+          textureHeight: Number(capture.textureHeight),
+          logicalWidth: Number(capture.logicalWidth),
+          logicalHeight: Number(capture.logicalHeight),
+          displayWidth: Number(capture.displayWidth),
+          displayHeight: Number(capture.displayHeight),
+          rgbaByteLength: rgba.byteLength,
+          rgbaSha256,
+          rgb,
+        };
+      });
+    }
+    globalThis.lazuliRendererDiagnostics = Object.freeze({ captureSelectedXfb });
     function gxClearEfb(clearColor) {
       const [red, green, blue] = clearColor;
       webGpuRenderer.clear_efb(red, green, blue);

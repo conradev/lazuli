@@ -210,6 +210,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
   const frame = {
     index: 12,
     captured: true,
+    capturedAtCycle: 300,
     destination: 0x01200000,
     stride: 0x500,
     height: 480,
@@ -237,6 +238,8 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       traceVi() {},
       viCurrentHalfLine() { return 42; },
       viLastPresentationAddress: 0,
+      viLastPresentationCopyIndex: 0,
+      viLastPresentationCopyRow: 0,
       viLastPresentationCycle: null,
       viLastPresentationField: null,
       viOutputDimensions() { return { width: 640, height: 480 }; },
@@ -269,9 +272,14 @@ test("VI field service selects a cached XFB independently of comparators", () =>
     rendererSequence: 1,
   }]);
   assert.equal(frame.displayed, true);
+  assert.equal(frame.capturedAtCycle, 300);
+  assert.equal(frame.displayedAtCycle, 420);
   assert.equal(frame.displayedField, "top");
   assert.equal(context.nextViPresentCycle, 5670);
   assert.equal(context.deviceEvents.get("viField"), 1);
+  assert.equal(context.viLastPresentationCopyIndex, 12);
+  assert.equal(context.viLastPresentationCycle, 420);
+  assert.equal(context.viLastPresentationCopyRow, 0);
   assert.deepEqual([...context.rendererFramesInFlight], [1]);
 
   context.viCurrentHalfLine = () => 567;
@@ -295,6 +303,8 @@ test("VI field service selects a cached XFB independently of comparators", () =>
     rendererSequence: 2,
   });
   assert.deepEqual([...context.rendererFramesInFlight], [2]);
+  assert.equal(context.viLastPresentationCopyIndex, 12);
+  assert.equal(context.viLastPresentationCopyRow, 1);
 });
 
 test("main thread caches XFB copies and presents only on VI messages", async () => {

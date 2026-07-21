@@ -292,6 +292,31 @@ function parseReport(text) {
   }
 }
 
+async function captureRendering(session, state) {
+  const selectedXfb = await session.evaluate(`(async () => {
+    const diagnostics = globalThis.lazuliRendererDiagnostics;
+    if (typeof diagnostics?.captureSelectedXfb !== "function") {
+      throw new Error("Lazuli renderer diagnostics are unavailable");
+    }
+    return diagnostics.captureSelectedXfb();
+  })()`);
+  return {
+    backend: state.dataset.renderer ?? null,
+    selectedXfb,
+  };
+}
+
+async function attachHeadlessCapture(session, state, report, details) {
+  report.rendering = await captureRendering(session, state);
+  report.headlessCapture = {
+    dataset: state.dataset,
+    devtoolsExceptions: session.exceptions,
+    pageTitle: state.title,
+    url: state.url,
+    ...details,
+  };
+}
+
 function verifyExpectedCheckpoint(report, options, manifest) {
   if (manifest === null) return;
   const checkpoint = verifyCheckpointReport(report, manifest);
@@ -325,13 +350,9 @@ async function main() {
       state = await pageState(session);
       const report = parseReport(state.result);
       if (report !== null) {
-        report.headlessCapture = {
-          dataset: state.dataset,
-          devtoolsExceptions: session.exceptions,
-          pageTitle: state.title,
+        await attachHeadlessCapture(session, state, report, {
           reuse: reuseCapture,
-          url: state.url,
-        };
+        });
         verifyExpectedCheckpoint(report, options, expectedManifest);
         await persist(options.output, report);
         return;
@@ -348,14 +369,10 @@ async function main() {
         state = await pageState(session);
         const report = parseReport(state.result);
         if (report !== null) {
-          report.headlessCapture = {
-            dataset: state.dataset,
-            devtoolsExceptions: session.exceptions,
-            pageTitle: state.title,
+          await attachHeadlessCapture(session, state, report, {
             reuse: reuseCapture,
             timedOut: true,
-            url: state.url,
-          };
+          });
           verifyExpectedCheckpoint(report, options, expectedManifest);
           await persist(options.output, report);
           process.exitCode = 124;
