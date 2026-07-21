@@ -141,3 +141,276 @@ export function validateSmbReadyCheckpointOptions(
   }
   return profile;
 }
+
+function validateRendererHealth(report, expected) {
+  const scheduler = requireCheckpointObject(
+    report.execution?.scheduler,
+    "$.execution.scheduler",
+  );
+  requireExact(
+    requirePositiveInteger(
+      scheduler.renderEvery,
+      "$.execution.scheduler.renderEvery",
+    ),
+    expected.run.renderEvery,
+    "$.execution.scheduler.renderEvery",
+  );
+
+  const rendererSync = requireCheckpointObject(
+    scheduler.rendererSync,
+    "$.execution.scheduler.rendererSync",
+  );
+  const sync = {};
+  for (const field of [
+    "posted",
+    "acknowledged",
+    "failed",
+    "inFlight",
+    "highWater",
+    "resultMisses",
+  ]) {
+    sync[field] = requireCheckpointNonNegativeInteger(
+      rendererSync[field],
+      `$.execution.scheduler.rendererSync.${field}`,
+    );
+  }
+  if (sync.posted === 0) {
+    checkpointValidationFailure(
+      "$.execution.scheduler.rendererSync.posted",
+      "expected at least one WebGPU renderer operation",
+    );
+  }
+  for (const field of ["failed", "inFlight", "resultMisses"]) {
+    requireZero(sync[field], `$.execution.scheduler.rendererSync.${field}`);
+  }
+  requireExact(
+    sync.acknowledged,
+    sync.posted,
+    "$.execution.scheduler.rendererSync.acknowledged",
+  );
+  if (sync.highWater > 1) {
+    checkpointValidationFailure(
+      "$.execution.scheduler.rendererSync.highWater",
+      `expected at most 1, got ${sync.highWater}`,
+    );
+  }
+
+  const rendering = requireCheckpointObject(report.rendering, "$.rendering");
+  requireExact(rendering.backend, expected.run.renderer, "$.rendering.backend");
+  if (rendering.error !== undefined && rendering.error !== null) {
+    checkpointValidationFailure(
+      "$.rendering.error",
+      `renderer reported ${describeCheckpointValue(rendering.error)}`,
+    );
+  }
+  const metrics = requireCheckpointObject(rendering.metrics, "$.rendering.metrics");
+  requireExact(metrics.scope, "current-worker", "$.rendering.metrics.scope");
+  const operations = requireCheckpointObject(
+    metrics.operations,
+    "$.rendering.metrics.operations",
+  );
+  requirePositiveInteger(
+    operations.enqueued,
+    "$.rendering.metrics.operations.enqueued",
+  );
+  requireZero(operations.pending, "$.rendering.metrics.operations.pending");
+  const operationHighWater = requireCheckpointNonNegativeInteger(
+    operations.highWater,
+    "$.rendering.metrics.operations.highWater",
+  );
+  if (operationHighWater > 1) {
+    checkpointValidationFailure(
+      "$.rendering.metrics.operations.highWater",
+      `expected at most 1, got ${operationHighWater}`,
+    );
+  }
+  requirePositiveInteger(
+    metrics.webgpu?.checkHealthCalls,
+    "$.rendering.metrics.webgpu.checkHealthCalls",
+  );
+  return { rendering, sync };
+}
+
+function validateDeviceHealth(report) {
+  requireExact(report.diskCommands?.lastError, "0x00000000", "$.diskCommands.lastError");
+  requireZero(report.deviceEvents?.diskDeviceError ?? 0, "$.deviceEvents.diskDeviceError");
+
+  const decoder = requireCheckpointObject(report.gxFifo?.decoder, "$.gxFifo.decoder");
+  requirePositiveInteger(decoder.xfbCopyCount, "$.gxFifo.decoder.xfbCopyCount");
+  for (const [path, value] of [
+    ["$.gxFifo.decoder.unknownOpcodes", decoder.unknownOpcodes],
+    ["$.gxFifo.decoder.displayListErrors", decoder.displayListErrors],
+    ["$.gxFifo.decoder.vertexDecodeErrors", decoder.vertexDecodeErrors],
+    ["$.gxFifo.decoder.textures.decodeErrors", decoder.textures?.decodeErrors],
+    ["$.gxFifo.decoder.textures.tlutErrors", decoder.textures?.tlutErrors],
+    ["$.controller.queueOverflows", report.controller?.queueOverflows],
+    ["$.serialInterface.unknownOutputCommands", report.serialInterface?.unknownOutputCommands],
+  ]) {
+    requireZero(value, path);
+  }
+
+  const exceptionCounts = requireCheckpointObject(
+    report.exceptions?.counts,
+    "$.exceptions.counts",
+  );
+  for (const vector of ["0x0200", "0x0300", "0x0400", "0x0600", "0x0700"]) {
+    requireZero(exceptionCounts[vector] ?? 0, `$.exceptions.counts[${JSON.stringify(vector)}]`);
+  }
+}
+
+function validateHeadlessCapture(report, expected) {
+  const capture = requireCheckpointObject(report.headlessCapture, "$.headlessCapture");
+  requireExact(capture.reuse, null, "$.headlessCapture.reuse");
+  if (!Array.isArray(capture.devtoolsExceptions)) {
+    checkpointValidationFailure("$.headlessCapture.devtoolsExceptions", "expected an array");
+  }
+  if (capture.devtoolsExceptions.length !== 0) {
+    checkpointValidationFailure(
+      "$.headlessCapture.devtoolsExceptions[0]",
+      `unexpected page exception ${describeCheckpointValue(capture.devtoolsExceptions[0])}`,
+    );
+  }
+  const dataset = requireCheckpointObject(capture.dataset, "$.headlessCapture.dataset");
+  requireExact(dataset.renderer, expected.run.renderer, "$.headlessCapture.dataset.renderer");
+  if (dataset.renderEvery !== undefined) {
+    requireExact(
+      dataset.renderEvery,
+      String(expected.run.renderEvery),
+      "$.headlessCapture.dataset.renderEvery",
+    );
+  }
+
+  const discImage = requireExactKeys(
+    capture.discImage,
+    ["algorithm", "format", "sha256"],
+    "$.headlessCapture.discImage",
+  );
+  for (const field of ["algorithm", "format", "sha256"]) {
+    requireExact(
+      discImage[field],
+      expected.game.image[field],
+      `$.headlessCapture.discImage.${field}`,
+    );
+  }
+}
+
+function validateTerminalPresentation(report, rendering, temporalSelectedXfb, sync) {
+  const lastFrame = temporalSelectedXfb.frames.at(-1);
+  requireExact(
+    sync.acknowledged,
+    lastFrame.rendererSequence,
+    "$.execution.scheduler.rendererSync.acknowledged",
+  );
+
+  const selected = requireCheckpointObject(
+    rendering.selectedXfb,
+    "$.rendering.selectedXfb",
+  );
+  for (const field of [
+    "address",
+    "generation",
+    "row",
+    "format",
+    "layout",
+    "sourceRow",
+    "width",
+    "height",
+    "textureWidth",
+    "textureHeight",
+    "logicalWidth",
+    "logicalHeight",
+    "displayWidth",
+    "displayHeight",
+    "rgbaByteLength",
+    "rgbaSha256",
+    "rgbSha256",
+  ]) {
+    requireExact(
+      selected[field],
+      lastFrame.selectedXfb[field],
+      `$.rendering.selectedXfb.${field}`,
+    );
+  }
+  const selectedRgb = requireCheckpointObject(selected.rgb, "$.rendering.selectedXfb.rgb");
+  for (const field of ["black", "white", "other", "unique"]) {
+    requireExact(
+      selectedRgb[field],
+      lastFrame.selectedXfb.rgb[field],
+      `$.rendering.selectedXfb.rgb.${field}`,
+    );
+  }
+
+  const vi = requireCheckpointObject(
+    report.mmioState?.viInterruptModel,
+    "$.mmioState.viInterruptModel",
+  );
+  requirePositiveInteger(
+    vi.presentationCount,
+    "$.mmioState.viInterruptModel.presentationCount",
+  );
+  for (const [field, expected] of [
+    ["lastPresentationField", lastFrame.presentation.field],
+    ["lastPresentationAddress", lastFrame.presentation.address],
+    ["lastPresentationCopyIndex", lastFrame.presentation.copyIndex],
+    ["lastPresentationCopyRow", lastFrame.presentation.copyRow],
+  ]) {
+    requireExact(vi[field], expected, `$.mmioState.viInterruptModel.${field}`);
+  }
+}
+
+function validateCheckpointEvidence(report, expected) {
+  validateSmbReadyCheckpointOptions(expected);
+  requireCheckpointObject(report, "$");
+  assertCheckpointJsonValue(report);
+  if (report.error !== undefined && report.error !== null) {
+    checkpointValidationFailure(
+      "$.error",
+      `emulator reported ${describeCheckpointValue(report.error)}`,
+    );
+  }
+  requireExact(report.status, "paused", "$.status");
+  requireExact(report.stage, "scenario-complete", "$.stage");
+  requireExact(report.title, SUPER_MONKEY_BALL_READY_TITLE, "$.title");
+
+  const disc = requireCheckpointObject(report.disc, "$.disc");
+  requireExact(disc.identifier, expected.game.identifier, "$.disc.identifier");
+  requireExact(disc.revision, expected.game.revision, "$.disc.revision");
+
+  const scenario = requireCheckpointObject(report.scenario, "$.scenario");
+  requireExact(scenario.id, expected.run.scenario, "$.scenario.id");
+  requireExact(scenario.status, "complete", "$.scenario.status");
+  requireExact(scenario.failure, null, "$.scenario.failure");
+  requireExact(scenario.currentStep, null, "$.scenario.currentStep");
+
+  validateDeviceHealth(report);
+  const renderer = validateRendererHealth(report, expected);
+  validateHeadlessCapture(report, expected);
+  requireCheckpointObject(report.gameplayTranscript, "$.gameplayTranscript");
+  const gameplayTranscript = verifySmbReadyPlayGameplayTranscript(
+    report,
+    report.gameplayTranscript,
+  );
+  const temporalSelectedXfb = projectSmbTemporalSelectedXfb(
+    renderer.rendering.temporalSelectedXfb,
+  );
+  requireExact(
+    temporalSelectedXfb.capacity,
+    expected.run.temporalXfbCapacity,
+    "$.rendering.temporalSelectedXfb.capacity",
+  );
+  validateTerminalPresentation(
+    report,
+    renderer.rendering,
+    temporalSelectedXfb,
+    renderer.sync,
+  );
+  return { gameplayTranscript, temporalSelectedXfb };
+}
+
+export function validateSmbReadyCheckpointReport(
+  report,
+  expected = SUPER_MONKEY_BALL_READY_CHECKPOINT,
+) {
+  validateCheckpointEvidence(report, expected);
+  return report;
+}

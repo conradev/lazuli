@@ -13,7 +13,26 @@ import {
 import {
   SUPER_MONKEY_BALL_READY_CHECKPOINT,
   validateSmbReadyCheckpointOptions,
+  validateSmbReadyCheckpointReport,
 } from "./browser_boot_checkpoint_v3.mjs";
+import {
+  smbReadyPlayCheckpointReport,
+} from "./browser_boot_checkpoint_v3_fixture.mjs";
+import {
+  GameplayTranscriptValidationError,
+} from "./browser_boot_gameplay_transcript.mjs";
+import {
+  TemporalXfbValidationError,
+} from "./browser_boot_temporal_xfb.mjs";
+
+function expectCheckpointFailure(mutate, path) {
+  const report = smbReadyPlayCheckpointReport();
+  mutate(report);
+  assert.throws(
+    () => validateSmbReadyCheckpointReport(report),
+    error => error instanceof CheckpointValidationError && error.path === path,
+  );
+}
 
 test("schema v3 defines one deeply frozen explicit SMB ready-to-PLAY profile", () => {
   assert.equal(BROWSER_BOOT_CHECKPOINT_SCHEMA_V3, "lazuli-browser-boot-checkpoint-v3");
@@ -71,6 +90,59 @@ test("schema v3 registers only the explicit ready-to-PLAY evidence fields", () =
     checkpointFieldsForSchema(BROWSER_BOOT_CHECKPOINT_SCHEMA_V3),
     BROWSER_BOOT_CHECKPOINT_FIELDS_V3,
   );
+});
+
+test("fresh ready-to-PLAY reports satisfy every health and provenance gate", () => {
+  const report = smbReadyPlayCheckpointReport();
+  assert.strictEqual(validateSmbReadyCheckpointReport(report), report);
+});
+
+test("v3 independently rederives the attached gameplay transcript", () => {
+  const report = smbReadyPlayCheckpointReport();
+  report.gameplayTranscript.steps[0].ready.witness.menuSelection += 1;
+  assert.throws(
+    () => validateSmbReadyCheckpointReport(report),
+    error => error instanceof GameplayTranscriptValidationError
+      && error.code === "transcript-mismatch"
+      && /menuSelection$/.test(error.path),
+  );
+});
+
+test("v3 fails closed on forged temporal oracle evidence", () => {
+  const report = smbReadyPlayCheckpointReport();
+  report.rendering.temporalSelectedXfb.oracle.complete = false;
+  assert.throws(
+    () => validateSmbReadyCheckpointReport(report),
+    error => error instanceof TemporalXfbValidationError
+      && error.code === "oracle-mismatch"
+      && /complete$/.test(error.path),
+  );
+});
+
+test("v3 gates fresh-disc, scenario, WebGPU, renderer, device, and DevTools health", () => {
+  const cases = [
+    [report => { report.error = "boom"; }, "$.error"],
+    [report => { report.title = "Other Game (GMBE8P Rev.00)"; }, "$.title"],
+    [report => { report.scenario.failure = { reason: "boom" }; }, "$.scenario.failure"],
+    [report => { report.headlessCapture.discImage.sha256 = "0".repeat(64); }, "$.headlessCapture.discImage.sha256"],
+    [report => { report.headlessCapture.discImage.hostPath = "/tmp/game.ciso"; }, "$.headlessCapture.discImage.[keys]"],
+    [report => { report.execution.scheduler.renderEvery = 2; }, "$.execution.scheduler.renderEvery"],
+    [report => { report.headlessCapture.dataset.renderEvery = "2"; }, "$.headlessCapture.dataset.renderEvery"],
+    [report => { report.rendering.backend = "fallback"; }, "$.rendering.backend"],
+    [report => { report.execution.scheduler.rendererSync.failed = 1; }, "$.execution.scheduler.rendererSync.failed"],
+    [report => { report.rendering.metrics.operations.pending = 1; }, "$.rendering.metrics.operations.pending"],
+    [report => { report.rendering.metrics.webgpu.checkHealthCalls = 0; }, "$.rendering.metrics.webgpu.checkHealthCalls"],
+    [report => { report.rendering.selectedXfb.rgbaSha256 = "f".repeat(64); }, "$.rendering.selectedXfb.rgbaSha256"],
+    [report => { report.mmioState.viInterruptModel.lastPresentationCopyIndex -= 1; }, "$.mmioState.viInterruptModel.lastPresentationCopyIndex"],
+    [report => { report.diskCommands.lastError = "0x00000001"; }, "$.diskCommands.lastError"],
+    [report => { report.deviceEvents.diskDeviceError = 1; }, "$.deviceEvents.diskDeviceError"],
+    [report => { report.gxFifo.decoder.unknownOpcodes = 1; }, "$.gxFifo.decoder.unknownOpcodes"],
+    [report => { report.serialInterface.unknownOutputCommands = 1; }, "$.serialInterface.unknownOutputCommands"],
+    [report => { report.exceptions.counts["0x0600"] = 1; }, '$.exceptions.counts["0x0600"]'],
+    [report => { report.headlessCapture.devtoolsExceptions.push({ text: "boom" }); }, "$.headlessCapture.devtoolsExceptions[0]"],
+    [report => { report.headlessCapture.reuse = { previous: {} }; }, "$.headlessCapture.reuse"],
+  ];
+  for (const [mutate, path] of cases) expectCheckpointFailure(mutate, path);
 });
 
 test("v3 profile validation cannot be weakened by callers", () => {
