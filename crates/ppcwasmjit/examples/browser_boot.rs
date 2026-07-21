@@ -2756,6 +2756,66 @@ const TEMPLATE: &str = r##"<!doctype html>
         : Math.max(-1024, Math.min(1023, result));
     }
 
+    function gxTevClamp(result, combiner) {
+      return (combiner & 0x00080000) !== 0
+        ? Math.max(0, Math.min(255, result))
+        : Math.max(-1024, Math.min(1023, result));
+    }
+
+    function gxTevComparison(a, b, combiner) {
+      return (combiner & 0x00040000) !== 0 ? a === b : a > b;
+    }
+
+    function gxTevPackedColor(color, target) {
+      let value = color[0] & 0xff;
+      if (target >= 1) value |= (color[1] & 0xff) << 8;
+      if (target >= 2) value |= (color[2] & 0xff) << 16;
+      return value;
+    }
+
+    function gxTevColorCombiner(a, b, c, d, combiner) {
+      if (((combiner >>> 16) & 3) !== 3) {
+        return Array.from({ length: 3 }, (_unused, channel) =>
+          gxTevRegular(a[channel], b[channel], c[channel], d[channel], combiner)
+        );
+      }
+
+      const target = (combiner >>> 20) & 3;
+      if (target === 3) {
+        return Array.from({ length: 3 }, (_unused, channel) => gxTevClamp(
+          d[channel] + (
+            gxTevComparison(a[channel] & 0xff, b[channel] & 0xff, combiner)
+              ? c[channel] & 0xff
+              : 0
+          ),
+          combiner
+        ));
+      }
+
+      const matches = gxTevComparison(
+        gxTevPackedColor(a, target), gxTevPackedColor(b, target), combiner
+      );
+      return Array.from({ length: 3 }, (_unused, channel) => gxTevClamp(
+        d[channel] + (matches ? c[channel] & 0xff : 0), combiner
+      ));
+    }
+
+    function gxTevAlphaCombiner(colorA, colorB, a, b, c, d, combiner) {
+      if (((combiner >>> 16) & 3) !== 3) {
+        return gxTevRegular(a, b, c, d, combiner);
+      }
+
+      const target = (combiner >>> 20) & 3;
+      // Packed alpha comparisons share the color combiner's RGB A/B inputs;
+      // target 3 is the only mode that compares the alpha combiner inputs.
+      const compareA = target === 3 ? a & 0xff : gxTevPackedColor(colorA, target);
+      const compareB = target === 3 ? b & 0xff : gxTevPackedColor(colorB, target);
+      return gxTevClamp(
+        d + (gxTevComparison(compareA, compareB, combiner) ? c & 0xff : 0),
+        combiner
+      );
+    }
+
     function gxTevSampleTexture(texture, x, y, width, height) {
       if (texture === null) return [255, 255, 255, 255];
       const normalizedX = (x + 0.5) / width;
@@ -2799,7 +2859,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           ? stage
           : best
       );
-      const vertexCount = vertices.length / 7;
+      const vertexCount = vertices.length / 8;
       const primaryCoords = texCoordSets[primary.texCoordIndex];
       if (!gxTevCoordsValid(primaryCoords, vertexCount)) return null;
       for (const stage of texturedStages) {
@@ -2811,7 +2871,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const rasterColor = [0, 0, 0, 0];
       for (let vertex = 0; vertex < vertexCount; vertex += 1) {
         for (let channel = 0; channel < 4; channel += 1) {
-          rasterColor[channel] += vertices[vertex * 7 + 3 + channel] * 255 / vertexCount;
+          rasterColor[channel] += vertices[vertex * 8 + 4 + channel] * 255 / vertexCount;
         }
       }
       for (let channel = 0; channel < 4; channel += 1) {
@@ -2910,36 +2970,33 @@ const TEMPLATE: &str = r##"<!doctype html>
               const konstAlpha = gxTevKonst(stage.konstAlphaSelector, true);
               const colorArgs = gxTevColorArguments(stage.colorCombiner);
               const alphaArgs = gxTevAlphaArguments(stage.alphaCombiner);
-              const colorResult = Array.from({ length: 3 }, (_unused, channel) =>
-                gxTevRegular(
-                  gxTevColorArgument(
-                    colorArgs.a, channel, registers, textureColor, raster, konstColor
-                  ),
-                  gxTevColorArgument(
-                    colorArgs.b, channel, registers, textureColor, raster, konstColor
-                  ),
-                  gxTevColorArgument(
-                    colorArgs.c, channel, registers, textureColor, raster, konstColor
-                  ),
+              const colorInput = argument => Array.from(
+                { length: 3 }, (_unused, channel) =>
                   gxTevColorArgument(
                     colorArgs.d, channel, registers, textureColor, raster, konstColor
                   ),
                   stage.colorCombiner
                 )
               );
-              const alphaResult = gxTevRegular(
-                gxTevAlphaArgument(
-                  alphaArgs.a, registers, textureColor, raster, konstAlpha
-                ),
-                gxTevAlphaArgument(
-                  alphaArgs.b, registers, textureColor, raster, konstAlpha
-                ),
-                gxTevAlphaArgument(
-                  alphaArgs.c, registers, textureColor, raster, konstAlpha
-                ),
-                gxTevAlphaArgument(
-                  alphaArgs.d, registers, textureColor, raster, konstAlpha
-                ),
+              const colorA = colorInput(colorArgs.a);
+              const colorB = colorInput(colorArgs.b);
+              const colorResult = gxTevColorCombiner(
+                colorA,
+                colorB,
+                colorInput(colorArgs.c),
+                colorInput(colorArgs.d),
+                stage.colorCombiner
+              );
+              const alphaInput = argument => gxTevAlphaArgument(
+                argument, registers, textureColor, raster, konstAlpha
+              );
+              const alphaResult = gxTevAlphaCombiner(
+                colorA,
+                colorB,
+                alphaInput(alphaArgs.a),
+                alphaInput(alphaArgs.b),
+                alphaInput(alphaArgs.c),
+                alphaInput(alphaArgs.d),
                 stage.alphaCombiner
               );
               const colorDestination = gxTevRegisterIndex(
