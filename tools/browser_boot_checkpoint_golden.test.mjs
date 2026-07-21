@@ -43,3 +43,50 @@ test("the SMB memory-card checkpoint is a valid three-run WebGPU golden", async 
     unique: 423,
   });
 });
+
+test("the SMB ready-to-PLAY checkpoint is a stable full-color WebGPU golden", async () => {
+  const manifest = await readCheckpointManifest(
+    new URL("./compatibility/smb-usa/ready-play.json", import.meta.url),
+  );
+
+  assert.equal(
+    manifest.id,
+    "smb-usa/smb-ready-play/render-every-1/temporal-xfb-8",
+  );
+  assert.equal(
+    manifest.sha256,
+    "cfed69a03d57a9cdbbe04446d88c911a0b35ad1296bb90651c6554d1dc8a8aed",
+  );
+  assert.equal(manifest.schema, "lazuli-browser-boot-checkpoint-v3");
+  assert.equal(manifest.consensus.cleanRuns, 3);
+  assert.equal(manifest.game.identifier, "GMBE8P");
+  assert.equal(
+    manifest.game.image.sha256,
+    "441a0eadc85afb501e2a3db5af2ee81d4783b96a58f6a2df2605f5c33dcb6202",
+  );
+  assert.equal(manifest.run.renderer, "wgpu-webgpu");
+  assert.equal(manifest.run.scenario, "smb-ready-play");
+
+  const oracle = manifest.state.rendering.temporalSelectedXfb.oracle;
+  assert.deepEqual({
+    blackWhiteAlternating: oracle.blackWhiteAlternating,
+    captured: oracle.captured,
+    complete: oracle.complete,
+    distinctRgbHashes: oracle.distinctRgbHashes,
+  }, {
+    blackWhiteAlternating: false,
+    captured: 8,
+    complete: true,
+    distinctRgbHashes: 8,
+  });
+
+  const encoded = JSON.stringify(manifest);
+  for (const hostEvidence of [
+    "headlessRun",
+    "127.0.0.1",
+    "HeadlessChrome",
+    "headlessRunToReportMs",
+  ]) {
+    assert.equal(encoded.includes(hostEvidence), false);
+  }
+});
