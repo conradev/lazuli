@@ -15,6 +15,9 @@ import {
   DevToolsSession,
   observeHeadlessPage,
 } from "./browser_boot_headless_cdp.mjs";
+import {
+  deriveSmbReadyPlayGameplayTranscript,
+} from "./browser_boot_gameplay_transcript.mjs";
 import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
 
 function parseArguments(argv) {
@@ -362,6 +365,11 @@ function verifyScenarioReport(report, options) {
   }
 }
 
+function attachScenarioGameplayTranscript(report, options) {
+  if (options.scenario !== "smb-ready-play") return;
+  report.gameplayTranscript = deriveSmbReadyPlayGameplayTranscript(report);
+}
+
 function verifyScenarioRendering(report, options) {
   if (options.scenario !== "smb-ready-play") return;
   const rendering = report.rendering;
@@ -449,6 +457,7 @@ async function main() {
         let scenarioError = null;
         try {
           verifyScenarioReport(report, options);
+          attachScenarioGameplayTranscript(report, options);
           verifyScenarioRendering(report, options);
         } catch (error) {
           scenarioError = error;

@@ -209,7 +209,15 @@ test("headless scenarios are selected before a fresh worker starts", () => {
   );
   assert.match(source, /Page\.navigate did not create a fresh document loader/);
   assert.equal(source.match(/verifyScenarioReport\(report, options\);/g)?.length, 1);
+  assert.equal(
+    source.match(/attachScenarioGameplayTranscript\(report, options\);/g)?.length,
+    1,
+  );
   assert.equal(source.match(/verifyScenarioRendering\(report, options\);/g)?.length, 1);
+  assert.match(
+    source,
+    /verifyScenarioReport\(report, options\);\s*attachScenarioGameplayTranscript\(report, options\);\s*verifyScenarioRendering\(report, options\);/,
+  );
   assert.match(
     source,
     /await persist\(options\.output, report\);\s*if \(scenarioError !== null\) throw scenarioError/,
@@ -296,4 +304,24 @@ test("SMB headless captures delegate temporal XFB verification", () => {
   assert.doesNotMatch(source, /distinctGenerations >= 2/);
   assert.doesNotMatch(source, /selected\.rgb\.unique > 1/);
   assert.doesNotMatch(source, /selected\.rgb\.other > 0/);
+});
+
+test("SMB headless captures attach a canonical gameplay transcript", () => {
+  assert.match(
+    source,
+    /import \{\s*deriveSmbReadyPlayGameplayTranscript,?\s*\} from "\.\/browser_boot_gameplay_transcript\.mjs"/,
+  );
+  const marker = Symbol("gameplay-transcript");
+  const context = vm.createContext({
+    deriveSmbReadyPlayGameplayTranscript(report) {
+      assert.equal(report.status, "paused");
+      return marker;
+    },
+  });
+  vm.runInContext(extractFunction("attachScenarioGameplayTranscript"), context);
+  const report = { status: "paused" };
+  context.attachScenarioGameplayTranscript(report, { scenario: "warioware-ready" });
+  assert.equal(Object.hasOwn(report, "gameplayTranscript"), false);
+  context.attachScenarioGameplayTranscript(report, { scenario: "smb-ready-play" });
+  assert.strictEqual(report.gameplayTranscript, marker);
 });
