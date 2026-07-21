@@ -9,6 +9,57 @@ pub(crate) const EFB_WIDTH: u32 = 640;
 pub(crate) const EFB_HEIGHT: u32 = 528;
 pub(crate) const WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RendererMetrics {
+    pub(crate) begin_segment_calls: u64,
+    pub(crate) bind_groups_created: u64,
+    pub(crate) buffers_created: u64,
+    pub(crate) check_health_calls: u64,
+    pub(crate) clear_efb_calls: u64,
+    pub(crate) copy_texture_calls: u64,
+    pub(crate) copy_xfb_calls: u64,
+    pub(crate) decoded_texture_queries: u64,
+    pub(crate) drain_calls: u64,
+    pub(crate) expanded_vertex_bytes: u64,
+    pub(crate) present_xfb_calls: u64,
+    pub(crate) push_tev_draw_calls: u64,
+    pub(crate) queue_submissions: u64,
+    pub(crate) render_pipelines_created: u64,
+    pub(crate) source_vertex_bytes: u64,
+    pub(crate) tev_state_bytes: u64,
+    pub(crate) texture_metadata_bytes: u64,
+    pub(crate) texture_pixel_bytes: u64,
+    pub(crate) texture_upload_bytes: u64,
+    pub(crate) texture_writes: u64,
+    pub(crate) textures_created: u64,
+}
+
+impl RendererMetrics {
+    pub(crate) fn record_draw_transport(
+        &mut self,
+        source_vertex_bytes: usize,
+        tev_state_bytes: usize,
+        texture_metadata_bytes: usize,
+        texture_pixel_bytes: usize,
+        expanded_vertex_bytes: usize,
+    ) {
+        self.push_tev_draw_calls = self.push_tev_draw_calls.saturating_add(1);
+        self.source_vertex_bytes = self
+            .source_vertex_bytes
+            .saturating_add(source_vertex_bytes as u64);
+        self.tev_state_bytes = self.tev_state_bytes.saturating_add(tev_state_bytes as u64);
+        self.texture_metadata_bytes = self
+            .texture_metadata_bytes
+            .saturating_add(texture_metadata_bytes as u64);
+        self.texture_pixel_bytes = self
+            .texture_pixel_bytes
+            .saturating_add(texture_pixel_bytes as u64);
+        self.expanded_vertex_bytes = self
+            .expanded_vertex_bytes
+            .saturating_add(expanded_vertex_bytes as u64);
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RendererFailureState {
     failure: Arc<Mutex<Option<String>>>,
@@ -488,12 +539,12 @@ pub use web::WebGpuRenderer;
 mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState,
-        SelectedTexture, TextureAddressMode, XfbCopyMetadata, alpha_compare, alpha_test_passes,
-        clipped_copy_extent, compact_xfb_readback_rows, decoded_texture_cache_hit,
-        decoded_texture_is_available, gx_blend_state, gx_sampler_identity,
-        merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy, select_texture,
-        valid_rgba8_texture, xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset,
-        xfb_source_rect,
+        RendererMetrics, SelectedTexture, TextureAddressMode, XfbCopyMetadata, alpha_compare,
+        alpha_test_passes, clipped_copy_extent, compact_xfb_readback_rows,
+        decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state,
+        gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy,
+        select_texture, valid_rgba8_texture, xfb_copy_matches_selection, xfb_readback_layout,
+        xfb_row_offset, xfb_source_rect,
     };
 
     const BASE: u32 = 0x0120_0000;
@@ -506,6 +557,20 @@ mod tests {
             height: 480,
             generation,
         }
+    }
+
+    #[test]
+    fn renderer_metrics_accumulate_exact_draw_transport_bytes() {
+        let mut metrics = RendererMetrics::default();
+        metrics.record_draw_transport(576, 464, 160, 4096, 864);
+        metrics.record_draw_transport(288, 464, 160, 0, 432);
+
+        assert_eq!(metrics.push_tev_draw_calls, 2);
+        assert_eq!(metrics.source_vertex_bytes, 864);
+        assert_eq!(metrics.tev_state_bytes, 928);
+        assert_eq!(metrics.texture_metadata_bytes, 320);
+        assert_eq!(metrics.texture_pixel_bytes, 4096);
+        assert_eq!(metrics.expanded_vertex_bytes, 1296);
     }
 
     #[test]

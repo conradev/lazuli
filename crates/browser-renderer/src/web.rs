@@ -1,7 +1,9 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -18,8 +20,8 @@ use crate::tev::{
     required_texture_maps, shader_source as tev_shader_source, validate_draw_transport,
 };
 use crate::{
-    EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState, SamplerIdentity,
-    SelectedTexture, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
+    EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState, RendererMetrics,
+    SamplerIdentity, SelectedTexture, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
     clipped_copy_extent, compact_xfb_readback_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_state, gx_sampler_identity, merge_contiguous_draw_range,
     require_tev_texture, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
@@ -298,6 +300,7 @@ pub struct WebGpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     failure_state: RendererFailureState,
+    metrics: Rc<Cell<RendererMetrics>>,
     surface_config: wgpu::SurfaceConfiguration,
     efb_color: wgpu::Texture,
     efb_color_view: wgpu::TextureView,
@@ -319,6 +322,49 @@ pub struct WebGpuRenderer {
     tev_draw_bindings: Vec<CachedTevDrawBinding>,
 }
 
+fn update_renderer_metrics(
+    metrics: &Cell<RendererMetrics>,
+    update: impl FnOnce(&mut RendererMetrics),
+) {
+    let mut current = metrics.get();
+    update(&mut current);
+    metrics.set(current);
+}
+
+fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> {
+    let result = Object::new();
+    for (name, value) in [
+        ("beginSegmentCalls", metrics.begin_segment_calls),
+        ("bindGroupsCreated", metrics.bind_groups_created),
+        ("buffersCreated", metrics.buffers_created),
+        ("checkHealthCalls", metrics.check_health_calls),
+        ("clearEfbCalls", metrics.clear_efb_calls),
+        ("copyTextureCalls", metrics.copy_texture_calls),
+        ("copyXfbCalls", metrics.copy_xfb_calls),
+        ("decodedTextureQueries", metrics.decoded_texture_queries),
+        ("drainCalls", metrics.drain_calls),
+        ("expandedVertexBytes", metrics.expanded_vertex_bytes),
+        ("presentXfbCalls", metrics.present_xfb_calls),
+        ("pushTevDrawCalls", metrics.push_tev_draw_calls),
+        ("queueSubmissions", metrics.queue_submissions),
+        ("renderPipelinesCreated", metrics.render_pipelines_created),
+        ("sourceVertexBytes", metrics.source_vertex_bytes),
+        ("tevStateBytes", metrics.tev_state_bytes),
+        ("textureMetadataBytes", metrics.texture_metadata_bytes),
+        ("texturePixelBytes", metrics.texture_pixel_bytes),
+        ("textureUploadBytes", metrics.texture_upload_bytes),
+        ("textureWrites", metrics.texture_writes),
+        ("texturesCreated", metrics.textures_created),
+    ] {
+        Reflect::set(
+            &result,
+            &JsValue::from_str(name),
+            &JsValue::from_f64(value as f64),
+        )?;
+    }
+    Ok(result)
+}
+
 #[wasm_bindgen]
 impl WebGpuRenderer {
     pub async fn create(canvas: HtmlCanvasElement) -> Result<WebGpuRenderer, JsValue> {
@@ -337,8 +383,19 @@ impl WebGpuRenderer {
         self.clear_efb(0, 0, 0)
     }
 
+    pub fn reset_diagnostics(&self) {
+        self.metrics.set(RendererMetrics::default());
+    }
+
+    pub fn diagnostics(&self) -> Result<Object, JsValue> {
+        renderer_metrics_object(self.metrics.get())
+    }
+
     pub fn clear_efb(&self, red: u8, green: u8, blue: u8) -> Result<(), JsValue> {
         self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
+        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -375,20 +432,33 @@ impl WebGpuRenderer {
             });
         }
         self.queue.submit([encoder.finish()]);
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+        });
         self.ensure_healthy()
     }
 
     pub fn begin_segment(&mut self) -> Result<(), JsValue> {
         self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.begin_segment_calls = metrics.begin_segment_calls.saturating_add(1);
+        });
         self.clear_segment();
         Ok(())
     }
 
     pub fn check_health(&self) -> Result<(), JsValue> {
-        self.ensure_healthy()
+        self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.check_health_calls = metrics.check_health_calls.saturating_add(1);
+        });
+        Ok(())
     }
 
     pub fn has_decoded_texture(&self, key: &str, width: u32, height: u32) -> bool {
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.decoded_texture_queries = metrics.decoded_texture_queries.saturating_add(1);
+        });
         decoded_texture_cache_hit(
             width,
             height,
@@ -399,6 +469,12 @@ impl WebGpuRenderer {
     }
 
     pub fn drain(&self) -> Promise {
+        if let Err(error) = self.ensure_healthy() {
+            return Promise::reject(&error);
+        }
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.drain_calls = metrics.drain_calls.saturating_add(1);
+        });
         let queue = self.queue.clone();
         let failure_state = self.failure_state.clone();
         future_to_promise(async move {
@@ -549,8 +625,46 @@ impl WebGpuRenderer {
         debug_assert_eq!(tev_state.len(), TEV_DRAW_STATE_BYTES);
         debug_assert_eq!(texture_metadata.len(), TEV_TEXTURE_METADATA_WORDS);
 
+        let mut keys = Vec::with_capacity(MAX_TEV_TEXTURES);
+        let mut pixels = Vec::with_capacity(MAX_TEV_TEXTURES);
+        for map in 0..MAX_TEV_TEXTURES {
+            let key = texture_keys.get(map as u32).as_string().ok_or_else(|| {
+                JsValue::from_str(&format!("TEV texture key {map} is not a string"))
+            })?;
+            let pixels_value = texture_pixels.get(map as u32);
+            if !pixels_value.is_instance_of::<Uint8Array>() {
+                return Err(JsValue::from_str(&format!(
+                    "TEV texture pixels {map} are not a Uint8Array"
+                )));
+            }
+            keys.push(key);
+            pixels.push(pixels_value.unchecked_into::<Uint8Array>());
+        }
+        let required_maps =
+            required_texture_maps(&tev_state).map_err(|error| JsValue::from_str(&error))?;
         let expanded = expanded_indices(topology, vertex_count)
             .ok_or_else(|| JsValue::from_str("unsupported GX primitive topology"))?;
+        let texture_pixel_bytes = pixels
+            .iter()
+            .map(|pixels| pixels.length() as usize)
+            .sum::<usize>();
+        let expanded_vertex_bytes = expanded
+            .len()
+            .saturating_mul(std::mem::size_of::<TevVertex>());
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.record_draw_transport(
+                source_vertices
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>()),
+                tev_state.len(),
+                texture_metadata
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+                texture_pixel_bytes,
+                expanded_vertex_bytes,
+            );
+        });
+
         if expanded.is_empty() {
             return Ok(());
         }
@@ -566,24 +680,6 @@ impl WebGpuRenderer {
         };
         if pipeline.cull == CullMode::All {
             return Ok(());
-        }
-
-        let required_maps =
-            required_texture_maps(&tev_state).map_err(|error| JsValue::from_str(&error))?;
-        let mut keys = Vec::with_capacity(MAX_TEV_TEXTURES);
-        let mut pixels = Vec::with_capacity(MAX_TEV_TEXTURES);
-        for map in 0..MAX_TEV_TEXTURES {
-            let key = texture_keys.get(map as u32).as_string().ok_or_else(|| {
-                JsValue::from_str(&format!("TEV texture key {map} is not a string"))
-            })?;
-            let pixels_value = texture_pixels.get(map as u32);
-            if !pixels_value.is_instance_of::<Uint8Array>() {
-                return Err(JsValue::from_str(&format!(
-                    "TEV texture pixels {map} are not a Uint8Array"
-                )));
-            }
-            keys.push(key);
-            pixels.push(pixels_value.unchecked_into::<Uint8Array>());
         }
 
         let mut selected = [SelectedTexture::White; MAX_TEV_TEXTURES];
@@ -738,6 +834,10 @@ impl WebGpuRenderer {
                 layout: &self.tev_texture_layout,
                 entries: &entries,
             });
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.buffers_created = metrics.buffers_created.saturating_add(2);
+                metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(2);
+            });
             let binding = self.tev_draw_bindings.len();
             self.tev_draw_bindings.push(CachedTevDrawBinding {
                 _alpha_uniform: alpha_uniform,
@@ -806,9 +906,15 @@ impl WebGpuRenderer {
         clear_blue: u8,
     ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.copy_texture_calls = metrics.copy_texture_calls.saturating_add(1);
+        });
         let mut encoder = self.flush_geometry();
         let Some((width, height)) = clipped_copy_extent(source_x, source_y, width, height) else {
             self.queue.submit([encoder.finish()]);
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+            });
             return self.ensure_healthy();
         };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -824,6 +930,9 @@ impl WebGpuRenderer {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
+        });
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.textures_created = metrics.textures_created.saturating_add(1);
         });
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
@@ -850,6 +959,9 @@ impl WebGpuRenderer {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.submit([encoder.finish()]);
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+        });
         self.efb_copy_cache.insert(
             destination,
             CachedTexture {
@@ -890,11 +1002,17 @@ impl WebGpuRenderer {
         clear_blue: u8,
     ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.copy_xfb_calls = metrics.copy_xfb_calls.saturating_add(1);
+        });
         let mut encoder = self.flush_geometry();
         let Some((width, source_height)) =
             clipped_copy_extent(source_x, source_y, width, source_height)
         else {
             self.queue.submit([encoder.finish()]);
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+            });
             return self.ensure_healthy();
         };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -912,6 +1030,9 @@ impl WebGpuRenderer {
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
+        });
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.textures_created = metrics.textures_created.saturating_add(1);
         });
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
@@ -938,6 +1059,9 @@ impl WebGpuRenderer {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.submit([encoder.finish()]);
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+        });
         self.xfb_cache.insert(
             destination,
             CachedXfb {
@@ -979,6 +1103,9 @@ impl WebGpuRenderer {
         output_height: u32,
     ) -> Result<bool, JsValue> {
         self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.present_xfb_calls = metrics.present_xfb_calls.saturating_add(1);
+        });
         if selected_address == 0 || expected_generation == 0 {
             return Ok(false);
         }
@@ -1085,6 +1212,10 @@ impl WebGpuRenderer {
                 },
             ],
         });
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.buffers_created = metrics.buffers_created.saturating_add(1);
+            metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
+        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1112,6 +1243,9 @@ impl WebGpuRenderer {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+        });
         output.present();
         self.last_presented_xfb = Some(PresentedXfb {
             texture,
@@ -1344,6 +1478,7 @@ impl WebGpuRenderer {
             device,
             queue,
             failure_state,
+            metrics: Rc::new(Cell::new(RendererMetrics::default())),
             surface_config,
             efb_color,
             efb_color_view,
@@ -1378,7 +1513,7 @@ impl WebGpuRenderer {
         pixels: &[u8],
         generation: u32,
     ) -> Result<CachedTexture, JsValue> {
-        upload_texture(
+        let texture = upload_texture(
             &self.device,
             &self.queue,
             label,
@@ -1387,7 +1522,15 @@ impl WebGpuRenderer {
             pixels,
             generation,
         )
-        .map_err(|error| JsValue::from_str(&error))
+        .map_err(|error| JsValue::from_str(&error))?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.textures_created = metrics.textures_created.saturating_add(1);
+            metrics.texture_writes = metrics.texture_writes.saturating_add(1);
+            metrics.texture_upload_bytes = metrics
+                .texture_upload_bytes
+                .saturating_add(pixels.len() as u64);
+        });
+        Ok(texture)
     }
 
     fn ensure_healthy(&self) -> Result<(), JsValue> {
@@ -1405,6 +1548,9 @@ impl WebGpuRenderer {
             return encoder;
         }
         let tev_vertex_buffer = (!self.tev_vertices.is_empty()).then(|| {
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.buffers_created = metrics.buffers_created.saturating_add(1);
+            });
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("browser GX per-fragment TEV vertices"),
@@ -1418,7 +1564,12 @@ impl WebGpuRenderer {
             .map(|command| command.state.pipeline)
             .collect::<HashSet<_>>();
         for key in tev_pipeline_keys {
-            self.pipelines.prepare_tev_geometry(&self.device, key);
+            if self.pipelines.prepare_tev_geometry(&self.device, key) {
+                update_renderer_metrics(&self.metrics, |metrics| {
+                    metrics.render_pipelines_created =
+                        metrics.render_pipelines_created.saturating_add(1);
+                });
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1738,13 +1889,14 @@ fn upload_texture(
 }
 
 impl Pipelines {
-    fn prepare_tev_geometry(&mut self, device: &wgpu::Device, key: PipelineKey) {
+    fn prepare_tev_geometry(&mut self, device: &wgpu::Device, key: PipelineKey) -> bool {
         if self.tev_geometry.contains_key(&key) {
-            return;
+            return false;
         }
         let pipeline =
             create_tev_geometry_pipeline(device, &self.tev_shader, &self.tev_layout, key);
         self.tev_geometry.insert(key, pipeline);
+        true
     }
 }
 
