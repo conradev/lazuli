@@ -626,6 +626,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Fmsubs => self.fmsubs(ins),
             Opcode::Fmul => self.fmul(ins),
             Opcode::Fmuls => self.fmuls(ins),
+            Opcode::Fnabs => self.fnabs(ins),
             Opcode::Fneg => self.fneg(ins),
             Opcode::Fnmadd => self.fnmadd(ins),
             Opcode::Fnmadds => self.fnmadds(ins),
