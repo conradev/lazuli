@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 
 export const BROWSER_BOOT_CHECKPOINT_SCHEMA_V1 = "lazuli-browser-boot-checkpoint-v1";
 export const BROWSER_BOOT_CHECKPOINT_SCHEMA = "lazuli-browser-boot-checkpoint-v2";
+export const BROWSER_BOOT_CHECKPOINT_SCHEMA_V3 = "lazuli-browser-boot-checkpoint-v3";
 export const SUPER_MONKEY_BALL_CHECKPOINT = Object.freeze({
   id: "smb-usa/no-input/cycles-1500000000/render-every-1",
   game: Object.freeze({
@@ -108,9 +109,21 @@ export const BROWSER_BOOT_CHECKPOINT_FIELDS = Object.freeze([
   "/rendering/selectedXfb/rgb/unique",
 ]);
 
+export const BROWSER_BOOT_CHECKPOINT_FIELDS_V3 = Object.freeze([
+  "/status",
+  "/stage",
+  "/title",
+  "/disc/identifier",
+  "/disc/revision",
+  "/gameplayTranscript",
+  "/rendering/backend",
+  "/rendering/temporalSelectedXfb",
+]);
+
 const CHECKPOINT_FIELDS_BY_SCHEMA = new Map([
   [BROWSER_BOOT_CHECKPOINT_SCHEMA_V1, BROWSER_BOOT_CHECKPOINT_FIELDS_V1],
   [BROWSER_BOOT_CHECKPOINT_SCHEMA, BROWSER_BOOT_CHECKPOINT_FIELDS],
+  [BROWSER_BOOT_CHECKPOINT_SCHEMA_V3, BROWSER_BOOT_CHECKPOINT_FIELDS_V3],
 ]);
 
 export function checkpointFieldsForSchema(schema, path = "$schema") {
