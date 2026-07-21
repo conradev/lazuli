@@ -814,7 +814,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     <div class="stage">
       <canvas id="display" data-testid="game-display" width="640" height="480">
-        Canvas support is required.
+        WebGPU support is required.
       </canvas>
     </div>
 
@@ -7206,105 +7206,46 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     } catch (error) {
       if (error !== Symbol.for("reported")) {
-        finish("stopped", {
-          stage,
-          pc: "0x" + pc.toString(16).padStart(8, "0"),
-          error: String(error?.stack ?? error),
-          instructions,
-          cycles,
-          dispatches,
-          compiledBlocks: blocks.size,
-        });
+        try {
+          await finishAfterRendererDrain("stopped", {
+            stage,
+            pc: "0x" + pc.toString(16).padStart(8, "0"),
+            error: String(error?.stack ?? error),
+            instructions,
+            cycles,
+            dispatches,
+            compiledBlocks: blocks.size,
+          });
+        } catch (reportError) {
+          if (reportError !== Symbol.for("reported")) throw reportError;
+        }
       }
     }
   </script>
   <script type="module">
+    import initBrowserRenderer, { WebGpuRenderer } from "/browser_renderer.js";
+
     const output = document.querySelector("#result") ?? { textContent: "" };
     const display = document.querySelector("#display");
     const runnerStatus = document.querySelector("#runner-status");
-    let displayContext = display.getContext("2d");
-    displayContext.fillStyle = "#000";
-    displayContext.fillRect(0, 0, display.width, display.height);
-    const efb = document.createElement("canvas");
-    efb.width = 640;
-    efb.height = 528;
-    const efbContext = efb.getContext("2d");
-    efbContext.fillStyle = "#000";
-    efbContext.fillRect(0, 0, efb.width, efb.height);
+    let webGpuRenderer;
+    try {
+      await initBrowserRenderer();
+      webGpuRenderer = await WebGpuRenderer.create(display);
+      await webGpuRenderer.drain();
+      webGpuRenderer.check_health();
+      document.body.dataset.renderer = "wgpu-webgpu";
+    } catch (error) {
+      const failure = `WebGPU is required: ${String(error?.message ?? error)}`;
+      document.body.dataset.status = "unsupported";
+      document.body.dataset.renderer = "unavailable";
+      runnerStatus.textContent = "WebGPU required";
+      output.textContent = failure;
+      throw new Error(failure, { cause: error });
+    }
     function gxClearEfb(clearColor) {
       const [red, green, blue] = clearColor;
-      efbContext.save();
-      efbContext.globalCompositeOperation = "copy";
-      // The XFB is an opaque color surface. GX titles commonly clear its alpha
-      // to zero, which must still replace the previous color instead of turning
-      // a Canvas source-over fill into a no-op.
-      efbContext.fillStyle = `rgb(${red}, ${green}, ${blue})`;
-      efbContext.fillRect(0, 0, efb.width, efb.height);
-      efbContext.restore();
-    }
-    function createWeightedLruCache(maximumEntries, maximumWeight, weightOf) {
-      const entries = new Map();
-      let totalWeight = 0;
-      let evictionCount = 0;
-
-      function measuredWeight(value) {
-        const weight = Number(weightOf(value));
-        return Number.isFinite(weight) ? Math.max(0, weight) : 0;
-      }
-
-      function remove(key) {
-        if (!entries.has(key)) return false;
-        const value = entries.get(key);
-        entries.delete(key);
-        totalWeight -= measuredWeight(value);
-        return true;
-      }
-
-      const cache = {
-        clear() {
-          entries.clear();
-          totalWeight = 0;
-          evictionCount = 0;
-        },
-        delete(key) {
-          return remove(key);
-        },
-        get(key) {
-          if (!entries.has(key)) return undefined;
-          const value = entries.get(key);
-          entries.delete(key);
-          entries.set(key, value);
-          return value;
-        },
-        set(key, value) {
-          remove(key);
-          entries.set(key, value);
-          totalWeight += measuredWeight(value);
-          while (entries.size > maximumEntries || totalWeight > maximumWeight) {
-            remove(entries.keys().next().value);
-            evictionCount += 1;
-          }
-          return cache;
-        },
-        get evictions() {
-          return evictionCount;
-        },
-        get maximumWeight() {
-          return maximumWeight;
-            presentationCount: viPresentationCount,
-            nextPresentationCycle: nextViPresentCycle,
-            lastPresentationCycle: viLastPresentationCycle,
-            lastPresentationField: viLastPresentationField,
-            lastPresentationAddress: hex32(viLastPresentationAddress),
-        },
-        get size() {
-          return entries.size;
-        },
-        get weight() {
-          return totalWeight;
-        },
-      };
-      return cache;
+      webGpuRenderer.clear_efb(red, green, blue);
     }
     const source = document.querySelector("#runner-source").textContent;
     const debugSurface = document.querySelector(".shell").dataset.surface === "debug";
@@ -7321,14 +7262,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let workerUrl = null;
 
     function resetPresentation() {
-      gxTextureCanvasCache.clear();
-      gxEfbTextureCopyCache.clear();
-          guestPad: inspectSuperMonkeyBallPad0(),
-      gxEfbTextureScaleCache.clear();
-      gxClearEfb([0, 0, 0, 0]);
-        guestGame: inspectSuperMonkeyBallGameState(),
-      displayContext.fillStyle = "#000";
-      displayContext.fillRect(0, 0, display.width, display.height);
+      webGpuRenderer.reset();
       output.textContent = "STARTING";
     }
 
@@ -7718,222 +7652,123 @@ const TEMPLATE: &str = r##"<!doctype html>
       requestAnimationFrame(sampleController);
     }
     sampleController();
-    const gxPresentationCachePixelLimit = 4 * 1024 * 1024;
-    const gxTextureCanvasCache = createWeightedLruCache(
-      64,
-      gxPresentationCachePixelLimit,
-      canvas => canvas.width * canvas.height
-    );
-    const gxEfbTextureCopyCache = createWeightedLruCache(
-      64,
-      gxPresentationCachePixelLimit,
-      copy => copy.canvas.width * copy.canvas.height
-    );
-    const gxEfbTextureScaleCache = createWeightedLruCache(
-      64,
-      gxPresentationCachePixelLimit,
-      canvas => canvas.width * canvas.height
-    );
-    function gxVertex(draw, index) {
-      const offset = index * 7;
-      return draw.vertices.slice(offset, offset + 7);
-    }
-    function gxTexCoord(draw, index) {
-      if (!Array.isArray(draw.texCoords) || draw.texCoords.length < index * 2 + 2) {
-        return null;
-      }
-      return draw.texCoords.slice(index * 2, index * 2 + 2);
-    }
-    function gxTextureCanvas(draw) {
-      if (draw.textureCanvas !== undefined) return draw.textureCanvas;
-      const texture = draw.texture;
-      if (
-        texture === undefined || texture.width <= 0 || texture.height <= 0
-      ) {
-        draw.textureCanvas = null;
-        return null;
-      }
-      const efbCopy = texture.textureCopyIndex === undefined
-        ? undefined
-        : gxEfbTextureCopyCache.get(texture.address);
-      if (efbCopy !== undefined && efbCopy.index === texture.textureCopyIndex) {
-        if (efbCopy.canvas.width === texture.width && efbCopy.canvas.height === texture.height) {
-          draw.textureCanvas = efbCopy.canvas;
-          return efbCopy.canvas;
-        }
-        const scaleKey = [
-          texture.address, efbCopy.index, texture.width, texture.height,
-        ].join(":");
-        let scaled = gxEfbTextureScaleCache.get(scaleKey);
-        if (scaled === undefined) {
-          scaled = document.createElement("canvas");
-          scaled.width = texture.width;
-          scaled.height = texture.height;
-          scaled.getContext("2d").drawImage(
-            efbCopy.canvas, 0, 0, texture.width, texture.height
+    function queueGxDraw(draw) {
+      const pipeline = draw.pipeline ?? {};
+      const textureKeys = [];
+      const textureMetadata = new Uint32Array(8 * 5);
+      const texturePixels = [];
+      for (let map = 0; map < 8; map += 1) {
+        const texture = draw.textures?.[map] ?? {};
+        const textureKey = String(texture.renderKey ?? texture.key ?? "");
+        textureKeys.push(textureKey);
+        const metadata = map * 5;
+        textureMetadata[metadata] = texture.address ?? 0;
+        textureMetadata[metadata + 1] = texture.textureCopyIndex ?? 0;
+        textureMetadata[metadata + 2] = texture.width ?? 0;
+        textureMetadata[metadata + 3] = texture.height ?? 0;
+        // Keep the GX wrap and filter fields together so the renderer can
+        // build the matching base-level WebGPU sampler without growing the ABI.
+        textureMetadata[metadata + 4] = ((texture.wrapS ?? 0) & 3)
+          | (((texture.wrapT ?? 0) & 3) << 2)
+          | (texture.magFilter !== 0 ? 1 << 4 : 0)
+          | (((texture.minFilter ?? 0) & 7) << 5);
+        const sourcePixels = texture.pixels;
+        const sourcePixelBytes = sourcePixels?.byteLength ?? sourcePixels?.length ?? 0;
+        const decodedTextureIsResident = sourcePixelBytes > 0
+          && textureKey !== ""
+          && webGpuRenderer.has_decoded_texture(
+            textureKey,
+            textureMetadata[metadata + 2],
+            textureMetadata[metadata + 3]
           );
-          gxEfbTextureScaleCache.set(scaleKey, scaled);
-        }
-        draw.textureCanvas = scaled;
-        return scaled;
+        const pixels = decodedTextureIsResident || sourcePixels === undefined
+          ? new Uint8Array()
+          : sourcePixels instanceof Uint8Array
+            ? sourcePixels
+            : new Uint8Array(sourcePixels);
+        texturePixels.push(pixels);
       }
-      if (texture.pixels === undefined) {
-        draw.textureCanvas = null;
-        return null;
-      }
-      if (texture.renderKey !== undefined) {
-        const cached = gxTextureCanvasCache.get(texture.renderKey);
-        if (cached !== undefined) {
-          draw.textureCanvas = cached;
-          return cached;
-        }
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = texture.width;
-      canvas.height = texture.height;
-      const context = canvas.getContext("2d");
-      const pixels = texture.pixels instanceof Uint8ClampedArray
-        ? texture.pixels
-        : new Uint8ClampedArray(texture.pixels);
-      context.putImageData(new ImageData(pixels, texture.width, texture.height), 0, 0);
-      if (texture.renderKey !== undefined) {
-        gxTextureCanvasCache.set(texture.renderKey, canvas);
-      }
-      draw.textureCanvas = canvas;
-      return canvas;
-    }
-    function gxColor(vertices) {
-      const scale = 1 / vertices.length;
-      const channels = [3, 4, 5, 6].map(channel =>
-        vertices.reduce((sum, vertex) => sum + vertex[channel], 0) * scale
+      webGpuRenderer.push_tev_draw(
+        draw.topology,
+        draw.vertices instanceof Float32Array
+          ? draw.vertices
+          : new Float32Array(draw.vertices),
+        draw.tevState instanceof Uint8Array
+          ? draw.tevState
+          : new Uint8Array(draw.tevState ?? []),
+        textureKeys,
+        textureMetadata,
+        texturePixels,
+        pipeline.zMode ?? 0,
+        pipeline.blendMode ?? 0x18,
+        pipeline.alphaTest ?? 0x003f0000,
+        pipeline.cullMode ?? 0,
+        pipeline.scissorX ?? 0,
+        pipeline.scissorY ?? 0,
+        pipeline.scissorWidth ?? 640,
+        pipeline.scissorHeight ?? 528
       );
-      return `rgba(${Math.round(channels[0] * 255)}, ${Math.round(channels[1] * 255)}, ${Math.round(channels[2] * 255)}, ${channels[3]})`;
     }
-    function gxTriangle(draw, a, b, c) {
-      const vertices = [gxVertex(draw, a), gxVertex(draw, b), gxVertex(draw, c)];
-      if (vertices.some(vertex => !Number.isFinite(vertex[0]) || !Number.isFinite(vertex[1]))) {
-        return;
-      }
-      const coords = [gxTexCoord(draw, a), gxTexCoord(draw, b), gxTexCoord(draw, c)];
-      const textureCanvas = gxTextureCanvas(draw);
-      if (
-        textureCanvas !== null
-        && coords.every(coord => coord !== null && coord.every(Number.isFinite))
-      ) {
-        const textureWidth = draw.texture.width;
-        const textureHeight = draw.texture.height;
-        const u0 = coords[0][0] * textureWidth;
-        const v0 = coords[0][1] * textureHeight;
-        const u1 = coords[1][0] * textureWidth;
-        const v1 = coords[1][1] * textureHeight;
-        const u2 = coords[2][0] * textureWidth;
-        const v2 = coords[2][1] * textureHeight;
-        const determinant = u0 * (v1 - v2) + u1 * (v2 - v0) + u2 * (v0 - v1);
-        if (Number.isFinite(determinant) && Math.abs(determinant) > 1e-8) {
-          const x0 = vertices[0][0];
-          const y0 = vertices[0][1];
-          const x1 = vertices[1][0];
-          const y1 = vertices[1][1];
-          const x2 = vertices[2][0];
-          const y2 = vertices[2][1];
-          const transformA = (
-            x0 * (v1 - v2) + x1 * (v2 - v0) + x2 * (v0 - v1)
-          ) / determinant;
-          const transformB = (
-            y0 * (v1 - v2) + y1 * (v2 - v0) + y2 * (v0 - v1)
-          ) / determinant;
-          const transformC = (
-            x0 * (u2 - u1) + x1 * (u0 - u2) + x2 * (u1 - u0)
-          ) / determinant;
-          const transformD = (
-            y0 * (u2 - u1) + y1 * (u0 - u2) + y2 * (u1 - u0)
-          ) / determinant;
-          const transformE = (
-            x0 * (u1 * v2 - u2 * v1)
-            + x1 * (u2 * v0 - u0 * v2)
-            + x2 * (u0 * v1 - u1 * v0)
-          ) / determinant;
-          const transformF = (
-            y0 * (u1 * v2 - u2 * v1)
-            + y1 * (u2 * v0 - u0 * v2)
-            + y2 * (u0 * v1 - u1 * v0)
-          ) / determinant;
-          efbContext.save();
-          efbContext.beginPath();
-          efbContext.moveTo(x0, y0);
-          efbContext.lineTo(x1, y1);
-          efbContext.lineTo(x2, y2);
-          efbContext.closePath();
-          efbContext.clip();
-          efbContext.setTransform(
-            transformA, transformB, transformC, transformD, transformE, transformF
-          );
-          efbContext.imageSmoothingEnabled = draw.texture.magFilter !== 0;
-          efbContext.drawImage(textureCanvas, 0, 0);
-          efbContext.restore();
-          return;
+    function queueGxGeometry(frame) {
+      webGpuRenderer.begin_segment();
+      for (const draw of frame.geometry.draws) queueGxDraw(draw);
+    }
+    async function drainWebGpuRenderer() {
+      await webGpuRenderer.drain();
+      webGpuRenderer.check_health();
+    }
+    function handleRendererFrame(message, render, sourceWorker = worker) {
+      const rendererSequence = Number(message.rendererSequence);
+      const isCurrentWorker = () => worker === sourceWorker;
+      const fail = error => {
+        if (!isCurrentWorker()) return;
+        const detail = String(error?.message ?? error);
+        if (Number.isSafeInteger(rendererSequence)) {
+          sourceWorker?.postMessage({
+            type: "renderer-frame-failed",
+            rendererSequence,
+            error: detail,
+          });
         }
+        handleRendererError(error, false);
+      };
+      try {
+        render();
+      } catch (error) {
+        fail(error);
+        return Promise.resolve();
       }
-      efbContext.beginPath();
-      efbContext.moveTo(vertices[0][0], vertices[0][1]);
-      efbContext.lineTo(vertices[1][0], vertices[1][1]);
-      efbContext.lineTo(vertices[2][0], vertices[2][1]);
-      efbContext.closePath();
-      efbContext.fillStyle = gxColor(vertices);
-      efbContext.fill();
+      return drainWebGpuRenderer().then(() => {
+        if (!isCurrentWorker()) return;
+        if (Number.isSafeInteger(rendererSequence)) {
+          sourceWorker?.postMessage({
+            type: "renderer-frame-complete",
+            rendererSequence,
+          });
+        }
+      }, fail);
     }
-    function gxLine(draw, a, b) {
-      const vertices = [gxVertex(draw, a), gxVertex(draw, b)];
-      efbContext.beginPath();
-      efbContext.moveTo(vertices[0][0], vertices[0][1]);
-      efbContext.lineTo(vertices[1][0], vertices[1][1]);
-      efbContext.strokeStyle = gxColor(vertices);
-      efbContext.lineWidth = 1;
-      efbContext.stroke();
-    }
-    function drawGxCall(draw) {
-      const count = draw.vertexCount;
-      switch (draw.topology) {
-        case 0:
-        case 1:
-          for (let index = 0; index + 3 < count; index += 4) {
-            gxTriangle(draw, index, index + 1, index + 2);
-            gxTriangle(draw, index, index + 2, index + 3);
-          }
-          if (count % 4 === 3) gxTriangle(draw, count - 3, count - 2, count - 1);
-          break;
-        case 2:
-          for (let index = 0; index + 2 < count; index += 3) {
-            gxTriangle(draw, index, index + 1, index + 2);
-          }
-          break;
-        case 3:
-          for (let index = 2; index < count; index += 1) {
-            if ((index & 1) === 0) gxTriangle(draw, index - 2, index - 1, index);
-            else gxTriangle(draw, index - 2, index, index - 1);
-          }
-          break;
-        case 4:
-          for (let index = 2; index < count; index += 1) {
-            gxTriangle(draw, 0, index - 1, index);
-          }
-          break;
-        case 5:
-          for (let index = 1; index < count; index += 2) gxLine(draw, index - 1, index);
-          break;
-        case 6:
-          for (let index = 1; index < count; index += 1) gxLine(draw, index - 1, index);
-          break;
-        case 7:
-          for (let index = 0; index < count; index += 1) {
-            const vertex = gxVertex(draw, index);
-            efbContext.fillStyle = gxColor([vertex]);
-            efbContext.fillRect(vertex[0] - 1, vertex[1] - 1, 2, 2);
-          }
-          break;
+    function handleRendererOperation(render, sourceWorker = worker) {
+      let value;
+      try {
+        value = render();
+      } catch (error) {
+        if (worker === sourceWorker) handleRendererError(error);
+        return Promise.resolve({ ok: false, value: null });
       }
+      return drainWebGpuRenderer().then(
+        () => worker === sourceWorker
+          ? { ok: true, value }
+          : { ok: false, value: null },
+        error => {
+          if (worker === sourceWorker) handleRendererError(error);
+          return { ok: false, value: null };
+        }
+      );
     }
     function handleWorkerMessage(event) {
+      const sourceWorker = event.currentTarget ?? worker;
+      if (sourceWorker !== worker) return;
       const message = event.data;
       if (message?.type === "controller-poll") {
         acknowledgeControllerPoll(message.buttons, message.sequence);
@@ -7941,61 +7776,95 @@ const TEMPLATE: &str = r##"<!doctype html>
         document.body.dataset[message.name] = message.value;
         if (message.name === "status") runnerStatus.textContent = message.value;
       } else if (message?.type === "efb-clear") {
-        gxClearEfb(message.clearColor);
+        return handleRendererOperation(() => gxClearEfb(message.clearColor), sourceWorker);
       } else if (message?.type === "texture-copy") {
         const frame = message.frame;
-        for (const draw of frame.geometry.draws) drawGxCall(draw);
-        const copy = document.createElement("canvas");
-        copy.width = Math.max(1, Math.min(1024, frame.width));
-        copy.height = Math.max(1, Math.min(1024, frame.sourceHeight));
-        copy.getContext("2d").drawImage(
-          efb,
-          frame.sourceX, frame.sourceY, frame.width, frame.sourceHeight,
-          0, 0, copy.width, copy.height
-        );
-        gxEfbTextureCopyCache.delete(frame.destination);
-        gxEfbTextureCopyCache.set(frame.destination, { canvas: copy, index: frame.index });
-        if (frame.clear) gxClearEfb(frame.clearColor);
-        document.body.dataset.gxTextureCopies = String(frame.index);
-      } else if (message?.type === "frame") {
-        const frame = message.frame;
-        for (const draw of frame.geometry.draws) drawGxCall(draw);
-        display.width = Math.max(1, Math.min(1024, frame.width));
-        display.height = Math.max(1, Math.min(1024, frame.height));
-        displayContext = display.getContext("2d");
-        displayContext.drawImage(
-          efb,
-          frame.sourceX, frame.sourceY, frame.width, frame.sourceHeight,
-          0, 0, display.width, display.height
-        );
-        if (frame.geometry.drawCalls === 0) {
-          displayContext.fillStyle = "#101018";
-          displayContext.fillRect(0, 0, display.width, display.height);
-          displayContext.fillStyle = "#d8e1ff";
-          displayContext.font = "16px system-ui";
-          displayContext.fillText(`GX XFB copy ${frame.index}`, 16, 28);
-          displayContext.fillText(
-            `${frame.width}x${frame.height} to 0x${frame.destination.toString(16)}`,
-            16,
-            52
+        return handleRendererFrame(message, () => {
+          queueGxGeometry(frame);
+          webGpuRenderer.copy_texture(
+            frame.sourceX,
+            frame.sourceY,
+            frame.width,
+            frame.sourceHeight,
+            frame.destination,
+            frame.index,
+            frame.clear,
+            frame.clearColor[0],
+            frame.clearColor[1],
+            frame.clearColor[2]
           );
-          displayContext.fillText("waiting for the first GX primitive", 16, 76);
-        }
-        if (frame.clear) gxClearEfb(frame.clearColor);
-        document.body.dataset.xfbCopies = String(frame.index);
-        document.body.dataset.gxDrawCalls = String(frame.geometry.drawCalls);
-        document.body.dataset.gxVertices = String(frame.geometry.vertices);
+          document.body.dataset.gxTextureCopies = String(frame.index);
+        }, sourceWorker);
+      } else if (message?.type === "xfb-copy") {
+        const frame = message.frame;
+        return handleRendererFrame(message, () => {
+          queueGxGeometry(frame);
+          webGpuRenderer.copy_xfb(
+            frame.sourceX,
+            frame.sourceY,
+            frame.width,
+            frame.sourceHeight,
+            frame.width,
+            frame.height,
+            frame.destination,
+            frame.stride,
+            frame.index,
+            frame.clear,
+            frame.clearColor[0],
+            frame.clearColor[1],
+            frame.clearColor[2]
+          );
+          document.body.dataset.xfbCopies = String(frame.index);
+          document.body.dataset.gxDrawCalls = String(frame.geometry.drawCalls);
+          document.body.dataset.gxVertices = String(frame.geometry.vertices);
+        }, sourceWorker);
+      } else if (message?.type === "vi-present") {
+        return handleRendererOperation(() =>
+          webGpuRenderer.present_xfb(
+            message.address,
+            Math.max(0, Math.min(1024, message.width)),
+            Math.max(0, Math.min(1024, message.height))
+          ),
+          sourceWorker
+        ).then(presentation => {
+          if (!presentation.ok) return;
+          const presented = presentation.value;
+          document.body.dataset.viField = message.field;
+          document.body.dataset.viXfbAddress =
+            "0x" + message.address.toString(16).padStart(8, "0");
+          document.body.dataset.viFields = String(
+            Number(document.body.dataset.viFields ?? 0) + 1
+          );
+          if (presented) {
+            document.body.dataset.viPresents = String(
+              Number(document.body.dataset.viPresents ?? 0) + 1
+            );
+          }
+        });
       } else if (message?.type === "finish") {
         output.textContent = message.text;
       }
     }
     function handleWorkerError(event) {
+      if (event.currentTarget !== undefined && event.currentTarget !== worker) return;
+      const message = String(event.message || "unknown worker error");
       document.body.dataset.status = "stopped";
+      runnerStatus.textContent = "worker error";
+      discStatus.textContent = message;
       output.textContent = JSON.stringify({
         status: "stopped",
         stage: "worker",
-        error: event.message,
+        error: message,
       }, null, 2);
+    }
+    function handleRendererError(error, notifyWorker = true) {
+      const detail = String(error?.message ?? error);
+      if (notifyWorker) {
+        worker?.postMessage({ type: "renderer-failed", error: detail });
+      }
+      handleWorkerError({
+        message: `WebGPU renderer failed: ${detail}`,
+      });
     }
     addEventListener("beforeunload", () => {
       worker?.terminate();
