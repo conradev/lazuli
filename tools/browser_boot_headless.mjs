@@ -19,6 +19,7 @@ function parseArguments(argv) {
     pulses: [],
     renderEvery: null,
     reuse: false,
+    scenario: null,
     timeoutMs: 300_000,
     output: null,
     url: null,
@@ -61,6 +62,9 @@ function parseArguments(argv) {
       case "--reuse":
         options.reuse = true;
         break;
+      case "--scenario":
+        options.scenario = value();
+        break;
       case "--render-every":
         options.renderEvery = Number(value());
         break;
@@ -75,8 +79,23 @@ function parseArguments(argv) {
     }
   }
   if (!options.reuse && options.url === null) throw new Error("--url is required without --reuse");
+  if (options.url !== null && new URL(options.url).searchParams.has("scenario")) {
+    throw new Error("select scenarios with --scenario, not the --url query");
+  }
   if (options.reuse && options.extendCycles === null) {
     throw new Error("--reuse requires --extend-cycles");
+  }
+  if (options.reuse && options.scenario !== null) {
+    throw new Error("--scenario cannot start inside a reused worker");
+  }
+  if (options.scenario !== null && options.pulses.length !== 0) {
+    throw new Error("--scenario cannot be combined with --pulse");
+  }
+  if (
+    options.scenario !== null
+    && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(options.scenario)
+  ) {
+    throw new Error("--scenario must be lowercase kebab-case");
   }
   if (
     options.extendCycles !== null
@@ -121,6 +140,17 @@ function parseArguments(argv) {
 
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function configuredRunUrl(options, headlessRunId) {
+  const url = new URL(options.url);
+  if (options.scenario !== null) url.searchParams.set("scenario", options.scenario);
+  url.searchParams.set("headlessRun", headlessRunId);
+  return url.href;
+}
+
+function isExpectedNavigation(state, runUrl, navigationLoaderId, frameLoaderId) {
+  return state.url === runUrl && frameLoaderId === navigationLoaderId;
 }
 
 class DevToolsSession {
@@ -327,6 +357,29 @@ function verifyExpectedCheckpoint(report, options, manifest) {
   };
 }
 
+function verifyScenarioReport(report, options) {
+  if (options.scenario === null) return;
+  const scenario = report.scenario;
+  if (
+    report.status !== "paused"
+    || report.stage !== "scenario-complete"
+    || scenario === null
+    || typeof scenario !== "object"
+    || scenario.id !== options.scenario
+    || scenario.status !== "complete"
+    || scenario.failure !== null
+  ) {
+    throw new Error(
+      `controller scenario did not complete: ${JSON.stringify({
+        expected: options.scenario,
+        reportStatus: report.status ?? null,
+        reportStage: report.stage ?? null,
+        scenario: scenario ?? null,
+      })}`
+    );
+  }
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   const expectedManifest = options.expect === null
@@ -341,17 +394,41 @@ async function main() {
     const runStartedAt = Date.now();
     const deadline = runStartedAt + options.timeoutMs;
     let reuseCapture = null;
+    let runUrl = null;
+    let navigationLoaderId = null;
     if (options.reuse) {
       reuseCapture = await extendExistingRun(session, options, deadline);
     } else {
-      await session.send("Page.navigate", { url: options.url });
+      runUrl = configuredRunUrl(options, `${process.pid}-${runStartedAt}`);
+      const navigation = await session.send("Page.navigate", { url: runUrl });
+      if (navigation.errorText !== undefined) {
+        throw new Error(`Page.navigate failed: ${navigation.errorText}`);
+      }
+      if (typeof navigation.loaderId !== "string" || navigation.loaderId.length === 0) {
+        throw new Error("Page.navigate did not create a fresh document loader");
+      }
+      navigationLoaderId = navigation.loaderId;
     }
 
     let state = null;
     while (Date.now() < deadline) {
       state = await pageState(session);
+      if (runUrl !== null) {
+        const frameTree = await session.send("Page.getFrameTree");
+        const frameLoaderId = frameTree.frameTree?.frame?.loaderId ?? null;
+        if (!isExpectedNavigation(state, runUrl, navigationLoaderId, frameLoaderId)) {
+          await delay(options.pollMs);
+          continue;
+        }
+      }
       const report = parseReport(state.result);
       if (report !== null) {
+        let scenarioError = null;
+        try {
+          verifyScenarioReport(report, options);
+        } catch (error) {
+          scenarioError = error;
+        }
         const reportDetectedAt = Date.now();
         await attachHeadlessCapture(session, state, report, {
           performance: {
@@ -359,8 +436,11 @@ async function main() {
           },
           reuse: reuseCapture,
         });
-        verifyExpectedCheckpoint(report, options, expectedManifest);
+        if (scenarioError === null) {
+          verifyExpectedCheckpoint(report, options, expectedManifest);
+        }
         await persist(options.output, report);
+        if (scenarioError !== null) throw scenarioError;
         return;
       }
       await delay(options.pollMs);
