@@ -8,9 +8,11 @@ import { pathToFileURL } from "node:url";
 import {
   BROWSER_BOOT_CHECKPOINT_FIELDS,
   BROWSER_BOOT_CHECKPOINT_SCHEMA,
+  BROWSER_BOOT_CHECKPOINT_SCHEMA_V3,
   CheckpointValidationError,
   SUPER_MONKEY_BALL_CHECKPOINT,
   assertCheckpointJsonValue,
+  canonicalCheckpointValue,
   checkpointChildPath,
   checkpointFieldsForSchema,
   checkpointIdentity,
@@ -23,6 +25,19 @@ import {
   requireCheckpointObject,
   validateCheckpointOptions,
 } from "./browser_boot_checkpoint_core.mjs";
+import {
+  SUPER_MONKEY_BALL_READY_CHECKPOINT,
+  createSmbReadyCheckpointCandidate,
+  validateSmbReadyCheckpointOptions,
+} from "./browser_boot_checkpoint_v3.mjs";
+import {
+  GameplayTranscriptValidationError,
+  validateSmbReadyPlayGameplayTranscript,
+} from "./browser_boot_gameplay_transcript.mjs";
+import {
+  TemporalXfbValidationError,
+  projectSmbTemporalSelectedXfb,
+} from "./browser_boot_temporal_xfb.mjs";
 
 export {
   BROWSER_BOOT_CHECKPOINT_FIELDS,
@@ -37,6 +52,7 @@ export {
 } from "./browser_boot_checkpoint_core.mjs";
 
 const MISSING = Symbol("missing checkpoint value");
+const SMB_READY_CHECKPOINT_TITLE = "Super Monkey Ball (GMBE8P Rev.00)";
 
 const RENDERER_MAXIMUM_METRICS = Object.freeze([
   Object.freeze({
@@ -206,6 +222,132 @@ function firstDifference(expected, actual, path = "$state") {
   return null;
 }
 
+function requireExactCheckpointValue(value, expected, path) {
+  if (!Object.is(value, expected)) {
+    checkpointValidationFailure(
+      path,
+      `expected ${describeCheckpointValue(expected)}, got ${describeCheckpointValue(value)}`,
+    );
+  }
+  return value;
+}
+
+function rebaseEvidencePath(base, path) {
+  if (path === "$" || path === "$." || typeof path !== "string") return base;
+  if (path.startsWith("$.")) return `${base}${path.slice(1)}`;
+  if (path.startsWith("$[")) return `${base}${path.slice(1)}`;
+  return base;
+}
+
+function reprojectSmbReadyManifestState(state) {
+  requireCheckpointObject(state, "$manifest.state");
+  const normalized = normalizeCheckpointState(
+    state,
+    "$manifest.state",
+    BROWSER_BOOT_CHECKPOINT_SCHEMA_V3,
+  );
+  requireExactCheckpointValue(normalized.status, "paused", "$manifest.state.status");
+  requireExactCheckpointValue(
+    normalized.stage,
+    "scenario-complete",
+    "$manifest.state.stage",
+  );
+  requireExactCheckpointValue(
+    normalized.title,
+    SMB_READY_CHECKPOINT_TITLE,
+    "$manifest.state.title",
+  );
+  requireExactCheckpointValue(
+    normalized.disc.identifier,
+    SUPER_MONKEY_BALL_READY_CHECKPOINT.game.identifier,
+    "$manifest.state.disc.identifier",
+  );
+  requireExactCheckpointValue(
+    normalized.disc.revision,
+    SUPER_MONKEY_BALL_READY_CHECKPOINT.game.revision,
+    "$manifest.state.disc.revision",
+  );
+  requireExactCheckpointValue(
+    normalized.rendering.backend,
+    SUPER_MONKEY_BALL_READY_CHECKPOINT.run.renderer,
+    "$manifest.state.rendering.backend",
+  );
+
+  let gameplayTranscript;
+  try {
+    gameplayTranscript = validateSmbReadyPlayGameplayTranscript(
+      normalized.gameplayTranscript,
+    );
+  } catch (error) {
+    if (!(error instanceof GameplayTranscriptValidationError)) throw error;
+    checkpointValidationFailure(
+      rebaseEvidencePath("$manifest.state.gameplayTranscript", error.path),
+      error.message,
+    );
+  }
+
+  let temporalSelectedXfb;
+  try {
+    temporalSelectedXfb = projectSmbTemporalSelectedXfb(
+      normalized.rendering.temporalSelectedXfb,
+    );
+  } catch (error) {
+    if (!(error instanceof TemporalXfbValidationError)) throw error;
+    checkpointValidationFailure(
+      rebaseEvidencePath(
+        "$manifest.state.rendering.temporalSelectedXfb",
+        error.path,
+      ),
+      error.message,
+    );
+  }
+
+  return {
+    status: normalized.status,
+    stage: normalized.stage,
+    title: normalized.title,
+    disc: {
+      identifier: normalized.disc.identifier,
+      revision: normalized.disc.revision,
+    },
+    gameplayTranscript: canonicalCheckpointValue(gameplayTranscript),
+    rendering: {
+      backend: normalized.rendering.backend,
+      temporalSelectedXfb: canonicalCheckpointValue(temporalSelectedXfb),
+    },
+  };
+}
+
+function smbReadyManifestProfile(manifest) {
+  return {
+    schema: manifest.schema,
+    id: manifest.id,
+    game: {
+      identifier: manifest.game.identifier,
+      revision: manifest.game.revision,
+      image: manifest.game.image,
+    },
+    run: manifest.run,
+  };
+}
+
+function smbReadyCheckpointIdentity(expected, state) {
+  return {
+    id: expected.id,
+    game: {
+      title: state.title,
+      identifier: state.disc.identifier,
+      revision: state.disc.revision,
+      image: canonicalCheckpointValue(expected.game.image),
+    },
+    checkpoint: {
+      status: state.status,
+      stage: state.stage,
+    },
+    run: canonicalCheckpointValue(expected.run),
+  };
+}
+
 export function createCheckpointManifest(
   reports,
   expected = SUPER_MONKEY_BALL_CHECKPOINT,
@@ -243,6 +385,66 @@ export function createCheckpointManifest(
   };
 }
 
+function validateSmbReadyCheckpointManifest(manifest) {
+  for (const field of ["game", "checkpoint", "run", "consensus"]) {
+    requireCheckpointObject(manifest[field], `$manifest.${field}`);
+  }
+  rejectUnexpectedCheckpointFields(
+    manifest.consensus,
+    ["cleanRuns"],
+    "$manifest.consensus",
+  );
+  const expected = smbReadyManifestProfile(manifest);
+  validateSmbReadyCheckpointOptions(expected, "$manifest");
+  const cleanRuns = requireCheckpointNonNegativeInteger(
+    manifest.consensus.cleanRuns,
+    "$manifest.consensus.cleanRuns",
+  );
+  if (cleanRuns < expected.run.cleanRunsRequired) {
+    checkpointValidationFailure(
+      "$manifest.consensus.cleanRuns",
+      `at least ${expected.run.cleanRunsRequired} clean runs are required`,
+    );
+  }
+  validateRendererPerformanceBudget(manifest);
+
+  const normalizedState = reprojectSmbReadyManifestState(manifest.state);
+  const stateShapeDifference = firstDifference(
+    normalizedState,
+    manifest.state,
+    "$manifest.state",
+  );
+  if (stateShapeDifference !== null) {
+    checkpointValidationFailure(
+      stateShapeDifference.path,
+      `unexpected checkpoint state field: expected ${describeDifferenceValue(stateShapeDifference.expected)}, got ${describeDifferenceValue(stateShapeDifference.actual)}`,
+    );
+  }
+
+  const identity = smbReadyCheckpointIdentity(expected, normalizedState);
+  for (const field of ["id", "game", "checkpoint", "run"]) {
+    const difference = firstDifference(
+      identity[field],
+      manifest[field],
+      `$manifest.${field}`,
+    );
+    if (difference !== null) {
+      checkpointValidationFailure(
+        difference.path,
+        `expected ${describeDifferenceValue(difference.expected)}, got ${describeDifferenceValue(difference.actual)}`,
+      );
+    }
+  }
+  const stateSha256 = checkpointSha256(normalizedState);
+  if (stateSha256 !== manifest.sha256) {
+    checkpointValidationFailure(
+      "$manifest.sha256",
+      `manifest state hashes to ${stateSha256}, not ${manifest.sha256}`,
+    );
+  }
+  return manifest;
+}
+
 export function validateCheckpointManifest(manifest) {
   requireCheckpointObject(manifest, "$manifest");
   assertCheckpointJsonValue(manifest, "$manifest");
@@ -266,6 +468,9 @@ export function validateCheckpointManifest(manifest) {
       fieldsDifference.path,
       `expected ${describeDifferenceValue(fieldsDifference.expected)}, got ${describeDifferenceValue(fieldsDifference.actual)}`,
     );
+  }
+  if (manifest.schema === BROWSER_BOOT_CHECKPOINT_SCHEMA_V3) {
+    return validateSmbReadyCheckpointManifest(manifest);
   }
   for (const field of ["game", "checkpoint", "run", "consensus"]) {
     requireCheckpointObject(manifest[field], `$manifest.${field}`);
@@ -334,16 +539,23 @@ export function validateCheckpointManifest(manifest) {
 
 export function verifyCheckpointReport(report, manifest) {
   validateCheckpointManifest(manifest);
-  const expected = {
-    id: manifest.id,
-    game: {
-      identifier: manifest.game.identifier,
-      revision: manifest.game.revision,
-      image: manifest.game.image,
-    },
-    run: manifest.run,
-  };
-  const candidate = createCheckpointCandidate(report, expected, manifest.schema);
+  let candidate;
+  if (manifest.schema === BROWSER_BOOT_CHECKPOINT_SCHEMA_V3) {
+    const expected = smbReadyManifestProfile(manifest);
+    validateSmbReadyCheckpointOptions(expected, "$manifest");
+    candidate = createSmbReadyCheckpointCandidate(report, expected);
+  } else {
+    const expected = {
+      id: manifest.id,
+      game: {
+        identifier: manifest.game.identifier,
+        revision: manifest.game.revision,
+        image: manifest.game.image,
+      },
+      run: manifest.run,
+    };
+    candidate = createCheckpointCandidate(report, expected, manifest.schema);
+  }
   for (const field of ["id", "game", "checkpoint", "run"]) {
     const difference = firstDifference(manifest[field], candidate[field], `$${field}`);
     if (difference !== null) {
