@@ -307,18 +307,22 @@ test("VI field service selects a cached XFB independently of comparators", () =>
   assert.equal(context.viLastPresentationCopyRow, 1);
 });
 
-test("main thread caches XFB copies and presents only on VI messages", async () => {
+test("main thread submits GX XFB frames before separate VI presentation", async () => {
   const calls = [];
   const workerMessages = [];
+  let submittedPacket;
   const context = evaluateFunctions(
     [
       "appendRendererOperation",
       "enqueueRendererOperation",
+      "submitGxFrame",
       "handleRendererFrame",
       "handleRendererOperation",
       "handleWorkerMessage",
     ],
     {
+      ArrayBuffer,
+      Uint8Array,
       document: { body: { dataset: {} } },
       drainWebGpuRenderer() { return Promise.resolve(); },
       gxClearEfb() {},
@@ -326,14 +330,17 @@ test("main thread caches XFB copies and presents only on VI messages", async () 
       output: { textContent: "" },
       rendererHostMetrics: {
         operations: { enqueued: 0, pending: 0, highWater: 0 },
+        workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
       },
       rendererOperationTail: Promise.resolve(),
-      queueGxGeometry(frame) { calls.push(["geometry", frame.index]); },
       runnerStatus: { textContent: "" },
       worker: { postMessage(message) { workerMessages.push(message); } },
       webGpuRenderer: {
-        copy_texture() { calls.push(["texture-copy"]); },
-        copy_xfb(...args) { calls.push(["xfb-copy", ...args]); },
+        submit_gx_frame(packet) {
+          submittedPacket = packet;
+          calls.push(["gx-frame", packet.byteLength]);
+          return ["texture-a"];
+        },
         present_xfb(...args) {
           calls.push(["vi-present", ...args]);
           return true;
@@ -341,44 +348,32 @@ test("main thread caches XFB copies and presents only on VI messages", async () 
       },
     },
   );
-  const frame = {
-    index: 7,
-    sourceX: 1,
-    sourceY: 2,
-    width: 640,
-    sourceHeight: 528,
-    height: 480,
-    destination: 0x01200000,
-    stride: 0x500,
-    clear: true,
-    clearColor: [4, 5, 6, 255],
-    geometry: { drawCalls: 1, vertices: 3, draws: [] },
-  };
+  const packet = new ArrayBuffer(128);
 
   await context.handleWorkerMessage({
-    data: { type: "xfb-copy", frame, rendererSequence: 19 },
+    data: {
+      type: "gx-frame",
+      packet,
+      diagnostics: { copyKind: 2, index: 7, drawCalls: 1, vertices: 3 },
+      rendererSequence: 19,
+    },
   });
-  assert.deepEqual(calls[0], ["geometry", 7]);
-  assert.deepEqual(calls[1], [
-    "xfb-copy",
-    1,
-    2,
-    640,
-    528,
-    640,
-    480,
-    0x01200000,
-    0x500,
-    7,
-    true,
-    4,
-    5,
-    6,
-  ]);
+  assert.deepEqual(calls, [["gx-frame", 128]]);
+  assert.equal(submittedPacket instanceof Uint8Array, true);
+  assert.equal(submittedPacket.buffer, packet);
   assert.equal(calls.some(([name]) => name === "vi-present"), false);
+  assert.deepEqual(context.rendererHostMetrics.workerMessages, {
+    gxFrames: 1,
+    drawCalls: 1,
+    receivedArrayBufferBytes: 128,
+  });
+  assert.equal(context.document.body.dataset.xfbCopies, "7");
+  assert.equal(context.document.body.dataset.gxDrawCalls, "1");
+  assert.equal(context.document.body.dataset.gxVertices, "3");
   assert.deepEqual(JSON.parse(JSON.stringify(workerMessages)), [{
     type: "renderer-frame-complete",
     rendererSequence: 19,
+    residentTextureKeys: ["texture-a"],
   }]);
 
   await context.handleWorkerMessage({
@@ -396,6 +391,7 @@ test("main thread caches XFB copies and presents only on VI messages", async () 
     },
   });
   assert.deepEqual(calls.at(-1), ["vi-present", 0x01200500, 7, 1, 640, 480]);
+  assert.deepEqual(calls.map(([name]) => name), ["gx-frame", "vi-present"]);
   assert.equal(context.document.body.dataset.viField, "bottom");
   assert.equal(context.document.body.dataset.viCopyIndex, "7");
   assert.equal(context.document.body.dataset.viCopyRow, "1");

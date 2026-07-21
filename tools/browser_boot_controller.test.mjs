@@ -13,11 +13,11 @@ const sourcePath = new URL(
 const source = readFileSync(sourcePath, "utf8");
 const controllerStart = source.lastIndexOf("    let controllerSequence = 0;");
 const controllerEnd = source.indexOf(
-  "    function queueGxDraw(draw)",
+  "    function submitGxFrame(message)",
   controllerStart,
 );
 assert.notEqual(controllerStart, -1, "missing controller binding start");
-assert.notEqual(controllerEnd, -1, "missing controller binding end");
+assert.notEqual(controllerEnd, -1, "missing packed renderer submission boundary");
 const controllerSource = source.slice(controllerStart, controllerEnd);
 
 class FakeElement {

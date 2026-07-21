@@ -895,6 +895,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererFrameHighWater = 0;
     let rendererFrameResultMisses = 0;
     let rendererFailure = null;
+    let rendererResidentTextureKeys = new Set();
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -1074,7 +1075,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     });
 
-    function postRendererFrame(type, frame) {
+    function postRendererFrame(type, frame, transfer = []) {
       const rendererSequence = ++rendererFrameSequence;
       rendererFramesInFlight.add(rendererSequence);
       rendererFrameHighWater = Math.max(
@@ -1082,11 +1083,37 @@ const TEMPLATE: &str = r##"<!doctype html>
         rendererFramesInFlight.size
       );
       try {
-        postMessage({ type, frame, rendererSequence });
+        if (type === "gx-frame") {
+          postMessage({
+            type,
+            packet: frame.packet,
+            diagnostics: frame.diagnostics,
+            rendererSequence,
+          }, transfer);
+        } else {
+          postMessage({ type, frame, rendererSequence }, transfer);
+        }
       } catch (error) {
         rendererFramesInFlight.delete(rendererSequence);
         throw error;
       }
+    }
+
+    function postGxFrame(copyKind, frame) {
+      const diagnostics = {
+        copyKind,
+        index: frame.index,
+        drawCalls: frame.geometry.drawCalls,
+        vertices: frame.geometry.vertices,
+      };
+      // A FIFO drain can produce more than one copy before the async renderer
+      // acknowledgement runs. Only omit payloads against a residency snapshot
+      // when no earlier packet can still change that cache.
+      const residentTextureKeys = rendererFramesInFlight.size === 0
+        ? rendererResidentTextureKeys
+        : null;
+      const packet = packGxFramePacketV1(copyKind, frame, residentTextureKeys);
+      postRendererFrame("gx-frame", { packet, diagnostics }, [packet]);
     }
 
     function gxFramePacketInteger(value, name, maximum = 0xffffffff) {
@@ -1644,6 +1671,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         rendererFrameFailures += 1;
         recordRendererFailure(message.error);
       } else {
+        if (message.residentTextureKeys !== undefined) {
+          if (
+            !Array.isArray(message.residentTextureKeys)
+            || message.residentTextureKeys.some(key => typeof key !== "string")
+          ) {
+            rendererFrameFailures += 1;
+            recordRendererFailure("WebGPU renderer returned invalid texture residency");
+            return;
+          }
+          rendererResidentTextureKeys = new Set(message.residentTextureKeys);
+        }
         rendererFramesAcknowledged += 1;
         if (rendererFramesInFlight.size === 0) rendererBackpressureResume?.();
       }
@@ -4204,7 +4242,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             postMessage({ type: "efb-clear", clearColor: gxSkippedFrameClearColor });
             gxSkippedFrameClearColor = null;
           }
-          postRendererFrame("xfb-copy", frame);
+          postGxFrame(2, frame);
           gxXfbFramesCaptured += 1;
         }
         gxFrameDraws = [];
@@ -4234,7 +4272,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             postMessage({ type: "efb-clear", clearColor: gxSkippedFrameClearColor });
             gxSkippedFrameClearColor = null;
           }
-          postRendererFrame("texture-copy", frame);
+          postGxFrame(1, frame);
           gxTextureCopyFramesPresented += 1;
         } else if (frame.clear) {
           postMessage({ type: "efb-clear", clearColor: frame.clearColor });
@@ -7910,23 +7948,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       rendererHostMetrics = newRendererHostMetrics();
       rendererWorkerStartedAt = performance.now();
     }
-    function receivedArrayBufferBytes(frame) {
-      const buffers = new Set();
-      const retain = value => {
-        if (value instanceof ArrayBuffer) buffers.add(value);
-        else if (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) {
-          buffers.add(value.buffer);
-        }
-      };
-      for (const draw of frame.geometry?.draws ?? []) {
-        retain(draw.vertices);
-        retain(draw.tevState);
-        for (const texture of draw.textures ?? []) retain(texture?.pixels);
-      }
-      let bytes = 0;
-      for (const buffer of buffers) bytes += buffer.byteLength;
-      return bytes;
-    }
     let rendererOperationTail = Promise.resolve();
     function appendRendererOperation(operation) {
       const pending = rendererOperationTail.then(operation, operation);
@@ -8016,26 +8037,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     function snapshotRendererPerformance() {
       const webgpu = webGpuRenderer.diagnostics();
-      const wasmBridgeCalls = [
-        "beginSegmentCalls",
-        "checkHealthCalls",
-        "clearEfbCalls",
-        "copyTextureCalls",
-        "copyXfbCalls",
-        "decodedTextureQueries",
-        "drainCalls",
-        "presentXfbCalls",
-        "pushTevDrawCalls",
-      ].reduce((total, key) => total + Number(webgpu[key] ?? 0), 0);
-      const typedArrayBytes = [
-        "sourceVertexBytes",
-        "tevStateBytes",
-        "textureMetadataBytes",
-        "texturePixelBytes",
-      ].reduce((total, key) => total + Number(webgpu[key] ?? 0), 0);
       return {
         scope: "current-worker",
-        wasmBridge: { calls: wasmBridgeCalls, typedArrayBytes },
+        wasmBridge: {
+          calls: Number(webgpu.wasmBridgeCalls ?? 0),
+          typedArrayBytes: Number(webgpu.wasmBridgeTypedArrayBytes ?? 0),
+        },
         queue: {
           drains: Number(webgpu.drainCalls ?? 0),
           submits: Number(webgpu.queueSubmissions ?? 0),
@@ -8050,6 +8057,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         workerMessages: { ...rendererHostMetrics.workerMessages },
         workload: {
           expandedVertexBytes: Number(webgpu.expandedVertexBytes ?? 0),
+          gxFramePacketBytes: Number(webgpu.gxFramePacketBytes ?? 0),
+          gxFramePacketPayloadBytes: Number(webgpu.gxFramePacketPayloadBytes ?? 0),
           textureUploadBytes: Number(webgpu.textureUploadBytes ?? 0),
           textureWrites: Number(webgpu.textureWrites ?? 0),
         },
@@ -8489,70 +8498,42 @@ const TEMPLATE: &str = r##"<!doctype html>
       requestAnimationFrame(sampleController);
     }
     sampleController();
-    function queueGxDraw(draw) {
-      const pipeline = draw.pipeline ?? {};
-      const textureKeys = [];
-      const textureMetadata = new Uint32Array(8 * 5);
-      const texturePixels = [];
-      for (let map = 0; map < 8; map += 1) {
-        const texture = draw.textures?.[map] ?? {};
-        const textureKey = String(texture.renderKey ?? texture.key ?? "");
-        textureKeys.push(textureKey);
-        const metadata = map * 5;
-        textureMetadata[metadata] = texture.address ?? 0;
-        textureMetadata[metadata + 1] = texture.textureCopyIndex ?? 0;
-        textureMetadata[metadata + 2] = texture.width ?? 0;
-        textureMetadata[metadata + 3] = texture.height ?? 0;
-        // Keep the GX wrap and filter fields together so the renderer can
-        // build the matching base-level WebGPU sampler without growing the ABI.
-        textureMetadata[metadata + 4] = ((texture.wrapS ?? 0) & 3)
-          | (((texture.wrapT ?? 0) & 3) << 2)
-          | (texture.magFilter !== 0 ? 1 << 4 : 0)
-          | (((texture.minFilter ?? 0) & 7) << 5);
-        const sourcePixels = texture.pixels;
-        const sourcePixelBytes = sourcePixels?.byteLength ?? sourcePixels?.length ?? 0;
-        const decodedTextureIsResident = sourcePixelBytes > 0
-          && textureKey !== ""
-          && webGpuRenderer.has_decoded_texture(
-            textureKey,
-            textureMetadata[metadata + 2],
-            textureMetadata[metadata + 3]
-          );
-        const pixels = decodedTextureIsResident || sourcePixels === undefined
-          ? new Uint8Array()
-          : sourcePixels instanceof Uint8Array
-            ? sourcePixels
-            : new Uint8Array(sourcePixels);
-        texturePixels.push(pixels);
+    function submitGxFrame(message) {
+      const packet = message.packet;
+      if (!(packet instanceof ArrayBuffer)) {
+        throw new TypeError("GX frame message packet must be an ArrayBuffer");
       }
-      webGpuRenderer.push_tev_draw(
-        draw.topology,
-        draw.vertices instanceof Float32Array
-          ? draw.vertices
-          : new Float32Array(draw.vertices),
-        draw.tevState instanceof Uint8Array
-          ? draw.tevState
-          : new Uint8Array(draw.tevState ?? []),
-        textureKeys,
-        textureMetadata,
-        texturePixels,
-        pipeline.zMode ?? 0,
-        pipeline.blendMode ?? 0x18,
-        pipeline.alphaTest ?? 0x003f0000,
-        pipeline.cullMode ?? 0,
-        pipeline.scissorX ?? 0,
-        pipeline.scissorY ?? 0,
-        pipeline.scissorWidth ?? 640,
-        pipeline.scissorHeight ?? 528
-      );
-    }
-    function queueGxGeometry(frame) {
+      const diagnostics = message.diagnostics ?? {};
+      const copyKind = Number(diagnostics.copyKind);
+      const index = Number(diagnostics.index);
+      const drawCalls = Number(diagnostics.drawCalls);
+      const vertices = Number(diagnostics.vertices);
+      if (
+        (copyKind !== 1 && copyKind !== 2)
+        || !Number.isSafeInteger(index)
+        || index < 0
+        || !Number.isSafeInteger(drawCalls)
+        || drawCalls < 0
+        || !Number.isSafeInteger(vertices)
+        || vertices < 0
+      ) {
+        throw new TypeError("GX frame message diagnostics are invalid");
+      }
       rendererHostMetrics.workerMessages.gxFrames += 1;
-      rendererHostMetrics.workerMessages.drawCalls += frame.geometry.draws.length;
-      rendererHostMetrics.workerMessages.receivedArrayBufferBytes +=
-        receivedArrayBufferBytes(frame);
-      webGpuRenderer.begin_segment();
-      for (const draw of frame.geometry.draws) queueGxDraw(draw);
+      rendererHostMetrics.workerMessages.drawCalls += drawCalls;
+      rendererHostMetrics.workerMessages.receivedArrayBufferBytes += packet.byteLength;
+      const residentTextureKeys = Array.from(
+        webGpuRenderer.submit_gx_frame(new Uint8Array(packet)) ?? [],
+        key => String(key)
+      );
+      if (copyKind === 1) {
+        document.body.dataset.gxTextureCopies = String(index);
+      } else {
+        document.body.dataset.xfbCopies = String(index);
+        document.body.dataset.gxDrawCalls = String(drawCalls);
+        document.body.dataset.gxVertices = String(vertices);
+      }
+      return { residentTextureKeys };
     }
     async function drainWebGpuRenderer() {
       await webGpuRenderer.drain();
@@ -8585,10 +8566,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         return drainWebGpuRenderer().then(() => {
           if (!isCurrentWorker()) return { ok: false, value: null };
           if (Number.isSafeInteger(rendererSequence)) {
-            sourceWorker?.postMessage({
+            const completion = {
               type: "renderer-frame-complete",
               rendererSequence,
-            });
+            };
+            if (Array.isArray(value?.residentTextureKeys)) {
+              completion.residentTextureKeys = value.residentTextureKeys;
+            }
+            sourceWorker?.postMessage(completion);
           }
           return { ok: true, value };
         }, fail);
@@ -8626,47 +8611,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (message.name === "status") runnerStatus.textContent = message.value;
       } else if (message?.type === "efb-clear") {
         return handleRendererOperation(() => gxClearEfb(message.clearColor), sourceWorker);
-      } else if (message?.type === "texture-copy") {
-        const frame = message.frame;
-        return handleRendererFrame(message, () => {
-          queueGxGeometry(frame);
-          webGpuRenderer.copy_texture(
-            frame.sourceX,
-            frame.sourceY,
-            frame.width,
-            frame.sourceHeight,
-            frame.destination,
-            frame.index,
-            frame.clear,
-            frame.clearColor[0],
-            frame.clearColor[1],
-            frame.clearColor[2]
-          );
-          document.body.dataset.gxTextureCopies = String(frame.index);
-        }, sourceWorker);
-      } else if (message?.type === "xfb-copy") {
-        const frame = message.frame;
-        return handleRendererFrame(message, () => {
-          queueGxGeometry(frame);
-          webGpuRenderer.copy_xfb(
-            frame.sourceX,
-            frame.sourceY,
-            frame.width,
-            frame.sourceHeight,
-            frame.width,
-            frame.height,
-            frame.destination,
-            frame.stride,
-            frame.index,
-            frame.clear,
-            frame.clearColor[0],
-            frame.clearColor[1],
-            frame.clearColor[2]
-          );
-          document.body.dataset.xfbCopies = String(frame.index);
-          document.body.dataset.gxDrawCalls = String(frame.geometry.drawCalls);
-          document.body.dataset.gxVertices = String(frame.geometry.vertices);
-        }, sourceWorker);
+      } else if (message?.type === "gx-frame") {
+        return handleRendererFrame(message, () => submitGxFrame(message), sourceWorker);
       } else if (message?.type === "vi-present") {
         const frame = message.frame;
         return handleRendererFrame(message, () =>

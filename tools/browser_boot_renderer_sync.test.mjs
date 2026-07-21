@@ -29,9 +29,10 @@ function extractFunction(name) {
   assert.fail(`unterminated ${name}`);
 }
 
-function workerHarness() {
+function workerHarness({ transferMessages = false } = {}) {
   const messages = [];
   const reports = [];
+  const transfers = [];
   const context = {
     Number,
     Math,
@@ -43,6 +44,7 @@ function workerHarness() {
     rendererFrameResultMisses: 0,
     rendererFramesAcknowledged: 0,
     rendererFramesInFlight: new Set(),
+    rendererResidentTextureKeys: new Set(),
     rendererFrameSequence: 0,
     runnerSliceMs: 8,
     runnerStopRequested: false,
@@ -54,12 +56,18 @@ function workerHarness() {
     blocks: { size: 0 },
     hex32(value) { return `0x${value.toString(16).padStart(8, "0")}`; },
     finish(status, details) { reports.push({ status, details }); },
-    postMessage(message) { messages.push(message); },
+    postMessage(message, transfer = []) {
+      transfers.push(transfer);
+      messages.push(
+        transferMessages ? structuredClone(message, { transfer }) : message,
+      );
+    },
   };
   vm.createContext(context);
   vm.runInContext(
     [
       "postRendererFrame",
+      "postGxFrame",
       "recordRendererFailure",
       "completeRendererFrame",
       "honorRendererBackpressure",
@@ -70,7 +78,7 @@ function workerHarness() {
     context,
     { filename: "browser_boot.renderer-sync.worker.js" },
   );
-  return { context, messages, reports };
+  return { context, messages, reports, transfers };
 }
 
 function rendererOperationMetrics() {
@@ -79,35 +87,91 @@ function rendererOperationMetrics() {
   };
 }
 
-test("renderer copies are sequenced and acknowledged without dropping work", () => {
-  const { context, messages } = workerHarness();
-  const frame = { index: 7 };
+test("packed renderer copies transfer one exact frame without dropping work", () => {
+  const { context, messages, transfers } = workerHarness();
+  const packet = new ArrayBuffer(128);
+  const frame = {
+    index: 7,
+    geometry: { drawCalls: 2, vertices: 6 },
+  };
+  const packCalls = [];
+  context.packGxFramePacketV1 = (copyKind, packedFrame, residentTextureKeys) => {
+    packCalls.push([copyKind, packedFrame, residentTextureKeys]);
+    return packet;
+  };
 
-  context.postRendererFrame("xfb-copy", frame);
+  context.postGxFrame(2, frame);
 
-  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
-    type: "xfb-copy",
-    frame,
-    rendererSequence: 1,
-  }]);
+  assert.deepEqual(packCalls, [[2, frame, context.rendererResidentTextureKeys]]);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].type, "gx-frame");
+  assert.strictEqual(messages[0].packet, packet);
+  assert.deepEqual(JSON.parse(JSON.stringify(messages[0].diagnostics)), {
+    copyKind: 2,
+    index: 7,
+    drawCalls: 2,
+    vertices: 6,
+  });
+  assert.equal(messages[0].rendererSequence, 1);
+  assert.equal(transfers.length, 1);
+  assert.equal(transfers[0].length, 1);
+  assert.strictEqual(transfers[0][0], packet);
   assert.equal(context.rendererFramesInFlight.size, 1);
   assert.equal(context.rendererFrameHighWater, 1);
 
   context.completeRendererFrame({
     type: "renderer-frame-complete",
     rendererSequence: 1,
+    residentTextureKeys: ["alpha"],
   });
 
   assert.equal(context.rendererFramesInFlight.size, 0);
   assert.equal(context.rendererFramesAcknowledged, 1);
   assert.equal(context.rendererFailure, null);
+  assert.deepEqual([...context.rendererResidentTextureKeys], ["alpha"]);
+});
+
+test("gx-frame transfer detaches only the sender's packet", () => {
+  const { context, messages, transfers } = workerHarness({ transferMessages: true });
+  const packet = new ArrayBuffer(128);
+  new Uint8Array(packet)[0] = 0x4c;
+  context.packGxFramePacketV1 = () => packet;
+
+  context.postGxFrame(1, {
+    index: 3,
+    geometry: { drawCalls: 0, vertices: 0 },
+  });
+
+  assert.equal(packet.byteLength, 0);
+  assert.strictEqual(transfers[0][0], packet);
+  assert.notStrictEqual(messages[0].packet, packet);
+  assert.equal(messages[0].packet.byteLength, 128);
+  assert.equal(new Uint8Array(messages[0].packet)[0], 0x4c);
+});
+
+test("concurrent GX packets do not trust an in-flight residency snapshot", () => {
+  const { context } = workerHarness();
+  context.rendererResidentTextureKeys = new Set(["resident"]);
+  const residencyArguments = [];
+  context.packGxFramePacketV1 = (_copyKind, _frame, residentTextureKeys) => {
+    residencyArguments.push(residentTextureKeys);
+    return new ArrayBuffer(128);
+  };
+  const frame = { index: 1, geometry: { drawCalls: 0, vertices: 0 } };
+
+  context.postGxFrame(1, frame);
+  context.postGxFrame(1, { ...frame, index: 2 });
+
+  assert.strictEqual(residencyArguments[0], context.rendererResidentTextureKeys);
+  assert.equal(residencyArguments[1], null);
 });
 
 test("renderer failures unblock the worker and remain fatal", () => {
   const { context } = workerHarness();
   let resumed = 0;
   context.rendererBackpressureResume = () => { resumed += 1; };
-  context.postRendererFrame("texture-copy", { index: 3 });
+  const packet = new ArrayBuffer(128);
+  context.postRendererFrame("gx-frame", { packet, diagnostics: {} }, [packet]);
 
   context.completeRendererFrame({
     type: "renderer-frame-failed",
@@ -136,7 +200,8 @@ test("unsequenced device failures remain fatal and preserve their first cause", 
 test("terminal reports wait for an in-flight renderer frame even while stopping", async () => {
   const { context, reports } = workerHarness();
   context.runnerStopRequested = true;
-  context.postRendererFrame("xfb-copy", { index: 9 });
+  const packet = new ArrayBuffer(128);
+  context.postRendererFrame("gx-frame", { packet, diagnostics: {} }, [packet]);
 
   const terminal = context.finishAfterRendererDrain("stopped", {
     stage: "terminal-pc",
@@ -158,7 +223,8 @@ test("terminal reports wait for an in-flight renderer frame even while stopping"
 
 test("renderer failure replaces a pending terminal report", async () => {
   const { context, reports } = workerHarness();
-  context.postRendererFrame("xfb-copy", { index: 10 });
+  const packet = new ArrayBuffer(128);
+  context.postRendererFrame("gx-frame", { packet, diagnostics: {} }, [packet]);
 
   const terminal = context.finishAfterRendererDrain("stopped", {
     stage: "terminal-pc",
@@ -248,6 +314,182 @@ test("deferred WebGPU failures reject the frame instead of acknowledging it", as
     error: "WebGPU device lost (Unknown)",
   }]);
   assert.deepEqual(visibleErrors, [["WebGPU device lost (Unknown)", false]]);
+});
+
+test("malformed GX packets fail synchronously without a drain or acknowledgement", async () => {
+  const messages = [];
+  const visibleErrors = [];
+  const submissions = [];
+  let drainCalls = 0;
+  const currentWorker = {
+    postMessage(message) { messages.push(message); },
+  };
+  const context = {
+    Array,
+    ArrayBuffer,
+    Number,
+    Promise,
+    String,
+    TypeError,
+    Uint8Array,
+    document: { body: { dataset: {} } },
+    rendererHostMetrics: {
+      ...rendererOperationMetrics(),
+      workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
+    },
+    rendererOperationTail: Promise.resolve(),
+    drainWebGpuRenderer() {
+      drainCalls += 1;
+      return Promise.resolve();
+    },
+    handleRendererError(error, notifyWorker) {
+      visibleErrors.push([error.message, notifyWorker]);
+    },
+    webGpuRenderer: {
+      submit_gx_frame(packet) {
+        submissions.push(packet);
+        throw new Error("invalid LZGX packet magic [00, 00, 00, 00]");
+      },
+    },
+    worker: currentWorker,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "appendRendererOperation",
+      "enqueueRendererOperation",
+      "submitGxFrame",
+      "handleRendererFrame",
+      "handleWorkerMessage",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.renderer-sync.malformed-gx-frame.js" },
+  );
+
+  const result = await context.handleWorkerMessage({
+    currentTarget: currentWorker,
+    data: {
+      type: "gx-frame",
+      packet: new ArrayBuffer(128),
+      diagnostics: { copyKind: 2, index: 7, drawCalls: 2, vertices: 6 },
+      rendererSequence: 23,
+    },
+  });
+
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0] instanceof Uint8Array, true);
+  assert.equal(drainCalls, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
+    type: "renderer-frame-failed",
+    rendererSequence: 23,
+    error: "invalid LZGX packet magic [00, 00, 00, 00]",
+  }]);
+  assert.deepEqual(visibleErrors, [[
+    "invalid LZGX packet magic [00, 00, 00, 00]",
+    false,
+  ]]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { ok: false, value: null });
+  assert.equal(context.document.body.dataset.xfbCopies, undefined);
+});
+
+test("standalone EFB clears remain serialized before the following GX frame", async () => {
+  assert.match(
+    source,
+    /if \(gxSkippedFrameClearColor !== null\) \{\s*postMessage\(\{ type: "efb-clear", clearColor: gxSkippedFrameClearColor \}\);/,
+  );
+  assert.match(
+    source,
+    /else if \(frame\.clear\) \{\s*postMessage\(\{ type: "efb-clear", clearColor: frame\.clearColor \}\);/,
+  );
+
+  const calls = [];
+  const messages = [];
+  let releaseClearDrain;
+  let drainCalls = 0;
+  const currentWorker = {
+    postMessage(message) { messages.push(message); },
+  };
+  const context = {
+    Array,
+    ArrayBuffer,
+    Number,
+    Promise,
+    String,
+    TypeError,
+    Uint8Array,
+    document: { body: { dataset: {} } },
+    rendererHostMetrics: {
+      ...rendererOperationMetrics(),
+      workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
+    },
+    rendererOperationTail: Promise.resolve(),
+    drainWebGpuRenderer() {
+      drainCalls += 1;
+      calls.push(`drain:${drainCalls}`);
+      if (drainCalls === 1) {
+        return new Promise(resolve => { releaseClearDrain = resolve; });
+      }
+      return Promise.resolve();
+    },
+    handleRendererError(error) { throw error; },
+    webGpuRenderer: {
+      clear_efb(red, green, blue) {
+        calls.push(`clear:${red},${green},${blue}`);
+      },
+      submit_gx_frame() {
+        calls.push("gx-frame");
+        return [];
+      },
+    },
+    worker: currentWorker,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "appendRendererOperation",
+      "enqueueRendererOperation",
+      "gxClearEfb",
+      "submitGxFrame",
+      "handleRendererFrame",
+      "handleRendererOperation",
+      "handleWorkerMessage",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.renderer-sync.efb-clear.js" },
+  );
+
+  const clear = context.handleWorkerMessage({
+    currentTarget: currentWorker,
+    data: { type: "efb-clear", clearColor: [4, 5, 6, 0xff] },
+  });
+  const frame = context.handleWorkerMessage({
+    currentTarget: currentWorker,
+    data: {
+      type: "gx-frame",
+      packet: new ArrayBuffer(128),
+      diagnostics: { copyKind: 1, index: 8, drawCalls: 0, vertices: 0 },
+      rendererSequence: 24,
+    },
+  });
+  await Promise.resolve();
+
+  assert.deepEqual(calls, ["clear:4,5,6", "drain:1"]);
+  assert.deepEqual(messages, []);
+  releaseClearDrain();
+  await clear;
+  await frame;
+
+  assert.deepEqual(calls, [
+    "clear:4,5,6",
+    "drain:1",
+    "gx-frame",
+    "drain:2",
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
+    type: "renderer-frame-complete",
+    rendererSequence: 24,
+    residentTextureKeys: [],
+  }]);
 });
 
 test("a replaced worker cannot receive a stale WebGPU frame completion", async () => {
@@ -513,8 +755,13 @@ test("guest execution waits for renderer completion before another block", () =>
     source,
     /for \(;;\) \{[\s\S]*?while \(rendererFramesInFlight\.size !== 0 \|\| rendererFailure !== null\) \{\s*await honorRendererBackpressure\(\);\s*if \(runnerStopRequested\) break;\s*serviceVideoPresentation\(cycles\);\s*\}[\s\S]*?stage = "compile";/,
   );
-  assert.match(source, /postRendererFrame\("xfb-copy", frame\)/);
-  assert.match(source, /postRendererFrame\("texture-copy", frame\)/);
+  assert.match(source, /postGxFrame\(2, frame\)/);
+  assert.match(source, /postGxFrame\(1, frame\)/);
+  assert.match(
+    source,
+    /postRendererFrame\("gx-frame", \{ packet, diagnostics \}, \[packet\]\)/,
+  );
+  assert.doesNotMatch(source, /postRendererFrame\("(?:xfb|texture)-copy"/);
   assert.match(source, /postRendererFrame\("vi-present", \{/);
   assert.match(source, /await finishAfterRendererDrain\("stopped", \{\s*stage: "terminal-pc"/);
 });

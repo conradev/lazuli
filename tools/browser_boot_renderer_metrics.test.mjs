@@ -33,30 +33,71 @@ function extractFunction(name) {
   assert.fail(`unterminated ${name}`);
 }
 
-test("GX frame accounting counts each received ArrayBuffer once", () => {
-  const context = { ArrayBuffer, Float32Array, Set, Uint8Array };
-  vm.createContext(context);
-  vm.runInContext(extractFunction("receivedArrayBufferBytes"), context);
-  const shared = new ArrayBuffer(64);
-  const texture = new ArrayBuffer(32);
-  const frame = {
-    geometry: {
-      draws: [
-        {
-          vertices: new Float32Array(shared, 0, 8),
-          tevState: new Uint8Array(shared, 32, 16),
-          textures: [{ pixels: new Uint8Array(texture) }],
-        },
-        {
-          vertices: new Float32Array(shared, 0, 4),
-          tevState: new Uint8Array(0),
-          textures: [{ pixels: new Uint8Array(texture, 0, 8) }],
-        },
-      ],
+test("GX frames cross the renderer bridge as one exact packet view", () => {
+  const submissions = [];
+  const context = {
+    ArrayBuffer,
+    Number,
+    String,
+    Uint8Array,
+    document: { body: { dataset: {} } },
+    rendererHostMetrics: {
+      workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
+    },
+    webGpuRenderer: {
+      submit_gx_frame(packet) {
+        submissions.push(packet);
+      },
     },
   };
+  vm.createContext(context);
+  vm.runInContext(extractFunction("submitGxFrame"), context);
 
-  assert.equal(context.receivedArrayBufferBytes(frame), 96);
+  const xfbPacket = new ArrayBuffer(1920);
+  context.submitGxFrame({
+    packet: xfbPacket,
+    diagnostics: { copyKind: 2, index: 0x11223344, drawCalls: 2, vertices: 3 },
+  });
+  assert.equal(submissions.length, 1);
+  assert.ok(submissions[0] instanceof Uint8Array);
+  assert.strictEqual(submissions[0].buffer, xfbPacket);
+  assert.equal(submissions[0].byteOffset, 0);
+  assert.equal(submissions[0].byteLength, 1920);
+  assert.deepEqual(context.rendererHostMetrics.workerMessages, {
+    gxFrames: 1,
+    drawCalls: 2,
+    receivedArrayBufferBytes: 1920,
+  });
+  assert.deepEqual(context.document.body.dataset, {
+    gxDrawCalls: "2",
+    gxVertices: "3",
+    xfbCopies: String(0x11223344),
+  });
+
+  const texturePacket = new ArrayBuffer(128);
+  context.submitGxFrame({
+    packet: texturePacket,
+    diagnostics: { copyKind: 1, index: 7, drawCalls: 0, vertices: 0 },
+  });
+  assert.equal(submissions.length, 2);
+  assert.strictEqual(submissions[1].buffer, texturePacket);
+  assert.equal(submissions[1].byteLength, 128);
+  assert.deepEqual(context.rendererHostMetrics.workerMessages, {
+    gxFrames: 2,
+    drawCalls: 2,
+    receivedArrayBufferBytes: 2048,
+  });
+  assert.equal(context.document.body.dataset.gxTextureCopies, "7");
+
+  assert.throws(
+    () => context.submitGxFrame({
+      packet: new ArrayBuffer(16),
+      diagnostics: { copyKind: 3, index: 0, drawCalls: 0, vertices: 0 },
+    }),
+    /diagnostics are invalid/,
+  );
+  assert.equal(submissions.length, 2);
+  assert.equal(context.rendererHostMetrics.workerMessages.gxFrames, 2);
 });
 
 test("renderer performance derives exact bridge and resource totals", async () => {
@@ -71,6 +112,8 @@ test("renderer performance derives exact bridge and resource totals", async () =
     decodedTextureQueries: 12,
     drainCalls: 5,
     expandedVertexBytes: 2048,
+    gxFramePacketBytes: 1920,
+    gxFramePacketPayloadBytes: 12,
     presentXfbCalls: 2,
     pushTevDrawCalls: 10,
     queueSubmissions: 6,
@@ -82,13 +125,16 @@ test("renderer performance derives exact bridge and resource totals", async () =
     textureUploadBytes: 400,
     textureWrites: 2,
     texturesCreated: 7,
+    submitGxFrameCalls: 1,
+    wasmBridgeCalls: 17,
+    wasmBridgeTypedArrayBytes: 1920,
   };
   const context = {
     Promise,
     rendererHostMetrics: {
       operations: { enqueued: 5, pending: 0, highWater: 1 },
       wall: { workerStartToLastReportMs: 1234.5 },
-      workerMessages: { gxFrames: 3, drawCalls: 10, receivedArrayBufferBytes: 4096 },
+      workerMessages: { gxFrames: 1, drawCalls: 10, receivedArrayBufferBytes: 1920 },
     },
     rendererOperationTail: Promise.resolve(),
     webGpuRenderer: { diagnostics: () => webgpu },
@@ -105,7 +151,7 @@ test("renderer performance derives exact bridge and resource totals", async () =
 
   const performance = JSON.parse(JSON.stringify(await context.captureRendererPerformance()));
   assert.equal(performance.scope, "current-worker");
-  assert.deepEqual(performance.wasmBridge, { calls: 43, typedArrayBytes: 1000 });
+  assert.deepEqual(performance.wasmBridge, { calls: 17, typedArrayBytes: 1920 });
   assert.deepEqual(performance.queue, { drains: 5, submits: 6 });
   assert.deepEqual(performance.resources, {
     bindGroups: 8,
@@ -116,14 +162,20 @@ test("renderer performance derives exact bridge and resource totals", async () =
   assert.deepEqual(performance.operations, { enqueued: 5, pending: 0, highWater: 1 });
   assert.deepEqual(performance.workerMessages, {
     drawCalls: 10,
-    gxFrames: 3,
-    receivedArrayBufferBytes: 4096,
+    gxFrames: 1,
+    receivedArrayBufferBytes: 1920,
   });
   assert.deepEqual(performance.workload, {
     expandedVertexBytes: 2048,
+    gxFramePacketBytes: 1920,
+    gxFramePacketPayloadBytes: 12,
     textureUploadBytes: 400,
     textureWrites: 2,
   });
+  assert.equal(
+    performance.wasmBridge.typedArrayBytes,
+    performance.workerMessages.receivedArrayBufferBytes,
+  );
   assert.deepEqual(performance.wall, { workerStartToLastReportMs: 1234.5 });
   assert.deepEqual(context.rendererHostMetrics.operations, {
     enqueued: 5,

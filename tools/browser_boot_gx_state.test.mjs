@@ -26,6 +26,70 @@ function extractFunction(name) {
   throw new Error(`unterminated ${name}`);
 }
 
+const packetFunctions = [
+  "gxFramePacketInteger",
+  "gxFramePacketAdd",
+  "gxFramePacketMultiply",
+  "gxFramePacketAlign16",
+  "gxFramePacketBytes",
+  "gxFramePacketEqualBytes",
+  "gxFramePacketKeyBytes",
+  "gxFramePacketSampler",
+  "packGxFramePacketV1",
+];
+
+function packetContext() {
+  const packet = {
+    Array,
+    ArrayBuffer,
+    DataView,
+    Float32Array,
+    JSON,
+    Map,
+    Number,
+    Object,
+    RangeError,
+    TextEncoder,
+    TypeError,
+    Uint8Array,
+  };
+  vm.createContext(packet);
+  vm.runInContext(packetFunctions.map(extractFunction).join("\n\n"), packet, {
+    filename: "browser_boot.gx-packet-state.js",
+  });
+  return packet;
+}
+
+function tevStateForMap(map = null) {
+  const state = new Uint8Array(464);
+  if (map === null) return state;
+  const view = new DataView(state.buffer);
+  view.setUint32(8, (1 << 6) | map, true);
+  view.setUint32(448, 1, true);
+  return state;
+}
+
+function packetFrame(draws) {
+  const vertices = draws.reduce(
+    (total, draw) => total + draw.vertices.byteLength / 144,
+    0,
+  );
+  return {
+    copyToXfb: true,
+    index: 23,
+    sourceX: 0,
+    sourceY: 0,
+    width: 640,
+    sourceHeight: 448,
+    height: 448,
+    destination: 0x00392c80,
+    stride: 1280,
+    clear: false,
+    clearColor: [0, 0, 0, 0],
+    geometry: { drawCalls: draws.length, vertices, draws },
+  };
+}
+
 const gxBpRegisters = new Uint32Array(256);
 const gxXfRegisters = new Uint32Array(0x1100);
 const gxXfValues = new Float32Array(gxXfRegisters.buffer);
@@ -160,31 +224,17 @@ test("does not forward null texcoord placeholders for untextured draws", () => {
   );
 });
 
-test("forwards each draw's GX pipeline snapshot to WebGPU", () => {
-  const calls = [];
-  const queueContext = {
-    Array,
-    Float32Array,
-    Uint8Array,
-    Uint32Array,
-    webGpuRenderer: {
-      has_decoded_texture() {
-        return false;
-      },
-      push_tev_draw(...arguments_) {
-        calls.push(arguments_);
-      },
-    },
-  };
-  vm.createContext(queueContext);
-  vm.runInContext(extractFunction("queueGxDraw"), queueContext, {
-    filename: "browser_boot.gx-queue.js",
-  });
-  queueContext.queueGxDraw({
+test("packs each draw's GX pipeline and f32 vertices into its canonical record", () => {
+  const packet = packetContext();
+  const vertices = Float32Array.from(
+    { length: 36 },
+    (_unused, index) => index - 4.5,
+  );
+  const buffer = packet.packGxFramePacketV1(2, packetFrame([{
     topology: 2,
-    vertices: Array(36).fill(1),
-    tevState: new Uint8Array(464),
-    textures: Array(8).fill(null),
+    vertices,
+    tevState: tevStateForMap(),
+    textures: [],
     pipeline: {
       zMode: 0x17,
       blendMode: 0x5a9,
@@ -195,127 +245,93 @@ test("forwards each draw's GX pipeline snapshot to WebGPU", () => {
       scissorWidth: 456,
       scissorHeight: 321,
     },
-  });
+  }]));
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  const draw = 128;
 
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][1].length, 36);
-  assert.equal(calls[0][2].length, 464);
-  assert.equal(calls[0][3].length, 8);
-  assert.equal(calls[0][4].length, 40);
-  assert.equal(calls[0][5].length, 8);
-  assert.deepEqual(
-    calls[0].slice(-8),
-    [0x17, 0x5a9, 0x00240000, 1, 12, 34, 456, 321],
+  assert.equal(buffer.byteLength, 864);
+  assert.equal(bytes[draw], 2);
+  assert.equal(bytes[draw + 1], 1);
+  assert.equal(view.getUint32(draw + 0x04, true), 1);
+  assert.equal(view.getUint32(draw + 0x08, true), 0);
+  assert.equal(view.getUint32(draw + 0x0c, true), 0);
+  assert.equal(view.getUint32(draw + 0x10, true), 0x17);
+  assert.equal(view.getUint32(draw + 0x14, true), 0x5a9);
+  assert.equal(view.getUint32(draw + 0x18, true), 0x00240000);
+  assert.equal(view.getUint32(draw + 0x1c, true), 12);
+  assert.equal(view.getUint32(draw + 0x20, true), 34);
+  assert.equal(view.getUint32(draw + 0x24, true), 456);
+  assert.equal(view.getUint32(draw + 0x28, true), 321);
+  for (let map = 0; map < 8; map += 1) {
+    assert.equal(view.getUint32(draw + 0x30 + map * 8, true), 0xffffffff);
+    assert.equal(view.getUint32(draw + 0x34 + map * 8, true), 0);
+  }
+  const vertexOffset = view.getUint32(0x28, true);
+  assert.equal(vertexOffset, 720);
+  assert.equal(view.getFloat32(vertexOffset, true), -4.5);
+  assert.equal(view.getFloat32(vertexOffset + 35 * 4, true), 30.5);
+});
+
+test("deduplicates packet textures while retaining each draw's sampler bits", () => {
+  const packet = packetContext();
+  const pixels = Uint8Array.of(1, 2, 3, 4);
+  const texture = {
+    renderKey: "shared:7",
+    address: 0x10203040,
+    textureCopyIndex: 9,
+    width: 1,
+    height: 1,
+    pixels,
+  };
+  const buffer = packet.packGxFramePacketV1(2, packetFrame([
+    {
+      topology: 2,
+      vertices: new Float32Array(36),
+      tevState: tevStateForMap(0),
+      textures: [{
+        ...texture,
+        wrapS: 1,
+        wrapT: 2,
+        magFilter: 1,
+        minFilter: 5,
+      }],
+    },
+    {
+      topology: 5,
+      vertices: new Float32Array(36),
+      tevState: tevStateForMap(0),
+      textures: [{
+        ...texture,
+        wrapS: 2,
+        wrapT: 3,
+        magFilter: 0,
+        minFilter: 1,
+      }],
+    },
+  ]));
+  const view = new DataView(buffer);
+  const firstDraw = 128;
+  const secondDraw = 256;
+  const textureTable = view.getUint32(0x20, true);
+
+  assert.equal(view.getUint32(0x14, true), 2);
+  assert.equal(view.getUint32(0x18, true), 1);
+  assert.equal(view.getUint32(firstDraw + 0x30, true), 0);
+  assert.equal(view.getUint32(firstDraw + 0x34, true), 0xb9);
+  assert.equal(view.getUint32(secondDraw + 0x30, true), 0);
+  assert.equal(view.getUint32(secondDraw + 0x34, true), 0x2e);
+  assert.equal(view.getUint32(textureTable + 0x0c, true), 4);
+  assert.equal(view.getUint32(textureTable + 0x20, true), 1);
+  assert.equal(view.getUint32(0x48, true), 16);
+});
+
+test("the main thread submits packets without rebuilding a per-draw bridge graph", () => {
+  const submit = extractFunction("submitGxFrame");
+  assert.match(submit, /submit_gx_frame\(new Uint8Array\(packet\)\)/);
+  assert.doesNotMatch(
+    submit,
+    /begin_segment|push_tev_draw|has_decoded_texture|copy_texture|copy_xfb/,
   );
-});
-
-test("forwards worker f32 vertex payloads without another main-thread copy", () => {
-  const calls = [];
-  const queueContext = {
-    Array,
-    Float32Array,
-    Uint8Array,
-    Uint32Array,
-    webGpuRenderer: {
-      has_decoded_texture() {
-        return false;
-      },
-      push_tev_draw(...arguments_) {
-        calls.push(arguments_);
-      },
-    },
-  };
-  vm.createContext(queueContext);
-  vm.runInContext(extractFunction("queueGxDraw"), queueContext, {
-    filename: "browser_boot.gx-queue-vertices.js",
-  });
-  const vertices = new Float32Array(36).fill(0.25);
-
-  queueContext.queueGxDraw({
-    topology: 2,
-    vertices,
-    tevState: new Uint8Array(464),
-    textures: Array(8).fill(null),
-  });
-
-  assert.strictEqual(calls[0][1], vertices);
-});
-
-test("forwards GX texture wrap and filter state to WebGPU", () => {
-  const calls = [];
-  const queueContext = {
-    Array,
-    Float32Array,
-    Uint8Array,
-    Uint32Array,
-    webGpuRenderer: {
-      has_decoded_texture() {
-        return false;
-      },
-      push_tev_draw(...arguments_) {
-        calls.push(arguments_);
-      },
-    },
-  };
-  vm.createContext(queueContext);
-  vm.runInContext(extractFunction("queueGxDraw"), queueContext, {
-    filename: "browser_boot.gx-queue-sampler.js",
-  });
-
-  queueContext.queueGxDraw({
-    topology: 2,
-    vertices: new Float32Array(36),
-    tevState: new Uint8Array(464),
-    textures: [{
-      renderKey: "sampler:7",
-      width: 1,
-      height: 1,
-      wrapS: 1,
-      wrapT: 2,
-      magFilter: 1,
-      minFilter: 5,
-      pixels: new Uint8Array([255, 255, 255, 255]),
-    }],
-  });
-
-  assert.equal(calls[0][4][4], 1 | (2 << 2) | (1 << 4) | (5 << 5));
-});
-
-test("omits resident TEV pixels before rebuilding their typed array", () => {
-  const calls = [];
-  const residentQueries = [];
-  const queueContext = {
-    Array,
-    Float32Array,
-    Uint8Array,
-    Uint32Array,
-    webGpuRenderer: {
-      has_decoded_texture(...arguments_) {
-        residentQueries.push(arguments_);
-        return true;
-      },
-      push_tev_draw(...arguments_) {
-        calls.push(arguments_);
-      },
-    },
-  };
-  vm.createContext(queueContext);
-  vm.runInContext(extractFunction("queueGxDraw"), queueContext, {
-    filename: "browser_boot.gx-queue-cache.js",
-  });
-  const pixels = {
-    byteLength: 4 * 8 * 4,
-    get [Symbol.iterator]() {
-      throw new Error("resident pixels must not be copied");
-    },
-  };
-  queueContext.queueGxDraw({
-    topology: 0,
-    vertices: Array(36).fill(0),
-    tevState: new Uint8Array(464),
-    textures: [{ renderKey: "decoded:7", width: 4, height: 8, pixels }],
-  });
-
-  assert.deepEqual(residentQueries, [["decoded:7", 4, 8]]);
-  assert.equal(calls[0][5][0].length, 0);
+  assert.doesNotMatch(source, /function queueGxDraw\(/);
 });
