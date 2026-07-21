@@ -100,7 +100,9 @@ function makeContext(functionNames, overrides = {}) {
     cpu: 0xf000,
     msrOffset: 0,
     cycles: 0,
+    controllerPollIndex: 0,
     controllerSequence: 0,
+    controllerScenario: null,
     controllerQueue: [],
     controllerQueueCapacity: 64,
     controllerQueueHighWater: 0,
@@ -172,6 +174,7 @@ function makeContext(functionNames, overrides = {}) {
       assert.fail("unexpected SI exception delivery in register test");
     },
     pollSerialController() {},
+    pollControllerScenario() { return null; },
     ...overrides,
   };
   vm.createContext(context);
@@ -196,6 +199,12 @@ const periodicFunctions = [
   "recomputeSerialInterruptLevel",
   "serialNoResponseBit",
   "performSerialPoll",
+];
+const scenarioPollFunctions = [
+  "recordControllerScenarioPoll",
+  "pollControllerScenario",
+  ...periodicFunctions,
+  "processSerialCommand",
 ];
 
 test("controller packets use PAD_USE_ORIGIN and exact mode packing", () => {
@@ -375,6 +384,77 @@ test("periodic polling ignores EN and backpressures an unread RDST mailbox", () 
   assert.equal(context.controllerAppliedSequence, 2);
   assert.equal(context.serialLastPublishedChannels, 1);
   assert.equal(pollMessages.length, 1);
+});
+
+test("scenario SI publications retain source cycles and exclude backpressure", () => {
+  const context = makeContext(scenarioPollFunctions, {
+    postMessage() {},
+  });
+  const press = {
+    sequence: 1,
+    polls: 0,
+    publications: [],
+    firstPollIndex: null,
+    lastPollIndex: null,
+    firstScheduledCycle: null,
+    lastScheduledCycle: null,
+    firstObservedCycle: null,
+    lastObservedCycle: null,
+  };
+  context.controllerScenario = {
+    status: "running",
+    pollIndex: 0,
+    nextSequence: 3,
+    pressPolls: 3,
+    pulse: {
+      button: 0x0100,
+      state: "press",
+      pressPolls: 0,
+      neutralPolls: 0,
+      releaseServiceCycle: null,
+    },
+    steps: [{
+      press,
+      release: {
+        sequence: 2,
+        polls: 0,
+        publications: [],
+      },
+    }],
+  };
+
+  context.performSerialPoll(100, 125);
+  assert.equal(context.controllerPollIndex, 1);
+  assert.equal(press.polls, 1);
+
+  context.performSerialPoll(200, 225);
+  assert.equal(context.controllerPollIndex, 1);
+  assert.equal(press.polls, 1);
+
+  context.view.setUint8(0x6480, 0x40);
+  assert.equal(
+    context.processSerialCommand(0, 300, 325),
+    context.serialTransferOutcome.success,
+  );
+  assert.equal(context.controllerPollIndex, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(press.publications)), [
+    {
+      source: "periodic",
+      pollIndex: 1,
+      scheduledCycle: 100,
+      observedCycle: 125,
+      buttons: 0x0100,
+      sequence: 1,
+    },
+    {
+      source: "direct",
+      pollIndex: 2,
+      scheduledCycle: 300,
+      observedCycle: 325,
+      buttons: 0x0100,
+      sequence: 1,
+    },
+  ]);
 });
 
 test("direct 0x40 reads acknowledge the controller state they publish", () => {

@@ -920,6 +920,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let controllerQueueCoalesces = 0;
     let controllerQueueOverflows = 0;
     let serialLastPollSignature = null;
+    let controllerPollIndex = 0;
     let serialLastPolledButtons = 0;
     let serialLastPolledSequence = 0;
     let serialLastRespondedChannels = 0;
@@ -1697,24 +1698,47 @@ const TEMPLATE: &str = r##"<!doctype html>
       rendererBackpressureResume?.();
     }
 
-    function controllerPacketForPoll(channel = 0) {
+    function controllerPacketForPoll(
+      channel = 0,
+      scheduledCycle = cycles,
+      observedCycle = scheduledCycle,
+      source = "periodic"
+    ) {
       const queued = controllerQueue.shift();
       if (queued !== undefined) {
         controllerState = queued.state;
         controllerAppliedSequence = queued.sequence;
       }
-      const rawButtons = controllerState.buttons & 0xffff;
+      controllerPollIndex += 1;
+      const scenarioButtons = pollControllerScenario(
+        controllerScenario,
+        channel,
+        controllerPollIndex,
+        scheduledCycle,
+        observedCycle,
+        source
+      );
+      const scenarioOwnsInput = scenarioButtons !== null;
+      const rawButtons = (
+        scenarioOwnsInput ? scenarioButtons : controllerState.buttons
+      ) & 0xffff;
       const buttons = (rawButtons | padUseOrigin) & 0xffff;
-      const cStickX = controllerState.cStickX & 0xff;
-      const cStickY = controllerState.cStickY & 0xff;
-      const triggerL = controllerState.triggerL & 0xff;
-      const triggerR = controllerState.triggerR & 0xff;
-      const analogA = (controllerState.analogA ?? (
-        (rawButtons & 0x0100) !== 0 ? 0xff : 0
-      )) & 0xff;
-      const analogB = (controllerState.analogB ?? (
-        (rawButtons & 0x0200) !== 0 ? 0xff : 0
-      )) & 0xff;
+      const stickX = scenarioOwnsInput ? 0x80 : controllerState.stickX & 0xff;
+      const stickY = scenarioOwnsInput ? 0x80 : controllerState.stickY & 0xff;
+      const cStickX = scenarioOwnsInput ? 0x80 : controllerState.cStickX & 0xff;
+      const cStickY = scenarioOwnsInput ? 0x80 : controllerState.cStickY & 0xff;
+      const triggerL = scenarioOwnsInput ? 0 : controllerState.triggerL & 0xff;
+      const triggerR = scenarioOwnsInput ? 0 : controllerState.triggerR & 0xff;
+      const analogA = (
+        !scenarioOwnsInput
+          ? controllerState.analogA ?? ((rawButtons & 0x0100) !== 0 ? 0xff : 0)
+          : (rawButtons & 0x0100) !== 0 ? 0xff : 0
+      ) & 0xff;
+      const analogB = (
+        !scenarioOwnsInput
+          ? controllerState.analogB ?? ((rawButtons & 0x0200) !== 0 ? 0xff : 0)
+          : (rawButtons & 0x0200) !== 0 ? 0xff : 0
+      ) & 0xff;
       const mode = serialControllerModes[channel] & 0xff;
       let low;
       if (mode === 0 || mode === 5 || mode === 6 || mode === 7) {
@@ -1750,8 +1774,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       return [
         buttons >>> 8,
         buttons,
-        controllerState.stickX,
-        controllerState.stickY,
+        stickX,
+        stickY,
         ...low,
       ];
     }
@@ -1913,6 +1937,81 @@ const TEMPLATE: &str = r##"<!doctype html>
     function controllerScenarioCycleLimit(limit, scenario) {
       if (scenario === null || !Number.isFinite(limit)) return limit;
       return Math.max(limit, scenario.hardCycleLimit);
+    }
+
+    function recordControllerScenarioPoll(
+      record,
+      pollIndex,
+      scheduledCycle,
+      observedCycle,
+      source,
+      buttons,
+      sequence
+    ) {
+      record.polls += 1;
+      record.firstPollIndex ??= pollIndex;
+      record.lastPollIndex = pollIndex;
+      record.firstScheduledCycle ??= scheduledCycle;
+      record.lastScheduledCycle = scheduledCycle;
+      record.firstObservedCycle ??= observedCycle;
+      record.lastObservedCycle = observedCycle;
+      record.publications.push({
+        source,
+        pollIndex,
+        scheduledCycle,
+        observedCycle,
+        buttons,
+        sequence,
+      });
+    }
+
+    function pollControllerScenario(
+      scenario,
+      channel,
+      pollIndex,
+      scheduledCycle,
+      observedCycle,
+      source = "periodic"
+    ) {
+      if (
+        scenario === null
+        || scenario.status !== "running"
+        || channel !== 0
+      ) return null;
+      scenario.pollIndex = pollIndex;
+      if (scenario.pulse === null) {
+        controllerAppliedSequence = Math.max(0, scenario.nextSequence - 1);
+        return 0;
+      }
+      const pulse = scenario.pulse;
+      const entry = scenario.steps.at(-1);
+      if (pulse.state === "press") {
+        controllerAppliedSequence = entry.press.sequence;
+        pulse.pressPolls += 1;
+        recordControllerScenarioPoll(
+          entry.press,
+          pollIndex,
+          scheduledCycle,
+          observedCycle,
+          source,
+          pulse.button,
+          entry.press.sequence
+        );
+        if (pulse.pressPolls === scenario.pressPolls) pulse.state = "release";
+        return pulse.button;
+      }
+      controllerAppliedSequence = entry.release.sequence;
+      pulse.neutralPolls += 1;
+      recordControllerScenarioPoll(
+        entry.release,
+        pollIndex,
+        scheduledCycle,
+        observedCycle,
+        source,
+        0,
+        entry.release.sequence
+      );
+      return 0;
     }
 
     __DISC_SOURCE_RUNTIME__
@@ -6240,7 +6339,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       serviceDecrementer(observedCycles);
     }
 
-    function processSerialCommand(channel) {
+    function processSerialCommand(channel, scheduledCycle, observedCycle) {
       const command = view.getUint8(mmio + 0x6480);
       if (channel !== 0) return serialTransferOutcome.noResponse;
       switch (command) {
@@ -6249,7 +6348,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           bytes.set([0x09, 0x00, 0x00], mmio + 0x6480);
           return serialTransferOutcome.success;
         case 0x40: {
-          const packet = controllerPacketForPoll(channel);
+          const packet = controllerPacketForPoll(
+            channel,
+            scheduledCycle,
+            observedCycle,
+            "direct"
+          );
           bytes.set(packet, mmio + 0x6480);
           postControllerPollAcknowledgement(packet);
           return serialTransferOutcome.success;
@@ -6293,7 +6397,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           } else {
             const inputHigh = mmio + 0x6404;
             const errorLatch = view.getUint32(inputHigh, false) & 0x40000000;
-            packet = controllerPacketForPoll(channel);
+            packet = controllerPacketForPoll(
+              channel,
+              scheduledCycle,
+              observedCycles,
+              "periodic"
+            );
             bytes.set(packet, inputHigh);
             view.setUint32(
               inputHigh,
@@ -6401,7 +6510,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         const command = view.getUint8(mmio + 0x6480);
         const controlBefore = view.getUint32(mmio + 0x6434, false);
         const statusBefore = view.getUint32(mmio + 0x6438, false);
-        const outcome = processSerialCommand(transfer.channel);
+        const outcome = processSerialCommand(
+          transfer.channel,
+          transfer.completionCycle,
+          observedCycles
+        );
         let statusAfter = view.getUint32(mmio + 0x6438, false);
         if (outcome === serialTransferOutcome.noResponse) {
           statusAfter |= serialNoResponseBit(transfer.channel);

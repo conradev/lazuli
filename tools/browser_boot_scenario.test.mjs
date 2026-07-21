@@ -33,6 +33,8 @@ const scenarioFunctions = [
   "createControllerScenario",
   "selectControllerScenario",
   "controllerScenarioCycleLimit",
+  "recordControllerScenarioPoll",
+  "pollControllerScenario",
 ];
 
 function scenarioHarness(overrides = {}) {
@@ -71,6 +73,9 @@ function scenarioHarness(overrides = {}) {
   vm.runInContext(scenarioFunctions.map(extractFunction).join("\n\n"), context, {
     filename: "browser_boot.scenario.js",
   });
+  vm.runInContext(extractFunction("controllerPacketForPoll"), context, {
+    filename: "browser_boot.controller-packet.js",
+  });
   return context;
 }
 
@@ -97,6 +102,33 @@ function definition(sample, overrides = {}) {
     ...overrides,
   };
 }
+
+test("controller scenarios own neutral input between scripted pulses", () => {
+  const sample = {
+    phase: "waiting",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const context = scenarioHarness();
+  const scenario = context.createControllerScenario(definition(sample));
+  context.controllerScenario = scenario;
+  context.controllerState = {
+    buttons: 0xffff,
+    stickX: 0x01,
+    stickY: 0xff,
+    cStickX: 0x02,
+    cStickY: 0xfe,
+    triggerL: 0xff,
+    triggerR: 0xff,
+    analogA: 0xff,
+    analogB: 0xff,
+  };
+  assert.deepEqual(
+    Array.from(context.controllerPacketForPoll(0, 2, 3, "direct")),
+    [0, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0],
+  );
+  assert.equal(scenario.pollIndex, 1);
+  assert.equal(context.controllerAppliedSequence, 0);
+});
 
 test("controller scenario selection validates ids, games, and observation steps", () => {
   const sample = { phase: "play", pad: { held: 0, pressed: 0, released: 0 } };
