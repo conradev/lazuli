@@ -7,6 +7,7 @@ import {
   readCheckpointManifest,
   verifyCheckpointReport,
 } from "./browser_boot_checkpoint.mjs";
+import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
 import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
 
 function parseArguments(argv) {
@@ -152,70 +153,6 @@ function configuredRunUrl(options, headlessRunId) {
 
 function isExpectedNavigation(state, runUrl, navigationLoaderId, frameLoaderId) {
   return state.url === runUrl && frameLoaderId === navigationLoaderId;
-}
-
-class DevToolsSession {
-  constructor(url) {
-    this.nextId = 1;
-    this.pending = new Map();
-    this.exceptions = [];
-    this.socket = new WebSocket(url);
-  }
-
-  async connect() {
-    await new Promise((resolve, reject) => {
-      this.socket.addEventListener("open", resolve, { once: true });
-      this.socket.addEventListener("error", reject, { once: true });
-    });
-    this.socket.addEventListener("message", event => {
-      const message = JSON.parse(String(event.data));
-      if (message.id !== undefined) {
-        const pending = this.pending.get(message.id);
-        if (pending === undefined) return;
-        this.pending.delete(message.id);
-        if (message.error !== undefined) {
-          pending.reject(new Error(`${pending.method}: ${message.error.message}`));
-        } else {
-          pending.resolve(message.result ?? {});
-        }
-        return;
-      }
-      if (message.method === "Runtime.exceptionThrown") {
-        this.exceptions.push(message.params?.exceptionDetails ?? message.params ?? message);
-      }
-    });
-    this.socket.addEventListener("close", () => {
-      for (const pending of this.pending.values()) {
-        pending.reject(new Error("Chrome DevTools connection closed"));
-      }
-      this.pending.clear();
-    });
-  }
-
-  send(method, params = {}) {
-    const id = this.nextId;
-    this.nextId += 1;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { method, reject, resolve });
-      this.socket.send(JSON.stringify({ id, method, params }));
-    });
-  }
-
-  async evaluate(expression) {
-    const response = await this.send("Runtime.evaluate", {
-      awaitPromise: true,
-      expression,
-      returnByValue: true,
-    });
-    if (response.exceptionDetails !== undefined) {
-      throw new Error(`Runtime.evaluate failed: ${JSON.stringify(response.exceptionDetails)}`);
-    }
-    return response.result?.value;
-  }
-
-  close() {
-    this.socket.close();
-  }
 }
 
 async function pageTarget(endpoint) {
