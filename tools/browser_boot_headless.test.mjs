@@ -216,6 +216,17 @@ test("headless scenarios are selected before a fresh worker starts", () => {
   );
 });
 
+test("fresh headless runs carry the requested render cadence into worker startup", () => {
+  assert.match(
+    source,
+    /if \(options\.renderEvery !== null\) \{\s*url\.searchParams\.set\("renderEvery", String\(options\.renderEvery\)\);\s*\}/,
+  );
+  assert.match(
+    source,
+    /runUrl = configuredRunUrl\(options,[\s\S]*?Page\.navigate/,
+  );
+});
+
 test("headless report capture rejects a stale document and loader", () => {
   const context = vm.createContext({});
   vm.runInContext(extractFunction("isExpectedNavigation"), context);

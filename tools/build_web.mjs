@@ -29,6 +29,7 @@ const STATIC_FILES = [
 ];
 const DEBUG_UI_START = "<!-- LAZULI DEBUG UI START -->";
 const DEBUG_UI_END = "<!-- LAZULI DEBUG UI END -->";
+const TERMINAL_REPORT_SINK = '<pre id="result" data-testid="browser-boot-result" hidden aria-hidden="true"></pre>';
 const DEBUG_ONLY_IDS = [
   "runner-controls",
   "pause-runner",
@@ -86,7 +87,7 @@ function sourceMetadata(repository, commit) {
   };
 }
 
-function withoutDebugUi(html) {
+export function withoutDebugUi(html) {
   let result = html;
   let sections = 0;
   while (result.includes(DEBUG_UI_START)) {
@@ -105,6 +106,9 @@ function withoutDebugUi(html) {
   for (const id of DEBUG_ONLY_IDS) {
     check(!result.includes(`id="${id}"`), `public frontend still contains ${id}`);
   }
+  const shellEnd = result.lastIndexOf("</main>");
+  check(shellEnd !== -1, "generated frontend has no closing shell");
+  result = `${result.slice(0, shellEnd)}  ${TERMINAL_REPORT_SINK}\n${result.slice(shellEnd)}`;
   return result;
 }
 

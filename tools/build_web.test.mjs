@@ -6,7 +6,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { buildWeb } from "./build_web.mjs";
+import { buildWeb, withoutDebugUi } from "./build_web.mjs";
 import {
   RELEASE_SCHEMA,
   WASM_CHUNK_SIZE,
@@ -17,6 +17,22 @@ import {
 
 const temporaryDirectories = [];
 after(async () => Promise.all(temporaryDirectories.map(path => rm(path, { recursive: true, force: true }))));
+
+test("release markup retains one hidden terminal report sink", () => {
+  const frontend = withoutDebugUi(`<!doctype html><body>
+<main class="shell" data-surface="debug">
+<!-- LAZULI DEBUG UI START -->
+<details id="diagnostics"><pre id="result">RUNNING</pre></details>
+<!-- LAZULI DEBUG UI END -->
+<section>Play</section>
+</main></body>`);
+  assert.doesNotMatch(frontend, /id="diagnostics"|>RUNNING<\/pre>/);
+  assert.equal(frontend.match(/id="result"/g)?.length, 1);
+  assert.match(
+    frontend,
+    /<pre id="result" data-testid="browser-boot-result" hidden aria-hidden="true"><\/pre>\s*<\/main>/,
+  );
+});
 
 test("builds a deterministic GPL release from a generic generated frontend", async () => {
   const directory = await mkdtemp(join(tmpdir(), "lazuli-web-build-"));

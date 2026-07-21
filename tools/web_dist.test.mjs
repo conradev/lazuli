@@ -34,7 +34,12 @@ test("generated public artifact contains only the release surface", async () => 
   );
   assert.doesNotMatch(
     frontend,
-    /id="(?:runner-controls|pause-runner|resume-runner|diagnostics|disc-url|load-disc-url|extend-cycles|extend-dispatches|extend-runner|runner-rest-ms|apply-throttle|runner-render-every|apply-presentation|snapshot-runner|stop-runner|result)"/,
+    /id="(?:runner-controls|pause-runner|resume-runner|diagnostics|disc-url|load-disc-url|extend-cycles|extend-dispatches|extend-runner|runner-rest-ms|apply-throttle|runner-render-every|apply-presentation|snapshot-runner|stop-runner)"/,
+  );
+  assert.equal(frontend.match(/id="result"/g)?.length, 1);
+  assert.match(
+    frontend,
+    /<pre id="result" data-testid="browser-boot-result" hidden aria-hidden="true"><\/pre>\s*<\/main>/,
   );
   assert.match(frontend, /runnerSearchForSurface\(debugSurface, location\.search\)/);
   assert.match(frontend, /scenario === "smb-ready-play"/);

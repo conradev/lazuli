@@ -8,6 +8,10 @@ import {
   verifyCheckpointReport,
 } from "./browser_boot_checkpoint.mjs";
 import {
+  attachDiscAfterFreshNavigation,
+  resolveDiscPath,
+} from "./browser_boot_headless_disc.mjs";
+import {
   DevToolsSession,
   observeHeadlessPage,
 } from "./browser_boot_headless_cdp.mjs";
@@ -16,6 +20,7 @@ import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
 function parseArguments(argv) {
   const options = {
     endpoint: "http://127.0.0.1:9222",
+    disc: null,
     expect: null,
     extendCycles: null,
     extendDispatches: undefined,
@@ -39,6 +44,9 @@ function parseArguments(argv) {
     switch (argument) {
       case "--endpoint":
         options.endpoint = value();
+        break;
+      case "--disc":
+        options.disc = value();
         break;
       case "--extend-cycles":
         options.extendCycles = Number(value());
@@ -87,6 +95,9 @@ function parseArguments(argv) {
   if (options.url !== null && new URL(options.url).searchParams.has("scenario")) {
     throw new Error("select scenarios with --scenario, not the --url query");
   }
+  if (options.reuse && options.disc !== null) {
+    throw new Error("--disc cannot be combined with --reuse");
+  }
   if (options.reuse && options.extendCycles === null) {
     throw new Error("--reuse requires --extend-cycles");
   }
@@ -102,6 +113,7 @@ function parseArguments(argv) {
   ) {
     throw new Error("--scenario must be lowercase kebab-case");
   }
+  if (options.disc !== null) options.disc = resolveDiscPath(options.disc);
   if (
     options.extendCycles !== null
     && (!Number.isInteger(options.extendCycles) || options.extendCycles <= 0)
@@ -150,6 +162,9 @@ function delay(milliseconds) {
 function configuredRunUrl(options, headlessRunId) {
   const url = new URL(options.url);
   if (options.scenario !== null) url.searchParams.set("scenario", options.scenario);
+  if (options.renderEvery !== null) {
+    url.searchParams.set("renderEvery", String(options.renderEvery));
+  }
   url.searchParams.set("headlessRun", headlessRunId);
   return url.href;
 }
@@ -386,6 +401,21 @@ async function main() {
         throw new Error("Page.navigate did not create a fresh document loader");
       }
       navigationLoaderId = navigation.loaderId;
+    }
+
+    if (options.disc !== null) {
+      await attachDiscAfterFreshNavigation(session, {
+        deadline,
+        discPath: options.disc,
+        navigationLoaderId,
+        pollMs: options.pollMs,
+        runUrl,
+      }, {
+        delay,
+        isExpectedNavigation,
+        observePage: observeHeadlessPage,
+        pageState,
+      });
     }
 
     let state = null;
