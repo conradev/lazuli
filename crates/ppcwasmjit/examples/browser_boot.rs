@@ -913,6 +913,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     };
     const controllerQueue = [];
     const controllerQueueCapacity = 64;
+    const requestedControllerScenario = new URLSearchParams(
+      globalThis.runnerSearch
+    ).get("scenario");
     let controllerQueueHighWater = 0;
     let controllerQueueCoalesces = 0;
     let controllerQueueOverflows = 0;
@@ -1764,6 +1767,154 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       return buttons;
     }
+
+    const controllerScenarioDefinitions = new Map();
+
+    function controllerScenarioInteger(value, name, minimum = 0) {
+      if (!Number.isSafeInteger(value) || value < minimum) {
+        throw new TypeError(`${name} must be a safe integer >= ${minimum}`);
+      }
+      return value;
+    }
+
+    function registerControllerScenario(definition) {
+      if (definition === null || typeof definition !== "object") {
+        throw new TypeError("controller scenario definition must be an object");
+      }
+      if (
+        typeof definition.id !== "string"
+        || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(definition.id)
+      ) {
+        throw new TypeError("controller scenario id must be lowercase kebab-case");
+      }
+      if (
+        typeof definition.gameIdentifier !== "string"
+        || definition.gameIdentifier.length === 0
+      ) {
+        throw new TypeError("controller scenario gameIdentifier must be nonempty");
+      }
+      controllerScenarioInteger(definition.hardCycleLimit, "hardCycleLimit", 1);
+      if (definition.gameVersion !== undefined) {
+        controllerScenarioInteger(definition.gameVersion, "gameVersion");
+        if (definition.gameVersion > 0xff) {
+          throw new RangeError("controller scenario gameVersion exceeds 8 bits");
+        }
+      }
+      if (typeof definition.sample !== "function") {
+        throw new TypeError("controller scenario sample must be a function");
+      }
+      if (!Array.isArray(definition.steps) || definition.steps.length === 0) {
+        throw new TypeError("controller scenario steps must be a nonempty array");
+      }
+      const ids = new Set();
+      for (const step of definition.steps) {
+        if (step === null || typeof step !== "object") {
+          throw new TypeError("controller scenario step must be an object");
+        }
+        if (typeof step.id !== "string" || step.id.length === 0 || ids.has(step.id)) {
+          throw new TypeError("controller scenario step ids must be unique and nonempty");
+        }
+        ids.add(step.id);
+        if (typeof step.ready !== "function") {
+          throw new TypeError(`controller scenario step ${step.id} needs a ready predicate`);
+        }
+        if (step.missed !== undefined && typeof step.missed !== "function") {
+          throw new TypeError(`controller scenario step ${step.id} missed must be a function`);
+        }
+        if (step.button !== null) {
+          controllerScenarioInteger(
+            step.button,
+            `controller scenario step ${step.id} button`,
+            1
+          );
+          if (step.button > 0xffff) {
+            throw new RangeError(`controller scenario step ${step.id} button exceeds 16 bits`);
+          }
+        }
+      }
+      if (controllerScenarioDefinitions.has(definition.id)) {
+        throw new Error(`duplicate controller scenario ${definition.id}`);
+      }
+      controllerScenarioDefinitions.set(definition.id, definition);
+      return definition;
+    }
+
+    function createControllerScenario(definition, startCycle = 0) {
+      controllerScenarioInteger(startCycle, "controller scenario startCycle");
+      const pressPolls = controllerScenarioInteger(
+        definition.pressPolls ?? 3,
+        "controller scenario pressPolls",
+        1
+      );
+      const minimumNeutralPolls = controllerScenarioInteger(
+        definition.minimumNeutralPolls ?? 3,
+        "controller scenario minimumNeutralPolls",
+        1
+      );
+      const maximumNeutralPolls = controllerScenarioInteger(
+        definition.maximumNeutralPolls ?? 120,
+        "controller scenario maximumNeutralPolls",
+        1
+      );
+      if (maximumNeutralPolls < minimumNeutralPolls) {
+        throw new RangeError(
+          "controller scenario maximumNeutralPolls must be >= minimumNeutralPolls"
+        );
+      }
+      return {
+        definition,
+        id: definition.id,
+        gameIdentifier: definition.gameIdentifier,
+        hardCycleLimit: definition.hardCycleLimit,
+        pressPolls,
+        minimumNeutralPolls,
+        maximumNeutralPolls,
+        status: "running",
+        startCycle,
+        completedCycle: null,
+        failure: null,
+        stepIndex: 0,
+        pollIndex: 0,
+        nextSequence: 1,
+        pulse: null,
+        steps: [],
+        lastState: null,
+      };
+    }
+
+    function selectControllerScenario(
+      name,
+      gameIdentifier,
+      startCycle = 0,
+      gameVersion,
+      optional = false
+    ) {
+      if (name === null || name === "") return null;
+      const definition = controllerScenarioDefinitions.get(name);
+      if (definition === undefined) throw new Error(`unsupported controller scenario ${name}`);
+      if (definition.gameIdentifier !== gameIdentifier) {
+        if (optional) return null;
+        throw new Error(
+          `controller scenario ${name} requires ${definition.gameIdentifier}, got ${gameIdentifier}`
+        );
+      }
+      if (
+        definition.gameVersion !== undefined
+        && definition.gameVersion !== gameVersion
+      ) {
+        if (optional) return null;
+        throw new Error(
+          `controller scenario ${name} requires disc revision ${definition.gameVersion}, got ${gameVersion}`
+        );
+      }
+      return createControllerScenario(definition, startCycle);
+    }
+
+    function controllerScenarioCycleLimit(limit, scenario) {
+      if (scenario === null || !Number.isFinite(limit)) return limit;
+      return Math.max(limit, scenario.hardCycleLimit);
+    }
+
     __DISC_SOURCE_RUNTIME__
 
     async function fetchBinary(url, label) {
@@ -1933,6 +2084,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       ? Math.max(1, Math.min(8192, Math.floor(requestedBlockChunk)))
       : 1024;
     const stopOnFirstDsi = searchParams.get("stopOnFirstDsi") === "1";
+    const controllerScenario = selectControllerScenario(
+      requestedControllerScenario,
+      boot.identifier,
+      0,
+      boot.version,
+      globalThis.runnerScenarioOptional === true
+    );
+    cycleLimit = controllerScenarioCycleLimit(cycleLimit, controllerScenario);
     let runnerYieldDeadline = Date.now() + runnerSliceMs;
     let runnerBlocksUntilYield = runnerBlockChunk;
 
