@@ -23,7 +23,7 @@ test("canonical JSON and checkpoint hashes ignore object insertion order", () =>
   );
 });
 
-test("projection reacts to CPU, GX, disk, guest, controller, and VI state", () => {
+test("projection reacts to guest, device, VI, and selected-XFB visual state", () => {
   const report = checkpointReport();
   const digest = createCheckpointCandidate(report).sha256;
   const mutations = [
@@ -34,6 +34,11 @@ test("projection reacts to CPU, GX, disk, guest, controller, and VI state", () =
     candidate => { candidate.guestGame.submodeTimer -= 1; },
     candidate => { candidate.controller.guestPad.pressed.buttons = 0x0100; },
     candidate => { candidate.mmioState.viInterruptModel.lastPresentationField = "bottom"; },
+    candidate => { candidate.rendering.selectedXfb.rgbaSha256 = "1".repeat(64); },
+    candidate => {
+      candidate.rendering.selectedXfb.rgb.other -= 1;
+      candidate.rendering.selectedXfb.rgb.black += 1;
+    },
   ];
   for (const mutate of mutations) {
     const changed = structuredClone(report);
@@ -42,7 +47,7 @@ test("projection reacts to CPU, GX, disk, guest, controller, and VI state", () =
   }
 });
 
-test("M0 hard gates fail at the actionable report path", () => {
+test("checkpoint hard gates fail at the actionable report path", () => {
   const cases = [
     ["status", report => { report.status = "running"; }, "$.status"],
     ["stage", report => { report.stage = "snapshot"; }, "$.stage"],
@@ -61,6 +66,21 @@ test("M0 hard gates fail at the actionable report path", () => {
     ["renderer high water", report => { report.execution.scheduler.rendererSync.highWater = 2; }, "$.execution.scheduler.rendererSync.highWater"],
     ["XFB progress", report => { report.gxFifo.decoder.xfbCopyCount = 0; }, "$.gxFifo.decoder.xfbCopyCount"],
     ["VI progress", report => { report.mmioState.viInterruptModel.presentationCount = 0; }, "$.mmioState.viInterruptModel.presentationCount"],
+    ["visual backend", report => { report.rendering.backend = "fallback"; }, "$.rendering.backend"],
+    ["visual address", report => { report.rendering.selectedXfb.address = "0x00307180"; }, "$.rendering.selectedXfb.address"],
+    ["visual generation", report => { report.rendering.selectedXfb.generation -= 1; }, "$.rendering.selectedXfb.generation"],
+    ["visual row", report => { report.rendering.selectedXfb.row = 1; }, "$.rendering.selectedXfb.row"],
+    ["visual layout", report => { report.rendering.selectedXfb.layout = "padded"; }, "$.rendering.selectedXfb.layout"],
+    ["visual byte count", report => { report.rendering.selectedXfb.rgbaByteLength -= 4; }, "$.rendering.selectedXfb.rgbaByteLength"],
+    ["visual digest", report => { report.rendering.selectedXfb.rgbaSha256 = "invalid"; }, "$.rendering.selectedXfb.rgbaSha256"],
+    ["visual color partition", report => { report.rendering.selectedXfb.rgb.black -= 1; }, "$.rendering.selectedXfb.rgb"],
+    ["uniform visual", report => {
+      const selected = report.rendering.selectedXfb;
+      selected.rgb.black = selected.width * selected.height;
+      selected.rgb.white = 0;
+      selected.rgb.other = 0;
+      selected.rgb.unique = 1;
+    }, "$.rendering.selectedXfb.rgb.other"],
     ["GX opcode", report => { report.gxFifo.decoder.unknownOpcodes = 1; }, "$.gxFifo.decoder.unknownOpcodes"],
     ["display list", report => { report.gxFifo.decoder.displayListErrors = 1; }, "$.gxFifo.decoder.displayListErrors"],
     ["vertex decode", report => { report.gxFifo.decoder.vertexDecodeErrors = 1; }, "$.gxFifo.decoder.vertexDecodeErrors"],
@@ -99,4 +119,11 @@ test("projected fixture contains exactly the declared stable leaves", () => {
   assert.equal(state.dispatches, 123_456);
   assert.equal(state.gxFifo.decoder.xfbCopyCount, 143);
   assert.equal(state.mmioState.viInterruptModel.presentationCount, 185);
+  assert.equal(state.mmioState.viInterruptModel.lastPresentationCopyIndex, 142);
+  assert.equal(state.rendering.backend, "wgpu-webgpu");
+  assert.equal(
+    state.rendering.selectedXfb.rgbaSha256,
+    "5fd0f5382bec2c974f7b6559b3c648a6db307d92eb37440d1f23dfa4be9d974e",
+  );
+  assert.equal(state.rendering.selectedXfb.rgb.unique, 423);
 });

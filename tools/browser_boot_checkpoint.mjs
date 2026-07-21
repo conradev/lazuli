@@ -12,6 +12,7 @@ import {
   SUPER_MONKEY_BALL_CHECKPOINT,
   assertCheckpointJsonValue,
   checkpointChildPath,
+  checkpointFieldsForSchema,
   checkpointIdentity,
   checkpointSha256,
   checkpointValidationFailure,
@@ -132,12 +133,7 @@ export function createCheckpointManifest(
 export function validateCheckpointManifest(manifest) {
   requireCheckpointObject(manifest, "$manifest");
   assertCheckpointJsonValue(manifest, "$manifest");
-  if (manifest.schema !== BROWSER_BOOT_CHECKPOINT_SCHEMA) {
-    checkpointValidationFailure(
-      "$manifest.schema",
-      `expected ${describeCheckpointValue(BROWSER_BOOT_CHECKPOINT_SCHEMA)}, got ${describeCheckpointValue(manifest.schema)}`,
-    );
-  }
+  const checkpointFields = checkpointFieldsForSchema(manifest.schema, "$manifest.schema");
   if (manifest.algorithm !== "sha256") {
     checkpointValidationFailure(
       "$manifest.algorithm",
@@ -148,7 +144,7 @@ export function validateCheckpointManifest(manifest) {
     checkpointValidationFailure("$manifest.sha256", "expected a lowercase SHA-256 digest");
   }
   const fieldsDifference = firstDifference(
-    BROWSER_BOOT_CHECKPOINT_FIELDS,
+    checkpointFields,
     manifest.fields,
     "$manifest.fields",
   );
@@ -182,7 +178,11 @@ export function validateCheckpointManifest(manifest) {
     );
   }
   requireCheckpointObject(manifest.state, "$manifest.state");
-  const normalizedState = normalizeCheckpointState(manifest.state);
+  const normalizedState = normalizeCheckpointState(
+    manifest.state,
+    "$manifest.state",
+    manifest.schema,
+  );
   const stateShapeDifference = firstDifference(
     normalizedState,
     manifest.state,
@@ -229,7 +229,7 @@ export function verifyCheckpointReport(report, manifest) {
     },
     run: manifest.run,
   };
-  const candidate = createCheckpointCandidate(report, expected);
+  const candidate = createCheckpointCandidate(report, expected, manifest.schema);
   for (const field of ["id", "game", "checkpoint", "run"]) {
     const difference = firstDifference(manifest[field], candidate[field], `$${field}`);
     if (difference !== null) {

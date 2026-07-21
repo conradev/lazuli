@@ -2,7 +2,8 @@
 
 import { createHash } from "node:crypto";
 
-export const BROWSER_BOOT_CHECKPOINT_SCHEMA = "lazuli-browser-boot-checkpoint-v1";
+export const BROWSER_BOOT_CHECKPOINT_SCHEMA_V1 = "lazuli-browser-boot-checkpoint-v1";
+export const BROWSER_BOOT_CHECKPOINT_SCHEMA = "lazuli-browser-boot-checkpoint-v2";
 export const SUPER_MONKEY_BALL_CHECKPOINT = Object.freeze({
   id: "smb-usa/no-input/cycles-1500000000/render-every-1",
   game: Object.freeze({
@@ -26,7 +27,7 @@ export const SUPER_MONKEY_BALL_CHECKPOINT = Object.freeze({
 // This is deliberately an allowlist. Browser reports contain useful live
 // diagnostics such as user-agent strings, URLs, cache residency and host wait
 // counts, but those values must never bless or break a guest-state golden.
-export const BROWSER_BOOT_CHECKPOINT_FIELDS = Object.freeze([
+const BROWSER_BOOT_CHECKPOINT_FIELDS_V1 = Object.freeze([
   "/status",
   "/stage",
   "/title",
@@ -80,10 +81,55 @@ export const BROWSER_BOOT_CHECKPOINT_FIELDS = Object.freeze([
   "/mmioState/viInterruptModel/lastPresentationAddress",
 ]);
 
-const CHECKPOINT_POINTER_PARTS = BROWSER_BOOT_CHECKPOINT_FIELDS.map(pointer => [
-  pointer,
-  pointer.slice(1).split("/").map(part => part.replaceAll("~1", "/").replaceAll("~0", "~")),
+export const BROWSER_BOOT_CHECKPOINT_FIELDS = Object.freeze([
+  ...BROWSER_BOOT_CHECKPOINT_FIELDS_V1,
+  "/mmioState/viInterruptModel/lastPresentationCopyIndex",
+  "/mmioState/viInterruptModel/lastPresentationCopyRow",
+  "/rendering/backend",
+  "/rendering/selectedXfb/address",
+  "/rendering/selectedXfb/generation",
+  "/rendering/selectedXfb/row",
+  "/rendering/selectedXfb/format",
+  "/rendering/selectedXfb/layout",
+  "/rendering/selectedXfb/sourceRow",
+  "/rendering/selectedXfb/width",
+  "/rendering/selectedXfb/height",
+  "/rendering/selectedXfb/textureWidth",
+  "/rendering/selectedXfb/textureHeight",
+  "/rendering/selectedXfb/logicalWidth",
+  "/rendering/selectedXfb/logicalHeight",
+  "/rendering/selectedXfb/displayWidth",
+  "/rendering/selectedXfb/displayHeight",
+  "/rendering/selectedXfb/rgbaByteLength",
+  "/rendering/selectedXfb/rgbaSha256",
+  "/rendering/selectedXfb/rgb/black",
+  "/rendering/selectedXfb/rgb/white",
+  "/rendering/selectedXfb/rgb/other",
+  "/rendering/selectedXfb/rgb/unique",
 ]);
+
+const CHECKPOINT_FIELDS_BY_SCHEMA = new Map([
+  [BROWSER_BOOT_CHECKPOINT_SCHEMA_V1, BROWSER_BOOT_CHECKPOINT_FIELDS_V1],
+  [BROWSER_BOOT_CHECKPOINT_SCHEMA, BROWSER_BOOT_CHECKPOINT_FIELDS],
+]);
+
+export function checkpointFieldsForSchema(schema, path = "$schema") {
+  const fields = CHECKPOINT_FIELDS_BY_SCHEMA.get(schema);
+  if (fields === undefined) {
+    checkpointValidationFailure(
+      path,
+      `unsupported checkpoint schema ${describeCheckpointValue(schema)}`,
+    );
+  }
+  return fields;
+}
+
+function checkpointPointerParts(schema) {
+  return checkpointFieldsForSchema(schema).map(pointer => [
+    pointer,
+    pointer.slice(1).split("/").map(part => part.replaceAll("~1", "/").replaceAll("~0", "~")),
+  ]);
+}
 
 export class CheckpointValidationError extends Error {
   constructor(path, detail) {
@@ -423,6 +469,164 @@ export function validateCheckpointReport(report, expected = SUPER_MONKEY_BALL_CH
     "$.mmioState.viInterruptModel.presentationCount",
   );
 
+  const lastPresentationAddress = requireHex32(
+    viInterruptModel.lastPresentationAddress,
+    "$.mmioState.viInterruptModel.lastPresentationAddress",
+  );
+  const lastPresentationCopyIndex = requirePositiveInteger(
+    viInterruptModel.lastPresentationCopyIndex,
+    "$.mmioState.viInterruptModel.lastPresentationCopyIndex",
+  );
+  const lastPresentationCopyRow = requireCheckpointNonNegativeInteger(
+    viInterruptModel.lastPresentationCopyRow,
+    "$.mmioState.viInterruptModel.lastPresentationCopyRow",
+  );
+  if (lastPresentationCopyRow > 1) {
+    checkpointValidationFailure(
+      "$.mmioState.viInterruptModel.lastPresentationCopyRow",
+      `expected field row 0 or 1, got ${lastPresentationCopyRow}`,
+    );
+  }
+
+  const rendering = requireCheckpointObject(report.rendering, "$.rendering");
+  const renderingBackend = requireString(rendering.backend, "$.rendering.backend");
+  if (renderingBackend !== expected.run.renderer) {
+    checkpointValidationFailure(
+      "$.rendering.backend",
+      `expected ${describeCheckpointValue(expected.run.renderer)}, got ${describeCheckpointValue(renderingBackend)}`,
+    );
+  }
+  const selectedXfb = requireCheckpointObject(
+    rendering.selectedXfb,
+    "$.rendering.selectedXfb",
+  );
+  const selectedAddress = requireHex32(
+    selectedXfb.address,
+    "$.rendering.selectedXfb.address",
+  );
+  if (selectedAddress !== lastPresentationAddress) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.address",
+      `expected last VI address ${lastPresentationAddress}, got ${selectedAddress}`,
+    );
+  }
+  const selectedGeneration = requirePositiveInteger(
+    selectedXfb.generation,
+    "$.rendering.selectedXfb.generation",
+  );
+  if (selectedGeneration !== lastPresentationCopyIndex) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.generation",
+      `expected last VI copy ${lastPresentationCopyIndex}, got ${selectedGeneration}`,
+    );
+  }
+  const selectedRow = requireCheckpointNonNegativeInteger(
+    selectedXfb.row,
+    "$.rendering.selectedXfb.row",
+  );
+  if (selectedRow !== lastPresentationCopyRow) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.row",
+      `expected last VI row ${lastPresentationCopyRow}, got ${selectedRow}`,
+    );
+  }
+  if (selectedXfb.format !== "rgba8unorm") {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.format",
+      `expected "rgba8unorm", got ${describeCheckpointValue(selectedXfb.format)}`,
+    );
+  }
+  if (selectedXfb.layout !== "top-left-row-major-tight") {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.layout",
+      `expected "top-left-row-major-tight", got ${describeCheckpointValue(selectedXfb.layout)}`,
+    );
+  }
+  const dimensions = {};
+  for (const field of [
+    "width",
+    "height",
+    "textureWidth",
+    "textureHeight",
+    "logicalWidth",
+    "logicalHeight",
+    "displayWidth",
+    "displayHeight",
+  ]) {
+    dimensions[field] = requirePositiveInteger(
+      selectedXfb[field],
+      `$.rendering.selectedXfb.${field}`,
+    );
+  }
+  const sourceRow = requireCheckpointNonNegativeInteger(
+    selectedXfb.sourceRow,
+    "$.rendering.selectedXfb.sourceRow",
+  );
+  const expectedSourceRow = Math.floor(
+    selectedRow * dimensions.textureHeight / dimensions.logicalHeight,
+  );
+  if (sourceRow !== expectedSourceRow) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.sourceRow",
+      `expected scaled source row ${expectedSourceRow}, got ${sourceRow}`,
+    );
+  }
+  if (dimensions.width !== dimensions.textureWidth) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.width",
+      `expected texture width ${dimensions.textureWidth}, got ${dimensions.width}`,
+    );
+  }
+  if (dimensions.height !== dimensions.textureHeight - sourceRow) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.height",
+      `expected cropped texture height ${dimensions.textureHeight - sourceRow}, got ${dimensions.height}`,
+    );
+  }
+  const pixelCount = dimensions.width * dimensions.height;
+  const rgbaByteLength = requirePositiveInteger(
+    selectedXfb.rgbaByteLength,
+    "$.rendering.selectedXfb.rgbaByteLength",
+  );
+  if (!Number.isSafeInteger(pixelCount * 4) || rgbaByteLength !== pixelCount * 4) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.rgbaByteLength",
+      `expected ${pixelCount * 4} tight RGBA8 bytes, got ${rgbaByteLength}`,
+    );
+  }
+  if (typeof selectedXfb.rgbaSha256 !== "string" || !/^[0-9a-f]{64}$/.test(selectedXfb.rgbaSha256)) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.rgbaSha256",
+      "expected a lowercase SHA-256 digest",
+    );
+  }
+  const rgb = requireCheckpointObject(selectedXfb.rgb, "$.rendering.selectedXfb.rgb");
+  const rgbCounts = {};
+  for (const field of ["black", "white", "other", "unique"]) {
+    rgbCounts[field] = requireCheckpointNonNegativeInteger(
+      rgb[field],
+      `$.rendering.selectedXfb.rgb.${field}`,
+    );
+  }
+  if (rgbCounts.black + rgbCounts.white + rgbCounts.other !== pixelCount) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.rgb",
+      `expected ${pixelCount} classified pixels`,
+    );
+  }
+  if (rgbCounts.unique === 0 || rgbCounts.unique > pixelCount) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.rgb.unique",
+      `expected 1 through ${pixelCount}, got ${rgbCounts.unique}`,
+    );
+  }
+  if (rgbCounts.other === 0 || rgbCounts.unique === 1) {
+    checkpointValidationFailure(
+      "$.rendering.selectedXfb.rgb.other",
+      "expected a non-uniform frame containing pixels other than exact black or white",
+    );
+  }
+
   if (report.diskCommands?.lastError !== "0x00000000") {
     checkpointValidationFailure(
       "$.diskCommands.lastError",
@@ -459,18 +663,26 @@ export function validateCheckpointReport(report, expected = SUPER_MONKEY_BALL_CH
   return report;
 }
 
-export function projectCheckpointReport(report, expected = SUPER_MONKEY_BALL_CHECKPOINT) {
+export function projectCheckpointReport(
+  report,
+  expected = SUPER_MONKEY_BALL_CHECKPOINT,
+  schema = BROWSER_BOOT_CHECKPOINT_SCHEMA,
+) {
   validateCheckpointReport(report, expected);
   const state = {};
-  for (const [pointer, parts] of CHECKPOINT_POINTER_PARTS) {
+  for (const [pointer, parts] of checkpointPointerParts(schema)) {
     assignPointer(state, parts, pointerValue(report, pointer, parts));
   }
   return state;
 }
 
-export function normalizeCheckpointState(state, base = "$manifest.state") {
+export function normalizeCheckpointState(
+  state,
+  base = "$manifest.state",
+  schema = BROWSER_BOOT_CHECKPOINT_SCHEMA,
+) {
   const normalized = {};
-  for (const [pointer, parts] of CHECKPOINT_POINTER_PARTS) {
+  for (const [pointer, parts] of checkpointPointerParts(schema)) {
     assignPointer(normalized, parts, pointerValue(state, pointer, parts, base));
   }
   return normalized;
@@ -504,14 +716,19 @@ export function checkpointIdentity(expected, state) {
   };
 }
 
-export function createCheckpointCandidate(report, expected = SUPER_MONKEY_BALL_CHECKPOINT) {
+export function createCheckpointCandidate(
+  report,
+  expected = SUPER_MONKEY_BALL_CHECKPOINT,
+  schema = BROWSER_BOOT_CHECKPOINT_SCHEMA,
+) {
   validateCheckpointOptions(expected);
-  const state = projectCheckpointReport(report, expected);
+  const fields = checkpointFieldsForSchema(schema);
+  const state = projectCheckpointReport(report, expected, schema);
   const identity = checkpointIdentity(expected, state);
   return {
-    schema: BROWSER_BOOT_CHECKPOINT_SCHEMA,
+    schema,
     algorithm: "sha256",
-    fields: [...BROWSER_BOOT_CHECKPOINT_FIELDS],
+    fields: [...fields],
     ...identity,
     sha256: checkpointSha256(state),
     state,

@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   BROWSER_BOOT_CHECKPOINT_FIELDS,
+  BROWSER_BOOT_CHECKPOINT_SCHEMA,
   CheckpointMismatchError,
   CheckpointValidationError,
   SUPER_MONKEY_BALL_CHECKPOINT,
@@ -24,6 +25,10 @@ import {
   validateCheckpointManifest,
   verifyCheckpointReport,
 } from "./browser_boot_checkpoint.mjs";
+import {
+  BROWSER_BOOT_CHECKPOINT_SCHEMA_V1,
+  checkpointFieldsForSchema,
+} from "./browser_boot_checkpoint_core.mjs";
 import {
   reportsForConsensus,
 } from "./browser_boot_checkpoint_fixture.mjs";
@@ -35,6 +40,7 @@ test("three clean reports bless one host-independent checkpoint manifest", () =>
 
   const manifest = createCheckpointManifest(reports);
   assert.equal(manifest.consensus.cleanRuns, 3);
+  assert.equal(manifest.schema, BROWSER_BOOT_CHECKPOINT_SCHEMA);
   assert.deepEqual(manifest.fields, BROWSER_BOOT_CHECKPOINT_FIELDS);
   assert.equal(manifest.game.identifier, "GMBE8P");
   assert.equal(manifest.id, "smb-usa/no-input/cycles-1500000000/render-every-1");
@@ -51,6 +57,8 @@ test("three clean reports bless one host-independent checkpoint manifest", () =>
   assert.equal(manifest.state.deviceEvents, undefined);
   assert.equal(manifest.state.runtime, undefined);
   assert.equal(manifest.state.headlessCapture, undefined);
+  assert.equal(manifest.state.rendering.backend, "wgpu-webgpu");
+  assert.equal(manifest.state.rendering.selectedXfb.generation, 142);
   assert.equal(manifest.state.execution.scheduler.rendererSync.waits, undefined);
   assert.equal(verifyCheckpointReport(reports[2], manifest).sha256, manifest.sha256);
   assert.deepEqual(SUPER_MONKEY_BALL_CHECKPOINT.run.inputs, []);
@@ -78,6 +86,33 @@ test("checkpoint mismatches name the first meaningful state path", () => {
       return true;
     },
   );
+
+  const changedPixels = structuredClone(reports[0]);
+  changedPixels.rendering.selectedXfb.rgbaSha256 = "1".repeat(64);
+  assert.throws(
+    () => verifyCheckpointReport(changedPixels, manifest),
+    error => error instanceof CheckpointMismatchError
+      && error.path === "$state.rendering.selectedXfb.rgbaSha256",
+  );
+});
+
+test("schema-1 manifests remain verifiable while visual goldens use schema 2", () => {
+  const reports = reportsForConsensus();
+  const candidate = createCheckpointCandidate(
+    reports[0],
+    SUPER_MONKEY_BALL_CHECKPOINT,
+    BROWSER_BOOT_CHECKPOINT_SCHEMA_V1,
+  );
+  const manifest = {
+    ...candidate,
+    consensus: { cleanRuns: 3 },
+  };
+  assert.deepEqual(
+    manifest.fields,
+    checkpointFieldsForSchema(BROWSER_BOOT_CHECKPOINT_SCHEMA_V1),
+  );
+  assert.equal(validateCheckpointManifest(manifest), manifest);
+  assert.equal(verifyCheckpointReport(reports[1], manifest).sha256, manifest.sha256);
 });
 
 test("goldens require three identical clean reports", () => {
