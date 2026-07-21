@@ -172,9 +172,14 @@ test("local harness retains controls removed from the public frontend", async ()
   assert.equal(harness.match(/<!-- LAZULI DEBUG UI END -->/g)?.length, 2);
 });
 
-test("public shell does not forward debug runner parameters", async () => {
+test("public shell forwards only the SMB scenario", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   assert.doesNotMatch(shell, /url\.search\s*=\s*location\.search/);
+  assert.match(
+    shell,
+    /if \(scenario === "smb-ready-play"\) \{\s*url\.searchParams\.set\("scenario", scenario\);/,
+  );
+  assert.doesNotMatch(shell, /searchParams\.set\("(?:cycles|dispatches|rest|renderEvery|harness)"/);
 });
 
 test("public shell keeps the upload surface at one stable URL", async () => {

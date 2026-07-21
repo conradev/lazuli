@@ -2242,6 +2242,236 @@ const TEMPLATE: &str = r##"<!doctype html>
         steps: scenario.steps,
       };
     }
+
+    function createSuperMonkeyBallControllerScenarioDefinition() {
+      const padA = 0x0100;
+      const padB = 0x0200;
+      const padStart = 0x1000;
+      const titleMode = sample =>
+        sample.gameModeRequest === -1
+        && sample.gameMode === 0
+        && sample.gameSubmodeRequest === -1
+        && sample.gameSubmode === 20
+        && (sample.pauseStatus & 0x0a) === 0
+        && (sample.inputLockStatus & 1) === 0
+        && sample.titleChoice === 0
+        && sample.textBoxState === 10
+        && sample.textBoxTimer >= 31;
+      const selector = (sample, current) =>
+        sample.gameModeRequest === -1
+        && sample.gameMode === 1
+        && sample.gameSubmodeRequest === -1
+        && sample.gameSubmode === 32
+        && (sample.pauseStatus & 0x0a) === 0
+        && sample.selectorRequest === -1
+        && sample.selectorCurrent === current;
+      const stepCycle = (scenario, id) => {
+        const step = scenario.steps.find(candidate => candidate.id === id);
+        return step?.completedCycle ?? step?.observedCycle ?? null;
+      };
+      const stepState = (scenario, id) =>
+        scenario.steps.find(candidate => candidate.id === id)?.state ?? null;
+      const deadline = (anchorId, additionalCycles, label) => (sample, scenario) => {
+        const anchor = anchorId === null ? scenario.startCycle : stepCycle(scenario, anchorId);
+        return anchor !== null && sample.cycle >= anchor + additionalCycles
+          ? `${label} deadline exceeded by ${sample.cycle - anchor - additionalCycles} cycles`
+          : false;
+      };
+      const stablePresentations = (id, minimumPresentations, predicate) =>
+        (sample, scenario) => {
+        const residency = scenario.superMonkeyBallResidency ??= Object.create(null);
+        if (!predicate(sample)) {
+          delete residency[id];
+          return false;
+        }
+        residency[id] ??= sample.viPresentationCount;
+        return sample.viPresentationCount - residency[id] >= minimumPresentations;
+      };
+      const stableSelector = (current, extra = () => true) => stablePresentations(
+        `selector-${current}`,
+        31,
+        sample => selector(sample, current) && extra(sample)
+      );
+
+      return {
+        id: "smb-ready-play",
+        gameIdentifier: "GMBE8P",
+        gameVersion: 0,
+        hardCycleLimit: 30_000_000_000,
+        pressPolls: 3,
+        minimumNeutralPolls: 3,
+        maximumNeutralPolls: 120,
+        sample: inspectSuperMonkeyBallScenarioState,
+        describe: sample => sample,
+        steps: [
+          {
+            id: "memory-card-back",
+            button: padB,
+            ready: sample =>
+              sample.gameModeRequest === -1
+              && sample.gameMode === 0
+              && sample.gameSubmodeRequest === -1
+              && sample.gameSubmode === 6
+              && sample.warningState === 2
+              && sample.warningDialogPhase === 0xff
+              && (sample.warningDialogFlags & 0x200) !== 0,
+            missed: deadline(null, 2_000_000_000, "memory-card prompt"),
+          },
+          {
+            id: "skip-opening-demo",
+            button: padStart,
+            ready: stablePresentations("opening-demo", 3, sample =>
+              sample.gameModeRequest === -1
+              && sample.gameMode === 0
+              && sample.gameSubmodeRequest === -1
+              && sample.gameSubmode === 2
+              && sample.submodeTimer > 60
+              && (sample.flags & 0x2000) === 0
+              && sample.demoSkipTimer === 0
+              && sample.demoResourcesReady !== 0
+            ),
+            missed: deadline("memory-card-back", 10_000_000_000, "opening demo"),
+          },
+          {
+            id: "opening-demo-skipped",
+            button: null,
+            ready: sample =>
+              sample.gameModeRequest === -1
+              && sample.gameMode === 0
+              && sample.gameSubmodeRequest === -1
+              && sample.gameSubmode === 2
+              && (sample.flags & 0x2000) !== 0
+              && sample.demoSkipTimer > 0
+              && sample.demoSkipTimer <= 30,
+            missed: deadline("skip-opening-demo", 200_000_000, "opening-demo skip"),
+          },
+          {
+            id: "title-start",
+            button: padStart,
+            ready: stablePresentations("title-start", 31, sample =>
+              titleMode(sample)
+              && (sample.flags & 4) === 0
+            ),
+            missed: deadline("opening-demo-skipped", 1_500_000_000, "title screen"),
+          },
+          {
+            id: "title-game-start",
+            button: padA,
+            ready: stablePresentations("title-game-start", 31, sample =>
+              titleMode(sample)
+              && (sample.flags & 4) !== 0
+              && (sample.flags & 2) === 0
+            ),
+            missed: deadline("title-start", 1_000_000_000, "Game Start acceptance"),
+          },
+          {
+            id: "select-current-8",
+            button: padA,
+            ready: stableSelector(8, sample => sample.selectorChoice === 0),
+            missed: deadline("title-game-start", 2_000_000_000, "main-game selector"),
+          },
+          {
+            id: "select-current-10",
+            button: padA,
+            ready: stableSelector(10, sample => sample.gameType === 0),
+            missed: deadline("select-current-8", 1_000_000_000, "normal-mode selector"),
+          },
+          {
+            id: "select-current-16",
+            button: padA,
+            ready: stableSelector(
+              16,
+              sample => sample.gameType === 0 && sample.playerCount === 1
+            ),
+            missed: deadline("select-current-10", 1_000_000_000, "player-count selector"),
+          },
+          {
+            id: "select-current-18",
+            button: padA,
+            ready: stableSelector(
+              18,
+              sample => sample.gameType === 0
+                && sample.playerCount === 1
+                && sample.characterSelection0 === 0
+                && sample.characterLocked0 === 0
+            ),
+            missed: deadline("select-current-16", 1_000_000_000, "character selector"),
+          },
+          {
+            id: "select-current-22",
+            button: padA,
+            ready: stableSelector(
+              22,
+              sample => sample.gameType === 0
+                && sample.playerCount === 1
+                && sample.difficulty === 0
+            ),
+            missed: deadline("select-current-18", 1_000_000_000, "difficulty selector"),
+          },
+          {
+            id: "ready-main",
+            button: null,
+            ready: sample =>
+              sample.gameModeRequest === -1
+              && sample.gameMode === 2
+              && sample.gameSubmodeRequest === -1
+              && sample.gameSubmode === 49
+              && (sample.pauseStatus & 0x0a) === 0
+              && sample.attempts === 1
+              && sample.floor === 1
+              && (sample.infoFlags & 0x108) === 0x108
+              && sample.submodeTimer === 360,
+            missed: deadline("select-current-22", 2_000_000_000, "READY main"),
+          },
+          {
+            id: "play-main",
+            button: null,
+            ready: (sample, scenario) => {
+              const readyCycle = stepCycle(scenario, "ready-main");
+              const readyState = stepState(scenario, "ready-main");
+              return readyCycle !== null
+                && readyState !== null
+                && sample.viPresentationCount - readyState.viPresentationCount
+                  >= readyState.submodeTimer
+                && sample.gameModeRequest === -1
+                && sample.gameMode === 2
+                && sample.gameSubmodeRequest === -1
+                && sample.gameSubmode === 51
+                && (sample.pauseStatus & 0x0a) === 0
+                && (sample.infoFlags & 0x108) === 0;
+            },
+            missed: deadline("ready-main", 4_000_000_000, "PLAY main"),
+          },
+          {
+            id: "post-play-presented",
+            button: null,
+            ready: (sample, scenario) => {
+              const playCycle = stepCycle(scenario, "play-main");
+              const playState = stepState(scenario, "play-main");
+              return playCycle !== null
+                && playState !== null
+                && sample.gameModeRequest === -1
+                && sample.gameMode === 2
+                && sample.gameSubmodeRequest === -1
+                && sample.gameSubmode === 51
+                && (sample.infoFlags & 0x108) === 0
+                && sample.viLastPresentationCopyIndex > 0
+                && sample.gxXfbCopyCount > playState.gxXfbCopyCount
+                && sample.viPresentationCount > playState.viPresentationCount
+                && sample.viLastPresentationCycle > playCycle
+                && sample.viLastPresentationCopyIndex > playState.gxXfbCopyCount
+                && sample.xfbCaptured === true
+                && sample.xfbCapturedAtCycle > playCycle
+                && sample.xfbDisplayedAtCycle > playCycle
+                && sample.rendererFramesAcknowledged > playState.rendererFramesAcknowledged
+                && sample.rendererFramesInFlight === 0
+                && sample.rendererFailed === false;
+            },
+            missed: deadline("play-main", 1_000_000_000, "post-PLAY presentation"),
+          },
+        ],
+      };
+    }
     __DISC_SOURCE_RUNTIME__
 
     async function fetchBinary(url, label) {
@@ -2411,6 +2641,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       ? Math.max(1, Math.min(8192, Math.floor(requestedBlockChunk)))
       : 1024;
     const stopOnFirstDsi = searchParams.get("stopOnFirstDsi") === "1";
+    registerControllerScenario(createSuperMonkeyBallControllerScenarioDefinition());
     const controllerScenario = selectControllerScenario(
       requestedControllerScenario,
       boot.identifier,
@@ -5845,6 +6076,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       return pointer === null ? null : view.getUint32(pointer, false);
     }
 
+    function guestU8(address) {
+      const pointer = ramPointer(address, 1);
+      return pointer === null ? null : view.getUint8(pointer);
+    }
+
     function guestU16(address) {
       const pointer = ramPointer(address, 2);
       return pointer === null ? null : view.getUint16(pointer, false);
@@ -5858,6 +6094,66 @@ const TEMPLATE: &str = r##"<!doctype html>
     function guestS16(address) {
       const pointer = ramPointer(address, 2);
       return pointer === null ? null : view.getInt16(pointer, false);
+    }
+
+    function inspectSuperMonkeyBallScenarioState() {
+      if (boot.identifier !== "GMBE8P") return null;
+      let lastPresentedCopy = null;
+      for (let index = gxXfbCopies.length - 1; index >= 0; index -= 1) {
+        if (gxXfbCopies[index].index === viLastPresentationCopyIndex) {
+          lastPresentedCopy = gxXfbCopies[index];
+          break;
+        }
+      }
+      return {
+        cycle: cycles,
+        pad: {
+          held: guestU16(0x801f3b70),
+          pressed: guestU16(0x801f3b88),
+          released: guestU16(0x801f3b94),
+        },
+        gameModeRequest: guestS16(0x802f1b90),
+        gameMode: guestS16(0x802f1b92),
+        gameSubmodeRequest: guestS16(0x802f1b8c),
+        gameSubmode: guestS16(0x802f1b8e),
+        warningState: guestU8(0x80173cc8),
+        warningDialogPhase: guestU8(0x802ba35c),
+        warningDialogFlags: guestU32(0x802ba318),
+        submodeTimer: guestS32(0x801eec20),
+        difficulty: guestS32(0x801eec24),
+        flags: guestU32(0x801eec28),
+        titleChoice: guestS32(0x801eec30),
+        menuSelection: guestS32(0x801eec40),
+        playerCount: guestS32(0x801eec44),
+        gameType: guestS32(0x801eec48),
+        currentPlayer: guestS32(0x801eec4c),
+        characterSelection0: guestS32(0x80206bc0),
+        textBoxState: guestS32(0x80292b60),
+        textBoxTimer: guestS32(0x80292b68),
+        selectorCurrent: guestS32(0x801eeda8),
+        selectorRequest: guestS32(0x801eedac),
+        selectorChoice: guestS32(0x801eede0),
+        characterLocked0: guestS32(0x801eedf0),
+        infoFlags: guestU32(0x801f3a58),
+        infoTimer: guestS16(0x801f3a5c),
+        attempts: guestS16(0x801f3a76),
+        floor: guestS16(0x801f3a78),
+        pauseStatus: guestU32(0x802f1ee0),
+        inputLockStatus: guestU32(0x802f1edc),
+        demoSkipTimer: guestS32(0x802f1ba8),
+        demoResourcesReady: guestS32(0x802f1bb0),
+        gameVersion: boot.version,
+        viPresentationCount,
+        viLastPresentationCycle,
+        viLastPresentationCopyIndex,
+        gxXfbCopyCount,
+        xfbCaptured: lastPresentedCopy?.captured ?? null,
+        xfbCapturedAtCycle: lastPresentedCopy?.capturedAtCycle ?? null,
+        xfbDisplayedAtCycle: lastPresentedCopy?.displayedAtCycle ?? null,
+        rendererFramesAcknowledged,
+        rendererFramesInFlight: rendererFramesInFlight.size,
+        rendererFailed: rendererFailure !== null,
+      };
     }
 
     function inspectSuperMonkeyBallGameState() {
@@ -8610,6 +8906,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     const source = document.querySelector("#runner-source").textContent;
     const debugSurface = document.querySelector(".shell").dataset.surface === "debug";
+    function runnerSearchForSurface(isDebugSurface, search) {
+      if (isDebugSurface) return search;
+      const scenario = new URLSearchParams(search).get("scenario");
+      return scenario === "smb-ready-play" ? "?scenario=smb-ready-play" : "";
+    }
     const defaultDiscSourceConfig = __HAS_DISC__
       ? {
           kind: "logical-range-endpoint",
@@ -8647,7 +8948,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       document.body.dataset.status = "loading";
       runnerStatus.textContent = "loading";
       const bootstrap = [
-        `globalThis.runnerSearch = ${JSON.stringify(debugSurface ? location.search : "")};`,
+        `globalThis.runnerSearch = ${JSON.stringify(
+          runnerSearchForSurface(debugSurface, location.search)
+        )};`,
+        `globalThis.runnerScenarioOptional = ${JSON.stringify(!debugSurface)};`,
         `globalThis.discSourceConfig = ${JSON.stringify(workerDiscConfig)};`,
         `globalThis.dolUrl = ${JSON.stringify(new URL("/boot.dol", location.href).href)};`,
         `globalThis.compilerWasmUrl = ${JSON.stringify(new URL("/ppcwasmjit.wasm", location.href).href)};`,

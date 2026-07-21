@@ -36,7 +36,8 @@ test("generated public artifact contains only the release surface", async () => 
     frontend,
     /id="(?:runner-controls|pause-runner|resume-runner|diagnostics|disc-url|load-disc-url|extend-cycles|extend-dispatches|extend-runner|runner-rest-ms|apply-throttle|runner-render-every|apply-presentation|snapshot-runner|stop-runner|result)"/,
   );
-  assert.match(frontend, /debugSurface \? location\.search : ""/);
+  assert.match(frontend, /runnerSearchForSurface\(debugSurface, location\.search\)/);
+  assert.match(frontend, /scenario === "smb-ready-play"/);
   assert.ok(frontend.includes(release.renderer.javascript.url));
   assert.ok(!frontend.includes("/browser_renderer.js"));
   assert.ok(rendererJavascript.includes(release.renderer.wasm.url));

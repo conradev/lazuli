@@ -117,6 +117,10 @@
       saved ||= !staged.ok;
 
       const url = new URL("/app.html", location.href);
+      const scenario = new URLSearchParams(location.search).get("scenario");
+      if (scenario === "smb-ready-play") {
+        url.searchParams.set("scenario", scenario);
+      }
       app.addEventListener("load", () => {
         status.hidden = true;
         app.hidden = false;
