@@ -100,9 +100,18 @@ function makeContext(functionNames, overrides = {}) {
     cpu: 0xf000,
     msrOffset: 0,
     cycles: 0,
+    controllerSequence: 0,
     controllerQueue: [],
+    controllerQueueCapacity: 64,
+    controllerQueueHighWater: 0,
+    controllerQueueCoalesces: 0,
+    controllerQueueOverflows: 0,
     controllerState: controllerState(),
     controllerAppliedSequence: 0,
+    runnerStopRequested: false,
+    runnerPaused: false,
+    runnerSnapshotRequested: false,
+    statusDataset: {},
     serialLastPolledButtons: 0,
     serialLastPolledSequence: 0,
     serialLastPollSignature: null,
@@ -171,7 +180,10 @@ function makeContext(functionNames, overrides = {}) {
   return context;
 }
 
-const packetFunctions = ["controllerPacketForPoll"];
+const packetFunctions = [
+  "controllerPacketForPoll",
+  "postControllerPollAcknowledgement",
+];
 const levelFunctions = [
   "recomputeSerialInterruptLevel",
   "serialNoResponseBit",
@@ -217,6 +229,33 @@ test("controller packets use PAD_USE_ORIGIN and exact mode packing", () => {
       `mode ${mode}`,
     );
   }
+});
+
+test("queued click edges survive until separate guest polls consume them", () => {
+  const context = makeContext(["enqueueControllerState", ...packetFunctions]);
+  context.enqueueControllerState({ sequence: 1, state: controllerState() });
+  context.enqueueControllerState({ sequence: 2, state: controllerState(0x0200) });
+  context.enqueueControllerState({ sequence: 3, state: controllerState() });
+
+  assert.equal(context.controllerQueueCoalesces, 1);
+  assert.equal(context.controllerQueueHighWater, 2);
+  assert.deepEqual(
+    Array.from(context.controllerQueue, queued => queued.state.buttons),
+    [0x0200, 0],
+  );
+
+  const pressed = context.controllerPacketForPoll();
+  assert.equal(((pressed[0] << 8) | pressed[1]) & ~context.padUseOrigin, 0x0200);
+  assert.equal(context.controllerAppliedSequence, 2);
+  assert.equal(context.controllerQueue.length, 1);
+
+  const released = context.controllerPacketForPoll();
+  assert.equal(((released[0] << 8) | released[1]) & ~context.padUseOrigin, 0);
+  assert.equal(context.controllerAppliedSequence, 3);
+  assert.equal(context.controllerQueue.length, 0);
+
+  const stable = context.controllerPacketForPoll();
+  assert.equal(((stable[0] << 8) | stable[1]) & ~context.padUseOrigin, 0);
 });
 
 test("RDSTINT is derived, W1C-reasserted, and PI-mask-correct", () => {
@@ -290,7 +329,10 @@ test("SISR selectively clears errors and dispatches WR to all OUT ports", () => 
 });
 
 test("periodic polling ignores EN and backpressures an unread RDST mailbox", () => {
-  const context = makeContext(periodicFunctions);
+  const pollMessages = [];
+  const context = makeContext(periodicFunctions, {
+    postMessage(message) { pollMessages.push(message); },
+  });
   const { bytes, view } = context;
   context.controllerQueue.push(
     { sequence: 1, state: controllerState(0x0100) },
@@ -309,6 +351,11 @@ test("periodic polling ignores EN and backpressures an unread RDST mailbox", () 
   assert.equal(context.serialLastRespondedChannels, 1);
   assert.equal(context.serialLastPublishedChannels, 1);
   assert.equal(context.serialLastUpdatedChannels, 4);
+  assert.deepEqual(JSON.parse(JSON.stringify(pollMessages)), [{
+    type: "controller-poll",
+    buttons: 0x0100,
+    sequence: 1,
+  }]);
   for (const offset of [0x6410, 0x641c, 0x6428]) {
     assert.equal(
       (view.getUint32(offset, false) & 0xc0000000) >>> 0,
@@ -320,12 +367,40 @@ test("periodic polling ignores EN and backpressures an unread RDST mailbox", () 
   assert.equal(context.controllerQueue.length, 1);
   assert.deepEqual(Array.from(bytes.slice(0x6404, 0x640c)), firstPacket);
   assert.equal(context.deviceEvents.get("serialPollBackpressured"), 1);
+  assert.equal(pollMessages.length, 1);
 
   view.setUint32(0x6438, view.getUint32(0x6438, false) & ~0x20000000, false);
   context.performSerialPoll(300, 300);
   assert.equal(context.controllerQueue.length, 0);
   assert.equal(context.controllerAppliedSequence, 2);
   assert.equal(context.serialLastPublishedChannels, 1);
+  assert.equal(pollMessages.length, 1);
+});
+
+test("direct 0x40 reads acknowledge the controller state they publish", () => {
+  const pollMessages = [];
+  const context = makeContext([
+    ...packetFunctions,
+    "processSerialCommand",
+  ], {
+    postMessage(message) { pollMessages.push(message); },
+  });
+  context.controllerQueue.push({ sequence: 7, state: controllerState(0x0100) });
+  context.view.setUint8(0x6480, 0x40);
+
+  assert.equal(
+    context.processSerialCommand(0),
+    context.serialTransferOutcome.success,
+  );
+  assert.equal(context.controllerAppliedSequence, 7);
+  assert.deepEqual(Array.from(context.bytes.slice(0x6480, 0x6488)), [
+    0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0,
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(pollMessages)), [{
+    type: "controller-poll",
+    buttons: 0x0100,
+    sequence: 7,
+  }]);
 });
 
 test("absent direct transfers mutate only COMCSR and the exact NOREP bit", () => {
