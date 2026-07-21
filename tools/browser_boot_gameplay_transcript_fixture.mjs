@@ -298,3 +298,17 @@ export function gameplayTranscript() {
         }),
   };
 }
+
+export function gameplayReportsForConsensus() {
+  return Array.from({ length: 3 }, (_unused, index) => {
+    const report = gameplayReport();
+    report.disc.source.name = `/host-${index}/Super Monkey Ball (USA).ciso`;
+    report.disc.source.cache.hits += index * 100;
+    report.controller.sequence += index * 10;
+    report.controller.queueCoalesces += index;
+    report.execution.scheduler.sliceMs += index;
+    report.headlessCapture.url = `http://localhost:${9000 + index}/?scenario=smb-ready-play`;
+    report.headlessCapture.runtime = `Fixture Browser/${index + 1}.0`;
+    return report;
+  });
+}

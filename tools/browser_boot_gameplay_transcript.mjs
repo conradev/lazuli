@@ -391,6 +391,26 @@ function validatePlan(plan) {
   return plan;
 }
 
+function projectWitness(raw, path, eventCycle, revision) {
+  requireObject(raw, path);
+  requireExact(raw.cycle, eventCycle, `${path}.cycle`);
+  const pad = requireObject(raw.pad, `${path}.pad`);
+  const witness = {
+    pad: {
+      held: requireInteger(pad.held, `${path}.pad.held`, 0, 0xffff),
+      pressed: requireInteger(pad.pressed, `${path}.pad.pressed`, 0, 0xffff),
+      released: requireInteger(pad.released, `${path}.pad.released`, 0, 0xffff),
+    },
+  };
+  for (const field of WITNESS_FIELDS.slice(1)) {
+    const minimum = SIGNED_SENTINEL_WITNESS_FIELDS.has(field) ? -1 : 0;
+    const maximum = field === "gameVersion" ? 0xff : 0xffff_ffff;
+    witness[field] = requireInteger(raw[field], `${path}.${field}`, minimum, maximum);
+  }
+  requireExact(witness.gameVersion, revision, `${path}.gameVersion`, "identity");
+  return witness;
+}
+
 function validateWitness(witness, path, revision, expected) {
   requireExactKeys(witness, WITNESS_FIELDS, path);
   const pad = requireExactKeys(
@@ -417,6 +437,122 @@ function validateWitness(witness, path, revision, expected) {
     }
   }
   return witness;
+}
+
+function projectPublication(raw, path) {
+  requireObject(raw, path);
+  return {
+    source: requireString(raw.source, `${path}.source`),
+    pollIndex: requireInteger(raw.pollIndex, `${path}.pollIndex`, 1),
+    scheduledCycle: requireInteger(raw.scheduledCycle, `${path}.scheduledCycle`),
+    observedCycle: requireInteger(raw.observedCycle, `${path}.observedCycle`),
+    buttons: requireInteger(raw.buttons, `${path}.buttons`, 0, 0xffff),
+    sequence: requireInteger(raw.sequence, `${path}.sequence`, 1),
+  };
+}
+
+function validateRawPhase(phase, path, expectedSequence, expectedButtons, plan) {
+  requireObject(phase, path);
+  requireExact(phase.sequence, expectedSequence, `${path}.sequence`);
+  requireExact(
+    phase.polls,
+    plan.input.publicationsPerPhase,
+    `${path}.polls`,
+  );
+  if (!Array.isArray(phase.publications)) {
+    fail("envelope", `${path}.publications`, "expected an array");
+  }
+  requireExact(
+    phase.publications.length,
+    plan.input.publicationsPerPhase,
+    `${path}.publications.length`,
+  );
+  const publications = phase.publications.map((publication, index) =>
+    projectPublication(publication, `${path}.publications[${index}]`));
+  for (const [index, publication] of publications.entries()) {
+    const publicationPath = `${path}.publications[${index}]`;
+    requireExact(publication.source, plan.input.source, `${publicationPath}.source`);
+    requireExact(publication.sequence, expectedSequence, `${publicationPath}.sequence`);
+    requireExact(publication.buttons, expectedButtons, `${publicationPath}.buttons`);
+  }
+  const first = publications[0];
+  const last = publications.at(-1);
+  for (const [field, expected] of [
+    ["firstPollIndex", first.pollIndex],
+    ["lastPollIndex", last.pollIndex],
+    ["firstScheduledCycle", first.scheduledCycle],
+    ["lastScheduledCycle", last.scheduledCycle],
+    ["firstObservedCycle", first.observedCycle],
+    ["lastObservedCycle", last.observedCycle],
+  ]) {
+    requireExact(phase[field], expected, `${path}.${field}`);
+  }
+  return {
+    sequence: expectedSequence,
+    publications,
+  };
+}
+
+function deriveInputStep(raw, expected, index, sequence, plan) {
+  const path = `$report.scenario.steps[${index}]`;
+  requireObject(raw, path);
+  requireExact(raw.id, expected.id, `${path}.id`, "identity");
+  requireExact(raw.type, "input", `${path}.type`, "identity");
+  requireExact(raw.button, expected.button, `${path}.button`, "identity");
+  const readyCycle = requireInteger(raw.readyCycle, `${path}.readyCycle`);
+  const readyPollIndex = requireInteger(raw.readyPollIndex, `${path}.readyPollIndex`);
+  const press = validateRawPhase(raw.press, `${path}.press`, sequence, expected.button, plan);
+  const release = validateRawPhase(raw.release, `${path}.release`, sequence + 1, 0, plan);
+  const guest = requireObject(raw.guest, `${path}.guest`);
+  return {
+    id: expected.id,
+    type: "input",
+    button: expected.button,
+    ready: {
+      cycle: readyCycle,
+      pollIndex: readyPollIndex,
+      witness: projectWitness(
+        raw.readyState,
+        `${path}.readyState`,
+        readyCycle,
+        plan.game.revision,
+      ),
+    },
+    press,
+    release,
+    guest: {
+      pressedCycle: requireInteger(guest.pressedCycle, `${path}.guest.pressedCycle`),
+      releasedCycle: requireInteger(guest.releasedCycle, `${path}.guest.releasedCycle`),
+      neutralCycle: requireInteger(guest.neutralCycle, `${path}.guest.neutralCycle`),
+    },
+    completed: {
+      cycle: requireInteger(raw.completedCycle, `${path}.completedCycle`),
+      pollIndex: requireInteger(raw.completedPollIndex, `${path}.completedPollIndex`),
+    },
+  };
+}
+
+function deriveObserveStep(raw, expected, index, plan) {
+  const path = `$report.scenario.steps[${index}]`;
+  requireObject(raw, path);
+  requireExact(raw.id, expected.id, `${path}.id`, "identity");
+  requireExact(raw.type, "observe", `${path}.type`, "identity");
+  const observedCycle = requireInteger(raw.observedCycle, `${path}.observedCycle`);
+  const observedPollIndex = requireInteger(raw.observedPollIndex, `${path}.observedPollIndex`);
+  return {
+    id: expected.id,
+    type: "observe",
+    observed: {
+      cycle: observedCycle,
+      pollIndex: observedPollIndex,
+      witness: projectWitness(
+        raw.state,
+        `${path}.state`,
+        observedCycle,
+        plan.game.revision,
+      ),
+    },
+  };
 }
 
 function validatePublication(
@@ -785,6 +921,189 @@ export function validateGameplayTranscript(transcript, plan) {
   return transcript;
 }
 
+export function deriveGameplayTranscript(report, plan) {
+  validatePlan(plan);
+  requireObject(report, "$report");
+  requireExact(report.status, "paused", "$report.status");
+  requireExact(report.stage, "scenario-complete", "$report.stage");
+  const reportCycles = requireInteger(report.cycles, "$report.cycles");
+
+  const disc = requireObject(report.disc, "$report.disc");
+  requireExact(disc.identifier, plan.game.identifier, "$report.disc.identifier", "identity");
+  requireExact(disc.revision, plan.game.revision, "$report.disc.revision", "identity");
+
+  const scenario = requireObject(report.scenario, "$report.scenario");
+  requireExact(scenario.id, plan.scenario.id, "$report.scenario.id", "identity");
+  requireExact(
+    scenario.gameIdentifier,
+    plan.game.identifier,
+    "$report.scenario.gameIdentifier",
+    "identity",
+  );
+  requireExact(scenario.status, "complete", "$report.scenario.status");
+  requireExact(
+    scenario.hardCycleLimit,
+    plan.scenario.hardCycleLimit,
+    "$report.scenario.hardCycleLimit",
+    "identity",
+  );
+  requireExact(
+    scenario.startCycle,
+    plan.scenario.startCycle,
+    "$report.scenario.startCycle",
+    "identity",
+  );
+  const completedCycle = requireInteger(
+    scenario.completedCycle,
+    "$report.scenario.completedCycle",
+  );
+  requireExact(reportCycles, completedCycle, "$report.cycles");
+  if (completedCycle >= scenario.hardCycleLimit) {
+    fail(
+      "ordering",
+      "$report.scenario.completedCycle",
+      `expected a value below ${scenario.hardCycleLimit}, got ${completedCycle}`,
+    );
+  }
+  requireExact(scenario.failure, null, "$report.scenario.failure");
+  requireExact(scenario.currentStep, null, "$report.scenario.currentStep");
+  if (!Array.isArray(scenario.steps)) {
+    fail("envelope", "$report.scenario.steps", "expected an array");
+  }
+  requireExact(scenario.steps.length, plan.steps.length, "$report.scenario.steps.length", "identity");
+  requireExact(scenario.stepIndex, scenario.steps.length, "$report.scenario.stepIndex");
+  const finalRawStep = scenario.steps.at(-1);
+  const lastStateDifference = firstDifference(
+    finalRawStep?.state,
+    scenario.lastState,
+    "$report.scenario.lastState",
+  );
+  if (lastStateDifference !== null) {
+    fail(
+      "provenance",
+      lastStateDifference.path,
+      `expected ${describe(lastStateDifference.expected)}, got ${describe(lastStateDifference.actual)}`,
+    );
+  }
+
+  const controller = requireObject(report.controller, "$report.controller");
+  const scenarioPoll = requireInteger(scenario.pollIndex, "$report.scenario.pollIndex");
+  const controllerPoll = requireInteger(controller.pollIndex, "$report.controller.pollIndex");
+  requireExact(controllerPoll, scenarioPoll, "$report.controller.pollIndex");
+
+  let sequence = 1;
+  const steps = plan.steps.map((expected, index) => {
+    if (expected.type === "observe") {
+      return deriveObserveStep(scenario.steps[index], expected, index, plan);
+    }
+    const step = deriveInputStep(scenario.steps[index], expected, index, sequence, plan);
+    sequence += 2;
+    return step;
+  });
+  const transcript = {
+    schema: GAMEPLAY_TRANSCRIPT_SCHEMA_V1,
+    game: {
+      identifier: plan.game.identifier,
+      revision: plan.game.revision,
+    },
+    scenario: {
+      id: plan.scenario.id,
+      status: "complete",
+      hardCycleLimit: plan.scenario.hardCycleLimit,
+      startCycle: plan.scenario.startCycle,
+      completedCycle,
+    },
+    controller: {
+      pollIndex: controllerPoll,
+      appliedSequence: requireInteger(
+        controller.appliedSequence,
+        "$report.controller.appliedSequence",
+      ),
+      lastPolledSequence: requireInteger(
+        controller.lastPolledSequence,
+        "$report.controller.lastPolledSequence",
+      ),
+      lastPolledButtons: requireInteger(
+        controller.lastPolledButtons,
+        "$report.controller.lastPolledButtons",
+        0,
+        0xffff,
+      ),
+      pendingButtons: requireInteger(
+        controller.pendingButtons,
+        "$report.controller.pendingButtons",
+        0,
+        0xffff,
+      ),
+      queuedStates: requireInteger(controller.queuedStates, "$report.controller.queuedStates"),
+      queueOverflows: requireInteger(
+        controller.queueOverflows,
+        "$report.controller.queueOverflows",
+      ),
+    },
+    steps,
+  };
+  validateGameplayTranscript(transcript, plan);
+  return transcript;
+}
+
+function firstDifference(expected, actual, path = "$") {
+  if (Object.is(expected, actual)) return null;
+  if (Array.isArray(expected) || Array.isArray(actual)) {
+    if (!Array.isArray(expected) || !Array.isArray(actual)) return { expected, actual, path };
+    if (expected.length !== actual.length) {
+      return { expected: expected.length, actual: actual.length, path: `${path}.length` };
+    }
+    for (let index = 0; index < expected.length; index += 1) {
+      const difference = firstDifference(
+        expected[index],
+        actual[index],
+        childPath(path, index),
+      );
+      if (difference !== null) return difference;
+    }
+    return null;
+  }
+  const expectedObject = expected !== null && typeof expected === "object";
+  const actualObject = actual !== null && typeof actual === "object";
+  if (!expectedObject || !actualObject) return { expected, actual, path };
+  const expectedKeys = Object.keys(expected).sort();
+  const actualKeys = Object.keys(actual).sort();
+  const keyDifference = firstDifference(expectedKeys, actualKeys, `${path}.[keys]`);
+  if (keyDifference !== null) return keyDifference;
+  for (const key of expectedKeys) {
+    const difference = firstDifference(
+      expected[key],
+      actual[key],
+      childPath(path, key),
+    );
+    if (difference !== null) return difference;
+  }
+  return null;
+}
+
+export function verifyGameplayTranscript(report, transcript, plan) {
+  validateGameplayTranscript(transcript, plan);
+  const derived = deriveGameplayTranscript(report, plan);
+  const difference = firstDifference(derived, transcript);
+  if (difference !== null) {
+    fail(
+      "transcript-mismatch",
+      difference.path,
+      `expected ${describe(difference.expected)}, got ${describe(difference.actual)}`,
+    );
+  }
+  return derived;
+}
+
+export function deriveSmbReadyPlayGameplayTranscript(report) {
+  return deriveGameplayTranscript(report, SMB_READY_PLAY_GAMEPLAY_PLAN);
+}
+
 export function validateSmbReadyPlayGameplayTranscript(transcript) {
   return validateGameplayTranscript(transcript, SMB_READY_PLAY_GAMEPLAY_PLAN);
+}
+
+export function verifySmbReadyPlayGameplayTranscript(report, transcript) {
+  return verifyGameplayTranscript(report, transcript, SMB_READY_PLAY_GAMEPLAY_PLAN);
 }
