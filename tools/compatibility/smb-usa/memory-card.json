@@ -1,5 +1,5 @@
 {
-  "schema": "lazuli-browser-boot-checkpoint-v1",
+  "schema": "lazuli-browser-boot-checkpoint-v2",
   "algorithm": "sha256",
   "fields": [
     "/status",
@@ -52,7 +52,30 @@
     "/mmioState/viInterruptModel/presentationCount",
     "/mmioState/viInterruptModel/lastPresentationCycle",
     "/mmioState/viInterruptModel/lastPresentationField",
-    "/mmioState/viInterruptModel/lastPresentationAddress"
+    "/mmioState/viInterruptModel/lastPresentationAddress",
+    "/mmioState/viInterruptModel/lastPresentationCopyIndex",
+    "/mmioState/viInterruptModel/lastPresentationCopyRow",
+    "/rendering/backend",
+    "/rendering/selectedXfb/address",
+    "/rendering/selectedXfb/generation",
+    "/rendering/selectedXfb/row",
+    "/rendering/selectedXfb/format",
+    "/rendering/selectedXfb/layout",
+    "/rendering/selectedXfb/sourceRow",
+    "/rendering/selectedXfb/width",
+    "/rendering/selectedXfb/height",
+    "/rendering/selectedXfb/textureWidth",
+    "/rendering/selectedXfb/textureHeight",
+    "/rendering/selectedXfb/logicalWidth",
+    "/rendering/selectedXfb/logicalHeight",
+    "/rendering/selectedXfb/displayWidth",
+    "/rendering/selectedXfb/displayHeight",
+    "/rendering/selectedXfb/rgbaByteLength",
+    "/rendering/selectedXfb/rgbaSha256",
+    "/rendering/selectedXfb/rgb/black",
+    "/rendering/selectedXfb/rgb/white",
+    "/rendering/selectedXfb/rgb/other",
+    "/rendering/selectedXfb/rgb/unique"
   ],
   "id": "smb-usa/no-input/cycles-1500000000/render-every-1",
   "game": {
@@ -82,7 +105,7 @@
     "renderEvery": 1,
     "renderer": "wgpu-webgpu"
   },
-  "sha256": "a2b8a34b7ae54b7b082dff62001aa12c9d48be0c04f507989ad33863c824b4eb",
+  "sha256": "26d7c2e52b6803ed431de91910846dd893cd40930acb215c6dd620c995f184c3",
   "state": {
     "status": "paused",
     "stage": "cycle-limit",
@@ -274,7 +297,36 @@
         "presentationCount": 185,
         "lastPresentationCycle": 1493528434,
         "lastPresentationField": "top",
-        "lastPresentationAddress": "0x00392c80"
+        "lastPresentationAddress": "0x00392c80",
+        "lastPresentationCopyIndex": 142,
+        "lastPresentationCopyRow": 0
+      }
+    },
+    "rendering": {
+      "backend": "wgpu-webgpu",
+      "selectedXfb": {
+        "address": "0x00392c80",
+        "generation": 142,
+        "row": 0,
+        "format": "rgba8unorm",
+        "layout": "top-left-row-major-tight",
+        "sourceRow": 0,
+        "width": 640,
+        "height": 448,
+        "textureWidth": 640,
+        "textureHeight": 448,
+        "logicalWidth": 640,
+        "logicalHeight": 448,
+        "displayWidth": 640,
+        "displayHeight": 448,
+        "rgbaByteLength": 1146880,
+        "rgbaSha256": "5fd0f5382bec2c974f7b6559b3c648a6db307d92eb37440d1f23dfa4be9d974e",
+        "rgb": {
+          "black": 278435,
+          "white": 2786,
+          "other": 5499,
+          "unique": 423
+        }
       }
     }
   },
