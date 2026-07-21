@@ -9044,7 +9044,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function captureSelectedXfb() {
       return appendRendererOperation(readSelectedXfb);
     }
-    function snapshotRendererPerformance() {
+    function snapshotRendererPerformance(hostMetrics = rendererHostMetrics) {
       const webgpu = webGpuRenderer.diagnostics();
       return {
         scope: "current-worker",
@@ -9062,8 +9062,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           renderPipelines: Number(webgpu.renderPipelinesCreated ?? 0),
           textures: Number(webgpu.texturesCreated ?? 0),
         },
-        operations: { ...rendererHostMetrics.operations },
-        workerMessages: { ...rendererHostMetrics.workerMessages },
+        operations: { ...hostMetrics.operations },
+        workerMessages: { ...hostMetrics.workerMessages },
         workload: {
           expandedVertexBytes: Number(webgpu.expandedVertexBytes ?? 0),
           gxFramePacketBytes: Number(webgpu.gxFramePacketBytes ?? 0),
@@ -9071,17 +9071,19 @@ const TEMPLATE: &str = r##"<!doctype html>
           textureUploadBytes: Number(webgpu.textureUploadBytes ?? 0),
           textureWrites: Number(webgpu.textureWrites ?? 0),
         },
-        wall: { ...rendererHostMetrics.wall },
+        wall: { ...hostMetrics.wall },
         webgpu,
       };
     }
     function captureRendererPerformance() {
       return appendRendererOperation(snapshotRendererPerformance);
     }
-    function captureRendererTerminal() {
-      const temporalFrames = temporalSelectedXfbFrames;
+    function captureRendererTerminal(
+      hostMetrics = rendererHostMetrics,
+      temporalFrames = temporalSelectedXfbFrames
+    ) {
       return appendRendererOperation(async () => {
-        const metrics = snapshotRendererPerformance();
+        const metrics = snapshotRendererPerformance(hostMetrics);
         const selectedXfb = await readSelectedXfb();
         const temporalSelectedXfb = {
           capacity: temporalSelectedXfbCapacity,
@@ -9124,6 +9126,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const discStatus = document.querySelector("#disc-status");
     let worker = null;
     let workerUrl = null;
+    let terminalPublicationSequence = 0;
 
     function resetPresentation() {
       output.textContent = "STARTING";
@@ -9637,6 +9640,50 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
       });
     }
+    function parseWorkerTerminalReport(text) {
+      if (typeof text !== "string" || text.trimStart().charCodeAt(0) !== 0x7b) return null;
+      try {
+        const report = JSON.parse(text);
+        return report !== null && typeof report === "object" && !Array.isArray(report)
+          ? report
+          : null;
+      } catch (_error) {
+        return null;
+      }
+    }
+    async function publishWorkerTerminalReport(text, sourceWorker = worker) {
+      if (worker !== sourceWorker) return false;
+      const publicationSequence = ++terminalPublicationSequence;
+      const isCurrentPublication = () => worker === sourceWorker
+        && terminalPublicationSequence === publicationSequence;
+      const report = parseWorkerTerminalReport(text);
+      if (report === null) {
+        handleWorkerError({
+          currentTarget: sourceWorker,
+          message: "worker terminal report is not valid JSON",
+        });
+        return false;
+      }
+      const hostMetrics = rendererHostMetrics;
+      const temporalFrames = temporalSelectedXfbFrames;
+      const backend = document.body.dataset.renderer ?? null;
+      hostMetrics.wall.workerStartToLastReportMs = Math.max(
+        0,
+        performance.now() - rendererWorkerStartedAt
+      );
+      output.textContent = "CAPTURING";
+      try {
+        const capture = await captureRendererTerminal(hostMetrics, temporalFrames);
+        if (!isCurrentPublication()) return false;
+        report.rendering = { ...capture, backend };
+        output.textContent = JSON.stringify(report, null, 2);
+        return true;
+      } catch (error) {
+        if (!isCurrentPublication()) return false;
+        handleRendererError(error, false);
+        return false;
+      }
+    }
     function handleWorkerMessage(event) {
       const sourceWorker = event.currentTarget ?? worker;
       if (sourceWorker !== worker) return;
@@ -9679,16 +9726,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
         });
       } else if (message?.type === "finish") {
-        rendererHostMetrics.wall.workerStartToLastReportMs = Math.max(
-          0,
-          performance.now() - rendererWorkerStartedAt
-        );
-        output.textContent = message.text;
+        return publishWorkerTerminalReport(message.text, sourceWorker);
       }
     }
     function handleWorkerError(event) {
       if (event.currentTarget !== undefined && event.currentTarget !== worker) return;
       const message = String(event.message || "unknown worker error");
+      const rendererError = String(event.rendererError ?? message);
+      terminalPublicationSequence += 1;
       document.body.dataset.status = "stopped";
       runnerStatus.textContent = "worker error";
       discStatus.textContent = message;
@@ -9696,6 +9741,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         status: "stopped",
         stage: "worker",
         error: message,
+        rendering: {
+          backend: document.body.dataset.renderer ?? null,
+          error: rendererError,
+        },
       }, null, 2);
     }
     function handleRendererError(error, notifyWorker = true) {
@@ -9705,6 +9754,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       handleWorkerError({
         message: `WebGPU renderer failed: ${detail}`,
+        rendererError: detail,
       });
     }
     addEventListener("beforeunload", () => {

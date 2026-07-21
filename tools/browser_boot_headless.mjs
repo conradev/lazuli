@@ -322,24 +322,39 @@ function parseReport(text) {
   }
 }
 
-async function captureRendering(session, state) {
-  const capture = await session.evaluate(`(async () => {
-    const diagnostics = globalThis.lazuliRendererDiagnostics;
-    if (typeof diagnostics?.captureTerminal !== "function") {
-      throw new Error("Lazuli renderer diagnostics are unavailable");
-    }
-    return await diagnostics.captureTerminal();
-  })()`);
-  return {
-    backend: state.dataset.renderer ?? null,
-    metrics: capture.metrics,
-    selectedXfb: capture.selectedXfb,
-    temporalSelectedXfb: capture.temporalSelectedXfb,
-  };
+function terminalReportFailure(report) {
+  const rootError = report?.error ?? null;
+  const rendererError = report?.rendering?.error ?? null;
+  if (report?.status !== "stopped" && rootError === null && rendererError === null) {
+    return null;
+  }
+  const detail = rootError ?? rendererError ?? `browser stopped at ${report?.stage ?? "unknown"}`;
+  const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  error.name = "BrowserTerminalReportError";
+  return error;
 }
 
-async function attachHeadlessCapture(session, state, report, details) {
-  report.rendering = await captureRendering(session, state);
+function verifyPageOwnedRendering(report, state) {
+  const rendering = report?.rendering;
+  const datasetBackend = state.dataset.renderer ?? null;
+  const terminalFailure = terminalReportFailure(report);
+  if (
+    rendering === null
+    || typeof rendering !== "object"
+    || Array.isArray(rendering)
+    || rendering.backend !== datasetBackend
+    || (terminalFailure === null
+      && (datasetBackend !== "wgpu-webgpu" || rendering.backend !== "wgpu-webgpu"))
+  ) {
+    throw new Error(`page-owned renderer evidence is invalid: ${JSON.stringify({
+      datasetBackend,
+      rendering: rendering ?? null,
+    })}`);
+  }
+}
+
+function attachHeadlessCapture(session, state, report, details) {
+  verifyPageOwnedRendering(report, state);
   report.headlessCapture = {
     dataset: state.dataset,
     devtoolsExceptions: session.exceptions,
@@ -347,6 +362,13 @@ async function attachHeadlessCapture(session, state, report, details) {
     url: state.url,
     ...details,
   };
+}
+
+async function persistTerminalReportFailure(output, report) {
+  const failure = terminalReportFailure(report);
+  if (failure === null) return false;
+  await persist(output, report);
+  throw failure;
 }
 
 function verifyExpectedCheckpoint(report, options, manifest) {
@@ -424,19 +446,20 @@ async function main() {
       }
       const report = parseReport(state.result);
       if (report !== null) {
+        const reportDetectedAt = Date.now();
+        attachHeadlessCapture(session, state, report, {
+          performance: {
+            headlessRunToReportMs: reportDetectedAt - runStartedAt,
+          },
+          reuse: reuseCapture,
+        });
+        await persistTerminalReportFailure(options.output, report);
         let scenarioError = null;
         try {
           verifyScenarioReport(report, options);
         } catch (error) {
           scenarioError = error;
         }
-        const reportDetectedAt = Date.now();
-        await attachHeadlessCapture(session, state, report, {
-          performance: {
-            headlessRunToReportMs: reportDetectedAt - runStartedAt,
-          },
-          reuse: reuseCapture,
-        });
         if (scenarioError === null) {
           verifyExpectedCheckpoint(report, options, expectedManifest);
         }
@@ -457,13 +480,14 @@ async function main() {
         const report = parseReport(state.result);
         if (report !== null) {
           const reportDetectedAt = Date.now();
-          await attachHeadlessCapture(session, state, report, {
+          attachHeadlessCapture(session, state, report, {
             performance: {
               headlessRunToReportMs: reportDetectedAt - runStartedAt,
             },
             reuse: reuseCapture,
             timedOut: true,
           });
+          await persistTerminalReportFailure(options.output, report);
           verifyExpectedCheckpoint(report, options, expectedManifest);
           await persist(options.output, report);
           process.exitCode = 124;

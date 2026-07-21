@@ -87,6 +87,68 @@ function rendererOperationMetrics() {
   };
 }
 
+function terminalPublicationHarness() {
+  const captures = [];
+  const rendererNotifications = [];
+  const oldWorker = {
+    postMessage(message) { rendererNotifications.push(message); },
+  };
+  const oldHostMetrics = {
+    operations: { enqueued: 7, pending: 0, highWater: 1 },
+    wall: { workerStartToLastReportMs: null },
+    workerMessages: { gxFrames: 3, drawCalls: 5, receivedArrayBufferBytes: 128 },
+  };
+  const oldTemporalFrames = [{ ordinal: 1 }];
+  const context = {
+    Array,
+    JSON,
+    Math,
+    Promise,
+    document: { body: { dataset: { renderer: "wgpu-webgpu" } } },
+    discStatus: { textContent: "ready" },
+    output: { textContent: "RUNNING" },
+    performance: { now: () => 175 },
+    rendererHostMetrics: oldHostMetrics,
+    rendererWorkerStartedAt: 100,
+    runnerStatus: { textContent: "running" },
+    terminalPublicationSequence: 0,
+    temporalSelectedXfbFrames: oldTemporalFrames,
+    worker: oldWorker,
+    captureRendererTerminal(hostMetrics, temporalFrames) {
+      let resolve;
+      let reject;
+      const pending = new Promise((resolvePending, rejectPending) => {
+        resolve = resolvePending;
+        reject = rejectPending;
+      });
+      captures.push({ hostMetrics, temporalFrames, pending, reject, resolve });
+      return pending;
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "parseWorkerTerminalReport",
+      "publishWorkerTerminalReport",
+      "handleWorkerMessage",
+      "handleWorkerError",
+      "handleRendererError",
+    ]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+    { filename: "browser_boot.renderer-sync.terminal-publication.js" },
+  );
+  return {
+    captures,
+    context,
+    oldHostMetrics,
+    oldTemporalFrames,
+    oldWorker,
+    rendererNotifications,
+  };
+}
+
 test("packed renderer copies transfer one exact frame without dropping work", () => {
   const { context, messages, transfers } = workerHarness();
   const packet = new ArrayBuffer(128);
@@ -240,6 +302,174 @@ test("renderer failure replaces a pending terminal report", async () => {
   assert.equal(reports.length, 1);
   assert.equal(reports[0].details.stage, "renderer");
   assert.equal(reports[0].details.error, "uncaptured WebGPU validation error");
+});
+
+test("the page publishes a terminal report only after one bound renderer capture", async () => {
+  const harness = terminalPublicationHarness();
+  const pending = harness.context.handleWorkerMessage({
+    currentTarget: harness.oldWorker,
+    data: {
+      type: "finish",
+      text: JSON.stringify({
+        stage: "scenario-complete",
+        status: "paused",
+      }),
+    },
+  });
+
+  assert.equal(harness.context.output.textContent, "CAPTURING");
+  assert.equal(harness.captures.length, 1);
+  assert.strictEqual(harness.captures[0].hostMetrics, harness.oldHostMetrics);
+  assert.strictEqual(harness.captures[0].temporalFrames, harness.oldTemporalFrames);
+  assert.equal(harness.oldHostMetrics.wall.workerStartToLastReportMs, 75);
+
+  harness.captures[0].resolve({
+    backend: "forged-backend",
+    metrics: { scope: "current-worker" },
+    selectedXfb: null,
+    temporalSelectedXfb: { capacity: 8, frames: [] },
+  });
+  assert.equal(await pending, true);
+  assert.deepEqual(JSON.parse(harness.context.output.textContent), {
+    stage: "scenario-complete",
+    status: "paused",
+    rendering: {
+      backend: "wgpu-webgpu",
+      metrics: { scope: "current-worker" },
+      selectedXfb: null,
+      temporalSelectedXfb: { capacity: 8, frames: [] },
+    },
+  });
+  assert.deepEqual(harness.rendererNotifications, []);
+});
+
+test("an old terminal capture cannot publish success or failure into a new run", async () => {
+  for (const outcome of ["success", "failure"]) {
+    const harness = terminalPublicationHarness();
+    const pending = harness.context.handleWorkerMessage({
+      currentTarget: harness.oldWorker,
+      data: {
+        type: "finish",
+        text: JSON.stringify({ status: "paused" }),
+      },
+    });
+    assert.equal(harness.context.output.textContent, "CAPTURING");
+    assert.equal(harness.captures.length, 1);
+
+    harness.context.worker = {};
+    harness.context.rendererHostMetrics = { wall: { workerStartToLastReportMs: null } };
+    harness.context.temporalSelectedXfbFrames = [];
+    harness.context.output.textContent = "STARTING NEW RUN";
+    if (outcome === "success") {
+      harness.captures[0].resolve({
+        metrics: {},
+        selectedXfb: null,
+        temporalSelectedXfb: {},
+      });
+    } else {
+      harness.captures[0].reject(new Error("old readback failed"));
+    }
+
+    assert.equal(await pending, false);
+    assert.equal(harness.context.output.textContent, "STARTING NEW RUN");
+    assert.deepEqual(harness.rendererNotifications, []);
+  }
+});
+
+test("a superseded same-worker terminal capture cannot publish success or failure", async () => {
+  for (const outcome of ["success", "failure"]) {
+    const harness = terminalPublicationHarness();
+    const first = harness.context.handleWorkerMessage({
+      currentTarget: harness.oldWorker,
+      data: {
+        type: "finish",
+        text: JSON.stringify({ report: "first", status: "paused" }),
+      },
+    });
+    const second = harness.context.handleWorkerMessage({
+      currentTarget: harness.oldWorker,
+      data: {
+        type: "finish",
+        text: JSON.stringify({ report: "second", status: "paused" }),
+      },
+    });
+    assert.equal(harness.context.output.textContent, "CAPTURING");
+    assert.equal(harness.captures.length, 2);
+
+    if (outcome === "success") {
+      harness.captures[0].resolve({
+        metrics: { report: "first" },
+        selectedXfb: null,
+        temporalSelectedXfb: {},
+      });
+    } else {
+      harness.captures[0].reject(new Error("superseded readback failed"));
+    }
+    assert.equal(await first, false);
+    assert.equal(harness.context.output.textContent, "CAPTURING");
+    assert.deepEqual(harness.rendererNotifications, []);
+
+    harness.captures[1].resolve({
+      metrics: { report: "second" },
+      selectedXfb: null,
+      temporalSelectedXfb: {},
+    });
+    assert.equal(await second, true);
+    assert.equal(JSON.parse(harness.context.output.textContent).report, "second");
+  }
+});
+
+test("worker and renderer-capture failures retain page-owned error envelopes", async () => {
+  const workerFailure = terminalPublicationHarness();
+  const interruptedCapture = workerFailure.context.handleWorkerMessage({
+    currentTarget: workerFailure.oldWorker,
+    data: {
+      type: "finish",
+      text: JSON.stringify({ stage: "snapshot", status: "running" }),
+    },
+  });
+  workerFailure.context.handleWorkerError({
+    currentTarget: workerFailure.oldWorker,
+    message: "guest worker crashed",
+  });
+  const workerErrorEnvelope = workerFailure.context.output.textContent;
+  assert.deepEqual(JSON.parse(workerErrorEnvelope), {
+    status: "stopped",
+    stage: "worker",
+    error: "guest worker crashed",
+    rendering: {
+      backend: "wgpu-webgpu",
+      error: "guest worker crashed",
+    },
+  });
+  workerFailure.captures[0].resolve({
+    metrics: {},
+    selectedXfb: null,
+    temporalSelectedXfb: {},
+  });
+  assert.equal(await interruptedCapture, false);
+  assert.equal(workerFailure.context.output.textContent, workerErrorEnvelope);
+
+  const rendererFailure = terminalPublicationHarness();
+  const pending = rendererFailure.context.handleWorkerMessage({
+    currentTarget: rendererFailure.oldWorker,
+    data: {
+      type: "finish",
+      text: JSON.stringify({ stage: "scenario-complete", status: "paused" }),
+    },
+  });
+  rendererFailure.captures[0].reject(new Error("readback device lost"));
+  assert.equal(await pending, false);
+  assert.deepEqual(JSON.parse(rendererFailure.context.output.textContent), {
+    status: "stopped",
+    stage: "worker",
+    error: "WebGPU renderer failed: readback device lost",
+    rendering: {
+      backend: "wgpu-webgpu",
+      error: "readback device lost",
+    },
+  });
+  assert.deepEqual(rendererFailure.rendererNotifications, []);
 });
 
 test("main thread acknowledges a frame only after the WebGPU drain resolves", async () => {

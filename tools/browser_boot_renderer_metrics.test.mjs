@@ -216,6 +216,8 @@ test("renderer performance waits for queued work without accounting itself", asy
 
 test("terminal capture snapshots metrics before its serialized XFB readback", async () => {
   const calls = [];
+  const originalHostMetrics = { id: "original" };
+  const replacementHostMetrics = { id: "replacement" };
   const originalTemporalFrames = [];
   const replacementTemporalFrames = [{
     ordinal: 1,
@@ -227,13 +229,13 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
   context = {
     Promise,
     rendererOperationTail: new Promise(resolve => { release = resolve; }),
-    snapshotRendererPerformance() {
-      calls.push("metrics");
+    rendererHostMetrics: originalHostMetrics,
+    snapshotRendererPerformance(hostMetrics) {
+      calls.push(`metrics:${hostMetrics.id}`);
       return { calls: 17 };
     },
     async readSelectedXfb() {
       calls.push("read");
-      context.temporalSelectedXfbFrames = replacementTemporalFrames;
       return { rgbaSha256: "abc" };
     },
     summarizeTemporalSelectedXfb(frames) {
@@ -252,6 +254,8 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
   );
 
   const pending = context.captureRendererTerminal();
+  context.rendererHostMetrics = replacementHostMetrics;
+  context.temporalSelectedXfbFrames = replacementTemporalFrames;
   await Promise.resolve();
   assert.deepEqual(calls, []);
   release();
@@ -264,13 +268,15 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
       oracle: { captured: 0, capacity: 8 },
     },
   });
-  assert.deepEqual(calls, ["metrics", "read", "temporal"]);
+  assert.deepEqual(calls, ["metrics:original", "read", "temporal"]);
 });
 
-test("headless capture uses one awaited terminal diagnostic", () => {
-  assert.match(headlessSource, /return await diagnostics\.captureTerminal\(\);/);
-  assert.doesNotMatch(headlessSource, /diagnostics\.capturePerformance\(\)/);
-  assert.doesNotMatch(headlessSource, /diagnostics\.captureSelectedXfb\(\)/);
+test("headless capture consumes page-owned rendering without renderer calls", () => {
+  assert.doesNotMatch(headlessSource, /lazuliRendererDiagnostics/);
+  assert.doesNotMatch(headlessSource, /captureTerminal\(/);
+  assert.doesNotMatch(headlessSource, /capturePerformance\(/);
+  assert.doesNotMatch(headlessSource, /captureSelectedXfb\(/);
+  assert.match(headlessSource, /verifyPageOwnedRendering\(report, state\);/);
 });
 
 test("WebGPU diagnostic readback is excluded from workload counters", () => {

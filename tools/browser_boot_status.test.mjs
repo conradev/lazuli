@@ -29,11 +29,19 @@ function extractFunction(name) {
 }
 
 function createHarness() {
-  const document = { body: { dataset: { status: "running" } } };
+  const document = {
+    body: { dataset: { renderer: "wgpu-webgpu", status: "running" } },
+  };
   const discStatus = { textContent: "ready" };
   const output = { textContent: "RUNNING" };
   const runnerStatus = { textContent: "running" };
-  const context = { document, discStatus, output, runnerStatus };
+  const context = {
+    document,
+    discStatus,
+    output,
+    runnerStatus,
+    terminalPublicationSequence: 0,
+  };
   vm.createContext(context);
   vm.runInContext(extractFunction("handleWorkerError"), context, {
     filename: "browser_boot.status.js",
@@ -53,7 +61,12 @@ test("worker errors remain visible when release diagnostics are stripped", () =>
     status: "stopped",
     stage: "worker",
     error: "disc read failed",
+    rendering: {
+      backend: "wgpu-webgpu",
+      error: "disc read failed",
+    },
   });
+  assert.equal(context.terminalPublicationSequence, 1);
 });
 
 test("worker errors have a visible message when the browser omits one", () => {

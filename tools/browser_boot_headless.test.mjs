@@ -11,8 +11,11 @@ const source = readFileSync(
 );
 
 function extractFunction(name) {
-  const start = source.indexOf(`function ${name}(`);
-  assert.notEqual(start, -1, `missing ${name}`);
+  const functionStart = source.indexOf(`function ${name}(`);
+  assert.notEqual(functionStart, -1, `missing ${name}`);
+  const start = source.slice(functionStart - 6, functionStart) === "async "
+    ? functionStart - 6
+    : functionStart;
   const bodyStart = source.indexOf("{", start);
   let depth = 0;
   for (let index = bodyStart; index < source.length; index += 1) {
@@ -36,21 +39,157 @@ test("headless capture exposes --expect and verifies before persistence", () => 
     /verifyExpectedCheckpoint\(report, options, expectedManifest\);\s*await persist/,
   );
   assert.equal(
-    source.match(/await attachHeadlessCapture\(session, state, report,/g)?.length,
+    source.match(/^\s+attachHeadlessCapture\(session, state, report,/gm)?.length,
     2,
   );
   assert.match(
     source,
-    /report\.rendering = await captureRendering\(session, state\);[\s\S]*?report\.headlessCapture =/,
+    /verifyPageOwnedRendering\(report, state\);\s*report\.headlessCapture =/,
   );
-  assert.match(
-    source,
-    /typeof diagnostics\?\.captureTerminal !== "function"[\s\S]*?return await diagnostics\.captureTerminal\(\);/,
-  );
-  assert.match(source, /temporalSelectedXfb: capture\.temporalSelectedXfb/);
+  assert.doesNotMatch(source, /lazuliRendererDiagnostics/);
+  assert.doesNotMatch(source, /captureRendering/);
   assert.equal(
     source.match(/headlessRunToReportMs: reportDetectedAt - runStartedAt/g)?.length,
     2,
+  );
+});
+
+test("headless capture cross-checks the page-owned renderer evidence", () => {
+  const context = vm.createContext({ Array, Error, JSON });
+  vm.runInContext([
+    extractFunction("terminalReportFailure"),
+    extractFunction("verifyPageOwnedRendering"),
+    extractFunction("attachHeadlessCapture"),
+  ].join("\n\n"), context);
+  const state = {
+    dataset: { renderer: "wgpu-webgpu" },
+    title: "Lazuli debug harness",
+    url: "http://127.0.0.1:8766/",
+  };
+  const rendering = {
+    backend: "wgpu-webgpu",
+    metrics: { scope: "current-worker" },
+    selectedXfb: null,
+    temporalSelectedXfb: { capacity: 8, frames: [] },
+  };
+  const report = {
+    rendering,
+  };
+  assert.doesNotThrow(() => context.verifyPageOwnedRendering(report, state));
+  context.attachHeadlessCapture({ exceptions: [] }, state, report, { reuse: null });
+  assert.strictEqual(report.rendering, rendering);
+  assert.throws(
+    () => context.verifyPageOwnedRendering({
+      rendering: { ...report.rendering, backend: "unavailable" },
+    }, state),
+    /page-owned renderer evidence is invalid/,
+  );
+  assert.throws(
+    () => context.verifyPageOwnedRendering({ rendering: null }, state),
+    /page-owned renderer evidence is invalid/,
+  );
+  for (const backend of [null, "unavailable"]) {
+    const backendState = {
+      ...state,
+      dataset: backend === null ? {} : { renderer: backend },
+    };
+    assert.throws(
+      () => context.verifyPageOwnedRendering({
+        rendering: { backend },
+      }, backendState),
+      /page-owned renderer evidence is invalid/,
+    );
+  }
+
+  const workerFailure = {
+    status: "stopped",
+    stage: "worker",
+    error: "disc read failed",
+    rendering: { backend: null, error: "secondary renderer detail" },
+  };
+  const unavailableState = { ...state, dataset: {} };
+  assert.doesNotThrow(() => context.verifyPageOwnedRendering(workerFailure, unavailableState));
+  context.attachHeadlessCapture(
+    { exceptions: [] },
+    unavailableState,
+    workerFailure,
+    { reuse: null },
+  );
+  assert.equal(context.terminalReportFailure(workerFailure).message, "disc read failed");
+  assert.equal("metrics" in workerFailure.rendering, false);
+  assert.equal("temporalSelectedXfb" in workerFailure.rendering, false);
+
+  const rendererFailure = {
+    status: "paused",
+    rendering: { backend: "unavailable", error: "device lost" },
+  };
+  const rendererFailureState = { ...state, dataset: { renderer: "unavailable" } };
+  assert.doesNotThrow(() => context.verifyPageOwnedRendering(
+    rendererFailure,
+    rendererFailureState,
+  ));
+  assert.equal(context.terminalReportFailure(rendererFailure).message, "device lost");
+
+  assert.equal(context.terminalReportFailure({
+    status: "stopped",
+    stage: "worker",
+    rendering: { backend: null },
+  }).message, "browser stopped at worker");
+  assert.equal(context.terminalReportFailure({
+    status: "paused",
+    error: "top-level failure",
+    rendering: { backend: "wgpu-webgpu" },
+  }).message, "top-level failure");
+});
+
+test("terminal worker and renderer failures persist before becoming nonzero", async () => {
+  const persisted = [];
+  const context = vm.createContext({
+    Error,
+    JSON,
+    async persist(output, report) {
+      persisted.push({ output, report });
+    },
+  });
+  vm.runInContext([
+    extractFunction("terminalReportFailure"),
+    extractFunction("persistTerminalReportFailure"),
+  ].join("\n\n"), context);
+  const failures = [
+    {
+      status: "stopped",
+      stage: "worker",
+      error: "guest worker crashed",
+      rendering: { backend: null, error: "secondary detail" },
+      expected: "guest worker crashed",
+    },
+    {
+      status: "paused",
+      stage: "scenario-complete",
+      rendering: { backend: "wgpu-webgpu", error: "readback device lost" },
+      expected: "readback device lost",
+    },
+  ];
+  for (const failure of failures) {
+    const { expected, ...report } = failure;
+    await assert.rejects(
+      context.persistTerminalReportFailure("capture.json", report),
+      error => error.name === "BrowserTerminalReportError" && error.message === expected,
+    );
+    assert.strictEqual(persisted.at(-1).report, report);
+  }
+  assert.equal(persisted.length, 2);
+  assert.equal(
+    source.match(/await persistTerminalReportFailure\(options\.output, report\)/g)?.length,
+    2,
+  );
+  const terminalCheck = source.indexOf(
+    "await persistTerminalReportFailure(options.output, report)",
+  );
+  assert.ok(terminalCheck < source.indexOf("verifyScenarioReport(report, options)", terminalCheck));
+  assert.match(
+    source,
+    /main\(\)\.catch\(error => \{[\s\S]*process\.exitCode = 1;/,
   );
 });
 
