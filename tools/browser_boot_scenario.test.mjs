@@ -28,15 +28,22 @@ function extractFunction(name) {
 }
 
 const scenarioFunctions = [
+  "normalizeControllerState",
+  "controllerStatesEqual",
+  "matchControllerScenarioInputRequest",
+  "enqueueControllerState",
   "controllerScenarioInteger",
   "registerControllerScenario",
   "createControllerScenario",
   "selectControllerScenario",
   "controllerScenarioCycleLimit",
   "failControllerScenario",
+  "createControllerScenarioStateRecord",
+  "requestControllerScenarioState",
   "observeControllerScenarioPulse",
   "serviceControllerScenario",
   "recordControllerScenarioPoll",
+  "recordControllerScenarioStatePoll",
   "pollControllerScenario",
   "snapshotControllerScenario",
 ];
@@ -54,6 +61,12 @@ function scenarioHarness(overrides = {}) {
     controllerAppliedSequence: 0,
     controllerPollIndex: 0,
     controllerQueue: [],
+    controllerQueueCapacity: 64,
+    controllerQueueCoalesces: 0,
+    controllerQueueHighWater: 0,
+    controllerQueueOverflows: 0,
+    controllerScenarioInputExclusive: false,
+    controllerSequence: 0,
     controllerScenario: null,
     controllerScenarioDefinitions: new Map(),
     controllerState: {
@@ -71,6 +84,10 @@ function scenarioHarness(overrides = {}) {
     serialControllerModes: [3, 3, 3, 3],
     serialLastPolledButtons: 0,
     serialLastPolledSequence: 0,
+    runnerPaused: false,
+    runnerSnapshotRequested: false,
+    runnerStopRequested: false,
+    statusDataset: {},
     ...overrides,
   };
   vm.createContext(context);
@@ -103,6 +120,21 @@ function definition(sample, overrides = {}) {
         ready: value => value.phase === "play",
       },
     ],
+    ...overrides,
+  };
+}
+
+function fullControllerState(overrides = {}) {
+  return {
+    buttons: 0,
+    stickX: 0x80,
+    stickY: 0x80,
+    cStickX: 0x80,
+    cStickY: 0x80,
+    triggerL: 0,
+    triggerR: 0,
+    analogA: 0,
+    analogB: 0,
     ...overrides,
   };
 }
@@ -319,6 +351,214 @@ test("controller scenarios own neutral input between scripted pulses", () => {
   assert.equal(context.controllerAppliedSequence, 0);
 });
 
+test("page-owned full-state phases request, echo, and publish active then neutral", () => {
+  const sample = {
+    phase: "prompt",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const messages = [];
+  const context = scenarioHarness({
+    postMessage(message) { messages.push(message); },
+  });
+  const active = fullControllerState({ stickX: 0x40, stickY: 0xc0 });
+  const neutral = fullControllerState();
+  const scenario = context.createControllerScenario(definition(sample, {
+    steps: [
+      {
+        id: "steer",
+        input: { owner: "page", active, neutral },
+        ready: value => value.phase === "prompt",
+      },
+      {
+        id: "play",
+        button: null,
+        ready: value => value.phase === "play",
+      },
+    ],
+  }));
+  context.controllerScenario = scenario;
+  context.controllerScenarioInputExclusive = true;
+
+  assert.equal(context.serviceControllerScenario(scenario, 10), "running");
+  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
+    type: "controller-scenario-input",
+    scenario: "test-path",
+    step: "steer",
+    phase: "active",
+    requestSequence: 1,
+    state: active,
+  }]);
+
+  context.enqueueControllerState({ sequence: 1, state: neutral });
+  assert.equal(context.controllerSequence, 0, "unowned page input stays excluded");
+  context.cycles = 11;
+  context.enqueueControllerState({
+    type: "controller",
+    sequence: 10,
+    state: active,
+    scenarioInput: {
+      scenario: "test-path",
+      step: "steer",
+      phase: "active",
+      requestSequence: 1,
+    },
+  });
+
+  for (let poll = 1; poll <= 3; poll += 1) {
+    const packet = context.controllerPacketForPoll(
+      0,
+      1_000 + poll,
+      2_000 + poll,
+      "periodic",
+    );
+    assert.deepEqual(
+      Array.from(packet),
+      [0x00, 0x80, 0x40, 0xc0, 0x80, 0x80, 0, 0],
+    );
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify(messages.at(-1))), {
+    type: "controller-scenario-input",
+    scenario: "test-path",
+    step: "steer",
+    phase: "neutral",
+    requestSequence: 2,
+    state: neutral,
+  });
+
+  context.cycles = 15;
+  context.enqueueControllerState({
+    type: "controller",
+    sequence: 11,
+    state: neutral,
+    scenarioInput: {
+      scenario: "test-path",
+      step: "steer",
+      phase: "neutral",
+      requestSequence: 2,
+    },
+  });
+  for (let poll = 4; poll <= 6; poll += 1) {
+    const packet = context.controllerPacketForPoll(
+      0,
+      1_000 + poll,
+      2_000 + poll,
+      "periodic",
+    );
+    assert.deepEqual(
+      Array.from(packet),
+      [0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0],
+    );
+  }
+  assert.equal(context.serviceControllerScenario(scenario, 20), "running");
+  assert.equal(scenario.stepIndex, 1);
+  sample.phase = "play";
+  assert.equal(context.serviceControllerScenario(scenario, 21), "complete");
+
+  const snapshot = JSON.parse(JSON.stringify(context.snapshotControllerScenario(scenario)));
+  assert.deepEqual(snapshot.steps[0], {
+    id: "steer",
+    type: "state-input",
+    owner: "page",
+    readyCycle: 10,
+    readyPollIndex: 0,
+    readyState: { phase: "prompt" },
+    active: {
+      requestSequence: 1,
+      state: active,
+      requestedCycle: 10,
+      requestedPollIndex: 0,
+      receivedCycle: 11,
+      sequence: 10,
+      polls: 3,
+      publications: [1, 2, 3].map(pollIndex => ({
+        source: "periodic",
+        pollIndex,
+        scheduledCycle: 1_000 + pollIndex,
+        observedCycle: 2_000 + pollIndex,
+        state: active,
+        sequence: 10,
+      })),
+      firstPollIndex: 1,
+      lastPollIndex: 3,
+      firstScheduledCycle: 1_001,
+      lastScheduledCycle: 1_003,
+      firstObservedCycle: 2_001,
+      lastObservedCycle: 2_003,
+    },
+    neutral: {
+      requestSequence: 2,
+      state: neutral,
+      requestedCycle: 2_003,
+      requestedPollIndex: 3,
+      receivedCycle: 15,
+      sequence: 11,
+      polls: 3,
+      publications: [4, 5, 6].map(pollIndex => ({
+        source: "periodic",
+        pollIndex,
+        scheduledCycle: 1_000 + pollIndex,
+        observedCycle: 2_000 + pollIndex,
+        state: neutral,
+        sequence: 11,
+      })),
+      firstPollIndex: 4,
+      lastPollIndex: 6,
+      firstScheduledCycle: 1_004,
+      lastScheduledCycle: 1_006,
+      firstObservedCycle: 2_004,
+      lastObservedCycle: 2_006,
+    },
+    completedCycle: 20,
+    completedPollIndex: 6,
+  });
+});
+
+test("page-owned state steps reject torn definitions and echoed states", () => {
+  const sample = {
+    phase: "prompt",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const active = fullControllerState({ stickX: 0x40 });
+  const neutral = fullControllerState();
+  const context = scenarioHarness({ postMessage() {} });
+  assert.throws(
+    () => context.registerControllerScenario(definition(sample, {
+      steps: [{
+        id: "same",
+        input: { owner: "page", active: neutral, neutral },
+        ready: () => true,
+      }],
+    })),
+    /active and neutral states must differ/,
+  );
+
+  const scenario = context.createControllerScenario(definition(sample, {
+    steps: [{
+      id: "steer",
+      input: { owner: "page", active, neutral },
+      ready: () => true,
+    }],
+  }));
+  context.controllerScenario = scenario;
+  context.controllerScenarioInputExclusive = true;
+  context.serviceControllerScenario(scenario, 1);
+  assert.throws(
+    () => context.enqueueControllerState({
+      sequence: 1,
+      state: { ...active, stickY: 0x40 },
+      scenarioInput: {
+        scenario: "test-path",
+        step: "steer",
+        phase: "active",
+        requestSequence: 1,
+      },
+    }),
+    /state does not match its request/,
+  );
+  assert.equal(context.controllerQueue.length, 0);
+  assert.equal(scenario.steps[0].active.sequence, null);
+});
+
 test("controller scenario selection validates ids, games, and observation steps", () => {
   const sample = { phase: "play", pad: { held: 0, pressed: 0, released: 0 } };
   const context = scenarioHarness();
@@ -527,7 +767,10 @@ test("browser worker routes successful SI publications through the scenario engi
   );
   assert.match(source, /scenario: snapshotControllerScenario\(controllerScenario\)/);
   assert.match(source, /stage: failed \? "scenario-failed" : "scenario-complete"/);
-  assert.match(source, /if \(controllerScenarioInputExclusive\) return;/);
+  assert.match(
+    source,
+    /controllerScenarioInputExclusive[\s\S]*?matchControllerScenarioInputRequest\(controllerScenario, message\)/,
+  );
   assert.match(source, /const scenarioOwnsInput = scenarioButtons !== null;/);
   assert.match(source, /scenarioOwnsInput \? 0x80 : controllerState\.stickX/);
   assert.match(source, /entry\.release\.polls === 0/);

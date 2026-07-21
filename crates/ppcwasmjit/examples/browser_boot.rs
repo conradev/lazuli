@@ -1020,16 +1020,59 @@ const TEMPLATE: &str = r##"<!doctype html>
         && left.analogA === right.analogA
         && left.analogB === right.analogB;
     }
+    function matchControllerScenarioInputRequest(scenario, message) {
+      const pulse = scenario?.pulse;
+      if (
+        scenario?.status !== "running"
+        || pulse?.owner !== "page"
+      ) return null;
+      const input = message.scenarioInput;
+      if (
+        input === null
+        || typeof input !== "object"
+        || Array.isArray(input)
+      ) return null;
+      if (
+        input.scenario !== scenario.id
+        || input.step !== scenario.definition.steps[scenario.stepIndex]?.id
+        || input.phase !== pulse.state
+        || input.requestSequence !== pulse.requestSequence
+      ) return null;
+      const entry = scenario.steps.at(-1);
+      const record = entry?.[pulse.state];
+      if (record === undefined || record.sequence !== null) return null;
+      return { input, record };
+    }
     function enqueueControllerState(message) {
-      if (controllerScenarioInputExclusive) return;
+      const scenarioRequest = controllerScenarioInputExclusive
+        ? matchControllerScenarioInputRequest(controllerScenario, message)
+        : null;
+      if (controllerScenarioInputExclusive && scenarioRequest === null) return;
       if (!Number.isSafeInteger(message.sequence) || message.sequence < 1) {
         throw new TypeError("controller sequence must be a positive safe integer");
       }
       if (message.sequence <= controllerSequence) return;
+      const state = normalizeControllerState(message.state);
+      if (
+        scenarioRequest !== null
+        && !controllerStatesEqual(state, scenarioRequest.record.state)
+      ) {
+        throw new TypeError("controller scenario state does not match its request");
+      }
       const queued = {
         sequence: message.sequence,
-        state: normalizeControllerState(message.state),
+        state,
       };
+      if (scenarioRequest !== null) {
+        scenarioRequest.record.sequence = queued.sequence;
+        scenarioRequest.record.receivedCycle = cycles;
+        queued.scenarioInput = {
+          scenario: scenarioRequest.input.scenario,
+          step: scenarioRequest.input.step,
+          phase: scenarioRequest.input.phase,
+          requestSequence: scenarioRequest.input.requestSequence,
+        };
+      }
       controllerSequence = queued.sequence;
       const previous = controllerQueue.at(-1);
       if (
@@ -1910,7 +1953,30 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (step.missed !== undefined && typeof step.missed !== "function") {
           throw new TypeError(`controller scenario step ${step.id} missed must be a function`);
         }
-        if (step.button !== null) {
+        if (step.input !== undefined) {
+          if (
+            step.input === null
+            || typeof step.input !== "object"
+            || Array.isArray(step.input)
+            || step.input.owner !== "page"
+          ) {
+            throw new TypeError(
+              `controller scenario step ${step.id} input must be page-owned`
+            );
+          }
+          if (step.button !== undefined) {
+            throw new TypeError(
+              `controller scenario step ${step.id} cannot combine button and state input`
+            );
+          }
+          const active = normalizeControllerState(step.input.active);
+          const neutral = normalizeControllerState(step.input.neutral);
+          if (controllerStatesEqual(active, neutral)) {
+            throw new TypeError(
+              `controller scenario step ${step.id} active and neutral states must differ`
+            );
+          }
+        } else if (step.button !== null) {
           controllerScenarioInteger(
             step.button,
             `controller scenario step ${step.id} button`,
@@ -1965,6 +2031,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         stepIndex: 0,
         pollIndex: 0,
         nextSequence: 1,
+        nextRequestSequence: 1,
         pulse: null,
         steps: [],
         lastState: null,
@@ -2017,9 +2084,47 @@ const TEMPLATE: &str = r##"<!doctype html>
       scenario.pulse = null;
     }
 
+    function createControllerScenarioStateRecord(requestSequence, state) {
+      return {
+        requestSequence,
+        state: normalizeControllerState(state),
+        requestedCycle: null,
+        requestedPollIndex: null,
+        receivedCycle: null,
+        sequence: null,
+        polls: 0,
+        publications: [],
+        firstPollIndex: null,
+        lastPollIndex: null,
+        firstScheduledCycle: null,
+        lastScheduledCycle: null,
+        firstObservedCycle: null,
+        lastObservedCycle: null,
+      };
+    }
+
+    function requestControllerScenarioState(scenario, entry, phase, cycle) {
+      const record = entry[phase];
+      record.requestedCycle = cycle;
+      record.requestedPollIndex = scenario.pollIndex;
+      scenario.pulse.state = phase;
+      scenario.pulse.requestSequence = record.requestSequence;
+      globalThis.postMessage?.({
+        type: "controller-scenario-input",
+        scenario: scenario.id,
+        step: entry.id,
+        phase,
+        requestSequence: record.requestSequence,
+        state: record.state,
+      });
+    }
+
     function observeControllerScenarioPulse(scenario, cycle, sample) {
       const pulse = scenario.pulse;
       if (pulse === null) return;
+      // Page-owned full-state phases prove transport through SI here. Guest
+      // observation is layered on separately by game-specific scenarios.
+      if (pulse.owner === "page") return;
       const pad = sample?.pad;
       if (pad === null || typeof pad !== "object") return;
       const held = Number(pad.held);
@@ -2091,7 +2196,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (scenario.pulse !== null) {
         const pulse = scenario.pulse;
         const entry = scenario.steps.at(-1);
-        if (pulse.state === "release") {
+        if (pulse.owner === "page") {
+          if (
+            pulse.state === "neutral"
+            && entry.neutral.polls >= scenario.minimumNeutralPolls
+          ) {
+            entry.completedCycle = cycle;
+            entry.completedPollIndex = scenario.pollIndex;
+            scenario.stepIndex += 1;
+            scenario.pulse = null;
+          }
+        } else if (pulse.state === "release") {
           const guestHadReleaseWindow = pulse.releaseServiceCycle !== null
             && cycle > pulse.releaseServiceCycle;
           if (guestHadReleaseWindow && entry.guest.pressedCycle === null) {
@@ -2160,6 +2275,36 @@ const TEMPLATE: &str = r##"<!doctype html>
           });
           scenario.stepIndex += 1;
           continue;
+        }
+
+        if (step.input?.owner === "page") {
+          const entry = {
+            id: step.id,
+            type: "state-input",
+            owner: "page",
+            readyCycle: cycle,
+            readyPollIndex: scenario.pollIndex,
+            readyState: state,
+            active: createControllerScenarioStateRecord(
+              scenario.nextRequestSequence,
+              step.input.active
+            ),
+            neutral: createControllerScenarioStateRecord(
+              scenario.nextRequestSequence + 1,
+              step.input.neutral
+            ),
+            completedCycle: null,
+            completedPollIndex: null,
+          };
+          scenario.steps.push(entry);
+          scenario.nextRequestSequence += 2;
+          scenario.pulse = {
+            owner: "page",
+            state: null,
+            requestSequence: null,
+          };
+          requestControllerScenarioState(scenario, entry, "active", cycle);
+          return scenario.status;
         }
 
         const entry = {
@@ -2238,6 +2383,31 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
 
+    function recordControllerScenarioStatePoll(
+      record,
+      pollIndex,
+      scheduledCycle,
+      observedCycle,
+      source,
+      sequence
+    ) {
+      record.polls += 1;
+      record.firstPollIndex ??= pollIndex;
+      record.lastPollIndex = pollIndex;
+      record.firstScheduledCycle ??= scheduledCycle;
+      record.lastScheduledCycle = scheduledCycle;
+      record.firstObservedCycle ??= observedCycle;
+      record.lastObservedCycle = observedCycle;
+      record.publications.push({
+        source,
+        pollIndex,
+        scheduledCycle,
+        observedCycle,
+        state: record.state,
+        sequence,
+      });
+    }
+
     function pollControllerScenario(
       scenario,
       channel,
@@ -2258,6 +2428,29 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       const pulse = scenario.pulse;
       const entry = scenario.steps.at(-1);
+      if (pulse.owner === "page") {
+        const record = entry[pulse.state];
+        if (
+          record.sequence === null
+          || controllerAppliedSequence !== record.sequence
+          || !controllerStatesEqual(controllerState, record.state)
+        ) return null;
+        recordControllerScenarioStatePoll(
+          record,
+          pollIndex,
+          scheduledCycle,
+          observedCycle,
+          source,
+          record.sequence
+        );
+        if (
+          pulse.state === "active"
+          && record.polls === scenario.pressPolls
+        ) {
+          requestControllerScenarioState(scenario, entry, "neutral", observedCycle);
+        }
+        return null;
+      }
       if (pulse.state === "press") {
         controllerAppliedSequence = entry.press.sequence;
         pulse.pressPolls += 1;
