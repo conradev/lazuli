@@ -32,6 +32,19 @@ jobs:
         uses: Swatinem/rust-cache@v2.7.7
       - name: Build browser compiler
         run: cargo build --release --target wasm32-unknown-unknown -p ppcwasmjit
+      - name: Test browser renderer
+        run: cargo test -p browser-renderer
+      - name: Build browser renderer
+        run: cargo build --release --target wasm32-unknown-unknown -p browser-renderer
+      - name: Install pinned wasm-bindgen CLI
+        run: cargo install --locked --version 0.2.114 wasm-bindgen-cli
+      - name: Generate browser renderer bindings
+        run: >-
+          wasm-bindgen
+          --target web
+          --out-dir target/gekko-web
+          --out-name browser_renderer
+          target/wasm32-unknown-unknown/release/browser_renderer.wasm
       - name: Generate generic frontend
         run: >-
           cargo run --release -p ppcwasmjit --example browser_boot --
