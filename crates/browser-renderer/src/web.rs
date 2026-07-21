@@ -25,8 +25,8 @@ use crate::{
     SamplerIdentity, SelectedTexture, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
     clipped_copy_extent, compact_xfb_readback_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_state, gx_sampler_identity, merge_contiguous_draw_range,
-    require_tev_texture, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
-    xfb_readback_layout, xfb_source_rect,
+    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
+    xfb_copy_matches_selection, xfb_readback_layout, xfb_source_rect, xfb_surface_extent_matches,
 };
 
 const PRESENT_SHADER: &str = "
@@ -179,18 +179,28 @@ struct CachedTexture {
     height: u32,
 }
 
-struct CachedXfb {
+#[derive(Clone)]
+struct CachedXfbSurface {
+    id: u64,
     texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    _view: wgpu::TextureView,
+    source_rect_buffer: wgpu::Buffer,
+    present_bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
+struct CachedXfb {
+    surface: CachedXfbSurface,
+    spare: Option<CachedXfbSurface>,
     metadata: XfbCopyMetadata,
-    source_width: u32,
-    source_height: u32,
     output_width: u32,
     output_height: u32,
 }
 
 #[derive(Clone)]
 struct PresentedXfb {
+    surface_id: u64,
     texture: wgpu::Texture,
     selected_address: u32,
     generation: u32,
@@ -328,6 +338,7 @@ pub struct WebGpuRenderer {
     efb_copy_cache: HashMap<u32, CachedTexture>,
     xfb_cache: HashMap<u32, CachedXfb>,
     last_presented_xfb: Option<PresentedXfb>,
+    next_xfb_surface_id: u64,
     pipelines: Pipelines,
     tev_vertices: Vec<TevVertex>,
     commands: Vec<DrawCommand>,
@@ -1363,24 +1374,31 @@ impl WebGpuRenderer {
             });
             return self.ensure_healthy();
         };
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("browser XFB copy"),
-            size: wgpu::Extent3d {
-                width,
-                height: source_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        update_renderer_metrics(&self.metrics, |metrics| {
-            metrics.textures_created = metrics.textures_created.saturating_add(1);
+        let protected_surface = self
+            .last_presented_xfb
+            .as_ref()
+            .map(|presented| presented.surface_id);
+        let mut surfaces = Vec::with_capacity(2);
+        if let Some(cached) = self.xfb_cache.remove(&destination) {
+            surfaces.push(cached.surface);
+            surfaces.extend(cached.spare);
+        }
+        let surface_descriptors = surfaces
+            .iter()
+            .map(|surface| (surface.id, surface.width, surface.height))
+            .collect::<Vec<_>>();
+        let surface = reusable_xfb_surface_index(
+            &surface_descriptors,
+            protected_surface,
+            width,
+            source_height,
+        )
+        .map_or_else(
+            || self.create_xfb_surface(width, source_height),
+            |index| surfaces.remove(index),
+        );
+        let spare = surfaces.into_iter().find(|candidate| {
+            xfb_surface_extent_matches(candidate.width, candidate.height, width, source_height)
         });
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
@@ -1394,7 +1412,7 @@ impl WebGpuRenderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture: &surface.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1405,7 +1423,6 @@ impl WebGpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.submit([encoder.finish()]);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
@@ -1413,16 +1430,14 @@ impl WebGpuRenderer {
         self.xfb_cache.insert(
             destination,
             CachedXfb {
-                texture,
-                view,
+                surface,
+                spare,
                 metadata: XfbCopyMetadata {
                     destination,
                     stride,
                     height: xfb_height.max(1),
                     generation,
                 },
-                source_width: width,
-                source_height,
                 output_width: xfb_width.max(1),
                 output_height: xfb_height.max(1),
             },
@@ -1458,15 +1473,7 @@ impl WebGpuRenderer {
         if selected_address == 0 || expected_generation == 0 {
             return Ok(false);
         }
-        let Some((
-            texture,
-            texture_view,
-            metadata,
-            source_width,
-            source_height,
-            cached_width,
-            cached_height,
-        )) = self
+        let Some((surface, metadata, cached_width, cached_height)) = self
             .xfb_cache
             .values()
             .find(|copy| {
@@ -1479,11 +1486,8 @@ impl WebGpuRenderer {
             })
             .map(|copy| {
                 (
-                    copy.texture.clone(),
-                    copy.view.clone(),
+                    copy.surface.clone(),
                     copy.metadata,
-                    copy.source_width,
-                    copy.source_height,
                     copy.output_width,
                     copy.output_height,
                 )
@@ -1529,42 +1533,8 @@ impl WebGpuRenderer {
         let output_view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let rect_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("browser XFB source rectangle"),
-                contents: bytemuck::cast_slice(&rect),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("browser XFB presentation bind group"),
-            layout: &self.present_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(
-                        &self.samplers[&SamplerIdentity {
-                            mag_filter: true,
-                            min_filter: true,
-                            address_u: TextureAddressMode::ClampToEdge,
-                            address_v: TextureAddressMode::ClampToEdge,
-                        }],
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: rect_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        update_renderer_metrics(&self.metrics, |metrics| {
-            metrics.buffers_created = metrics.buffers_created.saturating_add(1);
-            metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
-        });
+        self.queue
+            .write_buffer(&surface.source_rect_buffer, 0, bytemuck::cast_slice(&rect));
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1588,7 +1558,7 @@ impl WebGpuRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipelines.present);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &surface.present_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
@@ -1597,12 +1567,13 @@ impl WebGpuRenderer {
         });
         output.present();
         self.last_presented_xfb = Some(PresentedXfb {
-            texture,
+            surface_id: surface.id,
+            texture: surface.texture,
             selected_address,
             generation: metadata.generation,
             selected_row,
-            source_width,
-            source_height,
+            source_width: surface.width,
+            source_height: surface.height,
             logical_width: cached_width,
             logical_height: cached_height,
             display_width: output_width,
@@ -1842,6 +1813,7 @@ impl WebGpuRenderer {
             efb_copy_cache: HashMap::new(),
             xfb_cache: HashMap::new(),
             last_presented_xfb: None,
+            next_xfb_surface_id: 1,
             pipelines,
             tev_vertices: Vec::new(),
             commands: Vec::new(),
@@ -1880,6 +1852,74 @@ impl WebGpuRenderer {
                 .saturating_add(pixels.len() as u64);
         });
         Ok(texture)
+    }
+
+    fn create_xfb_surface(&mut self, width: u32, height: u32) -> CachedXfbSurface {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("browser XFB copy"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let source_rect_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("browser XFB source rectangle"),
+                    contents: bytemuck::cast_slice(&[0.0_f32, 0.0, 1.0, 1.0]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+        let present_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser XFB presentation bind group"),
+            layout: &self.present_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        &self.samplers[&SamplerIdentity {
+                            mag_filter: true,
+                            min_filter: true,
+                            address_u: TextureAddressMode::ClampToEdge,
+                            address_v: TextureAddressMode::ClampToEdge,
+                        }],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: source_rect_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.textures_created = metrics.textures_created.saturating_add(1);
+            metrics.buffers_created = metrics.buffers_created.saturating_add(1);
+            metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
+        });
+        let id = self.next_xfb_surface_id;
+        self.next_xfb_surface_id = self.next_xfb_surface_id.wrapping_add(1).max(1);
+        CachedXfbSurface {
+            id,
+            texture,
+            _view: view,
+            source_rect_buffer,
+            present_bind_group,
+            width,
+            height,
+        }
     }
 
     fn ensure_healthy(&self) -> Result<(), JsValue> {

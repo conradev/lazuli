@@ -419,6 +419,29 @@ pub(crate) fn xfb_copy_matches_selection(
         && xfb_row_offset(copy, address) == Some(row)
 }
 
+pub(crate) const fn xfb_surface_extent_matches(
+    cached_width: u32,
+    cached_height: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    cached_width == width && cached_height == height
+}
+
+pub(crate) fn reusable_xfb_surface_index(
+    surfaces: &[(u64, u32, u32)],
+    protected_surface: Option<u64>,
+    width: u32,
+    height: u32,
+) -> Option<usize> {
+    surfaces
+        .iter()
+        .position(|(surface, cached_width, cached_height)| {
+            Some(*surface) != protected_surface
+                && xfb_surface_extent_matches(*cached_width, *cached_height, width, height)
+        })
+}
+
 #[cfg(test)]
 pub(crate) fn resolve_xfb_copy(copies: &[XfbCopyMetadata], address: u32) -> Option<(usize, u32)> {
     copies
@@ -556,8 +579,9 @@ mod tests {
         alpha_test_passes, clipped_copy_extent, compact_xfb_readback_rows,
         decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state,
         gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy,
-        select_texture, valid_rgba8_texture, xfb_copy_matches_selection, xfb_readback_layout,
-        xfb_row_offset, xfb_source_rect,
+        reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
+        xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_source_rect,
+        xfb_surface_extent_matches,
     };
 
     const BASE: u32 = 0x0120_0000;
@@ -650,6 +674,43 @@ mod tests {
         assert!(!xfb_copy_matches_selection(copy, BASE, 0, 0));
         assert!(!xfb_copy_matches_selection(copy, BASE + STRIDE, 12, 0));
         assert!(!xfb_copy_matches_selection(copy, BASE + STRIDE * 2, 12, 2));
+    }
+
+    #[test]
+    fn xfb_surface_reuse_requires_an_exact_copy_extent() {
+        assert!(xfb_surface_extent_matches(640, 448, 640, 448));
+        assert!(!xfb_surface_extent_matches(640, 448, 608, 448));
+        assert!(!xfb_surface_extent_matches(640, 448, 640, 480));
+    }
+
+    #[test]
+    fn xfb_surface_reuse_preserves_the_last_presented_surface() {
+        let surfaces = [(41, 640, 448), (42, 640, 448)];
+        assert_eq!(
+            reusable_xfb_surface_index(&surfaces, Some(41), 640, 448),
+            Some(1)
+        );
+        assert_eq!(
+            reusable_xfb_surface_index(&surfaces, Some(42), 640, 448),
+            Some(0)
+        );
+        assert_eq!(
+            reusable_xfb_surface_index(&surfaces, None, 640, 448),
+            Some(0)
+        );
+        assert_eq!(
+            reusable_xfb_surface_index(&surfaces, Some(41), 608, 448),
+            None
+        );
+        let mismatched_spare = [(41, 640, 448), (42, 608, 448)];
+        assert_eq!(
+            reusable_xfb_surface_index(&mismatched_spare, Some(41), 640, 448),
+            None
+        );
+        assert_eq!(
+            reusable_xfb_surface_index(&mismatched_spare, Some(41), 608, 448),
+            Some(1)
+        );
     }
 
     #[test]

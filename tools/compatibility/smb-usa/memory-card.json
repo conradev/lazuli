@@ -330,6 +330,17 @@
       }
     }
   },
+  "performance": {
+    "rendererMaximum": {
+      "wasmBridgeCalls": 984,
+      "wasmBridgeTypedArrayBytes": 11222288,
+      "queueSubmissions": 468,
+      "bindGroups": 700,
+      "buffers": 839,
+      "renderPipelines": 3,
+      "textures": 8
+    }
+  },
   "consensus": {
     "cleanRuns": 3
   }

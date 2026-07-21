@@ -18,6 +18,17 @@ test("the SMB memory-card checkpoint is a valid three-run WebGPU golden", async 
   assert.equal(manifest.schema, "lazuli-browser-boot-checkpoint-v2");
   assert.equal(manifest.consensus.cleanRuns, 3);
   assert.equal(manifest.run.renderer, "wgpu-webgpu");
+  assert.deepEqual(manifest.performance, {
+    rendererMaximum: {
+      wasmBridgeCalls: 984,
+      wasmBridgeTypedArrayBytes: 11_222_288,
+      queueSubmissions: 468,
+      bindGroups: 700,
+      buffers: 839,
+      renderPipelines: 3,
+      textures: 8,
+    },
+  });
   assert.equal(manifest.state.cpuState.signature, "0xcc536b5b");
   assert.equal(manifest.state.gxFifo.hash, "0x63f324ac");
   assert.equal(manifest.state.diskReads.hash, "0x691e18d1");
