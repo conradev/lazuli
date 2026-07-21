@@ -1130,7 +1130,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     let dspUcodeBooted = false;
     let dspAxCommandListPending = false;
     let dspScheduledMail = null;
-    let dspInterruptDelivered = false;
+    const dspAudioDmaEnableInterruptLatencyCycles = 200;
+    let dspAudioDmaRemainingBlocks = 0;
+    let nextDspAudioDmaCycle = null;
+    let nextDspAudioDmaInterruptCycle = null;
     const aram = new Uint8Array(0x01000000);
     let aramTransfer = null;
     let diskReadBytes = 0;
@@ -3076,6 +3079,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (logical === 0xcc006c08 && size === 4) {
         updateAudioSampleCounter(cycles);
       }
+      if (logical === 0xcc00503a && size === 2) {
+        view.setUint16(pointer, dspAudioDmaBlocksLeft(), true);
+        return 1;
+      }
+      if (logical === 0xcc005038 && size === 4) {
+        publishDspAudioDmaBlocksLeft();
+      }
       const lockedSource = lockedCachePointer(address, size);
       const source = ramPointer(address, size) ?? mmioPointer(address, size) ?? lockedSource;
       if (source === null) {
@@ -3314,6 +3324,105 @@ const TEMPLATE: &str = r##"<!doctype html>
       view.setUint32(mmio + 0x6c00, next >>> 0, false);
     }
 
+    function dspAudioDmaCyclesPerBlock() {
+      const control = view.getUint32(mmio + 0x6c00, false);
+      const sampleRate = (control & 0x40) !== 0 ? 32_029 : 48_043;
+      return Math.ceil((8 * 486_000_000) / sampleRate);
+    }
+
+    function dspAudioDmaBlocksLeft() {
+      return dspAudioDmaRemainingBlocks > 0
+        ? (dspAudioDmaRemainingBlocks - 1) & 0x7fff
+        : 0;
+    }
+
+    function publishDspAudioDmaBlocksLeft() {
+      view.setUint16(mmio + 0x503a, dspAudioDmaBlocksLeft(), false);
+    }
+
+    function assertDspAudioDmaInterrupt(eventName) {
+      view.setUint16(
+        mmio + 0x500a,
+        view.getUint16(mmio + 0x500a, false) | 0x0008,
+        false
+      );
+      deviceEvents.set(eventName, (deviceEvents.get(eventName) ?? 0) + 1);
+    }
+
+    function startDspAudioDma() {
+      dspAudioDmaRemainingBlocks = view.getUint16(mmio + 0x5036, false) & 0x7fff;
+      nextDspAudioDmaCycle = dspAudioDmaRemainingBlocks === 0
+        ? null
+        : Math.ceil(cycles + dspAudioDmaCyclesPerBlock());
+      nextDspAudioDmaInterruptCycle = cycles + dspAudioDmaEnableInterruptLatencyCycles;
+      publishDspAudioDmaBlocksLeft();
+      deviceEvents.set(
+        "dspAudioDmaStart",
+        (deviceEvents.get("dspAudioDmaStart") ?? 0) + 1
+      );
+    }
+
+    function stopDspAudioDma() {
+      dspAudioDmaRemainingBlocks = 0;
+      nextDspAudioDmaCycle = null;
+      nextDspAudioDmaInterruptCycle = null;
+      publishDspAudioDmaBlocksLeft();
+      deviceEvents.set(
+        "dspAudioDmaStop",
+        (deviceEvents.get("dspAudioDmaStop") ?? 0) + 1
+      );
+    }
+
+    function resetDspAudioDma() {
+      view.setUint16(mmio + 0x5036, 0, false);
+      stopDspAudioDma();
+    }
+
+    function writeDspAudioDmaControl(value) {
+      const current = view.getUint16(mmio + 0x5036, false);
+      const wasEnabled = (current & 0x8000) !== 0;
+      const written = value & 0xffff;
+      const enabled = (written & 0x8000) !== 0;
+      view.setUint16(mmio + 0x5036, written, false);
+
+      if (!wasEnabled && enabled) {
+        startDspAudioDma();
+      } else if (wasEnabled && !enabled) {
+        stopDspAudioDma();
+      } else {
+        publishDspAudioDmaBlocksLeft();
+      }
+    }
+
+    function serviceDspAudioDma(observedCycles) {
+      if (
+        nextDspAudioDmaInterruptCycle !== null
+        && observedCycles >= nextDspAudioDmaInterruptCycle
+      ) {
+        nextDspAudioDmaInterruptCycle = null;
+        assertDspAudioDmaInterrupt("dspAudioDmaInitialInterrupt");
+      }
+      while (nextDspAudioDmaCycle !== null && observedCycles >= nextDspAudioDmaCycle) {
+        const eventCycle = nextDspAudioDmaCycle;
+        dspAudioDmaRemainingBlocks -= 1;
+        deviceEvents.set(
+          "dspAudioDmaBlock",
+          (deviceEvents.get("dspAudioDmaBlock") ?? 0) + 1
+        );
+
+        if (dspAudioDmaRemainingBlocks === 0) {
+          assertDspAudioDmaInterrupt("dspAudioDmaComplete");
+          dspAudioDmaRemainingBlocks = view.getUint16(mmio + 0x5036, false) & 0x7fff;
+        }
+
+        const enabled = (view.getUint16(mmio + 0x5036, false) & 0x8000) !== 0;
+        nextDspAudioDmaCycle = enabled && dspAudioDmaRemainingBlocks !== 0
+          ? Math.ceil(eventCycle + dspAudioDmaCyclesPerBlock())
+          : null;
+        publishDspAudioDmaBlocksLeft();
+      }
+    }
+
     function startAramDma(value) {
       const written = value >>> 0;
       const countAndDirection = (
@@ -3397,12 +3506,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       let next = (written & ~interruptStatuses) | status;
       if ((written & 1) !== 0) {
         resetDspMailbox();
+        resetDspAudioDma();
         next &= ~1;
       }
       if ((current & 0x0800) !== 0 && (next & 0x0800) === 0) {
         initializeDspAudioSystem();
       }
-      if ((next & 0x80) === 0) dspInterruptDelivered = false;
       view.setUint16(mmio + 0x500a, next, false);
       traceDsp("control-write", {
         current: "0x" + current.toString(16).padStart(4, "0"),
@@ -3469,6 +3578,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if (logical === 0xcc00500a && size === 2) {
         writeDspControl(value);
+        return 1;
+      }
+      if (logical === 0xcc005034 && size === 4) {
+        view.setUint16(mmio + 0x5034, (value >>> 16) & 0xffff, false);
+        writeDspAudioDmaControl(value & 0xffff);
+        return 1;
+      }
+      if (logical === 0xcc005036 && size === 2) {
+        writeDspAudioDmaControl(value);
         return 1;
       }
       if (logical === 0xcc005028 && size === 4) {
@@ -4229,6 +4347,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function serviceDsp(observedCycles) {
+      serviceDspAudioDma(observedCycles);
       serviceAramDma(observedCycles);
       if (dspScheduledMail !== null && observedCycles >= dspScheduledMail.completionCycle) {
         pushDspMail(dspScheduledMail.mail, true);
@@ -4248,16 +4367,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         active
         && (mask & 0x00000040) !== 0
         && (msr & 0x00008000) !== 0
-        && !dspInterruptDelivered
       ) {
-        dspInterruptDelivered = true;
         deviceEvents.set(
           "dspExternalInterrupt",
           (deviceEvents.get("dspExternalInterrupt") ?? 0) + 1
         );
         raiseException(cpu, 0x0500);
-      } else if (!active) {
-        dspInterruptDelivered = false;
       }
     }
 
@@ -4877,6 +4992,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         serialTransfer?.completionCycle ?? null,
         peFinishCycle,
         dspScheduledMail?.completionCycle ?? null,
+        nextDspAudioDmaInterruptCycle,
+        nextDspAudioDmaCycle,
         aramTransfer?.completionCycle ?? null,
         nextAudioSampleCycle(),
         includeCycleLimit && Number.isFinite(cycleLimit) ? cycleLimit : null,
@@ -5308,6 +5425,15 @@ const TEMPLATE: &str = r##"<!doctype html>
           dspScheduledMail,
           dspMode,
           dspTrace,
+          dspAudioDma: {
+            enabled: (view.getUint16(mmio + 0x5036, false) & 0x8000) !== 0,
+            configuredBlocks: view.getUint16(mmio + 0x5036, false) & 0x7fff,
+            remainingBlocks: dspAudioDmaRemainingBlocks,
+            blocksLeft: dspAudioDmaBlocksLeft(),
+            cyclesPerBlock: dspAudioDmaCyclesPerBlock(),
+            nextInterruptCycle: nextDspAudioDmaInterruptCycle,
+            nextCycle: nextDspAudioDmaCycle,
+          },
           aramTransfer,
           nextViCycle,
           nextSerialPollCycle,
