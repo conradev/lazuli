@@ -209,6 +209,7 @@ test("headless scenarios are selected before a fresh worker starts", () => {
   );
   assert.match(source, /Page\.navigate did not create a fresh document loader/);
   assert.equal(source.match(/verifyScenarioReport\(report, options\);/g)?.length, 1);
+  assert.equal(source.match(/verifyScenarioRendering\(report, options\);/g)?.length, 1);
   assert.match(
     source,
     /await persist\(options\.output, report\);\s*if \(scenarioError !== null\) throw scenarioError/,
@@ -270,4 +271,18 @@ test("headless scenario captures accept only their matching terminal report", ()
     () => context.verifyScenarioReport({ ...complete, scenario: null }, options),
     /controller scenario did not complete/,
   );
+});
+
+test("SMB headless captures delegate temporal XFB verification", () => {
+  assert.match(
+    source,
+    /import \{ verifySmbTemporalSelectedXfb \} from "\.\/browser_boot_temporal_xfb\.mjs"/,
+  );
+  assert.match(
+    source,
+    /verifySmbTemporalSelectedXfb\(rendering\.temporalSelectedXfb\)/,
+  );
+  assert.doesNotMatch(source, /distinctGenerations >= 2/);
+  assert.doesNotMatch(source, /selected\.rgb\.unique > 1/);
+  assert.doesNotMatch(source, /selected\.rgb\.other > 0/);
 });

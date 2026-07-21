@@ -7,6 +7,7 @@ import {
   readCheckpointManifest,
   verifyCheckpointReport,
 } from "./browser_boot_checkpoint.mjs";
+import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
 
 function parseArguments(argv) {
   const options = {
@@ -403,6 +404,17 @@ function verifyScenarioReport(report, options) {
   }
 }
 
+function verifyScenarioRendering(report, options) {
+  if (options.scenario !== "smb-ready-play") return;
+  const rendering = report.rendering;
+  if (rendering?.backend !== "wgpu-webgpu") {
+    throw new Error(
+      `SMB temporal XFB requires wgpu-webgpu, got ${JSON.stringify(rendering?.backend ?? null)}`,
+    );
+  }
+  verifySmbTemporalSelectedXfb(rendering.temporalSelectedXfb);
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   const expectedManifest = options.expect === null
@@ -457,6 +469,7 @@ async function main() {
         let scenarioError = null;
         try {
           verifyScenarioReport(report, options);
+          verifyScenarioRendering(report, options);
         } catch (error) {
           scenarioError = error;
         }
