@@ -108,11 +108,14 @@ function withoutDebugUi(html) {
   return result;
 }
 
-function licensedFrontend(html, source) {
+function licensedFrontend(html, source, rendererJavascriptUrl) {
   html = withoutDebugUi(html);
   const sourceAnchor = '<a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a>';
   check(html.includes(sourceAnchor), "generated frontend does not contain the expected source link");
   check(html.includes('new URL("/ppcwasmjit.wasm", location.href)'), "generated frontend has no browser compiler URL");
+  check(html.includes(RENDERER_IMPORT_URL), "generated frontend has no browser renderer import");
+  html = html.replaceAll(RENDERER_IMPORT_URL, rendererJavascriptUrl);
+  check(!html.includes(RENDERER_IMPORT_URL), "generated frontend still imports the stable browser renderer URL");
   const links = [
     `<a href="${source.tree}" target="_blank" rel="source noopener">Source</a>`,
     '<a href="/LICENSE.txt" target="_blank" rel="license noopener">GPL-3.0-only</a>',
@@ -153,13 +156,13 @@ function cloudflareHeaders() {
 /index.html
   Cache-Control: no-store
 
-/release.json
-  Cache-Control: no-store
-
 /app
   Cache-Control: no-store
 
 /app.html
+  Cache-Control: no-store
+
+/release.json
   Cache-Control: no-store
 
 /source.html
@@ -180,6 +183,9 @@ function cloudflareHeaders() {
 export async function buildWeb(options) {
   const appPath = resolve(options.appPath);
   const wasmPath = resolve(options.wasmPath);
+  const generatedDirectory = dirname(appPath);
+  const rendererJavascriptPath = join(generatedDirectory, RENDERER_JAVASCRIPT_NAME);
+  const rendererWasmPath = join(generatedDirectory, RENDERER_WASM_NAME);
   const output = outputDirectory(options.outputPath);
   const repository = (options.repository ?? DEFAULT_REPOSITORY).replace(/\/$/, "");
   const commit = options.commit;
@@ -187,17 +193,53 @@ export async function buildWeb(options) {
   check(repository === DEFAULT_REPOSITORY, `unsupported source repository ${repository}`);
 
   const source = sourceMetadata(repository, commit);
-  const [generatedHtml, wasm] = await Promise.all([
+  const [generatedHtml, wasm, rendererJavascriptSource, rendererWasm] = await Promise.all([
     readFile(appPath, "utf8"),
     readFile(wasmPath),
+    readFile(rendererJavascriptPath, "utf8"),
+    readFile(rendererWasmPath),
   ]);
   check(wasm.byteLength > 0, "browser compiler is empty");
+  check(rendererJavascriptSource.length > 0, "browser renderer JavaScript is empty");
+  check(rendererWasm.byteLength > 0, "browser renderer wasm is empty");
 
   await rm(output, { recursive: true, force: true });
   const assetsDirectory = join(output, "assets");
   await mkdir(assetsDirectory, { recursive: true });
 
-  const frontendBytes = new TextEncoder().encode(licensedFrontend(generatedHtml, source));
+  const rendererWasmAsset = await contentAsset(
+    assetsDirectory,
+    "browser-renderer-wasm",
+    "wasm",
+    rendererWasm,
+  );
+  let rendererJavascript = rendererJavascriptSource;
+  let rendererWasmReferences = 0;
+  for (const reference of [`./${RENDERER_WASM_NAME}`, RENDERER_WASM_NAME]) {
+    const count = rendererJavascript.split(reference).length - 1;
+    if (count === 0) continue;
+    rendererWasmReferences += count;
+    rendererJavascript = rendererJavascript.replaceAll(reference, rendererWasmAsset.url);
+  }
+  check(rendererWasmReferences > 0, "browser renderer JavaScript has no relative wasm URL");
+  check(
+    !rendererJavascript.includes(RENDERER_WASM_NAME),
+    "browser renderer JavaScript still contains the stable wasm filename",
+  );
+  const rendererJavascriptAsset = await contentAsset(
+    assetsDirectory,
+    "browser-renderer",
+    "js",
+    new TextEncoder().encode(rendererJavascript),
+  );
+  const renderer = {
+    javascript: rendererJavascriptAsset,
+    wasm: rendererWasmAsset,
+  };
+
+  const frontendBytes = new TextEncoder().encode(
+    licensedFrontend(generatedHtml, source, renderer.javascript.url),
+  );
   const frontend = await contentAsset(assetsDirectory, "frontend", "html", frontendBytes);
   const chunks = [];
   for (let offset = 0; offset < wasm.byteLength; offset += WASM_CHUNK_SIZE) {
@@ -212,7 +254,7 @@ export async function buildWeb(options) {
     chunkSize: WASM_CHUNK_SIZE,
     chunks,
   };
-  const release = { schema: RELEASE_SCHEMA, source, frontend, backend };
+  const release = { schema: RELEASE_SCHEMA, source, frontend, renderer, backend };
   release.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(release)));
 
   const webDirectory = resolve(options.webDirectory ?? join(PROJECT_ROOT, "web"));

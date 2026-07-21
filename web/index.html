@@ -40,19 +40,37 @@
   <iframe id="app" title="Gekko" hidden></iframe>
   <noscript>JavaScript is required. <a href="/source.html">Source</a></noscript>
   <script type="module">
+    // Keep this bootstrap self-contained: an incumbent schema-1 worker can
+    // cache the new shell before the schema-2 worker finishes installing.
+    const EXPECTED_RELEASE_SCHEMA = 2;
     const status = document.querySelector("#status");
     const detail = document.querySelector("#detail");
     const app = document.querySelector("#app");
 
-    function waitForController() {
-      if (navigator.serviceWorker.controller !== null) return Promise.resolve();
-      return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("offline worker did not take control")), 5000);
-        navigator.serviceWorker.addEventListener("controllerchange", () => {
-          clearTimeout(timeout);
-          resolve();
-        }, { once: true });
-      });
+    function requireCompatibleRelease(release) {
+      if (release?.schema !== EXPECTED_RELEASE_SCHEMA) {
+        throw new Error(
+          `release schema ${release?.schema ?? "unknown"} cannot provide mandatory WebGPU`,
+        );
+      }
+      return release;
+    }
+
+    async function waitForCompatibleController() {
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        if (navigator.serviceWorker.controller !== null) {
+          try {
+            const response = await fetch("/.gekko/worker-status", { cache: "no-store" });
+            const worker = response.ok ? await response.json() : null;
+            if (worker?.releaseSchema === EXPECTED_RELEASE_SCHEMA) {
+              return navigator.serviceWorker.controller;
+            }
+          } catch {}
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      throw new Error("mandatory WebGPU service worker did not take control");
     }
 
     async function registerWorker() {
@@ -64,14 +82,14 @@
       });
       await registration.update().catch(() => {});
       await navigator.serviceWorker.ready;
-      await waitForController();
-      return navigator.serviceWorker.controller;
+      return waitForCompatibleController();
     }
 
     async function fetchLatestRelease() {
       const response = await fetch("/release.json", { cache: "no-store" });
       if (!response.ok) throw new Error(`release check failed: HTTP ${response.status}`);
-      return { release: await response.json(), offline: response.headers.has("X-Gekko-Offline") };
+      const release = requireCompatibleRelease(await response.json());
+      return { release, offline: response.headers.has("X-Gekko-Offline") };
     }
 
     async function stageLatestRelease(release) {
@@ -82,7 +100,8 @@
         body: JSON.stringify(release),
       });
       const result = await response.json();
-      if (!response.ok && !result.release) throw new Error(result.error ?? "release staging failed");
+      if (!result.release) throw new Error(result.error ?? "release staging failed");
+      result.release = requireCompatibleRelease(result.release);
       return result;
     }
 
@@ -94,7 +113,6 @@
       let saved = latest.offline;
       detail.textContent = latest.offline ? "Opening the saved release…" : "Preparing the latest release…";
       const staged = await stageLatestRelease(release);
-      if (!staged.release) throw new Error(staged.error ?? "no usable release is available");
       release = staged.release;
       saved ||= !staged.ok;
 
