@@ -38,6 +38,7 @@ const scenarioFunctions = [
   "serviceControllerScenario",
   "recordControllerScenarioPoll",
   "pollControllerScenario",
+  "snapshotControllerScenario",
 ];
 
 function scenarioHarness(overrides = {}) {
@@ -105,6 +106,162 @@ function definition(sample, overrides = {}) {
     ...overrides,
   };
 }
+
+test("controller scenarios emit three acknowledged press polls then neutral", () => {
+  const sample = {
+    phase: "prompt",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const context = scenarioHarness();
+  context.registerControllerScenario(definition(sample));
+  const scenario = context.selectControllerScenario("test-path", "TEST01", 0);
+
+  assert.equal(context.serviceControllerScenario(scenario, 10), "running");
+  assert.equal(scenario.steps.length, 1);
+  assert.equal(scenario.steps[0].readyCycle, 10);
+
+  for (let poll = 1; poll <= 3; poll += 1) {
+    context.controllerPollIndex = poll;
+    assert.equal(
+      context.pollControllerScenario(scenario, 0, poll, 1_000 + poll, 2_000 + poll),
+      0x0100,
+    );
+    sample.pad = poll === 1
+      ? { held: 0x0100, pressed: 0x0100, released: 0 }
+      : { held: 0x0100, pressed: 0, released: 0 };
+    context.serviceControllerScenario(scenario, 10 + poll);
+  }
+
+  for (let poll = 4; poll <= 6; poll += 1) {
+    context.controllerPollIndex = poll;
+    assert.equal(
+      context.pollControllerScenario(scenario, 0, poll, 1_000 + poll, 2_000 + poll),
+      0,
+    );
+    sample.pad = poll === 5
+      ? { held: 0, pressed: 0, released: 0x0100 }
+      : poll === 4
+        ? { held: 0x0100, pressed: 0, released: 0 }
+        : { held: 0, pressed: 0, released: 0 };
+    context.serviceControllerScenario(scenario, 10 + poll);
+  }
+
+  assert.equal(scenario.stepIndex, 1);
+  assert.equal(scenario.pulse, null);
+  sample.phase = "play";
+  assert.equal(context.serviceControllerScenario(scenario, 20), "complete");
+
+  const snapshot = JSON.parse(JSON.stringify(context.snapshotControllerScenario(scenario)));
+  assert.deepEqual(snapshot, {
+    id: "test-path",
+    gameIdentifier: "TEST01",
+    status: "complete",
+    hardCycleLimit: 10_000,
+    startCycle: 0,
+    completedCycle: 20,
+    failure: null,
+    stepIndex: 2,
+    currentStep: null,
+    pollIndex: 6,
+    lastState: { phase: "play" },
+    steps: [
+      {
+        id: "confirm",
+        type: "input",
+        button: 0x0100,
+        readyCycle: 10,
+        readyPollIndex: 0,
+        readyState: { phase: "prompt" },
+        press: {
+          sequence: 1,
+          polls: 3,
+          publications: [
+            {
+              source: "periodic",
+              pollIndex: 1,
+              scheduledCycle: 1_001,
+              observedCycle: 2_001,
+              buttons: 0x0100,
+              sequence: 1,
+            },
+            {
+              source: "periodic",
+              pollIndex: 2,
+              scheduledCycle: 1_002,
+              observedCycle: 2_002,
+              buttons: 0x0100,
+              sequence: 1,
+            },
+            {
+              source: "periodic",
+              pollIndex: 3,
+              scheduledCycle: 1_003,
+              observedCycle: 2_003,
+              buttons: 0x0100,
+              sequence: 1,
+            },
+          ],
+          firstPollIndex: 1,
+          lastPollIndex: 3,
+          firstScheduledCycle: 1_001,
+          lastScheduledCycle: 1_003,
+          firstObservedCycle: 2_001,
+          lastObservedCycle: 2_003,
+        },
+        release: {
+          sequence: 2,
+          polls: 3,
+          publications: [
+            {
+              source: "periodic",
+              pollIndex: 4,
+              scheduledCycle: 1_004,
+              observedCycle: 2_004,
+              buttons: 0,
+              sequence: 2,
+            },
+            {
+              source: "periodic",
+              pollIndex: 5,
+              scheduledCycle: 1_005,
+              observedCycle: 2_005,
+              buttons: 0,
+              sequence: 2,
+            },
+            {
+              source: "periodic",
+              pollIndex: 6,
+              scheduledCycle: 1_006,
+              observedCycle: 2_006,
+              buttons: 0,
+              sequence: 2,
+            },
+          ],
+          firstPollIndex: 4,
+          lastPollIndex: 6,
+          firstScheduledCycle: 1_004,
+          lastScheduledCycle: 1_006,
+          firstObservedCycle: 2_004,
+          lastObservedCycle: 2_006,
+        },
+        guest: {
+          pressedCycle: 11,
+          releasedCycle: 15,
+          neutralCycle: 16,
+        },
+        completedCycle: 16,
+        completedPollIndex: 6,
+      },
+      {
+        id: "play",
+        type: "observe",
+        observedCycle: 20,
+        observedPollIndex: 6,
+        state: { phase: "play" },
+      },
+    ],
+  });
+});
 
 test("controller scenarios never retry an unobserved input edge", () => {
   const sample = {
@@ -353,4 +510,26 @@ test("controller scenarios fail exactly at their guest-cycle cap", () => {
   assert.equal(context.serviceControllerScenario(scenario, 25), "failed");
   assert.equal(scenario.failure.cycle, 25);
   assert.match(scenario.failure.reason, /hard cycle limit reached/);
+});
+
+test("browser worker routes successful SI publications through the scenario engine", () => {
+  assert.match(
+    source,
+    /controllerPollIndex \+= 1;[\s\S]*?pollControllerScenario\([\s\S]*?scheduledCycle,[\s\S]*?observedCycle/,
+  );
+  assert.match(
+    source,
+    /controllerPacketForPoll\([\s\S]*?channel,[\s\S]*?scheduledCycle,[\s\S]*?observedCycles,[\s\S]*?"periodic"/,
+  );
+  assert.match(
+    source,
+    /processSerialCommand\([\s\S]*?transfer\.completionCycle,[\s\S]*?observedCycles/,
+  );
+  assert.match(source, /scenario: snapshotControllerScenario\(controllerScenario\)/);
+  assert.match(source, /stage: failed \? "scenario-failed" : "scenario-complete"/);
+  assert.match(source, /if \(controllerScenarioInputExclusive\) return;/);
+  assert.match(source, /const scenarioOwnsInput = scenarioButtons !== null;/);
+  assert.match(source, /scenarioOwnsInput \? 0x80 : controllerState\.stickX/);
+  assert.match(source, /entry\.release\.polls === 0/);
+  assert.match(source, /await finishTerminalControllerScenario\(\);/);
 });

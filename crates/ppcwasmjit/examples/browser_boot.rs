@@ -916,6 +916,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const requestedControllerScenario = new URLSearchParams(
       globalThis.runnerSearch
     ).get("scenario");
+    let controllerScenarioInputExclusive = false;
     let controllerQueueHighWater = 0;
     let controllerQueueCoalesces = 0;
     let controllerQueueOverflows = 0;
@@ -979,6 +980,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let serialInterruptLevelChanges = 0;
     let serialInterruptLevelReason = null;
     function enqueueControllerState(message) {
+      if (controllerScenarioInputExclusive) return;
       if (message.sequence <= controllerSequence) return;
       controllerSequence = message.sequence;
       const queued = {
@@ -2222,6 +2224,24 @@ const TEMPLATE: &str = r##"<!doctype html>
       return 0;
     }
 
+    function snapshotControllerScenario(scenario) {
+      if (scenario === null) return null;
+      const current = scenario.definition.steps[scenario.stepIndex] ?? null;
+      return {
+        id: scenario.id,
+        gameIdentifier: scenario.gameIdentifier,
+        status: scenario.status,
+        hardCycleLimit: scenario.hardCycleLimit,
+        startCycle: scenario.startCycle,
+        completedCycle: scenario.completedCycle,
+        failure: scenario.failure,
+        stepIndex: scenario.stepIndex,
+        currentStep: current?.id ?? null,
+        pollIndex: scenario.pollIndex,
+        lastState: scenario.lastState,
+        steps: scenario.steps,
+      };
+    }
     __DISC_SOURCE_RUNTIME__
 
     async function fetchBinary(url, label) {
@@ -2398,6 +2418,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       boot.version,
       globalThis.runnerScenarioOptional === true
     );
+    controllerScenarioInputExclusive = controllerScenario !== null;
     cycleLimit = controllerScenarioCycleLimit(cycleLimit, controllerScenario);
     let runnerYieldDeadline = Date.now() + runnerSliceMs;
     let runnerBlocksUntilYield = runnerBlockChunk;
@@ -7786,6 +7807,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         controller: {
           sequence: controllerSequence,
           appliedSequence: controllerAppliedSequence,
+          pollIndex: controllerPollIndex,
           pendingButtons: controllerQueue.reduce(
             (buttons, queued) => buttons | queued.state.buttons,
             0
@@ -7808,6 +7830,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           guestPad: inspectSuperMonkeyBallPad0(),
           ...controllerState,
         },
+        scenario: snapshotControllerScenario(controllerScenario),
         guestGame: inspectSuperMonkeyBallGameState(),
         serialInterface: {
           transferInterruptAcknowledgements: serialTransferInterruptAcknowledgements,
@@ -8129,6 +8152,22 @@ const TEMPLATE: &str = r##"<!doctype html>
       statusDataset.dispatchLimit = String(dispatchLimit);
       statusDataset.status = "running";
 
+      async function finishTerminalControllerScenario() {
+        const scenarioStatus = serviceControllerScenario(controllerScenario, cycles);
+        if (scenarioStatus !== "complete" && scenarioStatus !== "failed") return;
+        const failed = scenarioStatus === "failed";
+        await finishAfterRendererDrain(failed ? "stopped" : "paused", {
+          stage: failed ? "scenario-failed" : "scenario-complete",
+          pc: hex32(pc),
+          error: failed ? controllerScenario.failure.reason : undefined,
+          instructions,
+          cycles,
+          dispatches,
+          compiledBlocks: blocks.size,
+        });
+        throw Symbol.for("reported");
+      }
+
       for (;;) {
         if (runnerSnapshotRequested) publishRunnerSnapshot();
         while (rendererFramesInFlight.size !== 0 || rendererFailure !== null) {
@@ -8137,6 +8176,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           serviceVideoPresentation(cycles);
         }
         if (runnerPaused || runnerStopRequested) await honorRunnerControl();
+        await finishTerminalControllerScenario();
         const reachedLimit = cycles >= cycleLimit
           ? "cycle-limit"
           : dispatches >= dispatchLimit
@@ -8299,6 +8339,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         lastCpuSignature = nextCpuSignature;
         pc = nextPc;
 
+        await finishTerminalControllerScenario();
+
         const semanticIdle = !executedRegion
           && executedBlocks === 1
           && pc === executedPc
@@ -8327,6 +8369,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             lastPc = null;
             lastCpuSignature = null;
             samePcCount = 0;
+            await finishTerminalControllerScenario();
           }
         }
 

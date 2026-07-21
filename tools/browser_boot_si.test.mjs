@@ -103,6 +103,7 @@ function makeContext(functionNames, overrides = {}) {
     controllerPollIndex: 0,
     controllerSequence: 0,
     controllerScenario: null,
+    controllerScenarioInputExclusive: false,
     controllerQueue: [],
     controllerQueueCapacity: 64,
     controllerQueueHighWater: 0,
