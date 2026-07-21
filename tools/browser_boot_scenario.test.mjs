@@ -513,6 +513,77 @@ test("page-owned full-state phases request, echo, and publish active then neutra
   });
 });
 
+test("page-owned guest predicates witness active and neutral states after SI", () => {
+  const sample = { guestStickX: 0 };
+  const context = scenarioHarness({ postMessage() {} });
+  const active = fullControllerState({ stickX: 0x40 });
+  const neutral = fullControllerState();
+  const scenario = context.createControllerScenario(definition(sample, {
+    describe: value => ({ guestStickX: value.guestStickX }),
+    steps: [{
+      id: "steer",
+      input: {
+        owner: "page",
+        active,
+        neutral,
+        activeObserved: value => value.guestStickX === -64,
+        neutralObserved: value => value.guestStickX === 0,
+      },
+      ready: value => value.guestStickX === 0,
+    }],
+  }));
+  context.controllerScenario = scenario;
+  context.controllerScenarioInputExclusive = true;
+  context.serviceControllerScenario(scenario, 1);
+  context.enqueueControllerState({
+    sequence: 10,
+    state: active,
+    scenarioInput: {
+      scenario: "test-path",
+      step: "steer",
+      phase: "active",
+      requestSequence: 1,
+    },
+  });
+
+  context.controllerPacketForPoll(0, 101, 201, "periodic");
+  sample.guestStickX = -64;
+  assert.equal(context.serviceControllerScenario(scenario, 2), "running");
+  context.controllerPacketForPoll(0, 102, 202, "periodic");
+  context.serviceControllerScenario(scenario, 3);
+  context.controllerPacketForPoll(0, 103, 203, "periodic");
+  context.serviceControllerScenario(scenario, 4);
+
+  context.enqueueControllerState({
+    sequence: 11,
+    state: neutral,
+    scenarioInput: {
+      scenario: "test-path",
+      step: "steer",
+      phase: "neutral",
+      requestSequence: 2,
+    },
+  });
+  for (let poll = 4; poll <= 6; poll += 1) {
+    context.controllerPacketForPoll(0, 100 + poll, 200 + poll, "periodic");
+    assert.equal(context.serviceControllerScenario(scenario, poll + 1), "running");
+  }
+  assert.equal(scenario.stepIndex, 0, "SI neutral alone is not a guest witness");
+
+  sample.guestStickX = 0;
+  assert.equal(context.serviceControllerScenario(scenario, 8), "complete");
+  assert.deepEqual(JSON.parse(JSON.stringify(scenario.steps[0].guest)), {
+    activeCycle: 2,
+    activePollIndex: 1,
+    activeState: { guestStickX: -64 },
+    neutralCycle: 8,
+    neutralPollIndex: 6,
+    neutralState: { guestStickX: 0 },
+  });
+  assert.equal(scenario.steps[0].completedCycle, 8);
+  assert.equal(scenario.steps[0].completedPollIndex, 6);
+});
+
 test("page-owned state steps reject torn definitions and echoed states", () => {
   const sample = {
     phase: "prompt",
@@ -530,6 +601,21 @@ test("page-owned state steps reject torn definitions and echoed states", () => {
       }],
     })),
     /active and neutral states must differ/,
+  );
+  assert.throws(
+    () => context.registerControllerScenario(definition(sample, {
+      steps: [{
+        id: "unpaired",
+        input: {
+          owner: "page",
+          active,
+          neutral,
+          activeObserved: () => true,
+        },
+        ready: () => true,
+      }],
+    })),
+    /needs paired guest predicates/,
   );
 
   const scenario = context.createControllerScenario(definition(sample, {

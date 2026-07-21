@@ -1976,6 +1976,17 @@ const TEMPLATE: &str = r##"<!doctype html>
               `controller scenario step ${step.id} active and neutral states must differ`
             );
           }
+          const activeObserved = step.input.activeObserved;
+          const neutralObserved = step.input.neutralObserved;
+          if (
+            (activeObserved === undefined) !== (neutralObserved === undefined)
+            || (activeObserved !== undefined && typeof activeObserved !== "function")
+            || (neutralObserved !== undefined && typeof neutralObserved !== "function")
+          ) {
+            throw new TypeError(
+              `controller scenario step ${step.id} needs paired guest predicates`
+            );
+          }
         } else if (step.button !== null) {
           controllerScenarioInteger(
             step.button,
@@ -2122,9 +2133,32 @@ const TEMPLATE: &str = r##"<!doctype html>
     function observeControllerScenarioPulse(scenario, cycle, sample) {
       const pulse = scenario.pulse;
       if (pulse === null) return;
-      // Page-owned full-state phases prove transport through SI here. Guest
-      // observation is layered on separately by game-specific scenarios.
-      if (pulse.owner === "page") return;
+      if (pulse.owner === "page") {
+        const step = scenario.definition.steps[scenario.stepIndex];
+        const entry = scenario.steps.at(-1);
+        if (entry.guest === undefined) return;
+        if (
+          entry.active.polls !== 0
+          && entry.guest.activeCycle === null
+          && step.input.activeObserved(sample, scenario)
+        ) {
+          entry.guest.activeCycle = cycle;
+          entry.guest.activePollIndex = scenario.pollIndex;
+          entry.guest.activeState = scenario.lastState;
+        }
+        if (
+          pulse.state !== "neutral"
+          || entry.neutral.polls === 0
+          || entry.guest.activeCycle === null
+          || cycle <= entry.guest.activeCycle
+          || entry.guest.neutralCycle !== null
+          || !step.input.neutralObserved(sample, scenario)
+        ) return;
+        entry.guest.neutralCycle = cycle;
+        entry.guest.neutralPollIndex = scenario.pollIndex;
+        entry.guest.neutralState = scenario.lastState;
+        return;
+      }
       const pad = sample?.pad;
       if (pad === null || typeof pad !== "object") return;
       const held = Number(pad.held);
@@ -2197,14 +2231,34 @@ const TEMPLATE: &str = r##"<!doctype html>
         const pulse = scenario.pulse;
         const entry = scenario.steps.at(-1);
         if (pulse.owner === "page") {
+          const guestObserved = entry.guest === undefined || (
+            entry.guest.activeCycle !== null
+            && entry.guest.neutralCycle !== null
+          );
           if (
             pulse.state === "neutral"
             && entry.neutral.polls >= scenario.minimumNeutralPolls
+            && guestObserved
           ) {
             entry.completedCycle = cycle;
             entry.completedPollIndex = scenario.pollIndex;
             scenario.stepIndex += 1;
             scenario.pulse = null;
+          } else if (
+            pulse.state === "neutral"
+            && entry.guest !== undefined
+            && entry.neutral.polls >= scenario.maximumNeutralPolls
+          ) {
+            const missing = [
+              entry.guest.activeCycle === null ? "active" : null,
+              entry.guest.neutralCycle === null ? "neutral" : null,
+            ].filter(value => value !== null).join(", ");
+            failControllerScenario(
+              scenario,
+              cycle,
+              `guest did not observe ${missing} controller state`
+            );
+            return scenario.status;
           }
         } else if (pulse.state === "release") {
           const guestHadReleaseWindow = pulse.releaseServiceCycle !== null
@@ -2293,6 +2347,16 @@ const TEMPLATE: &str = r##"<!doctype html>
               scenario.nextRequestSequence + 1,
               step.input.neutral
             ),
+            ...(step.input.activeObserved === undefined ? {} : {
+              guest: {
+                activeCycle: null,
+                activePollIndex: null,
+                activeState: null,
+                neutralCycle: null,
+                neutralPollIndex: null,
+                neutralState: null,
+              },
+            }),
             completedCycle: null,
             completedPollIndex: null,
           };
@@ -2730,6 +2794,52 @@ const TEMPLATE: &str = r##"<!doctype html>
         ],
       };
     }
+
+    function createSuperMonkeyBallMainStickRoundtripScenarioDefinition() {
+      const neutral = {
+        buttons: 0,
+        stickX: 0x80,
+        stickY: 0x80,
+        cStickX: 0x80,
+        cStickY: 0x80,
+        triggerL: 0,
+        triggerR: 0,
+        analogA: 0,
+        analogB: 0,
+      };
+      const active = { ...neutral, stickX: 0x40 };
+      return {
+        id: "smb-main-stick-roundtrip",
+        gameIdentifier: "GMBE8P",
+        gameVersion: 0,
+        hardCycleLimit: 2_000_000_000,
+        pressPolls: 3,
+        minimumNeutralPolls: 3,
+        maximumNeutralPolls: 120,
+        sample: inspectSuperMonkeyBallMainStickRoundtripState,
+        describe: sample => sample,
+        steps: [{
+          id: "main-stick-left-roundtrip",
+          input: {
+            owner: "page",
+            active,
+            neutral,
+            activeObserved: sample =>
+              sample?.padStatus?.error === 0
+              && sample.padStatus.stickX === -64,
+            neutralObserved: sample =>
+              sample?.padStatus?.error === 0
+              && sample.padStatus.stickX === 0,
+          },
+          ready: sample =>
+            sample?.si?.pollIndex > 0
+            && sample.si.publishedChannels === 1
+            && sample.si.updatedChannels === 4
+            && sample?.padStatus?.error === 0
+            && sample.padStatus.stickX === 0,
+        }],
+      };
+    }
     __DISC_SOURCE_RUNTIME__
 
     async function fetchBinary(url, label) {
@@ -2900,6 +3010,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       : 1024;
     const stopOnFirstDsi = searchParams.get("stopOnFirstDsi") === "1";
     registerControllerScenario(createSuperMonkeyBallControllerScenarioDefinition());
+    // The public surface filters this diagnostic id; the debug harness keeps
+    // it available as a short, independently witnessed analog bring-up path.
+    registerControllerScenario(createSuperMonkeyBallMainStickRoundtripScenarioDefinition());
     const controllerScenario = selectControllerScenario(
       requestedControllerScenario,
       boot.identifier,
@@ -6326,6 +6439,21 @@ const TEMPLATE: &str = r##"<!doctype html>
         pressed: inspectPadStatus(controllerInfo + 0x18),
         released: inspectPadStatus(controllerInfo + 0x24),
         repeat: inspectPadStatus(controllerInfo + 0x30),
+      };
+    }
+
+    function inspectSuperMonkeyBallMainStickRoundtripState() {
+      const controller = inspectSuperMonkeyBallPad0();
+      if (controller === null) return null;
+      return {
+        cycle: cycles,
+        si: {
+          pollIndex: controllerPollIndex,
+          appliedSequence: controllerAppliedSequence,
+          publishedChannels: serialLastPublishedChannels,
+          updatedChannels: serialLastUpdatedChannels,
+        },
+        padStatus: controller.held,
       };
     }
 

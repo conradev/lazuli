@@ -38,14 +38,18 @@ function definitionHarness(sample) {
     Error,
     controllerScenarioDefinitions: new Map(),
     inspectSuperMonkeyBallScenarioState() { return sample; },
+    inspectSuperMonkeyBallMainStickRoundtripState() { return sample; },
   };
   vm.createContext(context);
   vm.runInContext([
+    "normalizeControllerState",
+    "controllerStatesEqual",
     "controllerScenarioInteger",
     "registerControllerScenario",
     "createControllerScenario",
     "selectControllerScenario",
     "createSuperMonkeyBallControllerScenarioDefinition",
+    "createSuperMonkeyBallMainStickRoundtripScenarioDefinition",
   ].map(extractFunction).join("\n\n"), context, {
     filename: "browser_boot.smb-scenario-definition.js",
   });
@@ -145,6 +149,71 @@ test("SMB scenario declares the exact B, Start x2, A x6 route", () => {
   assert.throws(
     () => context.selectControllerScenario("smb-ready-play", "GMBE8P", 0, 1),
     /requires disc revision 0, got 1/,
+  );
+});
+
+test("SMB debug roundtrip maps wire 0x40 to signed PADStatus -64 then neutral", () => {
+  const sample = {
+    cycle: 0,
+    si: { pollIndex: 1, publishedChannels: 1, updatedChannels: 4 },
+    padStatus: { error: 0, stickX: 0 },
+  };
+  const context = definitionHarness(sample);
+  const definition = context.createSuperMonkeyBallMainStickRoundtripScenarioDefinition();
+  context.registerControllerScenario(definition);
+  const step = definition.steps[0];
+
+  assert.equal(definition.id, "smb-main-stick-roundtrip");
+  assert.equal(definition.gameIdentifier, "GMBE8P");
+  assert.equal(definition.gameVersion, 0);
+  assert.equal(definition.hardCycleLimit, 2_000_000_000);
+  assert.equal(definition.pressPolls, 3);
+  assert.equal(definition.minimumNeutralPolls, 3);
+  assert.equal(definition.maximumNeutralPolls, 120);
+  assert.equal(step.id, "main-stick-left-roundtrip");
+  assert.equal(step.input.owner, "page");
+  assert.deepEqual(JSON.parse(JSON.stringify(step.input.active)), {
+    buttons: 0,
+    stickX: 0x40,
+    stickY: 0x80,
+    cStickX: 0x80,
+    cStickY: 0x80,
+    triggerL: 0,
+    triggerR: 0,
+    analogA: 0,
+    analogB: 0,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(step.input.neutral)), {
+    buttons: 0,
+    stickX: 0x80,
+    stickY: 0x80,
+    cStickX: 0x80,
+    cStickY: 0x80,
+    triggerL: 0,
+    triggerR: 0,
+    analogA: 0,
+    analogB: 0,
+  });
+  assert.equal(step.ready(sample), true);
+  assert.equal(step.input.activeObserved(sample), false);
+  assert.equal(step.input.neutralObserved(sample), true);
+  sample.si.pollIndex = 0;
+  assert.equal(step.ready(sample), false);
+  sample.si.pollIndex = 1;
+  sample.padStatus.stickX = -64;
+  assert.equal(step.ready(sample), false);
+  assert.equal(step.input.activeObserved(sample), true);
+  assert.equal(step.input.neutralObserved(sample), false);
+  sample.padStatus.error = -3;
+  assert.equal(step.input.activeObserved(sample), false);
+  assert.equal(
+    context.selectControllerScenario(
+      "smb-main-stick-roundtrip",
+      "GMBE8P",
+      0,
+      0,
+    ).status,
+    "running",
   );
 });
 
@@ -561,6 +630,78 @@ test("SMB scenario samples exact guest state and selected XFB provenance", () =>
   assert.equal(context.inspectSuperMonkeyBallScenarioState(), null);
 });
 
+test("SMB roundtrip sample reads the signed held PADStatus main stick", () => {
+  const memory = new ArrayBuffer(0x400000);
+  const view = new DataView(memory);
+  const context = {
+    boot: { identifier: "GMBE8P" },
+    controllerAppliedSequence: 7,
+    controllerPollIndex: 9,
+    cycles: 456,
+    ram: 0,
+    ramSize: memory.byteLength,
+    serialLastPublishedChannels: 1,
+    serialLastUpdatedChannels: 4,
+    view,
+  };
+  vm.createContext(context);
+  vm.runInContext([
+    "hex32",
+    "physicalOffset",
+    "ramPointer",
+    "inspectPadStatus",
+    "inspectSuperMonkeyBallPad0",
+    "inspectSuperMonkeyBallMainStickRoundtripState",
+  ].map(extractFunction).join("\n\n"), context, {
+    filename: "browser_boot.smb-stick-roundtrip-state.js",
+  });
+
+  const held = 0x1f3b70;
+  view.setUint16(held, 0, false);
+  view.setInt8(held + 2, -64);
+  view.setInt8(held + 3, 0);
+  view.setInt8(held + 4, 0);
+  view.setInt8(held + 5, 0);
+  view.setUint8(held + 6, 0);
+  view.setUint8(held + 7, 0);
+  view.setUint8(held + 8, 0);
+  view.setUint8(held + 9, 0);
+  view.setInt8(held + 10, 0);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.inspectSuperMonkeyBallMainStickRoundtripState())),
+    {
+      cycle: 456,
+      si: {
+        pollIndex: 9,
+        appliedSequence: 7,
+        publishedChannels: 1,
+        updatedChannels: 4,
+      },
+      padStatus: {
+        address: "0x801f3b70",
+        buttons: 0,
+        stickX: -64,
+        stickY: 0,
+        cStickX: 0,
+        cStickY: 0,
+        triggerL: 0,
+        triggerR: 0,
+        analogA: 0,
+        analogB: 0,
+        error: 0,
+      },
+    },
+  );
+  view.setInt8(held + 2, 0);
+  assert.equal(
+    context.inspectSuperMonkeyBallMainStickRoundtripState().padStatus.stickX,
+    0,
+  );
+  context.boot.identifier = "GZWE01";
+  assert.equal(context.inspectSuperMonkeyBallMainStickRoundtripState(), null);
+});
+
 test("only the SMB scenario crosses the public runner-search boundary", () => {
   const context = { URLSearchParams };
   vm.createContext(context);
@@ -572,6 +713,10 @@ test("only the SMB scenario crosses the public runner-search boundary", () => {
   );
   assert.equal(context.runnerSearchForSurface(false, "?cycles=10"), "");
   assert.equal(context.runnerSearchForSurface(false, "?scenario=anything"), "");
+  assert.equal(
+    context.runnerSearchForSurface(false, "?scenario=smb-main-stick-roundtrip"),
+    "",
+  );
   assert.equal(
     context.runnerSearchForSurface(false, "?cycles=10&scenario=smb-ready-play&restMs=99"),
     "?scenario=smb-ready-play",
@@ -590,4 +735,8 @@ test("only the SMB scenario crosses the public runner-search boundary", () => {
     /globalThis\.runnerScenarioOptional = \$\{JSON\.stringify\(!debugSurface\)\}/,
   );
   assert.match(source, /controllerScenarioInputExclusive = controllerScenario !== null/);
+  assert.match(
+    source,
+    /registerControllerScenario\(createSuperMonkeyBallMainStickRoundtripScenarioDefinition\(\)\)/,
+  );
 });
