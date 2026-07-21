@@ -468,3 +468,121 @@ test("SI cadence is stateful across X changes and field boundaries", () => {
   assert.equal(context.nextStatefulSerialPollCycle(526), 541);
   assert.equal(context.nextStatefulSerialPollCycle(541), 1066);
 });
+
+test("Super Monkey Ball snapshots expose PADRead edge state", () => {
+  const memory = new ArrayBuffer(0x200000);
+  const view = new DataView(memory);
+  const context = {
+    boot: { identifier: "GMBE8P" },
+    ram: 0,
+    ramSize: memory.byteLength,
+    view,
+  };
+  vm.createContext(context);
+  vm.runInContext([
+    "physicalOffset",
+    "ramPointer",
+    "hex32",
+    "inspectPadStatus",
+    "inspectSuperMonkeyBallPad0",
+  ].map(extractFunction).join("\n\n"), context, {
+    filename: "browser_boot.pad-diagnostics.js",
+  });
+
+  const base = 0x1f3b70;
+  const buttons = [0x0100, 0x0000, 0x0100, 0x0000, 0x0008];
+  for (const [index, value] of buttons.entries()) {
+    const pointer = base + index * 0x0c;
+    view.setUint16(pointer, value, false);
+    view.setInt8(pointer + 2, -64 + index);
+    view.setInt8(pointer + 3, 63 - index);
+    view.setUint8(pointer + 8, value === 0x0100 ? 0xff : 0);
+    view.setInt8(pointer + 10, index === 2 ? -1 : 0);
+  }
+
+  const snapshot = JSON.parse(JSON.stringify(context.inspectSuperMonkeyBallPad0()));
+  assert.equal(snapshot.controllerInfo, "0x801f3b70");
+  assert.deepEqual(
+    Object.fromEntries(
+      ["held", "previous", "pressed", "released", "repeat"]
+        .map(name => [name, snapshot[name].buttons]),
+    ),
+    {
+      held: 0x0100,
+      previous: 0x0000,
+      pressed: 0x0100,
+      released: 0x0000,
+      repeat: 0x0008,
+    },
+  );
+  assert.deepEqual(
+    {
+      address: snapshot.pressed.address,
+      stickX: snapshot.pressed.stickX,
+      stickY: snapshot.pressed.stickY,
+      analogA: snapshot.pressed.analogA,
+      error: snapshot.pressed.error,
+    },
+    {
+      address: "0x801f3b88",
+      stickX: -62,
+      stickY: 61,
+      analogA: 0xff,
+      error: -1,
+    },
+  );
+
+  context.boot.identifier = "GZWE01";
+  assert.equal(context.inspectSuperMonkeyBallPad0(), null);
+});
+
+test("Super Monkey Ball snapshots expose the exact READY-to-play gate", () => {
+  const memory = new ArrayBuffer(0x400000);
+  const view = new DataView(memory);
+  const context = {
+    boot: { identifier: "GMBE8P" },
+    ram: 0,
+    ramSize: memory.byteLength,
+    view,
+  };
+  vm.createContext(context);
+  vm.runInContext([
+    "physicalOffset",
+    "ramPointer",
+    "guestU32",
+    "guestS32",
+    "guestS16",
+    "hex32",
+    "inspectSuperMonkeyBallGameState",
+  ].map(extractFunction).join("\n\n"), context, {
+    filename: "browser_boot.smb-game-state-diagnostics.js",
+  });
+
+  view.setInt32(0x1eec20, 119, false);
+  view.setInt16(0x2f1b8c, -1, false);
+  view.setInt16(0x2f1b8e, 0x31, false);
+  view.setUint32(0x2f1ee0, 0x00000008, false);
+
+  const paused = JSON.parse(JSON.stringify(context.inspectSuperMonkeyBallGameState()));
+  assert.deepEqual(paused, {
+    modeControl: "0x801eec20",
+    gamePauseStatusAddress: "0x802f1ee0",
+    gameSubmodeRequestAddress: "0x802f1b8c",
+    gameSubmodeAddress: "0x802f1b8e",
+    pauseStatus: "0x00000008",
+    readyPauseGateActive: true,
+    submodeTimer: 119,
+    submodeRequest: -1,
+    submode: 0x31,
+    readyMain: true,
+    playRequested: false,
+  });
+
+  view.setUint32(0x2f1ee0, 0, false);
+  view.setInt16(0x2f1b8c, 0x32, false);
+  assert.equal(context.inspectSuperMonkeyBallGameState().readyPauseGateActive, false);
+  assert.equal(context.inspectSuperMonkeyBallGameState().playRequested, true);
+
+  context.boot.identifier = "GZWE01";
+  assert.equal(context.inspectSuperMonkeyBallGameState(), null);
+});
