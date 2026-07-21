@@ -41,7 +41,9 @@ import {
 
 export {
   BROWSER_BOOT_CHECKPOINT_FIELDS,
+  BROWSER_BOOT_CHECKPOINT_FIELDS_V3,
   BROWSER_BOOT_CHECKPOINT_SCHEMA,
+  BROWSER_BOOT_CHECKPOINT_SCHEMA_V3,
   CheckpointValidationError,
   SUPER_MONKEY_BALL_CHECKPOINT,
   canonicalStringify,
@@ -50,8 +52,12 @@ export {
   projectCheckpointReport,
   validateCheckpointReport,
 } from "./browser_boot_checkpoint_core.mjs";
+export {
+  SUPER_MONKEY_BALL_READY_CHECKPOINT,
+} from "./browser_boot_checkpoint_v3.mjs";
 
 const MISSING = Symbol("missing checkpoint value");
+const SMB_READY_CHECKPOINT_PROFILE = "smb-ready-play";
 const SMB_READY_CHECKPOINT_TITLE = "Super Monkey Ball (GMBE8P Rev.00)";
 
 const RENDERER_MAXIMUM_METRICS = Object.freeze([
@@ -232,6 +238,51 @@ function requireExactCheckpointValue(value, expected, path) {
   return value;
 }
 
+function requireFreshHeadlessRun(report, path) {
+  requireCheckpointObject(report, path);
+  const capturePath = checkpointChildPath(path, "headlessCapture");
+  const capture = requireCheckpointObject(report.headlessCapture, capturePath);
+  requireExactCheckpointValue(
+    capture.reuse,
+    null,
+    checkpointChildPath(capturePath, "reuse"),
+  );
+  const urlPath = checkpointChildPath(capturePath, "url");
+  if (typeof capture.url !== "string" || capture.url.length === 0) {
+    checkpointValidationFailure(urlPath, "expected an absolute run URL");
+  }
+  let url;
+  try {
+    url = new URL(capture.url);
+  } catch {
+    checkpointValidationFailure(urlPath, "expected an absolute run URL");
+  }
+  const runIds = url.searchParams.getAll("headlessRun");
+  if (runIds.length !== 1 || runIds[0].trim().length === 0) {
+    checkpointValidationFailure(
+      urlPath,
+      "expected exactly one non-empty headlessRun query ID",
+    );
+  }
+  return runIds[0];
+}
+
+function validateFreshRunConsensus(reports) {
+  const runIdPaths = new Map();
+  for (const [index, report] of reports.entries()) {
+    const reportPath = checkpointChildPath("$runs", index);
+    const runId = requireFreshHeadlessRun(report, reportPath);
+    const urlPath = `${reportPath}.headlessCapture.url`;
+    if (runIdPaths.has(runId)) {
+      checkpointValidationFailure(
+        urlPath,
+        `headlessRun query ID duplicates ${runIdPaths.get(runId)}`,
+      );
+    }
+    runIdPaths.set(runId, urlPath);
+  }
+}
+
 function rebaseEvidencePath(base, path) {
   if (path === "$" || path === "$." || typeof path !== "string") return base;
   if (path.startsWith("$.")) return `${base}${path.slice(1)}`;
@@ -348,10 +399,50 @@ function smbReadyCheckpointIdentity(expected, state) {
   };
 }
 
+function createSmbReadyCheckpointManifest(reports, expected) {
+  validateSmbReadyCheckpointOptions(expected);
+  if (!Array.isArray(reports) || reports.length < expected.run.cleanRunsRequired) {
+    checkpointValidationFailure(
+      "$runs",
+      `at least ${expected.run.cleanRunsRequired} clean reports are required to bless a golden`,
+    );
+  }
+  validateFreshRunConsensus(reports);
+  const candidates = reports.map(report =>
+    createSmbReadyCheckpointCandidate(report, expected)
+  );
+  const first = candidates[0];
+  for (let index = 1; index < candidates.length; index += 1) {
+    for (const field of ["game", "checkpoint", "run", "state"]) {
+      const difference = firstDifference(
+        first[field],
+        candidates[index][field],
+        `$runs[${index}].${field}`,
+      );
+      if (difference !== null) {
+        throw new CheckpointMismatchError(
+          difference.path,
+          difference.expected,
+          difference.actual,
+          first.sha256,
+          candidates[index].sha256,
+        );
+      }
+    }
+  }
+  return {
+    ...first,
+    consensus: { cleanRuns: reports.length },
+  };
+}
+
 export function createCheckpointManifest(
   reports,
   expected = SUPER_MONKEY_BALL_CHECKPOINT,
 ) {
+  if (expected?.schema === BROWSER_BOOT_CHECKPOINT_SCHEMA_V3) {
+    return createSmbReadyCheckpointManifest(reports, expected);
+  }
   validateCheckpointOptions(expected);
   if (!Array.isArray(reports) || reports.length < expected.run.cleanRunsRequired) {
     checkpointValidationFailure(
@@ -543,6 +634,7 @@ export function verifyCheckpointReport(report, manifest) {
   if (manifest.schema === BROWSER_BOOT_CHECKPOINT_SCHEMA_V3) {
     const expected = smbReadyManifestProfile(manifest);
     validateSmbReadyCheckpointOptions(expected, "$manifest");
+    requireFreshHeadlessRun(report, "$");
     candidate = createSmbReadyCheckpointCandidate(report, expected);
   } else {
     const expected = {
@@ -619,28 +711,40 @@ async function persistManifest(output, manifest) {
 async function main(argv) {
   const inputs = [];
   let output = null;
+  let profile = null;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--output") {
       index += 1;
       if (index >= argv.length) throw new Error("missing value after --output");
       output = argv[index];
+    } else if (argument === "--profile") {
+      index += 1;
+      if (index >= argv.length) throw new Error("missing value after --profile");
+      profile = argv[index];
     } else if (argument.startsWith("-")) {
       throw new Error(`unknown argument ${argument}`);
     } else {
       inputs.push(argument);
     }
   }
+  let expected = SUPER_MONKEY_BALL_CHECKPOINT;
+  if (profile === SMB_READY_CHECKPOINT_PROFILE) {
+    expected = SUPER_MONKEY_BALL_READY_CHECKPOINT;
+  } else if (profile !== null) {
+    throw new Error(`unknown checkpoint profile ${JSON.stringify(profile)}`);
+  }
   if (inputs.length < 3) {
     throw new Error(
       "usage: browser_boot_checkpoint.mjs <run-1.json> <run-2.json> <run-3.json>"
-      + " [more-runs.json ...] [--output <manifest.json>]",
+      + " [more-runs.json ...] [--profile smb-ready-play]"
+      + " [--output <manifest.json>]",
     );
   }
   const reports = await Promise.all(inputs.map(async input =>
     JSON.parse(await readFile(input, "utf8"))
   ));
-  await persistManifest(output, createCheckpointManifest(reports));
+  await persistManifest(output, createCheckpointManifest(reports, expected));
 }
 
 const invokedPath = process.argv[1] === undefined
