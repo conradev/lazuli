@@ -1355,6 +1355,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const gxXfRegisters = new Uint32Array(0x1058);
     const gxTevColorRegisters = Array.from({ length: 4 }, () => [0, 0, 0, 0]);
     const gxTevKonstRegisters = Array.from({ length: 4 }, () => [0, 0, 0, 0]);
+    gxBpRegisters[0xf3] = 0x003f0000;
     gxBpRegisters[0xfe] = 0x00ffffff;
     const gxXfbCopies = [];
     const gxTextureCopies = [];
@@ -1411,7 +1412,6 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxVertexDecodeErrors = 0;
     let gxUnknownOpcodes = 0;
     let gxTextureDecodes = 0;
-    gxBpRegisters[0xf3] = 0x003f0000;
     let gxTextureCacheHits = 0;
     let gxTextureDecodedBytes = 0;
     let gxTextureDecodeErrors = 0;
@@ -1795,44 +1795,52 @@ const TEMPLATE: &str = r##"<!doctype html>
       const info = gxXfRegisters[0x1040 + texgenIndex] >>> 0;
       const projection = (info >>> 1) & 1;
       const inputForm = (info >>> 2) & 1;
-      const texgenType = (info >>> 4) & 7;
+      const texgenType = (info >>> 4) & 3;
       const sourceRow = (info >>> 7) & 0x1f;
-      const sourceTexture = sourceRow - 5;
-      const raw = sourceTexture >= 0 && sourceTexture < rawTextureCoords.length
-        ? rawTextureCoords[sourceTexture]
-        : rawTextureCoords[0];
-      if (raw === null || raw === undefined) return null;
-      if (
-        texgenCount === 0 || texgenType !== 0
-        || sourceTexture < 0 || sourceTexture >= rawTextureCoords.length
-      ) {
-        return raw;
+      let source;
+      if (sourceRow === 0) source = attributes.position;
+      if (sourceRow === 1) source = attributes.normal;
+      if (sourceRow === 2) {
+        source = attributes.colors[texgenType === 3 ? 1 : 0];
       }
-      const row0 = gxXfMatrixRow(0, matrixIndex);
-      const row1 = gxXfMatrixRow(0, matrixIndex + 1);
-      const row2 = projection !== 0 ? gxXfMatrixRow(0, matrixIndex + 2) : null;
-      if (row0 === null || row1 === null || (projection !== 0 && row2 === null)) {
-        gxTexgenFallbacks += 1;
-        return raw;
+      if (sourceRow === 3) source = attributes.tangent;
+      if (sourceRow === 4) source = attributes.binormal;
+      if (sourceRow >= 5 && sourceRow <= 12) {
+        source = attributes.rawTextureCoords[sourceRow - 5];
       }
-      const input = [raw[0] ?? 0, raw[1] ?? 0, inputForm !== 0 ? (raw[2] ?? 1) : 1, 1];
-      let result = [gxDot4(row0, input), gxDot4(row1, input), 1];
-      if (projection !== 0) result[2] = gxDot4(row2, input);
+      if (source === null || source === undefined) return null;
+
+      const input = inputForm === 0
+        ? [source[0] ?? 0, source[1] ?? 0, 1, 1]
+        : [source[0] ?? 0, source[1] ?? 0, source[2] ?? 0, 1];
+      let transformed;
+      if (texgenType === 0) {
+        const row0 = gxXfMatrixRow(0, matrixIndex);
+        const row1 = gxXfMatrixRow(0, matrixIndex + 1);
+        const row2 = gxXfMatrixRow(0, matrixIndex + 2);
+        if (row0 === null || row1 === null || row2 === null) return null;
+        transformed = [gxDot4(row0, input), gxDot4(row1, input), gxDot4(row2, input)];
+      } else if (texgenType === 1) {
+        // Emboss texgen is not used by either browser bring-up title yet. GX's
+        // base operation leaves its selected source available to the post matrix.
+        transformed = input.slice(0, 3);
+      } else {
+        transformed = [source[0] ?? 0, source[1] ?? 0, 1];
+      }
+      let result = projection === 0
+        ? [transformed[0], transformed[1], 1]
+        : transformed;
       if ((gxXfRegisters[0x1012] & 1) !== 0) {
         const postInfo = gxXfRegisters[0x1050 + texgenIndex] >>> 0;
         if ((postInfo & 0x100) !== 0) {
-          const length = Math.hypot(result[0], result[1], result[2]);
-          if (Number.isFinite(length) && length > 1e-12) {
-            result = result.map(value => value / length);
-          }
+          result = gxNormalize3(result);
         }
         const postIndex = postInfo & 0x3f;
         const post0 = gxXfMatrixRow(0x500, postIndex);
         const post1 = gxXfMatrixRow(0x500, (postIndex + 1) & 0x3f);
         const post2 = gxXfMatrixRow(0x500, (postIndex + 2) & 0x3f);
         if (post0 === null || post1 === null || post2 === null) {
-          gxTexgenFallbacks += 1;
-          return raw;
+          return null;
         }
         result = [
           post0[0] * result[0] + post0[1] * result[1]
@@ -1843,12 +1851,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             + post2[2] * result[2] + post2[3],
         ];
       }
-      if (!result.every(Number.isFinite) || Math.abs(result[2]) < 1e-12) {
-        gxTexgenFallbacks += 1;
-        return raw;
-      }
+      if (!result.every(Number.isFinite)) return null;
       gxTexgenTransforms += 1;
-      return [result[0] / result[2], result[1] / result[2]];
+      return result;
     }
 
     function gxAttributeStatus(index) {
@@ -1869,8 +1874,16 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function viXfbAddressFromRaw(value, topValue) {
       const base = value & 0x00ffffff;
-      const top = view.getUint32(mmio + 0x201c, false);
-      return (top & 0x10000000) !== 0 ? (base << 5) >>> 0 : base;
+      // VI exposes one POFF line shared by TFBL and BFBL. When asserted,
+      // both packed 24-bit framebuffer bases are expressed in 32-byte units.
+      return (topValue & 0x10000000) !== 0 ? (base << 5) >>> 0 : base;
+    }
+
+    function viXfbAddress(offset) {
+      return viXfbAddressFromRaw(
+        view.getUint32(mmio + offset, false),
+        view.getUint32(mmio + 0x201c, false)
+      );
     }
 
     function gxVertexSize(vatIndex) {
@@ -2001,77 +2014,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function gxTextureRegisters(textureMap) {
-      const slot = textureMap & 3;
-      const bank = textureMap >= 4 ? 0x20 : 0;
-      return {
-        mode0: 0x80 + bank + slot,
-        image0: 0x88 + bank + slot,
-        image3: 0x94 + bank + slot,
-        tlut: 0x98 + bank + slot,
-      };
-    }
-
-    function gxRecordTextureCopyGeneration(address, index, captured) {
-      if (!captured) {
-        if (gxTextureCopyDestinations.has(address)) {
-          gxTextureCopyCapturedSurfacesRetained += 1;
-        }
-        return;
-      }
-      gxTextureCopyDestinations.delete(address);
-      gxTextureCopyDestinations.set(address, index);
-      if (gxTextureCopyDestinations.size > 64) {
-        gxTextureCopyDestinations.delete(gxTextureCopyDestinations.keys().next().value);
-      }
-    }
-
-    function gxRememberTextureCopyConsumer(address) {
-      gxTextureCopyConsumers.delete(address);
-      gxTextureCopyConsumers.set(address, gxXfbCopyCount);
-      if (gxTextureCopyConsumers.size > 128) {
-        gxTextureCopyConsumers.delete(gxTextureCopyConsumers.keys().next().value);
-      }
-    }
-
-    function gxShouldCollectNextXfb() {
-      const nextFrame = gxXfbCopyCount + 1;
-      return nextFrame <= 4
-        || nextFrame % runnerRenderEvery === 0
-        || nextFrame <= gxTextureCopyCaptureThroughXfb;
-    }
-
-    function gxPrearmTextureCopyProducer(address) {
-      if (!gxTextureCopyConsumers.has(address)) return false;
-      if (gxFrameSkippedPrimitives !== 0) {
-        gxTextureCopyProducerLateArms += 1;
-        return false;
-      }
-      gxTextureCopyProducerPreArms += 1;
-      gxCollectFrameGeometry = true;
-      return true;
-    }
-
-    function gxMarkTextureCopyConsumer(address) {
-      // Texture image registers can point at an EFB-copy destination before its
-      // first copy exists. Remember that prospective consumer so the matching
-      // copy producer can arm geometry collection before drawing its source.
-      gxRememberTextureCopyConsumer(address);
-      if (!gxTextureCopyDestinations.has(address)) return false;
-      const nextXfbCopy = gxXfbCopyCount + 1;
-      const framesUntilSample = nextXfbCopy <= 4 || runnerRenderEvery <= 1
-        ? 0
-        : (runnerRenderEvery - (nextXfbCopy % runnerRenderEvery)) % runnerRenderEvery;
-      // A copied EFB surface only needs to be current when its consuming XFB
-      // frame will be presented. Re-arming on every texture lookup otherwise
-      // defeats renderEvery and makes sparse browser rendering fully sampled.
-      if (framesUntilSample > 4) {
-        gxTextureCopyCaptureDeferrals += 1;
-        return true;
-      }
-      gxTextureCopyCaptureArms += 1;
-      gxTextureCopyCaptureThroughXfb = Math.max(
-        gxTextureCopyCaptureThroughXfb,
     function gxDecodeNormalAttribute(
       source, cursor, status, elements, format, separateIndices
     ) {
@@ -2266,6 +2208,77 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
 
+    function gxTextureRegisters(textureMap) {
+      const slot = textureMap & 3;
+      const bank = textureMap >= 4 ? 0x20 : 0;
+      return {
+        mode0: 0x80 + bank + slot,
+        image0: 0x88 + bank + slot,
+        image3: 0x94 + bank + slot,
+        tlut: 0x98 + bank + slot,
+      };
+    }
+
+    function gxRecordTextureCopyGeneration(address, index, captured) {
+      if (!captured) {
+        if (gxTextureCopyDestinations.has(address)) {
+          gxTextureCopyCapturedSurfacesRetained += 1;
+        }
+        return;
+      }
+      gxTextureCopyDestinations.delete(address);
+      gxTextureCopyDestinations.set(address, index);
+      if (gxTextureCopyDestinations.size > 64) {
+        gxTextureCopyDestinations.delete(gxTextureCopyDestinations.keys().next().value);
+      }
+    }
+
+    function gxRememberTextureCopyConsumer(address) {
+      gxTextureCopyConsumers.delete(address);
+      gxTextureCopyConsumers.set(address, gxXfbCopyCount);
+      if (gxTextureCopyConsumers.size > 128) {
+        gxTextureCopyConsumers.delete(gxTextureCopyConsumers.keys().next().value);
+      }
+    }
+
+    function gxShouldCollectNextXfb() {
+      const nextFrame = gxXfbCopyCount + 1;
+      return nextFrame <= 4
+        || nextFrame % runnerRenderEvery === 0
+        || nextFrame <= gxTextureCopyCaptureThroughXfb;
+    }
+
+    function gxPrearmTextureCopyProducer(address) {
+      if (!gxTextureCopyConsumers.has(address)) return false;
+      if (gxFrameSkippedPrimitives !== 0) {
+        gxTextureCopyProducerLateArms += 1;
+        return false;
+      }
+      gxTextureCopyProducerPreArms += 1;
+      gxCollectFrameGeometry = true;
+      return true;
+    }
+
+    function gxMarkTextureCopyConsumer(address) {
+      // Texture image registers can point at an EFB-copy destination before its
+      // first copy exists. Remember that prospective consumer so the matching
+      // copy producer can arm geometry collection before drawing its source.
+      gxRememberTextureCopyConsumer(address);
+      if (!gxTextureCopyDestinations.has(address)) return false;
+      const nextXfbCopy = gxXfbCopyCount + 1;
+      const framesUntilSample = nextXfbCopy <= 4 || runnerRenderEvery <= 1
+        ? 0
+        : (runnerRenderEvery - (nextXfbCopy % runnerRenderEvery)) % runnerRenderEvery;
+      // A copied EFB surface only needs to be current when its consuming XFB
+      // frame will be presented. Re-arming on every texture lookup otherwise
+      // defeats renderEvery and makes sparse browser rendering fully sampled.
+      if (framesUntilSample > 4) {
+        gxTextureCopyCaptureDeferrals += 1;
+        return true;
+      }
+      gxTextureCopyCaptureArms += 1;
+      gxTextureCopyCaptureThroughXfb = Math.max(
+        gxTextureCopyCaptureThroughXfb,
         gxXfbCopyCount + 4
       );
       gxCollectFrameGeometry = true;
@@ -2683,6 +2696,62 @@ const TEMPLATE: &str = r##"<!doctype html>
       return [rg & 3, (rg >>> 2) & 3, ba & 3, (ba >>> 2) & 3];
     }
 
+    function gxPackTevState(stages) {
+      const buffer = new ArrayBuffer(464);
+      const state = new DataView(buffer);
+      const stageCount = Math.min(16, stages.length);
+      for (let index = 0; index < stageCount; index += 1) {
+        const stage = stages[index];
+        const offset = index * 16;
+        const refs = (stage.textureMap & 7)
+          | ((stage.texCoordIndex & 7) << 3)
+          | (Number(stage.textureEnabled) << 6)
+          | ((stage.colorChannel & 7) << 7);
+        const konstSelectors = (stage.konstColorSelector & 0x1f)
+          | ((stage.konstAlphaSelector & 0x1f) << 5);
+        state.setUint32(offset, stage.colorCombiner & 0x00ffffff, true);
+        state.setUint32(offset + 4, stage.alphaCombiner & 0x00ffffff, true);
+        state.setUint32(offset + 8, refs, true);
+        state.setUint32(offset + 12, konstSelectors, true);
+      }
+      for (let register = 0; register < 4; register += 1) {
+        for (let component = 0; component < 4; component += 1) {
+          state.setInt32(
+            256 + (register * 4 + component) * 4,
+            gxTevColorRegisters[register][component],
+            true
+          );
+          state.setInt32(
+            320 + (register * 4 + component) * 4,
+            gxTevKonstRegisters[register][component],
+            true
+          );
+          state.setUint32(
+            384 + (register * 4 + component) * 4,
+            gxTevSwapTable(register)[component],
+            true
+          );
+        }
+      }
+      state.setUint32(448, stageCount, true);
+      return new Uint8Array(buffer);
+    }
+
+    function gxTevTextures(stages) {
+      const textures = Array(8).fill(null);
+      for (const stage of stages) {
+        if (!stage.textureEnabled || textures[stage.textureMap] !== null) continue;
+        const texture = gxDecodeTexture(stage.textureMap);
+        if (texture === null) {
+          throw new Error(
+            `GX TEV stage ${stage.index} requires undecodable texture map ${stage.textureMap}`
+          );
+        }
+        textures[stage.textureMap] = texture;
+      }
+      return textures;
+    }
+
     function gxTevSwizzle(color, tableIndex) {
       const table = gxTevSwapTable(tableIndex);
       return table.map(channel => color[channel] ?? 0);
@@ -2741,6 +2810,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxTevRegular(a, b, c, d, combiner) {
+      // GX stores TEV registers as signed 11-bit values, but the A, B, and C
+      // combiner inputs are read through 8-bit lanes. D retains the signed
+      // value so intermediate add/subtract stages can use the extended range.
+      a &= 0xff;
+      b &= 0xff;
+      c &= 0xff;
       const mixed = ((255 - c) * a + c * b + 127) / 255;
       let result = ((combiner >>> 18) & 1) !== 0 ? d - mixed : d + mixed;
       const bias = (combiner >>> 16) & 3;
@@ -2973,10 +3048,8 @@ const TEMPLATE: &str = r##"<!doctype html>
               const colorInput = argument => Array.from(
                 { length: 3 }, (_unused, channel) =>
                   gxTevColorArgument(
-                    colorArgs.d, channel, registers, textureColor, raster, konstColor
-                  ),
-                  stage.colorCombiner
-                )
+                    argument, channel, registers, textureColor, raster, konstColor
+                  )
               );
               const colorA = colorInput(colorArgs.a);
               const colorB = colorInput(colorArgs.b);
@@ -3079,6 +3152,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         clipX / clipW * viewport[0] + viewport[3] - scissorX * 2,
         clipY / clipW * viewport[1] + viewport[4] - scissorY * 2,
         clipZ / clipW * viewport[2] + viewport[5],
+        clipW,
       ];
     }
 
@@ -3149,8 +3223,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           source, cursor, status, 2 + colorIndex, directBytes
         );
         cursor = colorSource.cursor;
-        if (colorIndex === 0 && colorSource.source !== null) {
-          color = gxDecodeColor(colorSource.source, colorSource.offset, format);
+        if (colorSource.source !== null) {
+          colors[colorIndex] = gxDecodeColor(colorSource.source, colorSource.offset, format);
         }
       }
 
@@ -3187,11 +3261,25 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (rawTextureCoords[texture].length === 1) rawTextureCoords[texture].push(0);
         }
       }
+      const viewPosition = gxTransformPosition(position, positionMatrix);
+      const projected = gxProjectPosition(position, positionMatrix);
+      const normal = gxTransformNormal(normalAttribute.normal, positionMatrix);
+      const tangent = gxTransformNormal(normalAttribute.tangent, positionMatrix);
+      const binormal = gxTransformNormal(normalAttribute.binormal, positionMatrix);
+      const rasterColors = viewPosition === null
+        ? colors.map(color => color.map(value => value / 255))
+        : gxLightRasterChannels(viewPosition, normal, colors);
+      const texgenAttributes = {
+        position,
+        normal: normalAttribute.normal,
+        tangent: normalAttribute.tangent,
+        binormal: normalAttribute.binormal,
+        colors: rasterColors,
+        rawTextureCoords,
+      };
       const texCoords = textureMatrices.map((matrixIndex, texgenIndex) =>
         gxTransformTexCoord(texgenAttributes, matrixIndex, texgenIndex)
       );
-
-      const projected = gxProjectPosition(position, positionMatrix);
       return {
         cursor,
         projected,
@@ -3209,6 +3297,43 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function gxDrawPipelineState() {
+      const topLeft = gxBpRegisters[0x20] >>> 0;
+      const bottomRight = gxBpRegisters[0x21] >>> 0;
+      const offset = gxBpRegisters[0x59] >>> 0;
+      const topLeftX = Math.max(0, ((topLeft >>> 12) & 0x7ff) - 342);
+      const topLeftY = Math.max(0, (topLeft & 0x7ff) - 342);
+      const width = Math.max(
+        0,
+        ((bottomRight >>> 12) & 0x7ff) - ((topLeft >>> 12) & 0x7ff)
+      ) + 1;
+      const height = Math.max(
+        0,
+        (bottomRight & 0x7ff) - (topLeft & 0x7ff)
+      ) + 1;
+      const offsetX = (offset & 0x3ff) * 2 - 342;
+      const offsetY = ((offset >>> 10) & 0x3ff) * 2 - 342;
+      const scissorX = Math.min(640, Math.max(0, topLeftX - offsetX));
+      const scissorY = Math.min(528, Math.max(0, topLeftY - offsetY));
+      return {
+        zMode: gxBpRegisters[0x40] >>> 0,
+        blendMode: gxBpRegisters[0x41] >>> 0,
+        alphaTest: gxBpRegisters[0xf3] >>> 0,
+        cullMode: (gxBpRegisters[0x00] >>> 14) & 3,
+        scissorX,
+        scissorY,
+        scissorWidth: Math.min(width, 640 - scissorX),
+        scissorHeight: Math.min(height, 528 - scissorY),
+      };
+    }
+
+    function gxDrawTexCoords(textureResult, selectedTexCoords) {
+      // Missing or unusable texcoords make gxTextureForDraw deliberately
+      // return null. Keep those primitives untextured instead of forwarding
+      // one null placeholder per vertex as a malformed UV array.
+      return textureResult === null ? [] : selectedTexCoords.flat();
+    }
+
     function recordGxPrimitive(opcode, source, payloadOffset, vertexCount, vertexSize) {
       if (!gxCollectFrameGeometry) {
         gxSkippedGeometryPrimitives += 1;
@@ -3219,6 +3344,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       const vertices = [];
       const texCoordSets = Array.from({ length: 8 }, () => []);
       const rawTextureCoordSets = Array.from({ length: 8 }, () => []);
+      const rasterColorSets = Array.from({ length: 2 }, () => []);
+      const normalSet = [];
       let textureMatrices = null;
       let complete = true;
       for (let vertex = 0; vertex < vertexCount; vertex += 1) {
@@ -3232,33 +3359,64 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
         gxDecodedVertices += 1;
         gxProjectedVertices += 1;
+        const raster0 = decoded.rasterColors?.[0]
+          ?? decoded.colors[0].map(value => value / 255);
+        const raster1 = decoded.rasterColors?.[1]
+          ?? decoded.colors[1].map(value => value / 255);
         vertices.push(
           decoded.projected[0], decoded.projected[1], decoded.projected[2],
-          decoded.color[0] / 255, decoded.color[1] / 255,
-          decoded.color[2] / 255, decoded.color[3] / 255
+          decoded.projected[3],
+          ...raster0,
+          ...raster1
         );
         for (let texgen = 0; texgen < 8; texgen += 1) {
-          texCoordSets[texgen].push(decoded.texCoords[texgen]);
+          const texCoord = decoded.texCoords[texgen];
+          texCoordSets[texgen].push(texCoord);
           rawTextureCoordSets[texgen].push(decoded.rawTextureCoords[texgen]);
+          vertices.push(...(texCoord ?? [0, 0, 1]));
         }
+        rasterColorSets[0].push(raster0);
+        rasterColorSets[1].push(raster1);
+        normalSet.push(decoded.normal);
         textureMatrices = decoded.textureMatrices;
       }
       if (!complete || vertices.length === 0) return;
       gxFrameDrawVertices += vertexCount;
-      const textureResult = gxTextureForDraw(vertices, texCoordSets);
-      const texCoordIndex = textureResult?.texCoordIndex
-        ?? ((gxBpRegisters[0x28] >>> 3) & 7);
+      const stageCount = Math.min(16, ((gxBpRegisters[0x00] >>> 10) & 0xf) + 1);
+      const stages = Array.from({ length: stageCount }, (_unused, stageIndex) =>
+        gxTevStageState(stageIndex)
+      );
+      for (const stage of stages) {
+        if (!stage.textureEnabled) continue;
+        const coords = texCoordSets[stage.texCoordIndex];
+        if (!gxTevCoordsValid(coords, vertexCount) || coords.some(coord => coord.length < 3)) {
+          throw new Error(
+            `GX TEV stage ${stage.index} requires invalid texcoord ${stage.texCoordIndex}`
+          );
+        }
+      }
+      const textures = gxTevTextures(stages);
+      const texturedStages = stages.filter(stage => stage.textureEnabled);
+      if (texturedStages.length !== 0) {
+        gxTexturedDraws += 1;
+        statusDataset.gxTextures = String(gxTexturedDraws);
+      }
+      const tevMode = `per-fragment-stage-${stageCount}`;
+      gxTevModeCounts.set(tevMode, (gxTevModeCounts.get(tevMode) ?? 0) + 1);
+      const texCoordIndex = texturedStages[0]?.texCoordIndex ?? 0;
       const selectedTexCoords = texCoordSets[texCoordIndex];
       const draw = {
         topology: (opcode >>> 3) & 7,
         vat: opcode & 7,
         vertexCount,
-        vertices,
-        texCoordIndex,
-        texCoords: selectedTexCoords.flat(),
+        // Renderer frames cross a Worker boundary. Keep the GPU-bound payload
+        // in its final f32 representation so structured cloning does not walk
+        // and duplicate one boxed JavaScript number per vertex component.
+        vertices: new Float32Array(vertices),
+        textures,
+        tevState: gxPackTevState(stages),
+        pipeline: gxDrawPipelineState(),
       };
-      const texture = textureResult?.texture ?? null;
-      if (texture !== null) draw.texture = texture;
       gxFrameDraws.push(draw);
       const vatIndex = opcode & 7;
       const primitiveSample = {
@@ -3274,16 +3432,29 @@ const TEMPLATE: &str = r##"<!doctype html>
         vat0: hex32(gxCpRegisters[0x70 + vatIndex]),
         vat1: hex32(gxCpRegisters[0x80 + vatIndex]),
         vat2: hex32(gxCpRegisters[0x90 + vatIndex]),
-        vertices: vertices.slice(0, 28),
+        vertices: vertices.slice(0, 32),
         texCoordIndex,
         texCoords: selectedTexCoords.slice(0, 4),
+        rasterColors: rasterColorSets.map(colors => colors.slice(0, 4)),
+        normals: normalSet.slice(0, 4),
         generatedTexCoords: texCoordSets.map(coords => coords.slice(0, 4)),
         rawTextureCoords: rawTextureCoordSets.map(coords => coords.slice(0, 4)),
         textureMatrices,
-        texture: gxTextureSummary(texture),
+        textures: textures.map(gxTextureSummary),
         tev: {
-          stageCount: ((gxBpRegisters[0x00] >>> 10) & 0xf) + 1,
-          stages: textureResult?.stages ?? [],
+          stageCount,
+          stages: stages.map(stage => ({
+            index: stage.index,
+            order: hex32(stage.order),
+            textureMap: stage.textureMap,
+            texCoordIndex: stage.texCoordIndex,
+            textureEnabled: stage.textureEnabled,
+            colorChannel: stage.colorChannel,
+            colorCombiner: hex32(stage.colorCombiner),
+            alphaCombiner: hex32(stage.alphaCombiner),
+            konstColorSelector: stage.konstColorSelector,
+            konstAlphaSelector: stage.konstAlphaSelector,
+          })),
           order0: hex32(gxBpRegisters[0x28]),
           color0: hex32(gxBpRegisters[0xc0]),
           alpha0: hex32(gxBpRegisters[0xc1]),
@@ -3383,22 +3554,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         ? 256 / Math.max(1, yScaleRaw)
         : yScaleRaw / 256;
       const copyToXfb = (trigger & 0x4000) !== 0;
-      const viewPosition = gxTransformPosition(position, positionMatrix);
-      const projected = gxProjectPosition(position, positionMatrix);
-      const normal = gxTransformNormal(normalAttribute.normal, positionMatrix);
-      const tangent = gxTransformNormal(normalAttribute.tangent, positionMatrix);
-      const binormal = gxTransformNormal(normalAttribute.binormal, positionMatrix);
-      const rasterColors = viewPosition === null
-        ? colors.map(color => color.map(value => value / 255))
-        : gxLightRasterChannels(viewPosition, normal, colors);
-      const texgenAttributes = {
-        position,
-        normal: normalAttribute.normal,
-        tangent: normalAttribute.tangent,
-        binormal: normalAttribute.binormal,
-        colors: rasterColors,
-        rawTextureCoords,
-      };
       const viTop = viXfbAddress(0x201c);
       const viBottom = viXfbAddress(0x2024);
       const frame = {
@@ -3519,7 +3674,6 @@ const TEMPLATE: &str = r##"<!doctype html>
           commandBytes = 9;
         } else if (opcode === 0x61) {
           commandBytes = 5;
-        clipW,
         } else if ((opcode & 0xc0) === 0x80) {
           if (end - offset < 3) break;
           const vertices = gxReadU16(source, offset + 1);
@@ -3551,8 +3705,6 @@ const TEMPLATE: &str = r##"<!doctype html>
           const size = gxReadU32(source, offset + 5);
           gxDisplayListBytes += size;
           if (!inDisplayList) {
-        rasterColors: rasterColorSets.map(colors => colors.slice(0, 4)),
-        normals: normalSet.slice(0, 4),
             const pointer = ramPointer(address, size);
             if (pointer === null) {
               gxDisplayListErrors += 1;
@@ -3666,43 +3818,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMailQueue.length = 0;
       dspCurrentMail = null;
       dspCpuMailbox = 0;
-    function gxDrawPipelineState() {
-      const topLeft = gxBpRegisters[0x20] >>> 0;
-      const bottomRight = gxBpRegisters[0x21] >>> 0;
-      const offset = gxBpRegisters[0x59] >>> 0;
-      const topLeftX = Math.max(0, ((topLeft >>> 12) & 0x7ff) - 342);
-      const topLeftY = Math.max(0, (topLeft & 0x7ff) - 342);
-      const width = Math.max(
-        0,
-        ((bottomRight >>> 12) & 0x7ff) - ((topLeft >>> 12) & 0x7ff)
-      ) + 1;
-      const height = Math.max(
-        0,
-        (bottomRight & 0x7ff) - (topLeft & 0x7ff)
-      ) + 1;
-      const offsetX = (offset & 0x3ff) * 2 - 342;
-      const offsetY = ((offset >>> 10) & 0x3ff) * 2 - 342;
-      const scissorX = Math.min(640, Math.max(0, topLeftX - offsetX));
-      const scissorY = Math.min(528, Math.max(0, topLeftY - offsetY));
-      return {
-        zMode: gxBpRegisters[0x40] >>> 0,
-        blendMode: gxBpRegisters[0x41] >>> 0,
-        alphaTest: gxBpRegisters[0xf3] >>> 0,
-        cullMode: (gxBpRegisters[0x00] >>> 14) & 3,
-        scissorX,
-        scissorY,
-        scissorWidth: Math.min(width, 640 - scissorX),
-        scissorHeight: Math.min(height, 528 - scissorY),
-      };
-    }
-
-    function gxDrawTexCoords(textureResult, selectedTexCoords) {
-      // Missing or unusable texcoords make gxTextureForDraw deliberately
-      // return null. Keep those primitives untextured instead of forwarding
-      // one null placeholder per vertex as a malformed UV array.
-      return textureResult === null ? [] : selectedTexCoords.flat();
-    }
-
       dspRomParameter = null;
       dspMode = "rom";
       dspUcodeBooted = false;
@@ -3993,7 +4108,6 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function writePixelEngineControl(value) {
-          captured: gxCollectFrameGeometry,
       const written = value & 0xffff;
       if ((written & 0x08) !== 0) {
         peFinishSignal = false;
@@ -7679,10 +7793,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       canvas.height = texture.height;
       const context = canvas.getContext("2d");
       const pixels = texture.pixels instanceof Uint8ClampedArray
-      // PI cause bit 16 is the active-low physical reset button input. Games
-      // treat a cleared bit as a held reset button and eventually call
-      // OSResetSystem, so power-on must expose the released state.
-      view.setUint32(mmio + 0x3000, 0x00010000, false);
         ? texture.pixels
         : new Uint8ClampedArray(texture.pixels);
       context.putImageData(new ImageData(pixels, texture.width, texture.height), 0, 0);
