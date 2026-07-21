@@ -1089,6 +1089,548 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function gxFramePacketInteger(value, name, maximum = 0xffffffff) {
+      if (
+        !Number.isSafeInteger(value)
+        || value < 0
+        || value > maximum
+      ) {
+        throw new RangeError(
+          `GX frame packet ${name} must be an integer from 0 through ${maximum}`
+        );
+      }
+      return value;
+    }
+
+    function gxFramePacketAdd(left, right, name) {
+      const sum = left + right;
+      return gxFramePacketInteger(sum, name);
+    }
+
+    function gxFramePacketMultiply(left, right, name) {
+      const product = left * right;
+      return gxFramePacketInteger(product, name);
+    }
+
+    function gxFramePacketAlign16(value, name) {
+      const padding = (16 - value % 16) % 16;
+      return gxFramePacketAdd(value, padding, name);
+    }
+
+    function gxFramePacketBytes(value, name) {
+      if (value instanceof ArrayBuffer) return new Uint8Array(value);
+      if (!ArrayBuffer.isView(value)) {
+        throw new TypeError(`GX frame packet ${name} must be an ArrayBuffer view`);
+      }
+      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+
+    function gxFramePacketEqualBytes(left, right) {
+      if (left.byteLength !== right.byteLength) return false;
+      if (left.buffer === right.buffer && left.byteOffset === right.byteOffset) return true;
+      for (let index = 0; index < left.byteLength; index += 1) {
+        if (left[index] !== right[index]) return false;
+      }
+      return true;
+    }
+
+    function gxFramePacketKeyBytes(key, encoder, name) {
+      for (let index = 0; index < key.length; index += 1) {
+        const codeUnit = key.charCodeAt(index);
+        if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+          const trailing = key.charCodeAt(index + 1);
+          if (!(trailing >= 0xdc00 && trailing <= 0xdfff)) {
+            throw new TypeError(`GX frame packet ${name} contains an unpaired surrogate`);
+          }
+          index += 1;
+        } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+          throw new TypeError(`GX frame packet ${name} contains an unpaired surrogate`);
+        }
+      }
+      return encoder.encode(key);
+    }
+
+    function gxFramePacketSampler(texture, name) {
+      const wrapS = gxFramePacketInteger(texture.wrapS ?? 0, `${name}.wrapS`, 3);
+      const wrapT = gxFramePacketInteger(texture.wrapT ?? 0, `${name}.wrapT`, 3);
+      const magFilter = gxFramePacketInteger(
+        texture.magFilter ?? 0,
+        `${name}.magFilter`,
+        1
+      );
+      const minFilter = gxFramePacketInteger(
+        texture.minFilter ?? 0,
+        `${name}.minFilter`,
+        7
+      );
+      return wrapS | (wrapT << 2) | (magFilter << 4) | (minFilter << 5);
+    }
+
+    // LZGX v1 is the deterministic Worker-to-renderer boundary. The packet is
+    // deliberately self-contained: one transferable ArrayBuffer, fixed-size
+    // little-endian records, and byte sections whose padding is always zero.
+    // Textures are emitted in first-use draw/slot order and referenced by
+    // table index so repeated TEV bindings do not duplicate pixel payloads.
+    function packGxFramePacketV1(copyKind, frame, residentTextureKeys = null) {
+      copyKind = gxFramePacketInteger(copyKind, "copyKind", 2);
+      if (copyKind !== 1 && copyKind !== 2) {
+        throw new RangeError("GX frame packet copyKind must be 1 or 2");
+      }
+      if (frame === null || typeof frame !== "object") {
+        throw new TypeError("GX frame packet frame must be an object");
+      }
+      if (frame.copyToXfb !== undefined) {
+        if (typeof frame.copyToXfb !== "boolean") {
+          throw new TypeError("GX frame packet frame.copyToXfb must be boolean");
+        }
+        if (frame.copyToXfb !== (copyKind === 2)) {
+          throw new Error("GX frame packet copyKind conflicts with frame.copyToXfb");
+        }
+      }
+
+      const geometry = frame.geometry;
+      if (geometry === null || typeof geometry !== "object") {
+        throw new TypeError("GX frame packet frame.geometry must be an object");
+      }
+      const draws = geometry.draws;
+      if (!Array.isArray(draws)) {
+        throw new TypeError("GX frame packet frame.geometry.draws must be an array");
+      }
+      const drawCount = gxFramePacketInteger(draws.length, "drawCount");
+      if (
+        geometry.drawCalls !== undefined
+        && gxFramePacketInteger(geometry.drawCalls, "geometry.drawCalls") !== drawCount
+      ) {
+        throw new Error("GX frame packet geometry.drawCalls does not match draws.length");
+      }
+
+      const encoder = new TextEncoder();
+      const textures = [];
+      const textureByKey = new Map();
+      const normalizedDraws = [];
+      let totalVertexCount = 0;
+      let vertexBytes = 0;
+      let keyBytes = 0;
+      let pixelBytes = 0;
+
+      for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
+        const draw = draws[drawIndex];
+        const name = `draws[${drawIndex}]`;
+        if (draw === null || typeof draw !== "object") {
+          throw new TypeError(`GX frame packet ${name} must be an object`);
+        }
+        const topology = gxFramePacketInteger(draw.topology, `${name}.topology`, 7);
+        if (Object.prototype.toString.call(draw.vertices) !== "[object Float32Array]") {
+          throw new TypeError(`GX frame packet ${name}.vertices must be a Float32Array`);
+        }
+        const vertices = gxFramePacketBytes(draw.vertices, `${name}.vertices`);
+        if (vertices.byteLength % 144 !== 0) {
+          throw new RangeError(
+            `GX frame packet ${name}.vertices must contain 144 bytes per vertex`
+          );
+        }
+        const vertexCount = vertices.byteLength / 144;
+        if (
+          draw.vertexCount !== undefined
+          && gxFramePacketInteger(draw.vertexCount, `${name}.vertexCount`) !== vertexCount
+        ) {
+          throw new Error(`GX frame packet ${name}.vertexCount does not match vertices`);
+        }
+        totalVertexCount = gxFramePacketAdd(
+          totalVertexCount,
+          vertexCount,
+          "totalVertexCount"
+        );
+        vertexBytes = gxFramePacketAdd(vertexBytes, vertices.byteLength, "vertexBytes");
+
+        const tevState = gxFramePacketBytes(draw.tevState, `${name}.tevState`);
+        if (tevState.byteLength !== 464) {
+          throw new RangeError(`GX frame packet ${name}.tevState must be 464 bytes`);
+        }
+        const pipeline = draw.pipeline ?? {};
+        if (pipeline === null || typeof pipeline !== "object") {
+          throw new TypeError(`GX frame packet ${name}.pipeline must be an object`);
+        }
+        const drawTextures = draw.textures ?? [];
+        if (!Array.isArray(drawTextures) || drawTextures.length > 8) {
+          throw new RangeError(`GX frame packet ${name}.textures must have at most 8 slots`);
+        }
+        const textureReferences = [];
+        for (let slot = 0; slot < 8; slot += 1) {
+          const texture = drawTextures[slot];
+          const textureName = `${name}.textures[${slot}]`;
+          if (texture === undefined || texture === null) {
+            textureReferences.push({ index: 0xffffffff, sampler: 0 });
+            continue;
+          }
+          if (typeof texture !== "object") {
+            throw new TypeError(`GX frame packet ${textureName} must be an object or null`);
+          }
+          const key = texture.renderKey ?? texture.key;
+          if (key === undefined || key === null || key === "") {
+            textureReferences.push({ index: 0xffffffff, sampler: 0 });
+            continue;
+          }
+          if (typeof key !== "string") {
+            throw new TypeError(`GX frame packet ${textureName} key must be a string`);
+          }
+          const sampler = gxFramePacketSampler(texture, textureName);
+          const address = gxFramePacketInteger(
+            texture.address ?? 0,
+            `${textureName}.address`
+          );
+          const generation = gxFramePacketInteger(
+            texture.textureCopyIndex ?? 0,
+            `${textureName}.textureCopyIndex`
+          );
+          const width = gxFramePacketInteger(
+            texture.width,
+            `${textureName}.width`,
+            1024
+          );
+          const height = gxFramePacketInteger(
+            texture.height,
+            `${textureName}.height`,
+            1024
+          );
+          if (width === 0 || height === 0) {
+            throw new RangeError(`GX frame packet ${textureName} dimensions must be nonzero`);
+          }
+          const sourcePixels = gxFramePacketBytes(
+            texture.pixels === undefined ? new Uint8Array() : texture.pixels,
+            `${textureName}.pixels`
+          );
+          const expectedPixels = gxFramePacketMultiply(
+            gxFramePacketMultiply(width, height, `${textureName} pixel count`),
+            4,
+            `${textureName} pixel bytes`
+          );
+          if (
+            sourcePixels.byteLength !== 0
+            && sourcePixels.byteLength !== expectedPixels
+          ) {
+            throw new RangeError(
+              `GX frame packet ${textureName}.pixels must be empty or width * height * 4 bytes`
+            );
+          }
+          const pixels = residentTextureKeys?.has(key)
+            ? new Uint8Array()
+            : sourcePixels;
+
+          let normalizedTexture = textureByKey.get(key);
+          if (normalizedTexture === undefined) {
+            const encodedKey = gxFramePacketKeyBytes(key, encoder, `${textureName} key`);
+            if (encodedKey.byteLength === 0) {
+              throw new Error(`GX frame packet ${textureName} key must encode to bytes`);
+            }
+            const pixelRelativeOffset = pixels.byteLength === 0
+              ? 0
+              : gxFramePacketAlign16(pixelBytes, "pixel relative offset");
+            if (pixels.byteLength !== 0) {
+              pixelBytes = gxFramePacketAdd(
+                pixelRelativeOffset,
+                pixels.byteLength,
+                "pixelBytes"
+              );
+            }
+            normalizedTexture = {
+              index: textures.length,
+              key,
+              encodedKey,
+              keyRelativeOffset: keyBytes,
+              pixelRelativeOffset,
+              address,
+              generation,
+              width,
+              height,
+              pixels,
+            };
+            keyBytes = gxFramePacketAdd(keyBytes, encodedKey.byteLength, "keyBytes");
+            textures.push(normalizedTexture);
+            textureByKey.set(key, normalizedTexture);
+          } else if (
+            normalizedTexture.address !== address
+            || normalizedTexture.generation !== generation
+            || normalizedTexture.width !== width
+            || normalizedTexture.height !== height
+            || !gxFramePacketEqualBytes(normalizedTexture.pixels, pixels)
+          ) {
+            throw new Error(
+              `GX frame packet texture key ${JSON.stringify(key)} has conflicting contents`
+            );
+          }
+          textureReferences.push({ index: normalizedTexture.index, sampler });
+        }
+
+        const tevView = new DataView(
+          tevState.buffer,
+          tevState.byteOffset,
+          tevState.byteLength
+        );
+        const tevStageCount = tevView.getUint32(448, true);
+        if (tevStageCount > 16) {
+          throw new RangeError(`GX frame packet ${name}.tevState has too many stages`);
+        }
+        for (let offset = 452; offset < 464; offset += 1) {
+          if (tevState[offset] !== 0) {
+            throw new Error(`GX frame packet ${name}.tevState has nonzero padding`);
+          }
+        }
+        for (let stage = 0; stage < 16; stage += 1) {
+          const offset = stage * 16;
+          if (stage >= tevStageCount) {
+            for (let byte = offset; byte < offset + 16; byte += 1) {
+              if (tevState[byte] !== 0) {
+                throw new Error(
+                  `GX frame packet ${name}.tevState has nonzero inactive stages`
+                );
+              }
+            }
+            continue;
+          }
+          const fields = [
+            [offset, 0x00ffffff],
+            [offset + 4, 0x00ffffff],
+            [offset + 8, 0x000003ff],
+            [offset + 12, 0x000003ff],
+          ];
+          for (const [fieldOffset, mask] of fields) {
+            if ((tevView.getUint32(fieldOffset, true) & ~mask) !== 0) {
+              throw new Error(
+                `GX frame packet ${name}.tevState has noncanonical stage fields`
+              );
+            }
+          }
+        }
+        for (let offset = 384; offset < 448; offset += 4) {
+          if (tevView.getUint32(offset, true) > 3) {
+            throw new Error(
+              `GX frame packet ${name}.tevState has invalid swap-table channels`
+            );
+          }
+        }
+        const requiredTextureMaps = new Set();
+        for (let stage = 0; stage < tevStageCount; stage += 1) {
+          const references = tevView.getUint32(stage * 16 + 8, true);
+          if ((references & (1 << 6)) === 0) continue;
+          const textureMap = references & 7;
+          requiredTextureMaps.add(textureMap);
+          if (textureReferences[textureMap].index === 0xffffffff) {
+            throw new Error(
+              `GX frame packet ${name} TEV stage ${stage} requires missing texture map ${textureMap}`
+            );
+          }
+        }
+        for (let textureMap = 0; textureMap < 8; textureMap += 1) {
+          if (
+            !requiredTextureMaps.has(textureMap)
+            && textureReferences[textureMap].index !== 0xffffffff
+          ) {
+            throw new Error(
+              `GX frame packet ${name} provides unused texture map ${textureMap}`
+            );
+          }
+        }
+
+        normalizedDraws.push({
+          topology,
+          vertexCount,
+          vertexRelativeOffset: vertexBytes - vertices.byteLength,
+          vertexValues: draw.vertices,
+          tevState,
+          textureReferences,
+          cullMode: gxFramePacketInteger(pipeline.cullMode ?? 0, `${name}.cullMode`, 3),
+          zMode: gxFramePacketInteger(pipeline.zMode ?? 0, `${name}.zMode`),
+          blendMode: gxFramePacketInteger(
+            pipeline.blendMode ?? 0x18,
+            `${name}.blendMode`
+          ),
+          alphaTest: gxFramePacketInteger(
+            pipeline.alphaTest ?? 0x003f0000,
+            `${name}.alphaTest`
+          ),
+          scissorX: gxFramePacketInteger(pipeline.scissorX ?? 0, `${name}.scissorX`),
+          scissorY: gxFramePacketInteger(pipeline.scissorY ?? 0, `${name}.scissorY`),
+          scissorWidth: gxFramePacketInteger(
+            pipeline.scissorWidth ?? 640,
+            `${name}.scissorWidth`
+          ),
+          scissorHeight: gxFramePacketInteger(
+            pipeline.scissorHeight ?? 528,
+            `${name}.scissorHeight`
+          ),
+        });
+      }
+
+      if (
+        geometry.vertices !== undefined
+        && gxFramePacketInteger(geometry.vertices, "geometry.vertices") !== totalVertexCount
+      ) {
+        throw new Error("GX frame packet geometry.vertices does not match draw vertices");
+      }
+
+      const textureCount = gxFramePacketInteger(textures.length, "textureCount");
+      const drawTableBytes = gxFramePacketMultiply(drawCount, 128, "drawTableBytes");
+      const textureTableBytes = gxFramePacketMultiply(
+        textureCount,
+        64,
+        "textureTableBytes"
+      );
+      const tevBytes = gxFramePacketMultiply(drawCount, 464, "tevBytes");
+      pixelBytes = gxFramePacketAlign16(pixelBytes, "pixelBytes");
+      const drawTableOffset = 128;
+      const textureTableOffset = gxFramePacketAdd(
+        drawTableOffset,
+        drawTableBytes,
+        "textureTableOffset"
+      );
+      const tevOffset = gxFramePacketAdd(
+        textureTableOffset,
+        textureTableBytes,
+        "tevOffset"
+      );
+      const vertexOffset = gxFramePacketAdd(tevOffset, tevBytes, "vertexOffset");
+      const keyOffset = gxFramePacketAdd(vertexOffset, vertexBytes, "keyOffset");
+      const pixelOffset = gxFramePacketAlign16(
+        gxFramePacketAdd(keyOffset, keyBytes, "key section end"),
+        "pixelOffset"
+      );
+      const packetBytes = gxFramePacketAlign16(
+        gxFramePacketAdd(pixelOffset, pixelBytes, "packet section end"),
+        "packetBytes"
+      );
+
+      const sourceX = gxFramePacketInteger(frame.sourceX, "frame.sourceX");
+      const sourceY = gxFramePacketInteger(frame.sourceY, "frame.sourceY");
+      const sourceWidth = gxFramePacketInteger(
+        frame.sourceWidth ?? frame.width,
+        "frame.sourceWidth"
+      );
+      const sourceHeight = gxFramePacketInteger(frame.sourceHeight, "frame.sourceHeight");
+      const outputWidth = copyKind === 2
+        ? gxFramePacketInteger(frame.outputWidth ?? frame.width, "frame.outputWidth")
+        : 0;
+      const outputHeight = copyKind === 2
+        ? gxFramePacketInteger(frame.outputHeight ?? frame.height, "frame.outputHeight")
+        : 0;
+      const destination = gxFramePacketInteger(frame.destination, "frame.destination");
+      const stride = copyKind === 2
+        ? gxFramePacketInteger(frame.stride, "frame.stride")
+        : 0;
+      if (sourceWidth === 0 || sourceHeight === 0) {
+        throw new RangeError("GX frame packet source dimensions must be nonzero");
+      }
+      if (copyKind === 2 && (outputWidth === 0 || outputHeight === 0 || stride === 0)) {
+        throw new RangeError(
+          "GX frame packet XFB output dimensions and stride must be nonzero"
+        );
+      }
+      const generation = gxFramePacketInteger(frame.index, "frame.index");
+      if (typeof frame.clear !== "boolean") {
+        throw new TypeError("GX frame packet frame.clear must be boolean");
+      }
+      const clearColor = frame.clearColor;
+      if (clearColor === null || clearColor === undefined || clearColor.length !== 4) {
+        throw new RangeError("GX frame packet frame.clearColor must have four bytes");
+      }
+      const rgba = Array.from(clearColor, (component, index) =>
+        gxFramePacketInteger(component, `frame.clearColor[${index}]`, 0xff)
+      );
+
+      const packet = new ArrayBuffer(packetBytes);
+      const bytes = new Uint8Array(packet);
+      const header = new DataView(packet);
+      bytes.set([0x4c, 0x5a, 0x47, 0x58], 0x00);
+      header.setUint16(0x04, 1, true);
+      header.setUint16(0x06, 128, true);
+      header.setUint32(0x08, packetBytes, true);
+      header.setUint32(0x0c, 0, true);
+      header.setUint32(0x10, copyKind, true);
+      header.setUint32(0x14, drawCount, true);
+      header.setUint32(0x18, textureCount, true);
+      header.setUint32(0x1c, drawTableOffset, true);
+      header.setUint32(0x20, textureTableOffset, true);
+      header.setUint32(0x24, tevOffset, true);
+      header.setUint32(0x28, vertexOffset, true);
+      header.setUint32(0x2c, keyOffset, true);
+      header.setUint32(0x30, pixelOffset, true);
+      header.setUint32(0x34, drawTableBytes, true);
+      header.setUint32(0x38, textureTableBytes, true);
+      header.setUint32(0x3c, tevBytes, true);
+      header.setUint32(0x40, vertexBytes, true);
+      header.setUint32(0x44, keyBytes, true);
+      header.setUint32(0x48, pixelBytes, true);
+      header.setUint32(0x4c, sourceX, true);
+      header.setUint32(0x50, sourceY, true);
+      header.setUint32(0x54, sourceWidth, true);
+      header.setUint32(0x58, sourceHeight, true);
+      header.setUint32(0x5c, outputWidth, true);
+      header.setUint32(0x60, outputHeight, true);
+      header.setUint32(0x64, destination, true);
+      header.setUint32(0x68, stride, true);
+      header.setUint32(0x6c, generation, true);
+      header.setUint32(0x70, frame.clear ? 1 : 0, true);
+      bytes.set(rgba, 0x74);
+      header.setUint16(0x78, 128, true);
+      header.setUint16(0x7a, 64, true);
+      header.setUint32(0x7c, totalVertexCount, true);
+
+      for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
+        const draw = normalizedDraws[drawIndex];
+        const recordOffset = drawTableOffset + drawIndex * 128;
+        bytes[recordOffset] = draw.topology;
+        bytes[recordOffset + 1] = draw.cullMode;
+        header.setUint16(recordOffset + 0x02, 0, true);
+        header.setUint32(recordOffset + 0x04, draw.vertexCount, true);
+        header.setUint32(recordOffset + 0x08, draw.vertexRelativeOffset, true);
+        header.setUint32(recordOffset + 0x0c, drawIndex * 464, true);
+        header.setUint32(recordOffset + 0x10, draw.zMode, true);
+        header.setUint32(recordOffset + 0x14, draw.blendMode, true);
+        header.setUint32(recordOffset + 0x18, draw.alphaTest, true);
+        header.setUint32(recordOffset + 0x1c, draw.scissorX, true);
+        header.setUint32(recordOffset + 0x20, draw.scissorY, true);
+        header.setUint32(recordOffset + 0x24, draw.scissorWidth, true);
+        header.setUint32(recordOffset + 0x28, draw.scissorHeight, true);
+        for (let slot = 0; slot < 8; slot += 1) {
+          const reference = draw.textureReferences[slot];
+          const referenceOffset = recordOffset + 0x30 + slot * 8;
+          header.setUint32(referenceOffset, reference.index, true);
+          header.setUint32(referenceOffset + 4, reference.sampler, true);
+        }
+        bytes.set(draw.tevState, tevOffset + drawIndex * 464);
+        const drawVertexOffset = vertexOffset + draw.vertexRelativeOffset;
+        for (let component = 0; component < draw.vertexValues.length; component += 1) {
+          const value = draw.vertexValues[component];
+          if (Number.isNaN(value)) {
+            header.setUint32(drawVertexOffset + component * 4, 0x7fc00000, true);
+          } else {
+            header.setFloat32(drawVertexOffset + component * 4, value, true);
+          }
+        }
+      }
+
+      for (let textureIndex = 0; textureIndex < textureCount; textureIndex += 1) {
+        const texture = textures[textureIndex];
+        const recordOffset = textureTableOffset + textureIndex * 64;
+        header.setUint32(recordOffset + 0x00, texture.keyRelativeOffset, true);
+        header.setUint32(recordOffset + 0x04, texture.encodedKey.byteLength, true);
+        header.setUint32(recordOffset + 0x08, texture.pixelRelativeOffset, true);
+        header.setUint32(recordOffset + 0x0c, texture.pixels.byteLength, true);
+        header.setUint32(recordOffset + 0x10, texture.address, true);
+        header.setUint32(recordOffset + 0x14, texture.generation, true);
+        header.setUint32(recordOffset + 0x18, texture.width, true);
+        header.setUint32(recordOffset + 0x1c, texture.height, true);
+        header.setUint32(
+          recordOffset + 0x20,
+          texture.pixels.byteLength === 0 ? 0 : 1,
+          true
+        );
+        bytes.set(texture.encodedKey, keyOffset + texture.keyRelativeOffset);
+        bytes.set(texture.pixels, pixelOffset + texture.pixelRelativeOffset);
+      }
+      return packet;
+    }
+
     function completeRendererFrame(message) {
       const rendererSequence = Number(message.rendererSequence);
       if (
