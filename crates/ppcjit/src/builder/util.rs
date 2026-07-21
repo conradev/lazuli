@@ -380,7 +380,28 @@ impl BlockBuilder<'_> {
     }
 
     pub fn update_fpscr(&mut self) {
-        // TODO: implement this
+        const VX_EXCEPTIONS: u32 = 0x01f8_0700;
+        const EXCEPTION_ENABLES: u32 = 0x0000_00f8;
+
+        let fpscr = self.get(Reg::FPSCR);
+
+        // VX is set whenever any invalid-operation exception bit is set.
+        let invalid = self.bd.ins().band_imm(fpscr, i64::from(VX_EXCEPTIONS));
+        let vx = self.bd.ins().icmp_imm(IntCC::NotEqual, invalid, 0);
+        let fpscr = self.set_bit(fpscr, 29u32, vx);
+
+        // OX, UX, ZX, XX, and the freshly computed VX line up with their enable bits after a
+        // 22-bit shift. FEX is set when any enabled exception remains pending.
+        let exceptions = self.bd.ins().ushr_imm(fpscr, 22);
+        let enables = self.bd.ins().band_imm(fpscr, i64::from(EXCEPTION_ENABLES));
+        let enabled_exceptions = self.bd.ins().band(exceptions, enables);
+        let fex = self
+            .bd
+            .ins()
+            .icmp_imm(IntCC::NotEqual, enabled_exceptions, 0);
+        let fpscr = self.set_bit(fpscr, 30u32, fex);
+
+        self.set(Reg::FPSCR, fpscr);
     }
 
     /// Updates CR1 by copying bits 28..32 of FPSCR.

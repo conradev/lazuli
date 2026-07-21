@@ -344,6 +344,36 @@ impl BlockBuilder<'_> {
         CR_INFO
     }
 
+    pub fn mcrfs(&mut self, ins: Ins) -> InstructionInfo {
+        const FPSCR_EXCEPTION_MASK: u32 = 0x9ff8_0700;
+
+        let src_field = 7 - ins.field_crfs();
+        let dst_field = 7 - ins.field_crfd();
+        let src_shift = 4 * src_field;
+        let dst_shift = 4 * dst_field;
+
+        // CR receives the field as it existed before mcrfs clears the exception bits it read.
+        let fpscr = self.get(Reg::FPSCR);
+        let src = self.bd.ins().ushr_imm(fpscr, i64::from(src_shift));
+        let src = self.bd.ins().band_imm(src, 0b1111);
+
+        let cr = self.get(Reg::CR);
+        let new = self.bd.ins().ishl_imm(src, i64::from(dst_shift));
+        let dst_mask = self.ir_value(0b1111u32 << dst_shift);
+        let value = self.bd.ins().bitselect(dst_mask, new, cr);
+        self.set(Reg::CR, value);
+
+        // Only sticky exception bits (and FX) in the selected FPSCR field are cleared. FEX and
+        // VX are derived summaries, while control and result bits in the same field are retained.
+        let field_mask = 0b1111u32 << src_shift;
+        let clear_mask = field_mask & FPSCR_EXCEPTION_MASK;
+        let value = self.bd.ins().band_imm(fpscr, i64::from(!clear_mask));
+        self.set(Reg::FPSCR, value);
+        self.update_fpscr();
+
+        CR_INFO
+    }
+
     pub fn mcrx(&mut self, ins: Ins) -> InstructionInfo {
         let dst_field = 7 - ins.field_crfd();
 

@@ -669,6 +669,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Lwzux => self.lwzux(ins),
             Opcode::Lwzx => self.lwzx(ins),
             Opcode::Mcrf => self.mcrf(ins),
+            Opcode::Mcrfs => self.mcrfs(ins),
             Opcode::Mcrxr => self.mcrx(ins),
             Opcode::Mfcr => self.mfcr(ins),
             Opcode::Mffs => self.mffs(ins),

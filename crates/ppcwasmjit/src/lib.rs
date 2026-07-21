@@ -254,7 +254,7 @@ mod tests {
     use cranelift_codegen::ir::{self, InstBuilder, InstructionData, Opcode};
     use cranelift_codegen::isa::CallConv;
     use gekko::disasm::{Extensions, Ins};
-    use gekko::{Address, Cpu, GPR, QuantReg, Reg, SPR};
+    use gekko::{Address, CondReg, Cpu, FloatControlReg, GPR, QuantReg, Reg, SPR};
     use ppcjit::block::{BlockFn, Executed as NativeExecuted, ExitReason as NativeExitReason};
     use ppcjit::hooks::{Context as NativeContext, ExitData, Hooks};
     use ppcjit::{CodegenSettings, ExitMode, FastmemLut, TranslationConfig, Translator};
@@ -338,6 +338,11 @@ mod tests {
     fn mtspr(rs: u8, spr: u16) -> Ins {
         let encoded_spr = (u32::from(spr) & 0x1f) << 16 | (u32::from(spr) >> 5) << 11;
         let code = 31 << 26 | u32::from(rs) << 21 | encoded_spr | 467 << 1;
+        Ins::new(code, Extensions::gekko_broadway())
+    }
+
+    fn mcrfs(crfd: u8, crfs: u8) -> Ins {
+        let code = 63 << 26 | u32::from(crfd) << 23 | u32::from(crfs) << 18 | 64 << 1;
         Ins::new(code, Extensions::gekko_broadway())
     }
 
@@ -793,6 +798,80 @@ if (view.getUint32(cpu + pcOffset, true) !== 0x80001500) {
             native.cpu.pc.value(),
             native.cpu.user.gpr[4],
             native.cpu.user.lr,
+        );
+    }
+
+    #[test]
+    fn mcrfs_moves_fpscr_fields_and_clears_only_exception_bits() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+            return;
+        }
+
+        let sequence = (0..8).map(|field| mcrfs(field, field)).collect::<Vec<_>>();
+        let block = Jit::new().build(sequence.iter().copied()).unwrap();
+        Validator::new().validate_all(block.wasm()).unwrap();
+
+        let initial_cr = 0x0123_4567;
+        let initial_fpscr = 0xffff_ffff;
+        let expected_cr = 0xffff_ffff;
+        // All sticky exception bits and FX were read and cleared. VX and FEX are now clear because
+        // no underlying exception remains; result, reserved, and control bits are preserved.
+        let expected_fpscr = 0x0007_f8ff;
+
+        let native = execute_with_native_jit_initialized(&sequence, 0x8000_1000, 0, |state| {
+            state.cpu.user.cr = CondReg::from_bits(initial_cr);
+            state.cpu.user.fpscr = FloatControlReg::from_bits(initial_fpscr);
+        });
+        assert_eq!(native.cpu.user.cr.to_bits(), expected_cr);
+        assert_eq!(native.cpu.user.fpscr.to_bits(), expected_fpscr);
+
+        let wasm = block
+            .wasm()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let script = r#"
+const [wasmHex, pcOffset, crOffset, fpscrOffset, initialCr, initialFpscr, expectedExecuted, expectedPc, expectedCr, expectedFpscr] = process.argv.slice(1);
+const memory = new WebAssembly.Memory({ initial: 1 });
+const view = new DataView(memory.buffer);
+const cpu = 64;
+view.setUint32(cpu + Number(pcOffset), 0x80001000, true);
+view.setUint32(cpu + Number(crOffset), Number(initialCr), true);
+view.setUint32(cpu + Number(fpscrOffset), Number(initialFpscr), true);
+const { instance } = await WebAssembly.instantiate(Buffer.from(wasmHex, "hex"), { lazuli: { memory } });
+const executed = instance.exports.run(0, cpu, 0) >>> 0;
+if (executed !== (Number(expectedExecuted) >>> 0)) throw new Error(`bad execution metadata: 0x${executed.toString(16)}`);
+const pc = view.getUint32(cpu + Number(pcOffset), true);
+if (pc !== (Number(expectedPc) >>> 0)) throw new Error(`bad pc: 0x${pc.toString(16)}`);
+const cr = view.getUint32(cpu + Number(crOffset), true);
+if (cr !== (Number(expectedCr) >>> 0)) throw new Error(`bad CR: 0x${cr.toString(16)}`);
+const fpscr = view.getUint32(cpu + Number(fpscrOffset), true);
+if (fpscr !== (Number(expectedFpscr) >>> 0)) throw new Error(`bad FPSCR: 0x${fpscr.toString(16)}`);
+"#;
+        let output = Command::new("node")
+            .args([
+                "--input-type=module",
+                "--eval",
+                script,
+                &wasm,
+                &Reg::PC.offset().to_string(),
+                &Reg::CR.offset().to_string(),
+                &Reg::FPSCR.offset().to_string(),
+                &initial_cr.to_string(),
+                &initial_fpscr.to_string(),
+                &block.metadata().executed.pack().to_string(),
+                &native.cpu.pc.value().to_string(),
+                &expected_cr.to_string(),
+                &expected_fpscr.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "node failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
