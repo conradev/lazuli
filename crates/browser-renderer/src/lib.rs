@@ -7,6 +7,7 @@ pub(crate) mod tev;
 
 pub(crate) const EFB_WIDTH: u32 = 640;
 pub(crate) const EFB_HEIGHT: u32 = 528;
+pub(crate) const WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 
 #[derive(Clone, Default)]
 pub(crate) struct RendererFailureState {
@@ -388,6 +389,69 @@ pub(crate) fn xfb_source_rect(row: u32, height: u32) -> Option<[f32; 4]> {
     Some([0.0, start_y, 1.0, 1.0 - start_y])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct XfbReadbackLayout {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) source_row: u32,
+    pub(crate) bytes_per_row: u32,
+    pub(crate) padded_bytes_per_row: u32,
+    pub(crate) buffer_bytes: u64,
+}
+
+pub(crate) fn xfb_readback_layout(
+    width: u32,
+    source_height: u32,
+    logical_height: u32,
+    selected_row: u32,
+) -> Option<XfbReadbackLayout> {
+    if width == 0 || source_height == 0 || logical_height == 0 || selected_row >= logical_height {
+        return None;
+    }
+    let source_row = u32::try_from(
+        u64::from(selected_row).checked_mul(u64::from(source_height))? / u64::from(logical_height),
+    )
+    .ok()?;
+    let height = source_height.checked_sub(source_row)?;
+    if height == 0 {
+        return None;
+    }
+    let bytes_per_row = width.checked_mul(4)?;
+    let padded_bytes_per_row = bytes_per_row
+        .checked_add(WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT - 1)?
+        .checked_div(WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT)?
+        .checked_mul(WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT)?;
+    let buffer_bytes = u64::from(padded_bytes_per_row).checked_mul(u64::from(height))?;
+    Some(XfbReadbackLayout {
+        width,
+        height,
+        source_row,
+        bytes_per_row,
+        padded_bytes_per_row,
+        buffer_bytes,
+    })
+}
+
+pub(crate) fn compact_xfb_readback_rows(
+    mapped: &[u8],
+    layout: XfbReadbackLayout,
+) -> Option<Vec<u8>> {
+    let padded_bytes_per_row = usize::try_from(layout.padded_bytes_per_row).ok()?;
+    let bytes_per_row = usize::try_from(layout.bytes_per_row).ok()?;
+    let height = usize::try_from(layout.height).ok()?;
+    let required = padded_bytes_per_row.checked_mul(height)?;
+    if mapped.len() < required {
+        return None;
+    }
+    let output_bytes = bytes_per_row.checked_mul(height)?;
+    let mut output = Vec::with_capacity(output_bytes);
+    for row in 0..height {
+        let start = row.checked_mul(padded_bytes_per_row)?;
+        output.extend_from_slice(mapped.get(start..start.checked_add(bytes_per_row)?)?);
+    }
+    Some(output)
+}
+
 #[cfg(test)]
 pub(crate) fn alpha_compare(value: u8, reference: u8, comparison: u8) -> bool {
     match comparison & 7 {
@@ -425,10 +489,11 @@ mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState,
         SelectedTexture, TextureAddressMode, XfbCopyMetadata, alpha_compare, alpha_test_passes,
-        clipped_copy_extent, decoded_texture_cache_hit, decoded_texture_is_available,
-        gx_blend_state, gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture,
-        resolve_xfb_copy, select_texture, valid_rgba8_texture, xfb_copy_matches_selection,
-        xfb_row_offset, xfb_source_rect,
+        clipped_copy_extent, compact_xfb_readback_rows, decoded_texture_cache_hit,
+        decoded_texture_is_available, gx_blend_state, gx_sampler_identity,
+        merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy, select_texture,
+        valid_rgba8_texture, xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset,
+        xfb_source_rect,
     };
 
     const BASE: u32 = 0x0120_0000;
@@ -515,6 +580,50 @@ mod tests {
     fn xfb_source_rect_rejects_rows_outside_the_copy() {
         assert_eq!(xfb_source_rect(0, 0), None);
         assert_eq!(xfb_source_rect(480, 480), None);
+    }
+
+    #[test]
+    fn xfb_readback_layout_crops_the_selected_field_row_and_aligns_webgpu_copies() {
+        let aligned = xfb_readback_layout(640, 480, 480, 1).unwrap();
+        assert_eq!(aligned.width, 640);
+        assert_eq!(aligned.height, 479);
+        assert_eq!(aligned.source_row, 1);
+        assert_eq!(aligned.bytes_per_row, 2560);
+        assert_eq!(aligned.padded_bytes_per_row, 2560);
+        assert_eq!(aligned.buffer_bytes, 1_226_240);
+
+        let padded = xfb_readback_layout(641, 2, 2, 0).unwrap();
+        assert_eq!(padded.bytes_per_row, 2564);
+        assert_eq!(padded.padded_bytes_per_row, 2816);
+        assert_eq!(padded.buffer_bytes, 5632);
+        assert_eq!(xfb_readback_layout(0, 480, 480, 0), None);
+        assert_eq!(xfb_readback_layout(640, 480, 480, 480), None);
+        assert_eq!(xfb_readback_layout(u32::MAX, 1, 1, 0), None);
+    }
+
+    #[test]
+    fn xfb_readback_maps_logical_field_rows_into_scaled_physical_copies() {
+        let layout = xfb_readback_layout(640, 264, 528, 1).unwrap();
+        assert_eq!(layout.source_row, 0);
+        assert_eq!(layout.height, 264);
+
+        let layout = xfb_readback_layout(640, 960, 480, 1).unwrap();
+        assert_eq!(layout.source_row, 2);
+        assert_eq!(layout.height, 958);
+    }
+
+    #[test]
+    fn xfb_readback_compacts_webgpu_row_padding_without_changing_pixels() {
+        let layout = xfb_readback_layout(2, 2, 2, 0).unwrap();
+        let mut mapped = vec![0xcc; usize::try_from(layout.buffer_bytes).unwrap()];
+        mapped[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let second = usize::try_from(layout.padded_bytes_per_row).unwrap();
+        mapped[second..second + 8].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(
+            compact_xfb_readback_rows(&mapped, layout).unwrap(),
+            (1_u8..=16).collect::<Vec<_>>()
+        );
+        assert_eq!(compact_xfb_readback_rows(&mapped[..second], layout), None);
     }
 
     #[test]
