@@ -11,6 +11,7 @@ import {
   attachDiscAfterFreshNavigation,
   resolveDiscPath,
 } from "./browser_boot_headless_disc.mjs";
+import { identifyLocalDiscImage } from "./browser_boot_disc_identity.mjs";
 import {
   DevToolsSession,
   observeHeadlessPage,
@@ -315,7 +316,7 @@ function verifyPageOwnedRendering(report, state) {
   }
 }
 
-function attachHeadlessCapture(session, state, report, details) {
+function attachHeadlessCapture(session, state, report, details, discImage = null) {
   verifyPageOwnedRendering(report, state);
   report.headlessCapture = {
     dataset: state.dataset,
@@ -324,6 +325,7 @@ function attachHeadlessCapture(session, state, report, details) {
     url: state.url,
     ...details,
   };
+  if (discImage !== null) report.headlessCapture.discImage = discImage;
 }
 
 async function persistTerminalReportFailure(output, report) {
@@ -383,6 +385,9 @@ function verifyScenarioRendering(report, options) {
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
+  const discImage = options.disc === null
+    ? null
+    : await identifyLocalDiscImage(options.disc);
   const expectedManifest = options.expect === null
     ? null
     : await readCheckpointManifest(options.expect);
@@ -452,7 +457,7 @@ async function main() {
             headlessRunToReportMs: reportDetectedAt - runStartedAt,
           },
           reuse: reuseCapture,
-        });
+        }, discImage);
         await persistTerminalReportFailure(options.output, report);
         let scenarioError = null;
         try {
@@ -494,7 +499,7 @@ async function main() {
             },
             reuse: reuseCapture,
             timedOut: true,
-          });
+          }, discImage);
           await persistTerminalReportFailure(options.output, report);
           verifyExpectedCheckpoint(report, options, expectedManifest);
           await persist(options.output, report);

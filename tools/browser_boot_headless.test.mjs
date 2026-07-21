@@ -54,6 +54,67 @@ test("headless capture exposes --expect and verifies before persistence", () => 
   );
 });
 
+test("local disc identity is complete before navigation and joins every capture", () => {
+  assert.match(
+    source,
+    /import \{ identifyLocalDiscImage \} from "\.\/browser_boot_disc_identity\.mjs"/,
+  );
+  const identity = source.indexOf("await identifyLocalDiscImage(options.disc)");
+  const navigation = source.indexOf('session.send("Page.navigate"');
+  const upload = source.indexOf("await attachDiscAfterFreshNavigation(session");
+  assert.notEqual(identity, -1);
+  assert.ok(identity < navigation);
+  assert.ok(identity < upload);
+  assert.equal(
+    source.match(/^\s+attachHeadlessCapture\(session, state, report,/gm)?.length,
+    2,
+  );
+  assert.equal(source.match(/\}, discImage\);/g)?.length, 2);
+
+  const context = vm.createContext({ Array, Error, JSON });
+  vm.runInContext([
+    extractFunction("terminalReportFailure"),
+    extractFunction("verifyPageOwnedRendering"),
+    extractFunction("attachHeadlessCapture"),
+  ].join("\n\n"), context);
+  const discImage = Object.freeze({
+    algorithm: "sha256",
+    format: "ciso",
+    sha256: "a".repeat(64),
+  });
+  const report = { rendering: { backend: "wgpu-webgpu" } };
+  context.attachHeadlessCapture(
+    { exceptions: [] },
+    {
+      dataset: { renderer: "wgpu-webgpu" },
+      title: "Lazuli debug harness",
+      url: "http://127.0.0.1:8766/",
+    },
+    report,
+    { reuse: null },
+    discImage,
+  );
+  assert.strictEqual(report.headlessCapture.discImage, discImage);
+  assert.deepEqual(Object.keys(report.headlessCapture.discImage), [
+    "algorithm",
+    "format",
+    "sha256",
+  ]);
+
+  const reportWithoutDisc = { rendering: { backend: "wgpu-webgpu" } };
+  context.attachHeadlessCapture(
+    { exceptions: [] },
+    {
+      dataset: { renderer: "wgpu-webgpu" },
+      title: "Lazuli debug harness",
+      url: "http://127.0.0.1:8766/",
+    },
+    reportWithoutDisc,
+    { reuse: null },
+  );
+  assert.equal(Object.hasOwn(reportWithoutDisc.headlessCapture, "discImage"), false);
+});
+
 test("headless capture cross-checks the page-owned renderer evidence", () => {
   const context = vm.createContext({ Array, Error, JSON });
   vm.runInContext([
