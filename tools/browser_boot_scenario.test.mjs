@@ -33,6 +33,9 @@ const scenarioFunctions = [
   "createControllerScenario",
   "selectControllerScenario",
   "controllerScenarioCycleLimit",
+  "failControllerScenario",
+  "observeControllerScenarioPulse",
+  "serviceControllerScenario",
   "recordControllerScenarioPoll",
   "pollControllerScenario",
 ];
@@ -103,6 +106,34 @@ function definition(sample, overrides = {}) {
   };
 }
 
+test("controller scenarios never retry an unobserved input edge", () => {
+  const sample = {
+    phase: "prompt",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const context = scenarioHarness();
+  const scenario = context.createControllerScenario(definition(sample, {
+    maximumNeutralPolls: 4,
+  }));
+  context.serviceControllerScenario(scenario, 1);
+
+  const buttons = [];
+  for (let poll = 1; poll <= 4; poll += 1) {
+    context.controllerPollIndex = poll;
+    buttons.push(context.pollControllerScenario(scenario, 0, poll, poll, poll));
+    context.serviceControllerScenario(scenario, 1 + poll);
+  }
+
+  assert.deepEqual(buttons, [0x0100, 0x0100, 0x0100, 0]);
+  assert.equal(scenario.status, "running");
+  context.serviceControllerScenario(scenario, 6);
+  assert.equal(scenario.status, "failed");
+  assert.equal(scenario.failure.step, "confirm");
+  assert.match(scenario.failure.reason, /guest did not observe pressed within 3 polls/);
+  assert.equal(scenario.steps[0].press.polls, 3);
+  assert.equal(context.pollControllerScenario(scenario, 0, 5, 5, 5), null);
+});
+
 test("controller scenarios own neutral input between scripted pulses", () => {
   const sample = {
     phase: "waiting",
@@ -122,6 +153,7 @@ test("controller scenarios own neutral input between scripted pulses", () => {
     analogA: 0xff,
     analogB: 0xff,
   };
+  assert.equal(context.serviceControllerScenario(scenario, 1), "running");
   assert.deepEqual(
     Array.from(context.controllerPacketForPoll(0, 2, 3, "direct")),
     [0, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0],
@@ -197,4 +229,128 @@ test("controller scenarios retain their hard guest-cycle budget", () => {
     context.controllerScenarioCycleLimit(40_000_000_000, scenario),
     40_000_000_000,
   );
+});
+
+test("controller scenarios reject stale and torn same-button release edges", () => {
+  const sample = {
+    phase: "prompt",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const context = scenarioHarness();
+  const scenario = context.createControllerScenario(definition(sample));
+  context.serviceControllerScenario(scenario, 1);
+
+  sample.pad = { held: 0, pressed: 0x0100, released: 0 };
+  context.serviceControllerScenario(scenario, 2);
+  assert.equal(scenario.steps[0].guest.pressedCycle, null);
+
+  for (let poll = 1; poll <= 3; poll += 1) {
+    context.controllerPollIndex = poll;
+    context.pollControllerScenario(scenario, 0, poll, poll + 2, poll + 2);
+    sample.pad = poll === 1
+      ? { held: 0x0100, pressed: 0x0100, released: 0 }
+      : { held: 0x0100, pressed: 0, released: 0 };
+    context.serviceControllerScenario(scenario, poll + 2);
+  }
+
+  context.controllerPollIndex = 4;
+  context.pollControllerScenario(scenario, 0, 4, 6, 6);
+  sample.pad = { held: 0x0100, pressed: 0, released: 0 };
+  context.serviceControllerScenario(scenario, 6);
+
+  sample.pad = { held: 0, pressed: 0x0100, released: 0x0100 };
+  context.serviceControllerScenario(scenario, 7);
+  assert.equal(scenario.steps[0].guest.releasedCycle, null);
+
+  sample.pad = { held: 0, pressed: 0, released: 0x0100 };
+  context.serviceControllerScenario(scenario, 8);
+  assert.equal(scenario.steps[0].guest.releasedCycle, 8);
+
+  for (let poll = 5; poll <= 6; poll += 1) {
+    context.controllerPollIndex = poll;
+    context.pollControllerScenario(scenario, 0, poll, poll + 4, poll + 4);
+    sample.pad = { held: 0, pressed: 0, released: 0 };
+    context.serviceControllerScenario(scenario, poll + 4);
+  }
+  assert.equal(scenario.steps[0].guest.neutralCycle, 9);
+  assert.equal(scenario.stepIndex, 1);
+});
+
+test("consecutive same-button pulses retain distinct guest edges and sequences", () => {
+  const sample = {
+    phase: "first",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const context = scenarioHarness();
+  const scenario = context.createControllerScenario(definition(sample, {
+    steps: [
+      { id: "first-a", button: 0x0100, ready: value => value.phase === "first" },
+      { id: "second-a", button: 0x0100, ready: value => value.phase === "second" },
+    ],
+  }));
+
+  function drivePulse(firstPoll, firstCycle) {
+    for (let offset = 0; offset < 3; offset += 1) {
+      const poll = firstPoll + offset;
+      const cycle = firstCycle + offset;
+      context.controllerPollIndex = poll;
+      assert.equal(
+        context.pollControllerScenario(scenario, 0, poll, cycle, cycle),
+        0x0100,
+      );
+      sample.pad = offset === 0
+        ? { held: 0x0100, pressed: 0x0100, released: 0 }
+        : { held: 0x0100, pressed: 0, released: 0 };
+      context.serviceControllerScenario(scenario, cycle);
+    }
+    for (let offset = 0; offset < 3; offset += 1) {
+      const poll = firstPoll + 3 + offset;
+      const cycle = firstCycle + 3 + offset;
+      context.controllerPollIndex = poll;
+      assert.equal(context.pollControllerScenario(scenario, 0, poll, cycle, cycle), 0);
+      sample.pad = offset === 0
+        ? { held: 0x0100, pressed: 0, released: 0 }
+        : offset === 1
+          ? { held: 0, pressed: 0, released: 0x0100 }
+          : { held: 0, pressed: 0, released: 0 };
+      context.serviceControllerScenario(scenario, cycle);
+    }
+  }
+
+  context.serviceControllerScenario(scenario, 1);
+  drivePulse(1, 2);
+  assert.equal(scenario.stepIndex, 1);
+
+  sample.phase = "second";
+  context.serviceControllerScenario(scenario, 8);
+  sample.pad = { held: 0, pressed: 0x0100, released: 0 };
+  context.serviceControllerScenario(scenario, 9);
+  assert.equal(scenario.steps[1].guest.pressedCycle, null);
+
+  drivePulse(7, 10);
+  assert.equal(scenario.status, "complete");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      scenario.steps.map(step => [step.press.sequence, step.release.sequence])
+    )),
+    [[1, 2], [3, 4]],
+  );
+  assert.ok(scenario.steps[1].guest.pressedCycle > scenario.steps[0].guest.neutralCycle);
+  assert.ok(scenario.steps[1].guest.releasedCycle > scenario.steps[1].guest.pressedCycle);
+  assert.ok(scenario.steps[1].guest.neutralCycle > scenario.steps[1].guest.releasedCycle);
+});
+
+test("controller scenarios fail exactly at their guest-cycle cap", () => {
+  const sample = {
+    phase: "waiting",
+    pad: { held: 0, pressed: 0, released: 0 },
+  };
+  const context = scenarioHarness();
+  const scenario = context.createControllerScenario(definition(sample, {
+    hardCycleLimit: 25,
+  }));
+  assert.equal(context.serviceControllerScenario(scenario, 24), "running");
+  assert.equal(context.serviceControllerScenario(scenario, 25), "failed");
+  assert.equal(scenario.failure.cycle, 25);
+  assert.match(scenario.failure.reason, /hard cycle limit reached/);
 });

@@ -1939,6 +1939,214 @@ const TEMPLATE: &str = r##"<!doctype html>
       return Math.max(limit, scenario.hardCycleLimit);
     }
 
+    function failControllerScenario(scenario, cycle, reason) {
+      if (scenario === null || scenario.status !== "running") return;
+      const step = scenario.definition.steps[scenario.stepIndex] ?? null;
+      scenario.status = "failed";
+      scenario.failure = {
+        step: step?.id ?? null,
+        cycle,
+        pollIndex: scenario.pollIndex,
+        reason: String(reason),
+      };
+      scenario.pulse = null;
+    }
+
+    function observeControllerScenarioPulse(scenario, cycle, sample) {
+      const pulse = scenario.pulse;
+      if (pulse === null) return;
+      const pad = sample?.pad;
+      if (pad === null || typeof pad !== "object") return;
+      const held = Number(pad.held);
+      const pressed = Number(pad.pressed);
+      const released = Number(pad.released);
+      if (
+        !Number.isSafeInteger(held)
+        || !Number.isSafeInteger(pressed)
+        || !Number.isSafeInteger(released)
+      ) return;
+      const entry = scenario.steps.at(-1);
+      if (
+        entry.press.polls !== 0
+        && entry.guest.pressedCycle === null
+        && (pressed & pulse.button) !== 0
+      ) {
+        entry.guest.pressedCycle = cycle;
+      }
+      if (
+        pulse.state !== "release"
+        || entry.release.polls === 0
+        || pulse.releaseServiceCycle === null
+        || cycle <= pulse.releaseServiceCycle
+      ) return;
+      if (
+        entry.guest.pressedCycle !== null
+        && cycle > entry.guest.pressedCycle
+        && entry.guest.releasedCycle === null
+        && (released & pulse.button) !== 0
+        && (held & pulse.button) === 0
+        && (pressed & pulse.button) === 0
+      ) {
+        entry.guest.releasedCycle = cycle;
+      }
+      if (
+        entry.guest.releasedCycle !== null
+        && cycle > entry.guest.releasedCycle
+        && entry.guest.neutralCycle === null
+        && held === 0
+        && pressed === 0
+        && released === 0
+      ) {
+        entry.guest.neutralCycle = cycle;
+      }
+    }
+
+    function serviceControllerScenario(scenario, cycle) {
+      if (scenario === null || scenario.status !== "running") return scenario?.status ?? null;
+      controllerScenarioInteger(cycle, "controller scenario cycle");
+      scenario.pollIndex = Math.max(scenario.pollIndex, controllerPollIndex);
+      const sample = scenario.definition.sample();
+      scenario.lastState = typeof scenario.definition.describe === "function"
+        ? scenario.definition.describe(sample)
+        : null;
+      if (
+        scenario.pulse?.state === "release"
+        && scenario.steps.at(-1).release.polls !== 0
+        && scenario.pulse.releaseServiceCycle === null
+      ) {
+        scenario.pulse.releaseServiceCycle = cycle;
+      }
+      observeControllerScenarioPulse(scenario, cycle, sample);
+
+      if (cycle >= scenario.hardCycleLimit) {
+        failControllerScenario(scenario, cycle, "hard cycle limit reached");
+        return scenario.status;
+      }
+
+      if (scenario.pulse !== null) {
+        const pulse = scenario.pulse;
+        const entry = scenario.steps.at(-1);
+        if (pulse.state === "release") {
+          const guestHadReleaseWindow = pulse.releaseServiceCycle !== null
+            && cycle > pulse.releaseServiceCycle;
+          if (guestHadReleaseWindow && entry.guest.pressedCycle === null) {
+            failControllerScenario(
+              scenario,
+              cycle,
+              `guest did not observe pressed within ${scenario.pressPolls} polls`
+            );
+            return scenario.status;
+          }
+          const observed = entry.guest.pressedCycle !== null
+            && entry.guest.releasedCycle !== null
+            && entry.guest.neutralCycle !== null;
+          if (pulse.neutralPolls >= scenario.minimumNeutralPolls && observed) {
+            entry.completedCycle = cycle;
+            entry.completedPollIndex = scenario.pollIndex;
+            scenario.stepIndex += 1;
+            scenario.pulse = null;
+          } else if (
+            guestHadReleaseWindow
+            && pulse.neutralPolls >= scenario.maximumNeutralPolls
+          ) {
+            const missing = [
+              entry.guest.pressedCycle === null ? "pressed" : null,
+              entry.guest.releasedCycle === null ? "released" : null,
+              entry.guest.neutralCycle === null ? "neutral" : null,
+            ].filter(value => value !== null).join(", ");
+            failControllerScenario(
+              scenario,
+              cycle,
+              `guest did not observe ${missing || "the input edge"}`
+            );
+          }
+        }
+        if (scenario.pulse !== null) return scenario.status;
+      }
+
+      for (;;) {
+        const step = scenario.definition.steps[scenario.stepIndex];
+        if (step === undefined) {
+          scenario.status = "complete";
+          scenario.completedCycle = cycle;
+          return scenario.status;
+        }
+        const missed = step.missed?.(sample, scenario);
+        if (missed) {
+          failControllerScenario(
+            scenario,
+            cycle,
+            typeof missed === "string" ? missed : `missed transition for ${step.id}`
+          );
+          return scenario.status;
+        }
+        if (!step.ready(sample, scenario)) return scenario.status;
+
+        const state = typeof scenario.definition.describe === "function"
+          ? scenario.definition.describe(sample)
+          : null;
+        if (step.button === null) {
+          scenario.steps.push({
+            id: step.id,
+            type: "observe",
+            observedCycle: cycle,
+            observedPollIndex: scenario.pollIndex,
+            state,
+          });
+          scenario.stepIndex += 1;
+          continue;
+        }
+
+        const entry = {
+          id: step.id,
+          type: "input",
+          button: step.button,
+          readyCycle: cycle,
+          readyPollIndex: scenario.pollIndex,
+          readyState: state,
+          press: {
+            sequence: scenario.nextSequence,
+            polls: 0,
+            publications: [],
+            firstPollIndex: null,
+            lastPollIndex: null,
+            firstScheduledCycle: null,
+            lastScheduledCycle: null,
+            firstObservedCycle: null,
+            lastObservedCycle: null,
+          },
+          release: {
+            sequence: scenario.nextSequence + 1,
+            polls: 0,
+            publications: [],
+            firstPollIndex: null,
+            lastPollIndex: null,
+            firstScheduledCycle: null,
+            lastScheduledCycle: null,
+            firstObservedCycle: null,
+            lastObservedCycle: null,
+          },
+          guest: {
+            pressedCycle: null,
+            releasedCycle: null,
+            neutralCycle: null,
+          },
+          completedCycle: null,
+          completedPollIndex: null,
+        };
+        scenario.steps.push(entry);
+        scenario.nextSequence += 2;
+        scenario.pulse = {
+          button: step.button,
+          state: "press",
+          pressPolls: 0,
+          neutralPolls: 0,
+          releaseServiceCycle: null,
+        };
+        return scenario.status;
+      }
+    }
+
     function recordControllerScenarioPoll(
       record,
       pollIndex,
