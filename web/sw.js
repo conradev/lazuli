@@ -11,6 +11,7 @@ export const META_CACHE = "gekko-meta-v1";
 export const RELEASE_CACHE_PREFIX = "gekko-release-";
 export const ACTIVE_RECORD_PATH = "/.gekko/active-release";
 export const STAGE_RELEASE_PATH = "/.gekko/stage-release";
+export const APP_PATH = "/app.html";
 
 const BOOTSTRAP_ASSETS = [
   "/index.html",
@@ -191,6 +192,31 @@ export async function backendResponse(
   });
 }
 
+export async function frontendResponse(
+  record,
+  cacheStorage = caches,
+  origin = self.location.origin,
+  fetcher = fetch,
+) {
+  const asset = record.release.frontend;
+  const cache = await cacheStorage.open(record.cacheName);
+  const url = absoluteUrl(asset.url, origin);
+  let response = await cache.match(url);
+  if (response === undefined) {
+    await fetchAndCacheAsset(asset, cache, null, fetcher, origin);
+    response = await cache.match(url);
+  }
+  if (response === undefined) throw new Error(`cached frontend is missing: ${asset.url}`);
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Type", "text/html; charset=utf-8");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function networkFirstBootstrap(request) {
   const cache = await caches.open(BOOTSTRAP_CACHE);
   const canonical = absoluteUrl("/index.html", self.location.origin);
@@ -277,6 +303,23 @@ async function handleFetch(request) {
     return networkFirstBootstrap(request);
   }
   if (url.pathname === "/release.json") return networkFirstRelease(request);
+  if (url.pathname === APP_PATH) {
+    const active = await readActiveRelease(caches, self.location.origin);
+    if (active !== null) {
+      try {
+        return await frontendResponse(active);
+      } catch {
+        return new Response("The saved frontend is unavailable.", {
+          status: 503,
+          headers: { "Cache-Control": "no-store" },
+        });
+      }
+    }
+    return new Response("No frontend release is active.", {
+      status: 503,
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
   if (url.pathname === "/ppcwasmjit.wasm") {
     const active = await readActiveRelease(caches, self.location.origin);
     if (active !== null) {

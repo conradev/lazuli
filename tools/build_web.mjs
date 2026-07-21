@@ -16,7 +16,17 @@ import {
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_REPOSITORY = "https://github.com/conradev/lazuli";
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
-const STATIC_FILES = ["index.html", "app.webmanifest", "icon.svg", "release.mjs", "sw.js"];
+const RENDERER_JAVASCRIPT_NAME = "browser_renderer.js";
+const RENDERER_WASM_NAME = "browser_renderer_bg.wasm";
+const RENDERER_IMPORT_URL = `/${RENDERER_JAVASCRIPT_NAME}`;
+const STATIC_FILES = [
+  "index.html",
+  "app.html",
+  "app.webmanifest",
+  "icon.svg",
+  "release.mjs",
+  "sw.js",
+];
 const DEBUG_UI_START = "<!-- LAZULI DEBUG UI START -->";
 const DEBUG_UI_END = "<!-- LAZULI DEBUG UI END -->";
 const DEBUG_ONLY_IDS = [
@@ -144,6 +154,12 @@ function cloudflareHeaders() {
   Cache-Control: no-store
 
 /release.json
+  Cache-Control: no-store
+
+/app
+  Cache-Control: no-store
+
+/app.html
   Cache-Control: no-store
 
 /source.html
