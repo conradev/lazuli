@@ -15,6 +15,7 @@ use wasm_bindgen_futures::future_to_promise;
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
+use crate::packet::{GxCopyKind, GxFramePacket};
 use crate::tev::{
     MAX_TEV_TEXTURES, TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS,
     required_texture_maps, shader_source as tev_shader_source, validate_draw_transport,
@@ -65,6 +66,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(textureSample(source_texture, source_sampler, input.uv).rgb, 1.0);
 }
 ";
+
+const DECODED_TEXTURE_CACHE_CAPACITY: usize = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -141,6 +144,16 @@ struct DrawCommandState {
 struct DrawCommand {
     vertices: Range<u32>,
     state: DrawCommandState,
+}
+
+struct TevTextureInput<'a> {
+    key: &'a str,
+    pixels: &'a [u8],
+    address: u32,
+    generation: u32,
+    width: u32,
+    height: u32,
+    sampler: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -344,6 +357,11 @@ fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> 
         ("decodedTextureQueries", metrics.decoded_texture_queries),
         ("drainCalls", metrics.drain_calls),
         ("expandedVertexBytes", metrics.expanded_vertex_bytes),
+        ("gxFramePacketBytes", metrics.gx_frame_packet_bytes),
+        (
+            "gxFramePacketPayloadBytes",
+            metrics.gx_frame_packet_payload_bytes,
+        ),
         ("presentXfbCalls", metrics.present_xfb_calls),
         ("pushTevDrawCalls", metrics.push_tev_draw_calls),
         ("queueSubmissions", metrics.queue_submissions),
@@ -355,6 +373,12 @@ fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> 
         ("textureUploadBytes", metrics.texture_upload_bytes),
         ("textureWrites", metrics.texture_writes),
         ("texturesCreated", metrics.textures_created),
+        ("submitGxFrameCalls", metrics.submit_gx_frame_calls),
+        ("wasmBridgeCalls", metrics.wasm_bridge_calls),
+        (
+            "wasmBridgeTypedArrayBytes",
+            metrics.wasm_bridge_typed_array_bytes,
+        ),
     ] {
         Reflect::set(
             &result,
@@ -374,13 +398,14 @@ impl WebGpuRenderer {
     }
 
     pub fn reset(&mut self) -> Result<(), JsValue> {
+        self.record_wasm_bridge_call(0);
         self.ensure_healthy()?;
         self.clear_segment();
         self.texture_cache.clear();
         self.efb_copy_cache.clear();
         self.xfb_cache.clear();
         self.last_presented_xfb = None;
-        self.clear_efb(0, 0, 0)
+        self.clear_efb_inner(0, 0, 0)
     }
 
     pub fn reset_diagnostics(&self) {
@@ -391,7 +416,18 @@ impl WebGpuRenderer {
         renderer_metrics_object(self.metrics.get())
     }
 
+    fn record_wasm_bridge_call(&self, typed_array_bytes: usize) {
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.record_wasm_bridge_call(typed_array_bytes);
+        });
+    }
+
     pub fn clear_efb(&self, red: u8, green: u8, blue: u8) -> Result<(), JsValue> {
+        self.record_wasm_bridge_call(0);
+        self.clear_efb_inner(red, green, blue)
+    }
+
+    fn clear_efb_inner(&self, red: u8, green: u8, blue: u8) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
@@ -439,6 +475,11 @@ impl WebGpuRenderer {
     }
 
     pub fn begin_segment(&mut self) -> Result<(), JsValue> {
+        self.record_wasm_bridge_call(0);
+        self.begin_segment_inner()
+    }
+
+    fn begin_segment_inner(&mut self) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.begin_segment_calls = metrics.begin_segment_calls.saturating_add(1);
@@ -448,6 +489,7 @@ impl WebGpuRenderer {
     }
 
     pub fn check_health(&self) -> Result<(), JsValue> {
+        self.record_wasm_bridge_call(0);
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.check_health_calls = metrics.check_health_calls.saturating_add(1);
@@ -456,6 +498,7 @@ impl WebGpuRenderer {
     }
 
     pub fn has_decoded_texture(&self, key: &str, width: u32, height: u32) -> bool {
+        self.record_wasm_bridge_call(0);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.decoded_texture_queries = metrics.decoded_texture_queries.saturating_add(1);
         });
@@ -469,6 +512,7 @@ impl WebGpuRenderer {
     }
 
     pub fn drain(&self) -> Promise {
+        self.record_wasm_bridge_call(0);
         if let Err(error) = self.ensure_healthy() {
             return Promise::reject(&error);
         }
@@ -614,7 +658,7 @@ impl WebGpuRenderer {
         let source_vertices = source_vertices.to_vec();
         let tev_state = source_tev_state.to_vec();
         let texture_metadata = texture_metadata.to_vec();
-        let vertex_count = validate_draw_transport(
+        validate_draw_transport(
             source_vertices.len(),
             tev_state.len(),
             texture_keys.length() as usize,
@@ -626,7 +670,7 @@ impl WebGpuRenderer {
         debug_assert_eq!(texture_metadata.len(), TEV_TEXTURE_METADATA_WORDS);
 
         let mut keys = Vec::with_capacity(MAX_TEV_TEXTURES);
-        let mut pixels = Vec::with_capacity(MAX_TEV_TEXTURES);
+        let mut pixel_storage = Vec::with_capacity(MAX_TEV_TEXTURES);
         for map in 0..MAX_TEV_TEXTURES {
             let key = texture_keys.get(map as u32).as_string().ok_or_else(|| {
                 JsValue::from_str(&format!("TEV texture key {map} is not a string"))
@@ -638,16 +682,257 @@ impl WebGpuRenderer {
                 )));
             }
             keys.push(key);
-            pixels.push(pixels_value.unchecked_into::<Uint8Array>());
+            pixel_storage.push(pixels_value.unchecked_into::<Uint8Array>().to_vec());
         }
+        let textures = std::array::from_fn(|map| {
+            let metadata = map * 5;
+            TevTextureInput {
+                key: &keys[map],
+                pixels: &pixel_storage[map],
+                address: texture_metadata[metadata],
+                generation: texture_metadata[metadata + 1],
+                width: texture_metadata[metadata + 2],
+                height: texture_metadata[metadata + 3],
+                sampler: texture_metadata[metadata + 4],
+            }
+        });
+        let texture_pixel_bytes = pixel_storage.iter().map(Vec::len).sum();
+        let bridge_typed_array_bytes = source_vertices
+            .len()
+            .saturating_mul(size_of::<f32>())
+            .saturating_add(tev_state.len())
+            .saturating_add(texture_metadata.len().saturating_mul(size_of::<u32>()))
+            .saturating_add(texture_pixel_bytes);
+        self.record_wasm_bridge_call(bridge_typed_array_bytes);
+        self.push_tev_draw_inner(
+            topology,
+            &source_vertices,
+            &tev_state,
+            &textures,
+            None,
+            texture_pixel_bytes,
+            z_mode,
+            blend_mode,
+            alpha_test,
+            cull_mode,
+            scissor_x,
+            scissor_y,
+            scissor_width,
+            scissor_height,
+        )
+    }
+
+    /// Submit one completely validated GX segment and its terminal EFB copy.
+    ///
+    /// Bridge telemetry records every call at entry, but parsing and resource
+    /// preflight finish before rendering state changes, so a malformed Worker
+    /// packet cannot leave a partial WebGPU frame behind.
+    pub fn submit_gx_frame(&mut self, source_packet: Uint8Array) -> Result<Array, JsValue> {
+        let packet_bytes = source_packet.to_vec();
+        self.record_wasm_bridge_call(packet_bytes.len());
+        let packet = GxFramePacket::parse(&packet_bytes)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let header = *packet.header();
+        let payload_bytes: usize = packet.textures().map(|texture| texture.pixels.len()).sum();
+        let packet_texture_keys = packet
+            .textures()
+            .map(|texture| texture.key)
+            .collect::<HashSet<_>>();
+
+        self.ensure_healthy()?;
+        // Resolve every required texture before beginning the segment. Packet
+        // syntax is already validated above; this preflight also makes a
+        // missing resident payload fail without leaving earlier draws queued.
+        for draw in packet.draws() {
+            for (map, slot) in draw.record.textures.iter().enumerate() {
+                let Some(index) = slot.texture else {
+                    continue;
+                };
+                let texture = packet
+                    .texture(index as usize)
+                    .expect("validated GX texture reference");
+                let cached_dimensions = self
+                    .texture_cache
+                    .get(texture.key)
+                    .map(|cached| (cached.width, cached.height));
+                let decoded_is_valid = decoded_texture_is_available(
+                    texture.record.width,
+                    texture.record.height,
+                    texture.pixels.len(),
+                    cached_dimensions,
+                )
+                .map_err(|error| {
+                    JsValue::from_str(&format!(
+                        "TEV texture map {map} key {}: {error}",
+                        texture.key
+                    ))
+                })?;
+                require_tev_texture(
+                    map,
+                    true,
+                    select_texture(
+                        texture.record.generation,
+                        self.efb_copy_cache
+                            .get(&texture.record.address)
+                            .map(|cached| cached.generation),
+                        decoded_is_valid,
+                    ),
+                )
+                .map_err(|error| JsValue::from_str(&error))?;
+            }
+        }
+        let mut source_vertices =
+            Vec::with_capacity(header.total_vertex_count as usize * TEV_VERTEX_FLOATS);
+        for draw in packet.draws() {
+            source_vertices.extend(draw.vertex_floats());
+        }
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.submit_gx_frame_calls = metrics.submit_gx_frame_calls.saturating_add(1);
+            metrics.gx_frame_packet_bytes = metrics
+                .gx_frame_packet_bytes
+                .saturating_add(packet_bytes.len() as u64);
+            metrics.gx_frame_packet_payload_bytes = metrics
+                .gx_frame_packet_payload_bytes
+                .saturating_add(payload_bytes as u64);
+            metrics.texture_pixel_bytes = metrics
+                .texture_pixel_bytes
+                .saturating_add(payload_bytes as u64);
+        });
+        let render = (|| {
+            self.begin_segment_inner()?;
+            for draw in packet.draws() {
+                let vertex_start = draw.record.vertex_relative_offset as usize / size_of::<f32>();
+                let vertex_len = draw.record.vertex_count as usize * TEV_VERTEX_FLOATS;
+                let draw_vertices = &source_vertices[vertex_start..vertex_start + vertex_len];
+                let textures = std::array::from_fn(|map| {
+                    let slot = draw.record.textures[map];
+                    match slot.texture {
+                        Some(index) => {
+                            let texture = packet
+                                .texture(index as usize)
+                                .expect("validated GX texture reference");
+                            TevTextureInput {
+                                key: texture.key,
+                                pixels: texture.pixels,
+                                address: texture.record.address,
+                                generation: texture.record.generation,
+                                width: texture.record.width,
+                                height: texture.record.height,
+                                sampler: slot.sampler_bits,
+                            }
+                        }
+                        None => TevTextureInput {
+                            key: "",
+                            pixels: &[],
+                            address: 0,
+                            generation: 0,
+                            width: 0,
+                            height: 0,
+                            sampler: 0,
+                        },
+                    }
+                });
+                self.push_tev_draw_inner(
+                    draw.record.topology,
+                    draw_vertices,
+                    draw.tev_state,
+                    &textures,
+                    Some(&packet_texture_keys),
+                    0,
+                    draw.record.z_mode,
+                    draw.record.blend_mode,
+                    draw.record.alpha_test,
+                    draw.record.cull_mode,
+                    draw.record.scissor_x,
+                    draw.record.scissor_y,
+                    draw.record.scissor_width,
+                    draw.record.scissor_height,
+                )?;
+            }
+
+            // LZGX carries the guest alpha byte so a future EFB-alpha layer
+            // need not change the transport ABI. This checkpoint deliberately
+            // preserves the renderer's current opaque-alpha clear semantics.
+            let [clear_red, clear_green, clear_blue, _clear_alpha] = header.clear_rgba;
+            match header.copy_kind {
+                GxCopyKind::Texture => self.copy_texture_inner(
+                    header.source_x,
+                    header.source_y,
+                    header.source_width,
+                    header.source_height,
+                    header.destination,
+                    header.generation,
+                    header.clear,
+                    clear_red,
+                    clear_green,
+                    clear_blue,
+                ),
+                GxCopyKind::Xfb => self.copy_xfb_inner(
+                    header.source_x,
+                    header.source_y,
+                    header.source_width,
+                    header.source_height,
+                    header.output_width,
+                    header.output_height,
+                    header.destination,
+                    header.stride,
+                    header.generation,
+                    header.clear,
+                    clear_red,
+                    clear_green,
+                    clear_blue,
+                ),
+            }
+        })();
+        if render.is_err() {
+            self.clear_segment();
+        }
+        render?;
+        while self.texture_cache.len() > DECODED_TEXTURE_CACHE_CAPACITY {
+            let Some(key) = self.texture_cache.keys().min().cloned() else {
+                break;
+            };
+            self.texture_cache.remove(&key);
+        }
+        let mut resident_keys = self.texture_cache.keys().collect::<Vec<_>>();
+        resident_keys.sort_unstable();
+        let resident = Array::new();
+        for key in resident_keys {
+            resident.push(&JsValue::from_str(key));
+        }
+        Ok(resident)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_tev_draw_inner(
+        &mut self,
+        topology: u8,
+        source_vertices: &[f32],
+        tev_state: &[u8],
+        textures: &[TevTextureInput<'_>; MAX_TEV_TEXTURES],
+        packet_protected_keys: Option<&HashSet<&str>>,
+        transport_texture_pixel_bytes: usize,
+        z_mode: u32,
+        blend_mode: u32,
+        alpha_test: u32,
+        cull_mode: u8,
+        scissor_x: u32,
+        scissor_y: u32,
+        scissor_width: u32,
+        scissor_height: u32,
+    ) -> Result<(), JsValue> {
+        let vertex_count = validate_draw_transport(
+            source_vertices.len(),
+            tev_state.len(),
+            MAX_TEV_TEXTURES,
+            TEV_TEXTURE_METADATA_WORDS,
+            MAX_TEV_TEXTURES,
+        )
+        .map_err(|error| JsValue::from_str(&error))?;
         let required_maps =
-            required_texture_maps(&tev_state).map_err(|error| JsValue::from_str(&error))?;
+            required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
         let expanded = expanded_indices(topology, vertex_count)
             .ok_or_else(|| JsValue::from_str("unsupported GX primitive topology"))?;
-        let texture_pixel_bytes = pixels
-            .iter()
-            .map(|pixels| pixels.length() as usize)
-            .sum::<usize>();
         let expanded_vertex_bytes = expanded
             .len()
             .saturating_mul(std::mem::size_of::<TevVertex>());
@@ -657,10 +942,8 @@ impl WebGpuRenderer {
                     .len()
                     .saturating_mul(std::mem::size_of::<f32>()),
                 tev_state.len(),
-                texture_metadata
-                    .len()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-                texture_pixel_bytes,
+                TEV_TEXTURE_METADATA_WORDS.saturating_mul(std::mem::size_of::<u32>()),
+                transport_texture_pixel_bytes,
                 expanded_vertex_bytes,
             );
         });
@@ -687,31 +970,27 @@ impl WebGpuRenderer {
             if !required_maps[map] {
                 continue;
             }
-            let metadata = map * 5;
-            let address = texture_metadata[metadata];
-            let generation = texture_metadata[metadata + 1];
-            let width = texture_metadata[metadata + 2];
-            let height = texture_metadata[metadata + 3];
+            let input = &textures[map];
             let cached_dimensions = self
                 .texture_cache
-                .get(&keys[map])
+                .get(input.key)
                 .map(|texture| (texture.width, texture.height));
             let decoded_is_valid = decoded_texture_is_available(
-                width,
-                height,
-                pixels[map].length() as usize,
+                input.width,
+                input.height,
+                input.pixels.len(),
                 cached_dimensions,
             )
             .map_err(|error| {
-                JsValue::from_str(&format!("TEV texture map {map} key {}: {error}", keys[map]))
+                JsValue::from_str(&format!("TEV texture map {map} key {}: {error}", input.key))
             })?;
             selected[map] = require_tev_texture(
                 map,
                 true,
                 select_texture(
-                    generation,
+                    input.generation,
                     self.efb_copy_cache
-                        .get(&address)
+                        .get(&input.address)
                         .map(|texture| texture.generation),
                     decoded_is_valid,
                 ),
@@ -723,52 +1002,56 @@ impl WebGpuRenderer {
             .iter()
             .enumerate()
             .filter(|(_, selected)| **selected == SelectedTexture::Decoded)
-            .map(|(map, _)| keys[map].clone())
+            .map(|(map, _)| textures[map].key)
             .collect::<HashSet<_>>();
         for map in 0..MAX_TEV_TEXTURES {
             if selected[map] != SelectedTexture::Decoded
-                || self.texture_cache.contains_key(&keys[map])
+                || self.texture_cache.contains_key(textures[map].key)
             {
                 continue;
             }
-            let metadata = map * 5;
-            let pixels = pixels[map].to_vec();
+            let input = &textures[map];
             let texture = self.upload_texture(
-                &format!("GX TEV texture {}", keys[map]),
-                texture_metadata[metadata + 2],
-                texture_metadata[metadata + 3],
-                &pixels,
+                &format!("GX TEV texture {}", input.key),
+                input.width,
+                input.height,
+                input.pixels,
                 0,
             )?;
-            if self.texture_cache.len() >= 128
+            if self.texture_cache.len() >= DECODED_TEXTURE_CACHE_CAPACITY
                 && let Some(key) = self
                     .texture_cache
                     .keys()
-                    .find(|key| !protected_keys.contains(*key))
+                    .filter(|key| {
+                        !protected_keys.contains(key.as_str())
+                            && packet_protected_keys
+                                .is_none_or(|packet| !packet.contains(key.as_str()))
+                    })
+                    .min()
                     .cloned()
             {
                 self.texture_cache.remove(&key);
             }
-            self.texture_cache.insert(keys[map].clone(), texture);
+            self.texture_cache.insert(input.key.to_owned(), texture);
         }
 
         let texture_identities = std::array::from_fn(|map| {
-            let metadata = map * 5;
+            let input = &textures[map];
             match selected[map] {
                 SelectedTexture::EfbCopy => TextureBindingIdentity::EfbCopy {
-                    address: texture_metadata[metadata],
-                    generation: texture_metadata[metadata + 1],
+                    address: input.address,
+                    generation: input.generation,
                 },
-                SelectedTexture::Decoded => TextureBindingIdentity::Decoded(keys[map].clone()),
+                SelectedTexture::Decoded => TextureBindingIdentity::Decoded(input.key.to_owned()),
                 SelectedTexture::White => TextureBindingIdentity::White,
             }
         });
         let sampler_identities =
-            std::array::from_fn(|map| gx_sampler_identity(texture_metadata[map * 5 + 4]));
+            std::array::from_fn(|map| gx_sampler_identity(textures[map].sampler));
         let binding_key = TevBindingKey {
             textures: texture_identities,
             samplers: sampler_identities,
-            state: tev_state.clone(),
+            state: tev_state.to_vec(),
             alpha_test: alpha_test & 0x00ff_ffff,
         };
         let binding = if let Some(binding) = self.tev_draw_binding_indices.get(&binding_key) {
@@ -796,19 +1079,14 @@ impl WebGpuRenderer {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("browser GX per-fragment TEV state"),
-                    contents: &tev_state,
+                    contents: tev_state,
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
             let texture_views = (0..MAX_TEV_TEXTURES)
-                .map(|map| {
-                    let metadata = map * 5;
-                    match selected[map] {
-                        SelectedTexture::EfbCopy => {
-                            &self.efb_copy_cache[&texture_metadata[metadata]].view
-                        }
-                        SelectedTexture::Decoded => &self.texture_cache[&keys[map]].view,
-                        SelectedTexture::White => &self.white_texture.view,
-                    }
+                .map(|map| match selected[map] {
+                    SelectedTexture::EfbCopy => &self.efb_copy_cache[&textures[map].address].view,
+                    SelectedTexture::Decoded => &self.texture_cache[textures[map].key].view,
+                    SelectedTexture::White => &self.white_texture.view,
                 })
                 .collect::<Vec<_>>();
             let samplers = sampler_identities.map(|identity| &self.samplers[&identity]);
@@ -905,6 +1183,35 @@ impl WebGpuRenderer {
         clear_green: u8,
         clear_blue: u8,
     ) -> Result<(), JsValue> {
+        self.record_wasm_bridge_call(0);
+        self.copy_texture_inner(
+            source_x,
+            source_y,
+            width,
+            height,
+            destination,
+            generation,
+            clear,
+            clear_red,
+            clear_green,
+            clear_blue,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_texture_inner(
+        &mut self,
+        source_x: u32,
+        source_y: u32,
+        width: u32,
+        height: u32,
+        destination: u32,
+        generation: u32,
+        clear: bool,
+        clear_red: u8,
+        clear_green: u8,
+        clear_blue: u8,
+    ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.copy_texture_calls = metrics.copy_texture_calls.saturating_add(1);
@@ -972,20 +1279,61 @@ impl WebGpuRenderer {
                 height,
             },
         );
-        if self.efb_copy_cache.len() > 64
-            && let Some(address) = self.efb_copy_cache.keys().next().copied()
-            && address != destination
-        {
+        while self.efb_copy_cache.len() > 64 {
+            let Some(address) = self
+                .efb_copy_cache
+                .iter()
+                .filter(|(address, _)| **address != destination)
+                .min_by_key(|(address, texture)| (texture.generation, **address))
+                .map(|(address, _)| *address)
+            else {
+                break;
+            };
             self.efb_copy_cache.remove(&address);
         }
         if clear {
-            self.clear_efb(clear_red, clear_green, clear_blue)?;
+            self.clear_efb_inner(clear_red, clear_green, clear_blue)?;
         }
         self.ensure_healthy()
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn copy_xfb(
+        &mut self,
+        source_x: u32,
+        source_y: u32,
+        width: u32,
+        source_height: u32,
+        xfb_width: u32,
+        xfb_height: u32,
+        destination: u32,
+        stride: u32,
+        generation: u32,
+        clear: bool,
+        clear_red: u8,
+        clear_green: u8,
+        clear_blue: u8,
+    ) -> Result<(), JsValue> {
+        self.record_wasm_bridge_call(0);
+        self.copy_xfb_inner(
+            source_x,
+            source_y,
+            width,
+            source_height,
+            xfb_width,
+            xfb_height,
+            destination,
+            stride,
+            generation,
+            clear,
+            clear_red,
+            clear_green,
+            clear_blue,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_xfb_inner(
         &mut self,
         source_x: u32,
         source_y: u32,
@@ -1083,13 +1431,13 @@ impl WebGpuRenderer {
             && let Some(address) = self
                 .xfb_cache
                 .iter()
-                .min_by_key(|(_, copy)| copy.metadata.generation)
+                .min_by_key(|(address, copy)| (copy.metadata.generation, **address))
                 .map(|(address, _)| *address)
         {
             self.xfb_cache.remove(&address);
         }
         if clear {
-            self.clear_efb(clear_red, clear_green, clear_blue)?;
+            self.clear_efb_inner(clear_red, clear_green, clear_blue)?;
         }
         self.ensure_healthy()
     }
@@ -1102,6 +1450,7 @@ impl WebGpuRenderer {
         output_width: u32,
         output_height: u32,
     ) -> Result<bool, JsValue> {
+        self.record_wasm_bridge_call(0);
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.present_xfb_calls = metrics.present_xfb_calls.saturating_add(1);

@@ -22,6 +22,8 @@ pub(crate) struct RendererMetrics {
     pub(crate) decoded_texture_queries: u64,
     pub(crate) drain_calls: u64,
     pub(crate) expanded_vertex_bytes: u64,
+    pub(crate) gx_frame_packet_bytes: u64,
+    pub(crate) gx_frame_packet_payload_bytes: u64,
     pub(crate) present_xfb_calls: u64,
     pub(crate) push_tev_draw_calls: u64,
     pub(crate) queue_submissions: u64,
@@ -33,9 +35,19 @@ pub(crate) struct RendererMetrics {
     pub(crate) texture_upload_bytes: u64,
     pub(crate) texture_writes: u64,
     pub(crate) textures_created: u64,
+    pub(crate) submit_gx_frame_calls: u64,
+    pub(crate) wasm_bridge_calls: u64,
+    pub(crate) wasm_bridge_typed_array_bytes: u64,
 }
 
 impl RendererMetrics {
+    pub(crate) fn record_wasm_bridge_call(&mut self, typed_array_bytes: usize) {
+        self.wasm_bridge_calls = self.wasm_bridge_calls.saturating_add(1);
+        self.wasm_bridge_typed_array_bytes = self
+            .wasm_bridge_typed_array_bytes
+            .saturating_add(typed_array_bytes as u64);
+    }
+
     pub(crate) fn record_draw_transport(
         &mut self,
         source_vertex_bytes: usize,
@@ -572,6 +584,19 @@ mod tests {
         assert_eq!(metrics.texture_metadata_bytes, 320);
         assert_eq!(metrics.texture_pixel_bytes, 4096);
         assert_eq!(metrics.expanded_vertex_bytes, 1296);
+    }
+
+    #[test]
+    fn renderer_metrics_count_actual_bridge_calls_and_packet_bytes_separately() {
+        let mut metrics = RendererMetrics::default();
+        metrics.record_wasm_bridge_call(1920);
+        metrics.record_wasm_bridge_call(0);
+        metrics.record_wasm_bridge_call(0);
+
+        assert_eq!(metrics.wasm_bridge_calls, 3);
+        assert_eq!(metrics.wasm_bridge_typed_array_bytes, 1920);
+        assert_eq!(metrics.push_tev_draw_calls, 0);
+        assert_eq!(metrics.texture_pixel_bytes, 0);
     }
 
     #[test]
