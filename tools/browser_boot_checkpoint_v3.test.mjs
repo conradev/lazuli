@@ -9,9 +9,12 @@ import {
   BROWSER_BOOT_CHECKPOINT_SCHEMA_V3,
   CheckpointValidationError,
   checkpointFieldsForSchema,
+  checkpointSha256,
 } from "./browser_boot_checkpoint_core.mjs";
 import {
   SUPER_MONKEY_BALL_READY_CHECKPOINT,
+  createSmbReadyCheckpointCandidate,
+  projectSmbReadyCheckpointReport,
   validateSmbReadyCheckpointOptions,
   validateSmbReadyCheckpointReport,
 } from "./browser_boot_checkpoint_v3.mjs";
@@ -20,9 +23,12 @@ import {
 } from "./browser_boot_checkpoint_v3_fixture.mjs";
 import {
   GameplayTranscriptValidationError,
+  deriveSmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
 import {
   TemporalXfbValidationError,
+  deriveTemporalSelectedXfbOracle,
+  projectSmbTemporalSelectedXfb,
 } from "./browser_boot_temporal_xfb.mjs";
 
 function expectCheckpointFailure(mutate, path) {
@@ -74,8 +80,10 @@ test("schema v3 defines one deeply frozen explicit SMB ready-to-PLAY profile", (
   );
 });
 
-test("schema v3 registers only the explicit ready-to-PLAY evidence fields", () => {
-  assert.equal(BROWSER_BOOT_CHECKPOINT_SCHEMA, "lazuli-browser-boot-checkpoint-v2");
+test("v3 candidate projects exactly the verified transcript and canonical temporal XFB", () => {
+  const report = smbReadyPlayCheckpointReport();
+  const state = projectSmbReadyCheckpointReport(report);
+  const candidate = createSmbReadyCheckpointCandidate(report);
   assert.deepEqual(BROWSER_BOOT_CHECKPOINT_FIELDS_V3, [
     "/status",
     "/stage",
@@ -90,18 +98,72 @@ test("schema v3 registers only the explicit ready-to-PLAY evidence fields", () =
     checkpointFieldsForSchema(BROWSER_BOOT_CHECKPOINT_SCHEMA_V3),
     BROWSER_BOOT_CHECKPOINT_FIELDS_V3,
   );
+  assert.deepEqual(Object.keys(state), [
+    "status",
+    "stage",
+    "title",
+    "disc",
+    "gameplayTranscript",
+    "rendering",
+  ]);
+  assert.deepEqual(Object.keys(state.disc), ["identifier", "revision"]);
+  assert.deepEqual(Object.keys(state.rendering), ["backend", "temporalSelectedXfb"]);
+  assert.equal(state.execution, undefined);
+  assert.equal(state.headlessCapture, undefined);
+  assert.equal(state.gxFifo, undefined);
+  assert.deepEqual(
+    state.gameplayTranscript,
+    deriveSmbReadyPlayGameplayTranscript(report),
+  );
+  assert.deepEqual(
+    state.rendering.temporalSelectedXfb,
+    projectSmbTemporalSelectedXfb(report.rendering.temporalSelectedXfb),
+  );
+  assert.equal(candidate.schema, BROWSER_BOOT_CHECKPOINT_SCHEMA_V3);
+  assert.deepEqual(candidate.fields, BROWSER_BOOT_CHECKPOINT_FIELDS_V3);
+  assert.equal(candidate.id, SUPER_MONKEY_BALL_READY_CHECKPOINT.id);
+  assert.deepEqual(candidate.checkpoint, {
+    status: "paused",
+    stage: "scenario-complete",
+  });
+  assert.deepEqual(candidate.run, SUPER_MONKEY_BALL_READY_CHECKPOINT.run);
+  assert.equal(candidate.sha256, checkpointSha256(state));
+  assert.equal(
+    candidate.sha256,
+    "cdfe1b4097c11de6419d8ee9d2e9da616ef3f1881086b0bfbcb8c52a709c1f70",
+  );
+  assert.deepEqual(candidate.state, state);
 });
 
-test("fresh ready-to-PLAY reports satisfy every health and provenance gate", () => {
+test("host diagnostics stay out while verified gameplay and temporal evidence affect v3", () => {
   const report = smbReadyPlayCheckpointReport();
-  assert.strictEqual(validateSmbReadyCheckpointReport(report), report);
+  const digest = createSmbReadyCheckpointCandidate(report).sha256;
+  report.runtime = "Another Browser/9.0";
+  report.headlessCapture.url = "http://localhost:9999/host-only";
+  report.rendering.metrics.webgpu.adapterLabel = "host-only";
+  report.scenario.steps[0].readyState.hostDiagnostic = 123;
+  report.rendering.temporalSelectedXfb.frames[0].hostTimestamp = 456;
+  report.rendering.temporalSelectedXfb.frames[0].selectedXfb.gpuLabel = "host-only";
+  assert.equal(createSmbReadyCheckpointCandidate(report).sha256, digest);
+
+  const gameplayChanged = smbReadyPlayCheckpointReport();
+  gameplayChanged.scenario.steps[0].readyState.menuSelection += 1;
+  gameplayChanged.gameplayTranscript = deriveSmbReadyPlayGameplayTranscript(gameplayChanged);
+  assert.notEqual(createSmbReadyCheckpointCandidate(gameplayChanged).sha256, digest);
+
+  const temporalChanged = smbReadyPlayCheckpointReport();
+  temporalChanged.rendering.temporalSelectedXfb.frames[0].selectedXfb.rgbSha256 = "f".repeat(64);
+  temporalChanged.rendering.temporalSelectedXfb.oracle = deriveTemporalSelectedXfbOracle(
+    temporalChanged.rendering.temporalSelectedXfb.frames,
+  );
+  assert.notEqual(createSmbReadyCheckpointCandidate(temporalChanged).sha256, digest);
 });
 
 test("v3 independently rederives the attached gameplay transcript", () => {
   const report = smbReadyPlayCheckpointReport();
   report.gameplayTranscript.steps[0].ready.witness.menuSelection += 1;
   assert.throws(
-    () => validateSmbReadyCheckpointReport(report),
+    () => createSmbReadyCheckpointCandidate(report),
     error => error instanceof GameplayTranscriptValidationError
       && error.code === "transcript-mismatch"
       && /menuSelection$/.test(error.path),
@@ -112,7 +174,7 @@ test("v3 fails closed on forged temporal oracle evidence", () => {
   const report = smbReadyPlayCheckpointReport();
   report.rendering.temporalSelectedXfb.oracle.complete = false;
   assert.throws(
-    () => validateSmbReadyCheckpointReport(report),
+    () => createSmbReadyCheckpointCandidate(report),
     error => error instanceof TemporalXfbValidationError
       && error.code === "oracle-mismatch"
       && /complete$/.test(error.path),

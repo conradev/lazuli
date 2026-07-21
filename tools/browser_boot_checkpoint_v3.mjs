@@ -414,3 +414,50 @@ export function validateSmbReadyCheckpointReport(
   validateCheckpointEvidence(report, expected);
   return report;
 }
+
+export function projectSmbReadyCheckpointReport(
+  report,
+  expected = SUPER_MONKEY_BALL_READY_CHECKPOINT,
+) {
+  const evidence = validateCheckpointEvidence(report, expected);
+  return {
+    status: report.status,
+    stage: report.stage,
+    title: report.title,
+    disc: {
+      identifier: report.disc.identifier,
+      revision: report.disc.revision,
+    },
+    gameplayTranscript: canonicalCheckpointValue(evidence.gameplayTranscript),
+    rendering: {
+      backend: report.rendering.backend,
+      temporalSelectedXfb: canonicalCheckpointValue(evidence.temporalSelectedXfb),
+    },
+  };
+}
+
+export function createSmbReadyCheckpointCandidate(
+  report,
+  expected = SUPER_MONKEY_BALL_READY_CHECKPOINT,
+) {
+  const state = projectSmbReadyCheckpointReport(report, expected);
+  return {
+    schema: expected.schema,
+    algorithm: "sha256",
+    fields: [...checkpointFieldsForSchema(expected.schema)],
+    id: expected.id,
+    game: {
+      title: state.title,
+      identifier: state.disc.identifier,
+      revision: state.disc.revision,
+      image: canonicalCheckpointValue(expected.game.image),
+    },
+    checkpoint: {
+      status: state.status,
+      stage: state.stage,
+    },
+    run: canonicalCheckpointValue(expected.run),
+    sha256: checkpointSha256(state),
+    state,
+  };
+}
