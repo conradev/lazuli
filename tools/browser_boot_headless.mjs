@@ -7,7 +7,10 @@ import {
   readCheckpointManifest,
   verifyCheckpointReport,
 } from "./browser_boot_checkpoint.mjs";
-import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
+import {
+  DevToolsSession,
+  observeHeadlessPage,
+} from "./browser_boot_headless_cdp.mjs";
 import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
 
 function parseArguments(argv) {
@@ -182,7 +185,10 @@ async function pageState(session) {
 async function waitForRunner(session, deadline, pollMs) {
   let state = null;
   while (Date.now() < deadline) {
-    state = await pageState(session);
+    state = (await observeHeadlessPage(session, {
+      deadline,
+      includeFrameTree: false,
+    }, { pageState })).state;
     if (state.runnerAvailable) return state;
     await delay(pollMs);
   }
@@ -384,11 +390,18 @@ async function main() {
 
     let state = null;
     while (Date.now() < deadline) {
-      state = await pageState(session);
+      const observation = await observeHeadlessPage(session, {
+        deadline,
+        includeFrameTree: runUrl !== null,
+      }, { pageState });
+      state = observation.state;
       if (runUrl !== null) {
-        const frameTree = await session.send("Page.getFrameTree");
-        const frameLoaderId = frameTree.frameTree?.frame?.loaderId ?? null;
-        if (!isExpectedNavigation(state, runUrl, navigationLoaderId, frameLoaderId)) {
+        if (!isExpectedNavigation(
+          state,
+          runUrl,
+          navigationLoaderId,
+          observation.frameLoaderId,
+        )) {
           await delay(options.pollMs);
           continue;
         }
@@ -420,13 +433,19 @@ async function main() {
       await delay(options.pollMs);
     }
 
-    state = await pageState(session);
+    state = (await observeHeadlessPage(session, {
+      deadline,
+      includeFrameTree: runUrl !== null,
+    }, { pageState })).state;
     if (state.runnerAvailable) {
       await session.evaluate("globalThis.lazuliCycleRunner.snapshot()");
       const snapshotDeadline = Date.now() + 5_000;
       while (Date.now() < snapshotDeadline) {
         await delay(options.pollMs);
-        state = await pageState(session);
+        state = (await observeHeadlessPage(session, {
+          deadline: snapshotDeadline,
+          includeFrameTree: runUrl !== null,
+        }, { pageState })).state;
         const report = parseReport(state.result);
         if (report !== null) {
           const reportDetectedAt = Date.now();

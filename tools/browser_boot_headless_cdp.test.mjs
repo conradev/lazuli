@@ -3,7 +3,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
+import {
+  DevToolsSession,
+  observeHeadlessPage,
+} from "./browser_boot_headless_cdp.mjs";
 import {
   createUncompressedDevToolsSocket,
 } from "./browser_boot_devtools_socket.mjs";
@@ -126,10 +129,33 @@ class FakeSocket {
   }
 }
 
+function timeoutError(method) {
+  const error = new Error(`${method} timed out`);
+  error.name = "DevToolsRequestTimeoutError";
+  error.method = method;
+  return error;
+}
+
+function exactLargeTerminalReport(length = 1_048_577) {
+  const report = {
+    error: "terminal sentinel",
+    padding: "",
+    stage: "worker",
+    status: "stopped",
+    tail: "complete-tail-sentinel",
+  };
+  const empty = JSON.stringify(report);
+  report.padding = "x".repeat(length - empty.length);
+  const text = JSON.stringify(report);
+  assert.equal(text.length, length);
+  return text;
+}
+
 test("DevTools sessions default to uncompressed WebSockets", () => {
   const session = new DevToolsSession("ws://127.0.0.1/devtools/page/default");
   assert.strictEqual(session.createSocket, createUncompressedDevToolsSocket);
 });
+
 test("DevTools requests time out cleanly and reconnect to the original target", async () => {
   const timers = manualTimers();
   const sockets = [];
@@ -300,4 +326,208 @@ test("an opened socket error is closed before reconnect can retry", async () => 
   assert.equal(sockets[1].readyState, 3);
   assert.equal(session.socket, null);
   assert.equal(timers.pendingCount(), 0);
+});
+
+test("fresh observation recovers either lost read and returns the complete terminal report", async () => {
+  const reportText = exactLargeTerminalReport();
+  for (const failure of ["pageState", "Page.getFrameTree"]) {
+    const calls = [];
+    let generation = 0;
+    const session = {
+      exceptions: [{ text: "before reconnect" }],
+      async readPageState() {
+        calls.push({ generation, method: "pageState" });
+        if (generation === 0 && failure === "pageState") {
+          throw timeoutError("Runtime.evaluate");
+        }
+        return {
+          dataset: { renderer: "wgpu-webgpu" },
+          result: generation === 0 ? "" : reportText,
+          title: "Lazuli debug harness",
+          url: "http://127.0.0.1:8766/?headlessRun=fresh",
+        };
+      },
+      async reconnect() {
+        calls.push({ generation, method: "reconnect" });
+        generation += 1;
+        calls.push({ generation, method: "Runtime.enable" });
+        calls.push({ generation, method: "Page.enable" });
+        this.exceptions.push({ text: "after reconnect" });
+      },
+      async send(method) {
+        calls.push({ generation, method });
+        assert.equal(method, "Page.getFrameTree");
+        if (generation === 0 && failure === "Page.getFrameTree") {
+          throw timeoutError(method);
+        }
+        return {
+          frameTree: { frame: { loaderId: "loader-fresh" } },
+        };
+      },
+    };
+
+    const observation = await observeHeadlessPage(session, {
+      deadline: 1,
+      includeFrameTree: true,
+    }, {
+      now: () => 0,
+      pageState: value => value.readPageState(),
+    });
+    const report = JSON.parse(observation.state.result);
+
+    assert.equal(observation.frameLoaderId, "loader-fresh", failure);
+    assert.equal(observation.state.result.length, 1_048_577, failure);
+    assert.equal(report.status, "stopped", failure);
+    assert.equal(report.tail, "complete-tail-sentinel", failure);
+    assert.equal(
+      calls.filter(call => call.method === "pageState").length,
+      2,
+      failure,
+    );
+    assert.deepEqual(session.exceptions, [
+      { text: "before reconnect" },
+      { text: "after reconnect" },
+    ]);
+    assert.equal(
+      calls.some(call => call.method === "Page.navigate" || call.method.startsWith("DOM.")),
+      false,
+      failure,
+    );
+    assert.deepEqual(
+      calls.filter(call => call.method.endsWith("enable")).map(call => call.method),
+      ["Runtime.enable", "Page.enable"],
+      failure,
+    );
+  }
+});
+
+test("observation survives a read timeout and a reconnect Runtime.enable timeout", async () => {
+  const reportText = exactLargeTerminalReport();
+  const terminalState = {
+    dataset: { renderer: "wgpu-webgpu" },
+    result: reportText,
+    title: "Lazuli debug harness",
+    url: "http://127.0.0.1:8766/?headlessRun=fresh",
+  };
+  const clock = { value: 0 };
+  const timers = virtualTimers(clock);
+  const sockets = [];
+  const targetUrl = "ws://127.0.0.1/devtools/page/exact-original-target";
+  const session = new DevToolsSession(targetUrl, {
+    cancelTimer: timers.cancelTimer,
+    createSocket(url) {
+      const socket = new FakeSocket(url);
+      const generation = sockets.length;
+      if (generation === 1) socket.stalledMethods.add("Runtime.enable");
+      if (generation === 2) {
+        socket.responses.set("Runtime.evaluate", {
+          result: { value: terminalState },
+        });
+        socket.responses.set("Page.getFrameTree", {
+          frameTree: { frame: { loaderId: "loader-after-reconnect" } },
+        });
+      }
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    },
+    requestTimeoutMs: 10,
+    scheduleTimer: timers.scheduleTimer,
+  });
+
+  await session.connect();
+  const observation = await observeHeadlessPage(session, {
+    deadline: 100,
+    includeFrameTree: true,
+  }, {
+    async delay(milliseconds) {
+      clock.value += milliseconds;
+    },
+    now: () => clock.value,
+    pageState: value => value.evaluate("window.__lazuliHeadlessPageState"),
+  });
+  const report = JSON.parse(observation.state.result);
+
+  assert.equal(clock.value, 45);
+  assert.equal(observation.frameLoaderId, "loader-after-reconnect");
+  assert.equal(observation.state.result.length, 1_048_577);
+  assert.equal(report.status, "stopped");
+  assert.equal(report.tail, "complete-tail-sentinel");
+  assert.deepEqual(sockets.map(socket => socket.url), [
+    targetUrl,
+    targetUrl,
+    targetUrl,
+  ]);
+  assert.deepEqual(sockets.map(socket => socket.calls.map(call => call.method)), [
+    ["Runtime.evaluate"],
+    ["Runtime.enable"],
+    ["Runtime.enable", "Page.enable", "Runtime.evaluate", "Page.getFrameTree"],
+  ]);
+  assert.equal(sockets[0].readyState, 3);
+  assert.equal(sockets[1].readyState, 3);
+  assert.equal(sockets[2].readyState, 1);
+  assert.equal(timers.pendingCount(), 0);
+  assert.equal(
+    sockets.some(socket => socket.calls.some(call =>
+      call.method === "Page.navigate" || call.method.startsWith("DOM."))),
+    false,
+  );
+  session.close();
+  assert.equal(sockets[2].readyState, 3);
+});
+
+test("permanent reconnect failure stops at the observation deadline without leaks", async () => {
+  const clock = { value: 0 };
+  const timers = virtualTimers(clock);
+  const sockets = [];
+  const targetUrl = "ws://127.0.0.1/devtools/page/permanent-failure-target";
+  const session = new DevToolsSession(targetUrl, {
+    cancelTimer: timers.cancelTimer,
+    createSocket(url) {
+      const socket = new FakeSocket(url);
+      if (sockets.length > 0) socket.stalledMethods.add("Runtime.enable");
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    },
+    requestTimeoutMs: 10,
+    scheduleTimer: timers.scheduleTimer,
+  });
+
+  await session.connect();
+  await assert.rejects(
+    observeHeadlessPage(session, {
+      deadline: 60,
+      includeFrameTree: true,
+    }, {
+      async delay(milliseconds) {
+        clock.value += milliseconds;
+      },
+      now: () => clock.value,
+      pageState: value => value.evaluate("window.__lazuliHeadlessPageState"),
+    }),
+    error => error.name === "DevToolsRequestTimeoutError"
+      && error.method === "Runtime.enable",
+  );
+
+  assert.equal(clock.value, 60);
+  assert.equal(sockets.length, 3);
+  assert.deepEqual(sockets.map(socket => socket.url), [
+    targetUrl,
+    targetUrl,
+    targetUrl,
+  ]);
+  assert.deepEqual(sockets.map(socket => socket.calls.map(call => call.method)), [
+    ["Runtime.evaluate"],
+    ["Runtime.enable"],
+    ["Runtime.enable"],
+  ]);
+  assert.equal(sockets.every(socket => socket.readyState === 3), true);
+  assert.equal(session.socket, null);
+  assert.equal(timers.pendingCount(), 0);
+  assert.equal(
+    sockets.some(socket => socket.calls.some(call =>
+      call.method === "Page.navigate" || call.method.startsWith("DOM."))),
+    false,
+  );
 });

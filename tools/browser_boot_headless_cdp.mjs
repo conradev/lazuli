@@ -280,3 +280,51 @@ export class DevToolsSession {
     socket?.close();
   }
 }
+
+export async function observeHeadlessPage(
+  session,
+  {
+    deadline,
+    includeFrameTree,
+  },
+  {
+    delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+    now = Date.now,
+    pageState,
+  },
+) {
+  while (true) {
+    try {
+      const state = await pageState(session);
+      let frameLoaderId = null;
+      if (includeFrameTree) {
+        const frameTree = await session.send("Page.getFrameTree");
+        frameLoaderId = frameTree.frameTree?.frame?.loaderId ?? null;
+      }
+      return { frameLoaderId, state };
+    } catch (error) {
+      if (!isTransientDevToolsError(error)) throw error;
+      let recoveryError = error;
+      while (now() < deadline) {
+        try {
+          await session.reconnect({ deadline, now });
+          recoveryError = null;
+          break;
+        } catch (reconnectError) {
+          if (!isTransientDevToolsError(reconnectError)) throw reconnectError;
+          recoveryError = reconnectError;
+          const remaining = Math.max(0, deadline - now());
+          if (remaining > 0) await delay(Math.min(25, remaining));
+        }
+      }
+      if (recoveryError === null && now() >= deadline) {
+        recoveryError = transportError(
+          "DevToolsRequestTimeoutError",
+          "headless observation deadline expired after reconnect",
+          "observeHeadlessPage",
+        );
+      }
+      if (recoveryError !== null) throw recoveryError;
+    }
+  }
+}
