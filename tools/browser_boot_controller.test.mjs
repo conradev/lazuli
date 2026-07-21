@@ -280,6 +280,40 @@ test("virtual directions override only their physical gamepad axis", () => {
   );
 });
 
+test("buttonless main-stick deflection and neutral publish separate sequences", () => {
+  const harness = createHarness();
+  const gamepad = {
+    axes: [0, 0, 0, 0],
+    buttons: [],
+    connected: true,
+  };
+  harness.gamepads.push(gamepad);
+  harness.context.sampleController();
+  const initialMessages = harness.messages.length;
+  const initialSequence = harness.messages.at(-1).sequence;
+
+  gamepad.axes[0] = -0.5;
+  gamepad.axes[1] = -0.5;
+  harness.context.sampleController();
+  gamepad.axes[0] = 0;
+  gamepad.axes[1] = 0;
+  harness.context.sampleController();
+
+  assert.equal(harness.messages.length, initialMessages + 2);
+  assert.deepEqual(
+    harness.messages.slice(-2).map(message => ({
+      sequence: message.sequence,
+      buttons: message.state.buttons,
+      stickX: message.state.stickX,
+      stickY: message.state.stickY,
+    })),
+    [
+      { sequence: initialSequence + 1, buttons: 0, stickX: 0x41, stickY: 0xc0 },
+      { sequence: initialSequence + 2, buttons: 0, stickX: 0x80, stickY: 0x80 },
+    ],
+  );
+});
+
 test("captured pointers hold multiple controller buttons independently", () => {
   const harness = createHarness();
   const a = harness.buttons.get("#controller-a");

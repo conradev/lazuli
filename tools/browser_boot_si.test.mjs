@@ -69,7 +69,7 @@ function extractFunction(name) {
   assert.fail(`unterminated body for ${name}`);
 }
 
-function controllerState(buttons = 0) {
+function controllerState(buttons = 0, overrides = {}) {
   return {
     buttons,
     stickX: 0x80,
@@ -80,6 +80,7 @@ function controllerState(buttons = 0) {
     triggerR: 0,
     analogA: (buttons & 0x0100) !== 0 ? 0xff : 0,
     analogB: (buttons & 0x0200) !== 0 ? 0xff : 0,
+    ...overrides,
   };
 }
 
@@ -188,6 +189,11 @@ const packetFunctions = [
   "controllerPacketForPoll",
   "postControllerPollAcknowledgement",
 ];
+const queueFunctions = [
+  "normalizeControllerState",
+  "controllerStatesEqual",
+  "enqueueControllerState",
+];
 const levelFunctions = [
   "recomputeSerialInterruptLevel",
   "serialNoResponseBit",
@@ -212,8 +218,8 @@ test("controller packets use PAD_USE_ORIGIN and exact mode packing", () => {
   const context = makeContext(packetFunctions);
   context.controllerState = {
     buttons: 0,
-    stickX: 0x80,
-    stickY: 0x80,
+    stickX: 0x40,
+    stickY: 0xc0,
     cStickX: 0xab,
     cStickY: 0xcd,
     triggerL: 0xef,
@@ -235,14 +241,14 @@ test("controller packets use PAD_USE_ORIGIN and exact mode packing", () => {
     context.serialControllerModes[0] = mode;
     assert.deepEqual(
       Array.from(context.controllerPacketForPoll(0)),
-      [0x00, 0x80, 0x80, 0x80, ...low],
+      [0x00, 0x80, 0x40, 0xc0, ...low],
       `mode ${mode}`,
     );
   }
 });
 
 test("queued click edges survive until separate guest polls consume them", () => {
-  const context = makeContext(["enqueueControllerState", ...packetFunctions]);
+  const context = makeContext([...queueFunctions, ...packetFunctions]);
   context.enqueueControllerState({ sequence: 1, state: controllerState() });
   context.enqueueControllerState({ sequence: 2, state: controllerState(0x0200) });
   context.enqueueControllerState({ sequence: 3, state: controllerState() });
@@ -266,6 +272,98 @@ test("queued click edges survive until separate guest polls consume them", () =>
 
   const stable = context.controllerPacketForPoll();
   assert.equal(((stable[0] << 8) | stable[1]) & ~context.padUseOrigin, 0);
+});
+
+test("buttonless main-stick deflection and neutral remain distinct queued states", () => {
+  const context = makeContext([...queueFunctions, ...packetFunctions]);
+  const deflected = controllerState(0, { stickX: 0x40, stickY: 0xc0 });
+
+  context.enqueueControllerState({ sequence: 1, state: controllerState() });
+  context.enqueueControllerState({ sequence: 2, state: deflected });
+  context.enqueueControllerState({ sequence: 3, state: { ...deflected } });
+  context.enqueueControllerState({ sequence: 4, state: controllerState() });
+
+  assert.equal(context.controllerQueueCoalesces, 2);
+  assert.equal(context.controllerQueueHighWater, 2);
+  assert.deepEqual(
+    Array.from(context.controllerQueue, queued => [
+      queued.sequence,
+      queued.state.buttons,
+      queued.state.stickX,
+      queued.state.stickY,
+    ]),
+    [
+      [3, 0, 0x40, 0xc0],
+      [4, 0, 0x80, 0x80],
+    ],
+  );
+
+  assert.deepEqual(
+    Array.from(context.controllerPacketForPoll()),
+    [0x00, 0x80, 0x40, 0xc0, 0x80, 0x80, 0, 0],
+  );
+  assert.equal(context.controllerAppliedSequence, 3);
+  assert.deepEqual(
+    Array.from(context.controllerPacketForPoll()),
+    [0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0],
+  );
+  assert.equal(context.controllerAppliedSequence, 4);
+});
+
+test("controller enqueue canonicalizes and validates every state field", () => {
+  const context = makeContext(queueFunctions);
+  const input = controllerState(0, { stickX: 0x40, ignored: 1 });
+
+  context.enqueueControllerState({ sequence: 1, state: input });
+  input.stickX = 0x80;
+  assert.equal(context.controllerQueue.length, 1);
+  assert.equal(context.controllerQueue[0].state.stickX, 0x40);
+  assert.equal(Object.hasOwn(context.controllerQueue[0].state, "ignored"), false);
+
+  assert.throws(
+    () => context.enqueueControllerState({
+      sequence: 2,
+      state: controllerState(0, { stickX: 0x100 }),
+    }),
+    /stickX must be between 0 and 255/,
+  );
+  assert.throws(
+    () => context.enqueueControllerState({
+      sequence: 2,
+      state: { ...controllerState(), analogB: undefined },
+    }),
+    /analogB must be a safe integer/,
+  );
+  assert.throws(
+    () => context.enqueueControllerState({ sequence: 1.5, state: controllerState() }),
+    /sequence must be a positive safe integer/,
+  );
+  assert.equal(context.controllerSequence, 1);
+  assert.equal(context.controllerQueue.length, 1);
+});
+
+test("distinct full-state overflow remains explicit and terminal", () => {
+  const context = makeContext(queueFunctions, { controllerQueueCapacity: 2 });
+  context.enqueueControllerState({
+    sequence: 1,
+    state: controllerState(0, { stickX: 0x40 }),
+  });
+  context.enqueueControllerState({
+    sequence: 2,
+    state: controllerState(0, { stickX: 0x41 }),
+  });
+  context.enqueueControllerState({
+    sequence: 3,
+    state: controllerState(0, { stickX: 0x42 }),
+  });
+
+  assert.equal(context.controllerSequence, 3);
+  assert.equal(context.controllerQueue.length, 2);
+  assert.equal(context.controllerQueueOverflows, 1);
+  assert.equal(context.runnerStopRequested, true);
+  assert.equal(context.runnerPaused, false);
+  assert.equal(context.runnerSnapshotRequested, true);
+  assert.equal(context.statusDataset.controllerQueue, "overflow");
 });
 
 test("RDSTINT is derived, W1C-reasserted, and PI-mask-correct", () => {
@@ -482,6 +580,40 @@ test("direct 0x40 reads acknowledge the controller state they publish", () => {
     buttons: 0x0100,
     sequence: 7,
   }]);
+});
+
+test("direct and periodic SI paths publish ordered non-neutral main axes", () => {
+  const context = makeContext([
+    ...queueFunctions,
+    ...periodicFunctions,
+    "processSerialCommand",
+  ], {
+    postMessage() {},
+  });
+  context.enqueueControllerState({
+    sequence: 1,
+    state: controllerState(0, { stickX: 0x40, stickY: 0xc0 }),
+  });
+  context.view.setUint8(0x6480, 0x40);
+
+  assert.equal(
+    context.processSerialCommand(0, 100, 125),
+    context.serialTransferOutcome.success,
+  );
+  assert.equal(context.controllerAppliedSequence, 1);
+  assert.deepEqual(Array.from(context.bytes.slice(0x6480, 0x6488)), [
+    0x00, 0x80, 0x40, 0xc0, 0x80, 0x80, 0, 0,
+  ]);
+
+  context.enqueueControllerState({
+    sequence: 2,
+    state: controllerState(0, { stickX: 0xc0, stickY: 0x40 }),
+  });
+  context.performSerialPoll(200, 225);
+  assert.equal(context.controllerAppliedSequence, 2);
+  assert.deepEqual(Array.from(context.bytes.slice(0x6404, 0x640c)), [
+    0x00, 0x80, 0xc0, 0x40, 0x80, 0x80, 0, 0,
+  ]);
 });
 
 test("absent direct transfers mutate only COMCSR and the exact NOREP bit", () => {

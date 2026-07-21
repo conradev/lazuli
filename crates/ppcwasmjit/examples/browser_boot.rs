@@ -981,21 +981,66 @@ const TEMPLATE: &str = r##"<!doctype html>
     let serialInterruptLevelActive = false;
     let serialInterruptLevelChanges = 0;
     let serialInterruptLevelReason = null;
+    function normalizeControllerState(state) {
+      if (state === null || typeof state !== "object" || Array.isArray(state)) {
+        throw new TypeError("controller state must be an object");
+      }
+      const integer = (name, maximum) => {
+        const value = state[name];
+        if (!Number.isSafeInteger(value)) {
+          throw new TypeError(`controller state ${name} must be a safe integer`);
+        }
+        if (value < 0 || value > maximum) {
+          throw new RangeError(
+            `controller state ${name} must be between 0 and ${maximum}`
+          );
+        }
+        return value;
+      };
+      return {
+        buttons: integer("buttons", 0xffff),
+        stickX: integer("stickX", 0xff),
+        stickY: integer("stickY", 0xff),
+        cStickX: integer("cStickX", 0xff),
+        cStickY: integer("cStickY", 0xff),
+        triggerL: integer("triggerL", 0xff),
+        triggerR: integer("triggerR", 0xff),
+        analogA: integer("analogA", 0xff),
+        analogB: integer("analogB", 0xff),
+      };
+    }
+    function controllerStatesEqual(left, right) {
+      return left.buttons === right.buttons
+        && left.stickX === right.stickX
+        && left.stickY === right.stickY
+        && left.cStickX === right.cStickX
+        && left.cStickY === right.cStickY
+        && left.triggerL === right.triggerL
+        && left.triggerR === right.triggerR
+        && left.analogA === right.analogA
+        && left.analogB === right.analogB;
+    }
     function enqueueControllerState(message) {
       if (controllerScenarioInputExclusive) return;
+      if (!Number.isSafeInteger(message.sequence) || message.sequence < 1) {
+        throw new TypeError("controller sequence must be a positive safe integer");
+      }
       if (message.sequence <= controllerSequence) return;
-      controllerSequence = message.sequence;
       const queued = {
         sequence: message.sequence,
-        state: message.state,
+        state: normalizeControllerState(message.state),
       };
+      controllerSequence = queued.sequence;
       const previous = controllerQueue.at(-1);
-      if (previous !== undefined && previous.state.buttons === queued.state.buttons) {
+      if (
+        previous !== undefined
+        && controllerStatesEqual(previous.state, queued.state)
+      ) {
         controllerQueue[controllerQueue.length - 1] = queued;
         controllerQueueCoalesces += 1;
       } else if (
         controllerQueue.length === 0
-        && controllerState.buttons === queued.state.buttons
+        && controllerStatesEqual(controllerState, queued.state)
       ) {
         controllerState = queued.state;
         controllerAppliedSequence = queued.sequence;
@@ -1007,8 +1052,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           controllerQueue.length
         );
       } else {
-        // Button-edge ordering is a correctness boundary. Surface bounded
-        // queue exhaustion instead of silently merging or dropping input.
+        // Full controller-state ordering is a correctness boundary. Surface
+        // bounded queue exhaustion instead of silently merging or dropping input.
         controllerQueueOverflows += 1;
         runnerStopRequested = true;
         runnerPaused = false;
