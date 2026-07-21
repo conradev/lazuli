@@ -16,6 +16,7 @@ members = [
     "crates/vtxjit",
     "crates/cores",
     "crates/renderer",
+    "crates/browser-renderer",
     "crates/modules",
 
     # binaries
@@ -40,6 +41,7 @@ default-members = [
     "crates/vtxjit",
     "crates/cores",
     "crates/renderer",
+    "crates/browser-renderer",
     "crates/modules",
 
     # binaries

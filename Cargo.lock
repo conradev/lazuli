@@ -477,6 +477,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-renderer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
