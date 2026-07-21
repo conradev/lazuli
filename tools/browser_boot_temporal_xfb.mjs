@@ -392,6 +392,58 @@ export function deriveTemporalSelectedXfbOracle(
   };
 }
 
+function projectTemporalSelectedXfbFrame(frame) {
+  return {
+    scenario: frame.scenario,
+    step: frame.step,
+    ordinal: frame.ordinal,
+    rendererSequence: frame.rendererSequence,
+    presentation: {
+      selected: frame.presentation.selected,
+      field: frame.presentation.field,
+      address: frame.presentation.address,
+      copyIndex: frame.presentation.copyIndex,
+      copyRow: frame.presentation.copyRow,
+      width: frame.presentation.width,
+      height: frame.presentation.height,
+    },
+    selectedXfb: {
+      address: frame.selectedXfb.address,
+      generation: frame.selectedXfb.generation,
+      row: frame.selectedXfb.row,
+      format: frame.selectedXfb.format,
+      layout: frame.selectedXfb.layout,
+      sourceRow: frame.selectedXfb.sourceRow,
+      width: frame.selectedXfb.width,
+      height: frame.selectedXfb.height,
+      textureWidth: frame.selectedXfb.textureWidth,
+      textureHeight: frame.selectedXfb.textureHeight,
+      logicalWidth: frame.selectedXfb.logicalWidth,
+      logicalHeight: frame.selectedXfb.logicalHeight,
+      displayWidth: frame.selectedXfb.displayWidth,
+      displayHeight: frame.selectedXfb.displayHeight,
+      rgbaByteLength: frame.selectedXfb.rgbaByteLength,
+      rgbaSha256: frame.selectedXfb.rgbaSha256,
+      rgbSha256: frame.selectedXfb.rgbSha256,
+      rgb: {
+        black: frame.selectedXfb.rgb.black,
+        white: frame.selectedXfb.rgb.white,
+        other: frame.selectedXfb.rgb.other,
+        unique: frame.selectedXfb.rgb.unique,
+      },
+    },
+  };
+}
+
+export function projectSmbTemporalSelectedXfb(temporal) {
+  const { oracle } = verifySmbTemporalSelectedXfb(temporal);
+  return {
+    capacity: SMB_TEMPORAL_XFB_CAPACITY,
+    frames: temporal.frames.map(projectTemporalSelectedXfbFrame),
+    oracle,
+  };
+}
+
 function firstDifference(expected, actual, path = "$.oracle") {
   if (Object.is(expected, actual)) return null;
   if (Array.isArray(expected) || Array.isArray(actual)) {

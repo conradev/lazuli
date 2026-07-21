@@ -9,6 +9,7 @@ import {
   SMB_TEMPORAL_XFB_CAPACITY,
   TemporalXfbValidationError,
   deriveTemporalSelectedXfbOracle,
+  projectSmbTemporalSelectedXfb,
   temporalXfbCalibrationVector,
   verifySmbTemporalSelectedXfb,
 } from "./browser_boot_temporal_xfb.mjs";
@@ -119,6 +120,92 @@ test("raw temporal frames derive every page oracle field", () => {
     })),
   });
   assert.doesNotThrow(() => verifySmbTemporalSelectedXfb(makeTemporal(frames)));
+});
+
+test("checkpoint projection keeps only canonical independently derived evidence", () => {
+  const temporal = makeTemporal();
+  temporal.hostDiagnostic = "ignored";
+  temporal.frames[0].hostTimestamp = 1234;
+  temporal.frames[0].presentation.browserOnly = true;
+  temporal.frames[0].selectedXfb.gpuLabel = "adapter-dependent";
+  temporal.frames[0].selectedXfb.rgb.untrustedBucket = 4;
+
+  const projected = projectSmbTemporalSelectedXfb(temporal);
+  assert.deepEqual(Object.keys(projected), ["capacity", "frames", "oracle"]);
+  assert.deepEqual(Object.keys(projected.frames[0]), [
+    "scenario",
+    "step",
+    "ordinal",
+    "rendererSequence",
+    "presentation",
+    "selectedXfb",
+  ]);
+  assert.deepEqual(Object.keys(projected.frames[0].presentation), [
+    "selected",
+    "field",
+    "address",
+    "copyIndex",
+    "copyRow",
+    "width",
+    "height",
+  ]);
+  assert.deepEqual(Object.keys(projected.frames[0].selectedXfb), [
+    "address",
+    "generation",
+    "row",
+    "format",
+    "layout",
+    "sourceRow",
+    "width",
+    "height",
+    "textureWidth",
+    "textureHeight",
+    "logicalWidth",
+    "logicalHeight",
+    "displayWidth",
+    "displayHeight",
+    "rgbaByteLength",
+    "rgbaSha256",
+    "rgbSha256",
+    "rgb",
+  ]);
+  assert.deepEqual(projected.frames[0].selectedXfb.rgb, {
+    black: 0,
+    white: 0,
+    other: 4,
+    unique: 4,
+  });
+  assert.deepEqual(projected.oracle, deriveTemporalSelectedXfbOracle(projected.frames));
+  assert.notEqual(projected.frames[0], temporal.frames[0]);
+  assert.notEqual(projected.oracle, temporal.oracle);
+});
+
+test("checkpoint projection fails closed before copying unstable temporal evidence", () => {
+  const forgedOracle = makeTemporal();
+  forgedOracle.oracle.complete = false;
+  expectFailure(forgedOracle, "oracle-mismatch", /complete$/);
+  assert.throws(
+    () => projectSmbTemporalSelectedXfb(forgedOracle),
+    error => error instanceof TemporalXfbValidationError
+      && error.code === "oracle-mismatch"
+      && /complete$/.test(error.path),
+  );
+
+  const alternating = makeTemporal();
+  for (const [index, frame] of alternating.frames.entries()) {
+    const black = index % 2 === 0;
+    frame.selectedXfb.rgbaSha256 = black ? "a".repeat(64) : "b".repeat(64);
+    frame.selectedXfb.rgbSha256 = black ? "c".repeat(64) : "d".repeat(64);
+    frame.selectedXfb.rgb = black
+      ? { black: 4, white: 0, other: 0, unique: 1 }
+      : { black: 0, white: 4, other: 0, unique: 1 };
+  }
+  updateOracle(alternating);
+  assert.throws(
+    () => projectSmbTemporalSelectedXfb(alternating),
+    error => error instanceof TemporalXfbValidationError
+      && error.code === "exact-black-white-alternation",
+  );
 });
 
 test("Node recomputation stays in deep parity with the page oracle", () => {
