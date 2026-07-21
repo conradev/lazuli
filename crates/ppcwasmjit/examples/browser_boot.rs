@@ -3166,6 +3166,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     let peFinishCycle = null;
     let peFinishSignal = false;
     let peFinishInterruptDelivered = false;
+    let peTokenValue = 0;
+    let peTokenSignal = false;
+    let peTokenInterruptDelivered = false;
     const viInterruptOffsets = [0x2030, 0x2034, 0x2038, 0x203c];
     const viClockFrequencies = [27_000_000, 54_000_000];
     const viCpuCyclesPerSecond = 486_000_000;
@@ -5270,6 +5273,23 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
         if (peFinishCycle === null && !peFinishSignal) peFinishCycle = cycles + 200;
       }
+      if (address === 0x47 || address === 0x48) {
+        // Both BP registers target the shared PE token; only 0x48 asserts it.
+        const tokenMask = mask & 0xffff;
+        peTokenValue = (
+          (peTokenValue & ~tokenMask) | (value & tokenMask)
+        ) & 0xffff;
+        view.setUint16(mmio + 0x100e, peTokenValue, false);
+        const event = address === 0x47
+          ? "peTokenCommand"
+          : "peTokenInterruptCommand";
+        deviceEvents.set(event, (deviceEvents.get(event) ?? 0) + 1);
+        if (address === 0x48 && !peTokenSignal) {
+          peTokenSignal = true;
+          peTokenInterruptDelivered = false;
+          deviceEvents.set("peToken", (deviceEvents.get("peToken") ?? 0) + 1);
+        }
+      }
       if (address === 0x65) gxLoadTlut();
       if (address !== 0x52) return;
 
@@ -5834,6 +5854,14 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function writePixelEngineControl(value) {
       const written = value & 0xffff;
+      if ((written & 0x04) !== 0) {
+        peTokenSignal = false;
+        peTokenInterruptDelivered = false;
+        deviceEvents.set(
+          "peTokenAcknowledge",
+          (deviceEvents.get("peTokenAcknowledge") ?? 0) + 1
+        );
+      }
       if ((written & 0x08) !== 0) {
         peFinishSignal = false;
         peFinishInterruptDelivered = false;
@@ -6136,6 +6164,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if (logical === 0xcc00100a && size === 2) {
         writePixelEngineControl(value);
+        return 1;
+      }
+      if (
+        size === 1
+        && (logical === 0xcc00100a || logical === 0xcc00100b)
+      ) {
+        const shift = logical === 0xcc00100a ? 8 : 0;
+        writePixelEngineControl((value & 0xff) << shift);
         return 1;
       }
       if (logical === 0xcc006c00 && size === 4) {
@@ -7154,26 +7190,42 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       const control = view.getUint16(mmio + 0x100a, false);
-      const active = peFinishSignal && (control & 0x02) !== 0;
+      const tokenActive = peTokenSignal && (control & 0x01) !== 0;
+      const finishActive = peFinishSignal && (control & 0x02) !== 0;
       let cause = view.getUint32(mmio + 0x3000, false);
-      cause = active ? cause | 0x00000400 : cause & ~0x00000400;
+      cause = tokenActive ? cause | 0x00000200 : cause & ~0x00000200;
+      cause = finishActive ? cause | 0x00000400 : cause & ~0x00000400;
       view.setUint32(mmio + 0x3000, cause >>> 0, false);
 
       const mask = view.getUint32(mmio + 0x3004, false);
       const msr = view.getUint32(cpu + msrOffset, true);
-      if (
-        active
+      const tokenPending = tokenActive
+        && (mask & 0x00000200) !== 0
+        && !peTokenInterruptDelivered;
+      const finishPending = finishActive
         && (mask & 0x00000400) !== 0
-        && (msr & 0x00008000) !== 0
-        && !peFinishInterruptDelivered
-      ) {
-        peFinishInterruptDelivered = true;
-        deviceEvents.set(
-          "peFinishInterrupt",
-          (deviceEvents.get("peFinishInterrupt") ?? 0) + 1
-        );
+        && !peFinishInterruptDelivered;
+      if ((msr & 0x00008000) !== 0 && (tokenPending || finishPending)) {
+        if (tokenPending) {
+          peTokenInterruptDelivered = true;
+          deviceEvents.set(
+            "peTokenInterrupt",
+            (deviceEvents.get("peTokenInterrupt") ?? 0) + 1
+          );
+        }
+        if (finishPending) {
+          peFinishInterruptDelivered = true;
+          deviceEvents.set(
+            "peFinishInterrupt",
+            (deviceEvents.get("peFinishInterrupt") ?? 0) + 1
+          );
+        }
         raiseException(cpu, 0x0500);
-      } else if (!active) {
+      }
+      if (!tokenActive) {
+        peTokenInterruptDelivered = false;
+      }
+      if (!finishActive) {
         peFinishInterruptDelivered = false;
       }
     }
@@ -8625,6 +8677,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           serialTransfer,
           peFinishCycle,
           peFinishSignal,
+          peTokenValue,
+          peTokenSignal,
+          peTokenInterruptDelivered,
           dspCurrentMail: hex32(dspCurrentMail),
           dspQueuedMails: dspMailQueue.length,
           dspScheduledMail,
