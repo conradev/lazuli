@@ -343,7 +343,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     button:hover, .button:hover { background: #2a3038; }
-    button:focus-visible, .button:focus-visible, input:focus-visible, summary:focus-visible {
+    button:focus-visible, .button:focus-visible, .disc-picker:focus-within,
+    input:focus-visible, summary:focus-visible {
       outline: 2px solid #a8c7ff;
       outline-offset: 2px;
     }
@@ -387,7 +388,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       letter-spacing: 0.04em;
     }
 
-    #disc-file { position: fixed; inline-size: 1px; block-size: 1px; opacity: 0; }
+    .disc-picker {
+      position: relative;
+      overflow: hidden;
+    }
+
+    #disc-file {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
+    }
 
     #disc-status {
       overflow: hidden;
@@ -508,6 +521,240 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     footer a { color: #aeb7c4; }
 
+    .shell[data-surface="release"] {
+      position: fixed;
+      inset: 0;
+      display: block;
+      width: 100%;
+      max-width: none;
+      height: 100dvh;
+      min-height: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      isolation: isolate;
+    }
+
+    .shell[data-surface="release"] header {
+      position: absolute;
+      z-index: 3;
+      top: max(clamp(0.65rem, 2vw, 1.15rem), env(safe-area-inset-top));
+      left: 50%;
+      width: min(calc(100% - 2rem), 52rem);
+      min-height: 3rem;
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: 999px;
+      padding: 0.4rem 0.45rem 0.4rem 1rem;
+      background: rgba(14, 15, 18, 0.76);
+      box-shadow: 0 0.8rem 2.5rem rgba(0, 0, 0, 0.28);
+      backdrop-filter: blur(1rem) saturate(125%);
+      transform: translateX(-50%);
+      transition: top 180ms ease, width 180ms ease, transform 180ms ease;
+    }
+
+    .shell[data-surface="release"] h1 {
+      color: #d9dde4;
+      font-size: 0.76rem;
+      font-weight: 620;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .shell[data-surface="release"] .status-group { min-width: 0; }
+
+    .shell[data-surface="release"] #runner-status {
+      color: #d9dde4;
+      font-size: 0.75rem;
+    }
+
+    .shell[data-surface="release"] #disc-status {
+      max-width: min(36vw, 24rem);
+      color: #8f98a6;
+      font-size: 0.75rem;
+    }
+
+    .shell[data-surface="release"] .disc-picker {
+      min-height: 2.15rem;
+      border-color: rgba(255, 255, 255, 0.22);
+      border-radius: 999px;
+      padding: 0.35rem 0.85rem;
+      background: #f1f3f5;
+      color: #111318;
+      font-size: 0.78rem;
+      font-weight: 680;
+    }
+
+    body:not([data-status="waiting"]) .shell[data-surface="release"] header {
+      right: max(clamp(0.65rem, 2vw, 1.15rem), env(safe-area-inset-right));
+      left: auto;
+      width: auto;
+      min-height: 0;
+      border: 0;
+      padding: 0;
+      background: transparent;
+      box-shadow: none;
+      backdrop-filter: none;
+      transform: none;
+    }
+
+    body:not([data-status="waiting"]) .shell[data-surface="release"] header h1,
+    body:not([data-status="waiting"]) .shell[data-surface="release"] .status-group {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    body:not([data-status="waiting"]) .shell[data-surface="release"] .disc-picker {
+      border-color: rgba(255, 255, 255, 0.14);
+      background: rgba(14, 15, 18, 0.64);
+      color: #d9dde4;
+      opacity: 0.56;
+      backdrop-filter: blur(1rem) saturate(125%);
+      transition: opacity 150ms ease, background 150ms ease;
+    }
+
+    body:not([data-status="waiting"]) .shell[data-surface="release"] .disc-picker:hover,
+    body:not([data-status="waiting"]) .shell[data-surface="release"] .disc-picker:focus-within {
+      background: rgba(14, 15, 18, 0.88);
+      opacity: 1;
+    }
+
+    .shell[data-surface="release"] .stage {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
+    }
+
+    .shell[data-surface="release"] #display {
+      width: min(100vw, calc(100dvh * 4 / 3));
+      height: auto;
+      max-width: 100vw;
+      max-height: 100dvh;
+    }
+
+    .shell[data-surface="release"] .play-controls {
+      position: absolute;
+      z-index: 3;
+      bottom: max(clamp(0.7rem, 2vw, 1.15rem), env(safe-area-inset-bottom));
+      left: 50%;
+      display: block;
+      width: max-content;
+      max-width: calc(100% - 1rem);
+      opacity: 0.72;
+      transform: translateX(-50%);
+      transition: opacity 150ms ease, transform 180ms ease;
+    }
+
+    .shell[data-surface="release"] .play-controls:hover,
+    .shell[data-surface="release"] .play-controls:focus-within { opacity: 1; }
+
+    .shell[data-surface="release"] #controller-controls {
+      display: grid;
+      grid-template-columns: repeat(3, 2.15rem) 0.35rem 2.65rem 2.65rem 4.25rem;
+      grid-template-rows: repeat(3, 2.15rem);
+      gap: 0.3rem;
+      padding: 0.45rem;
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: 1rem;
+      background: rgba(14, 15, 18, 0.76);
+      box-shadow: 0 0.8rem 2.5rem rgba(0, 0, 0, 0.28);
+      backdrop-filter: blur(1rem) saturate(125%);
+      user-select: none;
+      touch-action: none;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+    }
+
+    .shell[data-surface="release"] #controller-controls button {
+      min-width: 0;
+      min-height: 0;
+      border-color: rgba(255, 255, 255, 0.16);
+      border-radius: 50%;
+      padding: 0;
+      background: rgba(255, 255, 255, 0.08);
+      color: #eef1f5;
+      transition: background 80ms ease, transform 80ms ease;
+    }
+
+    .shell[data-surface="release"] #controller-controls button:active {
+      background: rgba(255, 255, 255, 0.22);
+      transform: scale(0.94);
+    }
+
+    .shell[data-surface="release"] #controller-left { grid-area: 2 / 1; }
+    .shell[data-surface="release"] #controller-up { grid-area: 1 / 2; }
+    .shell[data-surface="release"] #controller-down { grid-area: 3 / 2; }
+    .shell[data-surface="release"] #controller-right { grid-area: 2 / 3; }
+
+    .shell[data-surface="release"] #controller-a,
+    .shell[data-surface="release"] #controller-b {
+      align-self: center;
+      height: 2.65rem;
+      background: rgba(255, 255, 255, 0.14);
+    }
+
+    .shell[data-surface="release"] #controller-a { grid-area: 1 / 5 / 4 / 6; }
+    .shell[data-surface="release"] #controller-b { grid-area: 1 / 6 / 4 / 7; }
+
+    .shell[data-surface="release"] #controller-start {
+      grid-area: 1 / 7 / 4 / 8;
+      align-self: center;
+      min-width: 0;
+      height: 2.35rem;
+      border-radius: 999px;
+      color: #c9ced6;
+      font-size: 0.75rem;
+    }
+
+    .shell[data-surface="release"] .key-help { display: none; }
+
+    .shell[data-surface="release"] footer {
+      position: absolute;
+      z-index: 3;
+      right: max(1rem, env(safe-area-inset-right));
+      bottom: max(0.7rem, env(safe-area-inset-bottom));
+      gap: 0.45rem;
+      color: #737b87;
+      font-size: 0;
+      opacity: 0.54;
+    }
+
+    .shell[data-surface="release"] footer span { display: none; }
+    .shell[data-surface="release"] footer a { font-size: 0.65rem; }
+
+    body[data-status="waiting"] .shell[data-surface="release"] header {
+      top: 50%;
+      width: min(calc(100% - 2rem), 27rem);
+      border-radius: 1.15rem;
+      padding: 0.75rem;
+      transform: translate(-50%, -50%);
+    }
+
+    body[data-status="waiting"] .shell[data-surface="release"] header h1 {
+      margin: 0 auto;
+      font-size: 0.82rem;
+    }
+
+    body[data-status="waiting"] .shell[data-surface="release"] .status-group { display: none; }
+
+    body[data-status="waiting"] .shell[data-surface="release"] .disc-picker {
+      min-width: 11rem;
+      text-align: center;
+    }
+
+    body[data-status="waiting"] .shell[data-surface="release"] .play-controls {
+      pointer-events: none;
+      opacity: 0;
+      transform: translate(-50%, 0.75rem);
+    }
+
     @media (max-width: 48rem) {
       .shell { grid-template-rows: auto auto auto auto auto; }
       header { flex-wrap: wrap; }
@@ -518,6 +765,34 @@ const TEMPLATE: &str = r##"<!doctype html>
       .shell[data-surface="release"] .play-controls { grid-template-columns: 1fr; }
       #runner-controls, #controller-controls { justify-content: center; }
       .key-help { display: none; }
+
+      .shell[data-surface="release"] header {
+        top: 0.5rem;
+        width: calc(100% - 1rem);
+        border-radius: 0.9rem;
+        padding-left: 0.7rem;
+        flex-wrap: nowrap;
+      }
+
+      .shell[data-surface="release"] h1 { display: none; }
+      .shell[data-surface="release"] .status-group { width: auto; }
+      .shell[data-surface="release"] #disc-status { max-width: 34vw; }
+      .shell[data-surface="release"] footer { display: none; }
+
+      body[data-status="waiting"] .shell[data-surface="release"] header {
+        top: 50%;
+        width: min(calc(100% - 2rem), 24rem);
+        flex-wrap: wrap;
+      }
+
+      body[data-status="waiting"] .shell[data-surface="release"] header h1 {
+        display: block;
+        width: 100%;
+      }
+    }
+
+    @media (hover: none) {
+      .shell[data-surface="release"] .play-controls { opacity: 0.9; }
     }
   </style>
 </head>
@@ -531,8 +806,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         <span aria-hidden="true">·</span>
         <span id="disc-status">ready</span>
       </div>
-      <label class="button primary" for="disc-file">Open ISO or CISO</label>
-      <input id="disc-file" type="file" accept=".iso,.ciso,.cso,application/octet-stream">
+      <label class="button primary disc-picker">
+        Open ISO or CISO
+        <input id="disc-file" type="file" aria-label="Open ISO or CISO" accept=".iso,.ciso,.cso,application/octet-stream">
+      </label>
     </header>
 
     <div class="stage">
@@ -6402,6 +6679,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       const workerDiscConfig = discConfig.kind === "file"
         ? { kind: "file-message" }
         : discConfig;
+      document.body.dataset.status = "loading";
+      runnerStatus.textContent = "loading";
       const bootstrap = [
         `globalThis.runnerSearch = ${JSON.stringify(debugSurface ? location.search : "")};`,
         `globalThis.discSourceConfig = ${JSON.stringify(workerDiscConfig)};`,

@@ -96,6 +96,8 @@ test("local harness retains controls removed from the public frontend", async ()
   assert.match(harness, /id="resume-runner"[^>]*>Resume<\/button>/);
   assert.match(harness, /id="diagnostics"/);
   assert.match(harness, /id="stop-runner"[^>]*>Stop<\/button>/);
+  assert.match(harness, /class="button primary disc-picker"/);
+  assert.match(harness, /id="disc-file"[^>]*aria-label="Open ISO or CISO"/);
   assert.match(harness, /data-surface="debug"/);
   assert.equal(harness.match(/<!-- LAZULI DEBUG UI START -->/g)?.length, 2);
   assert.equal(harness.match(/<!-- LAZULI DEBUG UI END -->/g)?.length, 2);
