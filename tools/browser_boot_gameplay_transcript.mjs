@@ -390,3 +390,401 @@ function validatePlan(plan) {
   }
   return plan;
 }
+
+function validateWitness(witness, path, revision, expected) {
+  requireExactKeys(witness, WITNESS_FIELDS, path);
+  const pad = requireExactKeys(
+    witness.pad,
+    ["held", "pressed", "released"],
+    `${path}.pad`,
+  );
+  for (const field of ["held", "pressed", "released"]) {
+    requireInteger(pad[field], `${path}.pad.${field}`, 0, 0xffff);
+  }
+  for (const field of WITNESS_FIELDS.slice(1)) {
+    const minimum = SIGNED_SENTINEL_WITNESS_FIELDS.has(field) ? -1 : 0;
+    const maximum = field === "gameVersion" ? 0xff : 0xffff_ffff;
+    requireInteger(witness[field], `${path}.${field}`, minimum, maximum);
+  }
+  requireExact(witness.gameVersion, revision, `${path}.gameVersion`, "identity");
+  for (const [field, expectedValue] of Object.entries(expected)) {
+    if (field === "pad") {
+      for (const [padField, padValue] of Object.entries(expectedValue)) {
+        requireExact(witness.pad[padField], padValue, `${path}.pad.${padField}`);
+      }
+    } else {
+      requireExact(witness[field], expectedValue, `${path}.${field}`);
+    }
+  }
+  return witness;
+}
+
+function validatePublication(
+  publication,
+  path,
+  expected,
+  state,
+  transcript,
+) {
+  requireExactKeys(
+    publication,
+    ["source", "pollIndex", "scheduledCycle", "observedCycle", "buttons", "sequence"],
+    path,
+  );
+  requireExact(publication.source, expected.source, `${path}.source`);
+  const pollIndex = requireInteger(publication.pollIndex, `${path}.pollIndex`, 1);
+  const scheduledCycle = requireInteger(publication.scheduledCycle, `${path}.scheduledCycle`);
+  const observedCycle = requireInteger(publication.observedCycle, `${path}.observedCycle`);
+  requireExact(publication.buttons, expected.buttons, `${path}.buttons`);
+  requireExact(publication.sequence, expected.sequence, `${path}.sequence`);
+  if (state.polls.has(pollIndex)) {
+    fail("ordering", `${path}.pollIndex`, `duplicate publication poll ${pollIndex}`);
+  }
+  if (pollIndex <= state.lastPublicationPoll) {
+    fail(
+      "ordering",
+      `${path}.pollIndex`,
+      `expected a value greater than ${state.lastPublicationPoll}, got ${pollIndex}`,
+    );
+  }
+  if (scheduledCycle < state.lastScheduledCycle) {
+    fail(
+      "ordering",
+      `${path}.scheduledCycle`,
+      `expected a value no smaller than ${state.lastScheduledCycle}, got ${scheduledCycle}`,
+    );
+  }
+  if (observedCycle < scheduledCycle) {
+    fail(
+      "ordering",
+      `${path}.observedCycle`,
+      `expected a value no smaller than scheduled cycle ${scheduledCycle}, got ${observedCycle}`,
+    );
+  }
+  if (observedCycle < state.lastObservedCycle) {
+    fail(
+      "ordering",
+      `${path}.observedCycle`,
+      `expected a value no smaller than ${state.lastObservedCycle}, got ${observedCycle}`,
+    );
+  }
+  if (
+    scheduledCycle < transcript.scenario.startCycle
+    || observedCycle > transcript.scenario.completedCycle
+  ) {
+    fail(
+      "ordering",
+      path,
+      `expected publication within scenario cycles ${transcript.scenario.startCycle}`
+        + `..${transcript.scenario.completedCycle}`,
+    );
+  }
+  state.polls.add(pollIndex);
+  state.lastPublicationPoll = pollIndex;
+  state.lastScheduledCycle = scheduledCycle;
+  state.lastObservedCycle = observedCycle;
+}
+
+function validateInputStep(step, expected, index, state, transcript, plan) {
+  const path = `$.steps[${index}]`;
+  requireExactKeys(
+    step,
+    ["id", "type", "button", "ready", "press", "release", "guest", "completed"],
+    path,
+  );
+  requireExact(step.id, expected.id, `${path}.id`, "identity");
+  requireExact(step.type, "input", `${path}.type`, "identity");
+  requireExact(step.button, expected.button, `${path}.button`, "identity");
+
+  const ready = requireExactKeys(step.ready, ["cycle", "pollIndex", "witness"], `${path}.ready`);
+  const readyCycle = requireInteger(ready.cycle, `${path}.ready.cycle`);
+  const readyPoll = requireInteger(ready.pollIndex, `${path}.ready.pollIndex`);
+  validateWitness(
+    ready.witness,
+    `${path}.ready.witness`,
+    plan.game.revision,
+    expected.witness,
+  );
+  if (readyCycle < state.lastMilestoneCycle || readyPoll < state.lastMilestonePoll) {
+    fail(
+      "ordering",
+      `${path}.ready`,
+      `expected a milestone at or after cycle ${state.lastMilestoneCycle}, poll ${state.lastMilestonePoll}`,
+    );
+  }
+
+  const phases = [
+    ["press", step.press, expected.button, state.nextSequence],
+    ["release", step.release, 0, state.nextSequence + 1],
+  ];
+  for (const [name, phase, buttons, sequence] of phases) {
+    const phasePath = `${path}.${name}`;
+    requireExactKeys(phase, ["sequence", "publications"], phasePath);
+    requireExact(phase.sequence, sequence, `${phasePath}.sequence`);
+    if (!Array.isArray(phase.publications)) {
+      fail("envelope", `${phasePath}.publications`, "expected an array");
+    }
+    requireExact(
+      phase.publications.length,
+      plan.input.publicationsPerPhase,
+      `${phasePath}.publications.length`,
+    );
+    for (const [publicationIndex, publication] of phase.publications.entries()) {
+      validatePublication(
+        publication,
+        `${phasePath}.publications[${publicationIndex}]`,
+        { source: plan.input.source, buttons, sequence },
+        state,
+        transcript,
+      );
+    }
+  }
+  const firstPress = step.press.publications[0];
+  const firstRelease = step.release.publications[0];
+  const lastRelease = step.release.publications.at(-1);
+  if (firstPress.pollIndex !== readyPoll + 1 || firstPress.scheduledCycle <= readyCycle) {
+    fail(
+      "ordering",
+      `${path}.press.publications[0]`,
+      "expected the first press publication in the poll immediately after the ready milestone",
+    );
+  }
+  const pulsePublications = [
+    ...step.press.publications,
+    ...step.release.publications,
+  ];
+  for (let publicationIndex = 1; publicationIndex < pulsePublications.length; publicationIndex += 1) {
+    const previousPoll = pulsePublications[publicationIndex - 1].pollIndex;
+    const poll = pulsePublications[publicationIndex].pollIndex;
+    if (poll !== previousPoll + 1) {
+      const phaseName = publicationIndex < step.press.publications.length
+        ? "press"
+        : "release";
+      const phaseIndex = phaseName === "press"
+        ? publicationIndex
+        : publicationIndex - step.press.publications.length;
+      fail(
+        "ordering",
+        `${path}.${phaseName}.publications[${phaseIndex}].pollIndex`,
+        `expected the poll immediately after ${previousPoll}, got ${poll}`,
+      );
+    }
+  }
+
+  const guest = requireExactKeys(
+    step.guest,
+    ["pressedCycle", "releasedCycle", "neutralCycle"],
+    `${path}.guest`,
+  );
+  const pressedCycle = requireInteger(guest.pressedCycle, `${path}.guest.pressedCycle`);
+  const releasedCycle = requireInteger(guest.releasedCycle, `${path}.guest.releasedCycle`);
+  const neutralCycle = requireInteger(guest.neutralCycle, `${path}.guest.neutralCycle`);
+  if (!(pressedCycle < releasedCycle && releasedCycle < neutralCycle)) {
+    fail(
+      "ordering",
+      `${path}.guest`,
+      `expected pressed < released < neutral, got ${pressedCycle}, ${releasedCycle}, ${neutralCycle}`,
+    );
+  }
+  if (pressedCycle < firstPress.observedCycle) {
+    fail(
+      "provenance",
+      `${path}.guest.pressedCycle`,
+      `expected a value no smaller than the first press observation ${firstPress.observedCycle}`,
+    );
+  }
+  if (pressedCycle >= firstRelease.observedCycle) {
+    fail(
+      "provenance",
+      `${path}.guest.pressedCycle`,
+      `expected a value below the first release observation ${firstRelease.observedCycle}`,
+    );
+  }
+  if (releasedCycle < firstRelease.observedCycle) {
+    fail(
+      "provenance",
+      `${path}.guest.releasedCycle`,
+      `expected a value no smaller than the first release observation ${firstRelease.observedCycle}`,
+    );
+  }
+
+  const completed = requireExactKeys(
+    step.completed,
+    ["cycle", "pollIndex"],
+    `${path}.completed`,
+  );
+  const completedCycle = requireInteger(completed.cycle, `${path}.completed.cycle`);
+  const completedPoll = requireInteger(completed.pollIndex, `${path}.completed.pollIndex`);
+  requireExact(completedPoll, lastRelease.pollIndex, `${path}.completed.pollIndex`);
+  if (neutralCycle > completedCycle || lastRelease.observedCycle > completedCycle) {
+    fail(
+      "ordering",
+      `${path}.completed.cycle`,
+      `expected a value at least ${Math.max(neutralCycle, lastRelease.observedCycle)}, got ${completedCycle}`,
+    );
+  }
+  if (
+    readyCycle < transcript.scenario.startCycle
+    || completedCycle > transcript.scenario.completedCycle
+  ) {
+    fail(
+      "ordering",
+      path,
+      `expected step within scenario cycles ${transcript.scenario.startCycle}`
+        + `..${transcript.scenario.completedCycle}`,
+    );
+  }
+  state.nextSequence += 2;
+  state.lastMilestoneCycle = completedCycle;
+  state.lastMilestonePoll = completedPoll;
+}
+
+function validateObserveStep(step, expected, index, state, transcript, plan) {
+  const path = `$.steps[${index}]`;
+  requireExactKeys(step, ["id", "type", "observed"], path);
+  requireExact(step.id, expected.id, `${path}.id`, "identity");
+  requireExact(step.type, "observe", `${path}.type`, "identity");
+  const observed = requireExactKeys(
+    step.observed,
+    ["cycle", "pollIndex", "witness"],
+    `${path}.observed`,
+  );
+  const cycle = requireInteger(observed.cycle, `${path}.observed.cycle`);
+  const poll = requireInteger(observed.pollIndex, `${path}.observed.pollIndex`);
+  validateWitness(
+    observed.witness,
+    `${path}.observed.witness`,
+    plan.game.revision,
+    expected.witness,
+  );
+  if (cycle < state.lastMilestoneCycle || poll < state.lastMilestonePoll) {
+    fail(
+      "ordering",
+      `${path}.observed`,
+      `expected a milestone at or after cycle ${state.lastMilestoneCycle}, poll ${state.lastMilestonePoll}`,
+    );
+  }
+  if (cycle > transcript.scenario.completedCycle) {
+    fail(
+      "ordering",
+      `${path}.observed.cycle`,
+      `expected a value no greater than ${transcript.scenario.completedCycle}, got ${cycle}`,
+    );
+  }
+  state.lastMilestoneCycle = cycle;
+  state.lastMilestonePoll = poll;
+}
+
+export function validateGameplayTranscript(transcript, plan) {
+  validatePlan(plan);
+  requireExactKeys(
+    transcript,
+    ["schema", "game", "scenario", "controller", "steps"],
+    "$",
+  );
+  requireExact(transcript.schema, GAMEPLAY_TRANSCRIPT_SCHEMA_V1, "$.schema", "identity");
+
+  const game = requireExactKeys(transcript.game, ["identifier", "revision"], "$.game");
+  requireExact(game.identifier, plan.game.identifier, "$.game.identifier", "identity");
+  requireExact(game.revision, plan.game.revision, "$.game.revision", "identity");
+
+  const scenario = requireExactKeys(
+    transcript.scenario,
+    ["id", "status", "hardCycleLimit", "startCycle", "completedCycle"],
+    "$.scenario",
+  );
+  requireExact(scenario.id, plan.scenario.id, "$.scenario.id", "identity");
+  requireExact(scenario.status, "complete", "$.scenario.status");
+  requireExact(
+    scenario.hardCycleLimit,
+    plan.scenario.hardCycleLimit,
+    "$.scenario.hardCycleLimit",
+    "identity",
+  );
+  requireExact(
+    scenario.startCycle,
+    plan.scenario.startCycle,
+    "$.scenario.startCycle",
+    "identity",
+  );
+  const completedCycle = requireInteger(
+    scenario.completedCycle,
+    "$.scenario.completedCycle",
+  );
+  if (completedCycle < scenario.startCycle || completedCycle >= scenario.hardCycleLimit) {
+    fail(
+      "ordering",
+      "$.scenario.completedCycle",
+      `expected ${scenario.startCycle} through ${scenario.hardCycleLimit - 1}, got ${completedCycle}`,
+    );
+  }
+
+  const controller = requireExactKeys(
+    transcript.controller,
+    [
+      "pollIndex",
+      "appliedSequence",
+      "lastPolledSequence",
+      "lastPolledButtons",
+      "pendingButtons",
+      "queuedStates",
+      "queueOverflows",
+    ],
+    "$.controller",
+  );
+  const controllerPoll = requireInteger(controller.pollIndex, "$.controller.pollIndex");
+  const inputCount = plan.steps.filter(step => step.type === "input").length;
+  const finalSequence = inputCount * 2;
+  requireExact(
+    requireInteger(controller.appliedSequence, "$.controller.appliedSequence"),
+    finalSequence,
+    "$.controller.appliedSequence",
+  );
+  requireExact(
+    requireInteger(controller.lastPolledSequence, "$.controller.lastPolledSequence"),
+    finalSequence,
+    "$.controller.lastPolledSequence",
+  );
+  for (const field of ["lastPolledButtons", "pendingButtons", "queuedStates"]) {
+    requireExact(
+      requireInteger(controller[field], `$.controller.${field}`),
+      0,
+      `$.controller.${field}`,
+    );
+  }
+  const queueOverflows = requireInteger(controller.queueOverflows, "$.controller.queueOverflows");
+  if (queueOverflows !== 0) {
+    fail("overflow", "$.controller.queueOverflows", `expected 0, got ${queueOverflows}`);
+  }
+
+  if (!Array.isArray(transcript.steps)) {
+    fail("envelope", "$.steps", "expected an array");
+  }
+  requireExact(transcript.steps.length, plan.steps.length, "$.steps.length", "identity");
+  const state = {
+    nextSequence: 1,
+    lastMilestoneCycle: scenario.startCycle,
+    lastMilestonePoll: 0,
+    lastPublicationPoll: 0,
+    lastScheduledCycle: scenario.startCycle,
+    lastObservedCycle: scenario.startCycle,
+    polls: new Set(),
+  };
+  for (const [index, expected] of plan.steps.entries()) {
+    if (expected.type === "input") {
+      validateInputStep(transcript.steps[index], expected, index, state, transcript, plan);
+    } else {
+      validateObserveStep(transcript.steps[index], expected, index, state, transcript, plan);
+    }
+  }
+  requireExact(state.nextSequence - 1, finalSequence, "$.controller.appliedSequence");
+  const terminal = transcript.steps.at(-1).observed;
+  const terminalPath = `$.steps[${transcript.steps.length - 1}].observed`;
+  requireExact(terminal.cycle, scenario.completedCycle, `${terminalPath}.cycle`);
+  requireExact(terminal.pollIndex, controllerPoll, `${terminalPath}.pollIndex`);
+  return transcript;
+}
+
+export function validateSmbReadyPlayGameplayTranscript(transcript) {
+  return validateGameplayTranscript(transcript, SMB_READY_PLAY_GAMEPLAY_PLAN);
+}
