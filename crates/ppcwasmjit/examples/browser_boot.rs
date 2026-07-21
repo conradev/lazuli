@@ -9172,6 +9172,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let worker = null;
     let workerUrl = null;
     let terminalPublicationSequence = 0;
+    let controllerScenarioState = null;
 
     function resetPresentation() {
       output.textContent = "STARTING";
@@ -9184,6 +9185,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function startWorker(discConfig, label) {
       const replacingWorker = worker !== null;
+      controllerScenarioState = null;
       if (replacingWorker) {
         worker.terminate();
         URL.revokeObjectURL(workerUrl);
@@ -9528,7 +9530,35 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (negative === positive) return 0x80;
       return negative ? 0x01 : 0xff;
     }
-    function publishControllerState() {
+    function normalizePageControllerState(state) {
+      if (state === null || typeof state !== "object" || Array.isArray(state)) {
+        throw new TypeError("controller scenario state must be an object");
+      }
+      const integer = (name, maximum) => {
+        const value = state[name];
+        if (!Number.isSafeInteger(value)) {
+          throw new TypeError(`controller scenario state ${name} must be a safe integer`);
+        }
+        if (value < 0 || value > maximum) {
+          throw new RangeError(
+            `controller scenario state ${name} must be between 0 and ${maximum}`
+          );
+        }
+        return value;
+      };
+      return {
+        buttons: integer("buttons", 0xffff),
+        stickX: integer("stickX", 0xff),
+        stickY: integer("stickY", 0xff),
+        cStickX: integer("cStickX", 0xff),
+        cStickY: integer("cStickY", 0xff),
+        triggerL: integer("triggerL", 0xff),
+        triggerR: integer("triggerR", 0xff),
+        analogA: integer("analogA", 0xff),
+        analogB: integer("analogB", 0xff),
+      };
+    }
+    function samplePageControllerState() {
       const gamepad = Array.from(navigator.getGamepads?.() ?? [])
         .find(candidate => candidate?.connected) ?? null;
       let virtualButtons = keyboardButtons | controllerPulseButtons;
@@ -9562,13 +9592,57 @@ const TEMPLATE: &str = r##"<!doctype html>
         analogA: (buttons & 0x0100) !== 0 ? 0xff : 0,
         analogB: (buttons & 0x0200) !== 0 ? 0xff : 0,
       };
-      const packet = JSON.stringify(state);
+      return state;
+    }
+    function publishControllerState() {
+      const scenarioInput = controllerScenarioState === null
+        ? null
+        : {
+            scenario: controllerScenarioState.scenario,
+            step: controllerScenarioState.step,
+            phase: controllerScenarioState.phase,
+            requestSequence: controllerScenarioState.requestSequence,
+          };
+      const state = controllerScenarioState?.state ?? samplePageControllerState();
+      const packet = JSON.stringify(
+        scenarioInput === null ? state : { state, scenarioInput }
+      );
       if (packet !== lastControllerPacket) {
         lastControllerPacket = packet;
         controllerSequence += 1;
-        worker?.postMessage({ type: "controller", sequence: controllerSequence, state });
+        const message = { type: "controller", sequence: controllerSequence, state };
+        if (scenarioInput !== null) message.scenarioInput = scenarioInput;
+        worker?.postMessage(message);
       }
       return state;
+    }
+    function applyControllerScenarioInput(message) {
+      if (
+        typeof message.scenario !== "string"
+        || message.scenario.length === 0
+        || typeof message.step !== "string"
+        || message.step.length === 0
+        || (message.phase !== "active" && message.phase !== "neutral")
+        || !Number.isSafeInteger(message.requestSequence)
+        || message.requestSequence < 1
+      ) {
+        throw new TypeError("controller scenario input request is invalid");
+      }
+      if (
+        controllerScenarioState !== null
+        && controllerScenarioState.scenario === message.scenario
+        && controllerScenarioState.step === message.step
+        && message.requestSequence <= controllerScenarioState.requestSequence
+      ) return false;
+      controllerScenarioState = {
+        scenario: message.scenario,
+        step: message.step,
+        phase: message.phase,
+        requestSequence: message.requestSequence,
+        state: normalizePageControllerState(message.state),
+      };
+      publishControllerState();
+      return true;
     }
     function sampleController() {
       publishControllerState();
@@ -9735,6 +9809,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       const message = event.data;
       if (message?.type === "controller-poll") {
         acknowledgeControllerPoll(message.buttons, message.sequence);
+      } else if (message?.type === "controller-scenario-input") {
+        applyControllerScenarioInput(message);
       } else if (message?.type === "dataset") {
         document.body.dataset[message.name] = message.value;
         if (message.name === "status") runnerStatus.textContent = message.value;

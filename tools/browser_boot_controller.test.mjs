@@ -126,6 +126,7 @@ function createHarness() {
       addListener(windowListeners, type, listener);
     },
     clearTimeout(id) { timers.delete(id); },
+    controllerScenarioState: null,
     document,
     lastControllerPacket: "",
     navigator: { getGamepads: () => gamepads },
@@ -312,6 +313,100 @@ test("buttonless main-stick deflection and neutral publish separate sequences", 
       { sequence: initialSequence + 2, buttons: 0, stickX: 0x80, stickY: 0x80 },
     ],
   );
+});
+
+test("worker scenario requests own a canonical full state until the next phase", () => {
+  const harness = createHarness();
+  const active = {
+    buttons: 0,
+    stickX: 0x40,
+    stickY: 0xc0,
+    cStickX: 0x80,
+    cStickY: 0x80,
+    triggerL: 0,
+    triggerR: 0,
+    analogA: 0,
+    analogB: 0,
+  };
+  const neutral = { ...active, stickX: 0x80, stickY: 0x80 };
+  const activeRequest = {
+    type: "controller-scenario-input",
+    scenario: "test-path",
+    step: "steer",
+    phase: "active",
+    requestSequence: 1,
+    state: { ...active, ignored: 1 },
+  };
+
+  assert.equal(harness.context.applyControllerScenarioInput(activeRequest), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.messages.at(-1))), {
+    type: "controller",
+    sequence: 2,
+    state: active,
+    scenarioInput: {
+      scenario: "test-path",
+      step: "steer",
+      phase: "active",
+      requestSequence: 1,
+    },
+  });
+
+  harness.gamepads.push({
+    axes: [1, 1, 0, 0],
+    buttons: [],
+    connected: true,
+  });
+  harness.context.sampleController();
+  assert.equal(
+    harness.messages.length,
+    2,
+    "physical sampling cannot tear the scenario phase",
+  );
+  assert.equal(harness.context.applyControllerScenarioInput(activeRequest), false);
+  assert.equal(harness.messages.length, 2, "duplicate worker requests are idempotent");
+
+  assert.equal(harness.context.applyControllerScenarioInput({
+    ...activeRequest,
+    phase: "neutral",
+    requestSequence: 2,
+    state: neutral,
+  }), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.messages.at(-1))), {
+    type: "controller",
+    sequence: 3,
+    state: neutral,
+    scenarioInput: {
+      scenario: "test-path",
+      step: "steer",
+      phase: "neutral",
+      requestSequence: 2,
+    },
+  });
+});
+
+test("page scenario requests reject incomplete full states", () => {
+  const harness = createHarness();
+  assert.throws(
+    () => harness.context.applyControllerScenarioInput({
+      type: "controller-scenario-input",
+      scenario: "test-path",
+      step: "steer",
+      phase: "active",
+      requestSequence: 1,
+      state: {
+        buttons: 0,
+        stickX: 0x40,
+        stickY: 0x80,
+        cStickX: 0x80,
+        cStickY: 0x80,
+        triggerL: 0,
+        triggerR: 0,
+        analogA: 0,
+      },
+    }),
+    /analogB must be a safe integer/,
+  );
+  assert.equal(harness.messages.length, 1);
 });
 
 test("captured pointers hold multiple controller buttons independently", () => {
@@ -502,4 +597,15 @@ test("native click activation pulses without stealing focused controls", () => {
   harness.dispatchWindow("blur");
   a.dispatch("click", { detail: 1 });
   assert.equal(harness.latestButtons(), 0);
+});
+
+test("current workers route scenario input requests to the page-owned publisher", () => {
+  assert.match(
+    source,
+    /message\?\.type === "controller-scenario-input"[\s\S]*?applyControllerScenarioInput\(message\)/,
+  );
+  assert.match(
+    source,
+    /function startWorker\([\s\S]*?controllerScenarioState = null;/,
+  );
 });
