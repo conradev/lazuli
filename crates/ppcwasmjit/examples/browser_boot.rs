@@ -826,7 +826,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       box-shadow: none;
     }
 
-    body[data-compositor-capture="enabled"] #display {
+    body[data-compositor-capture="enabled"] .shell #display {
       width: auto;
       height: auto;
       max-width: none;

@@ -36,10 +36,10 @@ test("headless capture exposes --expect and verifies before persistence", () => 
   );
   assert.match(
     source,
-    /verifyExpectedCheckpoint\(report, options, expectedManifest\);\s*await persist/,
+    /verifyExpectedCheckpoint\(report, options, expectedManifest\);[\s\S]*?await persist/,
   );
   assert.equal(
-    source.match(/^\s+attachHeadlessCapture\(session, state, report,/gm)?.length,
+    source.match(/^\s+attachHeadlessCapture\(/gm)?.length,
     2,
   );
   assert.match(
@@ -231,10 +231,13 @@ test("local disc identity is complete before navigation and joins every capture"
   assert.ok(identity < navigation);
   assert.ok(identity < upload);
   assert.equal(
-    source.match(/^\s+attachHeadlessCapture\(session, state, report,/gm)?.length,
+    source.match(/^\s+attachHeadlessCapture\(/gm)?.length,
     2,
   );
-  assert.equal(source.match(/\}, terminalRelease, discImage\);/g)?.length, 2);
+  assert.equal(
+    source.match(/terminalRelease,\s*discImage,\s*\);/g)?.length,
+    2,
+  );
 
   const context = vm.createContext({ Array, Error, JSON });
   vm.runInContext([
@@ -435,7 +438,9 @@ test("terminal worker and renderer failures persist before becoming nonzero", as
   const terminalCheck = source.indexOf(
     "await persistTerminalReportFailure(options.output, report)",
   );
-  assert.ok(terminalCheck < source.indexOf("verifyScenarioReport(report, options)", terminalCheck));
+  assert.ok(
+    terminalCheck < source.indexOf("verifyCompletedRunEvidence(report, options)", terminalCheck),
+  );
   assert.match(
     source,
     /main\(\)\.catch\(error => \{[\s\S]*process\.exitCode = 1;/,
@@ -457,20 +462,66 @@ test("headless scenarios are selected before a fresh worker starts", () => {
     /Page\.navigate", \{ url: runUrl \}/,
   );
   assert.match(source, /Page\.navigate did not create a fresh document loader/);
-  assert.equal(source.match(/verifyScenarioReport\(report, options\);/g)?.length, 1);
-  assert.equal(
-    source.match(/attachScenarioGameplayTranscript\(report, options\);/g)?.length,
-    1,
-  );
-  assert.equal(source.match(/verifyScenarioRendering\(report, options\);/g)?.length, 1);
-  assert.match(
-    source,
-    /verifyScenarioReport\(report, options\);\s*attachScenarioGameplayTranscript\(report, options\);\s*verifyScenarioRendering\(report, options\);/,
-  );
+  const completed = extractFunction("verifyCompletedRunEvidence");
+  assert.match(completed, /verifyScenarioReport\(report, options\)/);
+  assert.match(completed, /attachScenarioGameplayTranscript\(report, options\)/);
+  assert.match(completed, /verifyScenarioRenderingBackend\(report, options\)/);
+  assert.match(completed, /verifyScenarioSelectedXfb\(report, options\)/);
+  assert.match(completed, /verifyScenarioPresentedSurfaces\(report, options\)/);
+  assert.match(completed, /verifyCompositorCaptureReport\(report, options\)/);
   assert.match(
     source,
     /await persist\(options\.output, report\);\s*if \(scenarioError !== null\) throw scenarioError/,
   );
+});
+
+test("completed-run evidence validators fail independently and aggregate", () => {
+  const calls = [];
+  const context = vm.createContext({
+    AggregateError,
+    Error,
+    aggregateVerificationFailure: undefined,
+    attachScenarioGameplayTranscript() { calls.push("transcript"); },
+    verifyCompositorCaptureReport(report) {
+      calls.push("compositor");
+      report.headlessCapture.compositor.oracle = { derived: true };
+      throw new Error("compositor failed");
+    },
+    verifyScenarioPresentedSurfaces() {
+      calls.push("surface");
+      throw new Error("surface failed");
+    },
+    verifyScenarioRenderingBackend() {
+      calls.push("backend");
+      throw new Error("backend failed");
+    },
+    verifyScenarioReport() { calls.push("scenario"); },
+    verifyScenarioSelectedXfb() {
+      calls.push("selected");
+      throw new Error("selected failed");
+    },
+  });
+  vm.runInContext([
+    extractFunction("collectVerificationFailures"),
+    extractFunction("aggregateVerificationFailure"),
+    extractFunction("verifyCompletedRunEvidence"),
+  ].join("\n\n"), context);
+  const report = { headlessCapture: { compositor: { oracle: null } } };
+  const failure = context.verifyCompletedRunEvidence(report, {
+    compositorCapture: true,
+    scenario: "smb-ready-play",
+  });
+  assert.equal(failure.name, "BrowserEvidenceValidationError");
+  assert.equal(failure.errors.length, 4);
+  assert.deepEqual(calls, [
+    "scenario",
+    "transcript",
+    "backend",
+    "selected",
+    "surface",
+    "compositor",
+  ]);
+  assert.deepEqual(report.headlessCapture.compositor.oracle, { derived: true });
 });
 
 test("fresh headless runs carry the requested render cadence into worker startup", () => {
@@ -482,6 +533,116 @@ test("fresh headless runs carry the requested render cadence into worker startup
     source,
     /runUrl = configuredRunUrl\(options,[\s\S]*?Page\.navigate/,
   );
+});
+
+test("SMB compositor capture is strict opt-in on a fresh pinned disc run", () => {
+  assert.match(
+    source,
+    /from "\.\/browser_boot_headless_compositor\.mjs"/,
+  );
+  assert.match(source, /from "\.\/browser_boot_headless_compositor_oracle\.mjs"/);
+  assert.doesNotMatch(source, /browser_boot_compositor_png\.mjs/);
+  assert.match(source, /case "--capture-compositor":/);
+  assert.match(source, /--capture-compositor cannot be combined with --reuse/);
+  assert.match(source, /--capture-compositor requires --scenario smb-ready-play/);
+  assert.match(
+    source,
+    /--capture-compositor requires both --expect-commit and --expect-release-id/,
+  );
+  assert.match(
+    source,
+    /url\.searchParams\.set\("compositorCapture", "1"\)/,
+  );
+  assert.match(
+    source,
+    /select compositor capture with --capture-compositor, not the --url query/,
+  );
+  const main = extractFunction("main");
+  assert.ok(
+    main.indexOf("await prepareCompositorCapture(session")
+      < main.indexOf("await attachDiscAfterFreshNavigation(session"),
+  );
+  assert.ok(
+    main.indexOf("state.compositorPending !== null")
+      < main.indexOf("const report = parseReport(state.result)"),
+  );
+  assert.doesNotMatch(source, /headlessCapture\.checkpoint\.compositor/);
+
+  const context = vm.createContext({
+    COMPOSITOR_CAPTURE_MAX_POLL_MS: 1_000,
+    Error,
+    Number,
+    Set,
+    URL,
+    resolveDiscPath(path) {
+      return `/resolved/${path}`;
+    },
+  });
+  vm.runInContext([
+    extractFunction("parseArguments"),
+    extractFunction("configuredRunUrl"),
+  ].join("\n\n"), context);
+  const options = context.parseArguments([
+    "--url",
+    "https://gekko.free/assets/frontend.html",
+    "--capture-compositor",
+    "--disc",
+    "smb.ciso",
+    "--scenario",
+    "smb-ready-play",
+    "--expect-commit",
+    "1".repeat(40),
+    "--expect-release-id",
+    "2".repeat(64),
+    "--poll-ms",
+    "60000",
+  ]);
+  assert.equal(options.compositorCapture, true);
+  assert.equal(options.pollMs, 1_000);
+  assert.equal(options.disc, "/resolved/smb.ciso");
+  const runUrl = new URL(context.configuredRunUrl(options, "run-1"));
+  assert.equal(runUrl.searchParams.get("compositorCapture"), "1");
+  assert.equal(runUrl.searchParams.get("scenario"), "smb-ready-play");
+  assert.equal(runUrl.searchParams.get("headlessRun"), "run-1");
+
+  assert.throws(
+    () => context.parseArguments([
+      "--url",
+      "https://gekko.free/assets/frontend.html",
+      "--capture-compositor",
+      "--disc",
+      "smb.ciso",
+      "--scenario",
+      "smb-ready-play",
+      "--expect-commit",
+      "1".repeat(40),
+    ]),
+    /requires both --expect-commit and --expect-release-id/,
+  );
+  assert.throws(
+    () => context.parseArguments([
+      "--url",
+      "https://gekko.free/assets/frontend.html?compositorCapture=1",
+    ]),
+    /not the --url query/,
+  );
+});
+
+test("compositor viewport commands bracket fresh navigation", () => {
+  const main = extractFunction("main");
+  const configure = main.indexOf("await configureCompositorViewport(session)");
+  const navigate = main.indexOf('session.send("Page.navigate"');
+  assert.notEqual(configure, -1);
+  assert.ok(configure < navigate);
+  assert.match(
+    main,
+    /finally \{[\s\S]*clearCompositorViewport\(session\)[\s\S]*session\.close\(\)/,
+  );
+  const snapshot = main.indexOf('session.evaluate("globalThis.lazuliCycleRunner.snapshot()")');
+  const timeoutCapture = main.lastIndexOf("await capturePendingCompositorFrame(", snapshot);
+  assert.notEqual(timeoutCapture, -1);
+  assert.ok(timeoutCapture < snapshot);
+  assert.equal(main.match(/await capturePendingCompositorFrame\(/g)?.length, 2);
 });
 
 test("headless report capture rejects a stale document and loader", () => {
@@ -556,8 +717,11 @@ test("SMB headless captures delegate temporal XFB verification", () => {
   );
   assert.match(
     source,
-    /verifySmbTemporalSelectedXfb\(rendering\.temporalSelectedXfb\);\s*verifySmbTemporalPresentedSurfaces\(rendering\.temporalSelectedXfb\)/,
+    /verifySmbTemporalPresentedSurfaces\(rendering\.temporalSelectedXfb\)/,
   );
+  const completed = extractFunction("verifyCompletedRunEvidence");
+  assert.match(completed, /verifyScenarioSelectedXfb\(report, options\)/);
+  assert.match(completed, /verifyScenarioPresentedSurfaces\(report, options\)/);
   assert.doesNotMatch(source, /distinctGenerations >= 2/);
   assert.doesNotMatch(source, /selected\.rgb\.unique > 1/);
   assert.doesNotMatch(source, /selected\.rgb\.other > 0/);

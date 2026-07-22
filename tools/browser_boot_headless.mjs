@@ -21,11 +21,25 @@ import {
 import {
   deriveSmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
+import {
+  capturePendingCompositorFrame,
+  clearCompositorViewport,
+  compositorCaptureEvidence,
+  compositorFailure,
+  configureCompositorViewport,
+  initializeCompositorCapture,
+} from "./browser_boot_headless_compositor.mjs";
+import {
+  verifyCompositorCaptureReport,
+} from "./browser_boot_headless_compositor_oracle.mjs";
 import { verifySmbTemporalPresentedSurfaces } from "./browser_boot_temporal_surface.mjs";
 import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
 
+const COMPOSITOR_CAPTURE_MAX_POLL_MS = 1_000;
+
 function parseArguments(argv) {
   const options = {
+    compositorCapture: false,
     endpoint: "http://127.0.0.1:9222",
     disc: null,
     expect: null,
@@ -51,6 +65,9 @@ function parseArguments(argv) {
       return argv[index];
     };
     switch (argument) {
+      case "--capture-compositor":
+        options.compositorCapture = true;
+        break;
       case "--endpoint":
         options.endpoint = value();
         break;
@@ -116,6 +133,14 @@ function parseArguments(argv) {
   if (options.url !== null && new URL(options.url).searchParams.has("scenario")) {
     throw new Error("select scenarios with --scenario, not the --url query");
   }
+  if (
+    options.url !== null
+    && new URL(options.url).searchParams.has("compositorCapture")
+  ) {
+    throw new Error(
+      "select compositor capture with --capture-compositor, not the --url query",
+    );
+  }
   if (options.reuse && options.disc !== null) {
     throw new Error("--disc cannot be combined with --reuse");
   }
@@ -124,6 +149,23 @@ function parseArguments(argv) {
   }
   if (options.reuse && options.scenario !== null) {
     throw new Error("--scenario cannot start inside a reused worker");
+  }
+  if (options.compositorCapture && options.reuse) {
+    throw new Error("--capture-compositor cannot be combined with --reuse");
+  }
+  if (options.compositorCapture && options.scenario !== "smb-ready-play") {
+    throw new Error("--capture-compositor requires --scenario smb-ready-play");
+  }
+  if (options.compositorCapture && options.disc === null) {
+    throw new Error("--capture-compositor requires --disc");
+  }
+  if (
+    options.compositorCapture
+    && (options.expectCommit === null || options.expectReleaseId === null)
+  ) {
+    throw new Error(
+      "--capture-compositor requires both --expect-commit and --expect-release-id",
+    );
   }
   if (options.scenario !== null && options.pulses.length !== 0) {
     throw new Error("--scenario cannot be combined with --pulse");
@@ -173,6 +215,9 @@ function parseArguments(argv) {
   if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < options.pollMs) {
     throw new Error("--timeout-ms must be an integer >= --poll-ms");
   }
+  if (options.compositorCapture) {
+    options.pollMs = Math.min(options.pollMs, COMPOSITOR_CAPTURE_MAX_POLL_MS);
+  }
   return options;
 }
 
@@ -186,6 +231,7 @@ function configuredRunUrl(options, headlessRunId) {
   if (options.renderEvery !== null) {
     url.searchParams.set("renderEvery", String(options.renderEvery));
   }
+  if (options.compositorCapture) url.searchParams.set("compositorCapture", "1");
   url.searchParams.set("headlessRun", headlessRunId);
   return url.href;
 }
@@ -340,6 +386,40 @@ async function observeActiveReleaseBeforeActivation(
   throw new Error("headless page was not ready for active release observation");
 }
 
+async function prepareCompositorCapture(
+  session,
+  { activeRelease, deadline, navigationLoaderId, options, runUrl },
+) {
+  while (Date.now() < deadline) {
+    const observation = await observeHeadlessPage(session, {
+      deadline,
+      includeFrameTree: true,
+    }, { pageState });
+    if (!isExpectedNavigation(
+      observation.state,
+      runUrl,
+      navigationLoaderId,
+      observation.frameLoaderId,
+    )) {
+      await delay(options.pollMs);
+      continue;
+    }
+    if (!observation.state.compositorCaptureAvailable) {
+      await delay(options.pollMs);
+      continue;
+    }
+    return initializeCompositorCapture(session, {
+      activeRelease,
+      navigationLoaderId,
+      options,
+      runUrl,
+    }, {
+      observeRelease: observeActiveRelease,
+    });
+  }
+  throw compositorFailure("page did not expose a valid capture surface before disc upload");
+}
+
 async function pageTarget(endpoint) {
   const response = await fetch(new URL("/json/list", endpoint));
   if (!response.ok) throw new Error(`Chrome target list returned HTTP ${response.status}`);
@@ -352,7 +432,14 @@ async function pageTarget(endpoint) {
 async function pageState(session) {
   return session.evaluate(`(() => {
     const result = document.querySelector("#result")?.textContent?.trim() ?? "";
+    const compositor = globalThis.lazuliCompositorCapture;
+    const compositorCaptureAvailable = compositor !== null
+      && typeof compositor === "object"
+      && typeof compositor.pending === "function"
+      && typeof compositor.acknowledge === "function";
     return {
+      compositorCaptureAvailable,
+      compositorPending: compositorCaptureAvailable ? compositor.pending() : null,
       dataset: Object.fromEntries(Object.entries(document.body?.dataset ?? {})),
       readyState: document.readyState,
       result,
@@ -543,7 +630,7 @@ function attachScenarioGameplayTranscript(report, options) {
   report.gameplayTranscript = deriveSmbReadyPlayGameplayTranscript(report);
 }
 
-function verifyScenarioRendering(report, options) {
+function verifyScenarioRenderingBackend(report, options) {
   if (options.scenario !== "smb-ready-play") return;
   const rendering = report.rendering;
   if (rendering?.backend !== "wgpu-webgpu") {
@@ -551,8 +638,57 @@ function verifyScenarioRendering(report, options) {
       `SMB temporal XFB requires wgpu-webgpu, got ${JSON.stringify(rendering?.backend ?? null)}`,
     );
   }
+}
+
+function verifyScenarioSelectedXfb(report, options) {
+  if (options.scenario !== "smb-ready-play") return;
+  const rendering = report.rendering;
   verifySmbTemporalSelectedXfb(rendering.temporalSelectedXfb);
+}
+
+function verifyScenarioPresentedSurfaces(report, options) {
+  if (options.scenario !== "smb-ready-play") return;
+  const rendering = report.rendering;
   verifySmbTemporalPresentedSurfaces(rendering.temporalSelectedXfb);
+}
+
+function collectVerificationFailures(verifications) {
+  const failures = [];
+  for (const verification of verifications) {
+    try {
+      verification();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  return failures;
+}
+
+function aggregateVerificationFailure(failures) {
+  if (failures.length === 0) return null;
+  const error = new AggregateError(
+    failures,
+    `browser evidence failed ${failures.length} independent verification(s)`,
+  );
+  error.name = "BrowserEvidenceValidationError";
+  return error;
+}
+
+function verifyCompletedRunEvidence(report, options) {
+  return aggregateVerificationFailure(collectVerificationFailures([
+    () => verifyScenarioReport(report, options),
+    () => attachScenarioGameplayTranscript(report, options),
+    () => verifyScenarioRenderingBackend(report, options),
+    () => verifyScenarioSelectedXfb(report, options),
+    () => verifyScenarioPresentedSurfaces(report, options),
+    () => verifyCompositorCaptureReport(report, options),
+  ]));
+}
+
+function verifyTimedOutRunEvidence(report, options) {
+  return aggregateVerificationFailure(collectVerificationFailures([
+    () => verifyCompositorCaptureReport(report, options),
+  ]));
 }
 
 async function main() {
@@ -566,14 +702,20 @@ async function main() {
   const target = await pageTarget(options.endpoint);
   const session = new DevToolsSession(target.webSocketDebuggerUrl);
   await session.connect();
+  let compositorViewportConfigured = false;
   try {
     await session.send("Runtime.enable");
     await session.send("Page.enable");
+    if (options.compositorCapture) {
+      compositorViewportConfigured = true;
+      await configureCompositorViewport(session);
+    }
     const runStartedAt = Date.now();
     const deadline = runStartedAt + options.timeoutMs;
     let reuseCapture = null;
     let runUrl = null;
     let navigationLoaderId = null;
+    let compositorCapture = null;
     let activeRelease;
     if (options.reuse) {
       activeRelease = await observeActiveReleaseBeforeActivation(
@@ -601,6 +743,16 @@ async function main() {
         runUrl,
         navigationLoaderId,
       );
+    }
+
+    if (options.compositorCapture) {
+      compositorCapture = await prepareCompositorCapture(session, {
+        activeRelease,
+        deadline,
+        navigationLoaderId,
+        options,
+        runUrl,
+      });
     }
 
     if (options.disc !== null) {
@@ -636,6 +788,21 @@ async function main() {
           continue;
         }
       }
+      if (compositorCapture !== null) {
+        if (!state.compositorCaptureAvailable) {
+          throw compositorFailure("capture API disappeared from the fresh document");
+        }
+        if (state.compositorPending !== null) {
+          await capturePendingCompositorFrame(
+            session,
+            compositorCapture,
+            state.compositorPending,
+            { activeRelease, navigationLoaderId, options, runUrl },
+            { observeRelease: observeActiveRelease },
+          );
+          continue;
+        }
+      }
       const report = parseReport(state.result);
       if (report !== null) {
         const reportDetectedAt = Date.now();
@@ -644,21 +811,25 @@ async function main() {
           options,
           activeRelease,
         );
-        attachHeadlessCapture(session, state, report, {
+        const details = {
           performance: {
             headlessRunToReportMs: reportDetectedAt - runStartedAt,
           },
           reuse: reuseCapture,
-        }, terminalRelease, discImage);
-        await persistTerminalReportFailure(options.output, report);
-        let scenarioError = null;
-        try {
-          verifyScenarioReport(report, options);
-          attachScenarioGameplayTranscript(report, options);
-          verifyScenarioRendering(report, options);
-        } catch (error) {
-          scenarioError = error;
+        };
+        if (compositorCapture !== null) {
+          details.compositor = compositorCaptureEvidence(compositorCapture);
         }
+        attachHeadlessCapture(
+          session,
+          state,
+          report,
+          details,
+          terminalRelease,
+          discImage,
+        );
+        await persistTerminalReportFailure(options.output, report);
+        const scenarioError = verifyCompletedRunEvidence(report, options);
         if (scenarioError === null) {
           verifyExpectedCheckpoint(report, options, expectedManifest);
         }
@@ -673,6 +844,24 @@ async function main() {
       deadline,
       includeFrameTree: runUrl !== null,
     }, { pageState })).state;
+    if (compositorCapture !== null) {
+      if (!state.compositorCaptureAvailable) {
+        throw compositorFailure("capture API disappeared before timeout snapshot");
+      }
+      if (state.compositorPending !== null) {
+        await capturePendingCompositorFrame(
+          session,
+          compositorCapture,
+          state.compositorPending,
+          { activeRelease, navigationLoaderId, options, runUrl },
+          { observeRelease: observeActiveRelease },
+        );
+        state = (await observeHeadlessPage(session, {
+          deadline: Date.now() + 5_000,
+          includeFrameTree: runUrl !== null,
+        }, { pageState })).state;
+      }
+    }
     if (state.runnerAvailable) {
       await session.evaluate("globalThis.lazuliCycleRunner.snapshot()");
       const snapshotDeadline = Date.now() + 5_000;
@@ -690,16 +879,31 @@ async function main() {
             options,
             activeRelease,
           );
-          attachHeadlessCapture(session, state, report, {
+          const details = {
             performance: {
               headlessRunToReportMs: reportDetectedAt - runStartedAt,
             },
             reuse: reuseCapture,
             timedOut: true,
-          }, terminalRelease, discImage);
+          };
+          if (compositorCapture !== null) {
+            details.compositor = compositorCaptureEvidence(compositorCapture);
+          }
+          attachHeadlessCapture(
+            session,
+            state,
+            report,
+            details,
+            terminalRelease,
+            discImage,
+          );
           await persistTerminalReportFailure(options.output, report);
-          verifyExpectedCheckpoint(report, options, expectedManifest);
+          const compositorError = verifyTimedOutRunEvidence(report, options);
+          if (compositorError === null) {
+            verifyExpectedCheckpoint(report, options, expectedManifest);
+          }
           await persist(options.output, report);
+          if (compositorError !== null) throw compositorError;
           process.exitCode = 124;
           return;
         }
@@ -709,7 +913,13 @@ async function main() {
       `browser boot timed out without a report: ${JSON.stringify(state)}`
     );
   } finally {
-    session.close();
+    try {
+      if (compositorViewportConfigured) {
+        await clearCompositorViewport(session);
+      }
+    } finally {
+      session.close();
+    }
   }
 }
 

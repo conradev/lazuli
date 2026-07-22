@@ -447,7 +447,7 @@ test("page contract fences renderer completion behind capture acknowledgement", 
   assert.match(source, /body\[data-compositor-capture="enabled"\][\s\S]*\.shell > \.play-controls/);
   assert.match(
     source,
-    /body\[data-compositor-capture="enabled"\] #display \{[\s\S]*width: auto;[\s\S]*height: auto;[\s\S]*aspect-ratio: auto;[\s\S]*object-fit: fill;/,
+    /body\[data-compositor-capture="enabled"\] \.shell #display \{[\s\S]*width: auto;[\s\S]*height: auto;[\s\S]*aspect-ratio: auto;[\s\S]*object-fit: fill;/,
   );
   assert.match(source, /document\.addEventListener\("visibilitychange"/);
 });

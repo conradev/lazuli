@@ -156,6 +156,8 @@ test("pending compositor frames use an exact pinned CDP canvas screenshot", asyn
     context,
     { observeRelease },
   );
+  assert.equal(capture.baselineLayout, null);
+  assert.strictEqual(capture.viewport, geometry.viewport);
   let acknowledged = null;
   const pending = descriptor(geometry);
   const evidence = await capturePendingCompositorFrame(
@@ -203,6 +205,17 @@ test("pending compositor frames use an exact pinned CDP canvas screenshot", asyn
   assert.deepEqual(acknowledged, { token: pending.token, url: runUrl });
   assert.equal(releaseObservations, 2);
   assert.equal(capture.frames.length, 1);
+  assert.deepEqual(capture.baselineLayout, {
+    canvas: {
+      bottom: 608,
+      height: 448,
+      left: 192,
+      right: 832,
+      top: 160,
+      width: 640,
+    },
+    viewport: geometry.viewport,
+  });
   assert.strictEqual(evidence.descriptor, pending);
   assert.equal(evidence.loaderId, "loader-fresh");
   assert.equal(evidence.releaseId, release.releaseId);
@@ -226,6 +239,97 @@ test("pending compositor frames use an exact pinned CDP canvas screenshot", asyn
     url: runUrl,
     viewport: geometry.viewport,
   });
+});
+
+test("first pending frame pins guest geometry after the pre-boot shell", async () => {
+  const shellGeometry = compositorGeometry({ bufferHeight: 480, height: 480 });
+  const guestGeometry = compositorGeometry();
+  let liveGeometry = shellGeometry;
+  const release = { commit: "1".repeat(40), releaseId: "2".repeat(64) };
+  const context = {
+    activeRelease: release,
+    navigationLoaderId: "loader",
+    options: {},
+    runUrl: "https://gekko.free/assets/frontend.html"
+      + "?scenario=smb-ready-play&compositorCapture=1&headlessRun=run-1",
+  };
+  const session = {
+    async evaluate() {
+      return compositorEnvironment(liveGeometry);
+    },
+    async send(method) {
+      if (method === "Page.captureScreenshot") {
+        return { data: Buffer.from("png").toString("base64") };
+      }
+      if (method === "Page.getFrameTree") {
+        return { frameTree: { frame: { loaderId: "loader" } } };
+      }
+      assert.fail(`unexpected CDP method ${method}`);
+    },
+  };
+  const observeRelease = async () => release;
+  const capture = await initializeCompositorCapture(
+    session,
+    context,
+    { observeRelease },
+  );
+  assert.equal(capture.baselineLayout, null);
+
+  liveGeometry = guestGeometry;
+  await capturePendingCompositorFrame(
+    session,
+    capture,
+    descriptor(guestGeometry),
+    context,
+    {
+      async acknowledge() {},
+      decodePng() {
+        return {
+          width: 640,
+          height: 448,
+          sourceColorType: "rgba8",
+          format: "rgba8unorm",
+          layout: "top-left-row-major-tight",
+          pngByteLength: 3,
+          pngSha256: "3".repeat(64),
+          rgbaByteLength: 640 * 448 * 4,
+          rgbaSha256: "4".repeat(64),
+          rgbSha256: "5".repeat(64),
+          rgb: { black: 0, white: 0, other: 640 * 448, unique: 32 },
+          rgba: Buffer.alloc(4),
+        };
+      },
+      observeRelease,
+    },
+  );
+  assert.deepEqual(capture.baselineLayout, {
+    canvas: {
+      bottom: 608,
+      height: 448,
+      left: 192,
+      right: 832,
+      top: 160,
+      width: 640,
+    },
+    viewport: guestGeometry.viewport,
+  });
+
+  liveGeometry = compositorGeometry({
+    bufferHeight: 224,
+    bufferWidth: 320,
+    height: 224,
+    width: 320,
+  });
+  await assert.rejects(
+    capturePendingCompositorFrame(
+      session,
+      capture,
+      { ...descriptor(liveGeometry), ordinal: 2, rendererSequence: 42, presentationSerial: 43 },
+      context,
+      { observeRelease },
+    ),
+    /geometry changed during compositor capture/,
+  );
 });
 
 test("transport rejects scaled geometry and invalid live provenance", async () => {

@@ -402,10 +402,16 @@ export async function initializeCompositorCapture(
   );
   await observeRelease(session, options, activeRelease);
   return {
-    baselineLayout: environment.layout,
+    // The empty release shell starts with a 640x480 canvas.  The guest's VI
+    // establishes the real XFB dimensions only after the disc begins running,
+    // so pinning the pre-boot canvas would reject the first valid 640x448 SMB
+    // presentation.  The first pending compositor frame is the evidence
+    // boundary; all later frames must retain that exact layout.
+    baselineLayout: null,
     frames: [],
     navigationLoaderId,
     runUrl,
+    viewport: environment.geometry.viewport,
   };
 }
 
@@ -433,6 +439,9 @@ export async function capturePendingCompositorFrame(
     capture.frames,
     environment.geometry,
   );
+  if (capture.baselineLayout === null) {
+    capture.baselineLayout = environment.layout;
+  }
   const release = await observeRelease(session, options, activeRelease);
   const canvas = environment.geometry.canvas;
   const clip = {
@@ -495,6 +504,6 @@ export function compositorCaptureEvidence(capture) {
     schemaValid: false,
     target: "#display",
     url: capture.runUrl,
-    viewport: capture.baselineLayout.viewport,
+    viewport: capture.viewport,
   };
 }
