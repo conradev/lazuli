@@ -307,3 +307,221 @@ export function validateTemporalPresentedSurfaceFrames(
   }
   return frames;
 }
+
+export function deriveTemporalPresentedSurfaceOracle(
+  frames,
+  capacity = SMB_TEMPORAL_XFB_CAPACITY,
+) {
+  if (!Array.isArray(frames)) {
+    fail("envelope", "$.frames", `expected an array, got ${describe(frames)}`);
+  }
+  const classified = frames.map(frame => {
+    const surface = frame.presentedSurface;
+    const pixels = surface === null ? 0 : surface.width * surface.height;
+    const matchesPresentation = surface !== null
+      && surface.address === frame.presentation.address
+      && surface.generation === frame.presentation.copyIndex
+      && surface.row === frame.presentation.copyRow
+      && surface.width === frame.presentation.width
+      && surface.height === frame.presentation.height;
+    return {
+      ordinal: frame.ordinal,
+      rendererSequence: frame.rendererSequence,
+      presentationSerial: surface?.presentationSerial ?? null,
+      copyIndex: frame.presentation.copyIndex,
+      generation: surface?.generation ?? null,
+      rgbaSha256: surface?.rgbaSha256 ?? null,
+      rgbSha256: surface?.rgbSha256 ?? null,
+      captured: surface !== null,
+      matchesPresentation,
+      monochrome: surface !== null && surface.rgb.unique === 1,
+      allBlack: surface !== null && surface.rgb.black === pixels,
+      allWhite: surface !== null && surface.rgb.white === pixels,
+    };
+  });
+  const rgbaHashes = classified
+    .map(frame => frame.rgbaSha256)
+    .filter(hash => hash !== null);
+  const rgbHashes = classified
+    .map(frame => frame.rgbSha256)
+    .filter(hash => hash !== null);
+  const monochrome = classified.filter(frame => frame.monochrome);
+  const blackWhite = classified.filter(frame => frame.allBlack || frame.allWhite);
+  const adjacentFramesAlternate = (candidates, key) => candidates.length >= 2
+    && candidates.every((frame, index) => index === 0
+      || frame[key] !== candidates[index - 1][key]);
+  const blackAndWhiteAlternate = candidates => candidates.length >= 2
+    && candidates.every((frame, index) => index === 0
+      || frame.allBlack !== candidates[index - 1].allBlack);
+  return {
+    captured: classified.filter(frame => frame.captured).length,
+    capacity,
+    complete: classified.length === capacity && classified.every(frame => frame.captured),
+    distinctRgbaHashes: new Set(rgbaHashes).size,
+    distinctRgbHashes: new Set(rgbHashes).size,
+    distinctPresentationSerials: new Set(classified
+      .map(frame => frame.presentationSerial)
+      .filter(serial => serial !== null)).size,
+    missingOrdinals: classified.filter(frame => !frame.captured).map(frame => frame.ordinal),
+    mismatchedPresentationOrdinals: classified
+      .filter(frame => frame.captured && !frame.matchesPresentation)
+      .map(frame => frame.ordinal),
+    presentationSerialRegressions: classified
+      .filter((frame, index) => index !== 0
+        && frame.presentationSerial !== null
+        && classified[index - 1].presentationSerial !== null
+        && frame.presentationSerial <= classified[index - 1].presentationSerial)
+      .map(frame => frame.ordinal),
+    monochromeOrdinals: monochrome.map(frame => frame.ordinal),
+    blackOrdinals: classified.filter(frame => frame.allBlack).map(frame => frame.ordinal),
+    whiteOrdinals: classified.filter(frame => frame.allWhite).map(frame => frame.ordinal),
+    allFramesMonochrome: classified.length !== 0
+      && monochrome.length === classified.length,
+    alternatingMonochromePair: monochrome.length === classified.length
+      && new Set(rgbHashes).size === 2
+      && adjacentFramesAlternate(classified, "rgbSha256"),
+    blackWhiteAlternating: blackWhite.length === classified.length
+      && blackAndWhiteAlternate(classified),
+    frames: classified,
+  };
+}
+
+function deriveFlickerDiagnosticsFromClassifiedFrames(classified) {
+  const exactBlackWhiteKind = frame => {
+    if (frame.allBlack) return "black";
+    if (frame.allWhite) return "white";
+    return null;
+  };
+  const adjacentExactBlackWhiteTransitions = [];
+  for (let index = 1; index < classified.length; index += 1) {
+    const previous = classified[index - 1];
+    const current = classified[index];
+    const from = exactBlackWhiteKind(previous);
+    const to = exactBlackWhiteKind(current);
+    if (from !== null && to !== null && from !== to) {
+      adjacentExactBlackWhiteTransitions.push({
+        fromOrdinal: previous.ordinal,
+        toOrdinal: current.ordinal,
+        from,
+        to,
+      });
+    }
+  }
+  const singleFrameMonochromeOrdinals = classified
+    .filter((frame, index) => frame.monochrome
+      && (index === 0 || !classified[index - 1].monochrome)
+      && (index === classified.length - 1 || !classified[index + 1].monochrome))
+    .map(frame => frame.ordinal);
+  const singleFrameMonochrome = new Set(singleFrameMonochromeOrdinals);
+  const isolatedExactBlackWhiteOrdinals = classified
+    .filter(frame => singleFrameMonochrome.has(frame.ordinal)
+      && exactBlackWhiteKind(frame) !== null)
+    .map(frame => frame.ordinal);
+  return {
+    adjacentExactBlackWhiteTransitions,
+    singleFrameMonochromeOrdinals,
+    isolatedExactBlackWhiteOrdinals,
+  };
+}
+
+export function deriveTemporalPresentedSurfaceFlickerDiagnostics(
+  frames,
+  capacity = SMB_TEMPORAL_XFB_CAPACITY,
+) {
+  const oracle = deriveTemporalPresentedSurfaceOracle(frames, capacity);
+  return deriveFlickerDiagnosticsFromClassifiedFrames(oracle.frames);
+}
+
+function firstDifference(expected, actual, path = "$.surfaceOracle") {
+  if (Object.is(expected, actual)) return null;
+  if (Array.isArray(expected) || Array.isArray(actual)) {
+    if (!Array.isArray(expected) || !Array.isArray(actual)) {
+      return { actual, expected, path };
+    }
+    if (expected.length !== actual.length) {
+      return { actual: actual.length, expected: expected.length, path: `${path}.length` };
+    }
+    for (let index = 0; index < expected.length; index += 1) {
+      const difference = firstDifference(expected[index], actual[index], `${path}[${index}]`);
+      if (difference !== null) return difference;
+    }
+    return null;
+  }
+  const expectedObject = expected !== null && typeof expected === "object";
+  const actualObject = actual !== null && typeof actual === "object";
+  if (!expectedObject || !actualObject) return { actual, expected, path };
+  const expectedKeys = Object.keys(expected).sort();
+  const actualKeys = Object.keys(actual).sort();
+  const keyDifference = firstDifference(expectedKeys, actualKeys, `${path}.[keys]`);
+  if (keyDifference !== null) return keyDifference;
+  for (const key of expectedKeys) {
+    const difference = firstDifference(expected[key], actual[key], `${path}.${key}`);
+    if (difference !== null) return difference;
+  }
+  return null;
+}
+
+export function compareTemporalPresentedSurfaceOracle(reported, derived) {
+  const difference = firstDifference(derived, reported);
+  if (difference !== null) {
+    fail(
+      "oracle-mismatch",
+      difference.path,
+      `expected ${describe(difference.expected)}, got ${describe(difference.actual)}`,
+    );
+  }
+  return true;
+}
+
+export function verifySmbTemporalPresentedSurfaces(temporal) {
+  const envelope = requireObject(temporal, "$.temporalSelectedXfb");
+  requireExact(envelope.capacity, SMB_TEMPORAL_XFB_CAPACITY, "$.capacity");
+  const frames = validateTemporalPresentedSurfaceFrames(
+    envelope.frames,
+    SMB_TEMPORAL_XFB_CAPACITY,
+  );
+  const derived = deriveTemporalPresentedSurfaceOracle(
+    frames,
+    SMB_TEMPORAL_XFB_CAPACITY,
+  );
+  const diagnostics = deriveFlickerDiagnosticsFromClassifiedFrames(derived.frames);
+  if (derived.blackWhiteAlternating) {
+    fail(
+      "exact-black-white-alternation",
+      "$.frames",
+      `captured exact black/white swapchain alternation at ordinals ${derived.frames
+        .map(frame => frame.ordinal)
+        .join(", ")}`,
+    );
+  }
+  if (diagnostics.adjacentExactBlackWhiteTransitions.length !== 0) {
+    fail(
+      "adjacent-exact-black-white-transition",
+      "$.frames",
+      `captured adjacent exact black/white swapchain transition(s): ${diagnostics
+        .adjacentExactBlackWhiteTransitions
+        .map(transition => `${transition.fromOrdinal}:${transition.from}`
+          + `->${transition.toOrdinal}:${transition.to}`)
+        .join(", ")}`,
+    );
+  }
+  if (diagnostics.isolatedExactBlackWhiteOrdinals.length !== 0) {
+    fail(
+      "isolated-exact-black-white-frame",
+      "$.frames",
+      `captured isolated exact black/white swapchain frame(s) at ordinals ${diagnostics
+        .isolatedExactBlackWhiteOrdinals
+        .join(", ")}`,
+    );
+  }
+  if (derived.monochromeOrdinals.length !== 0) {
+    fail(
+      "monochrome-frame",
+      "$.frames",
+      `captured monochrome swapchain frame(s) at ordinals ${derived.monochromeOrdinals
+        .join(", ")}`,
+    );
+  }
+  compareTemporalPresentedSurfaceOracle(envelope.surfaceOracle, derived);
+  return { oracle: derived, diagnostics };
+}

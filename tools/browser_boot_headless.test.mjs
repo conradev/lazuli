@@ -360,7 +360,15 @@ test("SMB headless captures delegate temporal XFB verification", () => {
   );
   assert.match(
     source,
+    /import \{ verifySmbTemporalPresentedSurfaces \} from "\.\/browser_boot_temporal_surface\.mjs"/,
+  );
+  assert.match(
+    source,
     /verifySmbTemporalSelectedXfb\(rendering\.temporalSelectedXfb\)/,
+  );
+  assert.match(
+    source,
+    /verifySmbTemporalSelectedXfb\(rendering\.temporalSelectedXfb\);\s*verifySmbTemporalPresentedSurfaces\(rendering\.temporalSelectedXfb\)/,
   );
   assert.doesNotMatch(source, /distinctGenerations >= 2/);
   assert.doesNotMatch(source, /selected\.rgb\.unique > 1/);

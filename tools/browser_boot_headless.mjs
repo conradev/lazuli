@@ -19,6 +19,7 @@ import {
 import {
   deriveSmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
+import { verifySmbTemporalPresentedSurfaces } from "./browser_boot_temporal_surface.mjs";
 import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
 
 function parseArguments(argv) {
@@ -381,6 +382,7 @@ function verifyScenarioRendering(report, options) {
     );
   }
   verifySmbTemporalSelectedXfb(rendering.temporalSelectedXfb);
+  verifySmbTemporalPresentedSurfaces(rendering.temporalSelectedXfb);
 }
 
 async function main() {
