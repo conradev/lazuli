@@ -794,6 +794,46 @@ const TEMPLATE: &str = r##"<!doctype html>
     @media (hover: none) {
       .shell[data-surface="release"] .play-controls { opacity: 0.9; }
     }
+
+    body[data-compositor-capture="enabled"] .shell {
+      position: fixed;
+      inset: 0;
+      display: block;
+      width: 100%;
+      max-width: none;
+      height: 100dvh;
+      min-height: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      isolation: isolate;
+    }
+
+    body[data-compositor-capture="enabled"] .shell > header,
+    body[data-compositor-capture="enabled"] .shell > .play-controls,
+    body[data-compositor-capture="enabled"] .shell > details,
+    body[data-compositor-capture="enabled"] .shell > footer {
+      display: none !important;
+    }
+
+    body[data-compositor-capture="enabled"] .stage {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
+    }
+
+    body[data-compositor-capture="enabled"] #display {
+      width: auto;
+      height: auto;
+      max-width: none;
+      max-height: none;
+      aspect-ratio: auto;
+      object-fit: fill;
+    }
   </style>
 </head>
 <body>
@@ -9308,6 +9348,331 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererWorkerStartedAt = performance.now();
     const temporalSelectedXfbCapacity = 8;
     let temporalSelectedXfbFrames = [];
+    function compositorCaptureOptIn(search) {
+      const params = new URLSearchParams(search);
+      const captureValues = params.getAll("compositorCapture");
+      if (captureValues.length === 0) return false;
+      const scenarioValues = params.getAll("scenario");
+      const headlessRunValues = params.getAll("headlessRun");
+      if (
+        captureValues.length !== 1
+        || captureValues[0] !== "1"
+        || scenarioValues.length !== 1
+        || scenarioValues[0] !== "smb-ready-play"
+        || headlessRunValues.length !== 1
+        || headlessRunValues[0].length === 0
+      ) {
+        throw new Error(
+          "compositor capture requires exactly one non-empty headlessRun with "
+          + "scenario=smb-ready-play&compositorCapture=1"
+        );
+      }
+      return true;
+    }
+    const compositorCaptureEnabled = compositorCaptureOptIn(location.search);
+    const compositorCaptureTimeoutMs = 60_000;
+    let compositorCaptureWorkerEpoch = 0;
+    let compositorCaptureSequence = 0;
+    let activeCompositorCapture = null;
+    let acknowledgedCompositorCaptureToken = null;
+
+    function freezeCompositorGeometry(canvas, viewport, visual) {
+      return Object.freeze({
+        canvas: Object.freeze({ ...canvas }),
+        viewport: Object.freeze({
+          ...viewport,
+          visual: Object.freeze({ ...visual }),
+        }),
+      });
+    }
+    function captureCompositorGeometry() {
+      if (
+        document.visibilityState !== "visible"
+        || !display.isConnected
+        || globalThis.visualViewport === null
+        || globalThis.visualViewport === undefined
+      ) {
+        throw new Error("compositor capture requires a visible connected canvas");
+      }
+      const rect = display.getBoundingClientRect();
+      const visualViewport = globalThis.visualViewport;
+      const canvas = {
+        bufferWidth: Number(display.width),
+        bufferHeight: Number(display.height),
+        left: Number(rect.left),
+        top: Number(rect.top),
+        right: Number(rect.right),
+        bottom: Number(rect.bottom),
+        width: Number(rect.width),
+        height: Number(rect.height),
+      };
+      const viewport = {
+        width: Number(globalThis.innerWidth),
+        height: Number(globalThis.innerHeight),
+        devicePixelRatio: Number(globalThis.devicePixelRatio),
+        scrollX: Number(globalThis.scrollX),
+        scrollY: Number(globalThis.scrollY),
+      };
+      const visual = {
+        offsetLeft: Number(visualViewport.offsetLeft),
+        offsetTop: Number(visualViewport.offsetTop),
+        pageLeft: Number(visualViewport.pageLeft),
+        pageTop: Number(visualViewport.pageTop),
+        width: Number(visualViewport.width),
+        height: Number(visualViewport.height),
+        scale: Number(visualViewport.scale),
+      };
+      const finite = [
+        ...Object.values(canvas),
+        ...Object.values(viewport),
+        ...Object.values(visual),
+      ].every(Number.isFinite);
+      if (
+        !finite
+        || !Number.isSafeInteger(canvas.bufferWidth)
+        || !Number.isSafeInteger(canvas.bufferHeight)
+        || canvas.bufferWidth <= 0
+        || canvas.bufferHeight <= 0
+        || !Number.isSafeInteger(canvas.width)
+        || !Number.isSafeInteger(canvas.height)
+        || canvas.width !== canvas.bufferWidth
+        || canvas.height !== canvas.bufferHeight
+        || canvas.width <= 0
+        || canvas.height <= 0
+        || viewport.width <= 0
+        || viewport.height <= 0
+        || viewport.devicePixelRatio <= 0
+        || visual.width <= 0
+        || visual.height <= 0
+        || visual.scale <= 0
+      ) {
+        throw new Error("compositor capture geometry is invalid");
+      }
+      return freezeCompositorGeometry(canvas, viewport, visual);
+    }
+    function compositorGeometryEqual(left, right) {
+      return JSON.stringify(left) === JSON.stringify(right);
+    }
+    function compositorCaptureProvenance(capture) {
+      const surface = capture?.presentedSurface;
+      const presentation = capture?.presentation;
+      const rendererSequence = Number(capture?.rendererSequence);
+      const presentationSerial = Number(surface?.presentationSerial);
+      const ordinal = Number(capture?.ordinal);
+      const generation = Number(surface?.generation);
+      const row = Number(surface?.row);
+      const width = Number(surface?.width);
+      const height = Number(surface?.height);
+      if (
+        capture?.scenario !== "smb-ready-play"
+        || capture?.step !== "post-play-presented"
+        || presentation?.selected !== true
+        || typeof surface?.address !== "string"
+        || !/^0x[0-9a-f]{8}$/.test(surface.address)
+        || surface.address !== presentation?.address
+        || generation !== Number(presentation?.copyIndex)
+        || row !== Number(presentation?.copyRow)
+        || width !== Number(presentation?.width)
+        || height !== Number(presentation?.height)
+        || !Number.isSafeInteger(ordinal)
+        || ordinal < 1
+        || ordinal > temporalSelectedXfbCapacity
+        || !Number.isSafeInteger(rendererSequence)
+        || rendererSequence < 1
+        || !Number.isSafeInteger(presentationSerial)
+        || presentationSerial < 1
+        || !Number.isSafeInteger(generation)
+        || generation < 1
+        || !Number.isSafeInteger(row)
+        || row < 0
+        || row > 1
+        || !Number.isSafeInteger(width)
+        || width <= 0
+        || width > 1024
+        || !Number.isSafeInteger(height)
+        || height <= 0
+        || height > 1024
+      ) {
+        throw new Error("compositor capture provenance is invalid");
+      }
+      return {
+        scenario: capture.scenario,
+        step: capture.step,
+        ordinal,
+        rendererSequence,
+        presentationSerial,
+        address: surface.address,
+        generation,
+        row,
+        width,
+        height,
+      };
+    }
+    function finishCompositorCapture(active, error = null) {
+      if (active.settled) return false;
+      active.settled = true;
+      clearTimeout(active.timeoutId);
+      if (active.animationFrameId !== null) {
+        cancelAnimationFrame(active.animationFrameId);
+        active.animationFrameId = null;
+      }
+      if (activeCompositorCapture === active) activeCompositorCapture = null;
+      if (error === null) active.resolve(active.descriptor);
+      else active.reject(error);
+      return true;
+    }
+    function failCompositorCapture(message) {
+      const error = message instanceof Error ? message : new Error(String(message));
+      acknowledgedCompositorCaptureToken = null;
+      if (activeCompositorCapture !== null) {
+        finishCompositorCapture(activeCompositorCapture, error);
+      }
+      return error;
+    }
+    function resetCompositorCaptureForWorker(replacingWorker) {
+      compositorCaptureWorkerEpoch += 1;
+      compositorCaptureSequence = 0;
+      acknowledgedCompositorCaptureToken = null;
+      if (activeCompositorCapture !== null) {
+        finishCompositorCapture(
+          activeCompositorCapture,
+          new Error(replacingWorker
+            ? "compositor capture cancelled by worker replacement"
+            : "compositor capture cancelled by worker reset")
+        );
+      }
+    }
+    function buildCompositorCaptureDescriptor(provenance, geometry) {
+      compositorCaptureSequence += 1;
+      const token = [
+        "lazuli-compositor-v1",
+        compositorCaptureWorkerEpoch,
+        compositorCaptureSequence,
+        provenance.rendererSequence,
+        provenance.presentationSerial,
+        crypto.randomUUID(),
+      ].join(":");
+      return Object.freeze({
+        protocol: "lazuli-compositor-capture-v1",
+        token,
+        ...provenance,
+        geometry,
+      });
+    }
+    function waitForCompositorCapture(capture, sourceWorker) {
+      if (!compositorCaptureEnabled) return Promise.resolve(null);
+      if (activeCompositorCapture !== null) {
+        const error = failCompositorCapture("duplicate compositor capture request");
+        return Promise.reject(error);
+      }
+      const provenance = compositorCaptureProvenance(capture);
+      acknowledgedCompositorCaptureToken = null;
+      return new Promise((resolve, reject) => {
+        const active = {
+          acknowledged: false,
+          animationFrameId: null,
+          descriptor: null,
+          firstGeometry: null,
+          reject,
+          resolve,
+          settled: false,
+          sourceWorker,
+          timeoutId: null,
+          workerEpoch: compositorCaptureWorkerEpoch,
+        };
+        activeCompositorCapture = active;
+        const ensureCurrent = () => {
+          if (
+            activeCompositorCapture !== active
+            || active.workerEpoch !== compositorCaptureWorkerEpoch
+            || worker !== sourceWorker
+          ) {
+            throw new Error("compositor capture worker was replaced");
+          }
+          if (document.visibilityState !== "visible") {
+            throw new Error("compositor capture document became hidden");
+          }
+        };
+        const fail = error => {
+          acknowledgedCompositorCaptureToken = null;
+          finishCompositorCapture(active, error);
+        };
+        active.timeoutId = setTimeout(() => {
+          fail(new Error("compositor capture acknowledgement timed out"));
+        }, compositorCaptureTimeoutMs);
+        active.animationFrameId = requestAnimationFrame(() => {
+          active.animationFrameId = null;
+          try {
+            ensureCurrent();
+            active.firstGeometry = captureCompositorGeometry();
+          } catch (error) {
+            fail(error);
+            return;
+          }
+          active.animationFrameId = requestAnimationFrame(() => {
+            active.animationFrameId = null;
+            try {
+              ensureCurrent();
+              const geometry = captureCompositorGeometry();
+              if (!compositorGeometryEqual(active.firstGeometry, geometry)) {
+                throw new Error("compositor capture geometry changed between animation frames");
+              }
+              active.descriptor = buildCompositorCaptureDescriptor(provenance, geometry);
+            } catch (error) {
+              fail(error);
+            }
+          });
+        });
+      });
+    }
+    function pendingCompositorCapture() {
+      return activeCompositorCapture?.descriptor ?? null;
+    }
+    function acknowledgeCompositorCapture(token) {
+      if (!compositorCaptureEnabled) {
+        throw new Error("compositor capture is not enabled");
+      }
+      const active = activeCompositorCapture;
+      if (active === null) {
+        if (
+          typeof token === "string"
+          && acknowledgedCompositorCaptureToken !== null
+          && token === acknowledgedCompositorCaptureToken
+        ) return true;
+        throw new Error("no compositor capture is pending");
+      }
+      if (
+        document.visibilityState !== "visible"
+        || active.descriptor === null
+        || typeof token !== "string"
+        || token !== active.descriptor.token
+      ) {
+        const error = failCompositorCapture("invalid compositor capture acknowledgement");
+        throw error;
+      }
+      if (active.acknowledged) return true;
+      active.acknowledged = true;
+      acknowledgedCompositorCaptureToken = token;
+      finishCompositorCapture(active);
+      return true;
+    }
+    if (compositorCaptureEnabled) {
+      document.body.dataset.compositorCapture = "enabled";
+      Object.defineProperty(globalThis, "lazuliCompositorCapture", {
+        configurable: false,
+        enumerable: true,
+        value: Object.freeze({
+          acknowledge: acknowledgeCompositorCapture,
+          pending: pendingCompositorCapture,
+        }),
+        writable: false,
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") {
+          failCompositorCapture("compositor capture document became hidden");
+        }
+      });
+    }
     function resetRendererHostMetrics() {
       rendererHostMetrics = newRendererHostMetrics();
       rendererWorkerStartedAt = performance.now();
@@ -9802,6 +10167,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function startWorker(discConfig, label) {
       const replacingWorker = worker !== null;
+      resetCompositorCaptureForWorker(replacingWorker);
       controllerScenarioState = null;
       if (replacingWorker) {
         worker.terminate();
@@ -10338,7 +10704,17 @@ const TEMPLATE: &str = r##"<!doctype html>
           await drainWebGpuRenderer();
           if (!isCurrentWorker()) return { ok: false, value: null };
           if (message.frame?.temporalXfbCapture !== undefined) {
-            await captureTemporalSelectedXfb(message, value, temporalFrames);
+            const temporalCapture = await captureTemporalSelectedXfb(
+              message,
+              value,
+              temporalFrames
+            );
+            if (
+              typeof compositorCaptureEnabled !== "undefined"
+              && compositorCaptureEnabled
+            ) {
+              await waitForCompositorCapture(temporalCapture, sourceWorker);
+            }
             if (!isCurrentWorker()) return { ok: false, value: null };
           }
           if (Number.isSafeInteger(rendererSequence)) {
@@ -10497,6 +10873,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
     addEventListener("beforeunload", () => {
+      failCompositorCapture("compositor capture cancelled by document unload");
       worker?.terminate();
       if (workerUrl !== null) URL.revokeObjectURL(workerUrl);
     }, { once: true });
