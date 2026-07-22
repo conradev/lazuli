@@ -1224,7 +1224,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const residentTextureKeys = rendererFramesInFlight.size === 0
         ? rendererResidentTextureKeys
         : null;
-      const packet = packGxFramePacketV1(copyKind, frame, residentTextureKeys);
+      const packet = packGxFramePacketV2(copyKind, frame, residentTextureKeys);
       postRendererFrame("gx-frame", { packet, diagnostics }, [packet]);
     }
 
@@ -1305,12 +1305,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       return wrapS | (wrapT << 2) | (magFilter << 4) | (minFilter << 5);
     }
 
-    // LZGX v1 is the deterministic Worker-to-renderer boundary. The packet is
+    // LZGX v2 is the deterministic Worker-to-renderer boundary. The packet is
     // deliberately self-contained: one transferable ArrayBuffer, fixed-size
     // little-endian records, and byte sections whose padding is always zero.
     // Textures are emitted in first-use draw/slot order and referenced by
     // table index so repeated TEV bindings do not duplicate pixel payloads.
-    function packGxFramePacketV1(copyKind, frame, residentTextureKeys = null) {
+    function packGxFramePacketV2(copyKind, frame, residentTextureKeys = null) {
       copyKind = gxFramePacketInteger(copyKind, "copyKind", 2);
       if (copyKind !== 1 && copyKind !== 2) {
         throw new RangeError("GX frame packet copyKind must be 1 or 2");
@@ -1617,7 +1617,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       const tevBytes = gxFramePacketMultiply(drawCount, 464, "tevBytes");
       pixelBytes = gxFramePacketAlign16(pixelBytes, "pixelBytes");
-      const drawTableOffset = 128;
+      const drawTableOffset = 160;
       const textureTableOffset = gxFramePacketAdd(
         drawTableOffset,
         drawTableBytes,
@@ -1668,20 +1668,82 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (typeof frame.clear !== "boolean") {
         throw new TypeError("GX frame packet frame.clear must be boolean");
       }
-      const clearColor = frame.clearColor;
-      if (clearColor === null || clearColor === undefined || clearColor.length !== 4) {
-        throw new RangeError("GX frame packet frame.clearColor must have four bytes");
+      const copyState = frame.copyState;
+      if (copyState === null || typeof copyState !== "object") {
+        throw new TypeError("GX frame packet frame.copyState must be an object");
       }
-      const rgba = Array.from(clearColor, (component, index) =>
-        gxFramePacketInteger(component, `frame.clearColor[${index}]`, 0xff)
+      const clearRgba = copyState.clearRgba;
+      if (clearRgba === null || clearRgba === undefined || clearRgba.length !== 4) {
+        throw new RangeError(
+          "GX frame packet frame.copyState.clearRgba must have four bytes"
+        );
+      }
+      const rgba = Array.from(clearRgba, (component, index) =>
+        gxFramePacketInteger(
+          component,
+          `frame.copyState.clearRgba[${index}]`,
+          0xff
+        )
       );
+      const terminalZMode = gxFramePacketInteger(
+        copyState.zMode,
+        "frame.copyState.zMode",
+        0x00ffffff
+      );
+      const terminalBlendMode = gxFramePacketInteger(
+        copyState.blendMode,
+        "frame.copyState.blendMode",
+        0x00ffffff
+      );
+      const pixelControl = gxFramePacketInteger(
+        copyState.pixelControl,
+        "frame.copyState.pixelControl",
+        0x00ffffff
+      );
+      const copyCommand = gxFramePacketInteger(
+        copyState.copyCommand,
+        "frame.copyState.copyCommand",
+        0x00ffffff
+      );
+      const clearDepth = gxFramePacketInteger(
+        copyState.clearDepth,
+        "frame.copyState.clearDepth",
+        0x00ffffff
+      );
+      const copyScale = gxFramePacketInteger(
+        copyState.copyScale,
+        "frame.copyState.copyScale",
+        0x00ffffff
+      );
+      const copyFilter = copyState.copyFilter;
+      if (copyFilter === null || copyFilter === undefined || copyFilter.length !== 2) {
+        throw new RangeError(
+          "GX frame packet frame.copyState.copyFilter must have two registers"
+        );
+      }
+      const copyFilter0 = gxFramePacketInteger(
+        copyFilter[0],
+        "frame.copyState.copyFilter[0]",
+        0x00ffffff
+      );
+      const copyFilter1 = gxFramePacketInteger(
+        copyFilter[1],
+        "frame.copyState.copyFilter[1]",
+        0x00ffffff
+      );
+      if (frame.clear !== ((copyCommand & 0x0800) !== 0)) {
+        throw new Error("GX frame packet clear flag conflicts with copy command");
+      }
+      if ((copyKind === 2) !== ((copyCommand & 0x4000) !== 0)) {
+        throw new Error("GX frame packet copyKind conflicts with copy command");
+      }
 
       const packet = new ArrayBuffer(packetBytes);
       const bytes = new Uint8Array(packet);
       const header = new DataView(packet);
       bytes.set([0x4c, 0x5a, 0x47, 0x58], 0x00);
-      header.setUint16(0x04, 1, true);
-      header.setUint16(0x06, 128, true);
+      header.setUint16(0x04, 2, true);
+      header.setUint16(0x06, 160, true);
       header.setUint32(0x08, packetBytes, true);
       header.setUint32(0x0c, 0, true);
       header.setUint32(0x10, copyKind, true);
@@ -1713,6 +1775,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       header.setUint16(0x78, 128, true);
       header.setUint16(0x7a, 64, true);
       header.setUint32(0x7c, totalVertexCount, true);
+      header.setUint32(0x80, terminalZMode, true);
+      header.setUint32(0x84, terminalBlendMode, true);
+      header.setUint32(0x88, pixelControl, true);
+      header.setUint32(0x8c, copyCommand, true);
+      header.setUint32(0x90, clearDepth, true);
+      header.setUint32(0x94, copyScale, true);
+      header.setUint32(0x98, copyFilter0, true);
+      header.setUint32(0x9c, copyFilter1, true);
 
       for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
         const draw = normalizedDraws[drawIndex];
@@ -5304,6 +5374,24 @@ const TEMPLATE: &str = r##"<!doctype html>
       const copyToXfb = (trigger & 0x4000) !== 0;
       const viTop = viXfbAddress(0x201c);
       const viBottom = viXfbAddress(0x2024);
+      const copyState = {
+        zMode: gxBpRegisters[0x40] >>> 0,
+        blendMode: gxBpRegisters[0x41] >>> 0,
+        pixelControl: gxBpRegisters[0x43] >>> 0,
+        copyCommand: trigger >>> 0,
+        clearRgba: [
+          gxBpRegisters[0x4f] & 0xff,
+          (gxBpRegisters[0x50] >>> 8) & 0xff,
+          gxBpRegisters[0x50] & 0xff,
+          (gxBpRegisters[0x4f] >>> 8) & 0xff,
+        ],
+        clearDepth: gxBpRegisters[0x51] >>> 0,
+        copyScale: yScaleRaw >>> 0,
+        copyFilter: [
+          gxBpRegisters[0x53] >>> 0,
+          gxBpRegisters[0x54] >>> 0,
+        ],
+      };
       const frame = {
         index: copyToXfb ? gxXfbCopyCount + 1 : gxTextureCopyCount + 1,
         capturedAtCycle: cycles,
@@ -5318,12 +5406,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         stride: (gxBpRegisters[0x4d] << 5) >>> 0,
         copyToXfb,
         clear: (trigger & 0x0800) !== 0,
-        clearColor: [
-          gxBpRegisters[0x4f] & 0xff,
-          (gxBpRegisters[0x50] >>> 8) & 0xff,
-          gxBpRegisters[0x50] & 0xff,
-          (gxBpRegisters[0x4f] >>> 8) & 0xff,
-        ],
+        clearColor: copyState.clearRgba,
+        copyState,
         geometry: {
           drawCalls: gxFrameDraws.length,
           vertices: gxFrameDrawVertices,
@@ -5331,10 +5415,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
       };
       frame.displayed = false;
+      const frameDiagnostics = { ...frame };
+      delete frameDiagnostics.copyState;
       if (copyToXfb) {
         gxXfbCopyCount += 1;
         gxXfbCopies.push({
-          ...frame,
+          ...frameDiagnostics,
           captured: gxCollectFrameGeometry,
           geometry: {
             drawCalls: frame.geometry.drawCalls,
@@ -5367,7 +5453,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
         const boundAsTexture = gxTextureCopyIsBound(frame.destination);
         gxTextureCopies.push({
-          ...frame,
+          ...frameDiagnostics,
           boundAsTexture,
           captured: collectedGeometry,
           geometry: {

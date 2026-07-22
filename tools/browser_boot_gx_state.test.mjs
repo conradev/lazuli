@@ -35,7 +35,7 @@ const packetFunctions = [
   "gxFramePacketEqualBytes",
   "gxFramePacketKeyBytes",
   "gxFramePacketSampler",
-  "packGxFramePacketV1",
+  "packGxFramePacketV2",
 ];
 
 function packetContext() {
@@ -86,6 +86,16 @@ function packetFrame(draws) {
     stride: 1280,
     clear: false,
     clearColor: [0, 0, 0, 0],
+    copyState: {
+      zMode: 0,
+      blendMode: 0,
+      pixelControl: 0,
+      copyCommand: 0x4000,
+      clearRgba: [0, 0, 0, 0],
+      clearDepth: 0,
+      copyScale: 0,
+      copyFilter: [0, 0],
+    },
     geometry: { drawCalls: draws.length, vertices, draws },
   };
 }
@@ -179,6 +189,92 @@ test("applies independent GX X/Y scissor offsets and clips to the EFB", () => {
   assert.equal(clipped.scissorHeight, 8);
 });
 
+test("copy commands snapshot complete terminal PE state for LZGX packets", () => {
+  const bp = new Uint32Array(256);
+  bp[0x40] = 0x010203;
+  bp[0x41] = 0x040506;
+  bp[0x43] = 0x070809;
+  bp[0x49] = 2 | (3 << 10);
+  bp[0x4a] = 319 | (239 << 10);
+  bp[0x4b] = 0x123400 >>> 5;
+  bp[0x4d] = 1280 >>> 5;
+  bp[0x4e] = 0x000100;
+  bp[0x4f] = 0x004411;
+  bp[0x50] = 0x002233;
+  bp[0x51] = 0x0a0b0c;
+  bp[0x53] = 0x101112;
+  bp[0x54] = 0x131415;
+  bp[0xfe] = 0x00ffffff;
+  const capturedFrames = [];
+  const textureCopies = [];
+  const memory = new ArrayBuffer(0x4000);
+  const copyContext = {
+    Array,
+    Math,
+    Number,
+    Set,
+    cycles: 100,
+    deviceEvents: new Map(),
+    gxBpLoads: 0,
+    gxBpRegisters: bp,
+    gxCollectFrameGeometry: true,
+    gxFrameDraws: [],
+    gxFrameDrawVertices: 0,
+    gxFrameSkippedPrimitives: 0,
+    gxSkippedFrameClearColor: null,
+    gxLoadTlut() { assert.fail("unexpected TLUT load"); },
+    gxMarkTextureCopyConsumer() { assert.fail("unexpected texture consumer"); },
+    gxPrearmTextureCopyProducer() { assert.fail("unexpected texture producer"); },
+    gxRecordTextureCopyGeneration() {},
+    gxShouldCollectNextXfb() { return false; },
+    gxTextureCopyConsumers: new Set(),
+    gxTextureCopyCount: 0,
+    gxTextureCopyFramesPresented: 0,
+    gxTextureCopies: textureCopies,
+    gxTextureCopyIsBound() { return false; },
+    mmio: 0,
+    peFinishCycle: null,
+    peFinishSignal: false,
+    peTokenInterruptDelivered: false,
+    peTokenSignal: false,
+    peTokenValue: 0,
+    postGxFrame(copyKind, frame) { capturedFrames.push({ copyKind, frame }); },
+    postMessage() { assert.fail("unexpected renderer message"); },
+    viXfbAddress() { return 0; },
+    view: new DataView(memory),
+  };
+  vm.createContext(copyContext);
+  vm.runInContext(
+    extractFunction("recordGxBpWrite"),
+    copyContext,
+    { filename: "browser_boot.gx-copy-state.js" },
+  );
+
+  copyContext.recordGxBpWrite(((0x52 << 24) | 0x000800) >>> 0);
+
+  const expected = {
+    zMode: 0x010203,
+    blendMode: 0x040506,
+    pixelControl: 0x070809,
+    copyCommand: 0x000800,
+    clearRgba: [0x11, 0x22, 0x33, 0x44],
+    clearDepth: 0x0a0b0c,
+    copyScale: 0x000100,
+    copyFilter: [0x101112, 0x131415],
+  };
+  assert.equal(capturedFrames.length, 1);
+  assert.equal(capturedFrames[0].copyKind, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(capturedFrames[0].frame.copyState)),
+    expected,
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(textureCopies[0].clearColor)),
+    expected.clearRgba,
+  );
+  assert.equal(JSON.stringify(textureCopies[0]).includes('"copyState"'), false);
+});
+
 test("preserves homogeneous W for WebGPU clipping and interpolation", () => {
   gxBpRegisters.fill(0);
   gxXfRegisters.fill(0);
@@ -230,7 +326,7 @@ test("packs each draw's GX pipeline and f32 vertices into its canonical record",
     { length: 36 },
     (_unused, index) => index - 4.5,
   );
-  const buffer = packet.packGxFramePacketV1(2, packetFrame([{
+  const buffer = packet.packGxFramePacketV2(2, packetFrame([{
     topology: 2,
     vertices,
     tevState: tevStateForMap(),
@@ -248,9 +344,9 @@ test("packs each draw's GX pipeline and f32 vertices into its canonical record",
   }]));
   const bytes = new Uint8Array(buffer);
   const view = new DataView(buffer);
-  const draw = 128;
+  const draw = 160;
 
-  assert.equal(buffer.byteLength, 864);
+  assert.equal(buffer.byteLength, 896);
   assert.equal(bytes[draw], 2);
   assert.equal(bytes[draw + 1], 1);
   assert.equal(view.getUint32(draw + 0x04, true), 1);
@@ -268,7 +364,7 @@ test("packs each draw's GX pipeline and f32 vertices into its canonical record",
     assert.equal(view.getUint32(draw + 0x34 + map * 8, true), 0);
   }
   const vertexOffset = view.getUint32(0x28, true);
-  assert.equal(vertexOffset, 720);
+  assert.equal(vertexOffset, 752);
   assert.equal(view.getFloat32(vertexOffset, true), -4.5);
   assert.equal(view.getFloat32(vertexOffset + 35 * 4, true), 30.5);
 });
@@ -284,7 +380,7 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
     height: 1,
     pixels,
   };
-  const buffer = packet.packGxFramePacketV1(2, packetFrame([
+  const buffer = packet.packGxFramePacketV2(2, packetFrame([
     {
       topology: 2,
       vertices: new Float32Array(36),
@@ -311,8 +407,8 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
     },
   ]));
   const view = new DataView(buffer);
-  const firstDraw = 128;
-  const secondDraw = 256;
+  const firstDraw = 160;
+  const secondDraw = 288;
   const textureTable = view.getUint32(0x20, true);
 
   assert.equal(view.getUint32(0x14, true), 2);

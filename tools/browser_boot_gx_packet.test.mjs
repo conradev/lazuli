@@ -39,7 +39,7 @@ const packetFunctions = [
   "gxFramePacketEqualBytes",
   "gxFramePacketKeyBytes",
   "gxFramePacketSampler",
-  "packGxFramePacketV1",
+  "packGxFramePacketV2",
 ];
 
 function packetContext() {
@@ -64,6 +64,19 @@ function packetContext() {
   return context;
 }
 
+function copyState(copyCommand) {
+  return {
+    zMode: 0x010203,
+    blendMode: 0x040506,
+    pixelControl: 0x070809,
+    copyCommand,
+    clearRgba: [0x11, 0x22, 0x33, 0x44],
+    clearDepth: 0x0a0b0c,
+    copyScale: 0x0d0e0f,
+    copyFilter: [0x101112, 0x131415],
+  };
+}
+
 function emptyTextureFrame() {
   return {
     copyToXfb: false,
@@ -77,6 +90,7 @@ function emptyTextureFrame() {
     stride: 777,
     clear: true,
     clearColor: [0x11, 0x22, 0x33, 0x44],
+    copyState: copyState(0x000800),
     geometry: { drawCalls: 0, vertices: 0, draws: [] },
   };
 }
@@ -151,6 +165,7 @@ function representativeXfbFrame() {
     stride: 1280,
     clear: true,
     clearColor: [0x11, 0x22, 0x33, 0x44],
+    copyState: copyState(0x004800),
     geometry: {
       drawCalls: 2,
       vertices: 3,
@@ -210,46 +225,47 @@ function fnv1a64(packet) {
   return hash.toString(16).padStart(16, "0");
 }
 
-test("packs the exact canonical empty LZGX v1 vector", () => {
+test("packs the exact canonical empty LZGX v2 vector", () => {
   const context = packetContext();
-  const packet = context.packGxFramePacketV1(1, emptyTextureFrame());
+  const packet = context.packGxFramePacketV2(1, emptyTextureFrame());
 
-  assert.equal(packet.byteLength, 128);
+  assert.equal(packet.byteLength, 160);
   assert.equal(
     packetBytes(packet).toString("hex"),
-    "4c5a475801008000800000000000000001000000000000000000000080000000"
-      + "8000000080000000800000008000000080000000000000000000000000000000"
+    "4c5a47580200a000a000000000000000010000000000000000000000a0000000"
+      + "a0000000a0000000a0000000a0000000a0000000000000000000000000000000"
       + "0000000000000000000000000100000002000000030000000400000000000000"
-      + "0000000000001000000000000700000001000000112233448000400000000000",
+      + "0000000000001000000000000700000001000000112233448000400000000000"
+      + "030201000605040009080700000800000c0b0a000f0e0d001211100015141300",
   );
   assert.equal(
     digest(packet),
-    "32539069280f1de32c9992c5772b7ee8ce86169517b871c658cfa4836cf0bccd",
+    "64f0577ef71c13f25212adfc281117a3d43e008dd3aba23f53179b04e90c4b8f",
   );
-  assert.equal(fnv1a64(packet), "7fee704bf65b620a");
+  assert.equal(fnv1a64(packet), "15e467b097830cca");
 });
 
 test("packs deterministic first-use texture tables and aligned payload sections", () => {
   const context = packetContext();
   const frame = representativeXfbFrame();
-  const first = context.packGxFramePacketV1(2, frame);
-  const second = context.packGxFramePacketV1(2, representativeXfbFrame());
+  const first = context.packGxFramePacketV2(2, frame);
+  const second = context.packGxFramePacketV2(2, representativeXfbFrame());
   const bytes = new Uint8Array(first);
   const view = new DataView(first);
 
   assert.deepEqual([...bytes.subarray(0, 4)], [0x4c, 0x5a, 0x47, 0x58]);
-  assert.equal(view.getUint16(0x04, true), 1);
-  assert.equal(view.getUint16(0x06, true), 128);
-  assert.equal(view.getUint32(0x08, true), 1920);
+  assert.equal(view.getUint16(0x04, true), 2);
+  assert.equal(view.getUint16(0x06, true), 160);
+  assert.equal(view.getUint32(0x08, true), 1952);
   assert.equal(view.getUint32(0x10, true), 2);
   assert.equal(view.getUint32(0x14, true), 2);
   assert.equal(view.getUint32(0x18, true), 2);
-  assert.equal(view.getUint32(0x1c, true), 128);
-  assert.equal(view.getUint32(0x20, true), 384);
-  assert.equal(view.getUint32(0x24, true), 512);
-  assert.equal(view.getUint32(0x28, true), 1440);
-  assert.equal(view.getUint32(0x2c, true), 1872);
-  assert.equal(view.getUint32(0x30, true), 1888);
+  assert.equal(view.getUint32(0x1c, true), 160);
+  assert.equal(view.getUint32(0x20, true), 416);
+  assert.equal(view.getUint32(0x24, true), 544);
+  assert.equal(view.getUint32(0x28, true), 1472);
+  assert.equal(view.getUint32(0x2c, true), 1904);
+  assert.equal(view.getUint32(0x30, true), 1920);
   assert.equal(view.getUint32(0x34, true), 256);
   assert.equal(view.getUint32(0x38, true), 128);
   assert.equal(view.getUint32(0x3c, true), 928);
@@ -270,8 +286,16 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.equal(view.getUint16(0x78, true), 128);
   assert.equal(view.getUint16(0x7a, true), 64);
   assert.equal(view.getUint32(0x7c, true), 3);
+  assert.equal(view.getUint32(0x80, true), 0x010203);
+  assert.equal(view.getUint32(0x84, true), 0x040506);
+  assert.equal(view.getUint32(0x88, true), 0x070809);
+  assert.equal(view.getUint32(0x8c, true), 0x004800);
+  assert.equal(view.getUint32(0x90, true), 0x0a0b0c);
+  assert.equal(view.getUint32(0x94, true), 0x0d0e0f);
+  assert.equal(view.getUint32(0x98, true), 0x101112);
+  assert.equal(view.getUint32(0x9c, true), 0x131415);
 
-  const firstDraw = 128;
+  const firstDraw = 160;
   assert.equal(bytes[firstDraw], 2);
   assert.equal(bytes[firstDraw + 1], 2);
   assert.equal(view.getUint32(firstDraw + 0x04, true), 2);
@@ -284,7 +308,7 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.equal(view.getUint32(firstDraw + 0x40, true), 1);
   assert.equal(view.getUint32(firstDraw + 0x44, true), 0xe3);
 
-  const secondDraw = 256;
+  const secondDraw = 288;
   assert.equal(view.getUint32(secondDraw + 0x04, true), 1);
   assert.equal(view.getUint32(secondDraw + 0x08, true), 288);
   assert.equal(view.getUint32(secondDraw + 0x0c, true), 464);
@@ -292,7 +316,7 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.equal(view.getUint32(secondDraw + 0x38, true), 0);
   assert.equal(view.getUint32(secondDraw + 0x3c, true), 0x2e);
 
-  const firstTexture = 384;
+  const firstTexture = 416;
   assert.equal(view.getUint32(firstTexture + 0x00, true), 0);
   assert.equal(view.getUint32(firstTexture + 0x04, true), 5);
   assert.equal(view.getUint32(firstTexture + 0x08, true), 0);
@@ -302,7 +326,7 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.equal(view.getUint32(firstTexture + 0x18, true), 2);
   assert.equal(view.getUint32(firstTexture + 0x1c, true), 1);
   assert.equal(view.getUint32(firstTexture + 0x20, true), 1);
-  const secondTexture = 448;
+  const secondTexture = 480;
   assert.equal(view.getUint32(secondTexture + 0x00, true), 5);
   assert.equal(view.getUint32(secondTexture + 0x04, true), 2);
   assert.equal(view.getUint32(secondTexture + 0x08, true), 16);
@@ -313,21 +337,21 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.equal(view.getUint32(secondTexture + 0x1c, true), 1);
   assert.equal(view.getUint32(secondTexture + 0x20, true), 1);
 
-  assert.equal(view.getUint32(1440, true), 0xc0080000);
-  assert.equal(view.getUint32(1440 + 288, true), 0x42000000);
+  assert.equal(view.getUint32(1472, true), 0xc0080000);
+  assert.equal(view.getUint32(1472 + 288, true), 0x42000000);
 
-  assert.equal(new TextDecoder().decode(bytes.subarray(1872, 1879)), "alphaβ");
-  assert.deepEqual([...bytes.subarray(1879, 1888)], Array(9).fill(0));
-  assert.deepEqual([...bytes.subarray(1888, 1896)], [1, 2, 3, 4, 5, 6, 7, 8]);
-  assert.deepEqual([...bytes.subarray(1896, 1904)], Array(8).fill(0));
-  assert.deepEqual([...bytes.subarray(1904, 1908)], [0xfa, 0xfb, 0xfc, 0xfd]);
-  assert.deepEqual([...bytes.subarray(1908, 1920)], Array(12).fill(0));
+  assert.equal(new TextDecoder().decode(bytes.subarray(1904, 1911)), "alphaβ");
+  assert.deepEqual([...bytes.subarray(1911, 1920)], Array(9).fill(0));
+  assert.deepEqual([...bytes.subarray(1920, 1928)], [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.deepEqual([...bytes.subarray(1928, 1936)], Array(8).fill(0));
+  assert.deepEqual([...bytes.subarray(1936, 1940)], [0xfa, 0xfb, 0xfc, 0xfd]);
+  assert.deepEqual([...bytes.subarray(1940, 1952)], Array(12).fill(0));
   assert.deepEqual(packetBytes(first), packetBytes(second));
   assert.equal(
     digest(first),
-    "60441ebbaa5c911e3af57da069b76dae8bff1b31be7945b011790444087f770f",
+    "c2b2339d6064e30e0d7418abada51617f8d2d2ccdc2c3e19182af589bdbc9cc9",
   );
-  assert.equal(fnv1a64(first), "699bd0c2be6e8a9f");
+  assert.equal(fnv1a64(first), "30995e12acfe660b");
 });
 
 test("rejects conflicting content for one frame-local texture key", () => {
@@ -335,14 +359,14 @@ test("rejects conflicting content for one frame-local texture key", () => {
   const frame = representativeXfbFrame();
   frame.geometry.draws[1].textures[1].pixels[0] ^= 0xff;
   assert.throws(
-    () => context.packGxFramePacketV1(2, frame),
+    () => context.packGxFramePacketV2(2, frame),
     /texture key "alpha" has conflicting contents/,
   );
 
   const metadataConflict = representativeXfbFrame();
   metadataConflict.geometry.draws[1].textures[1].address += 1;
   assert.throws(
-    () => context.packGxFramePacketV1(2, metadataConflict),
+    () => context.packGxFramePacketV2(2, metadataConflict),
     /texture key "alpha" has conflicting contents/,
   );
 });
@@ -350,42 +374,70 @@ test("rejects conflicting content for one frame-local texture key", () => {
 test("rejects malformed or non-canonical packet inputs", () => {
   const context = packetContext();
   assert.throws(
-    () => context.packGxFramePacketV1(3, emptyTextureFrame()),
+    () => context.packGxFramePacketV2(3, emptyTextureFrame()),
     /copyKind must be 1 or 2|copyKind must be an integer/,
   );
 
   const unsafeGeneration = emptyTextureFrame();
   unsafeGeneration.index = Number.MAX_SAFE_INTEGER + 1;
   assert.throws(
-    () => context.packGxFramePacketV1(1, unsafeGeneration),
+    () => context.packGxFramePacketV2(1, unsafeGeneration),
     /frame.index must be an integer/,
+  );
+
+  const oversizedBpWord = emptyTextureFrame();
+  oversizedBpWord.copyState.zMode = 0x01000000;
+  assert.throws(
+    () => context.packGxFramePacketV2(1, oversizedBpWord),
+    /copyState.zMode must be an integer from 0 through 16777215/,
+  );
+
+  const malformedFilter = emptyTextureFrame();
+  malformedFilter.copyState.copyFilter = [0];
+  assert.throws(
+    () => context.packGxFramePacketV2(1, malformedFilter),
+    /copyState.copyFilter must have two registers/,
+  );
+
+  const clearConflict = emptyTextureFrame();
+  clearConflict.copyState.copyCommand = 0;
+  assert.throws(
+    () => context.packGxFramePacketV2(1, clearConflict),
+    /clear flag conflicts with copy command/,
+  );
+
+  const kindConflict = emptyTextureFrame();
+  kindConflict.copyState.copyCommand |= 0x4000;
+  assert.throws(
+    () => context.packGxFramePacketV2(1, kindConflict),
+    /copyKind conflicts with copy command/,
   );
 
   const wrongVertexBytes = representativeXfbFrame();
   wrongVertexBytes.geometry.draws[0].vertices = new Float32Array(35);
   assert.throws(
-    () => context.packGxFramePacketV1(2, wrongVertexBytes),
+    () => context.packGxFramePacketV2(2, wrongVertexBytes),
     /144 bytes per vertex/,
   );
 
   const wrongTevBytes = representativeXfbFrame();
   wrongTevBytes.geometry.draws[0].tevState = new Uint8Array(463);
   assert.throws(
-    () => context.packGxFramePacketV1(2, wrongTevBytes),
+    () => context.packGxFramePacketV2(2, wrongTevBytes),
     /tevState must be 464 bytes/,
   );
 
   const nonzeroTevPadding = representativeXfbFrame();
   nonzeroTevPadding.geometry.draws[0].tevState[452] = 1;
   assert.throws(
-    () => context.packGxFramePacketV1(2, nonzeroTevPadding),
+    () => context.packGxFramePacketV2(2, nonzeroTevPadding),
     /tevState has nonzero padding/,
   );
 
   const nonzeroInactiveStage = representativeXfbFrame();
   nonzeroInactiveStage.geometry.draws[0].tevState[32] = 1;
   assert.throws(
-    () => context.packGxFramePacketV1(2, nonzeroInactiveStage),
+    () => context.packGxFramePacketV2(2, nonzeroInactiveStage),
     /tevState has nonzero inactive stages/,
   );
 
@@ -393,14 +445,14 @@ test("rejects malformed or non-canonical packet inputs", () => {
   new DataView(invalidSwapChannel.geometry.draws[0].tevState.buffer)
     .setUint32(384, 4, true);
   assert.throws(
-    () => context.packGxFramePacketV1(2, invalidSwapChannel),
+    () => context.packGxFramePacketV2(2, invalidSwapChannel),
     /tevState has invalid swap-table channels/,
   );
 
   const wrongPixelBytes = representativeXfbFrame();
   wrongPixelBytes.geometry.draws[0].textures[0].pixels = new Uint8Array(7);
   assert.throws(
-    () => context.packGxFramePacketV1(2, wrongPixelBytes),
+    () => context.packGxFramePacketV2(2, wrongPixelBytes),
     /pixels must be empty or width \* height \* 4 bytes/,
   );
 
@@ -408,35 +460,35 @@ test("rejects malformed or non-canonical packet inputs", () => {
   oversizedTexture.geometry.draws[0].textures[0].width = 1025;
   oversizedTexture.geometry.draws[1].textures[1].width = 1025;
   assert.throws(
-    () => context.packGxFramePacketV1(2, oversizedTexture),
+    () => context.packGxFramePacketV2(2, oversizedTexture),
     /width must be an integer from 0 through 1024/,
   );
 
   const tooManyTextureSlots = representativeXfbFrame();
   tooManyTextureSlots.geometry.draws[0].textures = Array(9).fill(null);
   assert.throws(
-    () => context.packGxFramePacketV1(2, tooManyTextureSlots),
+    () => context.packGxFramePacketV2(2, tooManyTextureSlots),
     /textures must have at most 8 slots/,
   );
 
   const zeroSourceWidth = emptyTextureFrame();
   zeroSourceWidth.width = 0;
   assert.throws(
-    () => context.packGxFramePacketV1(1, zeroSourceWidth),
+    () => context.packGxFramePacketV2(1, zeroSourceWidth),
     /source dimensions must be nonzero/,
   );
 
   const missingRequiredTexture = representativeXfbFrame();
   missingRequiredTexture.geometry.draws[0].textures[2] = null;
   assert.throws(
-    () => context.packGxFramePacketV1(2, missingRequiredTexture),
+    () => context.packGxFramePacketV2(2, missingRequiredTexture),
     /TEV stage 1 requires missing texture map 2/,
   );
 
   const malformedKey = representativeXfbFrame();
   malformedKey.geometry.draws[0].textures[0].key = "bad\ud800";
   assert.throws(
-    () => context.packGxFramePacketV1(2, malformedKey),
+    () => context.packGxFramePacketV2(2, malformedKey),
     /unpaired surrogate/,
   );
 });
@@ -445,9 +497,9 @@ test("canonicalizes NaN vertices to one little-endian f32 encoding", () => {
   const context = packetContext();
   const frame = representativeXfbFrame();
   frame.geometry.draws[0].vertices[0] = Number.NaN;
-  const packet = context.packGxFramePacketV1(2, frame);
+  const packet = context.packGxFramePacketV2(2, frame);
 
-  assert.equal(new DataView(packet).getUint32(1440, true), 0x7fc00000);
+  assert.equal(new DataView(packet).getUint32(1472, true), 0x7fc00000);
 });
 
 test("encodes a legal resident texture reference without a pixel payload", () => {
@@ -456,31 +508,31 @@ test("encodes a legal resident texture reference without a pixel payload", () =>
   const resident = frame.geometry.draws[0].textures[0];
   resident.pixels = undefined;
   frame.geometry.draws[1].textures[1].pixels = undefined;
-  const packet = context.packGxFramePacketV1(2, frame);
+  const packet = context.packGxFramePacketV2(2, frame);
   const view = new DataView(packet);
 
-  assert.equal(view.getUint32(384 + 0x08, true), 0);
-  assert.equal(view.getUint32(384 + 0x0c, true), 0);
-  assert.equal(view.getUint32(384 + 0x20, true), 0);
-  assert.equal(view.getUint32(448 + 0x08, true), 0);
-  assert.equal(view.getUint32(448 + 0x0c, true), 4);
-  assert.equal(view.getUint32(448 + 0x20, true), 1);
+  assert.equal(view.getUint32(416 + 0x08, true), 0);
+  assert.equal(view.getUint32(416 + 0x0c, true), 0);
+  assert.equal(view.getUint32(416 + 0x20, true), 0);
+  assert.equal(view.getUint32(480 + 0x08, true), 0);
+  assert.equal(view.getUint32(480 + 0x0c, true), 4);
+  assert.equal(view.getUint32(480 + 0x20, true), 1);
 });
 
 test("omits acknowledged resident payloads across GX frames", () => {
   const context = packetContext();
   const frame = representativeXfbFrame();
-  const packet = context.packGxFramePacketV1(
+  const packet = context.packGxFramePacketV2(
     2,
     frame,
     new Set(["alpha", "β"]),
   );
   const view = new DataView(packet);
 
-  assert.equal(packet.byteLength, 1888);
+  assert.equal(packet.byteLength, 1920);
   assert.equal(view.getUint32(0x48, true), 0);
-  assert.equal(view.getUint32(384 + 0x0c, true), 0);
-  assert.equal(view.getUint32(384 + 0x20, true), 0);
-  assert.equal(view.getUint32(448 + 0x0c, true), 0);
-  assert.equal(view.getUint32(448 + 0x20, true), 0);
+  assert.equal(view.getUint32(416 + 0x0c, true), 0);
+  assert.equal(view.getUint32(416 + 0x20, true), 0);
+  assert.equal(view.getUint32(480 + 0x0c, true), 0);
+  assert.equal(view.getUint32(480 + 0x20, true), 0);
 });

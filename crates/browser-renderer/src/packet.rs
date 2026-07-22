@@ -11,8 +11,8 @@ use std::fmt;
 use crate::tev::{MAX_TEV_STAGES, MAX_TEV_TEXTURES, required_texture_maps};
 
 pub(crate) const GX_PACKET_MAGIC: [u8; 4] = *b"LZGX";
-pub(crate) const GX_PACKET_VERSION: u16 = 1;
-pub(crate) const GX_PACKET_HEADER_BYTES: u16 = 128;
+pub(crate) const GX_PACKET_VERSION: u16 = 2;
+pub(crate) const GX_PACKET_HEADER_BYTES: u16 = 160;
 pub(crate) const GX_DRAW_RECORD_BYTES: u16 = 128;
 pub(crate) const GX_TEXTURE_RECORD_BYTES: u16 = 64;
 pub(crate) const GX_TEV_STATE_BYTES: u32 = 464;
@@ -45,6 +45,18 @@ impl GxCopyKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxCopyState {
+    pub(crate) z_mode: u32,
+    pub(crate) blend_mode: u32,
+    pub(crate) pixel_control: u32,
+    pub(crate) copy_command: u32,
+    pub(crate) clear_rgba: [u8; 4],
+    pub(crate) clear_depth: u32,
+    pub(crate) copy_scale: u32,
+    pub(crate) copy_filter: [u32; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GxPacketHeader {
     pub(crate) packet_bytes: u32,
     pub(crate) copy_kind: GxCopyKind,
@@ -72,7 +84,7 @@ pub(crate) struct GxPacketHeader {
     pub(crate) stride: u32,
     pub(crate) generation: u32,
     pub(crate) clear: bool,
-    pub(crate) clear_rgba: [u8; 4],
+    pub(crate) copy_state: GxCopyState,
     pub(crate) total_vertex_count: u32,
 }
 
@@ -215,6 +227,27 @@ impl<'a> GxFramePacket<'a> {
             GX_TEXTURE_RECORD_BYTES,
         )?;
         let total_vertex_count = read_u32(bytes, 0x7c);
+        let terminal_z_mode = read_bp_word(bytes, 0x80, "terminal Z mode")?;
+        let terminal_blend_mode = read_bp_word(bytes, 0x84, "terminal blend mode")?;
+        let pixel_control = read_bp_word(bytes, 0x88, "pixel control")?;
+        let copy_command = read_bp_word(bytes, 0x8c, "copy command")?;
+        let clear_depth = read_bp_word(bytes, 0x90, "clear depth")?;
+        let copy_scale = read_bp_word(bytes, 0x94, "copy scale")?;
+        let copy_filter = [
+            read_bp_word(bytes, 0x98, "copy filter 0")?,
+            read_bp_word(bytes, 0x9c, "copy filter 1")?,
+        ];
+
+        if (copy_flags & COPY_FLAG_CLEAR != 0) != (copy_command & 0x0800 != 0) {
+            return Err(GxPacketError::NonCanonical(
+                "copy clear flag must match the raw copy command",
+            ));
+        }
+        if (copy_kind == GxCopyKind::Xfb) != (copy_command & 0x4000 != 0) {
+            return Err(GxPacketError::NonCanonical(
+                "copy kind must match the raw copy command",
+            ));
+        }
 
         if source_width == 0 || source_height == 0 {
             return Err(GxPacketError::InvalidField {
@@ -340,7 +373,16 @@ impl<'a> GxFramePacket<'a> {
             stride,
             generation,
             clear: copy_flags & COPY_FLAG_CLEAR != 0,
-            clear_rgba,
+            copy_state: GxCopyState {
+                z_mode: terminal_z_mode,
+                blend_mode: terminal_blend_mode,
+                pixel_control,
+                copy_command,
+                clear_rgba,
+                clear_depth,
+                copy_scale,
+                copy_filter,
+            },
             total_vertex_count,
         };
 
@@ -930,6 +972,17 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     )
 }
 
+fn read_bp_word(bytes: &[u8], offset: usize, field: &'static str) -> Result<u32, GxPacketError> {
+    let value = read_u32(bytes, offset);
+    if value & !0x00ff_ffff != 0 {
+        return Err(GxPacketError::InvalidField {
+            field,
+            value: u64::from(value),
+        });
+    }
+    Ok(value)
+}
+
 fn expect_u16(field: &'static str, actual: u16, expected: u16) -> Result<(), GxPacketError> {
     if field == "version" && actual != expected {
         return Err(GxPacketError::UnsupportedVersion(actual));
@@ -995,14 +1048,14 @@ mod tests {
     }
 
     fn empty_texture_copy() -> Vec<u8> {
-        let mut bytes = vec![0; 128];
+        let mut bytes = vec![0; 160];
         bytes[0..4].copy_from_slice(b"LZGX");
-        put_u16(&mut bytes, 0x04, 1);
-        put_u16(&mut bytes, 0x06, 128);
-        put_u32(&mut bytes, 0x08, 128);
+        put_u16(&mut bytes, 0x04, 2);
+        put_u16(&mut bytes, 0x06, 160);
+        put_u32(&mut bytes, 0x08, 160);
         put_u32(&mut bytes, 0x10, 1);
         for offset in [0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30] {
-            put_u32(&mut bytes, offset, 128);
+            put_u32(&mut bytes, offset, 160);
         }
         put_u32(&mut bytes, 0x4c, 1);
         put_u32(&mut bytes, 0x50, 2);
@@ -1014,21 +1067,29 @@ mod tests {
         bytes[0x74..0x78].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
         put_u16(&mut bytes, 0x78, 128);
         put_u16(&mut bytes, 0x7a, 64);
+        put_u32(&mut bytes, 0x80, 0x0001_0203);
+        put_u32(&mut bytes, 0x84, 0x0004_0506);
+        put_u32(&mut bytes, 0x88, 0x0007_0809);
+        put_u32(&mut bytes, 0x8c, 0x0000_0800);
+        put_u32(&mut bytes, 0x90, 0x000a_0b0c);
+        put_u32(&mut bytes, 0x94, 0x000d_0e0f);
+        put_u32(&mut bytes, 0x98, 0x0010_1112);
+        put_u32(&mut bytes, 0x9c, 0x0013_1415);
         bytes
     }
 
     fn textured_xfb_copy() -> Vec<u8> {
-        const PACKET_BYTES: usize = 1920;
-        const DRAW_OFFSET: u32 = 128;
-        const TEXTURE_OFFSET: u32 = 384;
-        const TEV_OFFSET: u32 = 512;
-        const VERTEX_OFFSET: u32 = 1440;
-        const KEY_OFFSET: u32 = 1872;
-        const PIXEL_OFFSET: u32 = 1888;
+        const PACKET_BYTES: usize = 1952;
+        const DRAW_OFFSET: u32 = 160;
+        const TEXTURE_OFFSET: u32 = 416;
+        const TEV_OFFSET: u32 = 544;
+        const VERTEX_OFFSET: u32 = 1472;
+        const KEY_OFFSET: u32 = 1904;
+        const PIXEL_OFFSET: u32 = 1920;
         let mut bytes = vec![0; PACKET_BYTES];
         bytes[0..4].copy_from_slice(b"LZGX");
-        put_u16(&mut bytes, 0x04, 1);
-        put_u16(&mut bytes, 0x06, 128);
+        put_u16(&mut bytes, 0x04, 2);
+        put_u16(&mut bytes, 0x06, 160);
         put_u32(&mut bytes, 0x08, PACKET_BYTES as u32);
         put_u32(&mut bytes, 0x10, 2);
         put_u32(&mut bytes, 0x14, 2);
@@ -1059,6 +1120,14 @@ mod tests {
         put_u16(&mut bytes, 0x78, 128);
         put_u16(&mut bytes, 0x7a, 64);
         put_u32(&mut bytes, 0x7c, 3);
+        put_u32(&mut bytes, 0x80, 0x0001_0203);
+        put_u32(&mut bytes, 0x84, 0x0004_0506);
+        put_u32(&mut bytes, 0x88, 0x0007_0809);
+        put_u32(&mut bytes, 0x8c, 0x0000_4800);
+        put_u32(&mut bytes, 0x90, 0x000a_0b0c);
+        put_u32(&mut bytes, 0x94, 0x000d_0e0f);
+        put_u32(&mut bytes, 0x98, 0x0010_1112);
+        put_u32(&mut bytes, 0x9c, 0x0013_1415);
 
         let first_draw = DRAW_OFFSET as usize;
         bytes[first_draw] = 2;
@@ -1159,11 +1228,23 @@ mod tests {
     #[test]
     fn parses_empty_texture_copy_golden() {
         let bytes = empty_texture_copy();
-        assert_eq!(fnv1a64(&bytes), 0x7fee_704b_f65b_620a);
+        assert_eq!(fnv1a64(&bytes), 0x15e4_67b0_9783_0cca);
         let packet = GxFramePacket::parse(&bytes).unwrap();
         assert_eq!(packet.header().copy_kind, GxCopyKind::Texture);
         assert!(packet.header().clear);
-        assert_eq!(packet.header().clear_rgba, [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(
+            packet.header().copy_state,
+            GxCopyState {
+                z_mode: 0x0001_0203,
+                blend_mode: 0x0004_0506,
+                pixel_control: 0x0007_0809,
+                copy_command: 0x0000_0800,
+                clear_rgba: [0x11, 0x22, 0x33, 0x44],
+                clear_depth: 0x000a_0b0c,
+                copy_scale: 0x000d_0e0f,
+                copy_filter: [0x0010_1112, 0x0013_1415],
+            }
+        );
         assert_eq!(packet.draws().len(), 0);
         assert_eq!(packet.textures().len(), 0);
     }
@@ -1171,10 +1252,11 @@ mod tests {
     #[test]
     fn parses_textured_xfb_copy_golden() {
         let bytes = textured_xfb_copy();
-        assert_eq!(fnv1a64(&bytes), 0x699b_d0c2_be6e_8a9f);
+        assert_eq!(fnv1a64(&bytes), 0x3099_5e12_acfe_660b);
         let packet = GxFramePacket::parse(&bytes).unwrap();
         assert_eq!(packet.header().copy_kind, GxCopyKind::Xfb);
         assert_eq!(packet.header().generation, 0x1122_3344);
+        assert_eq!(packet.header().copy_state.copy_command, 0x0000_4800);
         let draw = packet.draw(0).unwrap();
         assert_eq!(draw.record.topology, 2);
         assert_eq!(draw.vertex_floats().len(), 72);
@@ -1199,6 +1281,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_noncanonical_terminal_copy_state() {
+        let mut oversized = empty_texture_copy();
+        put_u32(&mut oversized, 0x80, 0x0100_0000);
+        assert_eq!(
+            GxFramePacket::parse(&oversized).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "terminal Z mode",
+                value: 0x0100_0000,
+            }
+        );
+
+        let mut clear_conflict = empty_texture_copy();
+        put_u32(&mut clear_conflict, 0x8c, 0);
+        assert_eq!(
+            GxFramePacket::parse(&clear_conflict).unwrap_err(),
+            GxPacketError::NonCanonical("copy clear flag must match the raw copy command")
+        );
+
+        let mut kind_conflict = empty_texture_copy();
+        put_u32(&mut kind_conflict, 0x8c, 0x4800);
+        assert_eq!(
+            GxFramePacket::parse(&kind_conflict).unwrap_err(),
+            GxPacketError::NonCanonical("copy kind must match the raw copy command")
+        );
+    }
+
+    #[test]
     fn rejects_count_arithmetic_overflow() {
         let mut bytes = empty_texture_copy();
         put_u32(&mut bytes, 0x14, u32::MAX);
@@ -1211,7 +1320,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_texture_reference() {
         let mut bytes = textured_xfb_copy();
-        put_u32(&mut bytes, 128 + 0x30, 2);
+        put_u32(&mut bytes, 160 + 0x30, 2);
         assert!(matches!(
             GxFramePacket::parse(&bytes),
             Err(GxPacketError::InvalidTextureReference {
@@ -1226,7 +1335,7 @@ mod tests {
     #[test]
     fn rejects_noncanonical_first_use_reference() {
         let mut bytes = textured_xfb_copy();
-        put_u32(&mut bytes, 128 + 0x30, 1);
+        put_u32(&mut bytes, 160 + 0x30, 1);
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
             GxPacketError::NonCanonicalTextureFirstUse {
@@ -1241,7 +1350,7 @@ mod tests {
     #[test]
     fn rejects_rgba_payload_size_mismatch() {
         let mut bytes = textured_xfb_copy();
-        put_u32(&mut bytes, 384 + 0x0c, 4);
+        put_u32(&mut bytes, 416 + 0x0c, 4);
         assert!(matches!(
             GxFramePacket::parse(&bytes),
             Err(GxPacketError::InvalidTextureSize {
@@ -1256,8 +1365,8 @@ mod tests {
     #[test]
     fn rejects_extreme_texture_dimensions_before_size_arithmetic() {
         let mut bytes = textured_xfb_copy();
-        put_u32(&mut bytes, 384 + 0x18, u32::MAX);
-        put_u32(&mut bytes, 384 + 0x1c, u32::MAX);
+        put_u32(&mut bytes, 416 + 0x18, u32::MAX);
+        put_u32(&mut bytes, 416 + 0x1c, u32::MAX);
         assert!(matches!(
             GxFramePacket::parse(&bytes),
             Err(GxPacketError::InvalidTextureSize {
@@ -1272,7 +1381,7 @@ mod tests {
     #[test]
     fn rejects_texture_dimensions_beyond_gx_limits() {
         let mut bytes = textured_xfb_copy();
-        put_u32(&mut bytes, 384 + 0x18, GX_MAX_TEXTURE_DIMENSION + 1);
+        put_u32(&mut bytes, 416 + 0x18, GX_MAX_TEXTURE_DIMENSION + 1);
         assert!(matches!(
             GxFramePacket::parse(&bytes),
             Err(GxPacketError::InvalidTextureSize {
@@ -1286,17 +1395,17 @@ mod tests {
     #[test]
     fn rejects_nonzero_alignment_padding() {
         let mut bytes = textured_xfb_copy();
-        bytes[1879] = 1;
+        bytes[1911] = 1;
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
-            GxPacketError::NonZeroPadding { offset: 1879 }
+            GxPacketError::NonZeroPadding { offset: 1911 }
         );
     }
 
     #[test]
     fn rejects_nonzero_tev_padding() {
         let mut bytes = textured_xfb_copy();
-        bytes[512 + 452] = 1;
+        bytes[544 + 452] = 1;
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
             GxPacketError::NonZeroPadding { offset: 452 }
@@ -1306,14 +1415,14 @@ mod tests {
     #[test]
     fn rejects_noncanonical_tev_fields() {
         let mut inactive = textured_xfb_copy();
-        inactive[512 + 32] = 1;
+        inactive[544 + 32] = 1;
         assert_eq!(
             GxFramePacket::parse(&inactive).unwrap_err(),
             GxPacketError::NonZeroPadding { offset: 32 }
         );
 
         let mut stage = textured_xfb_copy();
-        put_u32(&mut stage, 512 + 8, (1 << 6) | (1 << 10));
+        put_u32(&mut stage, 544 + 8, (1 << 6) | (1 << 10));
         assert_eq!(
             GxFramePacket::parse(&stage).unwrap_err(),
             GxPacketError::InvalidField {
@@ -1323,7 +1432,7 @@ mod tests {
         );
 
         let mut swap = textured_xfb_copy();
-        put_u32(&mut swap, 512 + 384, 4);
+        put_u32(&mut swap, 544 + 384, 4);
         assert_eq!(
             GxFramePacket::parse(&swap).unwrap_err(),
             GxPacketError::InvalidField {
@@ -1336,7 +1445,7 @@ mod tests {
     #[test]
     fn rejects_noncanonical_vertex_nan() {
         let mut bytes = textured_xfb_copy();
-        put_u32(&mut bytes, 1440, 0x7fa0_0001);
+        put_u32(&mut bytes, 1472, 0x7fa0_0001);
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
             GxPacketError::NonCanonical("vertex NaNs must use the canonical quiet-NaN encoding")
@@ -1346,7 +1455,7 @@ mod tests {
     #[test]
     fn rejects_empty_and_duplicate_texture_keys() {
         let mut empty = textured_xfb_copy();
-        put_u32(&mut empty, 384 + 0x04, 0);
+        put_u32(&mut empty, 416 + 0x04, 0);
         assert_eq!(
             GxFramePacket::parse(&empty).unwrap_err(),
             GxPacketError::NonCanonical("texture keys must not be empty")
@@ -1354,8 +1463,8 @@ mod tests {
 
         let mut duplicate = textured_xfb_copy();
         put_u32(&mut duplicate, 0x44, 10);
-        put_u32(&mut duplicate, 384 + 64 + 0x04, 5);
-        duplicate[1872..1882].copy_from_slice(b"alphaalpha");
+        put_u32(&mut duplicate, 416 + 64 + 0x04, 5);
+        duplicate[1904..1914].copy_from_slice(b"alphaalpha");
         assert_eq!(
             GxFramePacket::parse(&duplicate).unwrap_err(),
             GxPacketError::NonCanonical("texture keys must be unique within a packet")
@@ -1365,7 +1474,7 @@ mod tests {
     #[test]
     fn rejects_nonrequired_texture_slot() {
         let mut bytes = textured_xfb_copy();
-        put_u32(&mut bytes, 128 + 0x38, 0);
+        put_u32(&mut bytes, 160 + 0x38, 0);
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
             GxPacketError::UnexpectedTextureReference { draw: 0, map: 1 }

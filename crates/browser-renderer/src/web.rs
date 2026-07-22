@@ -861,10 +861,10 @@ impl WebGpuRenderer {
                 )?;
             }
 
-            // LZGX carries the guest alpha byte so a future EFB-alpha layer
-            // need not change the transport ABI. This checkpoint deliberately
-            // preserves the renderer's current opaque-alpha clear semantics.
-            let [clear_red, clear_green, clear_blue, _clear_alpha] = header.clear_rgba;
+            // LZGX v2 carries the complete terminal copy state so exact PE
+            // clear behavior can land without another transport change. This
+            // commit deliberately preserves the current RGB-only semantics.
+            let [clear_red, clear_green, clear_blue, _clear_alpha] = header.copy_state.clear_rgba;
             match header.copy_kind {
                 GxCopyKind::Texture => self.copy_texture_inner(
                     header.source_x,
