@@ -46,6 +46,8 @@ const scenarioFunctions = [
   "recordControllerScenarioStatePoll",
   "pollControllerScenario",
   "snapshotControllerScenario",
+  "cloneControllerScenarioEvidence",
+  "captureSmbReadyPlayAnchor",
 ];
 
 function scenarioHarness(overrides = {}) {
@@ -69,6 +71,8 @@ function scenarioHarness(overrides = {}) {
     controllerSequence: 0,
     controllerScenario: null,
     controllerScenarioDefinitions: new Map(),
+    boot: { identifier: "GMBE8P", version: 0 },
+    smbReadyPlayAnchor: null,
     controllerState: {
       buttons: 0,
       stickX: 0x80,
@@ -293,6 +297,69 @@ test("controller scenarios emit three acknowledged press polls then neutral", ()
       },
     ],
   });
+});
+
+test("sustained PLAY freezes a detached ready-play anchor before analog input", () => {
+  const context = scenarioHarness({
+    controllerAppliedSequence: 18,
+    controllerPollIndex: 77,
+    serialLastPolledSequence: 18,
+  });
+  const state = { cycle: 1234, gameMode: 2, gameSubmode: 51 };
+  const steps = Array.from({ length: 13 }, (_unused, index) => ({
+    id: index === 12 ? "post-play-presented" : `ready-step-${index}`,
+    type: "observe",
+    state: { ordinal: index },
+  }));
+  steps.at(-1).state = state;
+  const scenario = {
+    id: "smb-sustained-play",
+    gameIdentifier: "GMBE8P",
+    startCycle: 0,
+    stepIndex: 13,
+    pollIndex: 77,
+    steps,
+  };
+
+  const anchor = context.captureSmbReadyPlayAnchor(scenario, 1234, state);
+  assert.deepEqual(JSON.parse(JSON.stringify(anchor)), {
+    status: "paused",
+    stage: "scenario-complete",
+    cycles: 1234,
+    disc: { identifier: "GMBE8P", revision: 0 },
+    controller: {
+      pollIndex: 77,
+      appliedSequence: 18,
+      lastPolledSequence: 18,
+      lastPolledButtons: 0,
+      pendingButtons: 0,
+      queuedStates: 0,
+      queueOverflows: 0,
+    },
+    scenario: {
+      id: "smb-ready-play",
+      gameIdentifier: "GMBE8P",
+      status: "complete",
+      hardCycleLimit: 30_000_000_000,
+      startCycle: 0,
+      completedCycle: 1234,
+      failure: null,
+      stepIndex: 13,
+      currentStep: null,
+      pollIndex: 77,
+      lastState: state,
+      steps,
+    },
+  });
+
+  scenario.steps[0].state.ordinal = 99;
+  state.gameSubmode = 52;
+  assert.equal(anchor.scenario.steps[0].state.ordinal, 0);
+  assert.equal(anchor.scenario.lastState.gameSubmode, 51);
+  assert.strictEqual(
+    context.captureSmbReadyPlayAnchor(scenario, 9999, state),
+    anchor,
+  );
 });
 
 test("controller scenarios never retry an unobserved input edge", () => {
@@ -524,6 +591,7 @@ test("page-owned guest predicates witness active and neutral states after SI", (
       id: "steer",
       input: {
         owner: "page",
+        activePolls: 5,
         active,
         neutral,
         activeObserved: value => value.guestStickX === -64,
@@ -553,6 +621,10 @@ test("page-owned guest predicates witness active and neutral states after SI", (
   context.serviceControllerScenario(scenario, 3);
   context.controllerPacketForPoll(0, 103, 203, "periodic");
   context.serviceControllerScenario(scenario, 4);
+  context.controllerPacketForPoll(0, 104, 204, "periodic");
+  context.serviceControllerScenario(scenario, 5);
+  context.controllerPacketForPoll(0, 105, 205, "periodic");
+  context.serviceControllerScenario(scenario, 6);
 
   context.enqueueControllerState({
     sequence: 11,
@@ -564,24 +636,24 @@ test("page-owned guest predicates witness active and neutral states after SI", (
       requestSequence: 2,
     },
   });
-  for (let poll = 4; poll <= 6; poll += 1) {
+  for (let poll = 6; poll <= 8; poll += 1) {
     context.controllerPacketForPoll(0, 100 + poll, 200 + poll, "periodic");
     assert.equal(context.serviceControllerScenario(scenario, poll + 1), "running");
   }
   assert.equal(scenario.stepIndex, 0, "SI neutral alone is not a guest witness");
 
   sample.guestStickX = 0;
-  assert.equal(context.serviceControllerScenario(scenario, 8), "complete");
+  assert.equal(context.serviceControllerScenario(scenario, 10), "complete");
   assert.deepEqual(JSON.parse(JSON.stringify(scenario.steps[0].guest)), {
     activeCycle: 2,
     activePollIndex: 1,
     activeState: { guestStickX: -64 },
-    neutralCycle: 8,
-    neutralPollIndex: 6,
+    neutralCycle: 10,
+    neutralPollIndex: 8,
     neutralState: { guestStickX: 0 },
   });
-  assert.equal(scenario.steps[0].completedCycle, 8);
-  assert.equal(scenario.steps[0].completedPollIndex, 6);
+  assert.equal(scenario.steps[0].completedCycle, 10);
+  assert.equal(scenario.steps[0].completedPollIndex, 8);
 });
 
 test("page-owned state steps reject torn definitions and echoed states", () => {

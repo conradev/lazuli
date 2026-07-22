@@ -277,6 +277,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       rendererFrameSequence: 0,
       rendererFramesInFlight: new Set(),
       controllerScenario: null,
+      claimSmbSustainedViReceipt() { return null; },
       smbTemporalXfbCaptureCapacity: 8,
       smbTemporalXfbCapturesPosted: 0,
       traceVi() {},
