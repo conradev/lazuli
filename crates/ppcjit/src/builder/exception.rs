@@ -40,6 +40,7 @@ impl BlockBuilder<'_> {
             .iconst(ir::types::I16, exception as u64 as i64);
 
         self.flush();
+        self.publish_hook_cycle_offset();
         self.bd.ins().call(
             self.hooks.raise_exception,
             &[self.consts.regs_ptr, exception],

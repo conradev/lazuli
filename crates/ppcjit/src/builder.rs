@@ -64,6 +64,8 @@ pub enum BuilderError {
     Illegal(Ins),
     #[error("unimplemented instruction {f0:?}")]
     Unimplemented(Ins),
+    #[error("hook cycle publication requires a portable exit mode")]
+    HookCycleOffsetRequiresPortableExit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,8 +173,8 @@ pub struct BlockBuilder<'ctx> {
     executed_cycles: u16,
     executed_instructions: u16,
 
-    ibat_changed: bool,
-    dbat_changed: bool,
+    ibat_changed_at: Option<u16>,
+    dbat_changed_at: Option<u16>,
     floats_checked: bool,
 }
 
@@ -338,8 +340,8 @@ impl<'ctx> BlockBuilder<'ctx> {
             executed_cycles: 0,
             executed_instructions: 0,
 
-            ibat_changed: false,
-            dbat_changed: false,
+            ibat_changed_at: None,
+            dbat_changed_at: None,
             floats_checked: false,
         }
     }
@@ -435,7 +437,33 @@ impl<'ctx> BlockBuilder<'ctx> {
 
     /// Calls a generic context hook.
     fn call_generic_hook(&mut self, hook: ir::FuncRef) {
+        self.call_generic_hook_at(hook, self.executed_cycles);
+    }
+
+    /// Calls a generic context hook on behalf of an instruction that started at `cycles`.
+    fn call_generic_hook_at(&mut self, hook: ir::FuncRef, cycles: u16) {
+        self.publish_hook_cycle_offset_at(cycles);
         self.bd.ins().call(hook, &[self.consts.ctx_ptr]);
+    }
+
+    /// Publishes the current instruction's start-cycle offset for portable semantic hooks.
+    fn publish_hook_cycle_offset(&mut self) {
+        self.publish_hook_cycle_offset_at(self.executed_cycles);
+    }
+
+    /// Publishes a semantic hook's instruction-start cycle offset.
+    fn publish_hook_cycle_offset_at(&mut self, cycles: u16) {
+        let Some(offset) = self.frontend.hook_cycle_offset else {
+            return;
+        };
+
+        let cycles = self.ir_value(cycles as u32);
+        let flags = ir::MemFlags::new()
+            .with_notrap()
+            .with_endianness(ir::Endianness::Little);
+        self.bd
+            .ins()
+            .store(flags, cycles, self.consts.ctx_ptr, offset);
     }
 
     fn create_exit_data(&mut self) -> ir::Value {
@@ -486,12 +514,12 @@ impl<'ctx> BlockBuilder<'ctx> {
 
     /// Exits the block.
     fn exit(&mut self, reason: impl IntoIrValue) {
-        if self.dbat_changed {
-            self.call_generic_hook(self.hooks.dbat_changed);
+        if let Some(cycles) = self.dbat_changed_at {
+            self.call_generic_hook_at(self.hooks.dbat_changed, cycles);
         }
 
-        if self.ibat_changed {
-            self.call_generic_hook(self.hooks.ibat_changed);
+        if let Some(cycles) = self.ibat_changed_at {
+            self.call_generic_hook_at(self.hooks.ibat_changed, cycles);
         }
 
         if self.frontend.exit_mode != ExitMode::Native {

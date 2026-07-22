@@ -126,6 +126,7 @@ impl BlockBuilder<'_> {
                 .ins()
                 .stack_addr(self.consts.ptr_type, self.consts.read_stack_slot, 0);
 
+        self.publish_hook_cycle_offset();
         let inst = self
             .bd
             .ins()
@@ -156,6 +157,7 @@ impl BlockBuilder<'_> {
 
     pub fn slow_mem_store<P: ReadWriteAble>(&mut self, addr: ir::Value, value: ir::Value) {
         let func = P::write_hook(self);
+        self.publish_hook_cycle_offset();
         let inst = self
             .bd
             .ins()
@@ -296,6 +298,7 @@ impl BlockBuilder<'_> {
                 .ins()
                 .stack_addr(self.consts.ptr_type, self.consts.read_stack_slot, 0);
 
+        self.publish_hook_cycle_offset();
         let inst = self.bd.ins().call(
             self.hooks.read_quant,
             &[self.consts.ctx_ptr, addr, gqr, stack_slot_addr],
@@ -334,6 +337,7 @@ impl BlockBuilder<'_> {
         gqr: ir::Value,
         value: ir::Value,
     ) -> ir::Value {
+        self.publish_hook_cycle_offset();
         let inst = self.bd.ins().call(
             self.hooks.write_quant,
             &[self.consts.ctx_ptr, addr, gqr, value],

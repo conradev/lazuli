@@ -26,8 +26,9 @@ native = [
 ]
 
 [dev-dependencies]
-insta.workspace = true
+clifwasm.workspace = true
 cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
+insta.workspace = true
 powerpc-asm = "0.4"
 
 [dependencies]

@@ -3996,6 +3996,7 @@ name = "ppcjit"
 version = "0.1.0"
 dependencies = [
  "bitos",
+ "clifwasm",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-native",

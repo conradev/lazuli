@@ -109,6 +109,11 @@ pub struct TranslationConfig {
     pub call_conv: CallConv,
     /// How generated blocks exit.
     pub exit_mode: ExitMode,
+    /// Optional byte offset in the caller context where portable semantic hooks publish the
+    /// current instruction's start-cycle offset as a little-endian `u32`.
+    ///
+    /// Native translations do not support this portable context ABI.
+    pub hook_cycle_offset: Option<i32>,
 }
 
 impl TranslationConfig {
@@ -124,6 +129,7 @@ impl TranslationConfig {
             pointer_type,
             call_conv,
             exit_mode,
+            hook_cycle_offset: None,
         }
     }
 
@@ -195,6 +201,12 @@ impl Translator {
         &mut self,
         instructions: impl Iterator<Item = Ins>,
     ) -> Result<Translation, BuildError> {
+        if self.config.hook_cycle_offset.is_some() && self.config.exit_mode == ExitMode::Native {
+            return Err(BuildError::Builder {
+                source: builder::BuilderError::HookCycleOffsetRequiresPortableExit,
+            });
+        }
+
         let mut function = ir::Function::new();
         function.signature = self.config.block_signature();
 
