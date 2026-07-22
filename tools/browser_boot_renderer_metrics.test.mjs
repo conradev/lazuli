@@ -242,6 +242,10 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
       calls.push("temporal");
       return { captured: frames.length, capacity: 8 };
     },
+    summarizeTemporalPresentedSurfaces(frames) {
+      calls.push("surface");
+      return { captured: frames.length, capacity: 8 };
+    },
     temporalSelectedXfbCapacity: 8,
     temporalSelectedXfbFrames: originalTemporalFrames,
   };
@@ -266,9 +270,10 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
       capacity: 8,
       frames: [],
       oracle: { captured: 0, capacity: 8 },
+      surfaceOracle: { captured: 0, capacity: 8 },
     },
   });
-  assert.deepEqual(calls, ["metrics:original", "read", "temporal"]);
+  assert.deepEqual(calls, ["metrics:original", "read", "temporal", "surface"]);
 });
 
 test("headless capture consumes page-owned rendering without renderer calls", () => {

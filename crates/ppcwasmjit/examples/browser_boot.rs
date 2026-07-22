@@ -9420,6 +9420,44 @@ const TEMPLATE: &str = r##"<!doctype html>
         rgb,
       };
     }
+    async function readPresentedSurface() {
+      if (!webGpuRenderer.has_presented_surface()) return null;
+      const capture = await webGpuRenderer.read_presented_surface_rgba();
+      const rgba = capture.rgba instanceof Uint8Array
+        ? capture.rgba
+        : new Uint8Array(capture.rgba);
+      const width = Number(capture.width);
+      const height = Number(capture.height);
+      const surfaceFormat = String(capture.surfaceFormat);
+      if (![
+        "rgba8unorm",
+        "rgba8unorm-srgb",
+        "bgra8unorm",
+        "bgra8unorm-srgb",
+      ].includes(surfaceFormat)) {
+        throw new Error(`WebGPU surface readback has unsupported format ${surfaceFormat}`);
+      }
+      const rgb = summarizePresentedXfbRgba(rgba, width, height);
+      const [rgbaSha256, rgbSha256] = await Promise.all([
+        sha256Hex(rgba),
+        sha256Hex(presentedXfbRgbBytes(rgba, width, height)),
+      ]);
+      return {
+        address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
+        generation: Number(capture.generation),
+        row: Number(capture.row),
+        presentationSerial: Number(capture.presentationSerial),
+        surfaceFormat,
+        format: String(capture.format),
+        layout: String(capture.layout),
+        width,
+        height,
+        rgbaByteLength: rgba.byteLength,
+        rgbaSha256,
+        rgbSha256,
+        rgb,
+      };
+    }
     async function captureTemporalSelectedXfb(
       message,
       presented,
@@ -9439,7 +9477,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         message?.type !== "vi-present"
         || request?.scenario !== "smb-ready-play"
         || request?.step !== "post-play-presented"
-        || typeof presented !== "boolean"
+        || presented !== true
         || !Number.isSafeInteger(rendererSequence)
         || !Number.isSafeInteger(ordinal)
         || ordinal !== frames.length + 1
@@ -9463,7 +9501,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         throw new Error("invalid temporal selected-XFB capture request");
       }
-      const selectedXfb = await readSelectedXfb();
+      const [selectedXfb, presentedSurface] = await Promise.all([
+        readSelectedXfb(),
+        readPresentedSurface(),
+      ]);
+      if (presentedSurface === null) {
+        throw new Error("requested WebGPU presented-surface capture is unavailable");
+      }
       const capture = {
         scenario: request.scenario,
         step: request.step,
@@ -9479,6 +9523,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           height,
         },
         selectedXfb,
+        presentedSurface,
       };
       frames.push(capture);
       return capture;
@@ -9560,6 +9605,80 @@ const TEMPLATE: &str = r##"<!doctype html>
         frames: classified,
       };
     }
+    function summarizeTemporalPresentedSurfaces(frames) {
+      const classified = frames.map(frame => {
+        const surface = frame.presentedSurface;
+        const pixels = surface === null ? 0 : surface.width * surface.height;
+        const matchesPresentation = surface !== null
+          && surface.address === frame.presentation.address
+          && surface.generation === frame.presentation.copyIndex
+          && surface.row === frame.presentation.copyRow
+          && surface.width === frame.presentation.width
+          && surface.height === frame.presentation.height;
+        return {
+          ordinal: frame.ordinal,
+          rendererSequence: frame.rendererSequence,
+          presentationSerial: surface?.presentationSerial ?? null,
+          copyIndex: frame.presentation.copyIndex,
+          generation: surface?.generation ?? null,
+          rgbaSha256: surface?.rgbaSha256 ?? null,
+          rgbSha256: surface?.rgbSha256 ?? null,
+          captured: surface !== null,
+          matchesPresentation,
+          monochrome: surface !== null && surface.rgb.unique === 1,
+          allBlack: surface !== null && surface.rgb.black === pixels,
+          allWhite: surface !== null && surface.rgb.white === pixels,
+        };
+      });
+      const rgbaHashes = classified
+        .map(frame => frame.rgbaSha256)
+        .filter(hash => hash !== null);
+      const rgbHashes = classified
+        .map(frame => frame.rgbSha256)
+        .filter(hash => hash !== null);
+      const monochrome = classified.filter(frame => frame.monochrome);
+      const blackWhite = classified.filter(frame => frame.allBlack || frame.allWhite);
+      const adjacentFramesAlternate = (candidates, key) => candidates.length >= 2
+        && candidates.every((frame, index) => index === 0
+          || frame[key] !== candidates[index - 1][key]);
+      const blackAndWhiteAlternate = candidates => candidates.length >= 2
+        && candidates.every((frame, index) => index === 0
+          || frame.allBlack !== candidates[index - 1].allBlack);
+      return {
+        captured: classified.filter(frame => frame.captured).length,
+        capacity: temporalSelectedXfbCapacity,
+        complete: classified.length === temporalSelectedXfbCapacity
+          && classified.every(frame => frame.captured),
+        distinctRgbaHashes: new Set(rgbaHashes).size,
+        distinctRgbHashes: new Set(rgbHashes).size,
+        distinctPresentationSerials: new Set(classified
+          .map(frame => frame.presentationSerial)
+          .filter(serial => serial !== null)).size,
+        missingOrdinals: classified
+          .filter(frame => !frame.captured)
+          .map(frame => frame.ordinal),
+        mismatchedPresentationOrdinals: classified
+          .filter(frame => frame.captured && !frame.matchesPresentation)
+          .map(frame => frame.ordinal),
+        presentationSerialRegressions: classified
+          .filter((frame, index) => index !== 0
+            && frame.presentationSerial !== null
+            && classified[index - 1].presentationSerial !== null
+            && frame.presentationSerial <= classified[index - 1].presentationSerial)
+          .map(frame => frame.ordinal),
+        monochromeOrdinals: monochrome.map(frame => frame.ordinal),
+        blackOrdinals: classified.filter(frame => frame.allBlack).map(frame => frame.ordinal),
+        whiteOrdinals: classified.filter(frame => frame.allWhite).map(frame => frame.ordinal),
+        allFramesMonochrome: classified.length !== 0
+          && monochrome.length === classified.length,
+        alternatingMonochromePair: monochrome.length === classified.length
+          && new Set(rgbHashes).size === 2
+          && adjacentFramesAlternate(classified, "rgbSha256"),
+        blackWhiteAlternating: blackWhite.length === classified.length
+          && blackAndWhiteAlternate(classified),
+        frames: classified,
+      };
+    }
     function captureSelectedXfb() {
       return appendRendererOperation(readSelectedXfb);
     }
@@ -9612,8 +9731,12 @@ const TEMPLATE: &str = r##"<!doctype html>
             selectedXfb: frame.selectedXfb === null
               ? null
               : { ...frame.selectedXfb, rgb: { ...frame.selectedXfb.rgb } },
+            presentedSurface: frame.presentedSurface === null
+              ? null
+              : { ...frame.presentedSurface, rgb: { ...frame.presentedSurface.rgb } },
           })),
           oracle: summarizeTemporalSelectedXfb(temporalFrames),
+          surfaceOracle: summarizeTemporalPresentedSurfaces(temporalFrames),
         };
         return { metrics, selectedXfb, temporalSelectedXfb };
       });

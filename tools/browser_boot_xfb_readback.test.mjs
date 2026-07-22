@@ -10,6 +10,10 @@ const source = readFileSync(
   new URL("../crates/ppcwasmjit/examples/browser_boot.rs", import.meta.url),
   "utf8",
 );
+const rendererSource = readFileSync(
+  new URL("../crates/browser-renderer/src/web.rs", import.meta.url),
+  "utf8",
+);
 
 function extractFunction(name) {
   const functionStart = source.indexOf(`function ${name}(`);
@@ -180,6 +184,65 @@ test("selected XFB capture reports no image after a renderer reset", async () =>
   assert.equal(reads, 0);
 });
 
+test("presented surface capture returns canonical tight RGBA evidence", async () => {
+  const rgba = new Uint8Array([
+    0, 0, 0, 255,
+    255, 255, 255, 255,
+  ]);
+  const context = evaluate(
+    [
+      "sha256Hex",
+      "presentedXfbRgbBytes",
+      "summarizePresentedXfbRgba",
+      "readPresentedSurface",
+    ],
+    {
+      webGpuRenderer: {
+        has_presented_surface() { return true; },
+        read_presented_surface_rgba() {
+          return {
+            address: 0x01200500,
+            generation: 71,
+            row: 1,
+            presentationSerial: 400,
+            surfaceFormat: "bgra8unorm-srgb",
+            format: "rgba8unorm",
+            layout: "top-left-row-major-tight",
+            width: 2,
+            height: 1,
+            rgba,
+          };
+        },
+      },
+    },
+  );
+  const capture = await context.readPresentedSurface();
+  assert.equal(capture.address, "0x01200500");
+  assert.equal(capture.presentationSerial, 400);
+  assert.equal(capture.surfaceFormat, "bgra8unorm-srgb");
+  assert.equal(capture.rgbaByteLength, 8);
+  assert.equal(capture.rgbaSha256, createHash("sha256").update(rgba).digest("hex"));
+  assert.deepEqual(JSON.parse(JSON.stringify(capture.rgb)), {
+    black: 1,
+    white: 1,
+    other: 0,
+    unique: 2,
+  });
+  assert.equal("rgba" in capture, false);
+
+  const originalRead = context.webGpuRenderer.read_presented_surface_rgba;
+  await assert.rejects(
+    async () => {
+      context.webGpuRenderer.read_presented_surface_rgba = () => ({
+        ...originalRead(),
+        surfaceFormat: "rgb10a2unorm",
+      });
+      await context.readPresentedSurface();
+    },
+    /unsupported format/,
+  );
+});
+
 test("temporal selected XFB capture preserves ordered presentation provenance", async () => {
   const selectedXfb = {
     address: "0x01200500",
@@ -193,13 +256,29 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     displayHeight: 480,
     rgb: { black: 0, white: 0, other: 307_200, unique: 4096 },
   };
-  let reads = 0;
+  const presentedSurface = {
+    address: "0x01200500",
+    generation: 71,
+    row: 1,
+    presentationSerial: 90,
+    width: 640,
+    height: 480,
+    rgbaSha256: "surface-abc",
+    rgbSha256: "surface-rgb-abc",
+    rgb: { black: 0, white: 0, other: 307_200, unique: 4096 },
+  };
+  let selectedReads = 0;
+  let surfaceReads = 0;
   const context = evaluate(["captureTemporalSelectedXfb"], {
     temporalSelectedXfbCapacity: 8,
     temporalSelectedXfbFrames: [],
     async readSelectedXfb() {
-      reads += 1;
+      selectedReads += 1;
       return selectedXfb;
+    },
+    async readPresentedSurface() {
+      surfaceReads += 1;
+      return presentedSurface;
     },
   });
   const message = {
@@ -222,7 +301,8 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
   };
 
   const capture = await context.captureTemporalSelectedXfb(message, true);
-  assert.equal(reads, 1);
+  assert.equal(selectedReads, 1);
+  assert.equal(surfaceReads, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(capture)), {
     scenario: "smb-ready-play",
     step: "post-play-presented",
@@ -238,8 +318,13 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
       height: 480,
     },
     selectedXfb,
+    presentedSurface,
   });
   assert.strictEqual(context.temporalSelectedXfbFrames[0].selectedXfb, selectedXfb);
+  assert.strictEqual(
+    context.temporalSelectedXfbFrames[0].presentedSurface,
+    presentedSurface,
+  );
 
   await assert.rejects(
     context.captureTemporalSelectedXfb({
@@ -252,7 +337,8 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     }, true),
     /invalid temporal selected-XFB capture request/,
   );
-  assert.equal(reads, 1, "invalid ordering must fail before another readback");
+  assert.equal(selectedReads, 1, "invalid ordering must fail before another readback");
+  assert.equal(surfaceReads, 1, "invalid ordering must fail before another readback");
   await assert.rejects(
     context.captureTemporalSelectedXfb({
       ...message,
@@ -265,7 +351,8 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     }, true),
     /invalid temporal selected-XFB capture request/,
   );
-  assert.equal(reads, 1, "invalid frame type must fail before another readback");
+  assert.equal(selectedReads, 1, "invalid frame type must fail before another readback");
+  assert.equal(surfaceReads, 1, "invalid frame type must fail before another readback");
   await assert.rejects(
     context.captureTemporalSelectedXfb({
       ...message,
@@ -278,7 +365,79 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     }, true),
     /invalid temporal selected-XFB capture request/,
   );
-  assert.equal(reads, 1, "invalid VI dimensions must fail before another readback");
+  assert.equal(selectedReads, 1, "invalid VI dimensions must fail before another readback");
+  assert.equal(surfaceReads, 1, "invalid VI dimensions must fail before another readback");
+});
+
+test("temporal surface capture fails before renderer acknowledgement when unavailable", async () => {
+  const context = evaluate(["captureTemporalSelectedXfb"], {
+    temporalSelectedXfbCapacity: 8,
+    temporalSelectedXfbFrames: [],
+    async readSelectedXfb() { return {}; },
+    async readPresentedSurface() { return null; },
+  });
+  await assert.rejects(
+    context.captureTemporalSelectedXfb({
+      type: "vi-present",
+      rendererSequence: 1,
+      frame: {
+        field: "top",
+        address: 0x01200500,
+        copyIndex: 1,
+        copyRow: 0,
+        width: 640,
+        height: 480,
+        temporalXfbCapture: {
+          scenario: "smb-ready-play",
+          step: "post-play-presented",
+          ordinal: 1,
+          capacity: 8,
+        },
+      },
+    }, true),
+    /presented-surface capture is unavailable/,
+  );
+  assert.deepEqual(context.temporalSelectedXfbFrames, []);
+});
+
+test("swapchain capture is opt-in and copied in the presentation encoder", () => {
+  const start = rendererSource.indexOf("pub fn present_xfb");
+  const end = rendererSource.indexOf("\n}\n\nimpl WebGpuRenderer", start);
+  const present = rendererSource.slice(start, end);
+  assert.match(present, /capture_surface: bool/);
+  assert.match(present, /requested_surface_readback_layout\(\s*capture_surface,/);
+  assert.match(present, /let surface_capture = capture_plan\.map/);
+  const allocation = present.indexOf("browser presented surface readback");
+  const copy = present.indexOf("encoder.copy_texture_to_buffer", allocation);
+  const submit = present.indexOf("self.queue.submit", copy);
+  const browserPresent = present.indexOf("output.present()", submit);
+  assert.ok(allocation > present.indexOf("capture_plan.map"));
+  assert.ok(allocation < copy && copy < submit && submit < browserPresent);
+  assert.ok(
+    present.indexOf("self.last_presented_surface = None")
+      < present.indexOf("if selected_address == 0"),
+    "every attempted presentation clears stale surface evidence",
+  );
+  const resetStart = rendererSource.indexOf("pub fn reset(&mut self)");
+  const resetEnd = rendererSource.indexOf("pub fn reset_diagnostics", resetStart);
+  assert.match(
+    rendererSource.slice(resetStart, resetEnd),
+    /self\.last_presented_surface = None/,
+  );
+  assert.match(source, /frame\.temporalXfbCapture !== undefined\s*\)\s*,/);
+});
+
+test("wgpu WebSurface under-reporting cannot disable the required COPY_SRC usage", () => {
+  const start = rendererSource.indexOf("let surface_config = wgpu::SurfaceConfiguration");
+  const end = rendererSource.indexOf("surface.configure(&device, &surface_config)", start);
+  const configuration = rendererSource.slice(start, end);
+  assert.match(configuration, /wgpu 29's WebSurface advertises only RENDER_ATTACHMENT/);
+  assert.match(
+    configuration,
+    /usage: wgpu::TextureUsages::RENDER_ATTACHMENT\s*\|\s*wgpu::TextureUsages::COPY_SRC/,
+  );
+  assert.doesNotMatch(configuration, /capabilities\.usages/);
+  assert.doesNotMatch(rendererSource, /CopySourceUnsupported/);
 });
 
 test("temporal selected XFB oracle detects exact monochrome alternation", () => {
