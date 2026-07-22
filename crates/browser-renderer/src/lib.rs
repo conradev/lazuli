@@ -9,6 +9,7 @@ pub(crate) mod tev;
 pub(crate) const EFB_WIDTH: u32 = 640;
 pub(crate) const EFB_HEIGHT: u32 = 528;
 pub(crate) const WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
+pub(crate) const GX_DEPTH24_MAX: u32 = 0x00ff_ffff;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RendererMetrics {
@@ -230,6 +231,47 @@ pub(crate) fn clipped_copy_extent(
     let width = width.min(available_width);
     let height = height.min(available_height);
     (width != 0 && height != 0).then_some((width, height))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GxCopyClearMask {
+    pub(crate) color: bool,
+    pub(crate) alpha: bool,
+    pub(crate) depth: bool,
+}
+
+impl GxCopyClearMask {
+    pub(crate) fn index(self) -> usize {
+        usize::from(self.color) | (usize::from(self.alpha) << 1) | (usize::from(self.depth) << 2)
+    }
+
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self {
+            color: index & 1 != 0,
+            alpha: index & 2 != 0,
+            depth: index & 4 != 0,
+        }
+    }
+
+    pub(crate) fn writes_anything(self) -> bool {
+        self.color || self.alpha || self.depth
+    }
+}
+
+pub(crate) fn gx_copy_clear_mask(z_mode: u32, blend_mode: u32) -> GxCopyClearMask {
+    GxCopyClearMask {
+        color: blend_mode & (1 << 3) != 0,
+        alpha: blend_mode & (1 << 4) != 0,
+        depth: z_mode & (1 << 4) != 0,
+    }
+}
+
+pub(crate) fn gx_depth24_to_float(depth: u32) -> f32 {
+    (depth & GX_DEPTH24_MAX) as f32 / GX_DEPTH24_MAX as f32
+}
+
+pub(crate) fn gx_float_to_depth24(depth: f32) -> u32 {
+    (depth.clamp(0.0, 1.0) * GX_DEPTH24_MAX as f32).round() as u32
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -574,10 +616,11 @@ pub use web::WebGpuRenderer;
 #[cfg(test)]
 mod tests {
     use super::{
-        EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState,
-        RendererMetrics, SelectedTexture, TextureAddressMode, XfbCopyMetadata, alpha_compare,
-        alpha_test_passes, clipped_copy_extent, compact_xfb_readback_rows,
-        decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state,
+        EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
+        RendererFailureState, RendererMetrics, SelectedTexture, TextureAddressMode,
+        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
+        compact_xfb_readback_rows, decoded_texture_cache_hit, decoded_texture_is_available,
+        gx_blend_state, gx_copy_clear_mask, gx_depth24_to_float, gx_float_to_depth24,
         gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
         xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_source_rect,
@@ -925,6 +968,39 @@ mod tests {
         assert_eq!(clipped_copy_extent(0, EFB_HEIGHT + 1, 1, 1), None);
         assert_eq!(clipped_copy_extent(0, 0, 0, 1), None);
         assert_eq!(clipped_copy_extent(0, 0, 1, 0), None);
+    }
+
+    #[test]
+    fn gx_copy_clear_masks_decode_independent_color_alpha_and_depth_updates() {
+        for index in 0..8 {
+            let expected = GxCopyClearMask::from_index(index);
+            let z_mode = u32::from(expected.depth) << 4;
+            let blend_mode = (u32::from(expected.color) << 3) | (u32::from(expected.alpha) << 4);
+            let actual = gx_copy_clear_mask(z_mode, blend_mode);
+            assert_eq!(actual, expected);
+            assert_eq!(actual.index(), index);
+            assert_eq!(actual.writes_anything(), index != 0);
+        }
+
+        assert_eq!(
+            gx_copy_clear_mask(1 << 4, 0),
+            GxCopyClearMask {
+                color: false,
+                alpha: false,
+                depth: true,
+            },
+            "depth updates must not depend on the depth-test enable bit",
+        );
+    }
+
+    #[test]
+    fn gx_depth_uses_the_full_unsigned_twenty_four_bit_range() {
+        assert_eq!(gx_depth24_to_float(0), 0.0);
+        assert_eq!(gx_depth24_to_float(GX_DEPTH24_MAX), 1.0);
+        assert_eq!(gx_float_to_depth24(1.0), GX_DEPTH24_MAX);
+        for depth in [0, 1, 0x12_3456, 0x44_5566, 0xab_cdef, 0xff_fffe, 0xff_ffff] {
+            assert_eq!(gx_float_to_depth24(gx_depth24_to_float(depth)), depth);
+        }
     }
 
     #[test]

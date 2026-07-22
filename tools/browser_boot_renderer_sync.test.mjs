@@ -769,8 +769,8 @@ test("structured GX clears remain serialized before the following GX frame", asy
     },
     handleRendererError(error) { throw error; },
     webGpuRenderer: {
-      clear_efb(red, green, blue) {
-        calls.push(`clear:${red},${green},${blue}`);
+      clear_efb_copy(...args) {
+        calls.push(`clear:${args.join(",")}`);
       },
       submit_gx_frame() {
         calls.push("gx-frame");
@@ -828,14 +828,17 @@ test("structured GX clears remain serialized before the following GX frame", asy
   });
   await Promise.resolve();
 
-  assert.deepEqual(calls, ["clear:4,5,6", "drain:1"]);
+  assert.deepEqual(calls, [
+    "clear:7,9,11,13,23,1449,3,4,5,6,255,1193046",
+    "drain:1",
+  ]);
   assert.deepEqual(messages, []);
   releaseClearDrain();
   await clear;
   await frame;
 
   assert.deepEqual(calls, [
-    "clear:4,5,6",
+    "clear:7,9,11,13,23,1449,3,4,5,6,255,1193046",
     "drain:1",
     "gx-frame",
     "drain:2",

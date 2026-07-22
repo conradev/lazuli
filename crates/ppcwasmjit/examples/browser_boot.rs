@@ -9624,11 +9624,28 @@ const TEMPLATE: &str = r##"<!doctype html>
       captureTerminal: captureRendererTerminal,
     });
     function gxClearEfb(clear) {
-      // LZGX v2 carries the complete terminal copy state. Exact EFB clear
-      // interpretation follows separately; retain the current RGB behavior here.
-      const { copyState } = clear;
-      const [red, green, blue] = copyState.clearRgba;
-      webGpuRenderer.clear_efb(red, green, blue);
+      const {
+        sourceX,
+        sourceY,
+        sourceWidth,
+        sourceHeight,
+        copyState,
+      } = clear;
+      const [red, green, blue, alpha] = copyState.clearRgba;
+      webGpuRenderer.clear_efb_copy(
+        sourceX,
+        sourceY,
+        sourceWidth,
+        sourceHeight,
+        copyState.zMode,
+        copyState.blendMode,
+        copyState.pixelControl,
+        red,
+        green,
+        blue,
+        alpha,
+        copyState.clearDepth,
+      );
     }
     const source = document.querySelector("#runner-source").textContent;
     const debugSurface = document.querySelector(".shell").dataset.surface === "debug";

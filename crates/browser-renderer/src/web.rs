@@ -15,18 +15,19 @@ use wasm_bindgen_futures::future_to_promise;
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
-use crate::packet::{GxCopyKind, GxFramePacket};
+use crate::packet::{GxCopyKind, GxCopyState, GxFramePacket};
 use crate::tev::{
     MAX_TEV_TEXTURES, TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS,
     required_texture_maps, shader_source as tev_shader_source, validate_draw_transport,
 };
 use crate::{
-    EFB_HEIGHT, EFB_WIDTH, GxBlendFactor, GxBlendOperation, RendererFailureState, RendererMetrics,
-    SamplerIdentity, SelectedTexture, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
-    clipped_copy_extent, compact_xfb_readback_rows, decoded_texture_cache_hit,
-    decoded_texture_is_available, gx_blend_state, gx_sampler_identity, merge_contiguous_draw_range,
-    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
-    xfb_copy_matches_selection, xfb_readback_layout, xfb_source_rect, xfb_surface_extent_matches,
+    EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
+    RendererFailureState, RendererMetrics, SamplerIdentity, SelectedTexture, TextureAddressMode,
+    TextureBindingIdentity, XfbCopyMetadata, clipped_copy_extent, compact_xfb_readback_rows,
+    decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state, gx_copy_clear_mask,
+    gx_depth24_to_float, gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture,
+    reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
+    xfb_readback_layout, xfb_source_rect, xfb_surface_extent_matches,
 };
 
 const PRESENT_SHADER: &str = "
@@ -67,6 +68,38 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
+const COPY_CLEAR_SHADER: &str = "
+struct CopyClearUniform {
+    color: vec4<f32>,
+    depth_and_padding: vec4<f32>,
+};
+
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
+@group(0) @binding(0) var<uniform> clear: CopyClearUniform;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> FragmentOutput {
+    var output: FragmentOutput;
+    output.color = clear.color;
+    output.depth = clear.depth_and_padding.x;
+    return output;
+}
+";
+
 const DECODED_TEXTURE_CACHE_CAPACITY: usize = 128;
 
 #[repr(C)]
@@ -85,6 +118,28 @@ const _: () = assert!(std::mem::size_of::<TevVertex>() == TEV_VERTEX_FLOATS * si
 struct DrawUniform {
     alpha_test: u32,
     _padding: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CopyClearUniform {
+    color: [f32; 4],
+    depth_and_padding: [f32; 4],
+}
+
+impl CopyClearUniform {
+    fn new(rgba: [u8; 4], depth: u32) -> Self {
+        Self {
+            color: rgba.map(|channel| f32::from(channel) / 255.0),
+            depth_and_padding: [gx_depth24_to_float(depth), 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+struct CopyClearResources {
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    pipelines: Vec<wgpu::RenderPipeline>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -329,6 +384,7 @@ pub struct WebGpuRenderer {
     efb_color_view: wgpu::TextureView,
     _efb_depth: wgpu::Texture,
     efb_depth_view: wgpu::TextureView,
+    copy_clear: CopyClearResources,
     tev_draw_layout: wgpu::BindGroupLayout,
     tev_texture_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
@@ -353,6 +409,44 @@ fn update_renderer_metrics(
     let mut current = metrics.get();
     update(&mut current);
     metrics.set(current);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn public_copy_clear_state(
+    clear: bool,
+    z_mode: u32,
+    blend_mode: u32,
+    pixel_control: u32,
+    copy_command: u32,
+    clear_rgba: [u8; 4],
+    clear_depth: u32,
+) -> Result<Option<GxCopyState>, JsValue> {
+    if !clear {
+        return Ok(None);
+    }
+    for (field, value) in [
+        ("terminal Z mode", z_mode),
+        ("terminal blend mode", blend_mode),
+        ("pixel control", pixel_control),
+        ("copy command", copy_command),
+        ("clear depth", clear_depth),
+    ] {
+        if value & !0x00ff_ffff != 0 {
+            return Err(JsValue::from_str(&format!(
+                "GX copy clear {field} has bits outside its raw 24-bit BP value"
+            )));
+        }
+    }
+    Ok(Some(GxCopyState {
+        z_mode,
+        blend_mode,
+        pixel_control,
+        copy_command,
+        clear_rgba,
+        clear_depth,
+        copy_scale: 0,
+        copy_filter: [0; 2],
+    }))
 }
 
 fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> {
@@ -416,7 +510,7 @@ impl WebGpuRenderer {
         self.efb_copy_cache.clear();
         self.xfb_cache.clear();
         self.last_presented_xfb = None;
-        self.clear_efb_inner(0, 0, 0)
+        self.reset_efb_inner()
     }
 
     pub fn reset_diagnostics(&self) {
@@ -433,33 +527,55 @@ impl WebGpuRenderer {
         });
     }
 
-    pub fn clear_efb(&self, red: u8, green: u8, blue: u8) -> Result<(), JsValue> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn clear_efb_copy(
+        &mut self,
+        source_x: u32,
+        source_y: u32,
+        source_width: u32,
+        source_height: u32,
+        z_mode: u32,
+        blend_mode: u32,
+        pixel_control: u32,
+        clear_red: u8,
+        clear_green: u8,
+        clear_blue: u8,
+        clear_alpha: u8,
+        clear_depth: u32,
+    ) -> Result<(), JsValue> {
         self.record_wasm_bridge_call(0);
-        self.clear_efb_inner(red, green, blue)
+        let state = public_copy_clear_state(
+            true,
+            z_mode,
+            blend_mode,
+            pixel_control,
+            0x0800,
+            [clear_red, clear_green, clear_blue, clear_alpha],
+            clear_depth,
+        )?
+        .expect("requested GX copy clear has state");
+        self.clear_copy_region_inner(source_x, source_y, source_width, source_height, state)
     }
 
-    fn clear_efb_inner(&self, red: u8, green: u8, blue: u8) -> Result<(), JsValue> {
+    fn reset_efb_inner(&self) -> Result<(), JsValue> {
         self.ensure_healthy()?;
-        update_renderer_metrics(&self.metrics, |metrics| {
-            metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
-        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("browser EFB clear encoder"),
+                label: Some("browser EFB reset encoder"),
             });
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("browser EFB clear pass"),
+                label: Some("browser EFB reset pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.efb_color_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(red) / 255.0,
-                            g: f64::from(green) / 255.0,
-                            b: f64::from(blue) / 255.0,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -483,6 +599,64 @@ impl WebGpuRenderer {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
         self.ensure_healthy()
+    }
+
+    fn clear_copy_region_inner(
+        &mut self,
+        source_x: u32,
+        source_y: u32,
+        source_width: u32,
+        source_height: u32,
+        state: GxCopyState,
+    ) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
+        });
+        let mut encoder = self.flush_geometry();
+        if let Some((width, height)) =
+            clipped_copy_extent(source_x, source_y, source_width, source_height)
+        {
+            self.encode_copy_clear(
+                &mut encoder,
+                ScissorRect {
+                    x: source_x,
+                    y: source_y,
+                    width,
+                    height,
+                },
+                state,
+            );
+        }
+        self.queue.submit([encoder.finish()]);
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+        });
+        self.ensure_healthy()
+    }
+
+    fn encode_copy_clear(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        rectangle: ScissorRect,
+        state: GxCopyState,
+    ) {
+        let mask = gx_copy_clear_mask(state.z_mode, state.blend_mode);
+        if !mask.writes_anything() {
+            return;
+        }
+        let uniform = CopyClearUniform::new(state.clear_rgba, state.clear_depth);
+        self.queue
+            .write_buffer(&self.copy_clear.uniform, 0, bytemuck::bytes_of(&uniform));
+        encode_copy_clear_pass(
+            encoder,
+            &self.efb_color_view,
+            &self.efb_depth_view,
+            &self.copy_clear.pipelines[mask.index()],
+            &self.copy_clear.bind_group,
+            rectangle,
+            "browser GX post-copy clear pass",
+        );
     }
 
     pub fn begin_segment(&mut self) -> Result<(), JsValue> {
@@ -861,10 +1035,7 @@ impl WebGpuRenderer {
                 )?;
             }
 
-            // LZGX v2 carries the complete terminal copy state so exact PE
-            // clear behavior can land without another transport change. This
-            // commit deliberately preserves the current RGB-only semantics.
-            let [clear_red, clear_green, clear_blue, _clear_alpha] = header.copy_state.clear_rgba;
+            let copy_clear = header.clear.then_some(header.copy_state);
             match header.copy_kind {
                 GxCopyKind::Texture => self.copy_texture_inner(
                     header.source_x,
@@ -873,10 +1044,7 @@ impl WebGpuRenderer {
                     header.source_height,
                     header.destination,
                     header.generation,
-                    header.clear,
-                    clear_red,
-                    clear_green,
-                    clear_blue,
+                    copy_clear,
                 ),
                 GxCopyKind::Xfb => self.copy_xfb_inner(
                     header.source_x,
@@ -888,10 +1056,7 @@ impl WebGpuRenderer {
                     header.destination,
                     header.stride,
                     header.generation,
-                    header.clear,
-                    clear_red,
-                    clear_green,
-                    clear_blue,
+                    copy_clear,
                 ),
             }
         })();
@@ -1190,11 +1355,25 @@ impl WebGpuRenderer {
         destination: u32,
         generation: u32,
         clear: bool,
+        z_mode: u32,
+        blend_mode: u32,
+        pixel_control: u32,
         clear_red: u8,
         clear_green: u8,
         clear_blue: u8,
+        clear_alpha: u8,
+        clear_depth: u32,
     ) -> Result<(), JsValue> {
         self.record_wasm_bridge_call(0);
+        let copy_clear = public_copy_clear_state(
+            clear,
+            z_mode,
+            blend_mode,
+            pixel_control,
+            if clear { 0x0800 } else { 0 },
+            [clear_red, clear_green, clear_blue, clear_alpha],
+            clear_depth,
+        )?;
         self.copy_texture_inner(
             source_x,
             source_y,
@@ -1202,10 +1381,7 @@ impl WebGpuRenderer {
             height,
             destination,
             generation,
-            clear,
-            clear_red,
-            clear_green,
-            clear_blue,
+            copy_clear,
         )
     }
 
@@ -1218,10 +1394,7 @@ impl WebGpuRenderer {
         height: u32,
         destination: u32,
         generation: u32,
-        clear: bool,
-        clear_red: u8,
-        clear_green: u8,
-        clear_blue: u8,
+        copy_clear: Option<GxCopyState>,
     ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
@@ -1275,6 +1448,21 @@ impl WebGpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        if let Some(state) = copy_clear {
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
+            });
+            self.encode_copy_clear(
+                &mut encoder,
+                ScissorRect {
+                    x: source_x,
+                    y: source_y,
+                    width,
+                    height,
+                },
+                state,
+            );
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.submit([encoder.finish()]);
         update_renderer_metrics(&self.metrics, |metrics| {
@@ -1302,9 +1490,6 @@ impl WebGpuRenderer {
             };
             self.efb_copy_cache.remove(&address);
         }
-        if clear {
-            self.clear_efb_inner(clear_red, clear_green, clear_blue)?;
-        }
         self.ensure_healthy()
     }
 
@@ -1321,11 +1506,25 @@ impl WebGpuRenderer {
         stride: u32,
         generation: u32,
         clear: bool,
+        z_mode: u32,
+        blend_mode: u32,
+        pixel_control: u32,
         clear_red: u8,
         clear_green: u8,
         clear_blue: u8,
+        clear_alpha: u8,
+        clear_depth: u32,
     ) -> Result<(), JsValue> {
         self.record_wasm_bridge_call(0);
+        let copy_clear = public_copy_clear_state(
+            clear,
+            z_mode,
+            blend_mode,
+            pixel_control,
+            if clear { 0x4800 } else { 0x4000 },
+            [clear_red, clear_green, clear_blue, clear_alpha],
+            clear_depth,
+        )?;
         self.copy_xfb_inner(
             source_x,
             source_y,
@@ -1336,10 +1535,7 @@ impl WebGpuRenderer {
             destination,
             stride,
             generation,
-            clear,
-            clear_red,
-            clear_green,
-            clear_blue,
+            copy_clear,
         )
     }
 
@@ -1355,10 +1551,7 @@ impl WebGpuRenderer {
         destination: u32,
         stride: u32,
         generation: u32,
-        clear: bool,
-        clear_red: u8,
-        clear_green: u8,
-        clear_blue: u8,
+        copy_clear: Option<GxCopyState>,
     ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
@@ -1423,6 +1616,21 @@ impl WebGpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        if let Some(state) = copy_clear {
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
+            });
+            self.encode_copy_clear(
+                &mut encoder,
+                ScissorRect {
+                    x: source_x,
+                    y: source_y,
+                    width,
+                    height: source_height,
+                },
+                state,
+            );
+        }
         self.queue.submit([encoder.finish()]);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
@@ -1450,9 +1658,6 @@ impl WebGpuRenderer {
                 .map(|(address, _)| *address)
         {
             self.xfb_cache.remove(&address);
-        }
-        if clear {
-            self.clear_efb_inner(clear_red, clear_green, clear_blue)?;
         }
         self.ensure_healthy()
     }
@@ -1775,6 +1980,7 @@ impl WebGpuRenderer {
             ],
         });
         let samplers = create_samplers(&device);
+        let copy_clear = create_copy_clear_resources(&device);
         let pipelines = create_pipelines(
             &device,
             &tev_draw_layout,
@@ -1804,6 +2010,7 @@ impl WebGpuRenderer {
             efb_color_view,
             _efb_depth: efb_depth,
             efb_depth_view,
+            copy_clear,
             tev_draw_layout,
             tev_texture_layout,
             present_layout,
@@ -1821,7 +2028,7 @@ impl WebGpuRenderer {
             tev_draw_bindings: Vec::new(),
         };
         renderer
-            .clear_efb(0, 0, 0)
+            .reset_efb_inner()
             .map_err(|error| error.as_string().unwrap_or_else(|| format!("{error:?}")))?;
         Ok(renderer)
     }
@@ -2380,6 +2587,134 @@ fn create_tev_geometry_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn create_copy_clear_resources(device: &wgpu::Device) -> CopyClearResources {
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("browser GX copy-clear layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("browser GX copy-clear uniform"),
+        contents: bytemuck::bytes_of(&CopyClearUniform::new([0; 4], GX_DEPTH24_MAX)),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("browser GX copy-clear bind group"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform.as_entire_binding(),
+        }],
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("browser GX copy-clear shader"),
+        source: wgpu::ShaderSource::Wgsl(COPY_CLEAR_SHADER.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("browser GX copy-clear pipeline layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipelines = (0..8)
+        .map(|index| {
+            let mask = GxCopyClearMask::from_index(index);
+            let mut write_mask = wgpu::ColorWrites::empty();
+            if mask.color {
+                write_mask |= wgpu::ColorWrites::COLOR;
+            }
+            if mask.alpha {
+                write_mask |= wgpu::ColorWrites::ALPHA;
+            }
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("browser GX copy-clear pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(mask.depth),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        })
+        .collect();
+    CopyClearResources {
+        uniform,
+        bind_group,
+        pipelines,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_copy_clear_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    color_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    rectangle: ScissorRect,
+    label: &'static str,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_scissor_rect(rectangle.x, rectangle.y, rectangle.width, rectangle.height);
+    pass.draw(0..3, 0..1);
 }
 
 fn create_pipelines(

@@ -1355,6 +1355,8 @@ mod tests {
         assert!(TEV_WGSL.contains("fn tev_color_combiner"));
         assert!(TEV_WGSL.contains("fn tev_alpha_combiner"));
         assert!(TEV_WGSL.contains("fn tev_evaluate"));
+        assert!(TEV_VERTEX_WGSL.contains("input.position.z / 16777215.0"));
+        assert!(!TEV_VERTEX_WGSL.contains("input.position.z / 16777216.0"));
     }
 
     #[test]
