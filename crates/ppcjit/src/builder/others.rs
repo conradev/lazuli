@@ -19,6 +19,12 @@ const MSR_INFO: InstructionInfo = InstructionInfo {
     action: Action::Continue,
 };
 
+const ADDRESS_SPACE_BARRIER_INFO: InstructionInfo = InstructionInfo {
+    cycles: 1,
+    auto_pc: true,
+    action: Action::Exit,
+};
+
 const CR_INFO: InstructionInfo = InstructionInfo {
     cycles: 1,
     auto_pc: true,
@@ -92,8 +98,14 @@ impl BlockBuilder<'_> {
             SPR::TBL | SPR::TBU => self.call_generic_hook(self.hooks.tb_changed),
             SPR::DMAL | SPR::DMAU => self.call_generic_hook(self.hooks.dcache_dma),
             SPR::WPAR => tracing::warn!("write to WPAR"),
-            spr if spr.is_data_bat() => self.dbat_changed_at = Some(self.executed_cycles),
-            spr if spr.is_instr_bat() => self.ibat_changed_at = Some(self.executed_cycles),
+            spr if spr.is_data_bat() => {
+                self.call_generic_hook(self.hooks.dbat_changed);
+                return ADDRESS_SPACE_BARRIER_INFO;
+            }
+            spr if spr.is_instr_bat() => {
+                self.call_generic_hook(self.hooks.ibat_changed);
+                return ADDRESS_SPACE_BARRIER_INFO;
+            }
             _ => (),
         }
 
@@ -131,7 +143,7 @@ impl BlockBuilder<'_> {
 
         self.call_generic_hook(self.hooks.msr_changed);
 
-        MSR_INFO
+        ADDRESS_SPACE_BARRIER_INFO
     }
 
     pub fn mfcr(&mut self, ins: Ins) -> InstructionInfo {

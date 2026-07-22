@@ -173,8 +173,6 @@ pub struct BlockBuilder<'ctx> {
     executed_cycles: u16,
     executed_instructions: u16,
 
-    ibat_changed_at: Option<u16>,
-    dbat_changed_at: Option<u16>,
     floats_checked: bool,
 }
 
@@ -340,8 +338,6 @@ impl<'ctx> BlockBuilder<'ctx> {
             executed_cycles: 0,
             executed_instructions: 0,
 
-            ibat_changed_at: None,
-            dbat_changed_at: None,
             floats_checked: false,
         }
     }
@@ -514,14 +510,6 @@ impl<'ctx> BlockBuilder<'ctx> {
 
     /// Exits the block.
     fn exit(&mut self, reason: impl IntoIrValue) {
-        if let Some(cycles) = self.dbat_changed_at {
-            self.call_generic_hook_at(self.hooks.dbat_changed, cycles);
-        }
-
-        if let Some(cycles) = self.ibat_changed_at {
-            self.call_generic_hook_at(self.hooks.ibat_changed, cycles);
-        }
-
         if self.frontend.exit_mode != ExitMode::Native {
             let executed = 0
                 .with_bits(0, 16, self.executed_instructions as u32)
