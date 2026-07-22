@@ -44,6 +44,17 @@ test("deployment retains the passive public SMB observer gates", async () => {
   }
 });
 
+test("deployment retains the sustained public SMB release gate", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/deploy-web.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /^\s+tools\/browser_public_smb_sustained\.test\.mjs$/m,
+  );
+});
+
 test("deployment builds pinned wasm-bindgen browser renderer assets before the frontend", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/deploy-web.yml", import.meta.url),

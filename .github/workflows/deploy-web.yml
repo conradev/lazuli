@@ -65,6 +65,7 @@ jobs:
           tools/browser_public_cdp.test.mjs
           tools/browser_public_smb_screencast.test.mjs
           tools/browser_public_smb_screencast_oracle.test.mjs
+          tools/browser_public_smb_sustained.test.mjs
           tools/browser_public_warioware_smoke.test.mjs
           tools/build_web.test.mjs
           tools/deploy_web.test.mjs
