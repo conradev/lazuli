@@ -22,13 +22,16 @@ const headlessSource = readFileSync(
 function extractFunction(name) {
   const functionStart = source.indexOf(`function ${name}(`);
   assert.notEqual(functionStart, -1, `missing ${name}`);
-  const bodyStart = source.indexOf("{", functionStart);
+  const start = source.slice(functionStart - 6, functionStart) === "async "
+    ? functionStart - 6
+    : functionStart;
+  const bodyStart = source.indexOf("{", start);
   let depth = 0;
   for (let index = bodyStart; index < source.length; index += 1) {
     if (source[index] === "{") depth += 1;
     if (source[index] !== "}") continue;
     depth -= 1;
-    if (depth === 0) return source.slice(functionStart, index + 1);
+    if (depth === 0) return source.slice(start, index + 1);
   }
   assert.fail(`unterminated ${name}`);
 }
@@ -129,20 +132,48 @@ test("renderer performance derives exact bridge and resource totals", async () =
     wasmBridgeCalls: 17,
     wasmBridgeTypedArrayBytes: 1920,
   };
+  const webgpuPhases = {
+    drawSampling: { eligibleCalls: 10_000, sampleStride: 1024 },
+    packetParse: { samples: 1, totalMs: 1.5, maxMs: 1.5 },
+    topologyExpansion: { samples: 10, totalMs: 2.5, maxMs: 0.5 },
+    resourcePreparation: { samples: 10, totalMs: 4.5, maxMs: 1.25 },
+    gxFrameExecution: { samples: 1, totalMs: 8.5, maxMs: 8.5 },
+  };
   const context = {
     Promise,
     rendererHostMetrics: {
       operations: { enqueued: 5, pending: 0, highWater: 1 },
-      wall: { workerStartToLastReportMs: 1234.5 },
+      wall: {
+        workerStartToLastReportMs: 1234.5,
+        phases: {
+          operationQueueWait: {
+            eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 3, maxMs: 2,
+          },
+          operationDispatch: {
+            eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 12, maxMs: 4,
+          },
+          operationTotal: {
+            eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 40, maxMs: 15,
+          },
+          queueDrain: {
+            eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 20, maxMs: 7,
+          },
+        },
+      },
       workerMessages: { gxFrames: 1, drawCalls: 10, receivedArrayBufferBytes: 1920 },
     },
     rendererOperationTail: Promise.resolve(),
-    webGpuRenderer: { diagnostics: () => webgpu },
+    webGpuRenderer: {
+      diagnostics: () => webgpu,
+      host_diagnostics: () => webgpuPhases,
+    },
   };
   vm.createContext(context);
   vm.runInContext(
     [
       "appendRendererOperation",
+      "snapshotRendererPhaseTiming",
+      "snapshotRendererWallPhases",
       "snapshotRendererPerformance",
       "captureRendererPerformance",
     ].map(extractFunction).join("\n\n"),
@@ -176,7 +207,39 @@ test("renderer performance derives exact bridge and resource totals", async () =
     performance.wasmBridge.typedArrayBytes,
     performance.workerMessages.receivedArrayBufferBytes,
   );
-  assert.deepEqual(performance.wall, { workerStartToLastReportMs: 1234.5 });
+  assert.deepEqual(performance.wall, {
+    workerStartToLastReportMs: 1234.5,
+    phases: {
+      gxFrameExecution: {
+        eligibleCalls: 1, sampleStride: 1, samples: 1, totalMs: 8.5, maxMs: 8.5,
+      },
+      operationDispatch: {
+        eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 12, maxMs: 4,
+      },
+      operationQueueWait: {
+        eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 3, maxMs: 2,
+      },
+      operationTotal: {
+        eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 40, maxMs: 15,
+      },
+      packetParse: {
+        eligibleCalls: 1, sampleStride: 1, samples: 1, totalMs: 1.5, maxMs: 1.5,
+      },
+      queueDrain: {
+        eligibleCalls: 5, sampleStride: 64, samples: 5, totalMs: 20, maxMs: 7,
+      },
+      resourcePreparation: {
+        eligibleCalls: 10_000, sampleStride: 1024, samples: 10, totalMs: 4.5, maxMs: 1.25,
+      },
+      topologyExpansion: {
+        eligibleCalls: 10_000, sampleStride: 1024, samples: 10, totalMs: 2.5, maxMs: 0.5,
+      },
+    },
+  });
+  context.rendererHostMetrics.wall.phases.operationQueueWait.totalMs = 999;
+  webgpuPhases.packetParse.totalMs = 999;
+  assert.equal(performance.wall.phases.operationQueueWait.totalMs, 3);
+  assert.equal(performance.wall.phases.packetParse.totalMs, 1.5);
   assert.deepEqual(context.rendererHostMetrics.operations, {
     enqueued: 5,
     pending: 0,
@@ -212,6 +275,80 @@ test("renderer performance waits for queued work without accounting itself", asy
     { operations: { enqueued: 9, pending: 0, highWater: 2 } },
   );
   assert.deepEqual(calls, ["metrics"]);
+});
+
+test("sampled renderer queue and drain phases account exact captured-epoch wall time", async () => {
+  const clock = [10, 14, 16, 18, 30, 40];
+  let release;
+  let healthChecks = 0;
+  const context = {
+    Math,
+    Number,
+    Promise,
+    performance: { now: () => clock.shift() },
+    rendererHostMetrics: { operations: {} },
+    rendererOperationTail: new Promise(resolve => { release = resolve; }),
+    webGpuRenderer: {
+      drain: () => Promise.resolve(),
+      check_health: () => { healthChecks += 1; },
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "newRendererPhaseTiming",
+      "beginRendererPhaseTiming",
+      "recordRendererPhaseTiming",
+      "newRendererWallPhases",
+      "appendRendererOperation",
+      "enqueueRendererOperation",
+      "drainWebGpuRenderer",
+    ].map(extractFunction).join("\n\n"),
+    context,
+  );
+
+  const oldMetrics = {
+    operations: { enqueued: 0, pending: 0, highWater: 0 },
+    wall: { phases: context.newRendererWallPhases() },
+  };
+  const replacementMetrics = {
+    operations: { enqueued: 0, pending: 0, highWater: 0 },
+    wall: { phases: context.newRendererWallPhases() },
+  };
+  context.rendererHostMetrics = oldMetrics;
+  const pending = context.enqueueRendererOperation(() => "complete");
+  context.rendererHostMetrics = replacementMetrics;
+  release();
+  assert.equal(await pending, "complete");
+  await Promise.resolve();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(oldMetrics.wall.phases)), {
+    operationDispatch: {
+      eligibleCalls: 1, sampleStride: 64, samples: 1, totalMs: 2, maxMs: 2,
+    },
+    operationQueueWait: {
+      eligibleCalls: 1, sampleStride: 64, samples: 1, totalMs: 4, maxMs: 4,
+    },
+    operationTotal: {
+      eligibleCalls: 1, sampleStride: 64, samples: 1, totalMs: 8, maxMs: 8,
+    },
+    queueDrain: {
+      eligibleCalls: 0, sampleStride: 64, samples: 0, totalMs: 0, maxMs: 0,
+    },
+  });
+  assert.equal(replacementMetrics.operations.enqueued, 0);
+  assert.equal(replacementMetrics.wall.phases.operationTotal.eligibleCalls, 0);
+
+  await context.drainWebGpuRenderer(oldMetrics.wall.phases);
+  assert.deepEqual(JSON.parse(JSON.stringify(oldMetrics.wall.phases.queueDrain)), {
+    eligibleCalls: 1,
+    sampleStride: 64,
+    samples: 1,
+    totalMs: 10,
+    maxMs: 10,
+  });
+  assert.equal(healthChecks, 1);
+  assert.deepEqual(clock, []);
 });
 
 test("terminal capture snapshots metrics before its serialized XFB readback", async () => {

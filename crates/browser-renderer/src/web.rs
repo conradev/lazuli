@@ -23,16 +23,22 @@ use crate::tev::{
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
     GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxEfbFormat, GxXfbCopyParameters,
-    RendererFailureState, RendererMetrics, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
-    SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
-    XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent, compact_surface_readback_rows,
-    compact_xfb_scanout_rows, decoded_texture_cache_hit, decoded_texture_is_available,
-    gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float,
-    gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height, merge_contiguous_draw_range,
-    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
-    rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
-    xfb_scanout_plan, xfb_surface_extent_matches,
+    RendererFailureState, RendererHostTimings, RendererMetrics, RendererPhaseTiming,
+    SamplerIdentity, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
+    TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan,
+    clipped_copy_extent, compact_surface_readback_rows, compact_xfb_scanout_rows,
+    decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state, gx_copy_clear_mask,
+    gx_copy_clear_rgba, gx_depth24_to_float, gx_sampler_identity, gx_xfb_copy_parameters,
+    gx_xfb_output_height, merge_contiguous_draw_range, requested_surface_readback_layout,
+    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
+    xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
 };
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn host_performance_now() -> f64;
+}
 
 const PRESENT_SHADER: &str = "
 struct XfbPresentUniform {
@@ -83,6 +89,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     );
 }
 ";
+
+const DRAW_TIMING_SAMPLE_STRIDE: u64 = 1024;
 
 const XFB_COPY_SHADER: &str = "
 struct XfbCopyUniform {
@@ -614,6 +622,8 @@ pub struct WebGpuRenderer {
     queue: wgpu::Queue,
     failure_state: RendererFailureState,
     metrics: Rc<Cell<RendererMetrics>>,
+    host_timings: Rc<Cell<RendererHostTimings>>,
+    draw_timing_eligible_calls: Cell<u64>,
     surface_config: wgpu::SurfaceConfiguration,
     efb_color: wgpu::Texture,
     efb_color_view: wgpu::TextureView,
@@ -640,6 +650,50 @@ pub struct WebGpuRenderer {
     tev_draw_bindings: Vec<CachedTevDrawBinding>,
 }
 
+#[derive(Clone, Copy)]
+enum RendererHostPhase {
+    PacketParse,
+    TopologyExpansion,
+    ResourcePreparation,
+    GxFrameExecution,
+}
+
+struct RendererPhaseTimer {
+    timings: Rc<Cell<RendererHostTimings>>,
+    phase: RendererHostPhase,
+    started_at: f64,
+}
+
+impl RendererPhaseTimer {
+    fn new(timings: Rc<Cell<RendererHostTimings>>, phase: RendererHostPhase) -> Self {
+        Self {
+            timings,
+            phase,
+            started_at: host_performance_now(),
+        }
+    }
+}
+
+impl Drop for RendererPhaseTimer {
+    fn drop(&mut self) {
+        let duration_ms = host_performance_now() - self.started_at;
+        let mut timings = self.timings.get();
+        match self.phase {
+            RendererHostPhase::PacketParse => timings.packet_parse.record(duration_ms),
+            RendererHostPhase::TopologyExpansion => {
+                timings.topology_expansion.record(duration_ms);
+            }
+            RendererHostPhase::ResourcePreparation => {
+                timings.resource_preparation.record(duration_ms);
+            }
+            RendererHostPhase::GxFrameExecution => {
+                timings.gx_frame_execution.record(duration_ms);
+            }
+        }
+        self.timings.set(timings);
+    }
+}
+
 fn update_renderer_metrics(
     metrics: &Cell<RendererMetrics>,
     update: impl FnOnce(&mut RendererMetrics),
@@ -647,6 +701,47 @@ fn update_renderer_metrics(
     let mut current = metrics.get();
     update(&mut current);
     metrics.set(current);
+}
+
+fn renderer_phase_timing_object(timing: RendererPhaseTiming) -> Result<Object, JsValue> {
+    let result = Object::new();
+    for (name, value) in [
+        ("samples", timing.samples as f64),
+        ("totalMs", timing.total_ms),
+        ("maxMs", timing.max_ms),
+    ] {
+        Reflect::set(&result, &JsValue::from_str(name), &JsValue::from_f64(value))?;
+    }
+    Ok(result)
+}
+
+fn renderer_host_timings_object(
+    timings: RendererHostTimings,
+    draw_timing_eligible_calls: u64,
+) -> Result<Object, JsValue> {
+    let result = Object::new();
+    for (name, timing) in [
+        ("packetParse", timings.packet_parse),
+        ("topologyExpansion", timings.topology_expansion),
+        ("resourcePreparation", timings.resource_preparation),
+        ("gxFrameExecution", timings.gx_frame_execution),
+    ] {
+        let timing: JsValue = renderer_phase_timing_object(timing)?.into();
+        Reflect::set(&result, &JsValue::from_str(name), &timing)?;
+    }
+    let draw_sampling = Object::new();
+    for (name, value) in [
+        ("eligibleCalls", draw_timing_eligible_calls),
+        ("sampleStride", DRAW_TIMING_SAMPLE_STRIDE),
+    ] {
+        Reflect::set(
+            &draw_sampling,
+            &JsValue::from_str(name),
+            &JsValue::from_f64(value as f64),
+        )?;
+    }
+    Reflect::set(&result, &JsValue::from_str("drawSampling"), &draw_sampling)?;
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -792,10 +887,30 @@ impl WebGpuRenderer {
 
     pub fn reset_diagnostics(&self) {
         self.metrics.set(RendererMetrics::default());
+        self.host_timings.set(RendererHostTimings::default());
+        self.draw_timing_eligible_calls.set(0);
     }
 
     pub fn diagnostics(&self) -> Result<Object, JsValue> {
         renderer_metrics_object(self.metrics.get())
+    }
+
+    pub fn host_diagnostics(&self) -> Result<Object, JsValue> {
+        renderer_host_timings_object(
+            self.host_timings.get(),
+            self.draw_timing_eligible_calls.get(),
+        )
+    }
+
+    fn host_phase_timer(&self, phase: RendererHostPhase) -> RendererPhaseTimer {
+        RendererPhaseTimer::new(Rc::clone(&self.host_timings), phase)
+    }
+
+    fn sample_draw_host_timing(&self) -> bool {
+        let eligible_call = self.draw_timing_eligible_calls.get();
+        self.draw_timing_eligible_calls
+            .set(eligible_call.saturating_add(1));
+        eligible_call % DRAW_TIMING_SAMPLE_STRIDE == 0
     }
 
     fn record_wasm_bridge_call(&self, typed_array_bytes: usize) {
@@ -1291,6 +1406,10 @@ impl WebGpuRenderer {
     /// preflight finish before rendering state changes, so a malformed Worker
     /// packet cannot leave a partial WebGPU frame behind.
     pub fn submit_gx_frame(&mut self, source_packet: Uint8Array) -> Result<Array, JsValue> {
+        // Keep the existing `packetParse` diagnostic as one inclusive packet-
+        // preparation phase: JS-to-Wasm copying, structural parsing, texture
+        // preflight, and vertex flattening all happen before renderer mutation.
+        let packet_parse_timer = self.host_phase_timer(RendererHostPhase::PacketParse);
         let packet_bytes = source_packet.to_vec();
         self.record_wasm_bridge_call(packet_bytes.len());
         let packet = GxFramePacket::parse(&packet_bytes)
@@ -1349,6 +1468,7 @@ impl WebGpuRenderer {
         for draw in packet.draws() {
             source_vertices.extend(draw.vertex_floats());
         }
+        drop(packet_parse_timer);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.submit_gx_frame_calls = metrics.submit_gx_frame_calls.saturating_add(1);
             metrics.gx_frame_packet_bytes = metrics
@@ -1361,6 +1481,9 @@ impl WebGpuRenderer {
                 .texture_pixel_bytes
                 .saturating_add(payload_bytes as u64);
         });
+        // This inclusive frame-level phase contains the draw loop, terminal
+        // copy encoding, and synchronous queue submission.
+        let gx_frame_execution_timer = self.host_phase_timer(RendererHostPhase::GxFrameExecution);
         let render = (|| {
             self.begin_segment_inner()?;
             for draw in packet.draws() {
@@ -1438,6 +1561,7 @@ impl WebGpuRenderer {
                 ),
             }
         })();
+        drop(gx_frame_execution_timer);
         if render.is_err() {
             self.clear_segment();
         }
@@ -1475,6 +1599,11 @@ impl WebGpuRenderer {
         scissor_width: u32,
         scissor_height: u32,
     ) -> Result<(), JsValue> {
+        // Super Monkey Ball emits millions of draws. Sample one deterministic
+        // draw ordinal per stride so host clock imports cannot dominate GX.
+        let sample_draw_timing = self.sample_draw_host_timing();
+        let topology_expansion_timer =
+            sample_draw_timing.then(|| self.host_phase_timer(RendererHostPhase::TopologyExpansion));
         let vertex_count = validate_draw_transport(
             source_vertices.len(),
             tev_state.len(),
@@ -1490,6 +1619,7 @@ impl WebGpuRenderer {
         let expanded_vertex_bytes = expanded
             .len()
             .saturating_mul(std::mem::size_of::<TevVertex>());
+        drop(topology_expansion_timer);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.record_draw_transport(
                 source_vertices
@@ -1502,6 +1632,8 @@ impl WebGpuRenderer {
             );
         });
 
+        let resource_preparation_timer = sample_draw_timing
+            .then(|| self.host_phase_timer(RendererHostPhase::ResourcePreparation));
         if expanded.is_empty() {
             return Ok(());
         }
@@ -1680,6 +1812,7 @@ impl WebGpuRenderer {
             self.tev_draw_binding_indices.insert(binding_key, binding);
             binding
         };
+        drop(resource_preparation_timer);
 
         let start = self.tev_vertices.len() as u32;
         for index in expanded {
@@ -2517,6 +2650,8 @@ impl WebGpuRenderer {
             queue,
             failure_state,
             metrics: Rc::new(Cell::new(RendererMetrics::default())),
+            host_timings: Rc::new(Cell::new(RendererHostTimings::default())),
+            draw_timing_eligible_calls: Cell::new(0),
             surface_config,
             efb_color,
             efb_color_view,

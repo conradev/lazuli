@@ -75,6 +75,32 @@ impl RendererMetrics {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RendererPhaseTiming {
+    pub(crate) samples: u64,
+    pub(crate) total_ms: f64,
+    pub(crate) max_ms: f64,
+}
+
+impl RendererPhaseTiming {
+    pub(crate) fn record(&mut self, duration_ms: f64) {
+        if !duration_ms.is_finite() || duration_ms < 0.0 {
+            return;
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.total_ms = (self.total_ms + duration_ms).min(f64::MAX);
+        self.max_ms = self.max_ms.max(duration_ms);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RendererHostTimings {
+    pub(crate) packet_parse: RendererPhaseTiming,
+    pub(crate) topology_expansion: RendererPhaseTiming,
+    pub(crate) resource_preparation: RendererPhaseTiming,
+    pub(crate) gx_frame_execution: RendererPhaseTiming,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RendererFailureState {
     failure: Arc<Mutex<Option<String>>>,
@@ -1140,16 +1166,16 @@ mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH24_MAX, GxBlendFactor,
         GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxEfbFormat, RendererFailureState,
-        RendererMetrics, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
-        TextureAddressMode, XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
-        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
-        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
-        gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_copy_filter_coefficients,
-        gx_copy_filter_taps, gx_depth24_to_float, gx_efb_format, gx_float_to_depth24,
-        gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height,
-        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
-        requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
-        reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
+        RendererMetrics, RendererPhaseTiming, SelectedTexture, SurfacePixelOrder,
+        SurfaceReadbackRequestError, TextureAddressMode, XfbCopyMetadata, alpha_compare,
+        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
+        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
+        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_blend_state,
+        gx_copy_clear_mask, gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
+        gx_depth24_to_float, gx_efb_format, gx_float_to_depth24, gx_sampler_identity,
+        gx_xfb_copy_parameters, gx_xfb_output_height, materialize_xfb_rgba8_reference,
+        merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
+        resolve_xfb_copy, reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
         xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_scanout_plan,
         xfb_scanout_source_row, xfb_surface_extent_matches,
     };
@@ -1518,6 +1544,20 @@ mod tests {
         assert_eq!(metrics.wasm_bridge_typed_array_bytes, 1920);
         assert_eq!(metrics.push_tev_draw_calls, 0);
         assert_eq!(metrics.texture_pixel_bytes, 0);
+    }
+
+    #[test]
+    fn renderer_phase_timing_accumulates_finite_nonnegative_host_samples() {
+        let mut timing = RendererPhaseTiming::default();
+        timing.record(1.25);
+        timing.record(0.75);
+        timing.record(-1.0);
+        timing.record(f64::NAN);
+        timing.record(f64::INFINITY);
+
+        assert_eq!(timing.samples, 2);
+        assert_eq!(timing.total_ms, 2.0);
+        assert_eq!(timing.max_ms, 1.25);
     }
 
     #[test]
