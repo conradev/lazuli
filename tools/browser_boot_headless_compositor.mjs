@@ -4,7 +4,8 @@ import { Buffer } from "node:buffer";
 
 import { decodeCompositorPng } from "./browser_boot_compositor_png.mjs";
 
-export const COMPOSITOR_CAPTURE_PROTOCOL = "lazuli-compositor-capture-v1";
+export const LEGACY_COMPOSITOR_CAPTURE_PROTOCOL = "lazuli-compositor-capture-v1";
+export const COMPOSITOR_CAPTURE_PROTOCOL = "lazuli-compositor-capture-v2";
 export const COMPOSITOR_CAPTURE_COUNT = 8;
 const COMPOSITOR_DEVICE_METRICS = Object.freeze({
   deviceScaleFactor: 1,
@@ -126,6 +127,38 @@ function compositorPositiveInteger(value, path) {
   const integer = compositorNonNegativeInteger(value, path);
   if (integer === 0) throw compositorFailure(`${path} must be positive`);
   return integer;
+}
+
+function compositorProtocol(value, path) {
+  if (
+    value !== COMPOSITOR_CAPTURE_PROTOCOL
+    && value !== LEGACY_COMPOSITOR_CAPTURE_PROTOCOL
+  ) {
+    throw compositorFailure(`${path} must be a supported compositor capture protocol`);
+  }
+  return value;
+}
+
+function validateCompositorScanout(value, path, height) {
+  const policy = value.scanoutPolicy;
+  const fieldStrideBytes = compositorPositiveInteger(
+    value.fieldStrideBytes,
+    `${path}.fieldStrideBytes`,
+  );
+  const sourceRowStep = compositorPositiveInteger(
+    value.sourceRowStep,
+    `${path}.sourceRowStep`,
+  );
+  const fieldHeight = compositorPositiveInteger(value.fieldHeight, `${path}.fieldHeight`);
+  const rowRepeat = compositorPositiveInteger(value.rowRepeat, `${path}.rowRepeat`);
+  if (rowRepeat !== 1 && rowRepeat !== 2) {
+    throw compositorFailure(`${path}.rowRepeat must be 1 or 2`);
+  }
+  compositorExact(policy, rowRepeat === 2 ? "bob" : "direct", `${path}.scanoutPolicy`);
+  compositorExact(height, fieldHeight * rowRepeat, `${path}.height`);
+  if (fieldStrideBytes % sourceRowStep !== 0) {
+    throw compositorFailure(`${path}.fieldStrideBytes must be divisible by sourceRowStep`);
+  }
 }
 
 function compositorExact(value, expected, path) {
@@ -283,7 +316,8 @@ async function observeCompositorEnvironment(session) {
 function validateCompositorDescriptor(pending, frames, liveGeometry) {
   const path = "$.lazuliCompositorCapture.pending";
   compositorObject(pending, path);
-  compositorExactKeys(pending, [
+  const protocol = compositorProtocol(pending.protocol, `${path}.protocol`);
+  const keys = [
     "address",
     "generation",
     "geometry",
@@ -297,8 +331,17 @@ function validateCompositorDescriptor(pending, frames, liveGeometry) {
     "step",
     "token",
     "width",
-  ], path);
-  compositorExact(pending.protocol, COMPOSITOR_CAPTURE_PROTOCOL, `${path}.protocol`);
+  ];
+  if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    keys.push(
+      "fieldHeight",
+      "fieldStrideBytes",
+      "rowRepeat",
+      "scanoutPolicy",
+      "sourceRowStep",
+    );
+  }
+  compositorExactKeys(pending, keys, path);
   compositorExact(pending.scenario, "smb-ready-play", `${path}.scenario`);
   compositorExact(pending.step, "post-play-presented", `${path}.step`);
   compositorExact(pending.ordinal, frames.length + 1, `${path}.ordinal`);
@@ -328,12 +371,16 @@ function validateCompositorDescriptor(pending, frames, liveGeometry) {
   if (width > 1024 || height > 1024) {
     throw compositorFailure(`${path} dimensions exceed 1024x1024`);
   }
+  if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    validateCompositorScanout(pending, path, height);
+  }
   validateCompositorGeometry(pending.geometry, { height, width }, `${path}.geometry`);
   if (JSON.stringify(pending.geometry) !== JSON.stringify(liveGeometry)) {
     throw compositorFailure(`${path}.geometry does not match the live #display geometry`);
   }
   const previous = frames.at(-1)?.descriptor ?? null;
   if (previous !== null) {
+    compositorExact(protocol, previous.protocol, `${path}.protocol`);
     if (rendererSequence <= previous.rendererSequence) {
       throw compositorFailure(`${path}.rendererSequence is not strictly increasing`);
     }
@@ -500,7 +547,7 @@ export function compositorCaptureEvidence(capture) {
     loaderId: capture.navigationLoaderId,
     oracle: null,
     oraclePassed: false,
-    protocol: COMPOSITOR_CAPTURE_PROTOCOL,
+    protocol: capture.frames[0]?.descriptor?.protocol ?? COMPOSITOR_CAPTURE_PROTOCOL,
     schemaValid: false,
     target: "#display",
     url: capture.runUrl,

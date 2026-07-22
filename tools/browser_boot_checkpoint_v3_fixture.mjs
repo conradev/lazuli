@@ -6,6 +6,7 @@ import {
 } from "./browser_boot_gameplay_transcript_fixture.mjs";
 import {
   SMB_TEMPORAL_XFB_CAPACITY,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
   deriveTemporalSelectedXfbOracle,
 } from "./browser_boot_temporal_xfb.mjs";
 
@@ -16,12 +17,19 @@ function digest(index) {
 function temporalFrame(index) {
   const bottom = index % 2 === 1;
   const generation = 500 + index;
-  const width = 4;
-  const textureHeight = 4;
+  const width = 640;
+  const textureHeight = 448;
   const sourceRow = bottom ? 1 : 0;
-  const height = textureHeight - sourceRow;
+  const height = 448;
   const pixels = width * height;
-  const address = bottom ? "0x00307180" : "0x00392c80";
+  const address = bottom ? "0x00307180" : "0x00306c80";
+  const scanout = {
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0xa00,
+    sourceRowStep: 2,
+    fieldHeight: 224,
+    rowRepeat: 2,
+  };
   return {
     scenario: "smb-ready-play",
     step: "post-play-presented",
@@ -35,6 +43,12 @@ function temporalFrame(index) {
       copyRow: sourceRow,
       width,
       height: textureHeight,
+      pictureConfiguration: 0x2850,
+      wordsPerLine: 40,
+      standardWordsPerLine: 80,
+      activeLines: 224,
+      nonInterlaced: false,
+      ...scanout,
     },
     selectedXfb: {
       address,
@@ -51,6 +65,7 @@ function temporalFrame(index) {
       logicalHeight: textureHeight,
       displayWidth: width,
       displayHeight: textureHeight,
+      ...scanout,
       rgbaByteLength: pixels * 4,
       rgbaSha256: digest(index + 1),
       rgbSha256: digest(index + 17),
@@ -65,6 +80,7 @@ export function smbReadyPlayTemporalSelectedXfb() {
     (_unused, index) => temporalFrame(index),
   );
   return {
+    scanoutEvidenceVersion: TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
     capacity: SMB_TEMPORAL_XFB_CAPACITY,
     frames,
     oracle: deriveTemporalSelectedXfbOracle(frames),

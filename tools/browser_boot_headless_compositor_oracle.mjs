@@ -3,6 +3,7 @@
 import {
   COMPOSITOR_CAPTURE_COUNT,
   COMPOSITOR_CAPTURE_PROTOCOL,
+  LEGACY_COMPOSITOR_CAPTURE_PROTOCOL,
   compositorFailure,
 } from "./browser_boot_headless_compositor.mjs";
 
@@ -50,6 +51,31 @@ function positiveInteger(value, path) {
   const integer = nonNegativeInteger(value, path);
   if (integer === 0) throw compositorFailure(`${path} must be positive`);
   return integer;
+}
+
+function captureProtocol(value, path) {
+  if (
+    value !== COMPOSITOR_CAPTURE_PROTOCOL
+    && value !== LEGACY_COMPOSITOR_CAPTURE_PROTOCOL
+  ) {
+    throw compositorFailure(`${path} must be a supported compositor capture protocol`);
+  }
+  return value;
+}
+
+function validateScanout(value, path, height) {
+  const fieldStrideBytes = positiveInteger(value.fieldStrideBytes, `${path}.fieldStrideBytes`);
+  const sourceRowStep = positiveInteger(value.sourceRowStep, `${path}.sourceRowStep`);
+  const fieldHeight = positiveInteger(value.fieldHeight, `${path}.fieldHeight`);
+  const rowRepeat = positiveInteger(value.rowRepeat, `${path}.rowRepeat`);
+  if (rowRepeat !== 1 && rowRepeat !== 2) {
+    throw compositorFailure(`${path}.rowRepeat must be 1 or 2`);
+  }
+  exact(value.scanoutPolicy, rowRepeat === 2 ? "bob" : "direct", `${path}.scanoutPolicy`);
+  exact(height, fieldHeight * rowRepeat, `${path}.height`);
+  if (fieldStrideBytes % sourceRowStep !== 0) {
+    throw compositorFailure(`${path}.fieldStrideBytes must be divisible by sourceRowStep`);
+  }
 }
 
 function finite(value, path) {
@@ -205,9 +231,9 @@ function validateGeometry(geometry, path, width, height) {
   return geometry;
 }
 
-function validateDescriptor(descriptor, path, index, previous) {
+function validateDescriptor(descriptor, path, index, previous, protocol) {
   object(descriptor, path);
-  exactKeys(descriptor, [
+  const keys = [
     "address",
     "generation",
     "geometry",
@@ -221,8 +247,18 @@ function validateDescriptor(descriptor, path, index, previous) {
     "step",
     "token",
     "width",
-  ], path);
-  exact(descriptor.protocol, COMPOSITOR_CAPTURE_PROTOCOL, `${path}.protocol`);
+  ];
+  if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    keys.push(
+      "fieldHeight",
+      "fieldStrideBytes",
+      "rowRepeat",
+      "scanoutPolicy",
+      "sourceRowStep",
+    );
+  }
+  exactKeys(descriptor, keys, path);
+  exact(descriptor.protocol, protocol, `${path}.protocol`);
   exact(descriptor.scenario, "smb-ready-play", `${path}.scenario`);
   exact(descriptor.step, "post-play-presented", `${path}.step`);
   exact(descriptor.ordinal, index + 1, `${path}.ordinal`);
@@ -246,6 +282,7 @@ function validateDescriptor(descriptor, path, index, previous) {
   if (width > 1024 || height > 1024) {
     throw compositorFailure(`${path} dimensions exceed 1024x1024`);
   }
+  if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) validateScanout(descriptor, path, height);
   validateGeometry(descriptor.geometry, `${path}.geometry`, width, height);
   if (previous !== null) {
     if (descriptor.rendererSequence <= previous.rendererSequence) {
@@ -378,9 +415,8 @@ export function verifyCompositorCaptureReport(report, options) {
   exact(compositor.fromSurface, true, "$.headlessCapture.compositor.fromSurface");
   exact(compositor.oracle, null, "$.headlessCapture.compositor.oracle");
   exact(compositor.oraclePassed, false, "$.headlessCapture.compositor.oraclePassed");
-  exact(
+  const protocol = captureProtocol(
     compositor.protocol,
-    COMPOSITOR_CAPTURE_PROTOCOL,
     "$.headlessCapture.compositor.protocol",
   );
   exact(compositor.schemaValid, false, "$.headlessCapture.compositor.schemaValid");
@@ -411,6 +447,20 @@ export function verifyCompositorCaptureReport(report, options) {
   if (!Array.isArray(temporal) || temporal.length !== COMPOSITOR_CAPTURE_COUNT) {
     throw compositorFailure("terminal temporal XFB evidence does not contain 8 frames");
   }
+  if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    exact(
+      report.rendering?.temporalSelectedXfb?.scanoutEvidenceVersion,
+      2,
+      "$.rendering.temporalSelectedXfb.scanoutEvidenceVersion",
+    );
+  } else {
+    const version = report.rendering?.temporalSelectedXfb?.scanoutEvidenceVersion;
+    if (version !== undefined && version !== 1) {
+      throw compositorFailure(
+        "$.rendering.temporalSelectedXfb.scanoutEvidenceVersion must be absent or 1 for v1",
+      );
+    }
+  }
   const validatedFrames = [];
   let baselineGeometry = null;
   const seenTokens = new Set();
@@ -431,6 +481,7 @@ export function verifyCompositorCaptureReport(report, options) {
       `${path}.descriptor`,
       index,
       validatedFrames.at(-1)?.descriptor ?? null,
+      protocol,
     );
     if (seenTokens.has(descriptor.token)) {
       throw compositorFailure(`${path}.descriptor.token was already acknowledged`);
@@ -467,6 +518,17 @@ export function verifyCompositorCaptureReport(report, options) {
     );
     for (const field of ["address", "generation", "row", "width", "height"]) {
       exact(descriptor[field], surface[field], `${path}.descriptor.${field}`);
+    }
+    if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+      for (const field of [
+        "fieldHeight",
+        "fieldStrideBytes",
+        "rowRepeat",
+        "scanoutPolicy",
+        "sourceRowStep",
+      ]) {
+        exact(descriptor[field], surface[field], `${path}.descriptor.${field}`);
+      }
     }
     exact(
       descriptor.presentationSerial,

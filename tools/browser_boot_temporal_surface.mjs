@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { SMB_TEMPORAL_XFB_CAPACITY } from "./browser_boot_temporal_xfb.mjs";
+import {
+  SMB_TEMPORAL_XFB_CAPACITY,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
+  temporalXfbScanoutEvidenceVersion,
+} from "./browser_boot_temporal_xfb.mjs";
 
 const LOWERCASE_HEX_32 = /^0x[0-9a-f]{8}$/;
 const LOWERCASE_SHA_256 = /^[0-9a-f]{64}$/;
@@ -89,6 +94,63 @@ function requireSha256(value, path) {
   return value;
 }
 
+const VI_SCANOUT_PROVENANCE_FIELDS = [
+  "scanoutPolicy",
+  "fieldStrideBytes",
+  "sourceRowStep",
+  "fieldHeight",
+  "rowRepeat",
+];
+
+function validateScanoutProvenance(value, path, displayHeight) {
+  const scanoutPolicy = value.scanoutPolicy;
+  if (scanoutPolicy !== "bob" && scanoutPolicy !== "direct") {
+    fail(
+      "envelope",
+      `${path}.scanoutPolicy`,
+      `expected "bob" or "direct", got ${describe(scanoutPolicy)}`,
+    );
+  }
+  const fieldStrideBytes = requirePositiveInteger(
+    value.fieldStrideBytes,
+    `${path}.fieldStrideBytes`,
+  );
+  const sourceRowStep = requirePositiveInteger(value.sourceRowStep, `${path}.sourceRowStep`);
+  const fieldHeight = requirePositiveInteger(value.fieldHeight, `${path}.fieldHeight`);
+  const rowRepeat = requirePositiveInteger(value.rowRepeat, `${path}.rowRepeat`);
+  if (rowRepeat !== 1 && rowRepeat !== 2) {
+    fail("envelope", `${path}.rowRepeat`, `expected 1 or 2, got ${rowRepeat}`);
+  }
+  const expectedPolicy = rowRepeat === 2 ? "bob" : "direct";
+  if (scanoutPolicy !== expectedPolicy) {
+    fail(
+      "provenance",
+      `${path}.scanoutPolicy`,
+      `expected ${expectedPolicy} for row repeat ${rowRepeat}, got ${scanoutPolicy}`,
+    );
+  }
+  if (displayHeight !== fieldHeight * rowRepeat) {
+    fail(
+      "provenance",
+      `${path}.fieldHeight`,
+      `expected ${displayHeight} display rows from field height ${fieldHeight} and repeat ${rowRepeat}`,
+    );
+  }
+  return { scanoutPolicy, fieldStrideBytes, sourceRowStep, fieldHeight, rowRepeat };
+}
+
+function requireMatchingScanoutProvenance(expected, actual, path) {
+  for (const field of VI_SCANOUT_PROVENANCE_FIELDS) {
+    if (actual[field] !== expected[field]) {
+      fail(
+        "provenance",
+        `${path}.${field}`,
+        `expected ${describe(expected[field])}, got ${describe(actual[field])}`,
+      );
+    }
+  }
+}
+
 function framePath(index, suffix = "") {
   return `$.frames[${index}]${suffix}`;
 }
@@ -135,7 +197,12 @@ function validateRgbCounts(rgb, path, pixelCount) {
   return counts;
 }
 
-function validateFrame(frame, index, previous) {
+function validateFrame(
+  frame,
+  index,
+  previous,
+  scanoutEvidenceVersion = TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
+) {
   const path = framePath(index);
   requireObject(frame, path);
   requireExact(frame.scenario, "smb-ready-play", `${path}.scenario`);
@@ -186,8 +253,63 @@ function validateFrame(frame, index, previous) {
     );
   }
 
+  let presentationScanout = null;
+  if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2) {
+    presentationScanout = validateScanoutProvenance(
+      presentation,
+      `${path}.presentation`,
+      presentationHeight,
+    );
+    const pictureConfiguration = requireNonNegativeInteger(
+      presentation.pictureConfiguration,
+      `${path}.presentation.pictureConfiguration`,
+    );
+    if (pictureConfiguration > 0xffff) {
+      fail(
+        "envelope",
+        `${path}.presentation.pictureConfiguration`,
+        `expected a 16-bit VI register, got ${pictureConfiguration}`,
+      );
+    }
+    const wordsPerLine = requirePositiveInteger(
+      presentation.wordsPerLine,
+      `${path}.presentation.wordsPerLine`,
+    );
+    const standardWordsPerLine = requirePositiveInteger(
+      presentation.standardWordsPerLine,
+      `${path}.presentation.standardWordsPerLine`,
+    );
+    const activeLines = requirePositiveInteger(
+      presentation.activeLines,
+      `${path}.presentation.activeLines`,
+    );
+    if (typeof presentation.nonInterlaced !== "boolean") {
+      fail(
+        "envelope",
+        `${path}.presentation.nonInterlaced`,
+        `expected a boolean, got ${describe(presentation.nonInterlaced)}`,
+      );
+    }
+    for (const [field, actual, expected] of [
+      ["wordsPerLine", wordsPerLine, (pictureConfiguration >>> 8) & 0x7f],
+      ["standardWordsPerLine", standardWordsPerLine, pictureConfiguration & 0xff],
+      ["activeLines", activeLines, presentationScanout.fieldHeight],
+      ["width", presentationWidth, wordsPerLine * 16],
+      ["fieldStrideBytes", presentationScanout.fieldStrideBytes, standardWordsPerLine * 32],
+      ["nonInterlaced", presentation.nonInterlaced, presentationScanout.rowRepeat === 1],
+    ]) {
+      if (actual !== expected) {
+        fail(
+          "provenance",
+          `${path}.presentation.${field}`,
+          `expected ${describe(expected)}, got ${describe(actual)}`,
+        );
+      }
+    }
+  }
+
   const surface = requireObject(frame.presentedSurface, `${path}.presentedSurface`);
-  requireExactKeys(surface, [
+  const surfaceKeys = [
     "address",
     "format",
     "generation",
@@ -201,7 +323,11 @@ function validateFrame(frame, index, previous) {
     "row",
     "surfaceFormat",
     "width",
-  ], `${path}.presentedSurface`);
+  ];
+  if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2) {
+    surfaceKeys.push(...VI_SCANOUT_PROVENANCE_FIELDS);
+  }
+  requireExactKeys(surface, surfaceKeys, `${path}.presentedSurface`);
   const surfaceAddress = requireHex32(surface.address, `${path}.presentedSurface.address`);
   if (surfaceAddress !== presentationAddress) {
     fail(
@@ -265,6 +391,43 @@ function validateFrame(frame, index, previous) {
       `expected presented dimensions ${presentationWidth}x${presentationHeight}, got ${width}x${height}`,
     );
   }
+  if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2) {
+    const surfaceScanout = validateScanoutProvenance(
+      surface,
+      `${path}.presentedSurface`,
+      height,
+    );
+    requireMatchingScanoutProvenance(
+      presentationScanout,
+      surfaceScanout,
+      `${path}.presentedSurface`,
+    );
+    const selected = requireObject(frame.selectedXfb, `${path}.selectedXfb`);
+    const selectedScanout = validateScanoutProvenance(
+      selected,
+      `${path}.selectedXfb`,
+      requirePositiveInteger(selected.displayHeight, `${path}.selectedXfb.displayHeight`),
+    );
+    requireMatchingScanoutProvenance(
+      presentationScanout,
+      selectedScanout,
+      `${path}.selectedXfb`,
+    );
+    const selectedRow = requireNonNegativeInteger(selected.row, `${path}.selectedXfb.row`);
+    const logicalHeight = requirePositiveInteger(
+      selected.logicalHeight,
+      `${path}.selectedXfb.logicalHeight`,
+    );
+    const lastLogicalRow = selectedRow
+      + (selectedScanout.fieldHeight - 1) * selectedScanout.sourceRowStep;
+    if (lastLogicalRow >= logicalHeight) {
+      fail(
+        "provenance",
+        `${path}.selectedXfb.fieldHeight`,
+        `last VI source row ${lastLogicalRow} exceeds logical height ${logicalHeight}`,
+      );
+    }
+  }
   const pixelCount = width * height;
   if (!Number.isSafeInteger(pixelCount) || pixelCount <= 0) {
     fail("envelope", `${path}.presentedSurface`, "pixel count exceeds the safe integer range");
@@ -292,7 +455,18 @@ function validateFrame(frame, index, previous) {
 export function validateTemporalPresentedSurfaceFrames(
   frames,
   capacity = SMB_TEMPORAL_XFB_CAPACITY,
+  scanoutEvidenceVersion = TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
 ) {
+  if (
+    scanoutEvidenceVersion !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1
+    && scanoutEvidenceVersion !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2
+  ) {
+    fail(
+      "envelope",
+      "$.scanoutEvidenceVersion",
+      `expected 1 or 2, got ${describe(scanoutEvidenceVersion)}`,
+    );
+  }
   if (!Number.isSafeInteger(capacity) || capacity <= 0) {
     fail("envelope", "$.capacity", `expected a positive safe integer, got ${describe(capacity)}`);
   }
@@ -303,7 +477,12 @@ export function validateTemporalPresentedSurfaceFrames(
     fail("envelope", "$.frames", `expected ${capacity} frames, got ${frames.length}`);
   }
   for (let index = 0; index < frames.length; index += 1) {
-    validateFrame(frames[index], index, index === 0 ? null : frames[index - 1]);
+    validateFrame(
+      frames[index],
+      index,
+      index === 0 ? null : frames[index - 1],
+      scanoutEvidenceVersion,
+    );
   }
   return frames;
 }
@@ -323,7 +502,10 @@ export function deriveTemporalPresentedSurfaceOracle(
       && surface.generation === frame.presentation.copyIndex
       && surface.row === frame.presentation.copyRow
       && surface.width === frame.presentation.width
-      && surface.height === frame.presentation.height;
+      && surface.height === frame.presentation.height
+      && VI_SCANOUT_PROVENANCE_FIELDS.every(
+        field => surface[field] === frame.presentation[field],
+      );
     return {
       ordinal: frame.ordinal,
       rendererSequence: frame.rendererSequence,
@@ -475,10 +657,12 @@ export function compareTemporalPresentedSurfaceOracle(reported, derived) {
 
 export function verifySmbTemporalPresentedSurfaces(temporal) {
   const envelope = requireObject(temporal, "$.temporalSelectedXfb");
+  const scanoutEvidenceVersion = temporalXfbScanoutEvidenceVersion(envelope);
   requireExact(envelope.capacity, SMB_TEMPORAL_XFB_CAPACITY, "$.capacity");
   const frames = validateTemporalPresentedSurfaceFrames(
     envelope.frames,
     SMB_TEMPORAL_XFB_CAPACITY,
+    scanoutEvidenceVersion,
   );
   const derived = deriveTemporalPresentedSurfaceOracle(
     frames,
@@ -523,5 +707,5 @@ export function verifySmbTemporalPresentedSurfaces(temporal) {
     );
   }
   compareTemporalPresentedSurfaceOracle(envelope.surfaceOracle, derived);
-  return { oracle: derived, diagnostics };
+  return { scanoutEvidenceVersion, oracle: derived, diagnostics };
 }
