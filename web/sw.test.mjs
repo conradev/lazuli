@@ -4,9 +4,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  ACTIVE_RECORD_PATH,
   APP_PATH,
   META_CACHE,
   WORKER_STATUS_PATH,
+  activeReleaseResponse,
   backendResponse,
   cachedReleaseAsset,
   frontendResponse,
@@ -32,6 +34,66 @@ test("worker status identifies the release schema during upgrades", async () => 
   const response = workerStatusResponse();
   assert.equal(response.headers.get("Cache-Control"), "no-store");
   assert.deepEqual(await response.json(), { releaseSchema: RELEASE_SCHEMA });
+});
+
+test("active release endpoint fails closed until a validated schema-2 release is active", async () => {
+  assert.equal(ACTIVE_RECORD_PATH, "/.gekko/active-release");
+  const storage = new MemoryCacheStorage();
+
+  const missing = await activeReleaseResponse(storage, ORIGIN);
+  assert.equal(missing.status, 503);
+  assert.equal(missing.headers.get("Cache-Control"), "no-store");
+
+  const candidate = await makeRelease(6);
+  const legacy = await legacyRelease(candidate.release);
+  const metadata = await storage.open(META_CACHE);
+  await metadata.put(
+    `${ORIGIN}${ACTIVE_RECORD_PATH}`,
+    new Response(JSON.stringify({
+      release: legacy,
+      cacheName: `gekko-release-${legacy.releaseId}-legacy`,
+    })),
+  );
+  assert.equal((await activeReleaseResponse(storage, ORIGIN)).status, 503);
+
+  const corrupt = structuredClone(candidate.release);
+  corrupt.releaseId = "0".repeat(64);
+  await metadata.put(
+    `${ORIGIN}${ACTIVE_RECORD_PATH}`,
+    new Response(JSON.stringify({
+      release: corrupt,
+      cacheName: `gekko-release-${corrupt.releaseId}-corrupt`,
+    })),
+  );
+  assert.equal((await activeReleaseResponse(storage, ORIGIN)).status, 503);
+});
+
+test("active release GET exposes only the validated schema-2 manifest", async () => {
+  const storage = new MemoryCacheStorage();
+  const candidate = await makeRelease(7);
+  await stageRelease(candidate.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(candidate.responses),
+    origin: ORIGIN,
+    cacheSuffix: "observer",
+  });
+
+  const direct = await activeReleaseResponse(storage, ORIGIN);
+  assert.equal(direct.status, 200);
+  assert.equal(direct.headers.get("Cache-Control"), "no-store");
+  assert.equal(direct.headers.get("Content-Type"), "application/json; charset=utf-8");
+  const directText = await direct.text();
+  assert.deepEqual(JSON.parse(directText), candidate.release);
+  assert.doesNotMatch(directText, /cacheName/);
+
+  await withWorkerGlobals(storage, async () => {
+    throw new Error("active release observer must not use the network");
+  }, async () => {
+    const response = await handleFetch(new Request(`${ORIGIN}${ACTIVE_RECORD_PATH}`));
+    const body = await response.json();
+    assert.deepEqual(body, candidate.release);
+    assert.equal(Object.hasOwn(body, "cacheName"), false);
+  });
 });
 
 function key(request) {

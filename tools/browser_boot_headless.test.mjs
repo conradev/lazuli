@@ -54,6 +54,171 @@ test("headless capture exposes --expect and verifies before persistence", () => 
   );
 });
 
+test("headless capture pins the validated active deployed release twice", async () => {
+  assert.match(
+    source,
+    /import \{ validateRelease \} from "\.\.\/web\/release\.mjs"/,
+  );
+  assert.match(source, /case "--expect-commit":/);
+  assert.match(source, /case "--expect-release-id":/);
+  assert.doesNotMatch(source, /fetch\("\/release\.json"/);
+  assert.equal(
+    source.match(/await observeActiveReleaseIfPinned\(/g)?.length,
+    2,
+  );
+  const observer = source.indexOf("await observeActiveReleaseBeforeActivation(");
+  const activation = source.indexOf("await attachDiscAfterFreshNavigation(session");
+  assert.notEqual(observer, -1);
+  assert.ok(observer < activation);
+
+  const argumentContext = vm.createContext({ Error, Number, Set, URL });
+  vm.runInContext(extractFunction("parseArguments"), argumentContext);
+  const parsed = argumentContext.parseArguments([
+    "--url",
+    "https://gekko.free/assets/frontend.html",
+    "--expect-commit",
+    "1".repeat(40),
+    "--expect-release-id",
+    "2".repeat(64),
+  ]);
+  assert.equal(parsed.expectCommit, "1".repeat(40));
+  assert.equal(parsed.expectReleaseId, "2".repeat(64));
+  assert.throws(
+    () => argumentContext.parseArguments([
+      "--url",
+      "https://gekko.free/assets/frontend.html",
+      "--expect-commit",
+      "A".repeat(40),
+    ]),
+    /--expect-commit must be 40 lowercase hexadecimal characters/,
+  );
+  assert.throws(
+    () => argumentContext.parseArguments([
+      "--url",
+      "https://gekko.free/assets/frontend.html",
+      "--expect-release-id",
+      "2".repeat(63),
+    ]),
+    /--expect-release-id must be 64 lowercase hexadecimal characters/,
+  );
+
+  let observerCalls = 0;
+  const optInContext = vm.createContext({
+    async observeActiveRelease(_session, options, expectedIdentity) {
+      observerCalls += 1;
+      return { options, expectedIdentity };
+    },
+  });
+  vm.runInContext([
+    extractFunction("releasePinRequested"),
+    extractFunction("observeActiveReleaseIfPinned"),
+  ].join("\n\n"), optInContext);
+  assert.equal(await optInContext.observeActiveReleaseIfPinned({}, {
+    expectCommit: null,
+    expectReleaseId: null,
+  }), null);
+  assert.equal(observerCalls, 0);
+  const pinnedIdentity = { releaseId: "2".repeat(64) };
+  const pinnedObservation = await optInContext.observeActiveReleaseIfPinned({}, {
+    expectCommit: null,
+    expectReleaseId: "2".repeat(64),
+  }, pinnedIdentity);
+  assert.equal(observerCalls, 1);
+  assert.strictEqual(pinnedObservation.expectedIdentity, pinnedIdentity);
+
+  const context = vm.createContext({
+    Array,
+    Error,
+    JSON,
+    async validateRelease(release) {
+      assert.equal(release.schema, 2);
+      assert.equal(Object.hasOwn(release, "cacheName"), false);
+      return release;
+    },
+  });
+  vm.runInContext([
+    extractFunction("compactReleaseAsset"),
+    extractFunction("compactActiveRelease"),
+    extractFunction("validateObservedActiveRelease"),
+  ].join("\n\n"), context);
+  const release = {
+    schema: 2,
+    releaseId: "a".repeat(64),
+    source: { commit: "b".repeat(40) },
+    frontend: { url: `/assets/frontend-${"c".repeat(64)}.html`, sha256: "c".repeat(64), bytes: 10 },
+    renderer: {
+      javascript: { url: `/assets/renderer-${"d".repeat(64)}.js`, sha256: "d".repeat(64), bytes: 20 },
+      wasm: { url: `/assets/renderer-${"e".repeat(64)}.wasm`, sha256: "e".repeat(64), bytes: 30 },
+    },
+    backend: {
+      url: "/ppcwasmjit.wasm",
+      sha256: "f".repeat(64),
+      bytes: 40,
+      chunks: [{ ignored: "compact evidence omits chunks" }],
+    },
+  };
+  const options = {
+    expectCommit: release.source.commit,
+    expectReleaseId: release.releaseId,
+  };
+  const observation = {
+    body: JSON.stringify(release),
+    controlled: true,
+    error: null,
+    pathname: release.frontend.url,
+    status: 200,
+  };
+  const identity = await context.validateObservedActiveRelease(observation, options);
+  assert.deepEqual(Object.keys(identity), [
+    "schema",
+    "releaseId",
+    "commit",
+    "frontend",
+    "renderer",
+    "backend",
+  ]);
+  assert.equal(Object.hasOwn(identity.backend, "chunks"), false);
+  await assert.doesNotReject(
+    context.validateObservedActiveRelease(observation, options, identity),
+  );
+
+  await assert.rejects(
+    context.validateObservedActiveRelease(
+      { ...observation, controlled: false },
+      options,
+    ),
+    /no service-worker controller/,
+  );
+  await assert.rejects(
+    context.validateObservedActiveRelease(
+      { ...observation, pathname: "/app.html" },
+      options,
+    ),
+    /not the active immutable frontend/,
+  );
+  await assert.rejects(
+    context.validateObservedActiveRelease(observation, {
+      ...options,
+      expectCommit: "0".repeat(40),
+    }),
+    /does not match --expect-commit/,
+  );
+  await assert.rejects(
+    context.validateObservedActiveRelease(observation, {
+      ...options,
+      expectReleaseId: "0".repeat(64),
+    }),
+    /does not match --expect-release-id/,
+  );
+  await assert.rejects(
+    context.validateObservedActiveRelease(observation, options, {
+      ...identity,
+      releaseId: "0".repeat(64),
+    }),
+    /changed during headless capture/,
+  );
+});
+
 test("local disc identity is complete before navigation and joins every capture", () => {
   assert.match(
     source,
@@ -69,7 +234,7 @@ test("local disc identity is complete before navigation and joins every capture"
     source.match(/^\s+attachHeadlessCapture\(session, state, report,/gm)?.length,
     2,
   );
-  assert.equal(source.match(/\}, discImage\);/g)?.length, 2);
+  assert.equal(source.match(/\}, terminalRelease, discImage\);/g)?.length, 2);
 
   const context = vm.createContext({ Array, Error, JSON });
   vm.runInContext([
@@ -92,6 +257,7 @@ test("local disc identity is complete before navigation and joins every capture"
     },
     report,
     { reuse: null },
+    { releaseId: "a".repeat(64) },
     discImage,
   );
   assert.strictEqual(report.headlessCapture.discImage, discImage);
@@ -111,8 +277,23 @@ test("local disc identity is complete before navigation and joins every capture"
     },
     reportWithoutDisc,
     { reuse: null },
+    { releaseId: "a".repeat(64) },
   );
   assert.equal(Object.hasOwn(reportWithoutDisc.headlessCapture, "discImage"), false);
+
+  const unpinnedReport = { rendering: { backend: "wgpu-webgpu" } };
+  context.attachHeadlessCapture(
+    { exceptions: [] },
+    {
+      dataset: { renderer: "wgpu-webgpu" },
+      title: "Local debug harness",
+      url: "http://127.0.0.1:8766/",
+    },
+    unpinnedReport,
+    { reuse: null },
+    null,
+  );
+  assert.equal(Object.hasOwn(unpinnedReport.headlessCapture, "release"), false);
 });
 
 test("headless capture cross-checks the page-owned renderer evidence", () => {
@@ -137,7 +318,13 @@ test("headless capture cross-checks the page-owned renderer evidence", () => {
     rendering,
   };
   assert.doesNotThrow(() => context.verifyPageOwnedRendering(report, state));
-  context.attachHeadlessCapture({ exceptions: [] }, state, report, { reuse: null });
+  context.attachHeadlessCapture(
+    { exceptions: [] },
+    state,
+    report,
+    { reuse: null },
+    { releaseId: "a".repeat(64) },
+  );
   assert.strictEqual(report.rendering, rendering);
   assert.throws(
     () => context.verifyPageOwnedRendering({
@@ -175,6 +362,7 @@ test("headless capture cross-checks the page-owned renderer evidence", () => {
     unavailableState,
     workerFailure,
     { reuse: null },
+    { releaseId: "a".repeat(64) },
   );
   assert.equal(context.terminalReportFailure(workerFailure).message, "disc read failed");
   assert.equal("metrics" in workerFailure.rendering, false);

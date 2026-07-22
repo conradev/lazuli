@@ -326,6 +326,25 @@ export function workerStatusResponse() {
   });
 }
 
+export async function activeReleaseResponse(
+  cacheStorage = caches,
+  origin = self.location.origin,
+) {
+  const active = await readActiveRelease(cacheStorage, origin);
+  if (active?.release?.schema !== RELEASE_SCHEMA) {
+    return new Response("No compatible release is active.", {
+      status: 503,
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
+  return new Response(JSON.stringify(active.release), {
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+    },
+  });
+}
+
 export async function handleFetch(request) {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return fetch(request);
@@ -334,6 +353,9 @@ export async function handleFetch(request) {
   }
   if (url.pathname === STAGE_RELEASE_PATH && request.method === "POST") {
     return stageReleaseRequest(request);
+  }
+  if (url.pathname === ACTIVE_RECORD_PATH && request.method === "GET") {
+    return activeReleaseResponse();
   }
   if (request.method !== "GET") return fetch(request);
   if (
