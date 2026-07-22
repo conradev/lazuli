@@ -105,6 +105,36 @@
       return result;
     }
 
+    function publicFrontendSearch(search) {
+      const input = new URLSearchParams(search);
+      const scenarioValues = input.getAll("scenario");
+      const captureValues = input.getAll("viewportCapture");
+      if (captureValues.length === 0) {
+        return scenarioValues.length === 1 && scenarioValues[0] === "smb-ready-play"
+          ? "?scenario=smb-ready-play"
+          : "";
+      }
+
+      const headlessRunValues = input.getAll("headlessRun");
+      const keys = [...input.keys()];
+      const exactCapture = keys.length === 3
+        && new Set(keys).size === 3
+        && scenarioValues.length === 1
+        && scenarioValues[0] === "smb-ready-play"
+        && captureValues.length === 1
+        && captureValues[0] === "1"
+        && headlessRunValues.length === 1
+        && /^[A-Za-z0-9._:-]{1,128}$/.test(headlessRunValues[0]);
+      if (!exactCapture) {
+        throw new Error("invalid passive viewport capture request");
+      }
+      const output = new URLSearchParams();
+      output.set("scenario", "smb-ready-play");
+      output.set("viewportCapture", "1");
+      output.set("headlessRun", headlessRunValues[0]);
+      return `?${output}`;
+    }
+
     async function launch() {
       const worker = await registerWorker();
       if (worker === null) throw new Error("this browser does not support offline applications");
@@ -116,10 +146,11 @@
       release = staged.release;
       saved ||= !staged.ok;
 
-      const url = new URL("/app.html", location.href);
-      const scenario = new URLSearchParams(location.search).get("scenario");
-      if (scenario === "smb-ready-play") {
-        url.searchParams.set("scenario", scenario);
+      const frontendSearch = publicFrontendSearch(location.search);
+      const url = new URL(release.frontend.url, location.href);
+      url.search = frontendSearch;
+      if (new URLSearchParams(frontendSearch).get("viewportCapture") === "1") {
+        document.body.dataset.viewportCapture = "enabled";
       }
       app.addEventListener("load", () => {
         status.hidden = true;

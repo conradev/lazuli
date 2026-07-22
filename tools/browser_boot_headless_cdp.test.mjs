@@ -156,6 +156,35 @@ test("DevTools sessions default to uncompressed WebSockets", () => {
   assert.strictEqual(session.createSocket, createUncompressedDevToolsSocket);
 });
 
+test("DevTools sessions publish protocol events without consuming responses", async () => {
+  const socket = new FakeSocket("ws://127.0.0.1/devtools/page/events");
+  const session = new DevToolsSession(socket.url, {
+    createSocket: () => {
+      queueMicrotask(() => socket.open());
+      return socket;
+    },
+  });
+  await session.connect();
+
+  const events = [];
+  const unsubscribe = session.on("Page.screencastFrame", event => events.push(event));
+  socket.emit("message", { data: JSON.stringify({
+    method: "Page.screencastFrame",
+    params: { data: "png", sessionId: 7 },
+  }) });
+  assert.deepEqual(events, [{ data: "png", sessionId: 7 }]);
+
+  unsubscribe();
+  socket.emit("message", { data: JSON.stringify({
+    method: "Page.screencastFrame",
+    params: { data: "ignored", sessionId: 8 },
+  }) });
+  assert.equal(events.length, 1);
+  assert.throws(() => session.on("", () => {}), /non-empty string/);
+  assert.throws(() => session.on("Page.event", null), /must be a function/);
+  session.close();
+});
+
 test("DevTools requests time out cleanly and reconnect to the original target", async () => {
   const timers = manualTimers();
   const sockets = [];

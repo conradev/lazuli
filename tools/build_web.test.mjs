@@ -188,22 +188,35 @@ test("local harness retains controls removed from the public frontend", async ()
   assert.equal(harness.match(/<!-- LAZULI DEBUG UI END -->/g)?.length, 2);
 });
 
-test("public shell forwards only the SMB scenario", async () => {
+test("public shell forwards only the SMB scenario outside passive capture", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   assert.doesNotMatch(shell, /url\.search\s*=\s*location\.search/);
   assert.match(
     shell,
-    /if \(scenario === "smb-ready-play"\) \{\s*url\.searchParams\.set\("scenario", scenario\);/,
+    /scenarioValues\.length === 1 && scenarioValues\[0\] === "smb-ready-play"/,
   );
   assert.doesNotMatch(shell, /searchParams\.set\("(?:cycles|dispatches|rest|renderEvery|harness)"/);
 });
 
-test("public shell keeps the upload surface at one stable URL", async () => {
+test("public shell binds the iframe to the staged immutable frontend", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   const fallback = await readFile(new URL("../web/app.html", import.meta.url), "utf8");
-  assert.match(shell, /new URL\("\/app\.html", location\.href\)/);
-  assert.doesNotMatch(shell, /new URL\(release\.frontend\.url/);
+  assert.match(shell, /new URL\(release\.frontend\.url, location\.href\)/);
+  assert.doesNotMatch(shell, /new URL\("\/app\.html", location\.href\)/);
   assert.match(fallback, /location\.replace\("\/"\)/);
+});
+
+test("public shell forwards only an exact passive capture trio", async () => {
+  const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+  assert.match(shell, /function publicFrontendSearch\(search\)/);
+  assert.match(shell, /captureValues\[0\] === "1"/);
+  assert.match(shell, /new Set\(keys\)\.size === 3/);
+  assert.match(shell, /\^\[A-Za-z0-9\._:-\]\{1,128\}\$/);
+  assert.match(shell, /output\.set\("scenario", "smb-ready-play"\)/);
+  assert.match(shell, /output\.set\("viewportCapture", "1"\)/);
+  assert.match(shell, /output\.set\("headlessRun", headlessRunValues\[0\]\)/);
+  assert.doesNotMatch(shell, /output\.set\("(?:compositorCapture|renderEvery|cycles|dispatches)"/);
+  assert.match(shell, /document\.body\.dataset\.viewportCapture = "enabled"/);
 });
 
 test("public shell requires a schema-2 worker and never launches a legacy release", async () => {
