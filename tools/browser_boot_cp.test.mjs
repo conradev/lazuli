@@ -70,10 +70,31 @@ function extractFunction(name) {
 }
 
 function makeContext() {
-  const memory = new ArrayBuffer(0x200);
+  const memory = new ArrayBuffer(0x4000);
   const context = {
+    commandProcessorActiveClearReassertions: 0,
+    commandProcessorExternalInterruptDeliveries: 0,
+    commandProcessorHighInterruptAssertions: 0,
+    commandProcessorHighInterruptPending: false,
+    commandProcessorInterruptClears: 0,
+    commandProcessorInterruptLevelActive: false,
+    commandProcessorInterruptResets: 0,
+    commandProcessorInterruptTrace: [],
+    commandProcessorInterruptTraceSignature: null,
+    commandProcessorLowInterruptAssertions: 0,
+    commandProcessorLowInterruptPending: false,
+    commandProcessorPerformanceMetricClears: 0,
+    commandProcessorPiAssertions: 0,
+    commandProcessorPiDeassertions: 0,
+    commandProcessorQualifiedInterruptSources: 0,
+    cpClearHighWatermarkInterrupt: 0x0001,
+    cpClearLowWatermarkInterrupt: 0x0002,
+    cpClearPerformanceMetrics: 0x0004,
     cpControlBreakpointEnable: 0x0002,
+    cpControlBreakpointInterruptEnable: 0x0020,
+    cpControlHighWatermarkInterruptEnable: 0x0004,
     cpControlLinkEnable: 0x0010,
+    cpControlLowWatermarkInterruptEnable: 0x0008,
     cpControlMask: 0x003f,
     cpControlReadEnable: 0x0001,
     cpFifoAddressMask: 0x03ffffe0,
@@ -85,14 +106,19 @@ function makeContext() {
     cpStatusHighWatermark: 0x0001,
     cpStatusLowWatermark: 0x0002,
     cpStatusReadIdle: 0x0004,
+    cycles: 0,
     hex32: value => "0x" + (value >>> 0).toString(16).padStart(8, "0"),
     mmio: 0,
     piFifoEndMask: 0x07ffffe0,
+    piCommandProcessorInterruptCause: 0x00000800,
     piFifoState: {},
     piFifoWrap: 0x20000000,
     resetGxCommandProcessorDecoder() {},
     resetGxWriteGatherPipe() {},
-    serviceCommandProcessorFifo() { return 0; },
+    serviceCommandProcessorFifo() {
+      context.refreshCommandProcessorInterruptLevel("register-harness");
+      return 0;
+    },
     translateDataRange: address => (
       address >= 0xc0000000 ? (address - 0xc0000000) >>> 0 : address >>> 0
     ),
@@ -101,10 +127,16 @@ function makeContext() {
   vm.createContext(context);
   vm.runInContext(
     [
-      "resetFifoRegisterState",
-      "resetCommandProcessorFifoFromPi",
       "commandProcessorBreakpointLevel",
       "readCommandProcessorStatus",
+      "commandProcessorInterruptInputs",
+      "traceCommandProcessorInterrupt",
+      "refreshCommandProcessorInterruptLevel",
+      "clearCommandProcessorInterrupts",
+      "resetCommandProcessorInterruptState",
+      "writeProcessorInterfaceInterruptCause",
+      "resetFifoRegisterState",
+      "resetCommandProcessorFifoFromPi",
       "commandProcessorPairValue",
       "writeCommandProcessorPairValue",
       "commandProcessorRegisterRangeOverlaps",
@@ -288,6 +320,18 @@ test("unsupported widths overlapping modeled CP and PI registers fail closed", (
   writeRejected(context, 0xcc003014, 0xff, 1);
   writeRejected(context, 0xcc00300c, 0xffff, 2);
 
+  context.view.setUint32(context.mmio + 0x3000, 0x00010800, false);
+  write32(context, 0xcc003000, 0x00000800);
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x3000, false),
+    0x00010000,
+    "the supported PI cause write is W1C",
+  );
+  writeRejected(context, 0xcc003000, 0xff, 1);
+  writeRejected(context, 0xcc003000, 0xffff, 2);
+  writeRejected(context, 0xcc003002, 0xffff, 2);
+  assert.equal(context.view.getUint32(context.mmio + 0x3000, false), 0x00010000);
+
   readRejected(context, 0xcc003018, 1);
   readRejected(context, 0xcc003018, 2);
   writeRejected(context, 0xcc003018, 1, 1);
@@ -429,8 +473,12 @@ test("FIFO diagnostics expose the modeled CP and independent PI state", () => {
   write32(context, 0xcc003010, 0x000002e0);
   write32(context, 0xcc003014, 0x20000240);
 
+  const cpSnapshot = JSON.parse(JSON.stringify(
+    context.snapshotCommandProcessorFifo(),
+  ));
+  const { interrupt, ...cpRegisters } = cpSnapshot;
   assert.deepEqual(
-    JSON.parse(JSON.stringify(context.snapshotCommandProcessorFifo())),
+    cpRegisters,
     {
       status: "0x0018",
       control: "0x0003",
@@ -445,6 +493,31 @@ test("FIFO diagnostics expose the modeled CP and independent PI state", () => {
       breakpointLevel: true,
     },
   );
+  const { trace, ...interruptSummary } = interrupt;
+  assert.deepEqual(interruptSummary, {
+    highPending: false,
+    lowPending: false,
+    qualifiedSources: "0x0010",
+    levelActive: false,
+    piCause: false,
+    highAssertions: 0,
+    lowAssertions: 0,
+    clears: 0,
+    activeClearReassertions: 0,
+    performanceMetricClears: 0,
+    piAssertions: 0,
+    piDeassertions: 0,
+    externalDeliveries: 0,
+    resets: 2,
+  });
+  assert.deepEqual(trace.map(entry => entry.reason), [
+    "fifo-register-reset",
+    "pi-fifo-reset",
+    "register-harness",
+    "register-harness",
+    "register-harness",
+  ]);
+  assert.equal(trace.at(-1).status, "0x0018");
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.snapshotProcessorInterfaceFifo())),
     {

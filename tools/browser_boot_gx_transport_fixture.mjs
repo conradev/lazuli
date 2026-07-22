@@ -73,6 +73,14 @@ const decoderFunctions = [
 
 const transportFunctions = [
   "commandProcessorBreakpointLevel",
+  "readCommandProcessorStatus",
+  "commandProcessorInterruptInputs",
+  "traceCommandProcessorInterrupt",
+  "refreshCommandProcessorInterruptLevel",
+  "clearCommandProcessorInterrupts",
+  "resetCommandProcessorInterruptState",
+  "writeProcessorInterfaceInterruptCause",
+  "serviceCommandProcessorInterrupt",
   "commandProcessorFifoSpanBytes",
   "normalizeCommandProcessorFifoDistance",
   "validatedCommandProcessorFifoSpan",
@@ -91,6 +99,7 @@ const transportFunctions = [
   "resetCommandProcessorFifoFromPi",
   "commandProcessorPairValue",
   "writeCommandProcessorPairValue",
+  "readCommandProcessorRegister",
   "writeCommandProcessorRegister",
   "writeProcessorInterfaceFifoRegister",
 ];
@@ -100,9 +109,12 @@ export function makeContext({
   realDecoder = false,
   stagingCapacity = 64,
 } = {}) {
-  const memory = new ArrayBuffer(ramSize + stagingCapacity + 0x40);
+  const mmio = ramSize + stagingCapacity + 0x40;
+  const cpu = mmio + 0x8000;
+  const memory = new ArrayBuffer(cpu + 0x100);
   const decodedChunks = [];
   const semanticEvents = [];
+  const raisedExceptions = [];
   const context = {
     appendGxCommandBytes(chunk) {
       decodedChunks.push(Array.from(chunk));
@@ -113,9 +125,24 @@ export function makeContext({
     commandProcessorDecoderDiscardedBytes: 0,
     commandProcessorDecoderResets: 0,
     commandProcessorDistanceNormalizations: 0,
+    commandProcessorHighInterruptAssertions: 0,
+    commandProcessorHighInterruptPending: false,
+    commandProcessorInterruptClears: 0,
+    commandProcessorInterruptLevelActive: false,
+    commandProcessorInterruptResets: 0,
+    commandProcessorInterruptTrace: [],
+    commandProcessorInterruptTraceSignature: null,
     commandProcessorLastDistanceNormalization: null,
+    commandProcessorLowInterruptAssertions: 0,
+    commandProcessorLowInterruptPending: false,
     commandProcessorMaximumDistance: 0,
     commandProcessorMaximumRawDistance: 0,
+    commandProcessorActiveClearReassertions: 0,
+    commandProcessorExternalInterruptDeliveries: 0,
+    commandProcessorPerformanceMetricClears: 0,
+    commandProcessorPiAssertions: 0,
+    commandProcessorPiDeassertions: 0,
+    commandProcessorQualifiedInterruptSources: 0,
     commandProcessorReadBursts: 0,
     commandProcessorReadBytes: 0,
     commandProcessorReadDisabledStops: 0,
@@ -123,9 +150,15 @@ export function makeContext({
     commandProcessorServiceBudgetBytes: 256 * 1024,
     commandProcessorServiceCalls: 0,
     cpControlBreakpointEnable: 0x0002,
+    cpControlBreakpointInterruptEnable: 0x0020,
+    cpControlHighWatermarkInterruptEnable: 0x0004,
     cpControlLinkEnable: 0x0010,
+    cpControlLowWatermarkInterruptEnable: 0x0008,
     cpControlMask: 0x003f,
     cpControlReadEnable: 0x0001,
+    cpClearHighWatermarkInterrupt: 0x0001,
+    cpClearLowWatermarkInterrupt: 0x0002,
+    cpClearPerformanceMetrics: 0x0004,
     cpFifoAddressMask: 0x03ffffe0,
     cpFifoHighWordMask: 0x03ff,
     cpFifoLowWordMask: 0xffe0,
@@ -140,6 +173,14 @@ export function makeContext({
       readPointer: 0,
       breakpoint: 0,
     },
+    cpStatusBreakpoint: 0x0010,
+    cpStatusCommandIdle: 0x0008,
+    cpStatusHighWatermark: 0x0001,
+    cpStatusLowWatermark: 0x0002,
+    cpStatusReadIdle: 0x0004,
+    cpu,
+    cycles: 0,
+    deviceEvents: new Map(),
     gxBpLoads: 0,
     gxCpLoads: 0,
     gxCpRegisters: new Uint32Array(256),
@@ -192,10 +233,20 @@ export function makeContext({
       return address >= 0 && address + size <= ramSize ? address : null;
     },
     piFifoEndMask: 0x07ffffe0,
+    piCommandProcessorInterruptCause: 0x00000800,
     piFifoRedirectEnd: 0x04000000,
     piFifoState: { base: 0, end: 0, current: 0, wrap: false },
     piFifoWrap: 0x20000000,
     recordWorkerPhaseTiming() {},
+    raiseException(registers, vector) {
+      raisedExceptions.push({ registers, vector });
+      const msr = context.view.getUint32(registers + context.msrOffset, true);
+      context.view.setUint32(
+        registers + context.msrOffset,
+        msr & ~0x00008000,
+        true,
+      );
+    },
     ramPointer(address, size) {
       return context.physicalRamPointer(address, size);
     },
@@ -219,6 +270,8 @@ export function makeContext({
       semanticEvents.push(["xf", address, word >>> 0]);
     },
     view: new DataView(memory),
+    mmio,
+    msrOffset: 0,
     workerHostTimings: { fifoDecode: {}, fifoStagingDrainInclusive: {} },
     gxVertexSize() { return 2; },
   };
@@ -232,6 +285,7 @@ export function makeContext({
     { filename: "browser_boot.gx_transport.js" },
   );
   context.decodedChunks = decodedChunks;
+  context.raisedExceptions = raisedExceptions;
   context.semanticEvents = semanticEvents;
   return context;
 }
@@ -292,4 +346,3 @@ export function append(context, values, stores = 1, quantizedStores = 0) {
 export function be32(value) {
   return [value >>> 24, value >>> 16 & 0xff, value >>> 8 & 0xff, value & 0xff];
 }
-

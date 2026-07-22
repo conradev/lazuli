@@ -1049,8 +1049,14 @@ const TEMPLATE: &str = r##"<!doctype html>
     const cpStatusBreakpoint = 0x0010;
     const cpControlReadEnable = 0x0001;
     const cpControlBreakpointEnable = 0x0002;
+    const cpControlHighWatermarkInterruptEnable = 0x0004;
+    const cpControlLowWatermarkInterruptEnable = 0x0008;
     const cpControlMask = 0x003f;
     const cpControlLinkEnable = 0x0010;
+    const cpControlBreakpointInterruptEnable = 0x0020;
+    const cpClearHighWatermarkInterrupt = 0x0001;
+    const cpClearLowWatermarkInterrupt = 0x0002;
+    const cpClearPerformanceMetrics = 0x0004;
     const cpFifoAddressMask = 0x03ffffe0;
     const cpFifoLowWordMask = 0xffe0;
     const cpFifoHighWordMask = 0x03ff;
@@ -1069,6 +1075,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const diErrorNoAudioBuffer = 0x00052001;
     const diErrorInvalidAudioCommand = 0x00052401;
     const piDiskInterruptCause = 0x00000004;
+    const piCommandProcessorInterruptCause = 0x00000800;
     const siTransferStart = 0x00000001;
     const siReadStatusInterruptMask = 0x08000000;
     const siReadStatusInterrupt = 0x10000000;
@@ -4077,6 +4084,21 @@ const TEMPLATE: &str = r##"<!doctype html>
     let commandProcessorLastDistanceNormalization = null;
     let commandProcessorDecoderResets = 0;
     let commandProcessorDecoderDiscardedBytes = 0;
+    let commandProcessorHighInterruptPending = false;
+    let commandProcessorLowInterruptPending = false;
+    let commandProcessorQualifiedInterruptSources = 0;
+    let commandProcessorInterruptLevelActive = false;
+    let commandProcessorHighInterruptAssertions = 0;
+    let commandProcessorLowInterruptAssertions = 0;
+    let commandProcessorInterruptClears = 0;
+    let commandProcessorActiveClearReassertions = 0;
+    let commandProcessorPerformanceMetricClears = 0;
+    let commandProcessorPiAssertions = 0;
+    let commandProcessorPiDeassertions = 0;
+    let commandProcessorExternalInterruptDeliveries = 0;
+    let commandProcessorInterruptResets = 0;
+    let commandProcessorInterruptTraceSignature = null;
+    const commandProcessorInterruptTrace = [];
     let peFinishCycle = null;
     let peFinishSignal = false;
     let peFinishInterruptDelivered = false;
@@ -6800,11 +6822,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         commandProcessorMaximumRawDistance,
         cpFifoState.distance
       );
-      if (cpFifoState.distance === 0) return 0;
-      if ((cpFifoState.control & cpControlReadEnable) === 0) {
-        commandProcessorReadDisabledStops += 1;
+      if (cpFifoState.distance === 0) {
+        refreshCommandProcessorInterruptLevel("fifo-empty");
         return 0;
       }
+      if ((cpFifoState.control & cpControlReadEnable) === 0) {
+        commandProcessorReadDisabledStops += 1;
+        refreshCommandProcessorInterruptLevel("fifo-read-disabled");
+        return 0;
+      }
+      // A guest can publish a signed write - read distance immediately before
+      // enabling GP reads. Recover that coherent ring value before sampling
+      // the high-water source so it cannot become a false sticky interrupt.
       normalizeCommandProcessorFifoDistance();
       commandProcessorMaximumDistance = Math.max(
         commandProcessorMaximumDistance,
@@ -6815,6 +6844,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         cpFifoState.readPointer,
         "read"
       );
+      refreshCommandProcessorInterruptLevel("fifo-before-consume");
 
       let remainingBudget = Math.max(
         gxWriteGatherBurstBytes,
@@ -6871,6 +6901,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         consumedBytes += chunkBytes;
         remainingBudget -= chunkBytes;
       }
+      refreshCommandProcessorInterruptLevel("fifo-after-consume");
       return consumedBytes;
     }
 
@@ -7097,6 +7128,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       gxFifoStores += stores;
       gxFifoBytes += source.length;
       gxFifoQuantizedStores += quantizedStores;
+      if (producedLinkedBurst) {
+        // Production is monotonic within one append, so a single sample here
+        // preserves every threshold crossing before the bounded consumer runs
+        // without adding an interrupt-MMIO round trip for every 32-byte burst.
+        refreshCommandProcessorInterruptLevel("gather-append");
+      }
       if (producedLinkedBurst && serviceLinkedFifo) {
         serviceCommandProcessorFifo();
       }
@@ -7267,12 +7304,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       piFifoState.end = 0;
       piFifoState.current = 0;
       piFifoState.wrap = false;
+      resetCommandProcessorInterruptState("fifo-register-reset");
     }
 
     function resetCommandProcessorFifoFromPi() {
       cpFifoState.control = cpControlLinkEnable;
       cpFifoState.highWatermark = cpFifoAddressMask;
       cpFifoState.lowWatermark = 0;
+      resetCommandProcessorInterruptState("pi-fifo-reset");
     }
 
     function commandProcessorBreakpointLevel() {
@@ -7301,6 +7340,221 @@ const TEMPLATE: &str = r##"<!doctype html>
         | (empty || !readEnabled || breakpoint ? cpStatusCommandIdle : 0)
         | (breakpoint ? cpStatusBreakpoint : 0)
       );
+    }
+
+    function commandProcessorInterruptInputs() {
+      const status = readCommandProcessorStatus();
+      const readEnabled = (cpFifoState.control & cpControlReadEnable) !== 0;
+      const highQualified = readEnabled
+        && (status & cpStatusHighWatermark) !== 0;
+      const lowQualified = readEnabled
+        && (status & cpStatusLowWatermark) !== 0;
+      const breakpointQualified = readEnabled
+        && (status & cpStatusBreakpoint) !== 0;
+      return {
+        status,
+        highQualified,
+        lowQualified,
+        breakpointQualified,
+        qualifiedSources: (
+          (highQualified ? cpStatusHighWatermark : 0)
+          | (lowQualified ? cpStatusLowWatermark : 0)
+          | (breakpointQualified ? cpStatusBreakpoint : 0)
+        ),
+      };
+    }
+
+    function traceCommandProcessorInterrupt(reason, inputs, force = false) {
+      const cause = view.getUint32(mmio + 0x3000, false);
+      const pending = (
+        (commandProcessorHighInterruptPending ? cpStatusHighWatermark : 0)
+        | (commandProcessorLowInterruptPending ? cpStatusLowWatermark : 0)
+      );
+      const signature = [
+        cpFifoState.control,
+        inputs.status & (
+          cpStatusHighWatermark | cpStatusLowWatermark | cpStatusBreakpoint
+        ),
+        inputs.qualifiedSources,
+        pending,
+        commandProcessorInterruptLevelActive ? 1 : 0,
+        cause & piCommandProcessorInterruptCause,
+      ].join(":");
+      if (!force && signature === commandProcessorInterruptTraceSignature) return;
+      commandProcessorInterruptTraceSignature = signature;
+      commandProcessorInterruptTrace.push({
+        cycle: cycles,
+        reason,
+        control: "0x" + cpFifoState.control.toString(16).padStart(4, "0"),
+        status: "0x" + inputs.status.toString(16).padStart(4, "0"),
+        qualifiedSources: "0x"
+          + inputs.qualifiedSources.toString(16).padStart(4, "0"),
+        pending: "0x" + pending.toString(16).padStart(4, "0"),
+        distance: hex32(cpFifoState.distance),
+        writePointer: hex32(cpFifoState.writePointer),
+        readPointer: hex32(cpFifoState.readPointer),
+        cause: hex32(cause),
+        mask: hex32(view.getUint32(mmio + 0x3004, false)),
+      });
+      if (commandProcessorInterruptTrace.length > 48) {
+        commandProcessorInterruptTrace.shift();
+      }
+    }
+
+    function refreshCommandProcessorInterruptLevel(reason) {
+      const inputs = commandProcessorInterruptInputs();
+      // Watermark pending state belongs to the CP source, not to the PI
+      // request gate. Real hardware keeps a legitimate pending watermark
+      // sticky until producer/consumer movement resolves its raw level, even
+      // if software disables that source's interrupt-enable bit meanwhile.
+      if (inputs.highQualified && !commandProcessorHighInterruptPending) {
+        commandProcessorHighInterruptAssertions += 1;
+      }
+      if (inputs.lowQualified && !commandProcessorLowInterruptPending) {
+        commandProcessorLowInterruptAssertions += 1;
+      }
+      if (inputs.highQualified) commandProcessorHighInterruptPending = true;
+      if (inputs.lowQualified) commandProcessorLowInterruptPending = true;
+
+      const readEnabled = (cpFifoState.control & cpControlReadEnable) !== 0;
+      const request = readEnabled && (
+        (
+          (cpFifoState.control & cpControlHighWatermarkInterruptEnable) !== 0
+          && commandProcessorHighInterruptPending
+        )
+        || (
+          (cpFifoState.control & cpControlLowWatermarkInterruptEnable) !== 0
+          && commandProcessorLowInterruptPending
+        )
+        || (
+          (cpFifoState.control & cpControlBreakpointInterruptEnable) !== 0
+          && inputs.breakpointQualified
+        )
+      );
+      const beforeCause = view.getUint32(mmio + 0x3000, false);
+      const cause = (
+        request
+          ? beforeCause | piCommandProcessorInterruptCause
+          : beforeCause & ~piCommandProcessorInterruptCause
+      ) >>> 0;
+      if (
+        (beforeCause & piCommandProcessorInterruptCause) === 0
+        && (cause & piCommandProcessorInterruptCause) !== 0
+      ) {
+        commandProcessorPiAssertions += 1;
+      } else if (
+        (beforeCause & piCommandProcessorInterruptCause) !== 0
+        && (cause & piCommandProcessorInterruptCause) === 0
+      ) {
+        commandProcessorPiDeassertions += 1;
+      }
+      view.setUint32(mmio + 0x3000, cause, false);
+      commandProcessorQualifiedInterruptSources = inputs.qualifiedSources;
+      commandProcessorInterruptLevelActive = request;
+      traceCommandProcessorInterrupt(reason, inputs);
+      return request;
+    }
+
+    function clearCommandProcessorInterrupts(value) {
+      const written = value & (
+        cpClearHighWatermarkInterrupt
+        | cpClearLowWatermarkInterrupt
+        | cpClearPerformanceMetrics
+      );
+      let cleared = 0;
+      if (
+        (written & cpClearHighWatermarkInterrupt) !== 0
+        && commandProcessorHighInterruptPending
+      ) {
+        commandProcessorHighInterruptPending = false;
+        commandProcessorInterruptClears += 1;
+        cleared |= cpClearHighWatermarkInterrupt;
+      }
+      if (
+        (written & cpClearLowWatermarkInterrupt) !== 0
+        && commandProcessorLowInterruptPending
+      ) {
+        commandProcessorLowInterruptPending = false;
+        commandProcessorInterruptClears += 1;
+        cleared |= cpClearLowWatermarkInterrupt;
+      }
+      if ((written & cpClearPerformanceMetrics) !== 0) {
+        commandProcessorPerformanceMetricClears += 1;
+      }
+
+      refreshCommandProcessorInterruptLevel("cp-clear");
+      if (
+        (cleared & cpClearHighWatermarkInterrupt) !== 0
+        && commandProcessorHighInterruptPending
+      ) {
+        commandProcessorActiveClearReassertions += 1;
+      }
+      if (
+        (cleared & cpClearLowWatermarkInterrupt) !== 0
+        && commandProcessorLowInterruptPending
+      ) {
+        commandProcessorActiveClearReassertions += 1;
+      }
+      traceCommandProcessorInterrupt(
+        "cp-clear-complete",
+        commandProcessorInterruptInputs(),
+        true
+      );
+    }
+
+    function resetCommandProcessorInterruptState(reason) {
+      commandProcessorHighInterruptPending = false;
+      commandProcessorLowInterruptPending = false;
+      commandProcessorQualifiedInterruptSources = 0;
+      commandProcessorInterruptLevelActive = false;
+      commandProcessorInterruptResets += 1;
+      const cause = view.getUint32(mmio + 0x3000, false)
+        & ~piCommandProcessorInterruptCause;
+      view.setUint32(mmio + 0x3000, cause >>> 0, false);
+      commandProcessorInterruptTraceSignature = null;
+      traceCommandProcessorInterrupt(
+        reason,
+        commandProcessorInterruptInputs(),
+        true
+      );
+    }
+
+    function writeProcessorInterfaceInterruptCause(value) {
+      const current = view.getUint32(mmio + 0x3000, false);
+      view.setUint32(mmio + 0x3000, current & ~(value >>> 0), false);
+      // PI cause is W1C, but CP is a level source. Hardware therefore
+      // reasserts bit 11 immediately while the CP request remains active.
+      refreshCommandProcessorInterruptLevel("pi-cause-w1c");
+    }
+
+    function serviceCommandProcessorInterrupt(observedCycles) {
+      refreshCommandProcessorInterruptLevel("mmio-service");
+      const cause = view.getUint32(mmio + 0x3000, false);
+      const mask = view.getUint32(mmio + 0x3004, false);
+      const msr = view.getUint32(cpu + msrOffset, true);
+      if (
+        (cause & mask & piCommandProcessorInterruptCause) === 0
+        || (msr & 0x00008000) === 0
+      ) {
+        return false;
+      }
+
+      commandProcessorExternalInterruptDeliveries += 1;
+      deviceEvents.set(
+        "commandProcessorExternalInterrupt",
+        (deviceEvents.get("commandProcessorExternalInterrupt") ?? 0) + 1
+      );
+      deviceEvents.set(
+        "externalInterrupt",
+        (deviceEvents.get("externalInterrupt") ?? 0) + 1
+      );
+      traceCommandProcessorInterrupt(
+        "pi-deliver@" + observedCycles,
+        commandProcessorInterruptInputs(),
+        true
+      );
+      raiseException(cpu, 0x0500);
+      return true;
     }
 
     function commandProcessorPairValue(lowOffset) {
@@ -7367,7 +7621,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         return false;
       }
       const offset = physical - 0x0c000000;
-      if (offset === 0x00 || offset === 0x04) return true;
+      if (offset === 0x00) return true;
+      if (offset === 0x04) {
+        clearCommandProcessorInterrupts(value);
+        return true;
+      }
       if (offset === 0x02) {
         cpFifoState.control = value & cpControlMask;
         serviceCommandProcessorFifo();
@@ -7381,12 +7639,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         ? (current & 0x03ff0000) | (value & cpFifoLowWordMask)
         : (current & 0x0000ffff) | ((value & cpFifoHighWordMask) << 16);
       const written = writeCommandProcessorPairValue(lowOffset, next);
-      if (
-        written
-        && (offset & 0x02) !== 0
-        && [0x30, 0x38, 0x3c].includes(lowOffset)
-      ) {
-        serviceCommandProcessorFifo();
+      if (written && (offset & 0x02) !== 0) {
+        if ([0x30, 0x38, 0x3c].includes(lowOffset)) {
+          serviceCommandProcessorFifo();
+        } else if ([0x28, 0x2c].includes(lowOffset)) {
+          refreshCommandProcessorInterruptLevel(
+            "cp-pair-0x" + lowOffset.toString(16).padStart(2, "0")
+          );
+        }
       }
       return written;
     }
@@ -7441,6 +7701,28 @@ const TEMPLATE: &str = r##"<!doctype html>
         readPointer: hex32(cpFifoState.readPointer),
         breakpoint: hex32(cpFifoState.breakpoint),
         breakpointLevel: commandProcessorBreakpointLevel(),
+        interrupt: {
+          highPending: commandProcessorHighInterruptPending,
+          lowPending: commandProcessorLowInterruptPending,
+          qualifiedSources: "0x"
+            + commandProcessorQualifiedInterruptSources
+              .toString(16).padStart(4, "0"),
+          levelActive: commandProcessorInterruptLevelActive,
+          piCause: (
+            view.getUint32(mmio + 0x3000, false)
+            & piCommandProcessorInterruptCause
+          ) !== 0,
+          highAssertions: commandProcessorHighInterruptAssertions,
+          lowAssertions: commandProcessorLowInterruptAssertions,
+          clears: commandProcessorInterruptClears,
+          activeClearReassertions: commandProcessorActiveClearReassertions,
+          performanceMetricClears: commandProcessorPerformanceMetricClears,
+          piAssertions: commandProcessorPiAssertions,
+          piDeassertions: commandProcessorPiDeassertions,
+          externalDeliveries: commandProcessorExternalInterruptDeliveries,
+          resets: commandProcessorInterruptResets,
+          trace: commandProcessorInterruptTrace,
+        },
       };
     }
 
@@ -7989,6 +8271,17 @@ const TEMPLATE: &str = r##"<!doctype html>
     function writeInteger(address, value, size) {
       const logical = address >>> 0;
       const physical = translateDataRange(logical, size, true);
+      if (
+        physical !== null
+        && physical < 0x0c003004
+        && physical + size > 0x0c003000
+      ) {
+        if (physical === 0x0c003000 && size === 4) {
+          writeProcessorInterfaceInterruptCause(value);
+          return 1;
+        }
+        return 0;
+      }
       if (
         physical !== null
         && physical < 0x0c000040
@@ -9293,6 +9586,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         serviceCommandProcessorFifo();
       }
+      serviceCommandProcessorInterrupt(observedCycles);
       ensureViSchedule(observedCycles);
       for (const offset of [0x680c, 0x6820, 0x6834]) {
         const control = view.getUint32(mmio + offset, false);
