@@ -216,6 +216,22 @@ fn main() {
         .map(|index| GPR::new(index).offset().to_string())
         .collect::<Vec<_>>()
         .join(",");
+    let instruction_bat_offsets = [
+        [SPR::IBAT0L, SPR::IBAT0U],
+        [SPR::IBAT1L, SPR::IBAT1U],
+        [SPR::IBAT2L, SPR::IBAT2U],
+        [SPR::IBAT3L, SPR::IBAT3U],
+    ]
+    .map(|[lower, upper]| format!("[{},{}]", lower.offset(), upper.offset()))
+    .join(",");
+    let data_bat_offsets = [
+        [SPR::DBAT0L, SPR::DBAT0U],
+        [SPR::DBAT1L, SPR::DBAT1U],
+        [SPR::DBAT2L, SPR::DBAT2U],
+        [SPR::DBAT3L, SPR::DBAT3U],
+    ]
+    .map(|[lower, upper]| format!("[{},{}]", lower.offset(), upper.offset()))
+    .join(",");
     let gx_fifo_runtime = gx_fifo_hook_runtime(
         GX_FIFO_STAGING_META_PTR as u32,
         GX_FIFO_STAGING_DATA_PTR as u32,
@@ -250,6 +266,8 @@ fn main() {
         .replace("__FST__", &hex(&disc.filesystem))
         .replace("__FST_MAX_SIZE__", &disc.filesystem_max_size.to_string())
         .replace("__GPR_OFFSETS__", &gpr_offsets)
+        .replace("__IBAT_OFFSETS__", &instruction_bat_offsets)
+        .replace("__DBAT_OFFSETS__", &data_bat_offsets)
         .replace("__DOL_NAME__", &js_string(&dol_name))
         .replace("__GAME_LABEL__", &js_string(&disc.game_label))
         .replace("__GAME_IDENTIFIER__", &js_string(&disc.game_identifier))
@@ -3769,6 +3787,20 @@ const TEMPLATE: &str = r##"<!doctype html>
     const fstBytes = fst.length;
     const compilerWasmBytes = compilerWasm.length;
     const gprOffsets = [__GPR_OFFSETS__];
+    const instructionBatOffsets = [__IBAT_OFFSETS__];
+    const dataBatOffsets = [__DBAT_OFFSETS__];
+    const defaultInstructionBats = [
+      [0x80001fff, 0x00000002],
+      [0x00000000, 0x00000000],
+      [0x00000000, 0x00000000],
+      [0xfff0001f, 0xfff00001],
+    ];
+    const defaultDataBats = [
+      [0x80001fff, 0x00000002],
+      [0xc0001fff, 0x0000002a],
+      [0x00000000, 0x00000000],
+      [0xfff0001f, 0xfff00001],
+    ];
     const memory = new WebAssembly.Memory({ initial: __MEMORY_PAGES__ });
     const bytes = new Uint8Array(memory.buffer);
     const view = new DataView(memory.buffer);
@@ -3782,6 +3814,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const ramSize = __RAM_SIZE__;
     const mmio = __MMIO_PTR__;
     const mmioSize = __MMIO_SIZE__;
+    const physicalMmioBase = 0x0c000000;
     const lockedCache = __LOCKED_CACHE_PTR__;
     const lockedCacheSize = __LOCKED_CACHE_SIZE__;
     const gxFifoHookRuntimeWasm = decode("__GX_FIFO_HOOK_RUNTIME__");
@@ -3874,6 +3907,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const exceptionFirstByVector = {};
     let firstDsi = null;
     let lastUnmappedAccess = null;
+    let dataFastmemTranslationSignature = null;
     let lockedCacheReads = 0;
     let lockedCacheReadBytes = 0;
     let lockedCacheWrites = 0;
@@ -4078,6 +4112,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       user_0_11: (_ctx, address, gqr, pointer) => readQuantized(address, gqr, pointer),
       user_0_12: (_ctx, address, gqr, value) => writeQuantized(address, gqr, value),
       user_0_15: () => serviceLockedCacheDma(),
+      user_0_16: () => msrChanged(),
+      user_0_18: () => dataBatChanged(),
       user_0_19: () => updateTimeBase(),
       user_0_20: () => timeBaseChanged(),
       user_0_21: () => updateDecrementer(cycles),
@@ -4098,7 +4134,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (![1, 2, 4, 8].includes(size)) return false;
 
       const address = Number(arguments_[1]) >>> 0;
-      return ramPointer(address, size) !== null || lockedCachePointer(address, size) !== null;
+      const write = [
+        "user_0_7",
+        "user_0_8",
+        "user_0_9",
+        "user_0_10",
+        "user_0_12",
+      ].includes(name);
+      return dataRamOrLockedCachePointer(address, size, write) !== null;
     }
 
     function withScopedCycles(scopedCycles, callback) {
@@ -4139,19 +4182,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       return withScopedCycles(observedCycles, drainGxFifoStaging);
     }
 
-    function jitHookDrainsFifo(name) {
-      // BAT callbacks are deferred until block exit but retain the originating
-      // mtspr timestamp. Later writes in the same block must drain at the
-      // returned block boundary rather than being moved back to that timestamp.
-      return name !== "user_0_17" && name !== "user_0_18";
-    }
-
     function invokeJitHook(target, name, arguments_) {
       return withPublishedHookCycles(() => {
-        const drainsFifo = jitHookDrainsFifo(name);
-        const drainedFifo = drainsFifo
-          && view.getUint32(gxFifoStagingMeta, true) !== 0;
-        if (drainsFifo) drainGxFifoStaging();
+        const drainedFifo = view.getUint32(gxFifoStagingMeta, true) !== 0;
+        drainGxFifoStaging();
         hookCalls.set(name, (hookCalls.get(name) ?? 0) + 1);
         if (!regionRunning) return target[name]?.(...arguments_) ?? 0;
 
@@ -4218,17 +4252,163 @@ const TEMPLATE: &str = r##"<!doctype html>
       return ram + physical;
     }
 
-    function mmioPointer(address, size) {
-      const logical = address >>> 0;
-      if (logical < 0xcc000000 || logical + size > 0xcc000000 + mmioSize) return null;
-      return mmio + logical - 0xcc000000;
+    function batAllowsAccess(lower, write) {
+      const protection = lower & 3;
+      return write ? protection === 2 : protection !== 0;
     }
 
-    function lockedCachePointer(address, size) {
-      const logical = address >>> 0;
-      const offset = logical - 0xe0000000;
+    function translateBatAddress(effectiveAddress, upper, lower, userMode, write) {
+      const valid = userMode ? 1 : 2;
+      if ((upper & valid) === 0) return null;
+      if (!batAllowsAccess(lower, write)) return null;
+      const blockMask = (((upper >>> 2) & 0x7ff) << 17) >>> 0;
+      const addressMask = (blockMask | 0x1ffff) >>> 0;
+      const regionMask = (~addressMask) >>> 0;
+      const effective = effectiveAddress >>> 0;
+      if ((effective & regionMask) !== ((upper >>> 0) & regionMask)) return null;
+      const physicalBase = ((lower & 0xfffe0000) & regionMask) >>> 0;
+      return (physicalBase | (effective & addressMask)) >>> 0;
+    }
+
+    function translateDataEffectiveAddress(effectiveAddress, msr, dataBats, write) {
+      const effective = effectiveAddress >>> 0;
+      if ((msr & 0x10) === 0) return effective;
+      const userMode = (msr & 0x4000) !== 0;
+      for (const [upper, lower] of dataBats) {
+        const physical = translateBatAddress(
+          effective,
+          upper,
+          lower,
+          userMode,
+          write
+        );
+        if (physical !== null) return physical;
+      }
+      return null;
+    }
+
+    function translateDataEffectiveRange(
+      effectiveAddress,
+      size,
+      msr,
+      dataBats,
+      write
+    ) {
+      const effective = effectiveAddress >>> 0;
+      if (!Number.isSafeInteger(size) || size <= 0) return null;
+      if (size > 0x100000000 - effective) return null;
+
+      let physicalStart = null;
+      let offset = 0;
+      while (offset < size) {
+        const currentEffective = (effective + offset) >>> 0;
+        const currentPhysical = translateDataEffectiveAddress(
+          currentEffective,
+          msr,
+          dataBats,
+          write
+        );
+        if (currentPhysical === null) return null;
+        if (physicalStart === null) {
+          physicalStart = currentPhysical;
+          if (size > 0x100000000 - physicalStart) return null;
+        } else if (currentPhysical !== physicalStart + offset) {
+          return null;
+        }
+        offset += Math.min(size - offset, 0x20000 - (currentEffective & 0x1ffff));
+      }
+      return physicalStart;
+    }
+
+    function readDataBats() {
+      return dataBatOffsets.map(([lowerOffset, upperOffset]) => [
+        view.getUint32(cpu + upperOffset, true),
+        view.getUint32(cpu + lowerOffset, true),
+      ]);
+    }
+
+    function translateDataAddress(effectiveAddress, write = false) {
+      return translateDataEffectiveAddress(
+        effectiveAddress,
+        view.getUint32(cpu + msrOffset, true),
+        readDataBats(),
+        write
+      );
+    }
+
+    function translateDataRange(effectiveAddress, size, write = false) {
+      return translateDataEffectiveRange(
+        effectiveAddress,
+        size,
+        view.getUint32(cpu + msrOffset, true),
+        readDataBats(),
+        write
+      );
+    }
+
+    function normalizePhysicalMemoryAddress(address, size, ramBytes, mmioBytes) {
+      const physical = address >>> 0;
+      if (!Number.isInteger(size) || size < 0) return null;
+      if (physical < ramBytes && size <= ramBytes - physical) {
+        return { kind: "ram", offset: physical };
+      }
+      if (physical >= physicalMmioBase) {
+        const offset = physical - physicalMmioBase;
+        if (offset < mmioBytes && size <= mmioBytes - offset) {
+          return { kind: "mmio", offset };
+        }
+      }
+      return null;
+    }
+
+    function physicalRamPointer(address, size) {
+      const normalized = normalizePhysicalMemoryAddress(
+        address,
+        size,
+        ramSize,
+        mmioSize
+      );
+      return normalized?.kind === "ram" ? ram + normalized.offset : null;
+    }
+
+    function physicalMmioPointer(address, size) {
+      const normalized = normalizePhysicalMemoryAddress(
+        address,
+        size,
+        ramSize,
+        mmioSize
+      );
+      return normalized?.kind === "mmio" ? mmio + normalized.offset : null;
+    }
+
+    function dataRamPointer(address, size, write = false) {
+      const physical = translateDataRange(address, size, write);
+      return physical === null ? null : physicalRamPointer(physical, size);
+    }
+
+    function dataFastmemPointer(effectiveAddress, msr, dataBats, ramBytes, ramBase) {
+      const physical = translateDataEffectiveAddress(
+        effectiveAddress,
+        msr,
+        dataBats,
+        true
+      );
+      if (physical === null || physical >= ramBytes) return null;
+      return ramBase + physical;
+    }
+
+    function physicalLockedCachePointer(address, size) {
+      const physical = address >>> 0;
+      const offset = physical - 0xe0000000;
       if (offset < 0 || offset + size > lockedCacheSize) return null;
       return lockedCache + offset;
+    }
+
+    function dataRamOrLockedCachePointer(address, size, write = false) {
+      const physical = translateDataRange(address, size, write);
+      if (physical === null) return null;
+      return physicalRamPointer(physical, size)
+        ?? physicalLockedCachePointer(physical, size);
     }
 
     function copyFromLockedCache(target, cacheAddress, length) {
@@ -6624,22 +6804,29 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function readInteger(address, pointer, size) {
       const logical = address >>> 0;
-      if (logical === 0xcc000000 && size === 2) {
+      const physical = translateDataRange(logical, size, false);
+      if (physical === 0x0c000000 && size === 2) {
         view.setUint16(pointer, readCommandProcessorStatus(), true);
         return 1;
       }
-      if (logical === 0xcc006c08 && size === 4) {
+      if (physical === 0x0c006c08 && size === 4) {
         updateAudioSampleCounter(cycles);
       }
-      if (logical === 0xcc00503a && size === 2) {
+      if (physical === 0x0c00503a && size === 2) {
         view.setUint16(pointer, dspAudioDmaBlocksLeft(), true);
         return 1;
       }
-      if (logical === 0xcc005038 && size === 4) {
+      if (physical === 0x0c005038 && size === 4) {
         publishDspAudioDmaBlocksLeft();
       }
-      const lockedSource = lockedCachePointer(address, size);
-      const source = ramPointer(address, size) ?? mmioPointer(address, size) ?? lockedSource;
+      const lockedSource = physical === null
+        ? null
+        : physicalLockedCachePointer(physical, size);
+      const source = physical === null
+        ? null
+        : physicalRamPointer(physical, size)
+          ?? physicalMmioPointer(physical, size)
+          ?? lockedSource;
       if (source === null) {
         lastUnmappedAccess = {
           kind: "read",
@@ -6671,9 +6858,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         lockedCacheReads += 1;
         lockedCacheReadBytes += size;
       }
-      if (logical === 0xcc005006 && size === 2) consumeDspMail();
-      if (size === 4 && logical >= 0xcc006404 && logical <= 0xcc00642c) {
-        const channelOffset = logical - 0xcc006404;
+      if (physical === 0x0c005006 && size === 2) consumeDspMail();
+      if (size === 4 && physical >= 0x0c006404 && physical <= 0x0c00642c) {
+        const channelOffset = physical - 0x0c006404;
         const registerOffset = channelOffset % 12;
         if (registerOffset === 0 || registerOffset === 4) {
           const channel = Math.floor(channelOffset / 12);
@@ -7127,7 +7314,8 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function writeInteger(address, value, size) {
       const logical = address >>> 0;
-      if (logical >= 0xcc008000 && logical < 0xcc008020) {
+      const physical = translateDataRange(logical, size, true);
+      if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (size) {
           case 1: gxFifoScratch.setUint8(0, value); break;
           case 2: gxFifoScratch.setUint16(0, value, false); break;
@@ -7138,70 +7326,70 @@ const TEMPLATE: &str = r##"<!doctype html>
         appendGxFifo(size);
         return 1;
       }
-      if (logical === 0xcc006434 && size === 4) {
+      if (physical === 0x0c006434 && size === 4) {
         writeSerialControl(value);
         return 1;
       }
-      if (logical === 0xcc006438 && size === 4) {
+      if (physical === 0x0c006438 && size === 4) {
         writeSerialStatus(value);
         return 1;
       }
-      if (logical === 0xcc006000 && size === 4) {
+      if (physical === 0x0c006000 && size === 4) {
         writeDiskStatus(value);
         return 1;
       }
-      if (logical === 0xcc00100a && size === 2) {
+      if (physical === 0x0c00100a && size === 2) {
         writePixelEngineControl(value);
         return 1;
       }
       if (
         size === 1
-        && (logical === 0xcc00100a || logical === 0xcc00100b)
+        && (physical === 0x0c00100a || physical === 0x0c00100b)
       ) {
-        const shift = logical === 0xcc00100a ? 8 : 0;
+        const shift = physical === 0x0c00100a ? 8 : 0;
         writePixelEngineControl((value & 0xff) << shift);
         return 1;
       }
-      if (logical === 0xcc006c00 && size === 4) {
+      if (physical === 0x0c006c00 && size === 4) {
         writeAudioControl(value);
         return 1;
       }
-      if (logical === 0xcc006c08 && size === 4) {
+      if (physical === 0x0c006c08 && size === 4) {
         aiSampleCounter = value >>> 0;
         aiLastCycle = cycles;
         view.setUint32(mmio + 0x6c08, aiSampleCounter, false);
         return 1;
       }
-      if (logical === 0xcc005000 && size === 2) {
+      if (physical === 0x0c005000 && size === 2) {
         writeDspMailboxHigh(value);
         return 1;
       }
-      if (logical === 0xcc005002 && size === 2) {
+      if (physical === 0x0c005002 && size === 2) {
         writeDspMailboxLow(value);
         return 1;
       }
-      if (logical === 0xcc00500a && size === 2) {
+      if (physical === 0x0c00500a && size === 2) {
         writeDspControl(value);
         return 1;
       }
-      if (logical === 0xcc005034 && size === 4) {
+      if (physical === 0x0c005034 && size === 4) {
         view.setUint16(mmio + 0x5034, (value >>> 16) & 0xffff, false);
         writeDspAudioDmaControl(value & 0xffff);
         return 1;
       }
-      if (logical === 0xcc005036 && size === 2) {
+      if (physical === 0x0c005036 && size === 2) {
         writeDspAudioDmaControl(value);
         return 1;
       }
-      if (logical === 0xcc005028 && size === 4) {
+      if (physical === 0x0c005028 && size === 4) {
         startAramDma(value);
         return 1;
       }
-      if (logical === 0xcc005028 && size === 2) {
+      if (physical === 0x0c005028 && size === 2) {
         view.setUint16(mmio + 0x5028, value & 0x83ff, false);
         return 1;
       }
-      if (logical === 0xcc00502a && size === 2) {
+      if (physical === 0x0c00502a && size === 2) {
         const countAndDirection = (
           (view.getUint16(mmio + 0x5028, false) << 16)
           | (value & 0xffe0)
@@ -7210,8 +7398,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         return 1;
       }
 
-      const lockedTarget = lockedCachePointer(address, size);
-      const target = ramPointer(address, size) ?? mmioPointer(address, size) ?? lockedTarget;
+      const lockedTarget = physical === null
+        ? null
+        : physicalLockedCachePointer(physical, size);
+      const target = physical === null
+        ? null
+        : physicalRamPointer(physical, size)
+          ?? physicalMmioPointer(physical, size)
+          ?? lockedTarget;
       if (target === null) {
         lastUnmappedAccess = {
           kind: "write",
@@ -7240,8 +7434,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         default:
           return 0;
       }
-      if (logical >= 0xcc002000 && logical < 0xcc002070) {
-        const start = logical - 0xcc002000;
+      if (physical >= 0x0c002000 && physical < 0x0c002070) {
+        const start = physical - 0x0c002000;
         const end = start + size;
         if (
           (start < 0x14 && end > 0x00)
@@ -7251,7 +7445,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           viScheduleDirty = true;
         }
       }
-      if (logical < 0xcc006434 && logical + size > 0xcc006430) {
+      if (physical < 0x0c006434 && physical + size > 0x0c006430) {
         viScheduleDirty = true;
       }
       if (lockedTarget !== null) {
@@ -7280,8 +7474,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       const type = (gqr >>> 16) & 7;
       const size = type === 0 ? 4 : (type === 4 || type === 6 ? 1 : 2);
       if (![0, 4, 5, 6, 7].includes(type)) return 0;
-      const lockedSource = lockedCachePointer(address, size);
-      const source = ramPointer(address, size) ?? lockedSource;
+      const physical = translateDataRange(address, size, false);
+      const lockedSource = physical === null
+        ? null
+        : physicalLockedCachePointer(physical, size);
+      const source = physical === null
+        ? null
+        : physicalRamPointer(physical, size) ?? lockedSource;
       if (source === null) return 0;
       let value;
       switch (type) {
@@ -7308,7 +7507,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       const scaled = value * (2 ** scale);
       const stored = quantizedStoreValue(type, scaled);
       const logical = address >>> 0;
-      if (logical >= 0xcc008000 && logical < 0xcc008020) {
+      const physical = translateDataRange(logical, size, true);
+      if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (type) {
           case 0: gxFifoScratch.setFloat32(0, stored, false); break;
           case 4: gxFifoScratch.setUint8(0, stored); break;
@@ -7320,8 +7520,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxFifoQuantizedStores += 1;
         return size;
       }
-      const lockedTarget = lockedCachePointer(address, size);
-      const target = ramPointer(address, size) ?? lockedTarget;
+      const lockedTarget = physical === null
+        ? null
+        : physicalLockedCachePointer(physical, size);
+      const target = physical === null
+        ? null
+        : physicalRamPointer(physical, size) ?? lockedTarget;
       if (target === null) return 0;
       switch (type) {
         case 0: view.setFloat32(target, stored, false); break;
@@ -7350,19 +7554,62 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function initializeFastmem() {
+    function initializeBatRegisters(offsets, values) {
+      for (let index = 0; index < offsets.length; index += 1) {
+        const [lowerOffset, upperOffset] = offsets[index];
+        const [upper, lower] = values[index];
+        view.setUint32(cpu + lowerOffset, lower >>> 0, true);
+        view.setUint32(cpu + upperOffset, upper >>> 0, true);
+      }
+    }
+
+    function initializeMemoryManagement() {
+      initializeBatRegisters(instructionBatOffsets, defaultInstructionBats);
+      initializeBatRegisters(dataBatOffsets, defaultDataBats);
+      view.setUint32(cpu + msrOffset, 0x30, true);
+    }
+
+    function rebuildDataFastmem() {
+      const currentMsr = view.getUint32(cpu + msrOffset, true);
+      const currentDataBats = readDataBats();
+      const translationSignature = [currentMsr & 0x4010];
+      for (const [upper, lower] of currentDataBats) {
+        translationSignature.push(upper >>> 0, lower >>> 0);
+      }
+      if (
+        dataFastmemTranslationSignature !== null
+        && translationSignature.every((value, index) =>
+          dataFastmemTranslationSignature[index] === value
+        )
+      ) {
+        return false;
+      }
+      dataFastmemTranslationSignature = translationSignature;
       for (let index = 0; index < __FASTMEM_LUT_COUNT__; index += 1) {
         view.setUint32(fastmem + index * 4, 0, true);
       }
-      const pageSize = 1 << __FASTMEM_PAGE_SHIFT__;
-      for (let physical = 0; physical < ramSize; physical += pageSize) {
-        const pointer = ram + physical;
-        const cached = (0x80000000 + physical) >>> 0;
-        const uncached = (0xc0000000 + physical) >>> 0;
-        view.setUint32(fastmem + (physical >>> __FASTMEM_PAGE_SHIFT__) * 4, pointer, true);
-        view.setUint32(fastmem + (cached >>> __FASTMEM_PAGE_SHIFT__) * 4, pointer, true);
-        view.setUint32(fastmem + (uncached >>> __FASTMEM_PAGE_SHIFT__) * 4, pointer, true);
+      for (let index = 0; index < __FASTMEM_LUT_COUNT__; index += 1) {
+        const effective = (index << __FASTMEM_PAGE_SHIFT__) >>> 0;
+        const pointer = dataFastmemPointer(
+          effective,
+          currentMsr,
+          currentDataBats,
+          ramSize,
+          ram
+        );
+        if (pointer !== null) view.setUint32(fastmem + index * 4, pointer, true);
       }
+      return true;
+    }
+
+    function msrChanged() {
+      // The compiler terminates this block after publishing its automatic PC.
+      // Device interrupt delivery remains in the normal post-block service pass.
+      rebuildDataFastmem();
+    }
+
+    function dataBatChanged() {
+      rebuildDataFastmem();
     }
 
     function writePhysical32(address, value) {
@@ -9059,6 +9306,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const exceptionMsr = ((oldMsr >>> 16) & 1) | (oldMsr & 0x00011040);
       const vectorBase = (oldMsr & 0x40) === 0 ? 0 : 0xfff00000;
       view.setUint32(registers + msrOffset, exceptionMsr, true);
+      if (((oldMsr ^ exceptionMsr) & 0x4010) !== 0) rebuildDataFastmem();
       view.setUint32(registers + pcOffset, vectorBase | exception, true);
     }
 
@@ -9185,6 +9433,20 @@ const TEMPLATE: &str = r##"<!doctype html>
         && fetchWord(currentPc + 8) === 0x4200fff8;
     }
 
+    function cacheInstructionUsesStoreAccess(cacheInstruction) {
+      return cacheInstruction === 0x7c001bac || cacheInstruction === 0x7c001fec;
+    }
+
+    function translateCacheLoopRange(cacheInstruction, effectiveStart, byteCount) {
+      // The 750 performs a virtual index lookup for icbi without translating it.
+      if (cacheInstruction === 0x7c001fac) return effectiveStart >>> 0;
+      return translateDataRange(
+        effectiveStart,
+        byteCount,
+        cacheInstructionUsesStoreAccess(cacheInstruction)
+      );
+    }
+
     function fastForwardRecognizedLoop(currentPc, maximumExecuted) {
       const cacheInstruction = fetchWord(currentPc);
       if (isCacheLineLoop(currentPc)) {
@@ -9193,9 +9455,17 @@ const TEMPLATE: &str = r##"<!doctype html>
           const skipped = loopSkipBudget(groups - 1, 6, maximumExecuted);
           if (skipped === 0) return;
           const guestStart = readGpr(3);
+          const byteCount = skipped * 32;
+          const guestRangeStart = guestStart & ~31;
+          const physicalStart = translateCacheLoopRange(
+            cacheInstruction,
+            guestRangeStart,
+            byteCount
+          );
+          if (physicalStart === null) return;
           if (cacheInstruction === 0x7c001fec) {
-            const byteCount = skipped * 32;
-            const target = ramPointer(guestStart & ~31, byteCount);
+            const target = physicalRamPointer(physicalStart, byteCount)
+              ?? physicalLockedCachePointer(physicalStart, byteCount);
             if (target === null) return;
             bytes.fill(0, target, target + byteCount);
           }
@@ -9227,7 +9497,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (skipped === 0) return;
       const byteCount = skipped * 32;
       const guestStart = (readGpr(memsetLoop.baseRegister) + 4) >>> 0;
-      const target = ramPointer(guestStart, byteCount);
+      const physicalStart = translateDataRange(guestStart, byteCount, true);
+      if (physicalStart === null) return;
+      const target = physicalRamPointer(physicalStart, byteCount)
+        ?? physicalLockedCachePointer(physicalStart, byteCount);
       if (target === null) return;
 
       bytes.fill(fillByte, target, target + byteCount);
@@ -9926,7 +10199,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       view.setUint16(mmio + 0x5016, 1, false);
       pushDspMail(0x8071feed, false, "initialize");
       deviceEvents.set("dspInitialize", (deviceEvents.get("dspInitialize") ?? 0) + 1);
-      initializeFastmem();
+      initializeMemoryManagement();
+      rebuildDataFastmem();
       bytes.fill(0, lockedCache, lockedCache + lockedCacheSize);
       bytes.fill(
         0,
@@ -9946,7 +10220,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       loadSections(0x1c, 0x64, 0xac, 11);
       pc = dolU32(0xe0);
       view.setUint32(cpu + pcOffset, pc, true);
-      view.setUint32(cpu + msrOffset, 0x30, true);
 
       const { instance: compilerInstance } = await WebAssembly.instantiate(compilerWasm, {});
       compilerWasm = null;

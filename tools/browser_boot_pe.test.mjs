@@ -96,16 +96,21 @@ function makeContext() {
     gxLoadTlut() {
       assert.fail("unexpected TLUT load in PE test");
     },
-    lockedCachePointer() {
+    physicalLockedCachePointer() {
       return null;
     },
-    mmioPointer(address, size) {
-      const logical = address >>> 0;
-      if (logical < 0xcc000000 || logical + size > 0xcc010000) return null;
-      return logical - 0xcc000000;
+    physicalMmioPointer(address, size) {
+      const physical = address >>> 0;
+      if (physical < 0x0c000000 || physical + size > 0x0c010000) return null;
+      return physical - 0x0c000000;
     },
-    ramPointer() {
+    physicalRamPointer() {
       return null;
+    },
+    translateDataRange(address) {
+      return address >= 0xc0000000
+        ? (address - 0xc0000000) >>> 0
+        : address >>> 0;
     },
   };
   context.gxBpRegisters[0xfe] = 0x00ffffff;

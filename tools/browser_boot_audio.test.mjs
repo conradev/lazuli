@@ -144,9 +144,12 @@ test("zero-length DSP audio DMA raises only its initial AID", () => {
 
 test("DSP audio DMA control and blocks-left registers use explicit MMIO hooks", () => {
   const context = audioContext();
-  context.lockedCachePointer = () => null;
-  context.mmioPointer = () => null;
-  context.ramPointer = () => null;
+  context.physicalLockedCachePointer = () => null;
+  context.physicalMmioPointer = () => null;
+  context.physicalRamPointer = () => null;
+  context.translateDataRange = address => (
+    address >= 0xc0000000 ? (address - 0xc0000000) >>> 0 : address >>> 0
+  );
   context.readGpr = () => 0;
   context.hex32 = value => `0x${(value >>> 0).toString(16).padStart(8, "0")}`;
   context.lastUnmappedAccess = null;
