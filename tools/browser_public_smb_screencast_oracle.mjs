@@ -331,9 +331,9 @@ function frame(value, path, ordinal, previous) {
   exactKeys(value, ["metadata", "ordinal", "png", "receivedAtMs", "sessionId"], path);
   exact(value.ordinal, ordinal, `${path}.ordinal`);
   const sessionId = positiveInteger(value.sessionId, `${path}.sessionId`);
-  if (previous !== null && sessionId <= previous.sessionId) {
-    fail(`${path}.sessionId`, "screencast session IDs must increase");
-  }
+  // CDP exposes sessionId as the opaque token for Page.screencastFrameAck;
+  // Chrome may reuse it across frames. Ordinals plus the independent metadata
+  // and receipt clocks establish the strict frame order below.
   const receivedAtMs = positiveInteger(value.receivedAtMs, `${path}.receivedAtMs`);
   if (previous !== null && receivedAtMs < previous.receivedAtMs) {
     fail(`${path}.receivedAtMs`, "receipt times must not move backwards");

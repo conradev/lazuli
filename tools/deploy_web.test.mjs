@@ -30,6 +30,20 @@ test("deployment retains the public WarioWare release gate", async () => {
   );
 });
 
+test("deployment retains the passive public SMB observer gates", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/deploy-web.yml", import.meta.url),
+    "utf8",
+  );
+  for (const path of [
+    "tools/browser_public_cdp.test.mjs",
+    "tools/browser_public_smb_screencast.test.mjs",
+    "tools/browser_public_smb_screencast_oracle.test.mjs",
+  ]) {
+    assert.match(workflow, new RegExp(`^\\s+${path.replaceAll(".", "\\.")}$`, "m"));
+  }
+});
+
 test("deployment builds pinned wasm-bindgen browser renderer assets before the frontend", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/deploy-web.yml", import.meta.url),
