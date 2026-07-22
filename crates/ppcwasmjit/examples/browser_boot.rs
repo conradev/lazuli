@@ -3221,7 +3221,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxXfbFramesCaptured = 0;
     let gxFramesPresented = 0;
     let gxFramesSkipped = 0;
-    let gxSkippedFrameClearColor = null;
+    let gxSkippedCopyClears = [];
     let gxSkippedGeometryPrimitives = 0;
     let gxSkippedGeometryVertices = 0;
     let gxUncollectedNonClearingFrames = 0;
@@ -5430,13 +5430,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (gxXfbCopies.length > 16) gxXfbCopies.shift();
         if (!gxCollectFrameGeometry) {
           gxFramesSkipped += 1;
-          if (frame.clear) gxSkippedFrameClearColor = frame.clearColor;
+          if (frame.clear) gxSkippedCopyClears.push(gxCopyClearOperation(frame));
           else gxUncollectedNonClearingFrames += 1;
         } else {
-          if (gxSkippedFrameClearColor !== null) {
-            postMessage({ type: "efb-clear", clearColor: gxSkippedFrameClearColor });
-            gxSkippedFrameClearColor = null;
-          }
+          gxFlushSkippedCopyClears();
           postGxFrame(2, frame);
           gxXfbFramesCaptured += 1;
         }
@@ -5463,14 +5460,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         });
         if (gxTextureCopies.length > 16) gxTextureCopies.shift();
         if (collectedGeometry) {
-          if (gxSkippedFrameClearColor !== null) {
-            postMessage({ type: "efb-clear", clearColor: gxSkippedFrameClearColor });
-            gxSkippedFrameClearColor = null;
-          }
+          gxFlushSkippedCopyClears();
           postGxFrame(1, frame);
           gxTextureCopyFramesPresented += 1;
         } else if (frame.clear) {
-          postMessage({ type: "efb-clear", clearColor: frame.clearColor });
+          gxFlushSkippedCopyClears();
+          postMessage({ type: "gx-clear", clear: gxCopyClearOperation(frame) });
         }
         gxFrameDraws = [];
         gxFrameDrawVertices = 0;
@@ -5485,6 +5480,23 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxCollectFrameGeometry = true;
         }
       }
+    }
+
+    function gxCopyClearOperation(frame) {
+      return {
+        sourceX: frame.sourceX,
+        sourceY: frame.sourceY,
+        sourceWidth: frame.width,
+        sourceHeight: frame.sourceHeight,
+        copyState: frame.copyState,
+      };
+    }
+
+    function gxFlushSkippedCopyClears() {
+      for (const clear of gxSkippedCopyClears) {
+        postMessage({ type: "gx-clear", clear });
+      }
+      gxSkippedCopyClears = [];
     }
 
     function decodeGxCommands(source, start, end, inDisplayList = false) {
@@ -9611,8 +9623,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       captureSelectedXfb,
       captureTerminal: captureRendererTerminal,
     });
-    function gxClearEfb(clearColor) {
-      const [red, green, blue] = clearColor;
+    function gxClearEfb(clear) {
+      // LZGX v2 carries the complete terminal copy state. Exact EFB clear
+      // interpretation follows separately; retain the current RGB behavior here.
+      const { copyState } = clear;
+      const [red, green, blue] = copyState.clearRgba;
       webGpuRenderer.clear_efb(red, green, blue);
     }
     const source = document.querySelector("#runner-source").textContent;
@@ -10276,8 +10291,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       } else if (message?.type === "dataset") {
         document.body.dataset[message.name] = message.value;
         if (message.name === "status") runnerStatus.textContent = message.value;
-      } else if (message?.type === "efb-clear") {
-        return handleRendererOperation(() => gxClearEfb(message.clearColor), sourceWorker);
+      } else if (message?.type === "gx-clear") {
+        return handleRendererOperation(() => gxClearEfb(message.clear), sourceWorker);
       } else if (message?.type === "gx-frame") {
         return handleRendererFrame(message, () => submitGxFrame(message), sourceWorker);
       } else if (message?.type === "vi-present") {

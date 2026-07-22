@@ -723,15 +723,20 @@ test("malformed GX packets fail synchronously without a drain or acknowledgement
   assert.equal(context.document.body.dataset.xfbCopies, undefined);
 });
 
-test("standalone EFB clears remain serialized before the following GX frame", async () => {
+test("structured GX clears remain serialized before the following GX frame", async () => {
   assert.match(
     source,
-    /if \(gxSkippedFrameClearColor !== null\) \{\s*postMessage\(\{ type: "efb-clear", clearColor: gxSkippedFrameClearColor \}\);/,
+    /gxSkippedCopyClears\.push\(gxCopyClearOperation\(frame\)\)/,
   );
   assert.match(
     source,
-    /else if \(frame\.clear\) \{\s*postMessage\(\{ type: "efb-clear", clearColor: frame\.clearColor \}\);/,
+    /for \(const clear of gxSkippedCopyClears\) \{\s*postMessage\(\{ type: "gx-clear", clear \}\);/,
   );
+  assert.match(
+    source,
+    /else if \(frame\.clear\) \{\s*gxFlushSkippedCopyClears\(\);\s*postMessage\(\{ type: "gx-clear", clear: gxCopyClearOperation\(frame\) \}\);/,
+  );
+  assert.doesNotMatch(source, /type: "efb-clear"/);
 
   const calls = [];
   const messages = [];
@@ -789,9 +794,28 @@ test("standalone EFB clears remain serialized before the following GX frame", as
     { filename: "browser_boot.renderer-sync.efb-clear.js" },
   );
 
+  const copyState = {
+    zMode: 0x17,
+    blendMode: 0x5a9,
+    pixelControl: 3,
+    copyCommand: 0x800,
+    clearRgba: [4, 5, 6, 0xff],
+    clearDepth: 0x123456,
+    copyScale: 0x100,
+    copyFilter: [0x111111, 0x222222],
+  };
   const clear = context.handleWorkerMessage({
     currentTarget: currentWorker,
-    data: { type: "efb-clear", clearColor: [4, 5, 6, 0xff] },
+    data: {
+      type: "gx-clear",
+      clear: {
+        sourceX: 7,
+        sourceY: 9,
+        sourceWidth: 11,
+        sourceHeight: 13,
+        copyState,
+      },
+    },
   });
   const frame = context.handleWorkerMessage({
     currentTarget: currentWorker,

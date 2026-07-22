@@ -221,6 +221,7 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     gxFrameDraws: [],
     gxFrameDrawVertices: 0,
     gxFrameSkippedPrimitives: 0,
+    gxFlushSkippedCopyClears() {},
     gxSkippedFrameClearColor: null,
     gxLoadTlut() { assert.fail("unexpected TLUT load"); },
     gxMarkTextureCopyConsumer() { assert.fail("unexpected texture consumer"); },
@@ -273,6 +274,67 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     expected.clearRgba,
   );
   assert.equal(JSON.stringify(textureCopies[0]).includes('"copyState"'), false);
+});
+
+test("distinct skipped regional clears retain their source order", () => {
+  const messages = [];
+  const clearContext = {
+    gxSkippedCopyClears: [],
+    postMessage(message) { messages.push(message); },
+  };
+  vm.createContext(clearContext);
+  vm.runInContext(
+    ["gxCopyClearOperation", "gxFlushSkippedCopyClears"]
+      .map(extractFunction)
+      .join("\n\n"),
+    clearContext,
+    { filename: "browser_boot.gx-skipped-copy-clears.js" },
+  );
+  for (const frame of [
+    {
+      sourceX: 4,
+      sourceY: 5,
+      width: 6,
+      sourceHeight: 7,
+      copyState: { clearRgba: [1, 2, 3, 4] },
+    },
+    {
+      sourceX: 40,
+      sourceY: 50,
+      width: 60,
+      sourceHeight: 70,
+      copyState: { clearRgba: [5, 6, 7, 8] },
+    },
+  ]) {
+    clearContext.gxSkippedCopyClears.push(
+      clearContext.gxCopyClearOperation(frame),
+    );
+  }
+  clearContext.gxFlushSkippedCopyClears();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [
+    {
+      type: "gx-clear",
+      clear: {
+        sourceX: 4,
+        sourceY: 5,
+        sourceWidth: 6,
+        sourceHeight: 7,
+        copyState: { clearRgba: [1, 2, 3, 4] },
+      },
+    },
+    {
+      type: "gx-clear",
+      clear: {
+        sourceX: 40,
+        sourceY: 50,
+        sourceWidth: 60,
+        sourceHeight: 70,
+        copyState: { clearRgba: [5, 6, 7, 8] },
+      },
+    },
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(clearContext.gxSkippedCopyClears)), []);
 });
 
 test("preserves homogeneous W for WebGPU clipping and interpolation", () => {
