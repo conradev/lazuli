@@ -27,6 +27,21 @@ function extractFunction(name) {
   assert.fail(`unterminated ${name}`);
 }
 
+test("headless capture ignores nonterminal diagnostic snapshots", () => {
+  const context = vm.createContext({});
+  vm.runInContext(extractFunction("isCompletedRunReport"), context);
+  assert.equal(context.isCompletedRunReport(null), false);
+  assert.equal(context.isCompletedRunReport({ status: "running", stage: "snapshot" }), false);
+  assert.equal(context.isCompletedRunReport({ status: "paused", stage: "snapshot" }), false);
+  assert.equal(context.isCompletedRunReport({ status: "paused", stage: "scenario-complete" }), true);
+  assert.equal(context.isCompletedRunReport({ status: "progress", stage: "operator-stop" }), true);
+  assert.equal(context.isCompletedRunReport({ status: "stopped", stage: "renderer" }), true);
+  assert.equal(context.isCompletedRunReport({ status: "unknown", stage: "renderer" }), false);
+  assert.equal(context.isCompletedRunReport({ status: "stopped", stage: "" }), false);
+  assert.equal(context.isCompletedRunReport({}), false, "malformed reports remain fail-closed");
+  assert.match(source, /if \(isCompletedRunReport\(report\)\) \{/);
+});
+
 test("headless capture exposes --expect and verifies before persistence", () => {
   assert.match(source, /case "--expect":/);
   assert.match(source, /readCheckpointManifest\(options\.expect\)/);
