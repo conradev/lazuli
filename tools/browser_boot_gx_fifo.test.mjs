@@ -487,13 +487,27 @@ test("staging drain preserves its pending record when decoder carry rejects it",
 });
 
 test("FIFO optimization preserves the existing semantic drain boundaries", () => {
-  const hookProxy = source.indexOf("const hooks = new Proxy(hookFunctions");
-  const slowHookDrain = source.indexOf("drainGxFifoStaging();", hookProxy);
+  const hookInvocation = source.indexOf("function invokeJitHook(");
+  const hookCycleScope = source.indexOf("return withPublishedHookCycles(", hookInvocation);
+  const slowHookDrain = source.indexOf("drainGxFifoStaging();", hookCycleScope);
   const slowHookTarget = source.indexOf("hookCalls.set(name", slowHookDrain);
-  assert.equal(hookProxy >= 0 && slowHookDrain > hookProxy && slowHookTarget > slowHookDrain, true);
+  assert.equal(
+    hookInvocation >= 0
+      && hookCycleScope > hookInvocation
+      && slowHookDrain > hookCycleScope
+      && slowHookTarget > slowHookDrain,
+    true,
+  );
 
   const execution = source.indexOf("if (executedBlocks === 0)");
-  const executionDrain = source.indexOf("drainGxFifoStaging();", execution);
+  const observedCycles = source.indexOf("const observedCycles = cycles + executedCycles;", execution);
+  const executionDrain = source.indexOf("drainGxFifoStagingAtCycle(observedCycles);", observedCycles);
   const mmioService = source.indexOf("serviceMmio(observedCycles);", executionDrain);
-  assert.equal(execution >= 0 && executionDrain > execution && mmioService > executionDrain, true);
+  assert.equal(
+    execution >= 0
+      && observedCycles > execution
+      && executionDrain > observedCycles
+      && mmioService > executionDrain,
+    true,
+  );
 });

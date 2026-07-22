@@ -7,6 +7,8 @@ use gekko::disasm::{Extensions, Ins};
 
 use crate::{Jit, RegionBlock, link_region};
 
+const HOOK_CYCLE_OFFSET: i32 = 8;
+
 #[derive(Default)]
 struct Output {
     wasm: Vec<u8>,
@@ -64,7 +66,7 @@ pub unsafe extern "C" fn ppcwasmjit_compile(pointer: u32, word_count: u32) -> u3
         .copied()
         .map(|code| Ins::new(code, Extensions::gekko_broadway()));
 
-    match Jit::with_slow_memory().build(instructions) {
+    match Jit::with_slow_memory_hook_cycle_offset(HOOK_CYCLE_OFFSET).build(instructions) {
         Ok(block) => {
             let maximum_executed = block.metadata().executed.pack();
             let pattern = block.metadata().pattern as u32;
