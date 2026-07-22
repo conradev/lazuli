@@ -233,6 +233,58 @@ pub(crate) fn clipped_copy_extent(
     (width != 0 && height != 0).then_some((width, height))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxEfbFormat {
+    Rgb8Z24,
+    Rgba6Z24,
+    Rgb565Z16,
+    Z24,
+    OtherNoAlpha,
+}
+
+impl GxEfbFormat {
+    fn has_alpha(self) -> bool {
+        matches!(self, Self::Rgba6Z24)
+    }
+}
+
+pub(crate) fn gx_efb_format(pixel_control: u32) -> GxEfbFormat {
+    match pixel_control & 7 {
+        0 => GxEfbFormat::Rgb8Z24,
+        1 => GxEfbFormat::Rgba6Z24,
+        2 => GxEfbFormat::Rgb565Z16,
+        3 => GxEfbFormat::Z24,
+        // Raw format 4 multiplexes Y/U/V through PE CMode1, which LZGX does
+        // not transport yet; raw 5 is YUV420 and 6/7 are reserved. Keep the
+        // whole unmodeled tail explicitly conservative until that state is
+        // available rather than pretending pixel_control can distinguish it.
+        _ => GxEfbFormat::OtherNoAlpha,
+    }
+}
+
+const fn expand_5_to_8(channel: u8) -> u8 {
+    (channel & 0xf8) | (channel >> 5)
+}
+
+const fn expand_6_to_8(channel: u8) -> u8 {
+    (channel & 0xfc) | (channel >> 6)
+}
+
+pub(crate) fn gx_copy_clear_rgba(pixel_control: u32, rgba: [u8; 4]) -> [u8; 4] {
+    match gx_efb_format(pixel_control) {
+        GxEfbFormat::Rgba6Z24 => rgba.map(expand_6_to_8),
+        GxEfbFormat::Rgb565Z16 => [
+            expand_5_to_8(rgba[0]),
+            expand_6_to_8(rgba[1]),
+            expand_5_to_8(rgba[2]),
+            0xff,
+        ],
+        // This is the canonical no-alpha host representation. Component/YUV
+        // conversion remains deliberately unmodeled until PE CMode1 arrives.
+        _ => [rgba[0], rgba[1], rgba[2], 0xff],
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GxCopyClearMask {
     pub(crate) color: bool,
@@ -258,11 +310,24 @@ impl GxCopyClearMask {
     }
 }
 
-pub(crate) fn gx_copy_clear_mask(z_mode: u32, blend_mode: u32) -> GxCopyClearMask {
+pub(crate) fn gx_copy_clear_mask(
+    z_mode: u32,
+    blend_mode: u32,
+    pixel_control: u32,
+) -> GxCopyClearMask {
+    let color = blend_mode & (1 << 3) != 0;
+    let depth = z_mode & (1 << 4) != 0;
+    let alpha = if gx_efb_format(pixel_control).has_alpha() {
+        blend_mode & (1 << 4) != 0
+    } else {
+        // Only RGBA6 has guest alpha. Whenever a real clear touches a no-alpha
+        // pixel, keep the RGBA8 host representation canonically opaque.
+        color || depth
+    };
     GxCopyClearMask {
-        color: blend_mode & (1 << 3) != 0,
-        alpha: blend_mode & (1 << 4) != 0,
-        depth: z_mode & (1 << 4) != 0,
+        color,
+        alpha,
+        depth,
     }
 }
 
@@ -617,11 +682,12 @@ pub use web::WebGpuRenderer;
 mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
-        RendererFailureState, RendererMetrics, SelectedTexture, TextureAddressMode,
+        GxEfbFormat, RendererFailureState, RendererMetrics, SelectedTexture, TextureAddressMode,
         XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
         compact_xfb_readback_rows, decoded_texture_cache_hit, decoded_texture_is_available,
-        gx_blend_state, gx_copy_clear_mask, gx_depth24_to_float, gx_float_to_depth24,
-        gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy,
+        expand_5_to_8, expand_6_to_8, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
+        gx_depth24_to_float, gx_efb_format, gx_float_to_depth24, gx_sampler_identity,
+        merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
         xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_source_rect,
         xfb_surface_extent_matches,
@@ -976,14 +1042,14 @@ mod tests {
             let expected = GxCopyClearMask::from_index(index);
             let z_mode = u32::from(expected.depth) << 4;
             let blend_mode = (u32::from(expected.color) << 3) | (u32::from(expected.alpha) << 4);
-            let actual = gx_copy_clear_mask(z_mode, blend_mode);
+            let actual = gx_copy_clear_mask(z_mode, blend_mode, 1);
             assert_eq!(actual, expected);
             assert_eq!(actual.index(), index);
             assert_eq!(actual.writes_anything(), index != 0);
         }
 
         assert_eq!(
-            gx_copy_clear_mask(1 << 4, 0),
+            gx_copy_clear_mask(1 << 4, 0, 1),
             GxCopyClearMask {
                 color: false,
                 alpha: false,
@@ -991,6 +1057,78 @@ mod tests {
             },
             "depth updates must not depend on the depth-test enable bit",
         );
+    }
+
+    #[test]
+    fn no_alpha_efb_clears_ignore_alpha_only_work_and_canonicalize_real_work() {
+        for pixel_control in [0, 2, 3, 4, 5, 6, 7] {
+            assert_eq!(
+                gx_copy_clear_mask(0, 1 << 4, pixel_control),
+                GxCopyClearMask {
+                    color: false,
+                    alpha: false,
+                    depth: false,
+                },
+                "format {pixel_control} alpha-only clear must remain a no-op",
+            );
+            assert_eq!(
+                gx_copy_clear_mask(0, 1 << 3, pixel_control),
+                GxCopyClearMask {
+                    color: true,
+                    alpha: true,
+                    depth: false,
+                },
+                "format {pixel_control} color clear must restore opaque host alpha",
+            );
+            assert_eq!(
+                gx_copy_clear_mask(1 << 4, 0, pixel_control),
+                GxCopyClearMask {
+                    color: false,
+                    alpha: true,
+                    depth: true,
+                },
+                "format {pixel_control} depth clear must restore opaque host alpha",
+            );
+        }
+    }
+
+    #[test]
+    fn transported_pixel_control_classifies_only_observable_efb_formats() {
+        let expected = [
+            GxEfbFormat::Rgb8Z24,
+            GxEfbFormat::Rgba6Z24,
+            GxEfbFormat::Rgb565Z16,
+            GxEfbFormat::Z24,
+            GxEfbFormat::OtherNoAlpha,
+            GxEfbFormat::OtherNoAlpha,
+            GxEfbFormat::OtherNoAlpha,
+            GxEfbFormat::OtherNoAlpha,
+        ];
+        for (raw, expected) in expected.into_iter().enumerate() {
+            assert_eq!(gx_efb_format(raw as u32), expected);
+            assert_eq!(gx_efb_format(0x00ff_ff00 | raw as u32), expected);
+        }
+    }
+
+    #[test]
+    fn copy_clear_quantizes_rgba6_and_rgb565_color_without_changing_depth() {
+        let rgba = [0x81, 0x92, 0xa3, 0xd4];
+        assert_eq!(gx_copy_clear_rgba(0, rgba), [0x81, 0x92, 0xa3, 0xff]);
+        assert_eq!(gx_copy_clear_rgba(1, rgba), [0x82, 0x92, 0xa2, 0xd7]);
+        assert_eq!(gx_copy_clear_rgba(2, rgba), [0x84, 0x92, 0xa5, 0xff]);
+        assert_eq!(gx_copy_clear_rgba(3, rgba), [0x81, 0x92, 0xa3, 0xff]);
+        for format in 4..=7 {
+            assert_eq!(gx_copy_clear_rgba(format, rgba)[3], 0xff);
+        }
+
+        for channel in 0..=u8::MAX {
+            let five = expand_5_to_8(channel);
+            let six = expand_6_to_8(channel);
+            assert_eq!(five >> 3, channel >> 3);
+            assert_eq!(five & 7, five >> 5);
+            assert_eq!(six >> 2, channel >> 2);
+            assert_eq!(six & 3, six >> 6);
+        }
     }
 
     #[test]

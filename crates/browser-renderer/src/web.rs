@@ -25,9 +25,9 @@ use crate::{
     RendererFailureState, RendererMetrics, SamplerIdentity, SelectedTexture, TextureAddressMode,
     TextureBindingIdentity, XfbCopyMetadata, clipped_copy_extent, compact_xfb_readback_rows,
     decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state, gx_copy_clear_mask,
-    gx_depth24_to_float, gx_sampler_identity, merge_contiguous_draw_range, require_tev_texture,
-    reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
-    xfb_readback_layout, xfb_source_rect, xfb_surface_extent_matches,
+    gx_copy_clear_rgba, gx_depth24_to_float, gx_sampler_identity, merge_contiguous_draw_range,
+    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
+    xfb_copy_matches_selection, xfb_readback_layout, xfb_source_rect, xfb_surface_extent_matches,
 };
 
 const PRESENT_SHADER: &str = "
@@ -641,11 +641,12 @@ impl WebGpuRenderer {
         rectangle: ScissorRect,
         state: GxCopyState,
     ) {
-        let mask = gx_copy_clear_mask(state.z_mode, state.blend_mode);
+        let mask = gx_copy_clear_mask(state.z_mode, state.blend_mode, state.pixel_control);
         if !mask.writes_anything() {
             return;
         }
-        let uniform = CopyClearUniform::new(state.clear_rgba, state.clear_depth);
+        let rgba = gx_copy_clear_rgba(state.pixel_control, state.clear_rgba);
+        let uniform = CopyClearUniform::new(rgba, state.clear_depth);
         self.queue
             .write_buffer(&self.copy_clear.uniform, 0, bytemuck::bytes_of(&uniform));
         encode_copy_clear_pass(

@@ -79,6 +79,31 @@ test("the draw clear loads prior EFB contents and independently masks RGB alpha 
   assert.match(pass, /pass\.draw\(0\.\.3, 0\.\.1\)/);
 });
 
+test("the exact copy clear consumes the transported EFB color format", () => {
+  const clear = rendererSection("fn encode_copy_clear(", "pub fn begin_segment");
+  assert.match(
+    clear,
+    /gx_copy_clear_mask\(state\.z_mode, state\.blend_mode, state\.pixel_control\)/,
+  );
+  assert.match(
+    clear,
+    /gx_copy_clear_rgba\(state\.pixel_control, state\.clear_rgba\)/,
+  );
+  assert.match(clear, /CopyClearUniform::new\(rgba, state\.clear_depth\)/);
+
+  const format = sourceSection(
+    rendererCoreSource,
+    "pub(crate) fn gx_copy_clear_rgba",
+    "pub(crate) struct GxCopyClearMask",
+  );
+  assert.match(format, /GxEfbFormat::Rgba6Z24 => rgba\.map\(expand_6_to_8\)/);
+  assert.match(format, /GxEfbFormat::Rgb565Z16/);
+  assert.match(format, /expand_5_to_8\(rgba\[0\]\)/);
+  assert.match(format, /expand_6_to_8\(rgba\[1\]\)/);
+  assert.match(format, /expand_5_to_8\(rgba\[2\]\)/);
+  assert.doesNotMatch(format, /clear_depth|GX_DEPTH24/);
+});
+
 test("GX depth endpoints span the full unsigned 24-bit range in clears and draws", () => {
   const vertexShader = sourceSection(
     tevSource,
