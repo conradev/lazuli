@@ -3881,7 +3881,23 @@ const TEMPLATE: &str = r##"<!doctype html>
     const lockedCacheDmaSample = [];
     const gxFifoScratch = new DataView(new ArrayBuffer(8));
     const gxFifoSample = [];
+    // Keep the carry as a packed numeric Array for sustained V8 throughput.
+    // JavaScript exposes no physical Array capacity; this logical watermark
+    // advances geometrically for deterministic growth telemetry. The separate
+    // maximum-buffered-bytes preflight is the hard safety bound.
+    const gxDecodeInitialCapacityWatermarkBytes = 4096;
+    // A direct vertex can occupy at most 129 bytes, so the largest legal
+    // primitive is 3 + 65,535 * 129 bytes. A 16 MiB ceiling safely covers that
+    // plus a complete staging append while bounding corrupt-stream growth.
+    const gxDecodeMaximumBufferedBytes = 16 * 1024 * 1024;
     let gxDecodeBuffer = [];
+    let gxDecodeCapacityWatermarkBytes = gxDecodeInitialCapacityWatermarkBytes;
+    let gxDecodeRetryAtBufferedBytes = 1;
+    let gxDecodeAttempts = 0;
+    let gxDecodeBlockedSkips = 0;
+    let gxDecodeCompactions = 0;
+    let gxDecodeCapacityWatermarkGrowths = 0;
+    let gxDecodePreDecodeHighWaterBytes = 0;
     const gxCpRegisters = new Uint32Array(256);
     const gxBpRegisters = new Uint32Array(256);
     const gxXfRegisters = new Uint32Array(0x1058);
@@ -6243,6 +6259,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function decodeGxCommands(source, start, end, inDisplayList = false) {
       let offset = start;
+      let retryAtBufferedBytes = 1;
       while (offset < end) {
         const opcode = source[offset];
         let commandBytes;
@@ -6251,7 +6268,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else if (opcode === 0x08) {
           commandBytes = 6;
         } else if (opcode === 0x10) {
-          if (end - offset < 5) break;
+          if (end - offset < 5) {
+            retryAtBufferedBytes = 5;
+            break;
+          }
           commandBytes = 5 + ((((gxReadU32(source, offset + 1) >>> 16) & 15) + 1) * 4);
         } else if ([0x20, 0x28, 0x30, 0x38].includes(opcode)) {
           commandBytes = 5;
@@ -6260,7 +6280,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else if (opcode === 0x61) {
           commandBytes = 5;
         } else if ((opcode & 0xc0) === 0x80) {
-          if (end - offset < 3) break;
+          if (end - offset < 3) {
+            retryAtBufferedBytes = 3;
+            break;
+          }
           const vertices = gxReadU16(source, offset + 1);
           commandBytes = 3 + vertices * gxVertexSize(opcode & 7);
         } else {
@@ -6268,7 +6291,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           offset += 1;
           continue;
         }
-        if (end - offset < commandBytes) break;
+        if (end - offset < commandBytes) {
+          retryAtBufferedBytes = commandBytes;
+          break;
+        }
 
         if (opcode === 0x08) {
           gxCpRegisters[source[offset + 1]] = gxReadU32(source, offset + 2);
@@ -6311,26 +6337,70 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxDecodedCommands += 1;
         offset += commandBytes;
       }
+      if (!inDisplayList) gxDecodeRetryAtBufferedBytes = retryAtBufferedBytes;
       return offset - start;
     }
 
+    function gxFifoBufferedBytes() {
+      return gxDecodeBuffer.length;
+    }
+
+    function gxPreflightDecodeAppend(additionalBytes) {
+      const bufferedBytes = gxFifoBufferedBytes();
+      const requiredBytes = bufferedBytes + additionalBytes;
+      // Validate the whole append before mutating carry bytes or diagnostics.
+      // Advancing the watermark models geometric growth; it does not reserve
+      // JavaScript Array backing storage.
+      if (requiredBytes > gxDecodeMaximumBufferedBytes) {
+        throw new Error(
+          `GX FIFO decode carry overflow: ${requiredBytes} > ${gxDecodeMaximumBufferedBytes}`
+        );
+      }
+      if (requiredBytes <= gxDecodeCapacityWatermarkBytes) return;
+
+      let capacity = gxDecodeCapacityWatermarkBytes;
+      while (capacity < requiredBytes) {
+        capacity = Math.min(gxDecodeMaximumBufferedBytes, Math.max(1, capacity * 2));
+      }
+      gxDecodeCapacityWatermarkBytes = capacity;
+      gxDecodeCapacityWatermarkGrowths += 1;
+    }
+
     function decodeGxFifo() {
+      const bufferedBytes = gxFifoBufferedBytes();
+      if (bufferedBytes < gxDecodeRetryAtBufferedBytes) {
+        gxDecodeBlockedSkips += 1;
+        return;
+      }
       const decodeStartedAt = beginWorkerPhaseTiming(workerHostTimings.fifoDecode);
       try {
-        const consumed = decodeGxCommands(gxDecodeBuffer, 0, gxDecodeBuffer.length);
-        if (consumed !== 0) gxDecodeBuffer.splice(0, consumed);
+        gxDecodeAttempts += 1;
+        const consumed = decodeGxCommands(gxDecodeBuffer, 0, bufferedBytes);
+        if (consumed === bufferedBytes) {
+          gxDecodeBuffer.length = 0;
+        } else if (consumed !== 0) {
+          // V8's packed-array front removal is materially faster here than a
+          // manual copyWithin/shrink pair on sustained SMB command traffic.
+          gxDecodeBuffer.splice(0, consumed);
+          gxDecodeCompactions += 1;
+        }
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.fifoDecode, decodeStartedAt);
       }
     }
 
     function appendGxFifoBytes(source, stores, quantizedStores = 0) {
+      gxPreflightDecodeAppend(source.length);
       for (let index = 0; index < source.length; index += 1) {
         const byte = source[index];
+        gxDecodeBuffer.push(byte);
         gxFifoHash = Math.imul(gxFifoHash ^ byte, 0x01000193) >>> 0;
         if (gxFifoSample.length < 256) gxFifoSample.push(byte);
-        gxDecodeBuffer.push(byte);
       }
+      gxDecodePreDecodeHighWaterBytes = Math.max(
+        gxDecodePreDecodeHighWaterBytes,
+        gxFifoBufferedBytes()
+      );
       gxFifoStores += stores;
       gxFifoBytes += source.length;
       gxFifoQuantizedStores += quantizedStores;
@@ -6350,6 +6420,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (pendingBytes > gxFifoStagingCapacity) {
         throw new Error(`GX FIFO staging overflow: ${pendingBytes}`);
       }
+      // Preserve the staged record if the bounded decoder cannot accept this
+      // whole drain. appendGxFifoBytes repeats the preflight after ownership
+      // transfers so direct and staged callers share the same invariant.
+      gxPreflightDecodeAppend(pendingBytes);
       // This boundary intentionally includes appendGxFifoBytes and its nested
       // FIFO decode; fifoDecode reports that nested component separately.
       const stagingStartedAt = beginWorkerPhaseTiming(
@@ -6486,7 +6560,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function readCommandProcessorStatus() {
       const idleMask = cpStatusReadIdle | cpStatusCommandIdle;
       const pendingStagingBytes = view.getUint32(gxFifoStagingMeta, true);
-      const idle = pendingStagingBytes === 0 && gxDecodeBuffer.length === 0;
+      const idle = pendingStagingBytes === 0 && gxFifoBufferedBytes() === 0;
       const stored = view.getUint16(mmio, false) & ~idleMask;
       return stored | (idle ? idleMask : 0);
     }
@@ -9341,7 +9415,15 @@ const TEMPLATE: &str = r##"<!doctype html>
           },
           decoder: {
             commands: gxDecodedCommands,
-            bufferedBytes: gxDecodeBuffer.length,
+            bufferedBytes: gxFifoBufferedBytes(),
+            capacityWatermarkBytes: gxDecodeCapacityWatermarkBytes,
+            maximumBufferedBytes: gxDecodeMaximumBufferedBytes,
+            retryAtBufferedBytes: gxDecodeRetryAtBufferedBytes,
+            decodeAttempts: gxDecodeAttempts,
+            blockedDecodeSkips: gxDecodeBlockedSkips,
+            compactions: gxDecodeCompactions,
+            capacityWatermarkGrowths: gxDecodeCapacityWatermarkGrowths,
+            preDecodeHighWaterBytes: gxDecodePreDecodeHighWaterBytes,
             cpLoads: gxCpLoads,
             xfLoads: gxXfLoads,
             indexedXfLoads: gxIndexedXfLoads,
