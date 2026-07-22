@@ -76,6 +76,7 @@ const fifoFunctions = [
   "gxFifoBufferedBytes",
   "gxPreflightDecodeAppend",
   "decodeGxFifo",
+  "appendGxCommandBytes",
   "appendGxFifoBytes",
   "drainGxFifoStaging",
 ];
@@ -153,6 +154,9 @@ function makeContext({
     view: new DataView(memory),
     workerHostTimings: { fifoDecode: {}, fifoStagingDrainInclusive: {} },
     gxVertexSize() { return vertexSize; },
+    appendGxWriteGatherBytes(chunk) {
+      context.appendGxCommandBytes(chunk);
+    },
   };
   vm.createContext(context);
   vm.runInContext(
