@@ -1121,5 +1121,9 @@ test("guest execution waits for renderer completion before another block", () =>
   );
   assert.doesNotMatch(source, /postRendererFrame\("(?:xfb|texture)-copy"/);
   assert.match(source, /postRendererFrame\("vi-present", \{/);
+  assert.match(
+    source,
+    /webGpuRenderer\.present_xfb\([\s\S]*?frame\.temporalXfbCapture !== undefined\s*\)/,
+  );
   assert.match(source, /await finishAfterRendererDrain\("stopped", \{\s*stage: "terminal-pc"/);
 });

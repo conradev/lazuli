@@ -22,10 +22,12 @@ use crate::tev::{
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
-    RendererFailureState, RendererMetrics, SamplerIdentity, SelectedTexture, TextureAddressMode,
-    TextureBindingIdentity, XfbCopyMetadata, clipped_copy_extent, compact_xfb_readback_rows,
-    decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state, gx_copy_clear_mask,
-    gx_copy_clear_rgba, gx_depth24_to_float, gx_sampler_identity, merge_contiguous_draw_range,
+    RendererFailureState, RendererMetrics, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
+    SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
+    XfbReadbackLayout, clipped_copy_extent, compact_surface_readback_rows,
+    compact_xfb_readback_rows, decoded_texture_cache_hit, decoded_texture_is_available,
+    gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float,
+    gx_sampler_identity, merge_contiguous_draw_range, requested_surface_readback_layout,
     require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
     xfb_copy_matches_selection, xfb_readback_layout, xfb_source_rect, xfb_surface_extent_matches,
 };
@@ -268,6 +270,18 @@ struct PresentedXfb {
     display_height: u32,
 }
 
+#[derive(Clone)]
+struct PresentedSurface {
+    buffer: wgpu::Buffer,
+    layout: XfbReadbackLayout,
+    pixel_order: SurfacePixelOrder,
+    surface_format: wgpu::TextureFormat,
+    presentation_serial: u64,
+    selected_address: u32,
+    generation: u32,
+    selected_row: u32,
+}
+
 struct Pipelines {
     tev_shader: wgpu::ShaderModule,
     tev_layout: wgpu::PipelineLayout,
@@ -394,6 +408,8 @@ pub struct WebGpuRenderer {
     efb_copy_cache: HashMap<u32, CachedTexture>,
     xfb_cache: HashMap<u32, CachedXfb>,
     last_presented_xfb: Option<PresentedXfb>,
+    last_presented_surface: Option<PresentedSurface>,
+    presentation_serial: u64,
     next_xfb_surface_id: u64,
     pipelines: Pipelines,
     tev_vertices: Vec<TevVertex>,
@@ -494,6 +510,43 @@ fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> 
     Ok(result)
 }
 
+fn surface_pixel_order(format: wgpu::TextureFormat) -> Option<SurfacePixelOrder> {
+    match format {
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
+            Some(SurfacePixelOrder::Rgba8)
+        }
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            Some(SurfacePixelOrder::Bgra8)
+        }
+        _ => None,
+    }
+}
+
+fn surface_format_name(format: wgpu::TextureFormat) -> Option<&'static str> {
+    match format {
+        wgpu::TextureFormat::Rgba8Unorm => Some("rgba8unorm"),
+        wgpu::TextureFormat::Rgba8UnormSrgb => Some("rgba8unorm-srgb"),
+        wgpu::TextureFormat::Bgra8Unorm => Some("bgra8unorm"),
+        wgpu::TextureFormat::Bgra8UnormSrgb => Some("bgra8unorm-srgb"),
+        _ => None,
+    }
+}
+
+fn surface_readback_error(
+    error: SurfaceReadbackRequestError,
+    format: wgpu::TextureFormat,
+) -> JsValue {
+    let detail = match error {
+        SurfaceReadbackRequestError::FormatUnsupported => {
+            format!("WebGPU surface capture requires RGBA8/BGRA8, got {format:?}")
+        }
+        SurfaceReadbackRequestError::InvalidDimensions => {
+            "WebGPU surface capture dimensions are invalid".to_owned()
+        }
+    };
+    JsValue::from_str(&detail)
+}
+
 #[wasm_bindgen]
 impl WebGpuRenderer {
     pub async fn create(canvas: HtmlCanvasElement) -> Result<WebGpuRenderer, JsValue> {
@@ -510,6 +563,8 @@ impl WebGpuRenderer {
         self.efb_copy_cache.clear();
         self.xfb_cache.clear();
         self.last_presented_xfb = None;
+        self.last_presented_surface = None;
+        self.presentation_serial = 0;
         self.reset_efb_inner()
     }
 
@@ -813,6 +868,72 @@ impl WebGpuRenderer {
                     &JsValue::from_f64(f64::from(value)),
                 )?;
             }
+            Reflect::set(
+                &result,
+                &JsValue::from_str("rgba"),
+                &Uint8Array::from(pixels.as_slice()),
+            )?;
+            Ok(result.into())
+        })
+    }
+
+    pub fn has_presented_surface(&self) -> bool {
+        self.last_presented_surface.is_some()
+    }
+
+    pub fn read_presented_surface_rgba(&self) -> Promise {
+        let failure_state = self.failure_state.clone();
+        let presented = self.last_presented_surface.clone();
+        future_to_promise(async move {
+            ensure_renderer_healthy(&failure_state)?;
+            let presented = presented.ok_or_else(|| {
+                JsValue::from_str("no requested WebGPU surface capture has been presented")
+            })?;
+            BufferMap::new(&presented.buffer).await.map_err(|error| {
+                JsValue::from_str(&format!("WebGPU surface map failed: {error}"))
+            })?;
+            let pixels = {
+                let mapped = presented.buffer.slice(..).get_mapped_range();
+                let pixels =
+                    compact_surface_readback_rows(&mapped, presented.layout, presented.pixel_order);
+                drop(mapped);
+                presented.buffer.unmap();
+                pixels.ok_or_else(|| {
+                    JsValue::from_str("WebGPU surface map returned truncated rows")
+                })?
+            };
+            ensure_renderer_healthy(&failure_state)?;
+
+            let surface_format =
+                surface_format_name(presented.surface_format).ok_or_else(|| {
+                    JsValue::from_str("captured WebGPU surface format is not RGBA8/BGRA8")
+                })?;
+            let result = Object::new();
+            for (name, value) in [
+                ("format", "rgba8unorm"),
+                ("surfaceFormat", surface_format),
+                ("layout", "top-left-row-major-tight"),
+            ] {
+                Reflect::set(&result, &JsValue::from_str(name), &JsValue::from_str(value))?;
+            }
+            for (name, value) in [
+                ("address", presented.selected_address),
+                ("generation", presented.generation),
+                ("row", presented.selected_row),
+                ("width", presented.layout.width),
+                ("height", presented.layout.height),
+            ] {
+                Reflect::set(
+                    &result,
+                    &JsValue::from_str(name),
+                    &JsValue::from_f64(f64::from(value)),
+                )?;
+            }
+            Reflect::set(
+                &result,
+                &JsValue::from_str("presentationSerial"),
+                &JsValue::from_f64(presented.presentation_serial as f64),
+            )?;
             Reflect::set(
                 &result,
                 &JsValue::from_str("rgba"),
@@ -1670,9 +1791,13 @@ impl WebGpuRenderer {
         selected_row: u32,
         output_width: u32,
         output_height: u32,
+        capture_surface: bool,
     ) -> Result<bool, JsValue> {
         self.record_wasm_bridge_call(0);
         self.ensure_healthy()?;
+        // A capture proves one exact presentation. Never let a failed or
+        // uncaptured presentation expose evidence from an earlier surface.
+        self.last_presented_surface = None;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.present_xfb_calls = metrics.present_xfb_calls.saturating_add(1);
         });
@@ -1717,6 +1842,18 @@ impl WebGpuRenderer {
         }
         .clamp(1, 1024);
         self.resize_surface(output_width, output_height);
+        let capture_plan = requested_surface_readback_layout(
+            capture_surface,
+            surface_pixel_order(self.surface_config.format),
+            output_width,
+            output_height,
+        )
+        .map_err(|error| surface_readback_error(error, self.surface_config.format))?;
+        let next_presentation_serial = self
+            .presentation_serial
+            .checked_add(1)
+            .filter(|serial| *serial <= 9_007_199_254_740_991)
+            .ok_or_else(|| JsValue::from_str("WebGPU presentation serial exhausted"))?;
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
@@ -1767,11 +1904,52 @@ impl WebGpuRenderer {
             pass.set_bind_group(0, &surface.present_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        let surface_capture = capture_plan.map(|(layout, pixel_order)| {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("browser presented surface readback"),
+                size: layout.buffer_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &output.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(layout.padded_bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: layout.width,
+                    height: layout.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            PresentedSurface {
+                buffer,
+                layout,
+                pixel_order,
+                surface_format: self.surface_config.format,
+                presentation_serial: next_presentation_serial,
+                selected_address,
+                generation: metadata.generation,
+                selected_row,
+            }
+        });
         self.queue.submit([encoder.finish()]);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
         output.present();
+        self.presentation_serial = next_presentation_serial;
+        self.last_presented_surface = surface_capture;
         self.last_presented_xfb = Some(PresentedXfb {
             surface_id: surface.id,
             texture: surface.texture,
@@ -1856,7 +2034,12 @@ impl WebGpuRenderer {
             .or_else(|| capabilities.alpha_modes.first().copied())
             .ok_or_else(|| "WebGPU canvas surface exposes no alpha modes".to_owned())?;
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // wgpu 29's WebSurface advertises only RENDER_ATTACHMENT even
+            // though its browser configure path forwards these usage bits to
+            // GPUCanvasContext. COPY_SRC is a mandatory WebGPU contract for
+            // Lazuli's presented-surface oracle; initialization fails rather
+            // than falling back if the browser rejects it.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: canvas.width().max(1),
             height: canvas.height().max(1),
@@ -2021,6 +2204,8 @@ impl WebGpuRenderer {
             efb_copy_cache: HashMap::new(),
             xfb_cache: HashMap::new(),
             last_presented_xfb: None,
+            last_presented_surface: None,
+            presentation_serial: 0,
             next_xfb_surface_id: 1,
             pipelines,
             tev_vertices: Vec::new(),

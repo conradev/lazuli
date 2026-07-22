@@ -10320,7 +10320,8 @@ const TEMPLATE: &str = r##"<!doctype html>
             frame.copyIndex,
             frame.copyRow,
             Math.max(0, Math.min(1024, frame.width)),
-            Math.max(0, Math.min(1024, frame.height))
+            Math.max(0, Math.min(1024, frame.height)),
+            frame.temporalXfbCapture !== undefined
           ),
           sourceWorker
         ).then(presentation => {

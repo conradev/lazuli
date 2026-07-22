@@ -646,6 +646,49 @@ pub(crate) fn compact_xfb_readback_rows(
     Some(output)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfacePixelOrder {
+    Rgba8,
+    Bgra8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceReadbackRequestError {
+    FormatUnsupported,
+    InvalidDimensions,
+}
+
+pub(crate) fn requested_surface_readback_layout(
+    requested: bool,
+    pixel_order: Option<SurfacePixelOrder>,
+    width: u32,
+    height: u32,
+) -> Result<Option<(XfbReadbackLayout, SurfacePixelOrder)>, SurfaceReadbackRequestError> {
+    // Surface readback is a bounded observer. Ordinary presentation still
+    // must not allocate a staging buffer.
+    if !requested {
+        return Ok(None);
+    }
+    let pixel_order = pixel_order.ok_or(SurfaceReadbackRequestError::FormatUnsupported)?;
+    let layout = xfb_readback_layout(width, height, height, 0)
+        .ok_or(SurfaceReadbackRequestError::InvalidDimensions)?;
+    Ok(Some((layout, pixel_order)))
+}
+
+pub(crate) fn compact_surface_readback_rows(
+    mapped: &[u8],
+    layout: XfbReadbackLayout,
+    pixel_order: SurfacePixelOrder,
+) -> Option<Vec<u8>> {
+    let mut rgba = compact_xfb_readback_rows(mapped, layout)?;
+    if pixel_order == SurfacePixelOrder::Bgra8 {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    Some(rgba)
+}
+
 #[cfg(test)]
 pub(crate) fn alpha_compare(value: u8, reference: u8, comparison: u8) -> bool {
     match comparison & 7 {
@@ -682,13 +725,14 @@ pub use web::WebGpuRenderer;
 mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
-        GxEfbFormat, RendererFailureState, RendererMetrics, SelectedTexture, TextureAddressMode,
-        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
+        GxEfbFormat, RendererFailureState, RendererMetrics, SelectedTexture, SurfacePixelOrder,
+        SurfaceReadbackRequestError, TextureAddressMode, XfbCopyMetadata, alpha_compare,
+        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
         compact_xfb_readback_rows, decoded_texture_cache_hit, decoded_texture_is_available,
         expand_5_to_8, expand_6_to_8, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
         gx_depth24_to_float, gx_efb_format, gx_float_to_depth24, gx_sampler_identity,
-        merge_contiguous_draw_range, require_tev_texture, resolve_xfb_copy,
-        reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
+        merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
+        resolve_xfb_copy, reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
         xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_source_rect,
         xfb_surface_extent_matches,
     };
@@ -885,6 +929,55 @@ mod tests {
             (1_u8..=16).collect::<Vec<_>>()
         );
         assert_eq!(compact_xfb_readback_rows(&mapped[..second], layout), None);
+    }
+
+    #[test]
+    fn surface_readback_is_opt_in_and_validates_requested_captures() {
+        assert_eq!(
+            requested_surface_readback_layout(false, None, 0, 0),
+            Ok(None),
+        );
+        assert_eq!(
+            requested_surface_readback_layout(true, None, 640, 480),
+            Err(SurfaceReadbackRequestError::FormatUnsupported),
+        );
+        assert_eq!(
+            requested_surface_readback_layout(true, Some(SurfacePixelOrder::Rgba8), 0, 480,),
+            Err(SurfaceReadbackRequestError::InvalidDimensions),
+        );
+
+        let (layout, order) =
+            requested_surface_readback_layout(true, Some(SurfacePixelOrder::Bgra8), 641, 2)
+                .unwrap()
+                .unwrap();
+        assert_eq!(order, SurfacePixelOrder::Bgra8);
+        assert_eq!(layout.bytes_per_row, 2564);
+        assert_eq!(layout.padded_bytes_per_row, 2816);
+    }
+
+    #[test]
+    fn surface_readback_compacts_rows_and_canonicalizes_bgra_to_rgba() {
+        let (layout, _) =
+            requested_surface_readback_layout(true, Some(SurfacePixelOrder::Rgba8), 2, 2)
+                .unwrap()
+                .unwrap();
+        let mut mapped = vec![0xcc; usize::try_from(layout.buffer_bytes).unwrap()];
+        mapped[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let second = usize::try_from(layout.padded_bytes_per_row).unwrap();
+        mapped[second..second + 8].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+
+        assert_eq!(
+            compact_surface_readback_rows(&mapped, layout, SurfacePixelOrder::Rgba8).unwrap(),
+            (1_u8..=16).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            compact_surface_readback_rows(&mapped, layout, SurfacePixelOrder::Bgra8).unwrap(),
+            vec![3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16],
+        );
+        assert_eq!(
+            compact_surface_readback_rows(&mapped[..second], layout, SurfacePixelOrder::Rgba8,),
+            None,
+        );
     }
 
     #[test]
