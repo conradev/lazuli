@@ -270,6 +270,13 @@ impl<'a> GxFramePacket<'a> {
                         value: 0,
                     });
                 }
+                let maximum_output_dimension = output_width.max(output_height);
+                if maximum_output_dimension > GX_MAX_TEXTURE_DIMENSION {
+                    return Err(GxPacketError::InvalidField {
+                        field: "XFB output extent",
+                        value: u64::from(maximum_output_dimension),
+                    });
+                }
             }
         }
 
@@ -1265,6 +1272,28 @@ mod tests {
         let texture = packet.texture(0).unwrap();
         assert_eq!(texture.key, "alpha");
         assert_eq!(texture.pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn xfb_output_extent_accepts_1024_and_rejects_1025() {
+        let mut exact_limit = textured_xfb_copy();
+        put_u32(&mut exact_limit, 0x5c, GX_MAX_TEXTURE_DIMENSION);
+        put_u32(&mut exact_limit, 0x60, GX_MAX_TEXTURE_DIMENSION);
+        let packet = GxFramePacket::parse(&exact_limit).unwrap();
+        assert_eq!(packet.header().output_width, GX_MAX_TEXTURE_DIMENSION);
+        assert_eq!(packet.header().output_height, GX_MAX_TEXTURE_DIMENSION);
+
+        for offset in [0x5c, 0x60] {
+            let mut oversized = exact_limit.clone();
+            put_u32(&mut oversized, offset, GX_MAX_TEXTURE_DIMENSION + 1);
+            assert_eq!(
+                GxFramePacket::parse(&oversized).unwrap_err(),
+                GxPacketError::InvalidField {
+                    field: "XFB output extent",
+                    value: u64::from(GX_MAX_TEXTURE_DIMENSION + 1),
+                }
+            );
+        }
     }
 
     #[test]

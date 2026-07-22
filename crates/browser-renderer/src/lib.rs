@@ -958,17 +958,6 @@ pub(crate) fn resolve_xfb_copy(copies: &[XfbCopyMetadata], address: u32) -> Opti
         })
 }
 
-pub(crate) fn xfb_source_rect(row: u32, height: u32) -> Option<[f32; 4]> {
-    if height == 0 || row > MAX_XFB_FIELD_ROW_OFFSET || row >= height {
-        return None;
-    }
-
-    // Retained for the legacy WebGPU presenter until the exact integer VI
-    // scanout plan is activated by the renderer layer.
-    let start_y = row as f32 / height as f32;
-    Some([0.0, start_y, 1.0, 1.0 - start_y])
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct XfbReadbackLayout {
     pub(crate) width: u32,

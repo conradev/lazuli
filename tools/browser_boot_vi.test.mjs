@@ -479,12 +479,16 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
     1,
     640,
     480,
+    2560,
+    240,
+    2,
     false,
   ]);
   assert.deepEqual(calls.map(([name]) => name), ["gx-frame", "vi-present"]);
   assert.equal(context.document.body.dataset.viField, "bottom");
   assert.equal(context.document.body.dataset.viCopyIndex, "7");
   assert.equal(context.document.body.dataset.viCopyRow, "1");
+  assert.equal(context.document.body.dataset.viScanoutPolicy, "bob");
   assert.equal(context.document.body.dataset.viPresents, "1");
   assert.deepEqual(JSON.parse(JSON.stringify(workerMessages.at(-1))), {
     type: "renderer-frame-complete",

@@ -244,17 +244,26 @@ test("presented surface capture returns canonical tight RGBA evidence", async ()
 });
 
 test("temporal selected XFB capture preserves ordered presentation provenance", async () => {
+  const scanout = {
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0x0a00,
+    sourceRowStep: 2,
+    fieldHeight: 224,
+    rowRepeat: 2,
+  };
   const selectedXfb = {
     address: "0x01200500",
     generation: 71,
     row: 1,
     width: 640,
-    height: 480,
+    height: 448,
     rgbaSha256: "abc",
     rgbSha256: "rgb-abc",
     displayWidth: 640,
-    displayHeight: 480,
-    rgb: { black: 0, white: 0, other: 307_200, unique: 4096 },
+    displayHeight: 448,
+    logicalHeight: 448,
+    ...scanout,
+    rgb: { black: 0, white: 0, other: 286_720, unique: 4096 },
   };
   const presentedSurface = {
     address: "0x01200500",
@@ -262,14 +271,19 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     row: 1,
     presentationSerial: 90,
     width: 640,
-    height: 480,
+    height: 448,
+    ...scanout,
     rgbaSha256: "surface-abc",
     rgbSha256: "surface-rgb-abc",
-    rgb: { black: 0, white: 0, other: 307_200, unique: 4096 },
+    rgb: { black: 0, white: 0, other: 286_720, unique: 4096 },
   };
   let selectedReads = 0;
   let surfaceReads = 0;
-  const context = evaluate(["captureTemporalSelectedXfb"], {
+  const context = evaluate([
+    "viScanoutProvenance",
+    "viScanoutProvenanceEqual",
+    "captureTemporalSelectedXfb",
+  ], {
     temporalSelectedXfbCapacity: 8,
     temporalSelectedXfbFrames: [],
     async readSelectedXfb() {
@@ -290,7 +304,13 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
       copyIndex: 71,
       copyRow: 1,
       width: 640,
-      height: 480,
+      height: 448,
+      pictureConfiguration: 0x2850,
+      wordsPerLine: 40,
+      standardWordsPerLine: 80,
+      activeLines: 224,
+      nonInterlaced: false,
+      ...scanout,
       temporalXfbCapture: {
         scenario: "smb-ready-play",
         step: "post-play-presented",
@@ -315,7 +335,13 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
       copyIndex: 71,
       copyRow: 1,
       width: 640,
-      height: 480,
+      height: 448,
+      pictureConfiguration: 0x2850,
+      wordsPerLine: 40,
+      standardWordsPerLine: 80,
+      activeLines: 224,
+      nonInterlaced: false,
+      ...scanout,
     },
     selectedXfb,
     presentedSurface,
@@ -370,7 +396,11 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
 });
 
 test("temporal surface capture fails before renderer acknowledgement when unavailable", async () => {
-  const context = evaluate(["captureTemporalSelectedXfb"], {
+  const context = evaluate([
+    "viScanoutProvenance",
+    "viScanoutProvenanceEqual",
+    "captureTemporalSelectedXfb",
+  ], {
     temporalSelectedXfbCapacity: 8,
     temporalSelectedXfbFrames: [],
     async readSelectedXfb() { return {}; },
@@ -386,7 +416,17 @@ test("temporal surface capture fails before renderer acknowledgement when unavai
         copyIndex: 1,
         copyRow: 0,
         width: 640,
-        height: 480,
+        height: 448,
+        pictureConfiguration: 0x2850,
+        wordsPerLine: 40,
+        standardWordsPerLine: 80,
+        activeLines: 224,
+        nonInterlaced: false,
+        scanoutPolicy: "bob",
+        fieldStrideBytes: 0x0a00,
+        sourceRowStep: 2,
+        fieldHeight: 224,
+        rowRepeat: 2,
         temporalXfbCapture: {
           scenario: "smb-ready-play",
           step: "post-play-presented",
@@ -441,9 +481,19 @@ test("wgpu WebSurface under-reporting cannot disable the required COPY_SRC usage
 });
 
 test("temporal selected XFB oracle detects exact monochrome alternation", () => {
-  const context = evaluate(["summarizeTemporalSelectedXfb"], {
+  const context = evaluate([
+    "viScanoutProvenanceEqual",
+    "summarizeTemporalSelectedXfb",
+  ], {
     temporalSelectedXfbCapacity: 8,
   });
+  const scanout = {
+    scanoutPolicy: "direct",
+    fieldStrideBytes: 8,
+    sourceRowStep: 1,
+    fieldHeight: 2,
+    rowRepeat: 1,
+  };
   const frame = (ordinal, rgbaSha256, rgb, generation = 200 + ordinal) => ({
     ordinal,
     rendererSequence: 100 + ordinal,
@@ -454,6 +504,7 @@ test("temporal selected XFB oracle detects exact monochrome alternation", () => 
       copyRow: 0,
       width: 2,
       height: 2,
+      ...scanout,
     },
     selectedXfb: {
       address: "0x01200000",
@@ -463,6 +514,7 @@ test("temporal selected XFB oracle detects exact monochrome alternation", () => 
       height: 2,
       displayWidth: 2,
       displayHeight: 2,
+      ...scanout,
       rgbaSha256,
       rgbSha256: rgbaSha256,
       rgb,
