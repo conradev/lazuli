@@ -4191,6 +4191,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       user_0_10: (_ctx, address, value) => writeInteger(address, value, 8),
       user_0_11: (_ctx, address, gqr, pointer) => readQuantized(address, gqr, pointer),
       user_0_12: (_ctx, address, gqr, value) => writeQuantized(address, gqr, value),
+      user_0_13: (_ctx, address) => invalidateInstructionCacheLine(address),
+      user_0_14: () => synchronizeInstructionStream(),
       user_0_15: () => serviceLockedCacheDma(),
       user_0_16: () => msrChanged(),
       user_0_17: () => instructionBatChanged(),
@@ -8713,6 +8715,146 @@ const TEMPLATE: &str = r##"<!doctype html>
       samePcCount = 0;
     }
 
+    function instructionRangesOverlap(startA, sizeA, startB, sizeB) {
+      if (
+        !Number.isSafeInteger(sizeA) || sizeA <= 0
+        || !Number.isSafeInteger(sizeB) || sizeB <= 0
+      ) return false;
+      const firstStart = startA >>> 0;
+      const secondStart = startB >>> 0;
+      if (sizeA >= 0x100000000 || sizeB >= 0x100000000) return true;
+      const firstEnd = firstStart + sizeA;
+      const secondEnd = secondStart + sizeB;
+      const firstSegments = firstEnd <= 0x100000000
+        ? [[firstStart, firstEnd]]
+        : [[firstStart, 0x100000000], [0, firstEnd - 0x100000000]];
+      const secondSegments = secondEnd <= 0x100000000
+        ? [[secondStart, secondEnd]]
+        : [[secondStart, 0x100000000], [0, secondEnd - 0x100000000]];
+      return firstSegments.some(([firstBegin, firstLimit]) =>
+        secondSegments.some(([secondBegin, secondLimit]) =>
+          firstBegin < secondLimit && secondBegin < firstLimit
+        )
+      );
+    }
+
+    function mapInstructionPhysicalRanges(effectiveStart, byteCount) {
+      if (
+        !Number.isSafeInteger(byteCount) || byteCount <= 0
+        || byteCount > 0x100000000
+      ) return [];
+      const ranges = [];
+      let effective = effectiveStart >>> 0;
+      let remaining = byteCount;
+      while (remaining > 0) {
+        const bytes = Math.min(remaining, 4, 0x100000000 - effective);
+        const physical = translateInstructionRange(effective, bytes);
+        if (physical === null) return [];
+        const previous = ranges.at(-1);
+        if (previous !== undefined && previous.start + previous.bytes === physical) {
+          previous.bytes += bytes;
+        } else {
+          ranges.push({ start: physical >>> 0, bytes });
+        }
+        effective = (effective + bytes) >>> 0;
+        remaining -= bytes;
+      }
+      return ranges;
+    }
+
+    function invalidateInstructionCacheRange(effectiveStart, byteCount) {
+      const start = effectiveStart >>> 0;
+      if (
+        !Number.isSafeInteger(byteCount) || byteCount <= 0
+        || byteCount > 0x100000000 - start
+      ) return 0;
+
+      const firstLine = (start & 0xffffffe0) >>> 0;
+      const lineCount = Math.ceil((start + byteCount - firstLine) / 32);
+      const virtualLines = [];
+      const physicalLines = [];
+      for (let index = 0; index < lineCount; index += 1) {
+        const virtualLine = firstLine + index * 32;
+        virtualLines.push(virtualLine);
+        const physicalLine = translateInstructionRange(virtualLine, 32);
+        if (physicalLine !== null) physicalLines.push(physicalLine >>> 0);
+      }
+
+      const invalidatedBlockKeys = new Set();
+      for (const [key, block] of blocks) {
+        const virtualOverlap = block.instructionAddressSpaceKey
+            === instructionAddressSpaceKey
+          && virtualLines.some(line => instructionRangesOverlap(
+            block.effectiveStart,
+            block.effectiveBytes,
+            line,
+            32
+          ));
+        const blockPhysicalRanges = Array.isArray(block.physicalRanges)
+          ? block.physicalRanges
+          : block.physicalStart !== null && block.physicalBytes > 0
+            ? [{ start: block.physicalStart, bytes: block.physicalBytes }]
+            : [];
+        const physicalOverlap = blockPhysicalRanges.some(range =>
+          physicalLines.some(line => instructionRangesOverlap(
+            range.start,
+            range.bytes,
+            line,
+            32
+          ))
+        );
+        if (virtualOverlap || physicalOverlap) invalidatedBlockKeys.add(key);
+      }
+      for (const key of invalidatedBlockKeys) blocks.delete(key);
+
+      const invalidatedRegions = new Set();
+      for (const region of new Set(regionsByPc.values())) {
+        if (region.pcs.some(regionPc => invalidatedBlockKeys.has(
+          region.instructionAddressSpaceKey
+            + ":"
+            + (regionPc >>> 0).toString(16).padStart(8, "0")
+        ))) {
+          invalidatedRegions.add(region);
+        }
+      }
+      for (const [key, region] of regionsByPc) {
+        if (invalidatedRegions.has(region)) regionsByPc.delete(key);
+      }
+
+      accelerations.set(
+        "instructionCacheInvalidationLines",
+        (accelerations.get("instructionCacheInvalidationLines") ?? 0) + lineCount
+      );
+      if (invalidatedBlockKeys.size !== 0 || invalidatedRegions.size !== 0) {
+        resetInstructionLinkingState();
+        accelerations.set(
+          "instructionCacheInvalidatedBlocks",
+          (accelerations.get("instructionCacheInvalidatedBlocks") ?? 0)
+            + invalidatedBlockKeys.size
+        );
+        accelerations.set(
+          "instructionCacheInvalidatedRegions",
+          (accelerations.get("instructionCacheInvalidatedRegions") ?? 0)
+            + invalidatedRegions.size
+        );
+      }
+      return invalidatedBlockKeys.size;
+    }
+
+    function invalidateInstructionCacheLine(effectiveAddress) {
+      return invalidateInstructionCacheRange(
+        (effectiveAddress & 0xffffffe0) >>> 0,
+        32
+      );
+    }
+
+    function synchronizeInstructionStream() {
+      accelerations.set(
+        "instructionStreamSynchronizations",
+        (accelerations.get("instructionStreamSynchronizations") ?? 0) + 1
+      );
+    }
+
     function invalidateAllCompiledCode(reason) {
       const invalidatedBlocks = blocks.size;
       const invalidatedRegions = new Set(regionsByPc.values()).size;
@@ -10612,7 +10754,10 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function translateCacheLoopRange(cacheInstruction, effectiveStart, byteCount) {
       // The 750 performs a virtual index lookup for icbi without translating it.
-      if (cacheInstruction === 0x7c001fac) return effectiveStart >>> 0;
+      if (cacheInstruction === 0x7c001fac) {
+        const start = effectiveStart >>> 0;
+        return byteCount <= 0x100000000 - start ? start : null;
+      }
       return translateDataRange(
         effectiveStart,
         byteCount,
@@ -10629,13 +10774,16 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (skipped === 0) return;
           const guestStart = readGpr(3);
           const byteCount = skipped * 32;
-          const guestRangeStart = guestStart & ~31;
+          const guestRangeStart = (guestStart & 0xffffffe0) >>> 0;
           const physicalStart = translateCacheLoopRange(
             cacheInstruction,
             guestRangeStart,
             byteCount
           );
           if (physicalStart === null) return;
+          if (cacheInstruction === 0x7c001fac) {
+            invalidateInstructionCacheRange(guestRangeStart, byteCount);
+          }
           if (cacheInstruction === 0x7c001fec) {
             const target = physicalRamPointer(physicalStart, byteCount)
               ?? physicalLockedCachePointer(physicalStart, byteCount);
@@ -11558,6 +11706,18 @@ const TEMPLATE: &str = r##"<!doctype html>
             lazuli: { memory },
             lazuli_hooks: jitHooks,
           });
+          block.effectiveStart = pc >>> 0;
+          block.effectiveBytes = Math.max(4, (block.maximum & 0xffff) * 4);
+          block.physicalRanges = mapInstructionPhysicalRanges(
+            block.effectiveStart,
+            block.effectiveBytes
+          );
+          block.physicalStart = block.physicalRanges.length === 1
+            ? block.physicalRanges[0].start
+            : null;
+          block.physicalBytes = block.physicalRanges.length === 1
+            ? block.physicalRanges[0].bytes
+            : 0;
           block.instance = instance;
           block.instructionAddressSpaceKey = instructionAddressSpaceKey;
           block.instructionAddressSpaceGeneration = instructionAddressSpaceGeneration;
