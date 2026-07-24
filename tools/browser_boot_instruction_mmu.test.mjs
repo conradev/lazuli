@@ -73,6 +73,15 @@ const instructionFunctions = [
   "batAllowsAccess",
   "translateBatAddress",
   "resolveInstructionEffectiveAddress",
+  "readSegmentRegisters",
+  "resetTranslationLookasideBuffer",
+  "initializeTranslationLookasideBuffers",
+  "instructionTlbSetIndex",
+  "lookupInstructionTlb",
+  "fillInstructionTlb",
+  "resolveInstructionTlbEntry",
+  "resolveInstructionPageAddress",
+  "resolveInstructionTranslation",
   "translateInstructionEffectiveAddress",
   "translateInstructionEffectiveRange",
   "readInstructionBats",
@@ -139,6 +148,14 @@ function makeContext() {
       [0x50, 0x54],
       [0x58, 0x5c],
     ],
+    instructionTlbSets: Array.from(
+      { length: 64 },
+      () => ({ entries: [null, null], lru: 0 }),
+    ),
+    dataTlbSets: Array.from(
+      { length: 64 },
+      () => ({ entries: [null, null], lru: 0 }),
+    ),
     instructionTranslationSignature: null,
     lastCpuSignature: 1,
     lastUnmappedAccess: null,
@@ -193,7 +210,7 @@ function writeInstructionBat(context, index, upper, lower) {
   context.view.setUint32(context.cpu + lowerOffset, lower >>> 0, true);
 }
 
-test("TLB hooks conservatively invalidate compiled code before residency is modeled", () => {
+test("TLB hooks conservatively invalidate all resident translations and compiled code", () => {
   assert.match(
     source,
     /user_0_25:\s*\(_ctx,\s*address\)\s*=>\s*invalidateTranslationLookasideBuffer\(address\)/,
@@ -206,16 +223,107 @@ test("TLB hooks conservatively invalidate compiled code before residency is mode
   const context = makeContext();
   context.blocks.set("stable:80001000", { id: "block" });
   context.regionsByPc.set("stable:80001000", { id: "region" });
+  context.instructionTlbSets[3] = {
+    entries: [{ id: "instruction-0" }, { id: "instruction-1" }],
+    lru: 1,
+  };
+  context.dataTlbSets[7] = {
+    entries: [{ id: "data-0" }, { id: "data-1" }],
+    lru: 1,
+  };
 
   assert.equal(context.invalidateTranslationLookasideBuffer(0x80001000), 1);
   assert.equal(context.blocks.size, 0);
   assert.equal(context.regionsByPc.size, 0);
   assert.equal(context.recentPcs.length, 0);
+  assert.equal(
+    context.instructionTlbSets.every(set =>
+      set.lru === 0 && set.entries.every(entry => entry === null)
+    ),
+    true,
+  );
+  assert.equal(
+    context.dataTlbSets.every(set =>
+      set.lru === 0 && set.entries.every(entry => entry === null)
+    ),
+    true,
+  );
   assert.equal(context.accelerations.get("translationTlbInvalidations"), 1);
   assert.equal(context.accelerations.get("instructionAddressSpaceInvalidations"), 1);
 
   context.synchronizeTranslationLookasideBuffer();
   assert.equal(context.accelerations.get("translationTlbSynchronizations"), 1);
+});
+
+test("browser memory-management layout derives and initializes SR and SDR1 registers", () => {
+  assert.match(
+    source,
+    /let segment_register_offsets = Reg::SR\s*\.map\(\|register\| register\.offset\(\)\.to_string\(\)\)/,
+  );
+  assert.match(
+    source,
+    /\.replace\("__SR_OFFSETS__", &segment_register_offsets\)/,
+  );
+  assert.match(
+    source,
+    /\.replace\("__SDR1_OFFSET__", &SPR::SDR1\.offset\(\)\.to_string\(\)\)/,
+  );
+  assert.match(source, /const segmentRegisterOffsets = \[__SR_OFFSETS__\];/);
+  assert.match(source, /const sdr1Offset = __SDR1_OFFSET__;/);
+  assert.match(
+    source,
+    /initializePageTableRegisters\(\);\s*initializeMemoryManagement\(\);/,
+  );
+
+  const context = makeContext();
+  for (const [index, offset] of context.segmentRegisterOffsets.entries()) {
+    context.view.setUint32(context.cpu + offset, 0x10000000 + index, true);
+  }
+  context.view.setUint32(context.cpu + context.sdr1Offset, 0xdeadbeef, true);
+
+  context.initializePageTableRegisters();
+
+  assert.deepEqual(
+    context.segmentRegisterOffsets.map(offset =>
+      context.view.getUint32(context.cpu + offset, true)
+    ),
+    Array(16).fill(0),
+  );
+  assert.equal(
+    context.view.getUint32(context.cpu + context.sdr1Offset, true),
+    0,
+  );
+});
+
+test("instruction signatures order MSR, IBATs, SR0..15, and SDR1", () => {
+  const context = makeContext();
+  const bats = [
+    [0x80001fff, 0x00000002],
+    [0x90000003, 0x00020001],
+    [0xa0000001, 0x00040003],
+    [0xfff0001f, 0xfff00001],
+  ];
+  const segmentRegisters = Array.from(
+    { length: 16 },
+    (_unused, index) => (0x10000000 + index) >>> 0,
+  );
+  bats.forEach(([upper, lower], index) => {
+    writeInstructionBat(context, index, upper, lower);
+  });
+  segmentRegisters.forEach((value, index) => {
+    context.view.setUint32(
+      context.cpu + context.segmentRegisterOffsets[index],
+      value,
+      true,
+    );
+  });
+  context.view.setUint32(context.cpu + context.sdr1Offset, 0xdeadbeef, true);
+  context.view.setUint32(context.cpu + context.msrOffset, 0xffffffff, true);
+
+  assert.deepEqual(
+    Array.from(context.currentInstructionTranslationSignature()),
+    [0x4020, ...bats.flat(), ...segmentRegisters, 0xdeadbeef],
+  );
 });
 
 test("instruction BAT translation honors IR, privilege validity, and read protection", () => {

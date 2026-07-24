@@ -3940,6 +3940,14 @@ const TEMPLATE: &str = r##"<!doctype html>
     let instructionTranslationSignature = null;
     let instructionAddressSpaceKey = null;
     let instructionAddressSpaceGeneration = 0;
+    const instructionTlbSets = Array.from(
+      { length: 64 },
+      () => ({ entries: [null, null], lru: 0 })
+    );
+    const dataTlbSets = Array.from(
+      { length: 64 },
+      () => ({ entries: [null, null], lru: 0 })
+    );
     const cpFifoState = {
       control: 0,
       base: 0,
@@ -4441,11 +4449,217 @@ const TEMPLATE: &str = r##"<!doctype html>
       return { kind: "bat-miss", effective };
     }
 
-    function translateInstructionEffectiveAddress(effectiveAddress, msr, instructionBats) {
+    function readSegmentRegisters() {
+      return segmentRegisterOffsets.map(offset =>
+        view.getUint32(cpu + offset, true)
+      );
+    }
+
+    function resetTranslationLookasideBuffer(sets) {
+      for (const set of sets) {
+        set.entries[0] = null;
+        set.entries[1] = null;
+        set.lru = 0;
+      }
+    }
+
+    function initializeTranslationLookasideBuffers() {
+      resetTranslationLookasideBuffer(instructionTlbSets);
+      resetTranslationLookasideBuffer(dataTlbSets);
+    }
+
+    function instructionTlbSetIndex(effectiveAddress) {
+      return ((effectiveAddress >>> 12) & 0x3f) >>> 0;
+    }
+
+    function lookupInstructionTlb(effectiveAddress, vsid, touch = false) {
+      const effective = effectiveAddress >>> 0;
+      const setIndex = instructionTlbSetIndex(effective);
+      const set = instructionTlbSets[setIndex];
+      const pageIndex = (effective >>> 12) & 0xffff;
+      for (let way = 0; way < 2; way += 1) {
+        const entry = set.entries[way];
+        if (
+          entry === null
+          || entry.vsid !== (vsid & 0x00ffffff)
+          || entry.pageIndex !== pageIndex
+        ) continue;
+        if (touch) set.lru = way ^ 1;
+        return { ...entry, setIndex, way };
+      }
+      return null;
+    }
+
+    function fillInstructionTlb(effectiveAddress, vsid, entry) {
+      const effective = effectiveAddress >>> 0;
+      const setIndex = instructionTlbSetIndex(effective);
+      const set = instructionTlbSets[setIndex];
+      let way = set.entries.findIndex(candidate => candidate === null);
+      if (way < 0) way = set.lru;
+      const stored = {
+        ...entry,
+        vsid: vsid & 0x00ffffff,
+        pageIndex: (effective >>> 12) & 0xffff,
+      };
+      set.entries[way] = stored;
+      set.lru = way ^ 1;
+      return { ...stored, setIndex, way };
+    }
+
+    function resolveInstructionTlbEntry(effectiveAddress, msr, segment, entry) {
+      const effective = effectiveAddress >>> 0;
+      const pte1 = entry.pte1 >>> 0;
+      const physical = ((pte1 & 0xfffff000) | (effective & 0xfff)) >>> 0;
+      const translation = {
+        effective,
+        physical,
+        ptePhysical: entry.ptePhysical >>> 0,
+        secondary: entry.secondary === true,
+        slot: entry.slot >>> 0,
+        tlbHit: entry.tlbHit === true,
+      };
+      if ((pte1 & 0x08) !== 0) {
+        return { kind: "guarded", ...translation };
+      }
+      const selectedKeyMask = (msr & 0x4000) !== 0
+        ? 0x20000000
+        : 0x40000000;
+      const key = (segment & selectedKeyMask) !== 0 ? 1 : 0;
+      if (key === 1 && (pte1 & 0x03) === 0) {
+        return { kind: "protection", ...translation };
+      }
+      return { kind: "mapped", ...translation };
+    }
+
+    function resolveInstructionPageAddress(
+      effectiveAddress,
+      msr,
+      segmentRegisters,
+      sdr1,
+      updateReferenced = false
+    ) {
+      const effective = effectiveAddress >>> 0;
+      const segment = segmentRegisters[effective >>> 28] >>> 0;
+      if ((segment & 0x80000000) !== 0) {
+        return { kind: "no-execute", reason: "direct-store-segment", effective };
+      }
+      if ((segment & 0x10000000) !== 0) {
+        return { kind: "no-execute", reason: "segment-no-execute", effective };
+      }
+
+      const vsid = segment & 0x00ffffff;
+      const pageIndex = (effective >>> 12) & 0xffff;
+      const abbreviatedPageIndex = (effective >>> 22) & 0x3f;
+      const primaryHash = ((vsid & 0x7ffff) ^ pageIndex) & 0x7ffff;
+      const secondaryHash = (~primaryHash) & 0x7ffff;
+      const tableBase = sdr1 & 0xffff0000;
+      const tableMask = 0x3ff | ((sdr1 & 0x1ff) << 10);
+      const ptegAddress = hash => (
+        tableBase | (((hash & tableMask) << 6) >>> 0)
+      ) >>> 0;
+      const primaryPteg = ptegAddress(primaryHash);
+      const secondaryPteg = ptegAddress(secondaryHash);
+      const cached = lookupInstructionTlb(effective, vsid, updateReferenced);
+      if (cached !== null) {
+        return resolveInstructionTlbEntry(effective, msr, segment, {
+          ...cached,
+          tlbHit: true,
+        });
+      }
+
+      for (const [secondary, ptegPhysical] of [
+        [false, primaryPteg],
+        [true, secondaryPteg],
+      ]) {
+        const ptegPointer = physicalRamPointer(ptegPhysical, 64);
+        if (ptegPointer === null) {
+          return {
+            kind: "page-table-unbacked",
+            effective,
+            physical: ptegPhysical,
+            secondary,
+          };
+        }
+        const expectedPte0 = (
+          0x80000000
+          | (vsid << 7)
+          | (secondary ? 0x40 : 0)
+          | abbreviatedPageIndex
+        ) >>> 0;
+        for (let slot = 0; slot < 8; slot += 1) {
+          const ptePointer = ptegPointer + slot * 8;
+          const pte0 = view.getUint32(ptePointer, false);
+          if (pte0 !== expectedPte0) continue;
+          const pte1 = view.getUint32(ptePointer + 4, false);
+          if (updateReferenced && (pte1 & 0x100) === 0) {
+            bytes[ptePointer + 6] |= 1;
+          }
+          let entry = {
+            // A real fetch sets R before the translation is retained. Keep
+            // the cached PTE image coherent with the architected table write
+            // so a later ITLB hit observes the same translation state.
+            pte1: updateReferenced ? (pte1 | 0x100) >>> 0 : pte1,
+            ptePhysical: (ptegPhysical + slot * 8) >>> 0,
+            secondary,
+            slot,
+          };
+          if (updateReferenced) {
+            entry = fillInstructionTlb(effective, vsid, entry);
+          }
+          return resolveInstructionTlbEntry(effective, msr, segment, {
+            ...entry,
+            tlbHit: false,
+          });
+        }
+      }
+      return {
+        kind: "page-fault",
+        effective,
+        primaryPteg,
+        secondaryPteg,
+      };
+    }
+
+    function resolveInstructionTranslation(
+      effectiveAddress,
+      msr,
+      instructionBats,
+      segmentRegisters,
+      sdr1,
+      updateReferenced = false
+    ) {
       const resolved = resolveInstructionEffectiveAddress(
         effectiveAddress,
         msr,
         instructionBats
+      );
+      if (resolved.kind !== "bat-miss") return resolved;
+      if (!Array.isArray(segmentRegisters) || segmentRegisters.length !== 16) {
+        return resolved;
+      }
+      return resolveInstructionPageAddress(
+        effectiveAddress,
+        msr,
+        segmentRegisters,
+        sdr1 >>> 0,
+        updateReferenced
+      );
+    }
+
+    function translateInstructionEffectiveAddress(
+      effectiveAddress,
+      msr,
+      instructionBats,
+      segmentRegisters = undefined,
+      sdr1 = 0
+    ) {
+      const resolved = resolveInstructionTranslation(
+        effectiveAddress,
+        msr,
+        instructionBats,
+        segmentRegisters,
+        sdr1,
+        false
       );
       return resolved.kind === "mapped" ? resolved.physical : null;
     }
@@ -4454,7 +4668,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       effectiveAddress,
       size,
       msr,
-      instructionBats
+      instructionBats,
+      segmentRegisters = undefined,
+      sdr1 = 0
     ) {
       const effective = effectiveAddress >>> 0;
       if (!Number.isSafeInteger(size) || size <= 0) return null;
@@ -4467,7 +4683,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         const currentPhysical = translateInstructionEffectiveAddress(
           currentEffective,
           msr,
-          instructionBats
+          instructionBats,
+          segmentRegisters,
+          sdr1
         );
         if (currentPhysical === null) return null;
         if (physicalStart === null) {
@@ -4476,7 +4694,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else if (currentPhysical !== physicalStart + offset) {
           return null;
         }
-        offset += Math.min(size - offset, 0x20000 - (currentEffective & 0x1ffff));
+        offset += Math.min(size - offset, 0x1000 - (currentEffective & 0xfff));
       }
       return physicalStart;
     }
@@ -4508,7 +4726,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       return translateInstructionEffectiveAddress(
         effectiveAddress,
         view.getUint32(cpu + msrOffset, true),
-        readInstructionBats()
+        readInstructionBats(),
+        readSegmentRegisters(),
+        view.getUint32(cpu + sdr1Offset, true)
       );
     }
 
@@ -4517,7 +4737,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         effectiveAddress,
         size,
         view.getUint32(cpu + msrOffset, true),
-        readInstructionBats()
+        readInstructionBats(),
+        readSegmentRegisters(),
+        view.getUint32(cpu + sdr1Offset, true)
       );
     }
 
@@ -4596,18 +4818,25 @@ const TEMPLATE: &str = r##"<!doctype html>
         ?? physicalLockedCachePointer(physical, size);
     }
 
-    function resolveInstructionFetch(effectiveAddress, size = 4) {
+    function resolveInstructionFetch(
+      effectiveAddress,
+      size = 4,
+      updateReferenced = true
+    ) {
       const effective = effectiveAddress >>> 0;
       if (
-        !Number.isSafeInteger(size) || size <= 0
+        size !== 4 || (effective & 3) !== 0
         || size > 0x100000000 - effective
       ) {
         return { kind: "invalid-range", effective };
       }
-      const resolved = resolveInstructionEffectiveAddress(
+      const resolved = resolveInstructionTranslation(
         effective,
         view.getUint32(cpu + msrOffset, true),
-        readInstructionBats()
+        readInstructionBats(),
+        readSegmentRegisters(),
+        view.getUint32(cpu + sdr1Offset, true),
+        updateReferenced
       );
       if (resolved.kind !== "mapped") return resolved;
       const pointer = physicalRamPointer(resolved.physical, size)
@@ -4622,8 +4851,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       return { ...resolved, pointer };
     }
 
-    function fetchInstructionWord(effectiveAddress) {
-      const resolved = resolveInstructionFetch(effectiveAddress, 4);
+    function fetchInstructionWord(effectiveAddress, updateReferenced = true) {
+      const resolved = resolveInstructionFetch(
+        effectiveAddress,
+        4,
+        updateReferenced
+      );
       if (resolved.kind !== "mapped") return resolved;
       return {
         ...resolved,
@@ -8955,6 +9188,8 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function invalidateTranslationLookasideBuffer(_effectiveAddress) {
       const invalidatedBlocks = blocks.size;
+      resetTranslationLookasideBuffer(instructionTlbSets);
+      resetTranslationLookasideBuffer(dataTlbSets);
       invalidateAllCompiledCode("tlbie");
       accelerations.set(
         "translationTlbInvalidations",
@@ -9061,14 +9296,14 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function instructionDiagnostic(pc) {
-      const fetched = fetchInstructionWord(pc);
+      const fetched = fetchInstructionWord(pc, false);
       return fetched.kind === "mapped"
         ? "0x" + fetched.word.toString(16).padStart(8, "0")
         : null;
     }
 
     function probeInstructionWord(pc) {
-      const fetched = fetchInstructionWord(pc);
+      const fetched = fetchInstructionWord(pc, false);
       return fetched.kind === "mapped" ? fetched.word : null;
     }
 
@@ -11745,6 +11980,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       view.setUint16(mmio + 0x5016, 1, false);
       pushDspMail(0x8071feed, false, "initialize");
       deviceEvents.set("dspInitialize", (deviceEvents.get("dspInitialize") ?? 0) + 1);
+      initializeTranslationLookasideBuffers();
+      initializePageTableRegisters();
       initializeMemoryManagement();
       rebuildDataFastmem();
       synchronizeInstructionAddressSpace("initialize");
