@@ -13,6 +13,17 @@ pub(crate) const GX_MAX_COPY_DIMENSION: u32 = 1024;
 pub(crate) const WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 pub(crate) const GX_DEPTH16_MAX: u32 = 0x0000_ffff;
 pub(crate) const GX_DEPTH24_MAX: u32 = 0x00ff_ffff;
+/// Flipper's canonical single-sample raster point, in EFB pixel coordinates.
+#[cfg(test)]
+pub(crate) const GX_NON_AA_RASTER_CENTER_EFB: f32 = 7.0 / 12.0;
+/// WebGPU's fixed single-sample raster point, in framebuffer pixel coordinates.
+#[cfg(test)]
+pub(crate) const WEBGPU_RASTER_CENTER_EFB: f32 = 1.0 / 2.0;
+/// Screen-space translation that makes WebGPU sample the GX non-AA raster point.
+///
+/// Keep the exact rational expression instead of subtracting the two rounded
+/// `f32` center constants: those operations produce different low bits.
+pub(crate) const GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB: f32 = -1.0 / 12.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RendererMetrics {
@@ -621,6 +632,25 @@ pub(crate) fn gx_efb_format(pixel_control: u32) -> GxEfbFormat {
         // whole unmodeled tail explicitly conservative until that state is
         // available rather than pretending pixel_control can distinguish it.
         _ => GxEfbFormat::OtherNoAlpha,
+    }
+}
+
+/// Raster-center evidence conservatively inferable from LZGX v3's BP43 state.
+///
+/// RGB565_Z16 is the EFB format associated with Flipper's three-sample AA, but
+/// the actual AA enable and sample locations live in BP0 and BP1..4, which v3
+/// does not transport. BP43 alone therefore cannot call that format
+/// antialiased or unsupported; it only makes the raster-center state ambiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxRasterCenterEvidence {
+    KnownNonAntialiased,
+    AmbiguousRgb565Z16,
+}
+
+pub(crate) fn gx_raster_center_evidence(pixel_control: u32) -> GxRasterCenterEvidence {
+    match gx_efb_format(pixel_control) {
+        GxEfbFormat::Rgb565Z16 => GxRasterCenterEvidence::AmbiguousRgb565Z16,
+        _ => GxRasterCenterEvidence::KnownNonAntialiased,
     }
 }
 
@@ -2215,21 +2245,23 @@ pub use web::WebGpuRenderer;
 mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX,
+        GX_NON_AA_RASTER_CENTER_EFB, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
         GxAlphaTestOutcome, GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxCopyGamma,
         GxDepthCompareLocation, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthDecodeError,
         GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
-        GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
-        RendererMetrics, RendererPhaseTiming, SelectedTexture, SurfacePixelOrder,
-        SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome,
-        ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode,
-        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
-        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
-        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
-        gx_alpha_test_outcome, gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask,
-        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
-        gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
-        gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
-        gx_fog_reference, gx_fog_state, gx_sampler_identity, gx_xfb_copy_parameters,
+        GxRasterCenterEvidence, GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation,
+        RendererFailureState, RendererMetrics, RendererPhaseTiming, SelectedTexture,
+        SurfacePixelOrder, SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor,
+        ViFieldPairOutcome, ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame,
+        ViPresentationMode, WEBGPU_RASTER_CENTER_EFB, XfbCopyMetadata, alpha_compare,
+        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
+        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
+        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_alpha_test_outcome,
+        gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
+        gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_from_units,
+        gx_depth24_to_float, gx_destination_alpha_state, gx_early_depth_plan,
+        gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24, gx_fog_reference, gx_fog_state,
+        gx_raster_center_evidence, gx_sampler_identity, gx_xfb_copy_parameters,
         gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
         materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
@@ -3675,6 +3707,51 @@ mod tests {
         for (raw, expected) in expected.into_iter().enumerate() {
             assert_eq!(gx_efb_format(raw as u32), expected);
             assert_eq!(gx_efb_format(0x00ff_ff00 | raw as u32), expected);
+        }
+    }
+
+    #[test]
+    fn gx_non_aa_and_webgpu_raster_centers_have_exact_canonical_f32_values() {
+        assert_eq!(GX_NON_AA_RASTER_CENTER_EFB.to_bits(), 0x3f15_5555);
+        assert_eq!(WEBGPU_RASTER_CENTER_EFB.to_bits(), 0x3f00_0000);
+        assert_eq!(
+            GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB.to_bits(),
+            0xbdaa_aaab,
+        );
+        assert_eq!(GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, -1.0_f32 / 12.0,);
+        assert_ne!(
+            GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
+            WEBGPU_RASTER_CENTER_EFB - GX_NON_AA_RASTER_CENTER_EFB,
+            "the correction must be rounded from exact -1/12, not from two rounded f32 centers",
+        );
+    }
+
+    #[test]
+    fn transported_efb_format_limits_raster_center_evidence() {
+        let expected = [
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxRasterCenterEvidence::AmbiguousRgb565Z16,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+        ];
+        for (raw_format, expected) in expected.into_iter().enumerate() {
+            for compression_and_early_z in 0..16 {
+                let pixel_control = raw_format as u32 | (compression_and_early_z << 3);
+                assert_eq!(
+                    gx_raster_center_evidence(pixel_control),
+                    expected,
+                    "pixel control {pixel_control:#08x}",
+                );
+                assert_eq!(
+                    gx_raster_center_evidence(0x00ff_ff80 | pixel_control),
+                    expected,
+                    "untransported high BP bits must not affect raster-center classification",
+                );
+            }
         }
     }
 
