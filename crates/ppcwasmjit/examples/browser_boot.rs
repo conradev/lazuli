@@ -4915,6 +4915,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     let dspCurrentMail = null;
     let dspCpuMailbox = 0;
     let dspRomParameter = null;
+    let dspUcodeUpload = emptyDspUcodeUpload();
+    let dspUcodeHash = null;
     let dspMode = "rom";
     let dspUcodeBooted = false;
     let dspAxCommandListPending = false;
@@ -10436,11 +10438,170 @@ const TEMPLATE: &str = r##"<!doctype html>
       loadNextDspMail();
     }
 
+    function emptyDspUcodeUpload() {
+      return {
+        ramAddress: null,
+        length: null,
+        imemAddress: null,
+        dmemLength: null,
+        startPc: null,
+        malformed: false,
+        malformedReason: null,
+      };
+    }
+
+    function dspUcodeHashEctor(source) {
+      let hash = 0;
+      for (const value of source) {
+        hash = (hash ^ value) >>> 0;
+        hash = ((hash << 3) | (hash >>> 29)) >>> 0;
+      }
+      return hash >>> 0;
+    }
+
+    function classifyDspUcode(hash) {
+      switch (hash >>> 0) {
+        case 0x3ad3b7ac:
+        case 0x3daf59b9:
+        case 0x4e8a8b21:
+        case 0x07f88145:
+        case 0xe2136399:
+        case 0x3389a79e:
+          return "ax";
+        case 0x2fcdf1ec:
+          return "zelda";
+        default:
+          return null;
+      }
+    }
+
+    function captureDspRomParameter(parameter, value) {
+      const pair = parameter >>> 0;
+      const payload = value >>> 0;
+      traceDsp("ucode-parameter", {
+        parameter: hex32(pair),
+        value: hex32(payload),
+      });
+
+      let field;
+      let captured;
+      switch (pair) {
+        case 0x80f3a001:
+          field = "ramAddress";
+          captured = payload;
+          break;
+        case 0x80f3a002:
+          field = "length";
+          captured = payload & 0xffff;
+          break;
+        case 0x80f3b002:
+          field = "dmemLength";
+          captured = payload & 0xffff;
+          break;
+        case 0x80f3c002:
+          field = "imemAddress";
+          captured = payload & 0xffff;
+          break;
+        case 0x80f3d001:
+          field = "startPc";
+          captured = payload & 0xffff;
+          break;
+        default:
+          dspUcodeUpload.malformed = true;
+          dspUcodeUpload.malformedReason = "unknown-parameter";
+          return false;
+      }
+
+      if (dspUcodeUpload[field] !== null) {
+        dspUcodeUpload.malformed = true;
+        dspUcodeUpload.malformedReason = "duplicate-" + field;
+        return false;
+      }
+      dspUcodeUpload[field] = captured;
+      return true;
+    }
+
+    function rejectDspUcodeBoot(reason, details = {}) {
+      dspMode = "rom";
+      dspUcodeBooted = false;
+      dspAxCommandListPending = false;
+      dspScheduledMail = null;
+      traceDsp("ucode-boot-rejected", { reason, ...details });
+      deviceEvents.set(
+        "dspUcodeBootRejected",
+        (deviceEvents.get("dspUcodeBootRejected") ?? 0) + 1
+      );
+      dspUcodeUpload = emptyDspUcodeUpload();
+    }
+
+    function bootDspUcode() {
+      const upload = dspUcodeUpload;
+      dspUcodeHash = null;
+      if (upload.malformed) {
+        rejectDspUcodeBoot(upload.malformedReason ?? "malformed-upload");
+        return false;
+      }
+      const missing = [
+        "ramAddress",
+        "length",
+        "imemAddress",
+        "dmemLength",
+        "startPc",
+      ].filter(field => upload[field] === null);
+      if (missing.length !== 0) {
+        rejectDspUcodeBoot("missing-parameters", { missing });
+        return false;
+      }
+      if (upload.length === 0) {
+        rejectDspUcodeBoot("empty-iram");
+        return false;
+      }
+
+      const source = ramPointer(upload.ramAddress, upload.length);
+      if (source === null) {
+        rejectDspUcodeBoot("iram-out-of-bounds", {
+          ramAddress: hex32(upload.ramAddress),
+          length: upload.length,
+        });
+        return false;
+      }
+      const hash = dspUcodeHashEctor(
+        bytes.subarray(source, source + upload.length)
+      );
+      dspUcodeHash = hash;
+      const mode = classifyDspUcode(hash);
+      if (mode === null) {
+        rejectDspUcodeBoot("unknown-hash", { hash: hex32(hash) });
+        return false;
+      }
+
+      dspMode = mode;
+      dspUcodeBooted = true;
+      traceDsp("ucode-boot", {
+        hash: hex32(hash),
+        mode,
+        ramAddress: hex32(upload.ramAddress),
+        length: upload.length,
+        imemAddress: upload.imemAddress,
+        dmemLength: upload.dmemLength,
+        startPc: upload.startPc,
+      });
+      pushDspMail(0xdcd10000, true, mode + "-ucode");
+      if (mode === "zelda") {
+        pushDspMail(0xf3551111, false, "zelda-ucode-handshake");
+      }
+      deviceEvents.set("dspUcodeBoot", (deviceEvents.get("dspUcodeBoot") ?? 0) + 1);
+      dspUcodeUpload = emptyDspUcodeUpload();
+      return true;
+    }
+
     function resetDspMailbox() {
       dspMailQueue.length = 0;
       dspCurrentMail = null;
       dspCpuMailbox = 0;
       dspRomParameter = null;
+      dspUcodeUpload = emptyDspUcodeUpload();
+      dspUcodeHash = null;
       dspMode = "rom";
       dspUcodeBooted = false;
       dspAxCommandListPending = false;
@@ -10457,6 +10618,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMailQueue.length = 0;
       dspCurrentMail = null;
       dspRomParameter = null;
+      dspUcodeUpload = emptyDspUcodeUpload();
+      dspUcodeHash = null;
       dspMode = "init";
       dspUcodeBooted = false;
       dspAxCommandListPending = false;
@@ -10483,23 +10646,24 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else {
           const parameter = dspRomParameter;
           dspRomParameter = null;
-          if (parameter === 0x80f3d001) {
-            dspMode = "ax";
-            dspUcodeBooted = true;
-            pushDspMail(0xdcd10000, true);
-            deviceEvents.set("dspUcodeBoot", (deviceEvents.get("dspUcodeBoot") ?? 0) + 1);
-          }
+          captureDspRomParameter(parameter, mail);
+          if (parameter === 0x80f3d001) bootDspUcode();
         }
-      } else if (dspAxCommandListPending) {
-        dspAxCommandListPending = false;
-        dspScheduledMail = { mail: 0xdcd10002, completionCycle: cycles + 2500 };
-        deviceEvents.set("dspAxCommandList", (deviceEvents.get("dspAxCommandList") ?? 0) + 1);
-      } else if (mail === 0xcdd10000) {
-        pushDspMail(0xdcd10001, true);
-      } else if (mail === 0xcdd10002) {
-        resetDspMailbox();
-      } else if (((mail & 0xffff0000) >>> 0) === 0xbabe0000) {
-        dspAxCommandListPending = true;
+      } else if (dspMode === "ax") {
+        if (dspAxCommandListPending) {
+          dspAxCommandListPending = false;
+          dspScheduledMail = { mail: 0xdcd10002, completionCycle: cycles + 2500 };
+          deviceEvents.set(
+            "dspAxCommandList",
+            (deviceEvents.get("dspAxCommandList") ?? 0) + 1
+          );
+        } else if (mail === 0xcdd10000) {
+          pushDspMail(0xdcd10001, true);
+        } else if (mail === 0xcdd10002) {
+          resetDspMailbox();
+        } else if (((mail & 0xffff0000) >>> 0) === 0xbabe0000) {
+          dspAxCommandListPending = true;
+        }
       }
     }
 
@@ -15818,6 +15982,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           dspQueuedMails: dspMailQueue.length,
           dspScheduledMail,
           dspMode,
+          dspUcodeHash: dspUcodeHash === null ? null : hex32(dspUcodeHash),
           dspTrace,
           dspAudioDma: {
             enabled: (view.getUint16(mmio + 0x5036, false) & 0x8000) !== 0,
