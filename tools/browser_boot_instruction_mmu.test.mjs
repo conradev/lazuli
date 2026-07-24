@@ -93,9 +93,14 @@ const instructionFunctions = [
   "compiledRegion",
   "resetInstructionLinkingState",
   "invalidateAllCompiledCode",
+  "invalidateTranslationLookasideBuffer",
+  "synchronizeTranslationLookasideBuffer",
   "synchronizeInstructionAddressSpace",
+  "initializePageTableRegisters",
   "msrChanged",
   "instructionBatChanged",
+  "segmentRegisterChanged",
+  "sdr1Changed",
   "fetchWord",
   "regionHookCanContinue",
   "withScopedCycles",
@@ -157,6 +162,11 @@ function makeContext() {
     regionRunning: false,
     regionsByPc: new Map(),
     samePcCount: 9,
+    sdr1Offset: 0x1c0,
+    segmentRegisterOffsets: Array.from(
+      { length: 16 },
+      (_unused, index) => 0x180 + index * 4,
+    ),
     srr0Offset: 0x80,
     srr1Offset: 0x84,
     view: new DataView(buffer),
@@ -182,6 +192,31 @@ function writeInstructionBat(context, index, upper, lower) {
   context.view.setUint32(context.cpu + upperOffset, upper >>> 0, true);
   context.view.setUint32(context.cpu + lowerOffset, lower >>> 0, true);
 }
+
+test("TLB hooks conservatively invalidate compiled code before residency is modeled", () => {
+  assert.match(
+    source,
+    /user_0_25:\s*\(_ctx,\s*address\)\s*=>\s*invalidateTranslationLookasideBuffer\(address\)/,
+  );
+  assert.match(
+    source,
+    /user_0_26:\s*\(\)\s*=>\s*synchronizeTranslationLookasideBuffer\(\)/,
+  );
+
+  const context = makeContext();
+  context.blocks.set("stable:80001000", { id: "block" });
+  context.regionsByPc.set("stable:80001000", { id: "region" });
+
+  assert.equal(context.invalidateTranslationLookasideBuffer(0x80001000), 1);
+  assert.equal(context.blocks.size, 0);
+  assert.equal(context.regionsByPc.size, 0);
+  assert.equal(context.recentPcs.length, 0);
+  assert.equal(context.accelerations.get("translationTlbInvalidations"), 1);
+  assert.equal(context.accelerations.get("instructionAddressSpaceInvalidations"), 1);
+
+  context.synchronizeTranslationLookasideBuffer();
+  assert.equal(context.accelerations.get("translationTlbSynchronizations"), 1);
+});
 
 test("instruction BAT translation honors IR, privilege validity, and read protection", () => {
   const context = makeContext();
@@ -373,6 +408,65 @@ test("stable instruction namespaces isolate IR, PR, and IBAT mappings", () => {
   assert.notEqual(context.instructionBlockKey(0x80001000), supervisorKey);
 });
 
+test("SR and SDR1 barriers switch stable namespaces without clearing compiled code", () => {
+  const context = makeContext();
+  const pc = 0x80001000;
+  writeInstructionBat(context, 0, 0x80001fff, 0x00000002);
+  for (let index = 1; index < 4; index += 1) {
+    writeInstructionBat(context, index, 0, 0);
+  }
+  context.initializePageTableRegisters();
+  context.view.setUint32(context.cpu + context.msrOffset, 0x30, true);
+
+  assert.equal(context.synchronizeInstructionAddressSpace("initial"), true);
+  const initialKey = context.instructionAddressSpaceKey;
+  const initialBlock = { mapping: "initial" };
+  const initialRegion = { mapping: "initial", pcs: [pc] };
+  context.blocks.set(context.instructionBlockKey(pc), initialBlock);
+  context.regionsByPc.set(context.instructionRegionKey(pc), initialRegion);
+
+  context.view.setUint32(
+    context.cpu + context.segmentRegisterOffsets[7],
+    0x12345678,
+    true,
+  );
+  context.segmentRegisterChanged();
+  const segmentKey = context.instructionAddressSpaceKey;
+  assert.notEqual(segmentKey, initialKey);
+  assert.equal(context.blocks.size, 1);
+  assert.equal(context.regionsByPc.size, 1);
+  assert.equal(context.compiledBlock(pc), undefined);
+  const segmentBlock = { mapping: "segment" };
+  context.blocks.set(context.instructionBlockKey(pc), segmentBlock);
+
+  context.view.setUint32(context.cpu + context.sdr1Offset, 0x00010000, true);
+  context.sdr1Changed();
+  assert.notEqual(context.instructionAddressSpaceKey, segmentKey);
+  assert.equal(context.blocks.size, 2);
+  assert.equal(context.regionsByPc.size, 1);
+
+  context.view.setUint32(context.cpu + context.sdr1Offset, 0, true);
+  context.sdr1Changed();
+  assert.equal(context.instructionAddressSpaceKey, segmentKey);
+  assert.equal(context.compiledBlock(pc), segmentBlock);
+
+  context.view.setUint32(
+    context.cpu + context.segmentRegisterOffsets[7],
+    0,
+    true,
+  );
+  context.segmentRegisterChanged();
+  assert.equal(context.instructionAddressSpaceKey, initialKey);
+  assert.equal(context.compiledBlock(pc), initialBlock);
+  assert.equal(context.compiledRegion(pc), initialRegion);
+  assert.equal(context.blocks.size, 2, "namespace switches must not globally clear blocks");
+  assert.equal(context.regionsByPc.size, 1);
+
+  for (const name of ["segmentRegisterChanged", "sdr1Changed"]) {
+    assert.doesNotMatch(extractFunction(name), /invalidateAllCompiledCode/);
+  }
+});
+
 test("exception entry switches namespaces before vector lookup and reuses the prior namespace on return", () => {
   const context = makeContext();
   const oldPc = 0x80001000;
@@ -540,6 +634,83 @@ test("MSR and IBAT hooks synchronously request linked-region exits before the ne
     1,
   );
   assert.equal(ibatContext.compiledRegion(pc), undefined);
+});
+
+test("SR and SDR1 hooks publish namespace changes before requesting a linked-region exit", () => {
+  assert.match(source, /user_0_23:\s*\(\) => segmentRegisterChanged\(\)/);
+  assert.match(source, /user_0_24:\s*\(\) => sdr1Changed\(\)/);
+  assert.match(
+    extractFunction("segmentRegisterChanged"),
+    /synchronizeInstructionAddressSpace\("sr"\)/,
+  );
+  assert.match(
+    extractFunction("sdr1Changed"),
+    /synchronizeInstructionAddressSpace\("sdr1"\)/,
+  );
+
+  const context = makeContext();
+  writeInstructionBat(context, 0, 0x80001fff, 0x00000002);
+  for (let index = 1; index < 4; index += 1) {
+    writeInstructionBat(context, index, 0, 0);
+  }
+  context.initializePageTableRegisters();
+  context.view.setUint32(context.cpu + context.msrOffset, 0x30, true);
+  context.synchronizeInstructionAddressSpace("initial");
+  context.regionRunning = true;
+
+  const barriers = [
+    {
+      hook: "user_0_23",
+      mutate() {
+        context.view.setUint32(
+          context.cpu + context.segmentRegisterOffsets[3],
+          0x456,
+          true,
+        );
+      },
+      synchronize: () => context.segmentRegisterChanged(),
+    },
+    {
+      hook: "user_0_24",
+      mutate() {
+        context.view.setUint32(context.cpu + context.sdr1Offset, 0x10000, true);
+      },
+      synchronize: () => context.sdr1Changed(),
+    },
+  ];
+
+  for (const barrier of barriers) {
+    const oldKey = context.instructionAddressSpaceKey;
+    barrier.mutate();
+    context.view.setUint32(
+      context.regionControl + context.regionExitRequestOffset,
+      0,
+      true,
+    );
+    let callbackKey = null;
+    context.invokeJitHook({
+      [barrier.hook]() {
+        barrier.synchronize();
+        callbackKey = context.instructionAddressSpaceKey;
+        assert.equal(
+          context.view.getUint32(
+            context.regionControl + context.regionExitRequestOffset,
+            true,
+          ),
+          0,
+          "the barrier callback runs before the proxy publishes its exit request",
+        );
+      },
+    }, barrier.hook, []);
+    assert.notEqual(callbackKey, oldKey);
+    assert.equal(
+      context.view.getUint32(
+        context.regionControl + context.regionExitRequestOffset,
+        true,
+      ),
+      1,
+    );
+  }
 });
 
 test("IBAT and MSR hooks synchronize fetch mappings before another block", () => {

@@ -139,6 +139,30 @@ fn mtmsr(rs: u8) -> Ins {
     instruction(31 << 26 | u32::from(rs) << 21 | 146 << 1)
 }
 
+fn tlbie(rb: u8) -> Ins {
+    instruction(0x7c00_0264 | u32::from(rb) << 11)
+}
+
+fn tlbsync() -> Ins {
+    instruction(0x7c00_046c)
+}
+
+fn mfsr(rd: u8, sr: u8) -> Ins {
+    instruction(0x7c00_04a6 | u32::from(rd) << 21 | u32::from(sr & 0xf) << 16)
+}
+
+fn mtsr(rs: u8, sr: u8) -> Ins {
+    instruction(0x7c00_01a4 | u32::from(rs) << 21 | u32::from(sr & 0xf) << 16)
+}
+
+fn mfsrin(rd: u8, rb: u8) -> Ins {
+    instruction(0x7c00_0526 | u32::from(rd) << 21 | u32::from(rb) << 11)
+}
+
+fn mtsrin(rs: u8, rb: u8) -> Ins {
+    instruction(0x7c00_01e4 | u32::from(rs) << 21 | u32::from(rb) << 11)
+}
+
 fn lower_portable(function: &ir::Function) -> Vec<u8> {
     clifwasm::function(
         function,
@@ -258,6 +282,158 @@ fn hook_cycle_publication_is_opt_in_and_rejects_native_exit_mode() {
 }
 
 #[test]
+fn address_space_hook_ids_are_stable_and_append_only() {
+    assert_eq!(HookKind::DecChanged as u32, 22);
+    assert_eq!(HookKind::SrChanged as u32, 23);
+    assert_eq!(HookKind::Sdr1Changed as u32, 24);
+    assert_eq!(HookKind::Tlbie as u32, 25);
+    assert_eq!(HookKind::Tlbsync as u32, 26);
+}
+
+#[test]
+fn tlb_maintenance_is_an_exact_cycle_synchronous_barrier() {
+    let prefix = instruction(0x3860_1000); // addi r3,r0,0x1000
+    let invalidate = tlbie(4);
+    let synchronize = tlbsync();
+    let later_load = instruction(0x80a3_0000); // lwz r5,0(r3)
+    let later_store = instruction(0x90a3_0004); // stw r5,4(r3)
+
+    for (barrier, hook, expected_cycles) in [
+        (invalidate, HookKind::Tlbie, 5),
+        (synchronize, HookKind::Tlbsync, 4),
+    ] {
+        let fixture = [prefix, barrier, later_load, later_store];
+        let portable = translate_with_cycle_publication(fixture);
+        assert_eq!(portable.sequence.0, fixture[..2]);
+        assert_eq!(portable.cycles, expected_cycles);
+        assert_eq!(portable.exit, TranslationExit::Synchronous);
+        assert_eq!(
+            hook_call_cycles(&portable.function, TEST_HOOK_CYCLE_OFFSET),
+            [(0, hook as u32, 2)]
+        );
+        assert_eq!(
+            user_hook_call_count(&portable.function, HookKind::Tlbie),
+            if hook == HookKind::Tlbie { 1 } else { 0 }
+        );
+        assert_eq!(
+            user_hook_call_count(&portable.function, HookKind::Tlbsync),
+            if hook == HookKind::Tlbsync { 1 } else { 0 }
+        );
+
+        let mut native = Translator::new(TranslationConfig::new(
+            CodegenSettings::default(),
+            ir::types::I64,
+            CallConv::SystemV,
+            ExitMode::Native,
+        ));
+        let native = native.translate(fixture.into_iter()).unwrap();
+        assert_eq!(native.sequence.0, fixture[..2]);
+        assert_eq!(native.cycles, expected_cycles);
+        assert_eq!(native.exit, TranslationExit::Synchronous);
+        assert_eq!(user_hook_call_count(&native.function, hook), 1);
+    }
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let invalidate =
+        translate_with_cycle_publication([prefix, invalidate, later_load, later_store]);
+    let synchronize =
+        translate_with_cycle_publication([prefix, synchronize, later_load, later_store]);
+    let invalidate = lower_portable(&invalidate.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let synchronize = lower_portable(&synchronize.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let script = r#"
+const [
+  invalidateHex,
+  synchronizeHex,
+  cycleOffset,
+  pcOffset,
+  r4Offset,
+  r5Offset,
+  tlbieHook,
+  tlbsyncHook,
+] = process.argv.slice(1).map((value, index) => index < 2 ? value : Number(value));
+
+const initialPc = 0x80001000;
+const rawRb = 0xa1234567;
+const untouchedR5 = 0xdeadbeef;
+
+async function execute(hex, expectedCycles, hookName, expectedAddress) {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const context = 32;
+  const cpu = 128;
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r4Offset, rawRb, true);
+  view.setUint32(cpu + r5Offset, untouchedR5, true);
+
+  const hooks = {
+    [hookName](hookContext, address) {
+      events.push([
+        view.getUint32(hookContext + cycleOffset, true),
+        view.getUint32(cpu + pcOffset, true),
+        address === undefined ? null : address >>> 0,
+      ]);
+    },
+  };
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(context, cpu, 0x10000) >>> 0;
+  if (executed !== ((expectedCycles << 16) | 2)) {
+    throw new Error(`${hookName} returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 8) {
+    throw new Error(`${hookName} did not advance PC through exactly the barrier`);
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== untouchedR5) {
+    throw new Error(`${hookName} executed the later load`);
+  }
+  const expectedEvents = [[2, initialPc + 4, expectedAddress]];
+  if (JSON.stringify(events) !== JSON.stringify(expectedEvents)) {
+    throw new Error(`${hookName} observed ${JSON.stringify(events)}`);
+  }
+}
+
+await execute(invalidateHex, 5, `user_0_${tlbieHook}`, rawRb);
+await execute(synchronizeHex, 4, `user_0_${tlbsyncHook}`, null);
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &invalidate,
+            &synchronize,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &GPR::R4.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &(HookKind::Tlbie as u32).to_string(),
+            &(HookKind::Tlbsync as u32).to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn every_portable_semantic_hook_is_immediately_cycle_stamped() {
     // addi r3,r0,0x1000; lwz r4,0(r3); addi r4,r4,1; stw r4,4(r3)
     let fixture = [
@@ -333,16 +509,19 @@ fn address_space_writes_are_exact_cycle_translation_barriers() {
     let later_load = instruction(0x8083_0000); // lwz r4,0(r3)
     let later_store = instruction(0x9083_0004); // stw r4,4(r3)
 
-    for (barrier, hook) in [
-        (mtmsr(3), HookKind::MsrChanged),
-        (mtspr(3, SPR::DBAT0U as u16), HookKind::DBatChanged),
-        (mtspr(3, SPR::IBAT0L as u16), HookKind::IBatChanged),
+    for (barrier, hook, cycles) in [
+        (mtmsr(3), HookKind::MsrChanged, 3),
+        (mtspr(3, SPR::SDR1 as u16), HookKind::Sdr1Changed, 3),
+        (mtsr(3, 7), HookKind::SrChanged, 4),
+        (mtsrin(3, 4), HookKind::SrChanged, 4),
+        (mtspr(3, SPR::DBAT0U as u16), HookKind::DBatChanged, 3),
+        (mtspr(3, SPR::IBAT0L as u16), HookKind::IBatChanged, 3),
     ] {
         let fixture = [prefix, barrier, later_load, later_store];
         let portable = translate_with_cycle_publication(fixture);
 
         assert_eq!(portable.sequence.0, fixture[..2]);
-        assert_eq!(portable.cycles, 3);
+        assert_eq!(portable.cycles, cycles);
         assert_eq!(portable.exit, TranslationExit::Synchronous);
         assert_eq!(
             hook_call_cycles(&portable.function, TEST_HOOK_CYCLE_OFFSET),
@@ -374,24 +553,34 @@ fn portable_address_space_barriers_return_the_exact_executed_boundary() {
     let later_load = instruction(0x8083_0000); // lwz r4,0(r3)
     let later_store = instruction(0x9083_0004); // stw r4,4(r3)
     let barriers = [
-        (mtmsr(3), HookKind::MsrChanged, Reg::MSR.offset()),
+        (mtmsr(3), HookKind::MsrChanged, Reg::MSR.offset(), 3),
+        (
+            mtspr(3, SPR::SDR1 as u16),
+            HookKind::Sdr1Changed,
+            SPR::SDR1.offset(),
+            3,
+        ),
+        (mtsr(3, 7), HookKind::SrChanged, Reg::SR[7].offset(), 4),
+        (mtsrin(3, 4), HookKind::SrChanged, Reg::SR[0].offset(), 4),
         (
             mtspr(3, SPR::DBAT0U as u16),
             HookKind::DBatChanged,
             SPR::DBAT0U.offset(),
+            3,
         ),
         (
             mtspr(3, SPR::IBAT0L as u16),
             HookKind::IBatChanged,
             SPR::IBAT0L.offset(),
+            3,
         ),
     ];
     let mut modules = Vec::new();
-    for (barrier, _, _) in barriers {
+    for (barrier, _, _, expected_cycles) in barriers {
         let translated =
             translate_with_cycle_publication([prefix, barrier, later_load, later_store]);
         assert_eq!(translated.sequence.len(), 2);
-        assert_eq!(translated.cycles, 3);
+        assert_eq!(translated.cycles, expected_cycles);
         assert_eq!(translated.exit, TranslationExit::Synchronous);
         modules.push(
             lower_portable(&translated.function)
@@ -403,12 +592,14 @@ fn portable_address_space_barriers_return_the_exact_executed_boundary() {
 
     let script = r#"
 const args = process.argv.slice(1);
-const modules = args.slice(0, 3);
-const [cycleOffset, pcOffset, ...barrierData] = args.slice(3).map(Number);
+const moduleCount = Number(args[0]);
+const modules = args.slice(1, 1 + moduleCount);
+const [cycleOffset, pcOffset, ...barrierData] = args.slice(1 + moduleCount).map(Number);
 
 for (let index = 0; index < modules.length; index += 1) {
-  const hookKind = barrierData[index * 2];
-  const registerOffset = barrierData[index * 2 + 1];
+  const hookKind = barrierData[index * 3];
+  const registerOffset = barrierData[index * 3 + 1];
+  const cycles = barrierData[index * 3 + 2];
   const memory = new WebAssembly.Memory({ initial: 2 });
   const view = new DataView(memory.buffer);
   const context = 32;
@@ -430,7 +621,7 @@ for (let index = 0; index < modules.length; index += 1) {
     lazuli_hooks: hooks,
   });
   const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
-  if (executed !== 0x00030002) {
+  if (executed !== ((cycles << 16) | 2)) {
     throw new Error(`barrier ${index} returned 0x${executed.toString(16)}`);
   }
   if (view.getUint32(cpu + pcOffset, true) !== 0x80001008) {
@@ -438,6 +629,9 @@ for (let index = 0; index < modules.length; index += 1) {
   }
   if (JSON.stringify(events) !== JSON.stringify([[2, 0x1000]])) {
     throw new Error(`barrier ${index} observed ${JSON.stringify(events)}`);
+  }
+  if (view.getUint32(cpu + registerOffset, true) !== 0x1000) {
+    throw new Error(`barrier ${index} lost its register write after returning`);
   }
   const cycleBytes = Array.from(new Uint8Array(memory.buffer, context + cycleOffset, 4));
   if (cycleBytes.join(",") !== "2,0,0,0") {
@@ -447,15 +641,174 @@ for (let index = 0; index < modules.length; index += 1) {
 "#;
     let mut command = Command::new("node");
     command.args(["--input-type=module", "--eval", script]);
+    command.arg(modules.len().to_string());
     command.args(&modules);
     command.args([
         TEST_HOOK_CYCLE_OFFSET.to_string(),
         Reg::PC.offset().to_string(),
     ]);
-    for (_, hook, register_offset) in barriers {
-        command.args([(hook as u32).to_string(), register_offset.to_string()]);
+    for (_, hook, register_offset, cycles) in barriers {
+        command.args([
+            (hook as u32).to_string(),
+            register_offset.to_string(),
+            cycles.to_string(),
+        ]);
     }
     let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_indirect_segment_access_uses_the_effective_address_high_nibble() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    // mfsrin r5,r4; addi r6,r0,7
+    let read = translate_with_cycle_publication([mfsrin(5, 4), instruction(0x38c0_0007)]);
+    assert_eq!(read.sequence.len(), 2);
+    assert_eq!(read.cycles, 4);
+    assert_eq!(read.exit, TranslationExit::Fallthrough);
+    assert_eq!(user_hook_call_count(&read.function, HookKind::SrChanged), 0);
+
+    // mfsr r6,sr10; mtsrin r3,r4; addi r7,r0,9
+    let write =
+        translate_with_cycle_publication([mfsr(6, 10), mtsrin(3, 4), instruction(0x38e0_0009)]);
+    assert_eq!(write.sequence.len(), 2);
+    assert_eq!(write.cycles, 4);
+    assert_eq!(write.exit, TranslationExit::Synchronous);
+    assert_eq!(
+        hook_call_cycles(&write.function, TEST_HOOK_CYCLE_OFFSET),
+        [(0, HookKind::SrChanged as u32, 2)]
+    );
+
+    let read = lower_portable(&read.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let write = lower_portable(&write.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let script = r#"
+const [
+  readHex,
+  writeHex,
+  cycleOffset,
+  pcOffset,
+  r3Offset,
+  r4Offset,
+  r5Offset,
+  r6Offset,
+  r7Offset,
+  sr0Offset,
+  sr5Offset,
+  sr10Offset,
+  srChangedHook,
+] = process.argv.slice(1).map((value, index) => index < 2 ? value : Number(value));
+
+const initialPc = 0x80001000;
+const indirectAddress = 0xa0000005;
+const oldSr10 = 0x11223344;
+const oldSr5 = 0x55667788;
+const oldSr0 = 0x99aabbcc;
+
+async function executeRead() {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const cpu = 128;
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r4Offset, indirectAddress, true);
+  view.setUint32(cpu + sr10Offset, oldSr10, true);
+  view.setUint32(cpu + sr5Offset, oldSr5, true);
+  view.setUint32(cpu + sr0Offset, oldSr0, true);
+  const { instance } = await WebAssembly.instantiate(Buffer.from(readHex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: new Proxy({}, {
+      get(_target, name) {
+        return () => { throw new Error(`mfsrin invoked unexpected hook ${String(name)}`); };
+      },
+    }),
+  });
+  const executed = instance.exports.run(32, cpu, 0x10000) >>> 0;
+  if (executed !== 0x00040002) throw new Error(`bad mfsrin execution: 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 8) throw new Error("mfsrin did not continue");
+  if (view.getUint32(cpu + r5Offset, true) !== oldSr10) throw new Error("mfsrin did not select SR10");
+  if (view.getUint32(cpu + r6Offset, true) !== 7) throw new Error("instruction after mfsrin did not run");
+}
+
+async function executeWrite() {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const context = 32;
+  const cpu = 128;
+  const newSr10 = 0xcafebabe;
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r3Offset, newSr10, true);
+  view.setUint32(cpu + r4Offset, indirectAddress, true);
+  view.setUint32(cpu + r7Offset, 0xdeadbeef, true);
+  view.setUint32(cpu + sr10Offset, oldSr10, true);
+  view.setUint32(cpu + sr5Offset, oldSr5, true);
+  view.setUint32(cpu + sr0Offset, oldSr0, true);
+  const hooks = {
+    [`user_0_${srChangedHook}`](hookContext) {
+      events.push([
+        view.getUint32(hookContext + cycleOffset, true),
+        view.getUint32(cpu + sr10Offset, true),
+        view.getUint32(cpu + sr5Offset, true),
+        view.getUint32(cpu + sr0Offset, true),
+      ]);
+    },
+  };
+  const { instance } = await WebAssembly.instantiate(Buffer.from(writeHex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(context, cpu, 0x10000) >>> 0;
+  if (executed !== 0x00040002) throw new Error(`bad mtsrin execution: 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 8) throw new Error("mtsrin advanced PC incorrectly");
+  if (view.getUint32(cpu + r6Offset, true) !== oldSr10) throw new Error("mfsr setup read the wrong SR");
+  if (view.getUint32(cpu + r7Offset, true) !== 0xdeadbeef) throw new Error("instruction after mtsrin ran");
+  if (view.getUint32(cpu + sr10Offset, true) !== newSr10) throw new Error("mtsrin write was lost");
+  if (view.getUint32(cpu + sr5Offset, true) !== oldSr5) throw new Error("mtsrin used the low nibble");
+  if (view.getUint32(cpu + sr0Offset, true) !== oldSr0) throw new Error("mtsrin aliased SR0");
+  const expected = [[2, newSr10, oldSr5, oldSr0]];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`SrChanged observed ${JSON.stringify(events)}`);
+  }
+}
+
+await executeRead();
+await executeWrite();
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &read,
+            &write,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &GPR::R3.offset().to_string(),
+            &GPR::R4.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &GPR::R6.offset().to_string(),
+            &GPR::R7.offset().to_string(),
+            &Reg::SR[0].offset().to_string(),
+            &Reg::SR[5].offset().to_string(),
+            &Reg::SR[10].offset().to_string(),
+            &(HookKind::SrChanged as u32).to_string(),
+        ])
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "node failed:\nstdout:\n{}\nstderr:\n{}",

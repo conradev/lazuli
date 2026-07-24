@@ -302,7 +302,7 @@ block66:
   str q0, [x3, #168]
   ldr q22, [sp, #24]
   str q22, [x3, #184]
-  load_ext_name_far x1, User(userextname37)+0
+  load_ext_name_far x1, User(userextname41)+0
   movz x2, #0
   movz w3, #10
   movk w3, w3, #20, LSL #16
@@ -322,7 +322,7 @@ block1:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname22)+0
+  load_ext_name_far x1, User(userextname26)+0
   movz x2, #0
   movz w3, #1
   movk w3, w3, #2, LSL #16
@@ -355,7 +355,7 @@ block6:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname23)+0
+  load_ext_name_far x1, User(userextname27)+0
   movz x2, #0
   movz w3, #1
   movk w3, w3, #2, LSL #16
@@ -395,7 +395,7 @@ block13:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname24)+0
+  load_ext_name_far x1, User(userextname28)+0
   movz x2, #0
   movz w3, #2
   movk w3, w3, #4, LSL #16
@@ -429,7 +429,7 @@ block19:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname25)+0
+  load_ext_name_far x1, User(userextname29)+0
   movz x2, #0
   movz w3, #3
   movk w3, w3, #6, LSL #16
@@ -462,7 +462,7 @@ block23:
   load_ext_name_far x10, User(userextname0)+0
   mov x0, x24
   blr x10
-  load_ext_name_far x1, User(userextname26)+0
+  load_ext_name_far x1, User(userextname30)+0
   movz x2, #0
   movz w3, #3
   movk w3, w3, #6, LSL #16
@@ -499,7 +499,7 @@ block27:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname27)+0
+  load_ext_name_far x1, User(userextname31)+0
   movz x2, #0
   movz w3, #5
   movk w3, w3, #10, LSL #16
@@ -535,7 +535,7 @@ block31:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname28)+0
+  load_ext_name_far x1, User(userextname32)+0
   movz x2, #0
   movz w3, #5
   movk w3, w3, #10, LSL #16
@@ -574,7 +574,7 @@ block35:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname29)+0
+  load_ext_name_far x1, User(userextname33)+0
   movz x2, #0
   movz w3, #7
   movk w3, w3, #14, LSL #16
@@ -612,7 +612,7 @@ block39:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname30)+0
+  load_ext_name_far x1, User(userextname34)+0
   movz x2, #0
   movz w3, #7
   movk w3, w3, #14, LSL #16
@@ -648,7 +648,7 @@ block43:
   load_ext_name_far x5, User(userextname0)+0
   mov x0, x24
   blr x5
-  load_ext_name_far x1, User(userextname31)+0
+  load_ext_name_far x1, User(userextname35)+0
   movz x2, #0
   movz w3, #8
   movk w3, w3, #16, LSL #16
@@ -683,7 +683,7 @@ block47:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname32)+0
+  load_ext_name_far x1, User(userextname36)+0
   movz x2, #0
   movz w3, #8
   movk w3, w3, #16, LSL #16
@@ -718,7 +718,7 @@ block51:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname33)+0
+  load_ext_name_far x1, User(userextname37)+0
   movz x2, #0
   movz w3, #9
   movk w3, w3, #18, LSL #16
@@ -753,7 +753,7 @@ block55:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname34)+0
+  load_ext_name_far x1, User(userextname38)+0
   movz x2, #0
   movz w3, #9
   movk w3, w3, #18, LSL #16
@@ -789,7 +789,7 @@ block59:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname35)+0
+  load_ext_name_far x1, User(userextname39)+0
   movz x2, #0
   movz w3, #10
   movk w3, w3, #20, LSL #16
@@ -824,7 +824,7 @@ block63:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x24
   blr x2
-  load_ext_name_far x1, User(userextname36)+0
+  load_ext_name_far x1, User(userextname40)+0
   movz x2, #0
   movz w3, #10
   movk w3, w3, #20, LSL #16

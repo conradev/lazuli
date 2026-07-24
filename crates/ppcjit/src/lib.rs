@@ -395,6 +395,10 @@ impl Codegen {
                     HookKind::TbChanged => self.hooks.tb_changed as usize,
                     HookKind::DecRead => self.hooks.dec_read as usize,
                     HookKind::DecChanged => self.hooks.dec_changed as usize,
+                    HookKind::SrChanged => self.hooks.sr_changed as usize,
+                    HookKind::Sdr1Changed => self.hooks.sdr1_changed as usize,
+                    HookKind::Tlbie => self.hooks.tlbie as usize,
+                    HookKind::Tlbsync => self.hooks.tlbsync as usize,
                 };
 
                 jitclif::write_relocation(code, reloc, addr);

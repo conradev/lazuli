@@ -61,6 +61,10 @@ pub enum HookKind {
     TbChanged,
     DecRead,
     DecChanged,
+    SrChanged,
+    Sdr1Changed,
+    Tlbie,
+    Tlbsync,
 }
 
 /// External functions that JITed code calls.
@@ -85,11 +89,17 @@ pub struct Hooks {
 
     // cache
     pub invalidate_icache: InvalidateICache,
+    pub tlbie: InvalidateICache,
+    pub tlbsync: GenericHook,
     pub clear_icache: GenericHook,
     pub dcache_dma: GenericHook,
 
     // msr
     pub msr_changed: GenericHook,
+
+    // page translation
+    pub sr_changed: GenericHook,
+    pub sdr1_changed: GenericHook,
 
     // bats
     pub ibat_changed: GenericHook,
@@ -133,9 +143,13 @@ impl Hooks {
             read_quantized: stub!(),
             write_quantized: stub!(),
             invalidate_icache: stub!(),
+            tlbie: stub!(),
+            tlbsync: stub!(),
             clear_icache: stub!(),
             dcache_dma: stub!(),
             msr_changed: stub!(),
+            sr_changed: stub!(),
+            sdr1_changed: stub!(),
             ibat_changed: stub!(),
             dbat_changed: stub!(),
             tb_read: stub!(),

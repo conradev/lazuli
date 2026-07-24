@@ -4,7 +4,7 @@ use cranelift_codegen::ir::InstBuilder;
 use gekko::disasm::Ins;
 use gekko::{InsExt, Reg, SPR};
 
-use super::BlockBuilder;
+use super::{BlockBuilder, MEMFLAGS};
 use crate::builder::{Action, InstructionInfo};
 
 const SPR_INFO: InstructionInfo = InstructionInfo {
@@ -61,6 +61,21 @@ const SYNC_ICACHE_INFO: InstructionInfo = InstructionInfo {
     action: Action::Exit,
 };
 
+const TLB_INVALIDATE_INFO: InstructionInfo = InstructionInfo {
+    cycles: 3,
+    auto_pc: true,
+    action: Action::Exit,
+};
+
+// The MPC750 marks tlbsync finished at dispatch and assigns it no execution-unit latency. Keep
+// Lazuli's existing no-op-class estimate while still ending the translated region at the exact
+// architectural synchronization point.
+const TLB_SYNC_INFO: InstructionInfo = InstructionInfo {
+    cycles: 2,
+    auto_pc: true,
+    action: Action::Exit,
+};
+
 fn generate_mask(control: u8) -> u32 {
     let mut mask = 0;
     for i in 0..8 {
@@ -98,6 +113,11 @@ impl BlockBuilder<'_> {
             SPR::TBL | SPR::TBU => self.call_generic_hook(self.hooks.tb_changed),
             SPR::DMAL | SPR::DMAU => self.call_generic_hook(self.hooks.dcache_dma),
             SPR::WPAR => tracing::warn!("write to WPAR"),
+            SPR::SDR1 => {
+                self.flush();
+                self.call_generic_hook(self.hooks.sdr1_changed);
+                return ADDRESS_SPACE_BARRIER_INFO;
+            }
             spr if spr.is_data_bat() => {
                 self.call_generic_hook(self.hooks.dbat_changed);
                 return ADDRESS_SPACE_BARRIER_INFO;
@@ -117,12 +137,55 @@ impl BlockBuilder<'_> {
         let sr = Reg::SR[ins.field_sr() as usize];
         self.set(sr, value);
 
-        SR_INFO
+        self.flush();
+        self.call_generic_hook(self.hooks.sr_changed);
+
+        InstructionInfo {
+            action: Action::Exit,
+            ..SR_INFO
+        }
     }
 
     pub fn mfsr(&mut self, ins: Ins) -> InstructionInfo {
         let sr = Reg::SR[ins.field_sr() as usize];
         let value = self.get(sr);
+        self.set(ins.gpr_d(), value);
+
+        SR_INFO
+    }
+
+    fn indexed_sr_address(&mut self, ins: Ins) -> ir::Value {
+        let address = self.get(ins.gpr_b());
+        let index = self.bd.ins().ushr_imm(address, 28);
+        let byte_offset = self.bd.ins().ishl_imm(index, 2);
+        let byte_offset = if self.consts.ptr_type == ir::types::I32 {
+            byte_offset
+        } else {
+            self.bd.ins().uextend(self.consts.ptr_type, byte_offset)
+        };
+        let sr_base = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.regs_ptr, Reg::SR[0].offset() as i64);
+        self.bd.ins().iadd(sr_base, byte_offset)
+    }
+
+    pub fn mtsrin(&mut self, ins: Ins) -> InstructionInfo {
+        let value = self.get(ins.gpr_s());
+        let sr_address = self.indexed_sr_address(ins);
+        self.bd.ins().store(MEMFLAGS, value, sr_address, 0);
+
+        self.call_generic_hook(self.hooks.sr_changed);
+
+        InstructionInfo {
+            action: Action::Exit,
+            ..SR_INFO
+        }
+    }
+
+    pub fn mfsrin(&mut self, ins: Ins) -> InstructionInfo {
+        let sr_address = self.indexed_sr_address(ins);
+        let value = self.bd.ins().load(ir::types::I32, MEMFLAGS, sr_address, 0);
         self.set(ins.gpr_d(), value);
 
         SR_INFO
@@ -483,5 +546,27 @@ impl BlockBuilder<'_> {
             .call(self.hooks.clear_icache, &[self.consts.ctx_ptr]);
 
         SYNC_ICACHE_INFO
+    }
+
+    pub fn tlbie(&mut self, ins: Ins) -> InstructionInfo {
+        let address = self.get(ins.gpr_b());
+
+        self.flush();
+        self.publish_hook_cycle_offset();
+        self.bd
+            .ins()
+            .call(self.hooks.tlbie, &[self.consts.ctx_ptr, address]);
+
+        TLB_INVALIDATE_INFO
+    }
+
+    pub fn tlbsync(&mut self, _: Ins) -> InstructionInfo {
+        self.flush();
+        self.publish_hook_cycle_offset();
+        self.bd
+            .ins()
+            .call(self.hooks.tlbsync, &[self.consts.ctx_ptr]);
+
+        TLB_SYNC_INFO
     }
 }

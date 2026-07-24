@@ -216,6 +216,9 @@ fn main() {
         .map(|index| GPR::new(index).offset().to_string())
         .collect::<Vec<_>>()
         .join(",");
+    let segment_register_offsets = Reg::SR
+        .map(|register| register.offset().to_string())
+        .join(",");
     let instruction_bat_offsets = [
         [SPR::IBAT0L, SPR::IBAT0U],
         [SPR::IBAT1L, SPR::IBAT1U],
@@ -266,6 +269,7 @@ fn main() {
         .replace("__FST__", &hex(&disc.filesystem))
         .replace("__FST_MAX_SIZE__", &disc.filesystem_max_size.to_string())
         .replace("__GPR_OFFSETS__", &gpr_offsets)
+        .replace("__SR_OFFSETS__", &segment_register_offsets)
         .replace("__IBAT_OFFSETS__", &instruction_bat_offsets)
         .replace("__DBAT_OFFSETS__", &data_bat_offsets)
         .replace("__DOL_NAME__", &js_string(&dol_name))
@@ -308,6 +312,7 @@ fn main() {
         .replace("__PC_OFFSET__", &Reg::PC.offset().to_string())
         .replace("__CTR_OFFSET__", &SPR::CTR.offset().to_string())
         .replace("__MSR_OFFSET__", &Reg::MSR.offset().to_string())
+        .replace("__SDR1_OFFSET__", &SPR::SDR1.offset().to_string())
         .replace("__LR_OFFSET__", &SPR::LR.offset().to_string())
         .replace("__DAR_OFFSET__", &SPR::DAR.offset().to_string())
         .replace("__SRR0_OFFSET__", &SPR::SRR0.offset().to_string())
@@ -3809,6 +3814,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const fstBytes = fst.length;
     const compilerWasmBytes = compilerWasm.length;
     const gprOffsets = [__GPR_OFFSETS__];
+    const segmentRegisterOffsets = [__SR_OFFSETS__];
     const instructionBatOffsets = [__IBAT_OFFSETS__];
     const dataBatOffsets = [__DBAT_OFFSETS__];
     const defaultInstructionBats = [
@@ -3846,6 +3852,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const pcOffset = __PC_OFFSET__;
     const ctrOffset = __CTR_OFFSET__;
     const msrOffset = __MSR_OFFSET__;
+    const sdr1Offset = __SDR1_OFFSET__;
     const lrOffset = __LR_OFFSET__;
     const darOffset = __DAR_OFFSET__;
     const srr0Offset = __SRR0_OFFSET__;
@@ -4201,6 +4208,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       user_0_20: () => timeBaseChanged(),
       user_0_21: () => updateDecrementer(cycles),
       user_0_22: () => decrementerChanged(),
+      user_0_23: () => segmentRegisterChanged(),
+      user_0_24: () => sdr1Changed(),
+      user_0_25: (_ctx, address) => invalidateTranslationLookasideBuffer(address),
+      user_0_26: () => synchronizeTranslationLookasideBuffer(),
       user_1_0: (registers, exception) => raiseException(registers, exception),
     };
 
@@ -8684,6 +8695,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function initializePageTableRegisters() {
+      for (const offset of segmentRegisterOffsets) {
+        view.setUint32(cpu + offset, 0, true);
+      }
+      view.setUint32(cpu + sdr1Offset, 0, true);
+    }
+
     function initializeMemoryManagement() {
       initializeBatRegisters(instructionBatOffsets, defaultInstructionBats);
       initializeBatRegisters(dataBatOffsets, defaultDataBats);
@@ -8728,6 +8746,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       for (const [upper, lower] of readInstructionBats()) {
         signature.push(upper >>> 0, lower >>> 0);
       }
+      for (const offset of segmentRegisterOffsets) {
+        signature.push(view.getUint32(cpu + offset, true));
+      }
+      signature.push(view.getUint32(cpu + sdr1Offset, true));
       return signature;
     }
 
@@ -8931,6 +8953,23 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function invalidateTranslationLookasideBuffer(_effectiveAddress) {
+      const invalidatedBlocks = blocks.size;
+      invalidateAllCompiledCode("tlbie");
+      accelerations.set(
+        "translationTlbInvalidations",
+        (accelerations.get("translationTlbInvalidations") ?? 0) + 1
+      );
+      return invalidatedBlocks;
+    }
+
+    function synchronizeTranslationLookasideBuffer() {
+      accelerations.set(
+        "translationTlbSynchronizations",
+        (accelerations.get("translationTlbSynchronizations") ?? 0) + 1
+      );
+    }
+
     function synchronizeInstructionAddressSpace(reason, invalidate = false) {
       const signature = currentInstructionTranslationSignature();
       if (
@@ -8961,6 +9000,14 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function instructionBatChanged() {
       synchronizeInstructionAddressSpace("ibat", true);
+    }
+
+    function segmentRegisterChanged() {
+      synchronizeInstructionAddressSpace("sr");
+    }
+
+    function sdr1Changed() {
+      synchronizeInstructionAddressSpace("sdr1");
     }
 
     function dataBatChanged() {

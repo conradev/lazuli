@@ -7,6 +7,11 @@ use zerocopy::IntoBytes;
 
 use crate::{Artifact, CodegenSettings, Sequence};
 
+// Increment whenever the translated artifact ABI or frontend semantics change. Cached machine
+// code is intentionally invalidated across these boundaries even when the guest sequence and
+// Cranelift settings are otherwise identical.
+const ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 2;
+
 struct Hash128(twox_hash::XxHash3_128);
 
 impl Hasher for Hash128 {
@@ -25,7 +30,17 @@ pub struct ArtifactKey(u128);
 
 impl ArtifactKey {
     pub fn new(isa: &dyn TargetIsa, settings: &CodegenSettings, seq: &Sequence) -> Self {
+        Self::with_schema(ARTIFACT_CACHE_SCHEMA_VERSION, isa, settings, seq)
+    }
+
+    fn with_schema(
+        schema_version: u32,
+        isa: &dyn TargetIsa,
+        settings: &CodegenSettings,
+        seq: &Sequence,
+    ) -> Self {
         let mut hasher = Hash128(twox_hash::XxHash3_128::with_seed(0));
+        schema_version.hash(&mut hasher);
         isa.name().hash(&mut hasher);
         isa.triple().hash(&mut hasher);
         isa.flags().hash(&mut hasher);
@@ -33,6 +48,30 @@ impl ArtifactKey {
         settings.hash(&mut hasher);
         seq.hash(&mut hasher);
         Self(hasher.0.finish_128())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_cache_schema_changes_key() {
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let isa = jitclif::isa::x86_64_v1().finish(flags).unwrap();
+        let settings = CodegenSettings::default();
+        let sequence = Sequence::default();
+
+        let current =
+            ArtifactKey::with_schema(ARTIFACT_CACHE_SCHEMA_VERSION, &*isa, &settings, &sequence);
+        let previous = ArtifactKey::with_schema(
+            ARTIFACT_CACHE_SCHEMA_VERSION - 1,
+            &*isa,
+            &settings,
+            &sequence,
+        );
+
+        assert_ne!(current.0, previous.0);
     }
 }
 

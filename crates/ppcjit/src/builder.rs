@@ -47,6 +47,7 @@ fn is_cacheable(reg: Reg) -> bool {
             | SPR::WPAR
             | SPR::DMAL
             | SPR::DMAU
+            | SPR::SDR1
             | SPR::SRR0
             | SPR::SRR1
             | SPR::DAR => false,
@@ -54,6 +55,22 @@ fn is_cacheable(reg: Reg) -> bool {
             spr if spr.is_gqr() => false,
             _ => true,
         },
+        Reg::SR0
+        | Reg::SR1
+        | Reg::SR2
+        | Reg::SR3
+        | Reg::SR4
+        | Reg::SR5
+        | Reg::SR6
+        | Reg::SR7
+        | Reg::SR8
+        | Reg::SR9
+        | Reg::SR10
+        | Reg::SR11
+        | Reg::SR12
+        | Reg::SR13
+        | Reg::SR14
+        | Reg::SR15 => false,
         _ => true,
     }
 }
@@ -131,6 +148,8 @@ struct HookFuncs {
     clear_icache: ir::FuncRef,
     dcache_dma: ir::FuncRef,
     msr_changed: ir::FuncRef,
+    sr_changed: ir::FuncRef,
+    sdr1_changed: ir::FuncRef,
     ibat_changed: ir::FuncRef,
     dbat_changed: ir::FuncRef,
     tb_read: ir::FuncRef,
@@ -139,6 +158,8 @@ struct HookFuncs {
     dec_changed: ir::FuncRef,
 
     // special
+    tlbie: ir::FuncRef,
+    tlbsync: ir::FuncRef,
     raise_exception: ir::FuncRef,
 }
 
@@ -311,6 +332,10 @@ impl<'ctx> BlockBuilder<'ctx> {
             tb_changed: hook(sigs.generic_hook, HookKind::TbChanged),
             dec_read: hook(sigs.generic_hook, HookKind::DecRead),
             dec_changed: hook(sigs.generic_hook, HookKind::DecChanged),
+            sr_changed: hook(sigs.generic_hook, HookKind::SrChanged),
+            sdr1_changed: hook(sigs.generic_hook, HookKind::Sdr1Changed),
+            tlbie: hook(sigs.invalidate_icache_hook, HookKind::Tlbie),
+            tlbsync: hook(sigs.generic_hook, HookKind::Tlbsync),
             raise_exception,
         };
 
@@ -693,6 +718,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Mfmsr => self.mfmsr(ins),
             Opcode::Mfspr => self.mfspr(ins),
             Opcode::Mfsr => self.mfsr(ins),
+            Opcode::Mfsrin => self.mfsrin(ins),
             Opcode::Mftb => self.mftb(ins),
             Opcode::Mtcrf => self.mtcrf(ins),
             Opcode::Mtfsb0 => self.mtfsb0(ins),
@@ -701,6 +727,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Mtmsr => self.mtmsr(ins),
             Opcode::Mtspr => self.mtspr(ins),
             Opcode::Mtsr => self.mtsr(ins),
+            Opcode::Mtsrin => self.mtsrin(ins),
             Opcode::Mulhw => self.mulhw(ins),
             Opcode::Mulhwu => self.mulhwu(ins),
             Opcode::Mulli => self.mulli(ins),
@@ -787,8 +814,8 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Subfme => self.subfme(ins),
             Opcode::Subfze => self.subfze(ins),
             Opcode::Sync => self.nop(Action::Exit),
-            Opcode::Tlbie => self.nop(Action::Continue),
-            Opcode::Tlbsync => self.nop(Action::Continue),
+            Opcode::Tlbie => self.tlbie(ins),
+            Opcode::Tlbsync => self.tlbsync(ins),
             Opcode::Xor => self.xor(ins),
             Opcode::Xori => self.xori(ins),
             Opcode::Xoris => self.xoris(ins),

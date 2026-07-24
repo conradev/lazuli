@@ -186,10 +186,28 @@ impl Blocks {
 
     /// Clears all mappings.
     pub fn clear(&mut self) {
+        self.unlink_all();
         self.logical_mappings.clear();
         self.physical_mappings.clear();
         self.logical_deps.clear();
         self.physical_deps.clear();
+    }
+
+    fn unlink_all(&mut self) {
+        for block in &mut self.storage {
+            for data in block.linked_from.drain(..) {
+                unsafe {
+                    (*data).linked = None;
+                    (*data).linked_pattern = Pattern::None;
+                }
+            }
+
+            for data in block.linked_return_from.drain(..) {
+                unsafe {
+                    (*data).linked_return = None;
+                }
+            }
+        }
     }
 }
 
@@ -213,6 +231,19 @@ struct Context<'a> {
     max_instructions: u32,
     /// Last followed link, if any.
     last_followed_link: Option<BlockFn>,
+    /// Whether the current block changed the instruction or data address space.
+    address_space_changed: bool,
+}
+
+fn reset_address_space_links(ctx: &mut Context, clear_mappings: bool) {
+    if clear_mappings {
+        ctx.blocks.clear();
+    } else {
+        ctx.blocks.unlink_all();
+    }
+    ctx.shadow_stack.clear();
+    ctx.last_followed_link = None;
+    ctx.address_space_changed = true;
 }
 
 const CTX_HOOKS: Hooks = {
@@ -243,7 +274,7 @@ const CTX_HOOKS: Hooks = {
         let limits_reached = ctx.executed_cycles >= ctx.target_cycles
             || ctx.executed_instructions >= ctx.max_instructions;
 
-        if has_pending || limits_reached {
+        if has_pending || limits_reached || ctx.address_space_changed {
             std::hint::cold_path();
             return None;
         }
@@ -453,6 +484,17 @@ const CTX_HOOKS: Hooks = {
         ctx.icache.clear();
     }
 
+    extern "C-unwind" fn tlbie(ctx: &mut Context, _address: Address) {
+        // Native page translation is not modeled yet, so conservatively discard every retained
+        // instruction mapping and unlink the current chain.
+        reset_address_space_links(ctx, true);
+    }
+
+    extern "C-unwind" fn tlbsync(_ctx: &mut Context) {
+        // The MPC750 has no local synchronization side effect when its external TLBISYNC input
+        // permits execution to continue. The JIT boundary itself provides the ordering point.
+    }
+
     extern "C-unwind" fn dcache_dma(ctx: &mut Context) {
         let dma = ctx.sys.cpu.supervisor.config.dma.clone();
 
@@ -480,12 +522,25 @@ const CTX_HOOKS: Hooks = {
     }
 
     extern "C-unwind" fn msr_changed(ctx: &mut Context) {
+        // Instruction mappings are already partitioned by MSR[IR]. Keep them across common
+        // EE-only changes; PR-specific translation is not modeled by the native LUT yet.
+        reset_address_space_links(ctx, false);
         ctx.sys.scheduler.schedule_now(system::pi::check_interrupts);
+    }
+
+    extern "C-unwind" fn sr_changed(ctx: &mut Context) {
+        tracing::info!("segment registers changed - clearing blocks mapping");
+        reset_address_space_links(ctx, true);
+    }
+
+    extern "C-unwind" fn sdr1_changed(ctx: &mut Context) {
+        tracing::info!("SDR1 changed - clearing blocks mapping");
+        reset_address_space_links(ctx, true);
     }
 
     extern "C-unwind" fn ibat_changed(ctx: &mut Context) {
         tracing::info!("ibats changed - clearing blocks mapping and rebuilding ibat lut");
-        ctx.blocks.clear();
+        reset_address_space_links(ctx, true);
         ctx.sys
             .mem
             .build_inst_bat_lut(&ctx.sys.cpu.supervisor.memory.ibat);
@@ -562,10 +617,15 @@ const CTX_HOOKS: Hooks = {
 
         let invalidate_icache =
             transmute::<_, InvalidateICache>(invalidate_icache as extern "C-unwind" fn(_, _));
+        let tlbie = transmute::<_, InvalidateICache>(tlbie as extern "C-unwind" fn(_, _));
+        let tlbsync = transmute::<_, GenericHook>(tlbsync as extern "C-unwind" fn(_));
         let clear_icache = transmute::<_, GenericHook>(clear_icache as extern "C-unwind" fn(_));
         let dcache_dma = transmute::<_, GenericHook>(dcache_dma as extern "C-unwind" fn(_));
 
         let msr_changed = transmute::<_, GenericHook>(msr_changed as extern "C-unwind" fn(_));
+
+        let sr_changed = transmute::<_, GenericHook>(sr_changed as extern "C-unwind" fn(_));
+        let sdr1_changed = transmute::<_, GenericHook>(sdr1_changed as extern "C-unwind" fn(_));
 
         let ibat_changed = transmute::<_, GenericHook>(ibat_changed as extern "C-unwind" fn(_));
         let dbat_changed = transmute::<_, GenericHook>(dbat_changed as extern "C-unwind" fn(_));
@@ -594,10 +654,15 @@ const CTX_HOOKS: Hooks = {
             write_quantized,
 
             invalidate_icache,
+            tlbie,
+            tlbsync,
             clear_icache,
             dcache_dma,
 
             msr_changed,
+
+            sr_changed,
+            sdr1_changed,
 
             ibat_changed,
             dbat_changed,
@@ -753,6 +818,7 @@ impl Core {
             target_cycles,
             max_instructions,
             last_followed_link: None,
+            address_space_changed: false,
         };
 
         unsafe {
@@ -832,5 +898,47 @@ impl CpuCore for Core {
         sys.process_events();
 
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lazuli::gekko::disasm::{Extensions, Ins};
+
+    #[test]
+    fn clearing_address_space_mappings_unlinks_stale_exit_targets() {
+        let mut core = Core::new(Settings {
+            instr_per_block: 1,
+            codegen: ppcjit::CodegenSettings::default(),
+            cache_path: None,
+        });
+        let target = core
+            .compiler
+            .build([Ins::new(0x6000_0000, Extensions::gekko_broadway())].into_iter())
+            .unwrap();
+        let target_ptr = target.as_ptr();
+        let target_id = core.blocks.insert(false, Address(0x1000), target);
+        let mut source_exit = ExitData {
+            linked: Some(target_ptr),
+            linked_pattern: Pattern::Call,
+            linked_return: Some(target_ptr),
+        };
+        let target = &mut core.blocks.storage[target_id.0];
+        target.linked_from.push(&raw mut source_exit);
+        target.linked_return_from.push(&raw mut source_exit);
+
+        core.blocks.clear();
+
+        assert_eq!(source_exit.linked, None);
+        assert_eq!(source_exit.linked_pattern, Pattern::None);
+        assert_eq!(source_exit.linked_return, None);
+        assert!(core.blocks.get_mapping(false, Address(0x1000)).is_none());
+        assert!(core.blocks.storage[target_id.0].linked_from.is_empty());
+        assert!(
+            core.blocks.storage[target_id.0]
+                .linked_return_from
+                .is_empty()
+        );
     }
 }
