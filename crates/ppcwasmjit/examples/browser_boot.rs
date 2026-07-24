@@ -21,7 +21,7 @@ const LOCKED_CACHE_PTR: usize = MMIO_PTR + MMIO_SIZE;
 const LOCKED_CACHE_SIZE: usize = 16 * 1024;
 const GX_FIFO_STAGING_META_PTR: usize = LOCKED_CACHE_PTR + LOCKED_CACHE_SIZE;
 const GX_FIFO_STAGING_DATA_PTR: usize = GX_FIFO_STAGING_META_PTR + 16;
-const GX_FIFO_STAGING_CAPACITY: usize = 256 * 1024;
+const GX_FIFO_STAGING_CAPACITY: usize = 64 * 1024;
 const FASTMEM_PAGE_SHIFT: u32 = 17;
 const FASTMEM_LUT_COUNT: usize = 1 << 15;
 const DISC_BI2_OFFSET: u64 = 0x440;
@@ -1055,7 +1055,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     const cpFifoLowWordMask = 0xffe0;
     const cpFifoHighWordMask = 0x03ff;
     const piFifoEndMask = 0x07ffffe0;
+    const piFifoRedirectEnd = 0x04000000;
     const piFifoWrap = 0x20000000;
+    const gxWriteGatherBurstBytes = 32;
+    const commandProcessorServiceBudgetBytes = 256 * 1024;
     const diBreakRequest = 0x00000001;
     const diInterruptMasks = 0x0000002a;
     const diInterruptStatuses = 0x00000054;
@@ -3937,6 +3940,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       current: 0,
       wrap: false,
     };
+    const gxWriteGatherBuffer = new Uint8Array(gxWriteGatherBurstBytes);
+    let gxWriteGatherPendingBytes = 0;
     let lockedCacheReads = 0;
     let lockedCacheReadBytes = 0;
     let lockedCacheWrites = 0;
@@ -4051,6 +4056,27 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxFifoStagingStores = 0;
     let gxFifoStagingBytes = 0;
     let gxFifoStagingQuantizedStores = 0;
+    let gxWriteGatherBursts = 0;
+    let gxWriteGatherLinkedBursts = 0;
+    let gxWriteGatherUnlinkedBursts = 0;
+    let gxWriteGatherBytesCommitted = 0;
+    let gxWriteGatherWraps = 0;
+    let gxWriteGatherResets = 0;
+    let gxWriteGatherDiscardedBytes = 0;
+    let gxWriteGatherHighWaterBytes = 0;
+    let gxWriteGatherLastDestination = null;
+    let commandProcessorServiceCalls = 0;
+    let commandProcessorReadBursts = 0;
+    let commandProcessorReadBytes = 0;
+    let commandProcessorReadWraps = 0;
+    let commandProcessorBreakpointStops = 0;
+    let commandProcessorReadDisabledStops = 0;
+    let commandProcessorMaximumDistance = 0;
+    let commandProcessorMaximumRawDistance = 0;
+    let commandProcessorDistanceNormalizations = 0;
+    let commandProcessorLastDistanceNormalization = null;
+    let commandProcessorDecoderResets = 0;
+    let commandProcessorDecoderDiscardedBytes = 0;
     let peFinishCycle = null;
     let peFinishSignal = false;
     let peFinishInterruptDelivered = false;
@@ -6655,22 +6681,426 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function appendGxFifoBytes(source, stores, quantizedStores = 0) {
+    function appendGxCommandBytes(source) {
       gxPreflightDecodeAppend(source.length);
       for (let index = 0; index < source.length; index += 1) {
-        const byte = source[index];
-        gxDecodeBuffer.push(byte);
-        gxFifoHash = Math.imul(gxFifoHash ^ byte, 0x01000193) >>> 0;
-        if (gxFifoSample.length < 256) gxFifoSample.push(byte);
+        gxDecodeBuffer.push(source[index]);
       }
       gxDecodePreDecodeHighWaterBytes = Math.max(
         gxDecodePreDecodeHighWaterBytes,
         gxFifoBufferedBytes()
       );
+      decodeGxFifo();
+    }
+
+    function commandProcessorFifoSpanBytes() {
+      if (cpFifoState.end < cpFifoState.base) return 0;
+      return cpFifoState.end - cpFifoState.base + gxWriteGatherBurstBytes;
+    }
+
+    function normalizeCommandProcessorFifoDistance() {
+      const rawDistance = cpFifoState.distance;
+      const span = commandProcessorFifoSpanBytes();
+      if (
+        span === 0
+        || rawDistance <= span
+        || (span & (gxWriteGatherBurstBytes - 1)) !== 0
+        || (rawDistance & (gxWriteGatherBurstBytes - 1)) !== 0
+        || physicalRamPointer(cpFifoState.base, span) === null
+        || cpFifoState.writePointer < cpFifoState.base
+        || cpFifoState.writePointer > cpFifoState.end
+        || cpFifoState.readPointer < cpFifoState.base
+        || cpFifoState.readPointer > cpFifoState.end
+        || cpFifoState.writePointer >= cpFifoState.readPointer
+      ) {
+        return false;
+      }
+
+      // A signed GX FIFO-object write - read distance can reach CP as a large
+      // positive value because the register exposes only 26 distance bits.
+      // Recover the intended ring distance only when the raw register value
+      // proves that exact origin; every other oversized distance remains an
+      // invalid state.
+      const maskedPointerDelta = (
+        cpFifoState.writePointer - cpFifoState.readPointer
+      ) & cpFifoAddressMask;
+      if (rawDistance !== maskedPointerDelta) return false;
+
+      const normalizedDistance = span
+        - (cpFifoState.readPointer - cpFifoState.writePointer);
+      if (
+        normalizedDistance < 0
+        || normalizedDistance > span
+        || (normalizedDistance & (gxWriteGatherBurstBytes - 1)) !== 0
+      ) {
+        return false;
+      }
+
+      cpFifoState.distance = normalizedDistance >>> 0;
+      commandProcessorDistanceNormalizations += 1;
+      commandProcessorLastDistanceNormalization = {
+        rawDistance,
+        normalizedDistance,
+        base: cpFifoState.base,
+        end: cpFifoState.end,
+        writePointer: cpFifoState.writePointer,
+        readPointer: cpFifoState.readPointer,
+        control: cpFifoState.control,
+      };
+      return true;
+    }
+
+    function validatedCommandProcessorFifoSpan(pointer, role) {
+      const span = commandProcessorFifoSpanBytes();
+      if (
+        span === 0
+        || pointer < cpFifoState.base
+        || pointer > cpFifoState.end
+        || (cpFifoState.distance & (gxWriteGatherBurstBytes - 1)) !== 0
+        || cpFifoState.distance > span
+        || physicalRamPointer(cpFifoState.base, span) === null
+      ) {
+        throw new Error(
+          `invalid CP FIFO ${role} state: ${hex32(cpFifoState.base)}`
+            + `..${hex32(cpFifoState.end)} @ ${hex32(pointer)}`
+            + ` distance ${hex32(cpFifoState.distance)}`
+        );
+      }
+      return span;
+    }
+
+    function advanceCommandProcessorFifoPointer(pointer) {
+      return pointer === cpFifoState.end
+        ? cpFifoState.base
+        : (pointer + gxWriteGatherBurstBytes) & cpFifoAddressMask;
+    }
+
+    function commandProcessorDistanceToBreakpoint() {
+      const pointer = cpFifoState.readPointer;
+      const breakpoint = cpFifoState.breakpoint;
+      if (
+        breakpoint < cpFifoState.base
+        || breakpoint > cpFifoState.end
+        || pointer < cpFifoState.base
+        || pointer > cpFifoState.end
+      ) {
+        return null;
+      }
+      return breakpoint >= pointer
+        ? breakpoint - pointer
+        : cpFifoState.end - pointer + gxWriteGatherBurstBytes
+          + breakpoint - cpFifoState.base;
+    }
+
+    function serviceCommandProcessorFifo(
+      byteBudget = commandProcessorServiceBudgetBytes
+    ) {
+      commandProcessorServiceCalls += 1;
+      commandProcessorMaximumRawDistance = Math.max(
+        commandProcessorMaximumRawDistance,
+        cpFifoState.distance
+      );
+      if (cpFifoState.distance === 0) return 0;
+      if ((cpFifoState.control & cpControlReadEnable) === 0) {
+        commandProcessorReadDisabledStops += 1;
+        return 0;
+      }
+      normalizeCommandProcessorFifoDistance();
+      commandProcessorMaximumDistance = Math.max(
+        commandProcessorMaximumDistance,
+        cpFifoState.distance
+      );
+
+      validatedCommandProcessorFifoSpan(
+        cpFifoState.readPointer,
+        "read"
+      );
+
+      let remainingBudget = Math.max(
+        gxWriteGatherBurstBytes,
+        Math.floor(byteBudget / gxWriteGatherBurstBytes) * gxWriteGatherBurstBytes
+      );
+      let consumedBytes = 0;
+      while (cpFifoState.distance !== 0 && remainingBudget !== 0) {
+        if (commandProcessorBreakpointLevel()) {
+          commandProcessorBreakpointStops += 1;
+          break;
+        }
+
+        const bytesToEnd = cpFifoState.end - cpFifoState.readPointer
+          + gxWriteGatherBurstBytes;
+        let chunkBytes = Math.min(
+          cpFifoState.distance,
+          remainingBudget,
+          bytesToEnd
+        );
+        if ((cpFifoState.control & cpControlBreakpointEnable) !== 0) {
+          const bytesToBreakpoint = commandProcessorDistanceToBreakpoint();
+          if (bytesToBreakpoint !== null) {
+            if (bytesToBreakpoint === 0) {
+              commandProcessorBreakpointStops += 1;
+              break;
+            }
+            chunkBytes = Math.min(chunkBytes, bytesToBreakpoint);
+          }
+        }
+        chunkBytes = Math.floor(chunkBytes / gxWriteGatherBurstBytes)
+          * gxWriteGatherBurstBytes;
+        if (chunkBytes === 0) break;
+
+        const source = physicalRamPointer(cpFifoState.readPointer, chunkBytes);
+        if (source === null) {
+          throw new Error(
+            `CP FIFO read is outside main RAM: ${hex32(cpFifoState.readPointer)}`
+              + ` + ${chunkBytes}`
+          );
+        }
+        appendGxCommandBytes(bytes.subarray(source, source + chunkBytes));
+
+        if (chunkBytes === bytesToEnd) {
+          cpFifoState.readPointer = cpFifoState.base;
+          commandProcessorReadWraps += 1;
+        } else {
+          cpFifoState.readPointer = (
+            cpFifoState.readPointer + chunkBytes
+          ) & cpFifoAddressMask;
+        }
+        cpFifoState.distance = (cpFifoState.distance - chunkBytes) >>> 0;
+        commandProcessorReadBursts += chunkBytes / gxWriteGatherBurstBytes;
+        commandProcessorReadBytes += chunkBytes;
+        consumedBytes += chunkBytes;
+        remainingBudget -= chunkBytes;
+      }
+      return consumedBytes;
+    }
+
+    function validateProcessorInterfaceFifoWriteState(destination) {
+      const target = physicalRamPointer(destination, gxWriteGatherBurstBytes);
+      if (
+        target === null
+        || piFifoState.end < piFifoState.base
+        || destination < piFifoState.base
+        || destination > piFifoState.end
+        || (
+          piFifoState.end === piFifoRedirectEnd
+          && destination >= piFifoRedirectEnd
+        )
+        || (
+          piFifoState.end !== piFifoRedirectEnd
+          && physicalRamPointer(
+            piFifoState.base,
+            piFifoState.end - piFifoState.base + gxWriteGatherBurstBytes
+          ) === null
+        )
+      ) {
+        throw new Error(
+          `invalid PI FIFO write state: ${hex32(piFifoState.base)}`
+            + `..${hex32(piFifoState.end)} @ ${hex32(destination)}`
+        );
+      }
+      return target;
+    }
+
+    function validateGxWriteGatherBurstState() {
+      const destination = piFifoState.current;
+      const target = validateProcessorInterfaceFifoWriteState(destination);
+
+      const linked = (cpFifoState.control & cpControlLinkEnable) !== 0;
+      if (linked) {
+        const span = validatedCommandProcessorFifoSpan(
+          cpFifoState.writePointer,
+          "write"
+        );
+        if (cpFifoState.distance + gxWriteGatherBurstBytes > span) {
+          throw new Error(
+            `CP FIFO overflow: ${hex32(cpFifoState.distance)}`
+              + ` + ${gxWriteGatherBurstBytes} > ${hex32(span)}`
+          );
+        }
+        if ((cpFifoState.control & cpControlReadEnable) !== 0) {
+          validatedCommandProcessorFifoSpan(
+            cpFifoState.readPointer,
+            "read"
+          );
+        }
+      }
+
+      return { destination, linked, target };
+    }
+
+    function preflightGxWriteGatherAppend(sourceBytes) {
+      const burstCount = Math.floor(
+        (gxWriteGatherPendingBytes + sourceBytes) / gxWriteGatherBurstBytes
+      );
+      if (burstCount === 0) return { burstCount, linked: false };
+
+      const linked = (cpFifoState.control & cpControlLinkEnable) !== 0;
+      const readEnabled = (cpFifoState.control & cpControlReadEnable) !== 0;
+      const producedBytes = burstCount * gxWriteGatherBurstBytes;
+      validateProcessorInterfaceFifoWriteState(piFifoState.current);
+
+      if (
+        piFifoState.end === piFifoRedirectEnd
+        && !(linked && readEnabled)
+        && (
+          piFifoState.current + producedBytes > piFifoRedirectEnd
+          || physicalRamPointer(piFifoState.current, producedBytes) === null
+        )
+      ) {
+        throw new Error(
+          `PI FIFO redirect run is outside main RAM: ${hex32(piFifoState.current)}`
+            + ` + ${producedBytes}`
+        );
+      }
+
+      if (!linked) return { burstCount, linked };
+
+      let span = validatedCommandProcessorFifoSpan(
+        cpFifoState.writePointer,
+        "write"
+      );
+      if (readEnabled) {
+        validatedCommandProcessorFifoSpan(cpFifoState.readPointer, "read");
+        while (cpFifoState.distance + producedBytes > span) {
+          const consumedBytes = serviceCommandProcessorFifo();
+          if (consumedBytes === 0) break;
+          span = validatedCommandProcessorFifoSpan(
+            cpFifoState.writePointer,
+            "write"
+          );
+        }
+      }
+      if (cpFifoState.distance + producedBytes > span) {
+        throw new Error(
+          `CP FIFO append overflow: ${hex32(cpFifoState.distance)}`
+            + ` + ${hex32(producedBytes)} > ${hex32(span)}`
+        );
+      }
+      if (readEnabled) {
+        // Prove every later bounded reader append fits even if this complete
+        // run turns out to be one incomplete GX command.
+        gxPreflightDecodeAppend(cpFifoState.distance + producedBytes);
+      }
+      return { burstCount, linked };
+    }
+
+    function commitGxWriteGatherBurst(
+      state = validateGxWriteGatherBurstState()
+    ) {
+      const { destination, linked, target } = state;
+
+      bytes.set(gxWriteGatherBuffer, target);
+      const piRedirect = piFifoState.end === piFifoRedirectEnd;
+      const piWrapped = !piRedirect && piFifoState.current === piFifoState.end;
+      if (piWrapped) {
+        piFifoState.current = piFifoState.base;
+        piFifoState.wrap = true;
+        gxWriteGatherWraps += 1;
+      } else if (piRedirect) {
+        // The display-list redirect end is a one-past sentinel, not a ring
+        // address. Preserve it internally so the next burst fails closed
+        // instead of normalizing bit 26 into a write at physical address zero.
+        piFifoState.current += gxWriteGatherBurstBytes;
+      } else {
+        piFifoState.current = (
+          piFifoState.current + gxWriteGatherBurstBytes
+        ) & cpFifoAddressMask;
+      }
+
+      if (linked) {
+        cpFifoState.writePointer = advanceCommandProcessorFifoPointer(
+          cpFifoState.writePointer
+        );
+        cpFifoState.distance = (
+          cpFifoState.distance + gxWriteGatherBurstBytes
+        ) >>> 0;
+        commandProcessorMaximumDistance = Math.max(
+          commandProcessorMaximumDistance,
+          cpFifoState.distance
+        );
+        gxWriteGatherLinkedBursts += 1;
+
+        if ((cpFifoState.control & cpControlReadEnable) !== 0) {
+          piFifoState.base = cpFifoState.base;
+          piFifoState.end = cpFifoState.end;
+          piFifoState.current = cpFifoState.writePointer;
+        }
+      } else {
+        gxWriteGatherUnlinkedBursts += 1;
+      }
+      gxWriteGatherBursts += 1;
+      gxWriteGatherBytesCommitted += gxWriteGatherBurstBytes;
+      gxWriteGatherLastDestination = destination;
+      return linked;
+    }
+
+    function appendGxWriteGatherBytes(source) {
+      const appendState = preflightGxWriteGatherAppend(source.length);
+      let producedLinkedBurst = false;
+      let offset = 0;
+      while (offset < source.length) {
+        const pendingBeforeCopy = gxWriteGatherPendingBytes;
+        const copied = Math.min(
+          source.length - offset,
+          gxWriteGatherBurstBytes - pendingBeforeCopy
+        );
+        const state = pendingBeforeCopy + copied === gxWriteGatherBurstBytes
+          ? validateGxWriteGatherBurstState()
+          : null;
+        gxWriteGatherBuffer.set(
+          source.subarray(offset, offset + copied),
+          pendingBeforeCopy
+        );
+        gxWriteGatherPendingBytes += copied;
+        gxWriteGatherHighWaterBytes = Math.max(
+          gxWriteGatherHighWaterBytes,
+          gxWriteGatherPendingBytes
+        );
+        offset += copied;
+        if (gxWriteGatherPendingBytes !== gxWriteGatherBurstBytes) continue;
+
+        producedLinkedBurst = commitGxWriteGatherBurst(state)
+          || producedLinkedBurst;
+        gxWriteGatherPendingBytes = 0;
+      }
+      if (producedLinkedBurst !== appendState.linked) {
+        throw new Error("GX write-gather routing changed during one append");
+      }
+      return producedLinkedBurst;
+    }
+
+    function resetGxWriteGatherPipe() {
+      gxWriteGatherDiscardedBytes += gxWriteGatherPendingBytes;
+      gxWriteGatherPendingBytes = 0;
+      gxWriteGatherResets += 1;
+    }
+
+    function resetGxCommandProcessorDecoder() {
+      commandProcessorDecoderDiscardedBytes += gxDecodeBuffer.length;
+      gxDecodeBuffer.length = 0;
+      gxDecodeRetryAtBufferedBytes = 1;
+      commandProcessorDecoderResets += 1;
+    }
+
+    function appendGxFifoBytes(
+      source,
+      stores,
+      quantizedStores = 0,
+      serviceLinkedFifo = true
+    ) {
+      const producedLinkedBurst = appendGxWriteGatherBytes(source);
+      for (let index = 0; index < source.length; index += 1) {
+        const byte = source[index];
+        gxFifoHash = Math.imul(gxFifoHash ^ byte, 0x01000193) >>> 0;
+        if (gxFifoSample.length < 256) gxFifoSample.push(byte);
+      }
       gxFifoStores += stores;
       gxFifoBytes += source.length;
       gxFifoQuantizedStores += quantizedStores;
-      decodeGxFifo();
+      if (producedLinkedBurst && serviceLinkedFifo) {
+        serviceCommandProcessorFifo();
+      }
+      return producedLinkedBurst;
     }
 
     function appendGxFifo(size) {
@@ -6686,30 +7116,30 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (pendingBytes > gxFifoStagingCapacity) {
         throw new Error(`GX FIFO staging overflow: ${pendingBytes}`);
       }
-      // Preserve the staged record if the bounded decoder cannot accept this
-      // whole drain. appendGxFifoBytes repeats the preflight after ownership
-      // transfers so direct and staged callers share the same invariant.
-      gxPreflightDecodeAppend(pendingBytes);
       // This boundary intentionally includes appendGxFifoBytes and its nested
-      // FIFO decode; fifoDecode reports that nested component separately.
+      // FIFO decode; fifoDecode reports that nested component separately. Keep
+      // the staging record live until the hardware transport accepts it. An
+      // unlinked PI destination never enters or preflights the CP decoder.
       const stagingStartedAt = beginWorkerPhaseTiming(
         workerHostTimings.fifoStagingDrainInclusive
       );
       try {
         const stores = view.getUint32(gxFifoStagingMeta + 4, true);
         const quantizedStores = view.getUint32(gxFifoStagingMeta + 8, true);
+        const producedLinkedBurst = appendGxFifoBytes(
+          bytes.subarray(gxFifoStagingData, gxFifoStagingData + pendingBytes),
+          stores,
+          quantizedStores,
+          false
+        );
         view.setUint32(gxFifoStagingMeta, 0, true);
         view.setUint32(gxFifoStagingMeta + 4, 0, true);
         view.setUint32(gxFifoStagingMeta + 8, 0, true);
-        appendGxFifoBytes(
-          bytes.subarray(gxFifoStagingData, gxFifoStagingData + pendingBytes),
-          stores,
-          quantizedStores
-        );
         gxFifoStagingDrains += 1;
         gxFifoStagingStores += stores;
         gxFifoStagingBytes += pendingBytes;
         gxFifoStagingQuantizedStores += quantizedStores;
+        if (producedLinkedBurst) serviceCommandProcessorFifo();
       } finally {
         recordWorkerPhaseTiming(
           workerHostTimings.fifoStagingDrainInclusive,
@@ -6940,6 +7370,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (offset === 0x00 || offset === 0x04) return true;
       if (offset === 0x02) {
         cpFifoState.control = value & cpControlMask;
+        serviceCommandProcessorFifo();
         return true;
       }
       if (offset < 0x20 || (offset & 1) !== 0) return false;
@@ -6949,7 +7380,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       const next = (offset & 0x02) === 0
         ? (current & 0x03ff0000) | (value & cpFifoLowWordMask)
         : (current & 0x0000ffff) | ((value & cpFifoHighWordMask) << 16);
-      return writeCommandProcessorPairValue(lowOffset, next);
+      const written = writeCommandProcessorPairValue(lowOffset, next);
+      if (
+        written
+        && (offset & 0x02) !== 0
+        && [0x30, 0x38, 0x3c].includes(lowOffset)
+      ) {
+        serviceCommandProcessorFifo();
+      }
+      return written;
     }
 
     function readProcessorInterfaceFifoRegister(physical, size) {
@@ -6979,7 +7418,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           piFifoState.wrap = (written & piFifoWrap) !== 0;
           return true;
         case 0x0c003018:
-          if ((written & 1) !== 0) resetCommandProcessorFifoFromPi();
+          if ((written & 1) !== 0) {
+            resetGxWriteGatherPipe();
+            resetGxCommandProcessorDecoder();
+            resetCommandProcessorFifoFromPi();
+          }
           return true;
         default: return false;
       }
@@ -8844,6 +9287,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function serviceMmio(observedCycles) {
+      if (
+        cpFifoState.distance !== 0
+        && (cpFifoState.control & cpControlReadEnable) !== 0
+      ) {
+        serviceCommandProcessorFifo();
+      }
       ensureViSchedule(observedCycles);
       for (const offset of [0x680c, 0x6820, 0x6834]) {
         const control = view.getUint32(mmio + offset, false);
@@ -9988,6 +10437,51 @@ const TEMPLATE: &str = r##"<!doctype html>
             bytes: gxFifoStagingBytes,
             emergencyDrains: view.getUint32(gxFifoStagingMeta + 12, true),
             pendingBytes: view.getUint32(gxFifoStagingMeta, true),
+          },
+          writeGather: {
+            pendingBytes: gxWriteGatherPendingBytes,
+            highWaterBytes: gxWriteGatherHighWaterBytes,
+            bursts: gxWriteGatherBursts,
+            linkedBursts: gxWriteGatherLinkedBursts,
+            unlinkedBursts: gxWriteGatherUnlinkedBursts,
+            bytesCommitted: gxWriteGatherBytesCommitted,
+            wraps: gxWriteGatherWraps,
+            resets: gxWriteGatherResets,
+            discardedBytes: gxWriteGatherDiscardedBytes,
+            lastDestination: gxWriteGatherLastDestination === null
+              ? null
+              : hex32(gxWriteGatherLastDestination),
+          },
+          commandProcessor: {
+            serviceCalls: commandProcessorServiceCalls,
+            readBursts: commandProcessorReadBursts,
+            readBytes: commandProcessorReadBytes,
+            readWraps: commandProcessorReadWraps,
+            breakpointStops: commandProcessorBreakpointStops,
+            readDisabledStops: commandProcessorReadDisabledStops,
+            maximumDistance: commandProcessorMaximumDistance,
+            maximumRawDistance: commandProcessorMaximumRawDistance,
+            distanceNormalizations: commandProcessorDistanceNormalizations,
+            lastDistanceNormalization: commandProcessorLastDistanceNormalization === null
+              ? null
+              : {
+                  raw: hex32(commandProcessorLastDistanceNormalization.rawDistance),
+                  normalized: hex32(
+                    commandProcessorLastDistanceNormalization.normalizedDistance
+                  ),
+                  base: hex32(commandProcessorLastDistanceNormalization.base),
+                  end: hex32(commandProcessorLastDistanceNormalization.end),
+                  writePointer: hex32(
+                    commandProcessorLastDistanceNormalization.writePointer
+                  ),
+                  readPointer: hex32(
+                    commandProcessorLastDistanceNormalization.readPointer
+                  ),
+                  control: "0x" + commandProcessorLastDistanceNormalization.control
+                    .toString(16).padStart(4, "0"),
+                },
+            decoderResets: commandProcessorDecoderResets,
+            decoderDiscardedBytes: commandProcessorDecoderDiscardedBytes,
           },
           decoder: {
             commands: gxDecodedCommands,

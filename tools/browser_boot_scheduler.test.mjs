@@ -156,3 +156,10 @@ test("browser execution defaults to an unthrottled cooperative yield", () => {
   assert.match(source, /get\("restMs"\) \?\? "0"/);
   assert.doesNotMatch(source, /setTimeout\(resolve, rest\)/);
 });
+
+test("browser runner services a queued CP FIFO only when work is pending", () => {
+  assert.match(
+    source,
+    /cpFifoState\.distance !== 0[\s\S]*serviceCommandProcessorFifo\(\);[\s\S]*ensureViSchedule/,
+  );
+});

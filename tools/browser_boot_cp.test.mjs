@@ -90,6 +90,9 @@ function makeContext() {
     piFifoEndMask: 0x07ffffe0,
     piFifoState: {},
     piFifoWrap: 0x20000000,
+    resetGxCommandProcessorDecoder() {},
+    resetGxWriteGatherPipe() {},
+    serviceCommandProcessorFifo() { return 0; },
     translateDataRange: address => (
       address >= 0xc0000000 ? (address - 0xc0000000) >>> 0 : address >>> 0
     ),
@@ -204,7 +207,7 @@ test("CP and PI FIFO registers cold-initialize to zero", () => {
   assert.equal(context.piFifoState.wrap, false);
 });
 
-test("PI FIFO reset is write-only and resets only CP control and watermarks", () => {
+test("PI FIFO reset is write-only and preserves programmed FIFO registers", () => {
   const context = makeContext();
   Object.assign(context.cpFifoState, {
     control: 0x003f,
