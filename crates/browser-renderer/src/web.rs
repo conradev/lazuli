@@ -22,19 +22,19 @@ use crate::tev::{
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
-    GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDepthCompareLocation,
-    GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding, GxEfbFormat, GxFogState,
-    GxXfbCopyParameters, GxZTextureFormat, GxZTextureOperation, GxZTextureState,
-    RendererFailureState, RendererHostTimings, RendererMetrics, RendererPhaseTiming,
-    SamplerIdentity, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
-    TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor, ViFieldPairOutcome,
-    ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField, ViPresentationMode,
-    XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
+    GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
+    GxDepthCompareLocation, GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding,
+    GxEfbFormat, GxFogState, GxRasterCenterEvidence, GxXfbCopyParameters, GxZTextureFormat,
+    GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
+    RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
+    SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor,
+    ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField,
+    ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
     compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
     gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state, gx_early_depth_plan,
-    gx_efb_depth_encoding, gx_fog_state, gx_sampler_identity, gx_xfb_copy_parameters,
-    gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
+    gx_efb_depth_encoding, gx_fog_state, gx_raster_center_evidence, gx_sampler_identity,
+    gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
     requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
     rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
     xfb_scanout_plan, xfb_surface_extent_matches,
@@ -2110,6 +2110,7 @@ impl WebGpuRenderer {
             7 => Primitive::Points,
             _ => Primitive::Triangles,
         };
+        let raster_position_correction = browser_raster_position_correction(pixel_control);
         let depth_encoding = draw_depth_encoding(z_mode, pixel_control)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
@@ -2130,7 +2131,12 @@ impl WebGpuRenderer {
                 return Ok(());
             };
             drop(resource_preparation_timer);
-            return self.push_expanded_draw(source_vertices, &expanded, state);
+            return self.push_expanded_draw(
+                source_vertices,
+                &expanded,
+                raster_position_correction,
+                state,
+            );
         }
 
         let required_maps =
@@ -2347,35 +2353,28 @@ impl WebGpuRenderer {
             binding,
         };
         drop(resource_preparation_timer);
-        self.push_expanded_draw(source_vertices, &expanded, state)
+        self.push_expanded_draw(
+            source_vertices,
+            &expanded,
+            raster_position_correction,
+            state,
+        )
     }
 
     fn push_expanded_draw(
         &mut self,
         source_vertices: &[f32],
         expanded: &[usize],
+        raster_position_correction: f32,
         state: DrawCommandState,
     ) -> Result<(), JsValue> {
         let start = self.tev_vertices.len() as u32;
         for index in expanded {
-            let offset = *index * TEV_VERTEX_FLOATS;
-            self.tev_vertices.push(TevVertex {
-                position: source_vertices[offset..offset + 4]
-                    .try_into()
-                    .expect("validated TEV position"),
-                raster0: source_vertices[offset + 4..offset + 8]
-                    .try_into()
-                    .expect("validated TEV raster channel zero"),
-                raster1: source_vertices[offset + 8..offset + 12]
-                    .try_into()
-                    .expect("validated TEV raster channel one"),
-                tex_coords: std::array::from_fn(|coord| {
-                    let start = offset + 12 + coord * 3;
-                    source_vertices[start..start + 3]
-                        .try_into()
-                        .expect("validated TEV texture coordinate")
-                }),
-            });
+            self.tev_vertices.push(tev_vertex_from_source(
+                source_vertices,
+                *index,
+                raster_position_correction,
+            ));
         }
         let end = self.tev_vertices.len() as u32;
         let vertices = start..end;
@@ -3786,6 +3785,50 @@ fn draw_depth_encoding(
     gx_efb_depth_encoding(pixel_control)
 }
 
+fn browser_raster_position_correction(pixel_control: u32) -> f32 {
+    match gx_raster_center_evidence(pixel_control) {
+        GxRasterCenterEvidence::KnownNonAntialiased => GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
+        GxRasterCenterEvidence::AmbiguousRgb565Z16 => {
+            // LZGX v3 does not transport BP0's AA enable or BP1..4's sample
+            // pattern. Preserve the already-deployed strict-WebGPU Z16 path
+            // unshifted until the later LZGX v4 managed three-sample-AA layer
+            // can reproduce those samples exactly. This is not a backend or
+            // rendering fallback.
+            0.0
+        }
+    }
+}
+
+fn tev_vertex_from_source(
+    source_vertices: &[f32],
+    index: usize,
+    raster_position_correction: f32,
+) -> TevVertex {
+    let offset = index * TEV_VERTEX_FLOATS;
+    let mut position: [f32; 4] = source_vertices[offset..offset + 4]
+        .try_into()
+        .expect("validated TEV position");
+    if raster_position_correction != 0.0 {
+        position[0] += raster_position_correction;
+        position[1] += raster_position_correction;
+    }
+    TevVertex {
+        position,
+        raster0: source_vertices[offset + 4..offset + 8]
+            .try_into()
+            .expect("validated TEV raster channel zero"),
+        raster1: source_vertices[offset + 8..offset + 12]
+            .try_into()
+            .expect("validated TEV raster channel one"),
+        tex_coords: std::array::from_fn(|coord| {
+            let start = offset + 12 + coord * 3;
+            source_vertices[start..start + 3]
+                .try_into()
+                .expect("validated TEV texture coordinate")
+        }),
+    }
+}
+
 fn primitive_cull_mode(primitive: Primitive, cull_mode: u8) -> CullMode {
     if primitive != Primitive::Triangles {
         return CullMode::None;
@@ -4598,12 +4641,13 @@ mod tests {
     use super::{
         BlendComponentState, CopyClearUniform, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
-        DepthCommitPipelineKey, DrawUniform, PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES,
-        ScissorRect, TevBindingKey, alpha_blend_factor, blend_write_mask, color_blend_factor,
-        depth_only_command_state, draw_depth_encoding, expanded_indices, expanded_primitive_ranges,
-        merge_contiguous_draw_range,
+        DepthCommitPipelineKey, DrawUniform, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
+        PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES, ScissorRect, TevBindingKey,
+        alpha_blend_factor, blend_write_mask, browser_raster_position_correction,
+        color_blend_factor, depth_only_command_state, draw_depth_encoding, expanded_indices,
+        expanded_primitive_ranges, merge_contiguous_draw_range, tev_vertex_from_source,
     };
-    use crate::tev::MAX_TEV_TEXTURES;
+    use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS};
     use crate::{
         GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState,
         SamplerIdentity, TextureAddressMode, TextureBindingIdentity, gx_destination_alpha_state,
@@ -4655,6 +4699,80 @@ mod tests {
         assert_eq!(expanded_indices(3, 4).unwrap(), [0, 1, 2, 1, 3, 2]);
         assert_eq!(expanded_indices(4, 4).unwrap(), [0, 1, 2, 0, 2, 3]);
         assert_eq!(expanded_indices(6, 3).unwrap(), [0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn browser_raster_correction_is_exact_for_known_non_aa_and_preserves_ambiguous_z16() {
+        assert_eq!(
+            browser_raster_position_correction(0),
+            GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB
+        );
+        assert_eq!(
+            browser_raster_position_correction(1 | (3 << 3) | (1 << 6)),
+            GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
+            "RGBA6 and unrelated depth state remain single-sample",
+        );
+        for compression in 0..8 {
+            assert_eq!(
+                browser_raster_position_correction(2 | (compression << 3)),
+                0.0,
+                "RGB565_Z16 compression {compression} must retain the deployed unshifted path",
+            );
+        }
+    }
+
+    #[test]
+    fn corrected_vertex_upload_preserves_quad_split_order_and_every_non_xy_component() {
+        let mut source = vec![0.0; TEV_VERTEX_FLOATS * 4];
+        for index in 0..4 {
+            let offset = index * TEV_VERTEX_FLOATS;
+            source[offset] = index as f32 * 10.0 + 0.25;
+            source[offset + 1] = index as f32 * -7.0 - 0.5;
+            source[offset + 2] = f32::from_bits(0x4b00_0100 + index as u32);
+            source[offset + 3] = f32::from_bits(0x3f80_0000 + index as u32);
+            for component in 4..TEV_VERTEX_FLOATS {
+                source[offset + component] = (index * 100 + component) as f32;
+            }
+        }
+
+        let correction = browser_raster_position_correction(0);
+        let expanded = expanded_indices(0, 4).unwrap();
+        let uploaded = expanded
+            .iter()
+            .map(|index| tev_vertex_from_source(&source, *index, correction))
+            .collect::<Vec<_>>();
+        assert_eq!(expanded, [0, 1, 2, 0, 2, 3]);
+        for (uploaded, index) in uploaded.iter().zip(expanded) {
+            let offset = index * TEV_VERTEX_FLOATS;
+            assert_eq!(uploaded.position[0], source[offset] + correction);
+            assert_eq!(uploaded.position[1], source[offset + 1] + correction);
+            assert_eq!(uploaded.position[2].to_bits(), source[offset + 2].to_bits());
+            assert_eq!(uploaded.position[3].to_bits(), source[offset + 3].to_bits());
+            assert_eq!(
+                uploaded.raster0,
+                source[offset + 4..offset + 8],
+                "raster channel zero changed for source vertex {index}",
+            );
+            assert_eq!(
+                uploaded.raster1,
+                source[offset + 8..offset + 12],
+                "raster channel one changed for source vertex {index}",
+            );
+            for coordinate in 0..MAX_TEV_TEXTURES {
+                let start = offset + 12 + coordinate * 3;
+                assert_eq!(
+                    uploaded.tex_coords[coordinate],
+                    source[start..start + 3],
+                    "texture coordinate {coordinate} changed for source vertex {index}",
+                );
+            }
+        }
+
+        source[0] = -0.0;
+        source[1] = f32::from_bits(0x7fc0_0000);
+        let unshifted = tev_vertex_from_source(&source, 0, browser_raster_position_correction(2));
+        assert_eq!(unshifted.position[0].to_bits(), source[0].to_bits());
+        assert_eq!(unshifted.position[1].to_bits(), source[1].to_bits());
     }
 
     #[test]
