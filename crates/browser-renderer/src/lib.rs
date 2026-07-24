@@ -890,6 +890,258 @@ pub(crate) fn gx_z_texture_reference(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxFogType {
+    Disabled,
+    Linear,
+    Exponential,
+    ExponentialSquared,
+    BackwardExponential,
+    BackwardExponentialSquared,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxFogProjection {
+    Perspective,
+    Orthographic,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct GxFogState {
+    pub(crate) range_base: u32,
+    pub(crate) range_coefficients: [u32; 5],
+    pub(crate) parameters: [u32; 5],
+}
+
+#[cfg(any(test, not(target_arch = "wasm32")))]
+impl GxFogState {
+    pub(crate) const fn fog_type(self) -> GxFogType {
+        match (self.parameters[3] >> 21) & 7 {
+            0 => GxFogType::Disabled,
+            2 => GxFogType::Linear,
+            4 => GxFogType::Exponential,
+            5 => GxFogType::ExponentialSquared,
+            6 => GxFogType::BackwardExponential,
+            7 => GxFogType::BackwardExponentialSquared,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) const fn projection(self) -> GxFogProjection {
+        if self.parameters[3] & (1 << 20) == 0 {
+            GxFogProjection::Perspective
+        } else {
+            GxFogProjection::Orthographic
+        }
+    }
+
+    pub(crate) const fn range_adjustment_enabled(self) -> bool {
+        self.range_base & (1 << 10) != 0
+    }
+
+    pub(crate) const fn range_center(self) -> i32 {
+        (self.range_base & 0x3ff) as i32 - 342
+    }
+
+    pub(crate) const fn color(self) -> [u8; 3] {
+        let word = self.parameters[4];
+        [
+            ((word >> 16) & 0xff) as u8,
+            ((word >> 8) & 0xff) as u8,
+            (word & 0xff) as u8,
+        ]
+    }
+
+    pub(crate) fn range_coefficient(self, index: usize) -> f32 {
+        debug_assert!(index < 10);
+        let word = self.range_coefficients[index / 2];
+        let raw = if index & 1 == 0 {
+            word & 0xfff
+        } else {
+            (word >> 12) & 0xfff
+        };
+        raw as f32 / 256.0
+    }
+
+    fn range_adjustment(self, position_x: f32) -> f32 {
+        if !self.range_adjustment_enabled() {
+            return 1.0;
+        }
+        // GX_InitFogAdjTable stores the already-computed range multiplier at
+        // 32-pixel intervals. Hardware implicitly uses 1.0 at the programmed
+        // center, interpolates r0..r9 moving away from it, and mirrors the
+        // lookup about that center. Projection and viewport scale are already
+        // baked into the table; the captured XF viewport width is therefore
+        // intentionally absent from this canonical draw state.
+        let sample = ((position_x - self.range_center() as f32).abs() / 32.0).clamp(0.0, 10.0);
+        if sample == 0.0 {
+            return 1.0;
+        }
+        if sample >= 10.0 {
+            return self.range_coefficient(9);
+        }
+        let interval = sample.floor() as usize;
+        let fraction = sample - interval as f32;
+        let lower = if interval == 0 {
+            1.0
+        } else {
+            self.range_coefficient(interval - 1)
+        };
+        let upper = self.range_coefficient(interval);
+        lower + (upper - lower) * fraction
+    }
+
+    fn float_parameter(word: u32) -> f32 {
+        let bits =
+            ((word & (1 << 19)) << 12) | (((word >> 11) & 0xff) << 23) | ((word & 0x7ff) << 12);
+        f32::from_bits(bits)
+    }
+
+    fn a_and_c(self) -> (f32, f32) {
+        let a_word = self.parameters[0];
+        let c_word = self.parameters[3];
+        if ((a_word >> 11) & 0xff) == 0xff && ((c_word >> 11) & 0xff) == 0xff {
+            let c = if a_word & (1 << 19) == 0 && c_word & (1 << 19) == 0 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            };
+            (0.0, c)
+        } else {
+            (Self::float_parameter(a_word), Self::float_parameter(c_word))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxFogDecodeError {
+    ReservedType(u8),
+}
+
+impl fmt::Display for GxFogDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservedType(value) => write!(formatter, "reserved GX fog type {value}"),
+        }
+    }
+}
+
+impl std::error::Error for GxFogDecodeError {}
+
+pub(crate) fn gx_fog_state(
+    range_base: u32,
+    range_coefficients: [u32; 5],
+    parameters: [u32; 5],
+    _viewport_half_width_bits: u32,
+) -> Result<GxFogState, GxFogDecodeError> {
+    let fog_type = match (parameters[3] >> 21) & 7 {
+        0 => return Ok(GxFogState::default()),
+        2 => GxFogType::Linear,
+        4 => GxFogType::Exponential,
+        5 => GxFogType::ExponentialSquared,
+        6 => GxFogType::BackwardExponential,
+        7 => GxFogType::BackwardExponentialSquared,
+        value => return Err(GxFogDecodeError::ReservedType(value as u8)),
+    };
+    let projection = if parameters[3] & (1 << 20) == 0 {
+        GxFogProjection::Perspective
+    } else {
+        GxFogProjection::Orthographic
+    };
+    let range_enabled = range_base & (1 << 10) != 0;
+
+    let mut canonical_parameters = [
+        parameters[0] & 0x000f_ffff,
+        parameters[1] & 0x00ff_ffff,
+        parameters[2] & 0x1f,
+        parameters[3] & 0x00ff_ffff,
+        parameters[4] & 0x00ff_ffff,
+    ];
+    if projection == GxFogProjection::Orthographic {
+        canonical_parameters[1] = 0;
+        canonical_parameters[2] = 0;
+    }
+    debug_assert_ne!(fog_type, GxFogType::Disabled);
+
+    Ok(GxFogState {
+        range_base: if range_enabled { range_base & 0x7ff } else { 0 },
+        range_coefficients: if range_enabled {
+            range_coefficients.map(|word| word & 0x00ff_ffff)
+        } else {
+            [0; 5]
+        },
+        parameters: canonical_parameters,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub(crate) struct GxFogReference {
+    pub(crate) eye_depth: f32,
+    pub(crate) factor: f32,
+    pub(crate) factor256: u32,
+    pub(crate) rgba8: [u8; 4],
+}
+
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub(crate) fn gx_fog_reference(
+    state: GxFogState,
+    position_x: f32,
+    depth: u32,
+    rgba8: [u8; 4],
+) -> GxFogReference {
+    if state.fog_type() == GxFogType::Disabled {
+        return GxFogReference {
+            eye_depth: 0.0,
+            factor: 0.0,
+            factor256: 0,
+            rgba8,
+        };
+    }
+
+    let depth = depth & GX_DEPTH24_MAX;
+    let (a, c) = state.a_and_c();
+    let mut eye_depth = match state.projection() {
+        GxFogProjection::Perspective => {
+            let shifted = depth >> state.parameters[2];
+            let denominator = state.parameters[1] as i32 - shifted as i32;
+            (a * 16_777_216.0) / denominator as f32
+        }
+        GxFogProjection::Orthographic => a * (depth as f32 / 16_777_216.0),
+    };
+
+    if state.range_adjustment_enabled() {
+        eye_depth *= state.range_adjustment(position_x);
+    }
+
+    let mut factor = (eye_depth - c).clamp(0.0, 1.0);
+    factor = match state.fog_type() {
+        GxFogType::Disabled | GxFogType::Linear => factor,
+        GxFogType::Exponential => 1.0 - (-8.0 * factor).exp2(),
+        GxFogType::ExponentialSquared => 1.0 - (-8.0 * factor * factor).exp2(),
+        GxFogType::BackwardExponential => (-8.0 * (1.0 - factor)).exp2(),
+        GxFogType::BackwardExponentialSquared => {
+            let backward = 1.0 - factor;
+            (-8.0 * backward * backward).exp2()
+        }
+    };
+    let factor256 = ((factor * 256.0 + 0.5).floor() as u32).min(256);
+    let inverse = 256 - factor256;
+    let fog_color = state.color();
+    let mut output = rgba8;
+    for channel in 0..3 {
+        output[channel] = ((u32::from(rgba8[channel]) * inverse
+            + u32::from(fog_color[channel]) * factor256)
+            >> 8) as u8;
+    }
+    GxFogReference {
+        eye_depth,
+        factor,
+        factor256,
+        rgba8: output,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GxBlendFactor {
     Zero,
@@ -1708,16 +1960,17 @@ mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH24_MAX, GxBlendFactor,
         GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxEfbFormat,
-        GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
-        RendererMetrics, RendererPhaseTiming, SelectedTexture, SurfacePixelOrder,
-        SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome,
-        ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode,
-        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
-        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
-        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
-        gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
-        gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_to_float,
-        gx_destination_alpha_state, gx_efb_format, gx_float_to_depth24, gx_sampler_identity,
+        GxFogDecodeError, GxFogProjection, GxFogState, GxFogType, GxZTextureDecodeError,
+        GxZTextureFormat, GxZTextureOperation, RendererFailureState, RendererMetrics,
+        RendererPhaseTiming, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
+        TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
+        ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode, XfbCopyMetadata,
+        alpha_compare, alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
+        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
+        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_blend_factor_for_component,
+        gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_copy_filter_coefficients,
+        gx_copy_filter_taps, gx_depth24_to_float, gx_destination_alpha_state, gx_efb_format,
+        gx_float_to_depth24, gx_fog_reference, gx_fog_state, gx_sampler_identity,
         gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
         materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
@@ -1729,6 +1982,11 @@ mod tests {
 
     const BASE: u32 = 0x0120_0000;
     const STRIDE: u32 = 0x500;
+
+    fn fog_float_word(value: f32) -> u32 {
+        let bits = value.to_bits();
+        ((bits >> 31) << 19) | (((bits >> 23) & 0xff) << 11) | ((bits >> 12) & 0x7ff)
+    }
 
     fn copy(destination: u32, generation: u32) -> XfbCopyMetadata {
         XfbCopyMetadata {
@@ -3276,6 +3534,207 @@ mod tests {
         assert_ne!(late_result.operation_depth, late_result.source_depth);
         assert_eq!(late_result.zbuffer_depth, late_result.operation_depth);
         assert_eq!(early_result.zbuffer_depth, early_result.source_depth);
+    }
+
+    #[test]
+    fn gx_fog_decodes_raw_state_and_canonicalizes_every_unobservable_word() {
+        let range_word = (0x120 << 12) | 0x100;
+        let parameters = [
+            fog_float_word(1.0),
+            0x12_3456,
+            31,
+            fog_float_word(0.25) | (1 << 20) | (2 << 21),
+            0x11_2233,
+        ];
+        let state = gx_fog_state(
+            (1 << 10) | 400,
+            [range_word; 5],
+            parameters,
+            320.0f32.to_bits(),
+        )
+        .unwrap();
+        assert_eq!(state.fog_type(), GxFogType::Linear);
+        assert_eq!(state.projection(), GxFogProjection::Orthographic);
+        assert_eq!(state.range_center(), 58);
+        assert_eq!(state.range_coefficient(0), 1.0);
+        assert_eq!(state.range_coefficient(1), 1.125);
+        assert_eq!(state.parameters[1], 0);
+        assert_eq!(state.parameters[2], 0);
+        assert_eq!(state.color(), [0x11, 0x22, 0x33]);
+
+        assert_eq!(
+            gx_fog_state(
+                1 << 10,
+                [0x00ff_ffff; 5],
+                [0x00ff_ffff, 0x00ff_ffff, 0x00ff_ffff, 0, 0x00ff_ffff],
+                f32::NAN.to_bits(),
+            )
+            .unwrap(),
+            GxFogState::default(),
+        );
+        assert_eq!(
+            gx_fog_state(0, [0; 5], [0, 0, 0, 1 << 21, 0], 0),
+            Err(GxFogDecodeError::ReservedType(1)),
+        );
+        let masked_shift = gx_fog_state(
+            0,
+            [0; 5],
+            [fog_float_word(1.0), 0x80_0000, 0x00ff_ffff, 2 << 21, 0],
+            f32::NAN.to_bits(),
+        )
+        .unwrap();
+        assert_eq!(masked_shift.parameters[2], 31);
+    }
+
+    #[test]
+    fn gx_fog_linear_orthographic_mix_uses_post_texture_depth_and_preserves_alpha() {
+        let state = gx_fog_state(
+            0,
+            [0; 5],
+            [
+                fog_float_word(1.0),
+                0,
+                0,
+                fog_float_word(0.0) | (1 << 20) | (2 << 21),
+                0x00_64c8,
+            ],
+            0,
+        )
+        .unwrap();
+        let result = gx_fog_reference(state, 0.0, 0x80_0000, [200, 100, 0, 77]);
+        assert!((result.eye_depth - 0.5).abs() < 0.000_001);
+        assert_eq!(result.factor256, 128);
+        assert_eq!(result.rgba8, [100, 100, 100, 77]);
+
+        let half_step = gx_fog_reference(state, 0.0, 0x00_8000, [255, 0, 0, 77]);
+        assert_eq!(half_step.factor256, 1);
+        assert_eq!(half_step.rgba8, [254, 0, 0, 77]);
+    }
+
+    #[test]
+    fn gx_fog_perspective_denominator_is_signed_at_and_beyond_b_magnitude() {
+        let state = gx_fog_state(
+            0,
+            [0; 5],
+            [fog_float_word(0.25), 0x80_0000, 0, 2 << 21, 0],
+            0,
+        )
+        .unwrap();
+        assert_eq!(gx_fog_reference(state, 0.0, 0, [0; 4]).factor256, 128);
+        assert_eq!(
+            gx_fog_reference(state, 0.0, 0x40_0000, [0; 4]).factor256,
+            256
+        );
+        assert_eq!(
+            gx_fog_reference(state, 0.0, 0x80_0000, [0; 4]).factor256,
+            256
+        );
+        assert_eq!(gx_fog_reference(state, 0.0, 0x90_0000, [0; 4]).factor256, 0);
+    }
+
+    #[test]
+    fn gx_fog_exponential_functions_match_the_fixed_eight_bit_blend_factors() {
+        let types = [(4, 192), (5, 75), (6, 4), (7, 11)];
+        for (fog_type, expected) in types {
+            let state = gx_fog_state(
+                0,
+                [0; 5],
+                [
+                    fog_float_word(1.0),
+                    0,
+                    0,
+                    fog_float_word(0.0) | (1 << 20) | (fog_type << 21),
+                    0,
+                ],
+                0,
+            )
+            .unwrap();
+            let result = gx_fog_reference(state, 0.0, 0x40_0000, [255; 4]);
+            assert_eq!(result.factor256, expected, "fog type {fog_type}");
+        }
+    }
+
+    #[test]
+    fn gx_fog_range_table_adjusts_horizontal_distance_and_nan_pairs_follow_hardware_signs() {
+        let identity_word = (0x100 << 12) | 0x100;
+        let state = gx_fog_state(
+            (1 << 10) | 342,
+            [
+                0x120_100,
+                identity_word,
+                identity_word,
+                identity_word,
+                identity_word,
+            ],
+            [
+                fog_float_word(1.0),
+                0,
+                0,
+                fog_float_word(0.0) | (1 << 20) | (2 << 21),
+                0,
+            ],
+            f32::NAN.to_bits(),
+        )
+        .unwrap();
+        let center = gx_fog_reference(state, 0.0, 0x40_0000, [255; 4]);
+        let first_sample = gx_fog_reference(state, 32.0, 0x40_0000, [255; 4]);
+        let midpoint = gx_fog_reference(state, 48.0, 0x40_0000, [255; 4]);
+        let second_sample = gx_fog_reference(state, 64.0, 0x40_0000, [255; 4]);
+        assert_eq!(center.factor256, 64);
+        assert_eq!(first_sample.factor256, 64);
+        assert_eq!(midpoint.factor256, 68);
+        assert_eq!(second_sample.factor256, 72);
+
+        let identity = gx_fog_state(
+            (1 << 10) | 342,
+            [identity_word; 5],
+            [
+                fog_float_word(1.0),
+                0,
+                0,
+                fog_float_word(0.0) | (1 << 20) | (2 << 21),
+                0,
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            gx_fog_reference(identity, 319.5, 0x40_0000, [255; 4]).factor256,
+            64
+        );
+
+        let infinity_word = 0xff << 11;
+        let fully_fogged = gx_fog_state(
+            0,
+            [0; 5],
+            [
+                infinity_word,
+                0,
+                0,
+                infinity_word | (1 << 20) | (2 << 21),
+                0,
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            gx_fog_reference(fully_fogged, 0.0, 0, [255; 4]).factor256,
+            256
+        );
+        let unfogged = gx_fog_state(
+            0,
+            [0; 5],
+            [
+                infinity_word | (1 << 19),
+                0,
+                0,
+                infinity_word | (1 << 20) | (2 << 21),
+                0,
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(gx_fog_reference(unfogged, 0.0, 0, [255; 4]).factor256, 0);
     }
 
     #[test]
