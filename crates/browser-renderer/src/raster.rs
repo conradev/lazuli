@@ -308,6 +308,14 @@ pub(crate) fn gx_raster_channel_u8(value: f32) -> u8 {
     value as u8
 }
 
+/// Recovers one transported normalized raster endpoint into GX's canonical
+/// byte domain. The producer ABI is f32 `u8 / 255`; multiplying first and then
+/// applying the raster clamp/truncate rule round-trips every canonical byte
+/// without introducing a second rounding convention.
+pub(crate) fn gx_normalized_raster_channel_u8(value: f32) -> u8 {
+    gx_raster_channel_u8(value * 255.0)
+}
+
 /// Evaluates four screen-linear channels expressed in GX byte units, then
 /// clamps and truncates each result to the EFB's unsigned eight-bit domain.
 pub(crate) fn gx_non_aa_raster_color_rgba8(
@@ -569,6 +577,50 @@ impl GxRasterTriangle28_4 {
 
     pub(crate) fn covers_pixel(self, x: u32, y: u32) -> bool {
         self.bounds.contains(x, y) && self.edges.into_iter().all(|edge| edge.covers_pixel(x, y))
+    }
+
+    /// Returns whether any exact 7/12 sample inside the clipped bounds is covered.
+    ///
+    /// A nonempty conservative bounding box is not sufficient for very thin
+    /// triangles. Solve each edge inequality as an integer x interval per row
+    /// so exact-empty qualification stays bounded by the EFB height rather
+    /// than scanning every pixel.
+    pub(crate) fn has_covered_sample(self) -> bool {
+        if self.bounds.left >= self.bounds.right || self.bounds.top >= self.bounds.bottom {
+            return false;
+        }
+
+        for y in self.bounds.top..self.bounds.bottom {
+            let mut lower = i128::from(self.bounds.left);
+            let mut upper = i128::from(self.bounds.right - 1);
+            for edge in self.edges {
+                let threshold = i128::from(!edge.inclusive);
+                let constant = GX_RASTER_SAMPLE_DENOMINATOR_28_4 * edge.constant
+                    + i128::from(edge.dx) * (i128::from(y) * 48 + GX_RASTER_SAMPLE_NUMERATOR_28_4)
+                    - i128::from(edge.dy) * GX_RASTER_SAMPLE_NUMERATOR_28_4;
+                let coefficient = -i128::from(edge.dy) * 48;
+
+                if coefficient > 0 {
+                    let numerator = threshold - constant;
+                    let candidate = numerator.div_euclid(coefficient)
+                        + i128::from(numerator.rem_euclid(coefficient) != 0);
+                    lower = lower.max(candidate);
+                } else if coefficient < 0 {
+                    upper = upper.min((constant - threshold).div_euclid(-coefficient));
+                } else if constant < threshold {
+                    lower = 1;
+                    upper = 0;
+                }
+
+                if lower > upper {
+                    break;
+                }
+            }
+            if lower <= upper {
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn coverage_mask_2x2(
