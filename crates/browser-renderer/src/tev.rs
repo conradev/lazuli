@@ -638,7 +638,7 @@ struct TevVertexInput {
 };
 
 struct TevVertexOutput {
-    @builtin(position) position: vec4<f32>,
+    @invariant @builtin(position) position: vec4<f32>,
     @location(0) raster0: vec4<f32>,
     @location(1) raster1: vec4<f32>,
     @location(2) stq0: vec3<f32>,
@@ -675,6 +675,13 @@ fn vs_main(input: TevVertexInput) -> TevVertexOutput {
     output.stq7 = input.stq7;
     output.depth24 = input.position.z;
     return output;
+}
+
+// Browser WebGPU cannot force early fragment tests. Early GX depth commits use
+// this side-effect-free fragment entry in a paired pipeline: fixed-function
+// depth is updated, while an empty color write mask preserves the EFB color.
+@fragment
+fn fs_early_depth_commit() {
 }
 
 fn alpha_compare(value: u32, reference: u32, operation: u32) -> bool {
@@ -1623,6 +1630,23 @@ mod tests {
             shader.contains("values.primary = vec4<f32>(normalized_source.rgb, primary_alpha)")
         );
         assert!(shader.contains("values.secondary = normalized_source"));
+    }
+
+    #[test]
+    fn wgsl_early_depth_commit_has_no_fragment_side_effects() {
+        let shader = shader_source();
+        assert!(shader.contains("@invariant @builtin(position) position: vec4<f32>"));
+        let start = shader
+            .find("@fragment\nfn fs_early_depth_commit()")
+            .unwrap();
+        let end = shader[start..].find("fn alpha_compare").unwrap() + start;
+        let commit = &shader[start..end];
+        assert!(!commit.contains("discard"));
+        assert!(!commit.contains("tev_evaluate"));
+        assert!(!commit.contains("textureSample"));
+        assert!(!commit.contains("fog"));
+        assert!(!commit.contains("destination_alpha"));
+        assert!(!commit.contains("frag_depth"));
     }
 
     #[test]

@@ -23,19 +23,20 @@ use crate::tev::{
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
     GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDepthCompareLocation,
-    GxDestinationAlphaState, GxEfbFormat, GxFogState, GxXfbCopyParameters, GxZTextureFormat,
-    GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
-    RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
-    SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor,
-    ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField,
-    ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
-    compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
-    decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
-    gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float, gx_destination_alpha_state,
-    gx_fog_state, gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height,
-    gx_z_texture_state, merge_contiguous_draw_range, requested_surface_readback_layout,
-    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
-    xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
+    GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbFormat, GxFogState, GxXfbCopyParameters,
+    GxZTextureFormat, GxZTextureOperation, GxZTextureState, RendererFailureState,
+    RendererHostTimings, RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture,
+    SurfacePixelOrder, SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity,
+    ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame,
+    ViOwnedField, ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan,
+    clipped_copy_extent, compact_surface_readback_rows, compact_xfb_scanout_rows,
+    decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_factor_for_component,
+    gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float,
+    gx_destination_alpha_state, gx_early_depth_plan, gx_fog_state, gx_sampler_identity,
+    gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
+    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
+    rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
+    xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -273,6 +274,20 @@ struct TevVertex {
 }
 
 const _: () = assert!(std::mem::size_of::<TevVertex>() == TEV_VERTEX_FLOATS * size_of::<f32>());
+
+const TEV_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_array![
+    0 => Float32x4,
+    1 => Float32x4,
+    2 => Float32x4,
+    3 => Float32x3,
+    4 => Float32x3,
+    5 => Float32x3,
+    6 => Float32x3,
+    7 => Float32x3,
+    8 => Float32x3,
+    9 => Float32x3,
+    10 => Float32x3
+];
 
 const DRAW_FRAGMENT_FLAG_RGBA6: u32 = 1;
 const DRAW_FRAGMENT_FLAG_FOG: u32 = 2;
@@ -518,6 +533,13 @@ struct PipelineKey {
     late_fragment_depth: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DepthCommitPipelineKey {
+    primitive: Primitive,
+    cull: CullMode,
+    compare: wgpu::CompareFunction,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScissorRect {
     x: u32,
@@ -528,9 +550,11 @@ struct ScissorRect {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DrawCommandState {
-    pipeline: PipelineKey,
+    pipeline: Option<PipelineKey>,
+    depth_commit: Option<DepthCommitPipelineKey>,
+    early_depth: GxEarlyDepthPlan,
     scissor: ScissorRect,
-    binding: usize,
+    binding: Option<usize>,
 }
 
 struct DrawCommand {
@@ -670,7 +694,9 @@ struct PresentedSurface {
 struct Pipelines {
     tev_shader: wgpu::ShaderModule,
     tev_layout: wgpu::PipelineLayout,
+    early_depth_layout: wgpu::PipelineLayout,
     tev_geometry: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    early_depth_commit: HashMap<DepthCommitPipelineKey, wgpu::RenderPipeline>,
     present: wgpu::RenderPipeline,
 }
 
@@ -951,12 +977,22 @@ fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> 
         ("copyTextureCalls", metrics.copy_texture_calls),
         ("copyXfbCalls", metrics.copy_xfb_calls),
         ("decodedTextureQueries", metrics.decoded_texture_queries),
+        ("depthCommitDraws", metrics.depth_commit_draws),
         ("drainCalls", metrics.drain_calls),
+        ("earlyDepthOnlyCommands", metrics.early_depth_only_commands),
         ("expandedVertexBytes", metrics.expanded_vertex_bytes),
         ("gxFramePacketBytes", metrics.gx_frame_packet_bytes),
         (
             "gxFramePacketPayloadBytes",
             metrics.gx_frame_packet_payload_bytes,
+        ),
+        (
+            "managedEarlyDepthCommands",
+            metrics.managed_early_depth_commands,
+        ),
+        (
+            "managedEarlyDepthPrimitives",
+            metrics.managed_early_depth_primitives,
         ),
         ("presentXfbCalls", metrics.present_xfb_calls),
         ("pushTevDrawCalls", metrics.push_tev_draw_calls),
@@ -1812,6 +1848,15 @@ impl WebGpuRenderer {
         // syntax is already validated above; this preflight also makes a
         // missing resident payload fail without leaving earlier draws queued.
         for draw in packet.draws() {
+            if gx_early_depth_plan(
+                draw.record.z_mode,
+                draw.record.blend_mode,
+                draw.record.alpha_test,
+                draw.record.fragment_tail.pixel_control,
+            ) == GxEarlyDepthPlan::DepthOnly
+            {
+                continue;
+            }
             for (map, slot) in draw.record.textures.iter().enumerate() {
                 let Some(index) = slot.texture else {
                     continue;
@@ -2014,17 +2059,6 @@ impl WebGpuRenderer {
             MAX_TEV_TEXTURES,
         )
         .map_err(|error| JsValue::from_str(&error))?;
-        let required_maps =
-            required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
-        let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let fog = gx_fog_state(
-            fog_range_base,
-            fog_range_coefficients,
-            fog_parameters,
-            viewport_half_width_bits,
-        )
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let expanded = expanded_indices(topology, vertex_count)
             .ok_or_else(|| JsValue::from_str("unsupported GX primitive topology"))?;
         let expanded_vertex_bytes = expanded
@@ -2053,6 +2087,37 @@ impl WebGpuRenderer {
             7 => Primitive::Points,
             _ => Primitive::Triangles,
         };
+        let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
+        if early_depth == GxEarlyDepthPlan::DepthOnly {
+            let Some(scissor) =
+                clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
+            else {
+                return Ok(());
+            };
+            if primitive_cull_mode(primitive, cull_mode) == CullMode::All {
+                return Ok(());
+            }
+            let Some(state) = depth_only_command_state(primitive, z_mode, cull_mode, scissor)
+            else {
+                // A failed fixed-function depth compare has no observable
+                // fragment or depth effect, so do not enqueue a GPU no-op.
+                return Ok(());
+            };
+            drop(resource_preparation_timer);
+            return self.push_expanded_draw(source_vertices, &expanded, state);
+        }
+
+        let required_maps =
+            required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
+        let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let fog = gx_fog_state(
+            fog_range_base,
+            fog_range_coefficients,
+            fog_parameters,
+            viewport_half_width_bits,
+        )
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let destination_alpha =
             gx_destination_alpha_state(blend_mode, constant_alpha, pixel_control);
         let pipeline = PipelineKey::from_gx(
@@ -2062,7 +2127,8 @@ impl WebGpuRenderer {
             destination_alpha,
             z_texture,
             cull_mode,
-        );
+        )
+        .color_pipeline_for_early_depth(early_depth);
         let fog = if pipeline.blend.color_write {
             fog
         } else {
@@ -2235,11 +2301,30 @@ impl WebGpuRenderer {
             self.tev_draw_binding_indices.insert(binding_key, binding);
             binding
         };
+        let depth_commit = (early_depth == GxEarlyDepthPlan::PrimitiveOrdered)
+            .then_some(DepthCommitPipelineKey::from(pipeline));
+        let pipeline = Some(pipeline);
+        let binding = Some(binding);
+        let state = DrawCommandState {
+            pipeline,
+            depth_commit,
+            early_depth,
+            scissor,
+            binding,
+        };
         drop(resource_preparation_timer);
+        self.push_expanded_draw(source_vertices, &expanded, state)
+    }
 
+    fn push_expanded_draw(
+        &mut self,
+        source_vertices: &[f32],
+        expanded: &[usize],
+        state: DrawCommandState,
+    ) -> Result<(), JsValue> {
         let start = self.tev_vertices.len() as u32;
         for index in expanded {
-            let offset = index * TEV_VERTEX_FLOATS;
+            let offset = *index * TEV_VERTEX_FLOATS;
             self.tev_vertices.push(TevVertex {
                 position: source_vertices[offset..offset + 4]
                     .try_into()
@@ -2259,11 +2344,6 @@ impl WebGpuRenderer {
             });
         }
         let end = self.tev_vertices.len() as u32;
-        let state = DrawCommandState {
-            pipeline,
-            scissor,
-            binding,
-        };
         let vertices = start..end;
         if let Some(previous) = self.commands.last_mut()
             && merge_contiguous_draw_range(
@@ -3407,7 +3487,7 @@ impl WebGpuRenderer {
         let tev_pipeline_keys = self
             .commands
             .iter()
-            .map(|command| command.state.pipeline)
+            .filter_map(|command| command.state.pipeline)
             .collect::<HashSet<_>>();
         for key in tev_pipeline_keys {
             if self.pipelines.prepare_tev_geometry(&self.device, key) {
@@ -3417,6 +3497,23 @@ impl WebGpuRenderer {
                 });
             }
         }
+        let depth_commit_keys = self
+            .commands
+            .iter()
+            .filter_map(|command| command.state.depth_commit)
+            .collect::<HashSet<_>>();
+        for key in depth_commit_keys {
+            if self.pipelines.prepare_early_depth_commit(&self.device, key) {
+                update_renderer_metrics(&self.metrics, |metrics| {
+                    metrics.render_pipelines_created =
+                        metrics.render_pipelines_created.saturating_add(1);
+                });
+            }
+        }
+        let mut managed_early_depth_commands = 0_u64;
+        let mut managed_early_depth_primitives = 0_u64;
+        let mut early_depth_only_commands = 0_u64;
+        let mut depth_commit_draws = 0_u64;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("browser GX geometry pass"),
@@ -3445,20 +3542,74 @@ impl WebGpuRenderer {
                 let vertex_buffer = tev_vertex_buffer
                     .as_ref()
                     .expect("TEV draw has a TEV vertex buffer");
-                let binding = &self.tev_draw_bindings[command.state.binding];
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.set_pipeline(&self.pipelines.tev_geometry[&command.state.pipeline]);
-                pass.set_bind_group(0, &binding.draw_bind_group, &[]);
-                pass.set_bind_group(1, &binding.tev_bind_group, &[]);
                 pass.set_scissor_rect(
                     command.state.scissor.x,
                     command.state.scissor.y,
                     command.state.scissor.width,
                     command.state.scissor.height,
                 );
-                pass.draw(command.vertices.clone(), 0..1);
+                match command.state.early_depth {
+                    GxEarlyDepthPlan::FixedFunction => {
+                        let pipeline = command.state.pipeline.expect("TEV pipeline");
+                        let binding =
+                            &self.tev_draw_bindings[command.state.binding.expect("TEV binding")];
+                        pass.set_pipeline(&self.pipelines.tev_geometry[&pipeline]);
+                        pass.set_bind_group(0, &binding.draw_bind_group, &[]);
+                        pass.set_bind_group(1, &binding.tev_bind_group, &[]);
+                        pass.draw(command.vertices.clone(), 0..1);
+                    }
+                    GxEarlyDepthPlan::DepthOnly => {
+                        let commit = command.state.depth_commit.expect("depth-only pipeline");
+                        pass.set_pipeline(&self.pipelines.early_depth_commit[&commit]);
+                        pass.draw(command.vertices.clone(), 0..1);
+                        early_depth_only_commands = early_depth_only_commands.saturating_add(1);
+                        depth_commit_draws = depth_commit_draws.saturating_add(1);
+                    }
+                    GxEarlyDepthPlan::PrimitiveOrdered => {
+                        let color_key = command.state.pipeline.expect("TEV pipeline");
+                        let commit_key = command
+                            .state
+                            .depth_commit
+                            .expect("early depth commit pipeline");
+                        let binding =
+                            &self.tev_draw_bindings[command.state.binding.expect("TEV binding")];
+                        let primitive = color_key.primitive;
+                        let color = &self.pipelines.tev_geometry[&color_key];
+                        let commit = &self.pipelines.early_depth_commit[&commit_key];
+                        pass.set_bind_group(0, &binding.draw_bind_group, &[]);
+                        pass.set_bind_group(1, &binding.tev_bind_group, &[]);
+                        managed_early_depth_commands =
+                            managed_early_depth_commands.saturating_add(1);
+                        for vertices in
+                            expanded_primitive_ranges(command.vertices.clone(), primitive)
+                        {
+                            pass.set_pipeline(color);
+                            pass.draw(vertices.clone(), 0..1);
+                            pass.set_pipeline(commit);
+                            pass.draw(vertices, 0..1);
+                            managed_early_depth_primitives =
+                                managed_early_depth_primitives.saturating_add(1);
+                            depth_commit_draws = depth_commit_draws.saturating_add(1);
+                        }
+                    }
+                }
             }
         }
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.managed_early_depth_commands = metrics
+                .managed_early_depth_commands
+                .saturating_add(managed_early_depth_commands);
+            metrics.managed_early_depth_primitives = metrics
+                .managed_early_depth_primitives
+                .saturating_add(managed_early_depth_primitives);
+            metrics.early_depth_only_commands = metrics
+                .early_depth_only_commands
+                .saturating_add(early_depth_only_commands);
+            metrics.depth_commit_draws = metrics
+                .depth_commit_draws
+                .saturating_add(depth_commit_draws);
+        });
         self.tev_vertices.clear();
         self.commands.clear();
         self.tev_draw_binding_indices.clear();
@@ -3495,14 +3646,7 @@ impl PipelineKey {
         cull_mode: u8,
     ) -> Self {
         let depth_enabled = z_mode & 1 != 0;
-        let depth = DepthPipelineState {
-            compare: if depth_enabled {
-                compare_function(((z_mode >> 1) & 7) as u8)
-            } else {
-                wgpu::CompareFunction::Always
-            },
-            write: depth_enabled && z_mode & (1 << 4) != 0,
-        };
+        let depth = depth_pipeline_state(z_mode);
 
         let blend = gx_blend_state(blend_mode);
         let color_blend = color_blend_component(blend, destination_alpha.target_has_guest_alpha);
@@ -3515,19 +3659,9 @@ impl PipelineKey {
         } else {
             alpha_blend_component(blend, destination_alpha.target_has_guest_alpha)
         };
-        let cull = if primitive == Primitive::Triangles {
-            match cull_mode & 3 {
-                1 => CullMode::Back,
-                2 => CullMode::Front,
-                3 => CullMode::All,
-                _ => CullMode::None,
-            }
-        } else {
-            CullMode::None
-        };
         Self {
             primitive,
-            cull,
+            cull: primitive_cull_mode(primitive, cull_mode),
             depth,
             blend: BlendPipelineState {
                 enabled: blend.enabled,
@@ -3541,6 +3675,98 @@ impl PipelineKey {
                 && z_texture.depth_compare_location == GxDepthCompareLocation::Late,
         }
     }
+
+    fn color_pipeline_for_early_depth(mut self, plan: GxEarlyDepthPlan) -> Self {
+        if plan == GxEarlyDepthPlan::PrimitiveOrdered {
+            self.depth.write = false;
+        }
+        self
+    }
+}
+
+impl DepthCommitPipelineKey {
+    fn from_gx(primitive: Primitive, z_mode: u32, cull_mode: u8) -> Self {
+        Self {
+            primitive,
+            cull: primitive_cull_mode(primitive, cull_mode),
+            compare: depth_pipeline_state(z_mode).compare,
+        }
+    }
+}
+
+fn depth_only_command_state(
+    primitive: Primitive,
+    z_mode: u32,
+    cull_mode: u8,
+    scissor: ScissorRect,
+) -> Option<DrawCommandState> {
+    let depth_commit = DepthCommitPipelineKey::from_gx(primitive, z_mode, cull_mode);
+    let early_depth = GxEarlyDepthPlan::DepthOnly;
+    let binding = None;
+    (depth_commit.compare != wgpu::CompareFunction::Never).then_some(DrawCommandState {
+        pipeline: None,
+        depth_commit: Some(depth_commit),
+        early_depth,
+        scissor,
+        binding,
+    })
+}
+
+impl From<PipelineKey> for DepthCommitPipelineKey {
+    fn from(pipeline: PipelineKey) -> Self {
+        Self {
+            primitive: pipeline.primitive,
+            cull: pipeline.cull,
+            compare: pipeline.depth.compare,
+        }
+    }
+}
+
+fn depth_pipeline_state(z_mode: u32) -> DepthPipelineState {
+    let enabled = z_mode & 1 != 0;
+    DepthPipelineState {
+        compare: if enabled {
+            compare_function(((z_mode >> 1) & 7) as u8)
+        } else {
+            wgpu::CompareFunction::Always
+        },
+        write: enabled && z_mode & (1 << 4) != 0,
+    }
+}
+
+fn primitive_cull_mode(primitive: Primitive, cull_mode: u8) -> CullMode {
+    if primitive != Primitive::Triangles {
+        return CullMode::None;
+    }
+    match cull_mode & 3 {
+        1 => CullMode::Back,
+        2 => CullMode::Front,
+        3 => CullMode::All,
+        _ => CullMode::None,
+    }
+}
+
+fn primitive_vertex_width(primitive: Primitive) -> u32 {
+    match primitive {
+        Primitive::Triangles => 3,
+        Primitive::Lines => 2,
+        Primitive::Points => 1,
+    }
+}
+
+fn expanded_primitive_ranges(
+    vertices: Range<u32>,
+    primitive: Primitive,
+) -> impl Iterator<Item = Range<u32>> {
+    let width = primitive_vertex_width(primitive);
+    assert_eq!(
+        (vertices.end - vertices.start) % width,
+        0,
+        "expanded GX draw is not primitive aligned"
+    );
+    (vertices.start..vertices.end)
+        .step_by(width as usize)
+        .map(move |start| start..start + width)
 }
 
 fn color_blend_component(
@@ -3812,6 +4038,24 @@ impl Pipelines {
         self.tev_geometry.insert(key, pipeline);
         true
     }
+
+    fn prepare_early_depth_commit(
+        &mut self,
+        device: &wgpu::Device,
+        key: DepthCommitPipelineKey,
+    ) -> bool {
+        if self.early_depth_commit.contains_key(&key) {
+            return false;
+        }
+        let pipeline = create_early_depth_commit_pipeline(
+            device,
+            &self.tev_shader,
+            &self.early_depth_layout,
+            key,
+        );
+        self.early_depth_commit.insert(key, pipeline);
+        true
+    }
 }
 
 fn create_tev_geometry_pipeline(
@@ -3820,16 +4064,6 @@ fn create_tev_geometry_pipeline(
     layout: &wgpu::PipelineLayout,
     key: PipelineKey,
 ) -> wgpu::RenderPipeline {
-    let topology = match key.primitive {
-        Primitive::Triangles => wgpu::PrimitiveTopology::TriangleList,
-        Primitive::Lines => wgpu::PrimitiveTopology::LineList,
-        Primitive::Points => wgpu::PrimitiveTopology::PointList,
-    };
-    let cull_mode = match key.cull {
-        CullMode::None => None,
-        CullMode::Back | CullMode::All => Some(wgpu::Face::Back),
-        CullMode::Front => Some(wgpu::Face::Front),
-    };
     let blend = key.blend.enabled.then_some(wgpu::BlendState {
         color: wgpu::BlendComponent {
             src_factor: key.blend.color.source,
@@ -3843,23 +4077,6 @@ fn create_tev_geometry_pipeline(
         },
     });
     let write_mask = blend_write_mask(key.blend);
-    let vertex_layout = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<TevVertex>() as u64,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![
-            0 => Float32x4,
-            1 => Float32x4,
-            2 => Float32x4,
-            3 => Float32x3,
-            4 => Float32x3,
-            5 => Float32x3,
-            6 => Float32x3,
-            7 => Float32x3,
-            8 => Float32x3,
-            9 => Float32x3,
-            10 => Float32x3
-        ],
-    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("browser GX per-fragment TEV state pipeline"),
         layout: Some(layout),
@@ -3867,13 +4084,13 @@ fn create_tev_geometry_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[vertex_layout],
+            buffers: &[tev_vertex_layout()],
         },
         primitive: wgpu::PrimitiveState {
-            topology,
+            topology: primitive_topology(key.primitive),
             strip_index_format: None,
             front_face: wgpu::FrontFace::Cw,
-            cull_mode,
+            cull_mode: webgpu_cull_mode(key.cull),
             unclipped_depth: key.late_fragment_depth,
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
@@ -3903,6 +4120,77 @@ fn create_tev_geometry_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn create_early_depth_commit_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    key: DepthCommitPipelineKey,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("browser GX early depth commit pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[tev_vertex_layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: primitive_topology(key.primitive),
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: webgpu_cull_mode(key.cull),
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(key.compare),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_early_depth_commit"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn tev_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<TevVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &TEV_VERTEX_ATTRIBUTES,
+    }
+}
+
+fn primitive_topology(primitive: Primitive) -> wgpu::PrimitiveTopology {
+    match primitive {
+        Primitive::Triangles => wgpu::PrimitiveTopology::TriangleList,
+        Primitive::Lines => wgpu::PrimitiveTopology::LineList,
+        Primitive::Points => wgpu::PrimitiveTopology::PointList,
+    }
+}
+
+fn webgpu_cull_mode(cull: CullMode) -> Option<wgpu::Face> {
+    match cull {
+        CullMode::None => None,
+        CullMode::Back | CullMode::All => Some(wgpu::Face::Back),
+        CullMode::Front => Some(wgpu::Face::Front),
+    }
 }
 
 fn create_xfb_copy_resources(
@@ -4182,6 +4470,11 @@ fn create_pipelines(
         bind_group_layouts: &[Some(tev_draw_layout), Some(tev_texture_layout)],
         immediate_size: 0,
     });
+    let early_depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("browser GX binding-free early depth pipeline layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
 
     let present_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("browser XFB presentation shader"),
@@ -4223,7 +4516,9 @@ fn create_pipelines(
     Pipelines {
         tev_shader,
         tev_layout,
+        early_depth_layout,
         tev_geometry: HashMap::new(),
+        early_depth_commit: HashMap::new(),
         present,
     }
 }
@@ -4231,13 +4526,16 @@ fn create_pipelines(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlendComponentState, DrawUniform, PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES,
-        TevBindingKey, alpha_blend_factor, blend_write_mask, color_blend_factor, expanded_indices,
+        BlendComponentState, DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_RGBA6,
+        DepthCommitPipelineKey, DrawUniform, PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES,
+        ScissorRect, TevBindingKey, alpha_blend_factor, blend_write_mask, color_blend_factor,
+        depth_only_command_state, expanded_indices, expanded_primitive_ranges,
+        merge_contiguous_draw_range,
     };
     use crate::tev::MAX_TEV_TEXTURES;
     use crate::{
-        GxBlendFactor, GxFogState, SamplerIdentity, TextureAddressMode, TextureBindingIdentity,
-        gx_destination_alpha_state, gx_z_texture_state,
+        GxBlendFactor, GxEarlyDepthPlan, GxFogState, SamplerIdentity, TextureAddressMode,
+        TextureBindingIdentity, gx_destination_alpha_state, gx_z_texture_state,
     };
 
     fn encoded_blend_mode(
@@ -4285,6 +4583,126 @@ mod tests {
         assert_eq!(expanded_indices(3, 4).unwrap(), [0, 1, 2, 1, 3, 2]);
         assert_eq!(expanded_indices(4, 4).unwrap(), [0, 1, 2, 0, 2, 3]);
         assert_eq!(expanded_indices(6, 3).unwrap(), [0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn managed_early_depth_pairs_each_expanded_primitive_in_order() {
+        assert_eq!(
+            expanded_primitive_ranges(12..24, Primitive::Triangles).collect::<Vec<_>>(),
+            [12..15, 15..18, 18..21, 21..24],
+        );
+        assert_eq!(
+            expanded_primitive_ranges(7..13, Primitive::Lines).collect::<Vec<_>>(),
+            [7..9, 9..11, 11..13],
+        );
+        assert_eq!(
+            expanded_primitive_ranges(2..5, Primitive::Points).collect::<Vec<_>>(),
+            [2..3, 3..4, 4..5],
+        );
+    }
+
+    #[test]
+    fn depth_only_commands_are_binding_free_and_merge_only_fixed_function_state() {
+        let scissor = ScissorRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        let less_update = 1 | (1 << 1) | (1 << 4);
+        let first =
+            depth_only_command_state(Primitive::Triangles, less_update, 1, scissor).unwrap();
+        let second =
+            depth_only_command_state(Primitive::Triangles, less_update, 1, scissor).unwrap();
+        assert!(first.pipeline.is_none());
+        assert!(first.binding.is_none());
+        assert!(first.depth_commit.is_some());
+
+        let mut vertices = 0..3;
+        assert!(merge_contiguous_draw_range(
+            &mut vertices,
+            &first,
+            3..6,
+            &second,
+        ));
+        assert_eq!(vertices, 0..6);
+
+        let greater_update = 1 | (4 << 1) | (1 << 4);
+        let different_compare =
+            depth_only_command_state(Primitive::Triangles, greater_update, 1, scissor).unwrap();
+        assert!(!merge_contiguous_draw_range(
+            &mut vertices,
+            &first,
+            6..9,
+            &different_compare,
+        ));
+        let different_scissor = depth_only_command_state(
+            Primitive::Triangles,
+            less_update,
+            1,
+            ScissorRect {
+                width: 4,
+                ..scissor
+            },
+        )
+        .unwrap();
+        assert!(!merge_contiguous_draw_range(
+            &mut vertices,
+            &first,
+            6..9,
+            &different_scissor,
+        ));
+    }
+
+    #[test]
+    fn depth_only_never_compare_is_dropped_before_command_encoding() {
+        let scissor = ScissorRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let never_update = 1 | (1 << 4);
+        assert!(depth_only_command_state(Primitive::Triangles, never_update, 0, scissor).is_none());
+    }
+
+    #[test]
+    fn managed_early_depth_disables_only_the_color_pass_depth_write() {
+        let z_mode = 1 | (1 << 1) | (1 << 4);
+        let pipeline = PipelineKey::from_gx(
+            Primitive::Triangles,
+            z_mode,
+            1 << 3,
+            gx_destination_alpha_state(1 << 3, 0, 1 << 6),
+            gx_z_texture_state(0, 0, 1 << 6).unwrap(),
+            0,
+        );
+        assert!(pipeline.depth.write);
+        assert!(
+            pipeline
+                .color_pipeline_for_early_depth(GxEarlyDepthPlan::FixedFunction)
+                .depth
+                .write
+        );
+        assert!(
+            !pipeline
+                .color_pipeline_for_early_depth(GxEarlyDepthPlan::PrimitiveOrdered)
+                .depth
+                .write
+        );
+        let commit = DepthCommitPipelineKey::from(pipeline);
+        assert_eq!(commit.compare, pipeline.depth.compare);
+    }
+
+    #[test]
+    fn early_depth_commit_pipeline_key_ignores_fragment_only_state() {
+        let first = pipeline_key(encoded_blend_mode(1, 0, true, false), 0, 0);
+        let second = pipeline_key(encoded_blend_mode(7, 6, false, true), 0x1ff, 1);
+        assert_ne!(first, second);
+        assert_eq!(
+            DepthCommitPipelineKey::from(first),
+            DepthCommitPipelineKey::from(second),
+        );
     }
 
     #[test]
@@ -4468,12 +4886,7 @@ mod tests {
     fn draw_uniform_marks_active_fog_without_changing_the_rgba6_flag() {
         let destination_alpha = gx_destination_alpha_state(0, 0, 0);
         let z_texture = gx_z_texture_state(0, 0, 0).unwrap();
-        let disabled = DrawUniform::from_gx(
-            0,
-            destination_alpha,
-            z_texture,
-            GxFogState::default(),
-        );
+        let disabled = DrawUniform::from_gx(0, destination_alpha, z_texture, GxFogState::default());
         let mut fog = GxFogState::default();
         fog.parameters[3] = 2 << 21;
         let enabled = DrawUniform::from_gx(0, destination_alpha, z_texture, fog);
