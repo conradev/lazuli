@@ -71,7 +71,7 @@ test("the public manifest API routes an exact cloned SMB ready profile to schema
   assert.equal(manifest.consensus.cleanRuns, 3);
   assert.equal(
     manifest.sha256,
-    "cdfe1b4097c11de6419d8ee9d2e9da616ef3f1881086b0bfbcb8c52a709c1f70",
+    "b1fda70448f54e03a36231d8c2b5a40d6223ffa23f90072101b0e73d16257010",
   );
   assert.equal(validateCheckpointManifest(manifest), manifest);
   assert.equal(verifyCheckpointReport(reports[2], manifest).sha256, manifest.sha256);

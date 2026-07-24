@@ -7,10 +7,13 @@ import vm from "node:vm";
 
 import {
   SMB_TEMPORAL_XFB_CAPACITY,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
   TemporalXfbValidationError,
   deriveTemporalSelectedXfbOracle,
   projectSmbTemporalSelectedXfb,
   temporalXfbCalibrationVector,
+  validateTemporalSelectedXfbFrames,
   verifySmbTemporalSelectedXfb,
 } from "./browser_boot_temporal_xfb.mjs";
 
@@ -70,6 +73,75 @@ function makeTemporal(frames = makeFrames()) {
   };
 }
 
+function makeV2Frame(index) {
+  const bottom = index % 2 === 1;
+  const generation = 300 + index;
+  const row = bottom ? 1 : 0;
+  const pixels = 16 * 4;
+  const scanout = {
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 64,
+    sourceRowStep: 2,
+    fieldHeight: 2,
+    rowRepeat: 2,
+  };
+  return {
+    scenario: "smb-ready-play",
+    step: "post-play-presented",
+    ordinal: index + 1,
+    rendererSequence: 400 + index,
+    presentation: {
+      selected: true,
+      field: bottom ? "bottom" : "top",
+      address: bottom ? "0x00300020" : "0x00300000",
+      copyIndex: generation,
+      copyRow: row,
+      width: 16,
+      height: 4,
+      pictureConfiguration: 0x0102,
+      wordsPerLine: 1,
+      standardWordsPerLine: 2,
+      activeLines: 2,
+      nonInterlaced: false,
+      ...scanout,
+    },
+    selectedXfb: {
+      address: bottom ? "0x00300020" : "0x00300000",
+      generation,
+      row,
+      format: "rgba8unorm",
+      layout: "top-left-row-major-tight",
+      sourceRow: row,
+      width: 16,
+      height: 4,
+      textureWidth: 16,
+      textureHeight: 4,
+      logicalWidth: 16,
+      logicalHeight: 4,
+      displayWidth: 16,
+      displayHeight: 4,
+      ...scanout,
+      rgbaByteLength: pixels * 4,
+      rgbaSha256: digest(index + 30),
+      rgbSha256: digest(index + 50),
+      rgb: { black: 0, white: 0, other: pixels, unique: 4 },
+    },
+  };
+}
+
+function makeV2Temporal() {
+  const frames = Array.from(
+    { length: SMB_TEMPORAL_XFB_CAPACITY },
+    (_unused, index) => makeV2Frame(index),
+  );
+  return {
+    scanoutEvidenceVersion: TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
+    capacity: SMB_TEMPORAL_XFB_CAPACITY,
+    frames,
+    oracle: deriveTemporalSelectedXfbOracle(frames),
+  };
+}
+
 function updateOracle(temporal) {
   temporal.oracle = deriveTemporalSelectedXfbOracle(temporal.frames, temporal.capacity);
   return temporal;
@@ -120,6 +192,131 @@ test("raw temporal frames derive every page oracle field", () => {
     })),
   });
   assert.doesNotThrow(() => verifySmbTemporalSelectedXfb(makeTemporal(frames)));
+});
+
+test("legacy v1 replay preserves the published bottom-field crop contract", () => {
+  const implicit = makeTemporal();
+  const bottom = implicit.frames[1];
+  bottom.presentation.copyRow = 1;
+  bottom.selectedXfb.row = 1;
+  bottom.selectedXfb.sourceRow = 1;
+  bottom.selectedXfb.height = 1;
+  bottom.selectedXfb.rgbaByteLength = 8;
+  bottom.selectedXfb.rgb = { black: 0, white: 0, other: 2, unique: 2 };
+  updateOracle(implicit);
+  assert.equal(
+    verifySmbTemporalSelectedXfb(implicit).scanoutEvidenceVersion,
+    TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
+  );
+
+  const explicit = structuredClone(implicit);
+  explicit.scanoutEvidenceVersion = TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1;
+  assert.doesNotThrow(() => verifySmbTemporalSelectedXfb(explicit));
+  assert.deepEqual(
+    projectSmbTemporalSelectedXfb(explicit),
+    projectSmbTemporalSelectedXfb(implicit),
+  );
+});
+
+test("v2 binds raw VI geometry to an exact integer-row bob plan", () => {
+  const temporal = makeV2Temporal();
+  const evidence = verifySmbTemporalSelectedXfb(temporal);
+  assert.equal(evidence.scanoutEvidenceVersion, TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2);
+  assert.equal(evidence.calibration.schema, "lazuli-temporal-xfb-calibration-vector-v2");
+  assert.equal(evidence.calibration.scanoutEvidenceVersion, 2);
+
+  const projected = projectSmbTemporalSelectedXfb(temporal);
+  assert.deepEqual(Object.keys(projected), [
+    "scanoutEvidenceVersion",
+    "capacity",
+    "frames",
+    "oracle",
+  ]);
+  assert.deepEqual(
+    projected.frames.map(frame => frame.selectedXfb.row),
+    [0, 1, 0, 1, 0, 1, 0, 1],
+  );
+  assert.deepEqual(Object.keys(projected.frames[0].presentation), [
+    "selected",
+    "field",
+    "address",
+    "copyIndex",
+    "copyRow",
+    "width",
+    "height",
+    "pictureConfiguration",
+    "wordsPerLine",
+    "standardWordsPerLine",
+    "activeLines",
+    "nonInterlaced",
+    "scanoutPolicy",
+    "fieldStrideBytes",
+    "sourceRowStep",
+    "fieldHeight",
+    "rowRepeat",
+  ]);
+  for (const field of [
+    "scanoutPolicy",
+    "fieldStrideBytes",
+    "sourceRowStep",
+    "fieldHeight",
+    "rowRepeat",
+  ]) {
+    assert.equal(
+      projected.frames[0].selectedXfb[field],
+      projected.frames[0].presentation[field],
+    );
+  }
+});
+
+test("v2 fails closed on scanout plan, raw geometry, and version mismatches", () => {
+  const cases = [
+    [
+      "old cropped height",
+      temporal => { temporal.frames[1].selectedXfb.height = 3; },
+      /selectedXfb\.height$/,
+    ],
+    [
+      "policy",
+      temporal => { temporal.frames[0].presentation.scanoutPolicy = "direct"; },
+      /presentation\.scanoutPolicy$/,
+    ],
+    [
+      "selected provenance",
+      temporal => { temporal.frames[0].selectedXfb.sourceRowStep = 1; },
+      /selectedXfb\.sourceRowStep$/,
+    ],
+    [
+      "last source row",
+      temporal => { temporal.frames[1].selectedXfb.logicalHeight = 3; },
+      /selectedXfb\.fieldHeight$/,
+    ],
+    [
+      "raw picture configuration",
+      temporal => { temporal.frames[0].presentation.pictureConfiguration = 0x0103; },
+      /presentation\.standardWordsPerLine$/,
+    ],
+  ];
+  for (const [label, mutate, pathPattern] of cases) {
+    const temporal = makeV2Temporal();
+    mutate(temporal);
+    assert.throws(
+      () => verifySmbTemporalSelectedXfb(temporal),
+      error => error instanceof TemporalXfbValidationError
+        && error.code !== "oracle-mismatch"
+        && pathPattern.test(error.path),
+      label,
+    );
+  }
+
+  const unknown = makeV2Temporal();
+  unknown.scanoutEvidenceVersion = 3;
+  expectFailure(unknown, "envelope", /scanoutEvidenceVersion$/);
+  assert.throws(
+    () => validateTemporalSelectedXfbFrames(unknown.frames, unknown.capacity, 3),
+    error => error instanceof TemporalXfbValidationError
+      && /scanoutEvidenceVersion$/.test(error.path),
+  );
 });
 
 test("checkpoint projection keeps only canonical independently derived evidence", () => {
@@ -231,6 +428,13 @@ test("Node recomputation stays in deep parity with the page oracle", () => {
   const context = vm.createContext({
     Set,
     temporalSelectedXfbCapacity: SMB_TEMPORAL_XFB_CAPACITY,
+    viScanoutProvenanceEqual: (left, right) => [
+      "scanoutPolicy",
+      "fieldStrideBytes",
+      "sourceRowStep",
+      "fieldHeight",
+      "rowRepeat",
+    ].every(name => left?.[name] === right?.[name]),
   });
   vm.runInContext(browserSource.slice(start, end), context);
 

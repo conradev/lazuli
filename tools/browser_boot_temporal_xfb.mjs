@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 export const SMB_TEMPORAL_XFB_CAPACITY = 8;
+export const TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1 = 1;
+export const TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2 = 2;
 
 const LOWERCASE_HEX_32 = /^0x[0-9a-f]{8}$/;
 const LOWERCASE_SHA_256 = /^[0-9a-f]{64}$/;
@@ -68,11 +70,93 @@ function requireSha256(value, path) {
   return value;
 }
 
+export function temporalXfbScanoutEvidenceVersion(temporal, path = "$") {
+  const envelope = requireObject(temporal, path);
+  const version = envelope.scanoutEvidenceVersion
+    ?? TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1;
+  if (
+    version !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1
+    && version !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2
+  ) {
+    fail(
+      "envelope",
+      `${path}.scanoutEvidenceVersion`,
+      `expected 1 or 2, got ${describe(version)}`,
+    );
+  }
+  return version;
+}
+
+const VI_SCANOUT_PROVENANCE_FIELDS = [
+  "scanoutPolicy",
+  "fieldStrideBytes",
+  "sourceRowStep",
+  "fieldHeight",
+  "rowRepeat",
+];
+
+function validateScanoutProvenance(value, path, displayHeight) {
+  const scanoutPolicy = value.scanoutPolicy;
+  if (scanoutPolicy !== "bob" && scanoutPolicy !== "direct") {
+    fail(
+      "envelope",
+      `${path}.scanoutPolicy`,
+      `expected "bob" or "direct", got ${describe(scanoutPolicy)}`,
+    );
+  }
+  const fieldStrideBytes = requirePositiveInteger(
+    value.fieldStrideBytes,
+    `${path}.fieldStrideBytes`,
+  );
+  const sourceRowStep = requirePositiveInteger(
+    value.sourceRowStep,
+    `${path}.sourceRowStep`,
+  );
+  const fieldHeight = requirePositiveInteger(value.fieldHeight, `${path}.fieldHeight`);
+  const rowRepeat = requirePositiveInteger(value.rowRepeat, `${path}.rowRepeat`);
+  if (rowRepeat !== 1 && rowRepeat !== 2) {
+    fail("envelope", `${path}.rowRepeat`, `expected 1 or 2, got ${rowRepeat}`);
+  }
+  const expectedPolicy = rowRepeat === 2 ? "bob" : "direct";
+  if (scanoutPolicy !== expectedPolicy) {
+    fail(
+      "provenance",
+      `${path}.scanoutPolicy`,
+      `expected ${expectedPolicy} for row repeat ${rowRepeat}, got ${scanoutPolicy}`,
+    );
+  }
+  if (displayHeight !== fieldHeight * rowRepeat) {
+    fail(
+      "provenance",
+      `${path}.fieldHeight`,
+      `expected ${displayHeight} display rows from field height ${fieldHeight} and repeat ${rowRepeat}`,
+    );
+  }
+  return { scanoutPolicy, fieldStrideBytes, sourceRowStep, fieldHeight, rowRepeat };
+}
+
+function requireMatchingScanoutProvenance(expected, actual, path) {
+  for (const field of VI_SCANOUT_PROVENANCE_FIELDS) {
+    if (actual[field] !== expected[field]) {
+      fail(
+        "provenance",
+        `${path}.${field}`,
+        `expected ${describe(expected[field])}, got ${describe(actual[field])}`,
+      );
+    }
+  }
+}
+
 function framePath(index, suffix = "") {
   return `$.frames[${index}]${suffix}`;
 }
 
-function validateFrame(frame, index, previous) {
+function validateFrame(
+  frame,
+  index,
+  previous,
+  scanoutEvidenceVersion = TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
+) {
   const path = framePath(index);
   requireObject(frame, path);
   requireExact(frame.scenario, "smb-ready-play", `${path}.scenario`);
@@ -135,6 +219,61 @@ function validateFrame(frame, index, previous) {
       `${path}.presentation.copyIndex`,
       `expected a value no smaller than ${previous.presentation.copyIndex}, got ${copyIndex}`,
     );
+  }
+
+  let presentationScanout = null;
+  if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2) {
+    presentationScanout = validateScanoutProvenance(
+      presentation,
+      `${path}.presentation`,
+      presentationHeight,
+    );
+    const pictureConfiguration = requireNonNegativeInteger(
+      presentation.pictureConfiguration,
+      `${path}.presentation.pictureConfiguration`,
+    );
+    if (pictureConfiguration > 0xffff) {
+      fail(
+        "envelope",
+        `${path}.presentation.pictureConfiguration`,
+        `expected a 16-bit VI register, got ${pictureConfiguration}`,
+      );
+    }
+    const wordsPerLine = requirePositiveInteger(
+      presentation.wordsPerLine,
+      `${path}.presentation.wordsPerLine`,
+    );
+    const standardWordsPerLine = requirePositiveInteger(
+      presentation.standardWordsPerLine,
+      `${path}.presentation.standardWordsPerLine`,
+    );
+    const activeLines = requirePositiveInteger(
+      presentation.activeLines,
+      `${path}.presentation.activeLines`,
+    );
+    if (typeof presentation.nonInterlaced !== "boolean") {
+      fail(
+        "envelope",
+        `${path}.presentation.nonInterlaced`,
+        `expected a boolean, got ${describe(presentation.nonInterlaced)}`,
+      );
+    }
+    for (const [field, actual, expected] of [
+      ["wordsPerLine", wordsPerLine, (pictureConfiguration >>> 8) & 0x7f],
+      ["standardWordsPerLine", standardWordsPerLine, pictureConfiguration & 0xff],
+      ["activeLines", activeLines, presentationScanout.fieldHeight],
+      ["width", presentationWidth, wordsPerLine * 16],
+      ["fieldStrideBytes", presentationScanout.fieldStrideBytes, standardWordsPerLine * 32],
+      ["nonInterlaced", presentation.nonInterlaced, presentationScanout.rowRepeat === 1],
+    ]) {
+      if (actual !== expected) {
+        fail(
+          "provenance",
+          `${path}.presentation.${field}`,
+          `expected ${describe(expected)}, got ${describe(actual)}`,
+        );
+      }
+    }
   }
 
   const selected = requireObject(frame.selectedXfb, `${path}.selectedXfb`);
@@ -209,11 +348,14 @@ function validateFrame(frame, index, previous) {
       `expected texture width ${dimensions.textureWidth}, got ${dimensions.width}`,
     );
   }
-  if (dimensions.height !== dimensions.textureHeight - sourceRow) {
+  const expectedHeight = scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2
+    ? dimensions.displayHeight
+    : dimensions.textureHeight - sourceRow;
+  if (dimensions.height !== expectedHeight) {
     fail(
       "envelope",
       `${path}.selectedXfb.height`,
-      `expected cropped texture height ${dimensions.textureHeight - sourceRow}, got ${dimensions.height}`,
+      `expected ${expectedHeight} tight scanout rows, got ${dimensions.height}`,
     );
   }
   if (
@@ -225,6 +367,28 @@ function validateFrame(frame, index, previous) {
       `${path}.selectedXfb.displayWidth`,
       `expected presented dimensions ${presentationWidth}x${presentationHeight}, got ${dimensions.displayWidth}x${dimensions.displayHeight}`,
     );
+  }
+
+  if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2) {
+    const selectedScanout = validateScanoutProvenance(
+      selected,
+      `${path}.selectedXfb`,
+      dimensions.displayHeight,
+    );
+    requireMatchingScanoutProvenance(
+      presentationScanout,
+      selectedScanout,
+      `${path}.selectedXfb`,
+    );
+    const lastLogicalRow = selectedRow
+      + (selectedScanout.fieldHeight - 1) * selectedScanout.sourceRowStep;
+    if (lastLogicalRow >= dimensions.logicalHeight) {
+      fail(
+        "provenance",
+        `${path}.selectedXfb.fieldHeight`,
+        `last VI source row ${lastLogicalRow} exceeds logical height ${dimensions.logicalHeight}`,
+      );
+    }
   }
 
   const pixelCount = dimensions.width * dimensions.height;
@@ -292,7 +456,18 @@ function validateFrame(frame, index, previous) {
 export function validateTemporalSelectedXfbFrames(
   frames,
   capacity = SMB_TEMPORAL_XFB_CAPACITY,
+  scanoutEvidenceVersion = TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
 ) {
+  if (
+    scanoutEvidenceVersion !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1
+    && scanoutEvidenceVersion !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2
+  ) {
+    fail(
+      "envelope",
+      "$.scanoutEvidenceVersion",
+      `expected 1 or 2, got ${describe(scanoutEvidenceVersion)}`,
+    );
+  }
   if (!Number.isSafeInteger(capacity) || capacity <= 0) {
     fail("envelope", "$.capacity", `expected a positive safe integer, got ${describe(capacity)}`);
   }
@@ -303,7 +478,12 @@ export function validateTemporalSelectedXfbFrames(
     fail("envelope", "$.frames", `expected ${capacity} frames, got ${frames.length}`);
   }
   for (let index = 0; index < frames.length; index += 1) {
-    validateFrame(frames[index], index, index === 0 ? null : frames[index - 1]);
+    validateFrame(
+      frames[index],
+      index,
+      index === 0 ? null : frames[index - 1],
+      scanoutEvidenceVersion,
+    );
   }
   return frames;
 }
@@ -323,7 +503,10 @@ export function deriveTemporalSelectedXfbOracle(
       && selected.generation === frame.presentation.copyIndex
       && selected.row === frame.presentation.copyRow
       && selected.displayWidth === frame.presentation.width
-      && selected.displayHeight === frame.presentation.height;
+      && selected.displayHeight === frame.presentation.height
+      && VI_SCANOUT_PROVENANCE_FIELDS.every(
+        field => selected[field] === frame.presentation[field],
+      );
     return {
       ordinal: frame.ordinal,
       rendererSequence: frame.rendererSequence,
@@ -392,56 +575,91 @@ export function deriveTemporalSelectedXfbOracle(
   };
 }
 
-function projectTemporalSelectedXfbFrame(frame) {
+function projectTemporalSelectedXfbFrame(
+  frame,
+  scanoutEvidenceVersion = TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
+) {
+  const presentation = {
+    selected: frame.presentation.selected,
+    field: frame.presentation.field,
+    address: frame.presentation.address,
+    copyIndex: frame.presentation.copyIndex,
+    copyRow: frame.presentation.copyRow,
+    width: frame.presentation.width,
+    height: frame.presentation.height,
+  };
+  const selectedXfb = {
+    address: frame.selectedXfb.address,
+    generation: frame.selectedXfb.generation,
+    row: frame.selectedXfb.row,
+    format: frame.selectedXfb.format,
+    layout: frame.selectedXfb.layout,
+    sourceRow: frame.selectedXfb.sourceRow,
+    width: frame.selectedXfb.width,
+    height: frame.selectedXfb.height,
+    textureWidth: frame.selectedXfb.textureWidth,
+    textureHeight: frame.selectedXfb.textureHeight,
+    logicalWidth: frame.selectedXfb.logicalWidth,
+    logicalHeight: frame.selectedXfb.logicalHeight,
+    displayWidth: frame.selectedXfb.displayWidth,
+    displayHeight: frame.selectedXfb.displayHeight,
+  };
+  if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2) {
+    Object.assign(presentation, {
+      pictureConfiguration: frame.presentation.pictureConfiguration,
+      wordsPerLine: frame.presentation.wordsPerLine,
+      standardWordsPerLine: frame.presentation.standardWordsPerLine,
+      activeLines: frame.presentation.activeLines,
+      nonInterlaced: frame.presentation.nonInterlaced,
+      scanoutPolicy: frame.presentation.scanoutPolicy,
+      fieldStrideBytes: frame.presentation.fieldStrideBytes,
+      sourceRowStep: frame.presentation.sourceRowStep,
+      fieldHeight: frame.presentation.fieldHeight,
+      rowRepeat: frame.presentation.rowRepeat,
+    });
+    Object.assign(selectedXfb, {
+      scanoutPolicy: frame.selectedXfb.scanoutPolicy,
+      fieldStrideBytes: frame.selectedXfb.fieldStrideBytes,
+      sourceRowStep: frame.selectedXfb.sourceRowStep,
+      fieldHeight: frame.selectedXfb.fieldHeight,
+      rowRepeat: frame.selectedXfb.rowRepeat,
+    });
+  }
+  Object.assign(selectedXfb, {
+    rgbaByteLength: frame.selectedXfb.rgbaByteLength,
+    rgbaSha256: frame.selectedXfb.rgbaSha256,
+    rgbSha256: frame.selectedXfb.rgbSha256,
+    rgb: {
+      black: frame.selectedXfb.rgb.black,
+      white: frame.selectedXfb.rgb.white,
+      other: frame.selectedXfb.rgb.other,
+      unique: frame.selectedXfb.rgb.unique,
+    },
+  });
   return {
     scenario: frame.scenario,
     step: frame.step,
     ordinal: frame.ordinal,
     rendererSequence: frame.rendererSequence,
-    presentation: {
-      selected: frame.presentation.selected,
-      field: frame.presentation.field,
-      address: frame.presentation.address,
-      copyIndex: frame.presentation.copyIndex,
-      copyRow: frame.presentation.copyRow,
-      width: frame.presentation.width,
-      height: frame.presentation.height,
-    },
-    selectedXfb: {
-      address: frame.selectedXfb.address,
-      generation: frame.selectedXfb.generation,
-      row: frame.selectedXfb.row,
-      format: frame.selectedXfb.format,
-      layout: frame.selectedXfb.layout,
-      sourceRow: frame.selectedXfb.sourceRow,
-      width: frame.selectedXfb.width,
-      height: frame.selectedXfb.height,
-      textureWidth: frame.selectedXfb.textureWidth,
-      textureHeight: frame.selectedXfb.textureHeight,
-      logicalWidth: frame.selectedXfb.logicalWidth,
-      logicalHeight: frame.selectedXfb.logicalHeight,
-      displayWidth: frame.selectedXfb.displayWidth,
-      displayHeight: frame.selectedXfb.displayHeight,
-      rgbaByteLength: frame.selectedXfb.rgbaByteLength,
-      rgbaSha256: frame.selectedXfb.rgbaSha256,
-      rgbSha256: frame.selectedXfb.rgbSha256,
-      rgb: {
-        black: frame.selectedXfb.rgb.black,
-        white: frame.selectedXfb.rgb.white,
-        other: frame.selectedXfb.rgb.other,
-        unique: frame.selectedXfb.rgb.unique,
-      },
-    },
+    presentation,
+    selectedXfb,
   };
 }
 
 export function projectSmbTemporalSelectedXfb(temporal) {
+  const scanoutEvidenceVersion = temporalXfbScanoutEvidenceVersion(temporal);
   const { oracle } = verifySmbTemporalSelectedXfb(temporal);
-  return {
+  const projection = {
     capacity: SMB_TEMPORAL_XFB_CAPACITY,
-    frames: temporal.frames.map(projectTemporalSelectedXfbFrame),
+    frames: temporal.frames.map(frame => projectTemporalSelectedXfbFrame(
+      frame,
+      scanoutEvidenceVersion,
+    )),
     oracle,
   };
+  return scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2
+    ? { scanoutEvidenceVersion, ...projection }
+    : projection;
 }
 
 function firstDifference(expected, actual, path = "$.oracle") {
@@ -492,8 +710,13 @@ function fractionIsLess(left, right) {
 
 export function temporalXfbCalibrationVector(temporal) {
   const envelope = requireObject(temporal, "$.");
+  const scanoutEvidenceVersion = temporalXfbScanoutEvidenceVersion(envelope);
   const capacity = requirePositiveInteger(envelope.capacity, "$.capacity");
-  const frames = validateTemporalSelectedXfbFrames(envelope.frames, capacity);
+  const frames = validateTemporalSelectedXfbFrames(
+    envelope.frames,
+    capacity,
+    scanoutEvidenceVersion,
+  );
   const oracle = deriveTemporalSelectedXfbOracle(frames, capacity);
   const perFrame = frames.map((frame, index) => {
     const selected = frame.selectedXfb;
@@ -538,8 +761,10 @@ export function temporalXfbCalibrationVector(temporal) {
   }
   const generations = perFrame.map(frame => frame.generation);
   const copyIndices = perFrame.map(frame => frame.copyIndex);
-  return {
-    schema: "lazuli-temporal-xfb-calibration-vector-v1",
+  const vector = {
+    schema: scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2
+      ? "lazuli-temporal-xfb-calibration-vector-v2"
+      : "lazuli-temporal-xfb-calibration-vector-v1",
     capacity,
     captured: frames.length,
     distinctRgbaHashes: oracle.distinctRgbaHashes,
@@ -560,14 +785,20 @@ export function temporalXfbCalibrationVector(temporal) {
     exactBlackWhiteAlternation: oracle.blackWhiteAlternating,
     frames: perFrame,
   };
+  if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2) {
+    vector.scanoutEvidenceVersion = scanoutEvidenceVersion;
+  }
+  return vector;
 }
 
 export function verifySmbTemporalSelectedXfb(temporal) {
   const envelope = requireObject(temporal, "$.");
+  const scanoutEvidenceVersion = temporalXfbScanoutEvidenceVersion(envelope);
   requireExact(envelope.capacity, SMB_TEMPORAL_XFB_CAPACITY, "$.capacity");
   const frames = validateTemporalSelectedXfbFrames(
     envelope.frames,
     SMB_TEMPORAL_XFB_CAPACITY,
+    scanoutEvidenceVersion,
   );
   const derived = deriveTemporalSelectedXfbOracle(frames, SMB_TEMPORAL_XFB_CAPACITY);
   if (derived.blackWhiteAlternating) {
@@ -581,6 +812,7 @@ export function verifySmbTemporalSelectedXfb(temporal) {
   }
   compareTemporalSelectedXfbOracle(envelope.oracle, derived);
   return {
+    scanoutEvidenceVersion,
     oracle: derived,
     calibration: temporalXfbCalibrationVector(envelope),
   };

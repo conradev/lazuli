@@ -159,7 +159,15 @@ test("pending compositor frames use an exact pinned CDP canvas screenshot", asyn
   assert.equal(capture.baselineLayout, null);
   assert.strictEqual(capture.viewport, geometry.viewport);
   let acknowledged = null;
-  const pending = descriptor(geometry);
+  const pending = {
+    ...descriptor(geometry),
+    protocol: "lazuli-compositor-capture-v2",
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0x0a00,
+    sourceRowStep: 2,
+    fieldHeight: 224,
+    rowRepeat: 2,
+  };
   const evidence = await capturePendingCompositorFrame(
     session,
     capture,
@@ -233,7 +241,7 @@ test("pending compositor frames use an exact pinned CDP canvas screenshot", asyn
     loaderId: "loader-fresh",
     oracle: null,
     oraclePassed: false,
-    protocol: "lazuli-compositor-capture-v1",
+    protocol: "lazuli-compositor-capture-v2",
     schemaValid: false,
     target: "#display",
     url: runUrl,

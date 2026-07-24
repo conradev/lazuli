@@ -133,6 +133,30 @@ function validReport() {
   };
 }
 
+function validV2Report() {
+  const report = validReport();
+  report.headlessCapture.compositor.protocol = "lazuli-compositor-capture-v2";
+  report.rendering.temporalSelectedXfb.scanoutEvidenceVersion = 2;
+  const scanout = {
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0x0a00,
+    sourceRowStep: 2,
+    fieldHeight: 224,
+    rowRepeat: 2,
+  };
+  for (let index = 0; index < 8; index += 1) {
+    Object.assign(report.headlessCapture.compositor.frames[index].descriptor, {
+      protocol: "lazuli-compositor-capture-v2",
+      ...scanout,
+    });
+    Object.assign(
+      report.rendering.temporalSelectedXfb.frames[index].presentedSurface,
+      scanout,
+    );
+  }
+  return report;
+}
+
 test("eight exact compositor screenshots join terminal surface content", () => {
   const report = validReport();
   const oracle = verifyCompositorCaptureReport(report, { compositorCapture: true });
@@ -154,6 +178,21 @@ test("eight exact compositor screenshots join terminal surface content", () => {
       report.rendering.temporalSelectedXfb.frames,
     ),
     oracle,
+  );
+});
+
+test("v2 compositor evidence binds exact scanout provenance while v1 remains replayable", () => {
+  const legacy = validReport();
+  assert.doesNotThrow(() => verifyCompositorCaptureReport(legacy, { compositorCapture: true }));
+
+  const current = validV2Report();
+  assert.doesNotThrow(() => verifyCompositorCaptureReport(current, { compositorCapture: true }));
+
+  const mismatched = validV2Report();
+  mismatched.rendering.temporalSelectedXfb.frames[0].presentedSurface.sourceRowStep = 1;
+  assert.throws(
+    () => verifyCompositorCaptureReport(mismatched, { compositorCapture: true }),
+    /descriptor\.sourceRowStep/,
   );
 });
 
