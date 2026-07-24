@@ -127,6 +127,202 @@ pub(crate) const fn gx_non_aa_raster_sample_12(pixel_x: u16, pixel_y: u16) -> Gx
     }
 }
 
+fn gx_non_aa_raster_sample_coordinate(pixel: i32) -> f32 {
+    let numerator = i64::from(pixel) * i64::from(GX_NON_AA_SAMPLE_DENOMINATOR)
+        + i64::from(GX_NON_AA_SAMPLE_NUMERATOR);
+    numerator as f32 / GX_NON_AA_SAMPLE_DENOMINATOR as f32
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxRasterAttributeError {
+    NonFinitePosition,
+    NonFiniteAttribute,
+    DegenerateTriangle,
+    PlaneOverflow,
+    SampleOverflow,
+}
+
+impl fmt::Display for GxRasterAttributeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFinitePosition => write!(formatter, "non-finite GX attribute position"),
+            Self::NonFiniteAttribute => write!(formatter, "non-finite GX raster attribute"),
+            Self::DegenerateTriangle => write!(formatter, "degenerate GX attribute triangle"),
+            Self::PlaneOverflow => write!(formatter, "GX attribute plane arithmetic overflow"),
+            Self::SampleOverflow => write!(formatter, "GX attribute sample arithmetic overflow"),
+        }
+    }
+}
+
+impl std::error::Error for GxRasterAttributeError {}
+
+/// Screen-space slopes for one f32 GX raster attribute.
+///
+/// These are source-EFB derivatives. They intentionally do not consume the
+/// snapped 28.4 coverage coordinates: GX coverage and attribute evaluation
+/// share the 7/12 sample position, but their setup domains remain distinct.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GxRasterAttributeSlopesF32 {
+    dfdx: f32,
+    dfdy: f32,
+}
+
+impl GxRasterAttributeSlopesF32 {
+    pub(crate) const fn dfdx(self) -> f32 {
+        self.dfdx
+    }
+
+    pub(crate) const fn dfdy(self) -> f32 {
+        self.dfdy
+    }
+}
+
+/// A source-EFB f32 attribute plane evaluated at the exact GX non-AA sample.
+///
+/// Coefficient setup and final accumulation spell out Dolphin's f32 slope
+/// operation order. Sample-coordinate construction deliberately uses Lazuli's
+/// exact `(12 * pixel + 7) / 12` authority instead of Dolphin's approximate
+/// integer anchor and `0.495` offset. Keeping the intermediates separate
+/// prevents an algebraic rewrite or reassociation from moving a truncation
+/// boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GxRasterAttributePlaneF32 {
+    origin_x: f32,
+    origin_y: f32,
+    origin_value: f32,
+    slopes: GxRasterAttributeSlopesF32,
+}
+
+impl GxRasterAttributePlaneF32 {
+    pub(crate) fn from_screen_triangle(
+        positions: [[f32; 2]; 3],
+        attributes: [f32; 3],
+    ) -> Result<Self, GxRasterAttributeError> {
+        if positions
+            .into_iter()
+            .flatten()
+            .any(|coordinate| !coordinate.is_finite())
+        {
+            return Err(GxRasterAttributeError::NonFinitePosition);
+        }
+        if attributes
+            .into_iter()
+            .any(|attribute| !attribute.is_finite())
+        {
+            return Err(GxRasterAttributeError::NonFiniteAttribute);
+        }
+
+        let [[x0, y0], [x1, y1], [x2, y2]] = positions;
+        let [f0, f1, f2] = attributes;
+
+        let dx10 = x1 - x0;
+        let dx20 = x2 - x0;
+        let dy10 = y1 - y0;
+        let dy20 = y2 - y0;
+        let delta20 = f2 - f0;
+        let delta10 = f1 - f0;
+        if [dx10, dx20, dy10, dy20, delta20, delta10]
+            .into_iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(GxRasterAttributeError::PlaneOverflow);
+        }
+
+        let a_left = delta20 * dy10;
+        let a_right = delta10 * dy20;
+        let a = a_left - a_right;
+        let b_left = dx20 * delta10;
+        let b_right = dx10 * delta20;
+        let b = b_left - b_right;
+        let c_left = dx20 * dy10;
+        let c_right = dx10 * dy20;
+        let c = c_left - c_right;
+        if c == 0.0 {
+            return Err(GxRasterAttributeError::DegenerateTriangle);
+        }
+        if [a_left, a_right, a, b_left, b_right, b, c_left, c_right, c]
+            .into_iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(GxRasterAttributeError::PlaneOverflow);
+        }
+
+        let dfdx = a / c;
+        let dfdy = b / c;
+        if !dfdx.is_finite() || !dfdy.is_finite() {
+            return Err(GxRasterAttributeError::PlaneOverflow);
+        }
+
+        Ok(Self {
+            origin_x: x0,
+            origin_y: y0,
+            origin_value: f0,
+            slopes: GxRasterAttributeSlopesF32 { dfdx, dfdy },
+        })
+    }
+
+    pub(crate) const fn slopes(self) -> GxRasterAttributeSlopesF32 {
+        self.slopes
+    }
+
+    pub(crate) const fn origin_position(self) -> [f32; 2] {
+        [self.origin_x, self.origin_y]
+    }
+
+    pub(crate) const fn origin_value(self) -> f32 {
+        self.origin_value
+    }
+
+    pub(crate) fn sample_non_aa(
+        self,
+        pixel_x: i32,
+        pixel_y: i32,
+    ) -> Result<f32, GxRasterAttributeError> {
+        let sample_x = gx_non_aa_raster_sample_coordinate(pixel_x);
+        let sample_y = gx_non_aa_raster_sample_coordinate(pixel_y);
+        let dx = sample_x - self.origin_x;
+        let dy = sample_y - self.origin_y;
+        let x_term = self.slopes.dfdx * dx;
+        let y_term = self.slopes.dfdy * dy;
+        let x_value = self.origin_value + x_term;
+        let value = x_value + y_term;
+        if [sample_x, sample_y, dx, dy, x_term, y_term, x_value, value]
+            .into_iter()
+            .any(|component| !component.is_finite())
+        {
+            return Err(GxRasterAttributeError::SampleOverflow);
+        }
+        Ok(value)
+    }
+}
+
+/// Canonicalizes one screen-linear raster channel like the GX software path:
+/// clamp to the unsigned eight-bit range, then truncate toward zero.
+pub(crate) fn gx_raster_channel_u8(value: f32) -> u8 {
+    if !(value > 0.0) {
+        return 0;
+    }
+    if value >= u8::MAX as f32 {
+        return u8::MAX;
+    }
+    value as u8
+}
+
+/// Evaluates four screen-linear channels expressed in GX byte units, then
+/// clamps and truncates each result to the EFB's unsigned eight-bit domain.
+pub(crate) fn gx_non_aa_raster_color_rgba8(
+    planes: [GxRasterAttributePlaneF32; 4],
+    pixel_x: i32,
+    pixel_y: i32,
+) -> Result<[u8; 4], GxRasterAttributeError> {
+    Ok([
+        gx_raster_channel_u8(planes[0].sample_non_aa(pixel_x, pixel_y)?),
+        gx_raster_channel_u8(planes[1].sample_non_aa(pixel_x, pixel_y)?),
+        gx_raster_channel_u8(planes[2].sample_non_aa(pixel_x, pixel_y)?),
+        gx_raster_channel_u8(planes[3].sample_non_aa(pixel_x, pixel_y)?),
+    ])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GxRasterScissor {
     left: u16,

@@ -543,3 +543,209 @@ fn rational_bounds_are_exact_across_signed_and_extreme_coordinates() {
         );
     }
 }
+
+#[test]
+fn attribute_plane_interpolates_variable_depth_at_the_gx_sample() {
+    let plane = GxRasterAttributePlaneF32::from_screen_triangle(
+        [[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]],
+        [16.25, 48.25, 80.25],
+    )
+    .unwrap();
+    assert_eq!(plane.slopes().dfdx(), 8.0);
+    assert_eq!(plane.slopes().dfdy(), 16.0);
+
+    let depth = plane.sample_non_aa(1, 2).unwrap();
+    assert_eq!(depth, 70.25);
+    assert_eq!(crate::gx_depth24_from_units(depth), 70);
+}
+
+#[test]
+fn attribute_plane_constructs_the_exact_rational_sample_before_rounding() {
+    let identity_x = GxRasterAttributePlaneF32::from_screen_triangle(
+        [[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]],
+        [0.0, 4.0, 0.0],
+    )
+    .unwrap();
+    let exact = 19.0_f32 / 12.0;
+    let separately_rounded = 1.0_f32 + 7.0_f32 / 12.0;
+    assert_eq!(
+        identity_x.sample_non_aa(1, 1).unwrap().to_bits(),
+        exact.to_bits()
+    );
+    assert_eq!(exact.to_bits(), 0x3fca_aaab);
+    assert_eq!(separately_rounded.to_bits(), 0x3fca_aaaa);
+}
+
+#[test]
+fn attribute_planes_interpolate_screen_linear_raster_channels() {
+    let positions = [[0.0, 0.0], [12.0, 0.0], [0.0, 12.0]];
+    let planes = [
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, [1.0, 241.0, 1.0]).unwrap(),
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, [2.0, 2.0, 122.0]).unwrap(),
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, [3.0, 123.0, 243.0]).unwrap(),
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, [255.0, 255.0, 255.0]).unwrap(),
+    ];
+
+    assert_eq!(planes[0].slopes().dfdx(), 20.0);
+    assert_eq!(planes[0].slopes().dfdy(), 0.0);
+    assert_eq!(planes[1].slopes().dfdx(), 0.0);
+    assert_eq!(planes[1].slopes().dfdy(), 10.0);
+    assert_eq!(planes[2].slopes().dfdx(), 10.0);
+    assert_eq!(planes[2].slopes().dfdy(), 20.0);
+    assert_eq!(
+        gx_non_aa_raster_color_rgba8(planes, 2, 3).unwrap(),
+        [52, 37, 100, 255],
+    );
+}
+
+#[test]
+fn attribute_plane_pins_f32_slope_and_evaluation_order() {
+    let plane = GxRasterAttributePlaneF32::from_screen_triangle(
+        [[7.0, 85.0], [-20.0, 29.0], [40.0, 70.0]],
+        [-418.0, -313.0, 792.0],
+    )
+    .unwrap();
+
+    assert_eq!(plane.origin_position(), [7.0, 85.0]);
+    assert_eq!(plane.origin_value(), -418.0);
+    assert_eq!(plane.slopes().dfdx().to_bits(), 0x41eb_02d7);
+    assert_eq!(plane.slopes().dfdy().to_bits(), 0xc180_4f15);
+    let value = plane.sample_non_aa(21, 77).unwrap();
+    assert_eq!(value.to_bits(), 0x4301_5bd3);
+
+    // Adding the Y term before the X term produces the adjacent f32. This
+    // guards the setup's documented `f0 + dfdx*dx + dfdy*dy` association.
+    let sample_x = 259.0_f32 / 12.0;
+    let sample_y = 931.0_f32 / 12.0;
+    let dx = sample_x - 7.0;
+    let dy = sample_y - 85.0;
+    let x_term = plane.slopes().dfdx() * dx;
+    let y_term = plane.slopes().dfdy() * dy;
+    let reordered = (-418.0_f32 + y_term) + x_term;
+    assert_eq!(reordered.to_bits(), 0x4301_5bd2);
+    assert_ne!(value.to_bits(), reordered.to_bits());
+}
+
+#[test]
+fn attribute_plane_pins_f32_setup_operation_order() {
+    let positions = [
+        [f32::from_bits(0xc399_437a), f32::from_bits(0x43a3_da19)],
+        [f32::from_bits(0xc35e_e365), f32::from_bits(0xc41a_fc1b)],
+        [f32::from_bits(0x4383_b6b4), f32::from_bits(0xc289_dde7)],
+    ];
+    let attributes = [
+        f32::from_bits(0xc462_8780),
+        f32::from_bits(0xc366_9b6b),
+        f32::from_bits(0xc44c_6bed),
+    ];
+    let plane = GxRasterAttributePlaneF32::from_screen_triangle(positions, attributes).unwrap();
+
+    assert_eq!(plane.slopes().dfdx().to_bits(), 0xbeb9_f848);
+    assert_eq!(plane.slopes().dfdy().to_bits(), 0xbf3e_b119);
+
+    // A single rounding after each multiply-subtract gives different slope
+    // bits. The GX reference sequence rounds both products before subtraction.
+    let [[x0, y0], [x1, y1], [x2, y2]] = positions;
+    let [f0, f1, f2] = attributes;
+    let dx10 = x1 - x0;
+    let dx20 = x2 - x0;
+    let dy10 = y1 - y0;
+    let dy20 = y2 - y0;
+    let delta20 = f2 - f0;
+    let delta10 = f1 - f0;
+    let single_round_a =
+        (f64::from(delta20) * f64::from(dy10) - f64::from(delta10) * f64::from(dy20)) as f32;
+    let single_round_b =
+        (f64::from(dx20) * f64::from(delta10) - f64::from(dx10) * f64::from(delta20)) as f32;
+    let single_round_c =
+        (f64::from(dx20) * f64::from(dy10) - f64::from(dx10) * f64::from(dy20)) as f32;
+    assert_eq!((single_round_a / single_round_c).to_bits(), 0xbeb9_f846);
+    assert_eq!((single_round_b / single_round_c).to_bits(), 0xbf3e_b117);
+}
+
+#[test]
+fn raster_channel_conversion_clamps_then_truncates() {
+    for (value, expected) in [
+        (f32::NEG_INFINITY, 0),
+        (-1.0, 0),
+        (-0.0, 0),
+        (0.0, 0),
+        (0.999, 0),
+        (1.999, 1),
+        (254.999, 254),
+        (255.0, 255),
+        (300.0, 255),
+        (f32::INFINITY, 255),
+        (f32::NAN, 0),
+    ] {
+        assert_eq!(gx_raster_channel_u8(value), expected, "{value:?}");
+    }
+}
+
+#[test]
+fn attribute_plane_rejects_nonfinite_overflow_and_degenerate_inputs() {
+    let positions = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+    for coordinate in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(
+            GxRasterAttributePlaneF32::from_screen_triangle(
+                [[coordinate, 0.0], positions[1], positions[2]],
+                [0.0, 1.0, 2.0],
+            ),
+            Err(GxRasterAttributeError::NonFinitePosition),
+        );
+    }
+    for attribute in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(
+            GxRasterAttributePlaneF32::from_screen_triangle(positions, [attribute, 1.0, 2.0],),
+            Err(GxRasterAttributeError::NonFiniteAttribute),
+        );
+    }
+    assert_eq!(
+        GxRasterAttributePlaneF32::from_screen_triangle(
+            [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+            [0.0, 1.0, 2.0],
+        ),
+        Err(GxRasterAttributeError::DegenerateTriangle),
+    );
+    assert_eq!(
+        GxRasterAttributePlaneF32::from_screen_triangle(
+            [[f32::MAX, 0.0], [-f32::MAX, 0.0], [0.0, 1.0]],
+            [0.0, 1.0, 2.0],
+        ),
+        Err(GxRasterAttributeError::PlaneOverflow),
+    );
+
+    let sample_overflow =
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, [0.0, f32::MAX / 4.0, 0.0])
+            .unwrap();
+    assert_eq!(
+        sample_overflow.sample_non_aa(i32::MAX, 0),
+        Err(GxRasterAttributeError::SampleOverflow),
+    );
+
+    let signed_sample = GxRasterAttributePlaneF32::from_screen_triangle(
+        [[-4.0, -4.0], [4.0, -4.0], [-4.0, 4.0]],
+        [-10.0, 6.0, 14.0],
+    )
+    .unwrap();
+    assert_eq!(
+        signed_sample.sample_non_aa(-2, -1).unwrap().to_bits(),
+        0x40bd_5556,
+    );
+}
+
+#[test]
+fn gx_seven_twelfths_depth_plane_preserves_the_z101_seam() {
+    let plane = GxRasterAttributePlaneF32::from_screen_triangle(
+        [[0.0, 0.0], [1280.0, 0.0], [0.0, 1056.0]],
+        [94.25, 94.25 + 12.0 * 1280.0, 94.25],
+    )
+    .unwrap();
+    assert_eq!(plane.slopes().dfdx(), 12.0);
+    assert_eq!(plane.slopes().dfdy(), 0.0);
+
+    let gx_depth = plane.sample_non_aa(0, 0).unwrap();
+    assert_eq!(gx_depth, 101.25);
+    assert_eq!(crate::gx_depth24_from_units(gx_depth), 101);
+    assert_eq!(crate::gx_depth24_from_units(94.25 + 12.0 * 0.5), 100,);
+}
