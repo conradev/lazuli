@@ -22,11 +22,13 @@ pub(crate) const GX_TEXTURE_REFERENCE_ABSENT: u32 = u32::MAX;
 const GX_PACKET_VERSION_V2: u16 = 2;
 const GX_PACKET_VERSION_V3: u16 = 3;
 const GX_PACKET_VERSION_V5: u16 = 5;
+const GX_PACKET_VERSION_V6: u16 = 6;
 const GX_DRAW_RECORD_BYTES_V2: u16 = 128;
 const PACKET_ALIGNMENT: u32 = 16;
 const COPY_FLAG_CLEAR: u32 = 1;
 const DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE: u16 = 1;
 const DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE: u16 = 1 << 1;
+const DRAW_FLAG_EXACT_CLIP_REQUIRED: u16 = 1 << 2;
 const EXACT_CLIP_INPUT_ENCODING_F32_V1: u32 = 1;
 const EXACT_CLIP_STATE_BYTES: u32 = 48;
 const EXACT_CLIP_VERTEX_BYTES: u32 = 16;
@@ -156,6 +158,7 @@ pub(crate) struct GxDrawRecord {
     pub(crate) textures: [GxTextureSlot; MAX_TEV_TEXTURES],
     pub(crate) fragment_tail: GxFragmentTailState,
     pub(crate) post_cull_actions: Option<Vec<GxTriangleAction>>,
+    pub(crate) exact_clip_required: bool,
     exact_clip: Option<GxExactClipRecord>,
 }
 
@@ -278,7 +281,8 @@ impl<'a> GxFramePacket<'a> {
         let version = read_u16(bytes, 0x04);
         let draw_record_bytes = match version {
             GX_PACKET_VERSION_V2 => GX_DRAW_RECORD_BYTES_V2,
-            GX_PACKET_VERSION_V3 | GX_PACKET_VERSION | GX_PACKET_VERSION_V5 => GX_DRAW_RECORD_BYTES,
+            GX_PACKET_VERSION_V3 | GX_PACKET_VERSION | GX_PACKET_VERSION_V5
+            | GX_PACKET_VERSION_V6 => GX_DRAW_RECORD_BYTES,
             _ => return Err(GxPacketError::UnsupportedVersion(version)),
         };
         expect_u16(
@@ -454,7 +458,10 @@ impl<'a> GxFramePacket<'a> {
         ] {
             expect_u32(field, actual, expected)?;
         }
-        if matches!(version, GX_PACKET_VERSION | GX_PACKET_VERSION_V5) {
+        if matches!(
+            version,
+            GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6
+        ) {
             if packet_bytes < packet_base_bytes {
                 return Err(GxPacketError::SectionOutOfBounds("base packet"));
             }
@@ -517,6 +524,7 @@ impl<'a> GxFramePacket<'a> {
         let mut evidence_tail_bytes = 0u32;
         let mut exact_clip_tail_bytes = 0u32;
         let mut exact_clip_draw_count = 0u32;
+        let mut required_exact_clip_draw_count = 0u32;
         let mut exact_clip_draws = Vec::with_capacity(to_usize(draw_count));
         for draw_index in 0..to_usize(draw_count) {
             let record_offset =
@@ -549,6 +557,23 @@ impl<'a> GxFramePacket<'a> {
                         ));
                     }
                 }
+                GX_PACKET_VERSION_V6 => {
+                    let required_exact =
+                        DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE | DRAW_FLAG_EXACT_CLIP_REQUIRED;
+                    if ![
+                        0,
+                        DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE,
+                        DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE,
+                        required_exact,
+                    ]
+                    .contains(&draw_flags)
+                    {
+                        return Err(GxPacketError::InvalidField {
+                            field: "draw flags",
+                            value: u64::from(draw_flags),
+                        });
+                    }
+                }
                 GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => {
                     expect_u16("draw flags", draw_flags, 0)?;
                 }
@@ -570,6 +595,7 @@ impl<'a> GxFramePacket<'a> {
             let has_post_cull_actions =
                 draw_flags & DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE != 0;
             let has_exact_clip_input = draw_flags & DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE != 0;
+            let exact_clip_required = draw_flags & DRAW_FLAG_EXACT_CLIP_REQUIRED != 0;
             if has_post_cull_actions {
                 let triangle_count = source_triangle_count(topology, vertex_count);
                 if triangle_count == 0 {
@@ -607,6 +633,13 @@ impl<'a> GxFramePacket<'a> {
                 )?;
                 exact_clip_draw_count =
                     checked_add(exact_clip_draw_count, 1, "exact clip draw count")?;
+                if exact_clip_required {
+                    required_exact_clip_draw_count = checked_add(
+                        required_exact_clip_draw_count,
+                        1,
+                        "required exact clip draw count",
+                    )?;
+                }
             }
             exact_clip_draws.push(has_exact_clip_input);
             let vertex_relative_offset = read_u32(record, 0x08);
@@ -745,7 +778,10 @@ impl<'a> GxFramePacket<'a> {
                 texture: None,
                 sampler_bits: 0,
             }; MAX_TEV_TEXTURES];
-            let sampler_bits_mask = if matches!(version, GX_PACKET_VERSION | GX_PACKET_VERSION_V5) {
+            let sampler_bits_mask = if matches!(
+                version,
+                GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6
+            ) {
                 SAMPLER_BITS_MASK_V4
             } else {
                 SAMPLER_BITS_MASK_V3
@@ -820,6 +856,7 @@ impl<'a> GxFramePacket<'a> {
                 textures: texture_slots,
                 fragment_tail,
                 post_cull_actions: has_post_cull_actions.then(Vec::new),
+                exact_clip_required,
                 exact_clip: None,
             });
         }
@@ -843,7 +880,9 @@ impl<'a> GxFramePacket<'a> {
         )?;
         let exact_clip_start = match version {
             GX_PACKET_VERSION => align_packet(evidence_end, "post-cull evidence padding")?,
-            GX_PACKET_VERSION_V5 => align_packet(evidence_end, "exact clip input alignment")?,
+            GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 => {
+                align_packet(evidence_end, "exact clip input alignment")?
+            }
             GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => evidence_end,
             _ => unreachable!("validated LZGX packet version"),
         };
@@ -854,6 +893,18 @@ impl<'a> GxFramePacket<'a> {
                 if exact_clip_draw_count == 0 {
                     return Err(GxPacketError::NonCanonical(
                         "version 5 requires at least one exact clip input",
+                    ));
+                }
+                checked_add(
+                    exact_clip_start,
+                    exact_clip_tail_bytes,
+                    "exact clip input end",
+                )?
+            }
+            GX_PACKET_VERSION_V6 => {
+                if required_exact_clip_draw_count == 0 {
+                    return Err(GxPacketError::NonCanonical(
+                        "version 6 requires at least one required exact clip input",
                     ));
                 }
                 checked_add(
@@ -903,7 +954,7 @@ impl<'a> GxFramePacket<'a> {
             evidence_offset = chunk_end;
         }
         debug_assert_eq!(evidence_offset, to_usize(evidence_end));
-        if version == GX_PACKET_VERSION_V5 {
+        if matches!(version, GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6) {
             require_zero(bytes, evidence_offset, to_usize(exact_clip_start))?;
 
             let mut exact_clip_offset = exact_clip_start;
@@ -1759,6 +1810,32 @@ mod tests {
         bytes
     }
 
+    fn promote_v5_to_v6(mut bytes: Vec<u8>, required_draws: &[usize]) -> Vec<u8> {
+        assert_eq!(read_u16(&bytes, 0x04), GX_PACKET_VERSION_V5);
+        assert!(!required_draws.is_empty());
+        let draw_count = read_u32(&bytes, 0x14) as usize;
+        let draw_table_offset = read_u32(&bytes, 0x1c) as usize;
+        let draw_record_bytes = read_u16(&bytes, 0x78) as usize;
+        let mut previous_draw = None;
+        for draw_index in required_draws {
+            assert!(*draw_index < draw_count);
+            assert!(previous_draw.is_none_or(|previous| previous < *draw_index));
+            previous_draw = Some(*draw_index);
+            let flags_offset = draw_table_offset + draw_index * draw_record_bytes + 0x02;
+            assert_eq!(
+                read_u16(&bytes, flags_offset),
+                DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE
+            );
+            put_u16(
+                &mut bytes,
+                flags_offset,
+                DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE | DRAW_FLAG_EXACT_CLIP_REQUIRED,
+            );
+        }
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V6);
+        bytes
+    }
+
     fn textured_xfb_copy() -> Vec<u8> {
         let mut bytes = vec![0; V3_PACKET_BYTES];
         bytes[0..4].copy_from_slice(b"LZGX");
@@ -2175,11 +2252,7 @@ mod tests {
         );
 
         let mut reserved = v4;
-        put_u32(
-            &mut reserved,
-            V3_DRAW_OFFSET + 0x34,
-            sampler | (1 << 18),
-        );
+        put_u32(&mut reserved, V3_DRAW_OFFSET + 0x34, sampler | (1 << 18));
         assert_eq!(
             GxFramePacket::parse(&reserved).unwrap_err(),
             GxPacketError::InvalidSampler {
@@ -2473,6 +2546,7 @@ mod tests {
         let draw = packet.draw(0).unwrap();
         let exact = draw.exact_clip_input.unwrap();
         assert_eq!(draw.record.post_cull_actions, None);
+        assert!(!draw.record.exact_clip_required);
         assert_eq!(exact.state, state);
         assert_eq!(
             exact.state.viewport(),
@@ -2551,6 +2625,90 @@ mod tests {
         let second = packet.draw(1).unwrap().exact_clip_input.unwrap();
         assert_eq!(second.state, second_state);
         assert_eq!(second.positions().collect::<Vec<_>>(), second_positions);
+    }
+
+    #[test]
+    fn v6_accepts_only_the_four_canonical_draw_flag_states() {
+        let action = [GxTriangleAction::Keep012];
+        let positions = exact_clip_positions();
+        let v5 = promote_v4_to_v5(
+            v4_texture_copy(&[
+                (2, 0, 3, None),
+                (2, 0, 3, Some(&action)),
+                (2, 0, 3, None),
+                (2, 0, 3, None),
+            ]),
+            &[
+                (2, exact_clip_state(0), &positions),
+                (3, exact_clip_state(0), &positions),
+            ],
+        );
+        let bytes = promote_v5_to_v6(v5, &[3]);
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+
+        let absent = packet.draw(0).unwrap();
+        assert!(absent.record.post_cull_actions.is_none());
+        assert!(absent.exact_clip_input.is_none());
+        assert!(!absent.record.exact_clip_required);
+
+        let post_cull = packet.draw(1).unwrap();
+        assert_eq!(
+            post_cull.record.post_cull_actions.as_deref(),
+            Some(action.as_slice())
+        );
+        assert!(post_cull.exact_clip_input.is_none());
+        assert!(!post_cull.record.exact_clip_required);
+
+        let optional = packet.draw(2).unwrap();
+        assert!(optional.exact_clip_input.is_some());
+        assert!(!optional.record.exact_clip_required);
+
+        let required = packet.draw(3).unwrap();
+        assert!(required.exact_clip_input.is_some());
+        assert!(required.record.exact_clip_required);
+    }
+
+    #[test]
+    fn v6_rejects_noncanonical_draw_flag_states() {
+        let positions = exact_clip_positions();
+        let valid = promote_v5_to_v6(
+            promote_v4_to_v5(
+                v4_texture_copy(&[(2, 0, 3, None), (2, 0, 3, None)]),
+                &[
+                    (0, exact_clip_state(0), &positions),
+                    (1, exact_clip_state(0), &positions),
+                ],
+            ),
+            &[1],
+        );
+
+        for draw_flags in [3, 4, 5, 7, 8, u16::MAX] {
+            let mut invalid = valid.clone();
+            put_u16(&mut invalid, V3_DRAW_OFFSET + 0x02, draw_flags);
+            assert_eq!(
+                GxFramePacket::parse(&invalid).unwrap_err(),
+                GxPacketError::InvalidField {
+                    field: "draw flags",
+                    value: u64::from(draw_flags),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn v6_requires_at_least_one_required_exact_draw() {
+        let positions = exact_clip_positions();
+        let mut bytes = promote_v4_to_v5(
+            single_draw_v4_texture_copy(2, 0, 3, None),
+            &[(0, exact_clip_state(0), &positions)],
+        );
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V6);
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::NonCanonical(
+                "version 6 requires at least one required exact clip input"
+            )
+        );
     }
 
     #[test]
@@ -2949,10 +3107,10 @@ mod tests {
     #[test]
     fn rejects_unknown_packet_version() {
         let mut bytes = textured_xfb_copy();
-        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V5 + 1);
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V6 + 1);
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
-            GxPacketError::UnsupportedVersion(GX_PACKET_VERSION_V5 + 1)
+            GxPacketError::UnsupportedVersion(GX_PACKET_VERSION_V6 + 1)
         );
     }
 

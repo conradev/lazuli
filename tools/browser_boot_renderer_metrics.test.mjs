@@ -436,13 +436,25 @@ test("draw transport is counted before empty, clipped, and culled exits", () => 
   const push = rendererSource.slice(start, end);
   const record = push.indexOf("metrics.record_draw_transport");
   assert.notEqual(record, -1);
+  assert.ok(
+    push.indexOf("PreparedExactDraw::is_authoritative_noop", record)
+      < push.indexOf("let expanded = expanded_indices", record),
+    "authoritative no-op allocates native topology",
+  );
+  assert.ok(
+    push.indexOf("RendererHostPhase::TopologyExpansion", record)
+      < push.indexOf("let expanded = expanded_indices", record),
+    "topology expansion begins outside its timing phase",
+  );
   for (const exit of [
-    "if expanded.is_empty()",
-    "QualifiedExactDraw::is_empty",
+    "if expanded_vertex_count == 0",
+    "PreparedExactDraw::is_authoritative_noop",
+    "required_exact && early_depth != GxEarlyDepthPlan::FixedFunction",
     "let native_scissor = clipped_scissor",
+    "required_exact && exact_managed.is_none()",
     "if pipeline.cull == CullMode::All",
   ]) {
-    const position = push.indexOf(exit);
+    const position = push.indexOf(exit, record);
     assert.notEqual(position, -1, `missing ${exit}`);
     assert.ok(record < position, `${exit} precedes transport accounting`);
   }
