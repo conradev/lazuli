@@ -188,9 +188,10 @@ test("transforms and normalizes normals with the selected XF normal matrix", () 
   assertVector(transformed, [2 / length, 3 / length, 0]);
 });
 
-test("normal-source projective texgen preserves homogeneous STQ", () => {
+test("normal-source projective texgen scales post-transform ST but preserves Q", () => {
   const context = workerContext();
   const matrixIndex = 9;
+  const postIndex = 5;
   context.gxXfRegisters[0x103f] = 1;
   // Vec3 output, ABC1 input, transform texgen, source row 1 (normal).
   context.gxXfRegisters[0x1040] = 0x86;
@@ -199,6 +200,11 @@ test("normal-source projective texgen preserves homogeneous STQ", () => {
     [2, 0, 0, 0],
     [0, 3, 0, 0],
     [0, 0, 4, 1],
+  ]);
+  setXfMatrixRows(context, 0x500, postIndex, [
+    [1, 0, 1, 0],
+    [0, 1, -1, 0],
+    [0, 0, 2, 1],
   ]);
   const attributes = {
     position: [11, 12, 13],
@@ -209,9 +215,55 @@ test("normal-source projective texgen preserves homogeneous STQ", () => {
     rawTextureCoords: [[0.25, 0.75], ...Array(7).fill(null)],
   };
 
-  const result = context.gxTransformTexCoord(attributes, matrixIndex, 0);
-  assertVector(result, [2, 6, 13]);
-  assert.notDeepEqual(plain(result), [2 / 13, 6 / 13, 1]);
+  const unscaled = context.gxTransformTexCoord(attributes, matrixIndex, 0);
+  assertVector(unscaled, [2, 6, 13]);
+  assert.notDeepEqual(plain(unscaled), [2 / 13, 6 / 13, 1]);
+
+  context.gxXfRegisters[0x1012] = 1;
+  context.gxXfRegisters[0x1050] = postIndex;
+  context.gxBpRegisters[0x30] = 2;
+  context.gxBpRegisters[0x31] = 4;
+  const scaled = context.gxTransformTexCoord(attributes, matrixIndex, 0);
+  // Post-transform STQ is [15, -7, 27]. SU_SSIZE/SU_TSIZE then scale only
+  // S/T by their low-16-bit values plus one.
+  assertVector(scaled, [45, -35, 27]);
+  assert.notDeepEqual(plain(scaled), [45 / 27, -35 / 27, 1]);
+});
+
+test("BP texture-coordinate scales use low 16 bits and f32 multiplication", () => {
+  const context = workerContext();
+  const matrixIndex = 12;
+  const texgenIndex = 3;
+  context.gxXfRegisters[0x103f] = texgenIndex + 1;
+  // Vec2 output, AB11 input, transform texgen, source row 8 (texcoord 3).
+  context.gxXfRegisters[0x1040 + texgenIndex] = (8 << 7);
+  context.gxBpRegisters[0x30 + texgenIndex * 2] = 0xab0002;
+  context.gxBpRegisters[0x31 + texgenIndex * 2] = 0xcd0004;
+  setXfMatrixRows(context, 0, matrixIndex, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  const rawTextureCoords = Array(8).fill(null);
+  rawTextureCoords[3] = [0.1, -0.2];
+  const attributes = {
+    position: [0, 0, 0],
+    normal: null,
+    tangent: null,
+    binormal: null,
+    colors: [[1, 1, 1, 1], [1, 1, 1, 1]],
+    rawTextureCoords,
+  };
+
+  const result = context.gxTransformTexCoord(
+    attributes,
+    matrixIndex,
+    texgenIndex,
+  );
+  assert.equal(result[0], Math.fround(Math.fround(0.1) * 3));
+  assert.equal(result[1], Math.fround(Math.fround(-0.2) * 5));
+  assert.equal(result[2], 1);
+  assert.notEqual(result[0], 0.1 * 3);
 });
 
 test("vertex decode retains two independent raster color channels", () => {

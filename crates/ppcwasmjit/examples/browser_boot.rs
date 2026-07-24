@@ -6392,6 +6392,16 @@ const TEMPLATE: &str = r##"<!doctype html>
             + post2[2] * result[2] + post2[3],
         ];
       }
+      const scaleRegister = 0x30 + texgenIndex * 2;
+      result = [
+        Math.fround(
+          Math.fround(result[0]) * ((gxBpRegisters[scaleRegister] & 0xffff) + 1)
+        ),
+        Math.fround(
+          Math.fround(result[1]) * ((gxBpRegisters[scaleRegister + 1] & 0xffff) + 1)
+        ),
+        result[2],
+      ];
       if (!result.every(Number.isFinite)) return null;
       gxTexgenTransforms += 1;
       return result;

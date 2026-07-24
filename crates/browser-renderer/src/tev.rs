@@ -948,19 +948,55 @@ fn tev_to_bytes(value: vec4<f32>) -> vec4<i32> {
     return vec4<i32>(round(clamp(value, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0));
 }
 
+fn gx_native_normalized_uv(texture: texture_2d<f32>, texel_uv: vec2<f32>) -> vec2<f32> {
+    return texel_uv / vec2<f32>(textureDimensions(texture, 0));
+}
+
 fn tev_sample_texture(map: u32, stq: vec3<f32>) -> vec4<i32> {
     // Q remains part of the interpolant until the fragment stage.
     let uv = stq.xy / stq.z;
     var sampled = vec4<f32>(1.0);
     switch map & 7u {
-        case 0u: { sampled = textureSample(tev_texture0, tev_sampler0, uv); }
-        case 1u: { sampled = textureSample(tev_texture1, tev_sampler1, uv); }
-        case 2u: { sampled = textureSample(tev_texture2, tev_sampler2, uv); }
-        case 3u: { sampled = textureSample(tev_texture3, tev_sampler3, uv); }
-        case 4u: { sampled = textureSample(tev_texture4, tev_sampler4, uv); }
-        case 5u: { sampled = textureSample(tev_texture5, tev_sampler5, uv); }
-        case 6u: { sampled = textureSample(tev_texture6, tev_sampler6, uv); }
-        case 7u: { sampled = textureSample(tev_texture7, tev_sampler7, uv); }
+        case 0u: {
+            sampled = textureSample(
+                tev_texture0, tev_sampler0, gx_native_normalized_uv(tev_texture0, uv),
+            );
+        }
+        case 1u: {
+            sampled = textureSample(
+                tev_texture1, tev_sampler1, gx_native_normalized_uv(tev_texture1, uv),
+            );
+        }
+        case 2u: {
+            sampled = textureSample(
+                tev_texture2, tev_sampler2, gx_native_normalized_uv(tev_texture2, uv),
+            );
+        }
+        case 3u: {
+            sampled = textureSample(
+                tev_texture3, tev_sampler3, gx_native_normalized_uv(tev_texture3, uv),
+            );
+        }
+        case 4u: {
+            sampled = textureSample(
+                tev_texture4, tev_sampler4, gx_native_normalized_uv(tev_texture4, uv),
+            );
+        }
+        case 5u: {
+            sampled = textureSample(
+                tev_texture5, tev_sampler5, gx_native_normalized_uv(tev_texture5, uv),
+            );
+        }
+        case 6u: {
+            sampled = textureSample(
+                tev_texture6, tev_sampler6, gx_native_normalized_uv(tev_texture6, uv),
+            );
+        }
+        case 7u: {
+            sampled = textureSample(
+                tev_texture7, tev_sampler7, gx_native_normalized_uv(tev_texture7, uv),
+            );
+        }
         default: {}
     }
     return tev_to_bytes(sampled);
@@ -1858,6 +1894,27 @@ mod tests {
             shader.contains("values.primary = vec4<f32>(normalized_source.rgb, primary_alpha)")
         );
         assert!(shader.contains("values.secondary = normalized_source"));
+    }
+
+    #[test]
+    fn wgsl_native_texture_path_normalizes_texel_space_per_map() {
+        let shader = shader_source();
+        let native_start = shader.find("fn gx_native_normalized_uv(").unwrap();
+        let native_end = shader
+            .find("fn gx_managed_wrap_coord(")
+            .or_else(|| shader.find("fn tev_swizzle("))
+            .unwrap();
+        let native = &shader[native_start..native_end];
+        assert!(native.contains("let uv = stq.xy / stq.z"));
+        assert!(native.contains("return texel_uv / vec2<f32>(textureDimensions(texture, 0))"));
+        for map in 0..MAX_TEV_TEXTURES {
+            assert!(native.contains(&format!(
+                "tev_texture{map}, tev_sampler{map}, gx_native_normalized_uv(tev_texture{map}, uv)"
+            )));
+        }
+        assert_eq!(native.matches("textureSample(").count(), MAX_TEV_TEXTURES);
+        assert!(!native.contains("textureSampleLevel("));
+        assert!(!native.contains("textureLoad("));
     }
 
     #[test]
