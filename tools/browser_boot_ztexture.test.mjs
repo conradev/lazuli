@@ -94,6 +94,6 @@ test("LZGX v3 Z-texture tail selects late operation depth within canonical GX de
   assert.match(tev, /var raw_texture = vec4<i32>\(0\)/);
   assert.match(
     tev,
-    /texture_base = tev_sample_texture[\s\S]*raw_texture = texture_base[\s\S]*tev_swizzle\(texture_base/,
+    /texture_base\s*=\s*tev_sample_texture[\s\S]*raw_texture = texture_base[\s\S]*tev_swizzle\(texture_base/,
   );
 });

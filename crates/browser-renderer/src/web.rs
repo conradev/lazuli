@@ -341,9 +341,11 @@ struct DrawUniform {
     fog_range1: [u32; 4],
     fog_parameters0: [u32; 4],
     fog_parameters1: [u32; 4],
+    sampler_modes0: [u32; 4],
+    sampler_modes1: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<DrawUniform>() == 96);
+const _: () = assert!(std::mem::size_of::<DrawUniform>() == 128);
 
 impl DrawUniform {
     fn from_gx(
@@ -401,7 +403,15 @@ impl DrawUniform {
                 fog.parameters[3],
             ],
             fog_parameters1: [fog.parameters[4], 0, 0, 0],
+            sampler_modes0: [0; 4],
+            sampler_modes1: [0; 4],
         }
+    }
+
+    fn with_sampler_modes(mut self, sampler_modes: [u32; MAX_TEV_TEXTURES]) -> Self {
+        self.sampler_modes0.copy_from_slice(&sampler_modes[..4]);
+        self.sampler_modes1.copy_from_slice(&sampler_modes[4..]);
+        self
     }
 }
 
@@ -2186,6 +2196,8 @@ impl WebGpuRenderer {
             required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
         let required_coords =
             required_texture_coords(tev_state).map_err(|error| JsValue::from_str(&error))?;
+        let sampler_modes = std::array::from_fn(|map| textures[map].sampler);
+        let sampler_identities = sampler_modes.map(gx_sampler_identity);
         let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let fog = gx_fog_state(
@@ -2217,7 +2229,6 @@ impl WebGpuRenderer {
             && gx_raster_center_evidence(pixel_control)
                 == GxRasterCenterEvidence::KnownNonAntialiased
             && early_depth == GxEarlyDepthPlan::FixedFunction
-            && !required_maps.into_iter().any(|required| required)
             && fog == GxFogState::default()
             && z_texture.operation == GxZTextureOperation::Disabled)
             .then(|| managed_post_cull_indices(&expanded, managed_coverage_actions))
@@ -2230,6 +2241,8 @@ impl WebGpuRenderer {
                 early_depth,
                 required_maps,
                 required_coords,
+                sampler_modes,
+                sampler_identities,
                 fog,
                 z_texture,
                 source_vertices,
@@ -2252,7 +2265,8 @@ impl WebGpuRenderer {
             depth_encoding,
             pipeline.canonical_fragment_depth,
             fog,
-        );
+        )
+        .with_sampler_modes(sampler_modes);
         if pipeline.cull == CullMode::All {
             return Ok(());
         }
@@ -2338,8 +2352,6 @@ impl WebGpuRenderer {
                 SelectedTexture::White => TextureBindingIdentity::White,
             }
         });
-        let sampler_identities =
-            std::array::from_fn(|map| gx_sampler_identity(textures[map].sampler));
         let binding_key = TevBindingKey {
             textures: texture_identities,
             samplers: sampler_identities,
@@ -3979,6 +3991,24 @@ fn managed_coverage_texture_coord(
     live.next().is_none().then_some(selected)
 }
 
+fn managed_coverage_samplers_are_safe(
+    required_maps: [bool; MAX_TEV_TEXTURES],
+    sampler_modes: [u32; MAX_TEV_TEXTURES],
+    sampler_identities: [SamplerIdentity; MAX_TEV_TEXTURES],
+) -> bool {
+    // LZGX v4 transports mode0's wrap/filter byte plus max-anisotropy bits.
+    required_maps
+        .into_iter()
+        .zip(sampler_modes)
+        .zip(sampler_identities)
+        .all(|((required, mode), identity)| {
+            !required
+                || ((mode & 0x60) == 0
+                    && (mode & (3 << 19)) == 0
+                    && identity.mag_filter == identity.min_filter)
+        })
+}
+
 const MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD: [[f32; 3]; 6] = [
     [0.0, 1.0, 0.0],
     [0.0, 0.0, 1.0],
@@ -3987,6 +4017,18 @@ const MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD: [[f32; 3]; 6] = [
     [0.0, 0.0, 0.0],
     [1.0, 1.0, 1.0],
 ];
+const GX_MANAGED_S17_7_RAW_LIMIT: f32 = 8_388_608.0;
+
+fn managed_coverage_texel_uv_is_safe(uv: [f32; 2]) -> bool {
+    uv.into_iter().all(|component| {
+        let raw_s17_7 = component * 128.0;
+        // This is the exact f32 expression converted to i32 by managed WGSL.
+        // Restricting it to signed S17.7 also leaves ample headroom for the
+        // bilinear half-texel subtraction, arithmetic shifts, and base + 1.
+        raw_s17_7.is_finite()
+            && (-GX_MANAGED_S17_7_RAW_LIMIT..GX_MANAGED_S17_7_RAW_LIMIT).contains(&raw_s17_7)
+    })
+}
 
 fn managed_coverage_attribute_payload(
     source_vertices: &[f32],
@@ -4113,7 +4155,7 @@ fn managed_coverage_payload_is_safe(
             return false;
         }
         let uv = [s_over_w * projection, t_over_w * projection];
-        if uv.into_iter().any(|value| !value.is_finite()) {
+        if !managed_coverage_texel_uv_is_safe(uv) {
             return false;
         }
     }
@@ -4154,6 +4196,8 @@ fn managed_coverage_draw_is_safe(
     early_depth: GxEarlyDepthPlan,
     required_maps: [bool; MAX_TEV_TEXTURES],
     required_coords: [bool; MAX_TEV_TEXTURES],
+    sampler_modes: [u32; MAX_TEV_TEXTURES],
+    sampler_identities: [SamplerIdentity; MAX_TEV_TEXTURES],
     fog: GxFogState,
     z_texture: GxZTextureState,
     source_vertices: &[f32],
@@ -4167,7 +4211,7 @@ fn managed_coverage_draw_is_safe(
         || primitive != Primitive::Triangles
         || raster_center != GxRasterCenterEvidence::KnownNonAntialiased
         || early_depth != GxEarlyDepthPlan::FixedFunction
-        || required_maps.into_iter().any(|required| required)
+        || !managed_coverage_samplers_are_safe(required_maps, sampler_modes, sampler_identities)
         || fog != GxFogState::default()
         || z_texture.operation != GxZTextureOperation::Disabled
         || !expanded.len().is_multiple_of(3)
@@ -5129,15 +5173,16 @@ mod tests {
     use super::{
         BlendComponentState, CopyClearUniform, CullMode, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
-        DepthCommitPipelineKey, DrawUniform, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
-        GxRasterPoint28_4, GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4,
-        GxRasterWinding, MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD,
-        MANAGED_COVERAGE_VERTEX_ATTRIBUTES, ManagedCoverageEvidence, PipelineKey, Primitive,
-        REQUIRED_WEBGPU_FEATURES, ScissorRect, TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex,
-        alpha_blend_factor, blend_write_mask, browser_raster_position_correction,
-        color_blend_factor, depth_only_command_state, draw_depth_encoding, expanded_indices,
-        expanded_primitive_ranges, managed_coverage_attribute_payload,
-        managed_coverage_draw_is_safe, managed_coverage_payload_is_safe,
+        DepthCommitPipelineKey, DrawUniform, GX_MANAGED_S17_7_RAW_LIMIT,
+        GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxRasterPoint28_4, GxRasterScissor,
+        GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
+        MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
+        ManagedCoverageEvidence, PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES, ScissorRect,
+        TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex, alpha_blend_factor, blend_write_mask,
+        browser_raster_position_correction, color_blend_factor, depth_only_command_state,
+        draw_depth_encoding, expanded_indices, expanded_primitive_ranges,
+        managed_coverage_attribute_payload, managed_coverage_draw_is_safe,
+        managed_coverage_samplers_are_safe, managed_coverage_texel_uv_is_safe,
         managed_coverage_texture_coord, managed_coverage_triangle_vertices,
         managed_post_cull_indices, merge_contiguous_draw_range,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
@@ -5147,7 +5192,8 @@ mod tests {
     use crate::{
         GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState,
         GxRasterCenterEvidence, GxZTextureOperation, SamplerIdentity, TextureAddressMode,
-        TextureBindingIdentity, gx_destination_alpha_state, gx_z_texture_state,
+        TextureBindingIdentity, gx_destination_alpha_state, gx_sampler_identity,
+        gx_z_texture_state,
     };
 
     fn encoded_blend_mode(
@@ -5210,14 +5256,21 @@ mod tests {
         source
     }
 
-    fn qualifying_managed_draw(source: &[f32]) -> bool {
+    fn qualifying_managed_draw_with_textures(
+        source: &[f32],
+        required_maps: [bool; MAX_TEV_TEXTURES],
+        required_coords: [bool; MAX_TEV_TEXTURES],
+        sampler_modes: [u32; MAX_TEV_TEXTURES],
+    ) -> bool {
         managed_coverage_draw_is_safe(
             ManagedCoverageEvidence::TrustedPostCull,
             Primitive::Triangles,
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::FixedFunction,
-            [false; MAX_TEV_TEXTURES],
-            [false; MAX_TEV_TEXTURES],
+            required_maps,
+            required_coords,
+            sampler_modes,
+            sampler_modes.map(gx_sampler_identity),
             GxFogState::default(),
             gx_z_texture_state(0, 0, 0).unwrap(),
             source,
@@ -5231,30 +5284,12 @@ mod tests {
         )
     }
 
-    fn projective_payload_is_safe(source: &[f32], texture_coord: usize) -> bool {
-        let Some(payload) =
-            managed_coverage_attribute_payload(source, [0, 1, 2], Some(texture_coord))
-        else {
-            return false;
-        };
-        let mut points = [GxRasterPoint28_4::from_raw(0, 0); 3];
-        for (point, vertex) in points.iter_mut().zip(0..3) {
-            let offset = vertex * TEV_VERTEX_FLOATS;
-            let Ok(source_point) = GxRasterPoint28_4::from_efb(
-                source[offset],
-                source[offset + 1],
-                0,
-                0,
-            ) else {
-                return false;
-            };
-            *point = source_point;
-        }
-        managed_coverage_payload_is_safe(
-            payload,
-            points,
-            GxRasterScissor::new(0, 0, 640, 528, 0, 0).unwrap(),
-            true,
+    fn qualifying_managed_draw(source: &[f32]) -> bool {
+        qualifying_managed_draw_with_textures(
+            source,
+            [false; MAX_TEV_TEXTURES],
+            [false; MAX_TEV_TEXTURES],
+            [0; MAX_TEV_TEXTURES],
         )
     }
 
@@ -5450,20 +5485,16 @@ mod tests {
             width: 640,
             height: 528,
         };
-        let eligible = |primitive,
-                        raster_center,
-                        early_depth,
-                        required_maps,
-                        fog,
-                        z_texture,
-                        source: &[f32]| {
+        let eligible = |primitive, raster_center, early_depth, fog, z_texture, source: &[f32]| {
             managed_coverage_draw_is_safe(
                 ManagedCoverageEvidence::TrustedPostCull,
                 primitive,
                 raster_center,
                 early_depth,
-                required_maps,
                 [false; MAX_TEV_TEXTURES],
+                [false; MAX_TEV_TEXTURES],
+                [0; MAX_TEV_TEXTURES],
+                [gx_sampler_identity(0); MAX_TEV_TEXTURES],
                 fog,
                 z_texture,
                 source,
@@ -5478,6 +5509,8 @@ mod tests {
             GxEarlyDepthPlan::FixedFunction,
             [false; MAX_TEV_TEXTURES],
             [false; MAX_TEV_TEXTURES],
+            [0; MAX_TEV_TEXTURES],
+            [gx_sampler_identity(0); MAX_TEV_TEXTURES],
             GxFogState::default(),
             z_texture,
             &source,
@@ -5488,7 +5521,6 @@ mod tests {
             Primitive::Lines,
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::FixedFunction,
-            [false; MAX_TEV_TEXTURES],
             GxFogState::default(),
             z_texture,
             &source,
@@ -5497,7 +5529,6 @@ mod tests {
             Primitive::Triangles,
             GxRasterCenterEvidence::AmbiguousRgb565Z16,
             GxEarlyDepthPlan::FixedFunction,
-            [false; MAX_TEV_TEXTURES],
             GxFogState::default(),
             z_texture,
             &source,
@@ -5506,18 +5537,6 @@ mod tests {
             Primitive::Triangles,
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::PrimitiveOrdered,
-            [false; MAX_TEV_TEXTURES],
-            GxFogState::default(),
-            z_texture,
-            &source,
-        ));
-        let mut required_maps = [false; MAX_TEV_TEXTURES];
-        required_maps[3] = true;
-        assert!(!eligible(
-            Primitive::Triangles,
-            GxRasterCenterEvidence::KnownNonAntialiased,
-            GxEarlyDepthPlan::FixedFunction,
-            required_maps,
             GxFogState::default(),
             z_texture,
             &source,
@@ -5528,7 +5547,6 @@ mod tests {
             Primitive::Triangles,
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::FixedFunction,
-            [false; MAX_TEV_TEXTURES],
             fog,
             z_texture,
             &source,
@@ -5543,7 +5561,6 @@ mod tests {
             Primitive::Triangles,
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::FixedFunction,
-            [false; MAX_TEV_TEXTURES],
             GxFogState::default(),
             active_z_texture,
             &source,
@@ -5583,6 +5600,19 @@ mod tests {
         assert!(
             qualifying_managed_draw(&extrapolating_w),
             "unused projective reconstruction must not reject an untextured variable-W draw",
+        );
+        let mut required_maps = [false; MAX_TEV_TEXTURES];
+        required_maps[0] = true;
+        let mut required_coords = [false; MAX_TEV_TEXTURES];
+        required_coords[0] = true;
+        assert!(
+            !qualifying_managed_draw_with_textures(
+                &extrapolating_w,
+                required_maps,
+                required_coords,
+                [0; MAX_TEV_TEXTURES],
+            ),
+            "textured coverage must reject nonpositive reciprocal-W extrapolation",
         );
         let narrow = flat_triangle_source([[0.0, 0.0], [0.5, 0.0], [0.0, 1.0]]);
         assert!(
@@ -5649,7 +5679,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_projective_payload_packs_one_selected_coordinate_without_activation() {
+    fn managed_textured_coverage_accepts_one_live_coord_and_packs_projective_planes() {
         let mut source = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
         let widths = [1.0, 2.0, 4.0];
         let selected_stq = [[0.25, 0.5, 1.0], [2.0, 1.0, 2.0], [8.0, 4.0, 4.0]];
@@ -5660,12 +5690,28 @@ mod tests {
             source[offset + 12 + 2 * 3] += vertex as f32 * 17.0;
         }
 
+        let mut required_maps = [false; MAX_TEV_TEXTURES];
+        required_maps[3] = true;
+        required_maps[5] = true;
         let mut required_coords = [false; MAX_TEV_TEXTURES];
         required_coords[7] = true;
+        let mut sampler_modes = [0; MAX_TEV_TEXTURES];
+        sampler_modes[3] = 0x90;
+        sampler_modes[5] = 0;
+        assert!(
+            qualifying_managed_draw_with_textures(
+                &source,
+                required_maps,
+                required_coords,
+                sampler_modes,
+            ),
+            "multiple maps may share one live projective coordinate",
+        );
         assert_eq!(
             managed_coverage_texture_coord(required_coords),
             Some(Some(7))
         );
+
         let vertices = managed_coverage_triangle_vertices(
             &source,
             [0, 1, 2],
@@ -5678,7 +5724,7 @@ mod tests {
             },
         )
         .unwrap()
-        .expect("projective payload setup must survive independently of activation");
+        .expect("eligible textured face survives managed setup");
         let expected_payload = [
             [0.590, 4.0, 4.0],
             [0.0, 0.0, 4.0],
@@ -5709,22 +5755,72 @@ mod tests {
 
         required_coords[6] = true;
         assert_eq!(managed_coverage_texture_coord(required_coords), None);
+        assert!(
+            !qualifying_managed_draw_with_textures(
+                &source,
+                required_maps,
+                required_coords,
+                sampler_modes,
+            ),
+            "two live texture coordinates must stay on the native path",
+        );
+    }
+
+    #[test]
+    fn managed_textured_sampler_gate_accepts_only_matching_non_mip_filters() {
+        let mut required_maps = [false; MAX_TEV_TEXTURES];
+        required_maps[0] = true;
+
+        for mode in [0, 0x0f, 0x90, 0x9f] {
+            let mut modes = [0; MAX_TEV_TEXTURES];
+            modes[0] = mode;
+            let identities = modes.map(gx_sampler_identity);
+            assert!(managed_coverage_samplers_are_safe(
+                required_maps,
+                modes,
+                identities,
+            ));
+        }
+
+        for mode in [0x10, 0x20, 0x40, 0xb0, 0xd0, 1 << 19, 3 << 19] {
+            let mut modes = [0; MAX_TEV_TEXTURES];
+            modes[0] = mode;
+            let identities = modes.map(gx_sampler_identity);
+            assert!(
+                !managed_coverage_samplers_are_safe(required_maps, modes, identities),
+                "sampler mode {mode:#x} was admitted",
+            );
+        }
     }
 
     #[test]
     fn managed_projective_payload_rejects_invalid_planes_and_sampled_coordinates() {
+        let mut required_maps = [false; MAX_TEV_TEXTURES];
+        required_maps[0] = true;
+        let mut required_coords = [false; MAX_TEV_TEXTURES];
+        required_coords[0] = true;
+        let sampler_modes = [0; MAX_TEV_TEXTURES];
+        let eligible = |source: &[f32]| {
+            qualifying_managed_draw_with_textures(
+                source,
+                required_maps,
+                required_coords,
+                sampler_modes,
+            )
+        };
+
         let base = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
 
         let degenerate = flat_triangle_source([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]);
         assert!(
-            !projective_payload_is_safe(&degenerate, 0),
+            !eligible(&degenerate),
             "degenerate source plane was admitted"
         );
 
         let mut inverse_w_overflow = base.clone();
         inverse_w_overflow[3] = f32::from_bits(1);
         assert!(
-            !projective_payload_is_safe(&inverse_w_overflow, 0),
+            !eligible(&inverse_w_overflow),
             "overflowing reciprocal W was admitted",
         );
 
@@ -5733,7 +5829,7 @@ mod tests {
             vanishing_inverse_w[vertex * TEV_VERTEX_FLOATS + 3] = 2.0 / f32::EPSILON;
         }
         assert!(
-            !projective_payload_is_safe(&vanishing_inverse_w, 0),
+            !eligible(&vanishing_inverse_w),
             "reciprocal W below the conservative denominator margin was admitted",
         );
 
@@ -5742,14 +5838,14 @@ mod tests {
             vanishing_recovered_w[vertex * TEV_VERTEX_FLOATS + 3] = f32::EPSILON / 2.0;
         }
         assert!(
-            !projective_payload_is_safe(&vanishing_recovered_w, 0),
+            !eligible(&vanishing_recovered_w),
             "recovered W below the shader-normal margin was admitted",
         );
 
         let mut attribute_overflow = base.clone();
         attribute_overflow[TEV_VERTEX_FLOATS + 12] = f32::MAX;
         assert!(
-            !projective_payload_is_safe(&attribute_overflow, 0),
+            !eligible(&attribute_overflow),
             "overflowing attribute-plane arithmetic was admitted",
         );
 
@@ -5757,17 +5853,14 @@ mod tests {
         for vertex in 0..3 {
             zero_q[vertex * TEV_VERTEX_FLOATS + 14] = 0.0;
         }
-        assert!(
-            !projective_payload_is_safe(&zero_q, 0),
-            "zero projective Q was admitted"
-        );
+        assert!(!eligible(&zero_q), "zero projective Q was admitted");
 
         let mut vanishing_q = base.clone();
         for vertex in 0..3 {
             vanishing_q[vertex * TEV_VERTEX_FLOATS + 14] = f32::EPSILON / 2.0;
         }
         assert!(
-            !projective_payload_is_safe(&vanishing_q, 0),
+            !eligible(&vanishing_q),
             "projective Q below the conservative denominator margin was admitted",
         );
 
@@ -5778,7 +5871,7 @@ mod tests {
             vanishing_recovered_q[offset + 14] = f32::EPSILON * f32::EPSILON;
         }
         assert!(
-            !projective_payload_is_safe(&vanishing_recovered_q, 0),
+            !eligible(&vanishing_recovered_q),
             "recovered Q below the shader-normal margin was admitted",
         );
 
@@ -5787,7 +5880,7 @@ mod tests {
         changing_q_sign[TEV_VERTEX_FLOATS + 14] = -1.0;
         changing_q_sign[TEV_VERTEX_FLOATS * 2 + 14] = 1.0;
         assert!(
-            !projective_payload_is_safe(&changing_q_sign, 0),
+            !eligible(&changing_q_sign),
             "a Q plane crossing zero in the raster bounds was admitted",
         );
 
@@ -5798,9 +5891,25 @@ mod tests {
             overflowing_uv[offset + 14] = f32::MIN_POSITIVE;
         }
         assert!(
-            !projective_payload_is_safe(&overflowing_uv, 0),
+            !eligible(&overflowing_uv),
             "a finite STQ payload with overflowing sampled UV was admitted",
         );
+
+        let positive_s17_7_max =
+            f32::from_bits(GX_MANAGED_S17_7_RAW_LIMIT.to_bits().saturating_sub(1)) / 128.0;
+        assert!(managed_coverage_texel_uv_is_safe([
+            -GX_MANAGED_S17_7_RAW_LIMIT / 128.0,
+            positive_s17_7_max,
+        ]));
+        assert!(!managed_coverage_texel_uv_is_safe([
+            GX_MANAGED_S17_7_RAW_LIMIT / 128.0,
+            0.0,
+        ]));
+        assert!(!managed_coverage_texel_uv_is_safe([
+            f32::from_bits((-GX_MANAGED_S17_7_RAW_LIMIT).to_bits().saturating_add(1)) / 128.0,
+            0.0,
+        ]));
+        assert!(!managed_coverage_texel_uv_is_safe([f32::NAN, 0.0]));
     }
 
     #[test]
@@ -6254,6 +6363,35 @@ mod tests {
         );
         assert_eq!(no_alpha.fragment_flags, 0);
         assert_ne!(binding_key(inactive_a), binding_key(no_alpha));
+    }
+
+    #[test]
+    fn draw_uniform_transports_all_eight_sampler_words_into_the_binding_key() {
+        assert_eq!(std::mem::size_of::<DrawUniform>(), 128);
+        let sampler_modes = [
+            0x0000_0000,
+            0x0000_0011,
+            0x0000_0022,
+            0x0000_0033,
+            0x0000_0044,
+            0x0000_0055,
+            0x0000_0066,
+            0x0018_0097,
+        ];
+        let draw = DrawUniform::from_gx(
+            0,
+            gx_destination_alpha_state(0, 0, 0),
+            gx_z_texture_state(0, 0, 0).unwrap(),
+            GxEfbDepthEncoding::Z24,
+            false,
+            GxFogState::default(),
+        )
+        .with_sampler_modes(sampler_modes);
+        assert_eq!(draw.sampler_modes0, sampler_modes[..4]);
+        assert_eq!(draw.sampler_modes1, sampler_modes[4..]);
+
+        let different = draw.with_sampler_modes([0; MAX_TEV_TEXTURES]);
+        assert_ne!(binding_key(draw), binding_key(different));
     }
 
     #[test]

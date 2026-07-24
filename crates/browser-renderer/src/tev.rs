@@ -634,9 +634,11 @@ const _: () = {
 /// - bind this block at group 1;
 /// - upload one [`TevDrawState`] at binding 0;
 /// - bind texture maps 0..7 at bindings 1..8 and their samplers at 9..16;
-/// - call `tev_evaluate(raster_colors, tex_coords)` from a fragment entry point;
-/// - provide post-texture-matrix STQ coordinates; sampling performs `st / q` in
-///   the fragment stage so interpolation remains projective.
+/// - call `tev_evaluate(raster_colors, tex_coords, managed_exact_sampler)` from a
+///   fragment entry point;
+/// - provide GX-scaled, texel-space STQ coordinates; sampling performs `st / q`
+///   in the fragment stage so interpolation remains projective, then only the
+///   native hardware-sampler path normalizes by the selected map dimensions.
 pub(crate) const TEV_VERTEX_WGSL: &str = "enable dual_source_blending;
 
 struct DrawState {
@@ -649,6 +651,8 @@ struct DrawState {
     fog_range1: vec4<u32>,
     fog_parameters0: vec4<u32>,
     fog_parameters1: vec4<u32>,
+    sampler_modes0: vec4<u32>,
+    sampler_modes1: vec4<u32>,
 };
 
 struct TevVertexInput {
@@ -1045,7 +1049,7 @@ fn gx_native_normalized_uv(texture: texture_2d<f32>, texel_uv: vec2<f32>) -> vec
     return texel_uv / vec2<f32>(textureDimensions(texture, 0));
 }
 
-fn tev_sample_texture(map: u32, stq: vec3<f32>) -> vec4<i32> {
+fn tev_sample_texture_native(map: u32, stq: vec3<f32>) -> vec4<i32> {
     // Q remains part of the interpolant until the fragment stage.
     let uv = stq.xy / stq.z;
     var sampled = vec4<f32>(1.0);
@@ -1093,6 +1097,119 @@ fn tev_sample_texture(map: u32, stq: vec3<f32>) -> vec4<i32> {
         default: {}
     }
     return tev_to_bytes(sampled);
+}
+
+fn gx_managed_wrap_coord(coord: i32, wrap_mode: u32, image_size: i32) -> i32 {
+    let mask = image_size - 1;
+    switch wrap_mode & 3u {
+        case 1u: {
+            return coord & mask;
+        }
+        case 2u: {
+            var mirrored = coord;
+            if (mirrored & image_size) != 0 {
+                mirrored = ~mirrored;
+            }
+            return mirrored & mask;
+        }
+        default: {
+            // GX's reserved wrap value three follows the clamp path.
+            return clamp(coord, 0, mask);
+        }
+    }
+}
+
+fn gx_managed_texture_load_bytes(
+    texture: texture_2d<f32>,
+    coord: vec2<i32>,
+) -> vec4<u32> {
+    return vec4<u32>(tev_to_bytes(textureLoad(texture, coord, 0)));
+}
+
+fn gx_managed_sample_texture(
+    texture: texture_2d<f32>,
+    sampler_mode: u32,
+    uv: vec2<f32>,
+) -> vec4<i32> {
+    // Dolphin's software sampler first truncates each reconstructed coordinate
+    // to GX's signed S17.7 representation.
+    var s = i32(uv.x * 128.0);
+    var t = i32(uv.y * 128.0);
+    let image_size = vec2<i32>(textureDimensions(texture, 0));
+    let wrap_s = sampler_mode & 3u;
+    let wrap_t = (sampler_mode >> 2u) & 3u;
+
+    if (sampler_mode & (1u << 4u)) == 0u {
+        let image_s = gx_managed_wrap_coord(s >> 7, wrap_s, image_size.x);
+        let image_t = gx_managed_wrap_coord(t >> 7, wrap_t, image_size.y);
+        return vec4<i32>(
+            gx_managed_texture_load_bytes(texture, vec2<i32>(image_s, image_t)),
+        );
+    }
+
+    // GX centers its 7-bit bilinear kernel half a texel before choosing the
+    // integer base coordinates and weights.
+    s -= 64;
+    t -= 64;
+    let image_s0 = s >> 7;
+    let image_t0 = t >> 7;
+    let image_s1 = image_s0 + 1;
+    let image_t1 = image_t0 + 1;
+    let fract_s = u32(s & 0x7f);
+    let fract_t = u32(t & 0x7f);
+    let inverse_s = 128u - fract_s;
+    let inverse_t = 128u - fract_t;
+    let weight00 = inverse_s * inverse_t;
+    let weight10 = fract_s * inverse_t;
+    let weight01 = inverse_s * fract_t;
+    let weight11 = fract_s * fract_t;
+
+    let s0 = gx_managed_wrap_coord(image_s0, wrap_s, image_size.x);
+    let s1 = gx_managed_wrap_coord(image_s1, wrap_s, image_size.x);
+    let t0 = gx_managed_wrap_coord(image_t0, wrap_t, image_size.y);
+    let t1 = gx_managed_wrap_coord(image_t1, wrap_t, image_size.y);
+    let texel00 = gx_managed_texture_load_bytes(texture, vec2<i32>(s0, t0));
+    let texel10 = gx_managed_texture_load_bytes(texture, vec2<i32>(s1, t0));
+    let texel01 = gx_managed_texture_load_bytes(texture, vec2<i32>(s0, t1));
+    let texel11 = gx_managed_texture_load_bytes(texture, vec2<i32>(s1, t1));
+    let filtered =
+        texel00 * vec4<u32>(weight00) +
+        texel10 * vec4<u32>(weight10) +
+        texel01 * vec4<u32>(weight01) +
+        texel11 * vec4<u32>(weight11);
+    return vec4<i32>(filtered >> vec4<u32>(14u));
+}
+
+fn tev_sample_texture_managed(map: u32, uv: vec2<f32>) -> vec4<i32> {
+    switch map & 7u {
+        case 0u: {
+            return gx_managed_sample_texture(tev_texture0, draw_state.sampler_modes0.x, uv);
+        }
+        case 1u: {
+            return gx_managed_sample_texture(tev_texture1, draw_state.sampler_modes0.y, uv);
+        }
+        case 2u: {
+            return gx_managed_sample_texture(tev_texture2, draw_state.sampler_modes0.z, uv);
+        }
+        case 3u: {
+            return gx_managed_sample_texture(tev_texture3, draw_state.sampler_modes0.w, uv);
+        }
+        case 4u: {
+            return gx_managed_sample_texture(tev_texture4, draw_state.sampler_modes1.x, uv);
+        }
+        case 5u: {
+            return gx_managed_sample_texture(tev_texture5, draw_state.sampler_modes1.y, uv);
+        }
+        case 6u: {
+            return gx_managed_sample_texture(tev_texture6, draw_state.sampler_modes1.z, uv);
+        }
+        case 7u: {
+            return gx_managed_sample_texture(tev_texture7, draw_state.sampler_modes1.w, uv);
+        }
+        default: {
+            return vec4<i32>(255);
+        }
+    }
 }
 
 fn tev_swizzle(color: vec4<i32>, table_index: u32) -> vec4<i32> {
@@ -1259,6 +1376,7 @@ struct TevEvaluation {
 fn tev_evaluate(
     raster_colors: array<vec4<f32>, 8>,
     tex_coords: array<vec3<f32>, 8>,
+    managed_exact_sampler: bool,
 ) -> TevEvaluation {
     var registers = tev_state.color_registers;
     var raw_texture = vec4<i32>(0);
@@ -1272,7 +1390,14 @@ fn tev_evaluate(
         let tex_coord = (stage.refs >> 3u) & 7u;
         var texture_base = vec4<i32>(255);
         if (stage.refs & (1u << 6u)) != 0u {
-            texture_base = tev_sample_texture(texture_map, tex_coords[tex_coord]);
+            if managed_exact_sampler {
+                // Managed coverage has already reconstructed the single live UV
+                // coordinate with Dolphin's BuildBlock operation order.
+                texture_base =
+                    tev_sample_texture_managed(texture_map, tex_coords[tex_coord].xy);
+            } else {
+                texture_base = tev_sample_texture_native(texture_map, tex_coords[tex_coord]);
+            }
             raw_texture = texture_base;
         }
         let texture = tev_swizzle(texture_base, (stage.alpha_combiner >> 2u) & 3u);
@@ -1454,7 +1579,11 @@ fn gx_fog_color(source: vec4<u32>, position_x: f32, depth: u32) -> vec4<u32> {
     return vec4<u32>(rgb, source.a);
 }
 
-fn tev_fragment_values(input: TevVertexOutput, needs_fragment_depth: bool) -> TevFragmentValues {
+fn tev_fragment_values(
+    input: TevVertexOutput,
+    needs_fragment_depth: bool,
+    managed_exact_sampler: bool,
+) -> TevFragmentValues {
     let raster_colors = array<vec4<f32>, 8>(
         input.raster0, input.raster1,
         vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
@@ -1464,7 +1593,7 @@ fn tev_fragment_values(input: TevVertexOutput, needs_fragment_depth: bool) -> Te
         input.stq0, input.stq1, input.stq2, input.stq3,
         input.stq4, input.stq5, input.stq6, input.stq7,
     );
-    let evaluation = tev_evaluate(raster_colors, tex_coords);
+    let evaluation = tev_evaluate(raster_colors, tex_coords, managed_exact_sampler);
     let source = evaluation.source;
     let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0));
     if !alpha_test_passes(tev_alpha, draw_state.alpha_test) {
@@ -1508,7 +1637,7 @@ fn tev_fragment_values(input: TevVertexOutput, needs_fragment_depth: bool) -> Te
 
 @fragment
 fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
-    let values = tev_fragment_values(input, false);
+    let values = tev_fragment_values(input, false, false);
     var output: TevFragmentOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1517,7 +1646,7 @@ fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
 
 @fragment
 fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput {
-    let values = tev_fragment_values(input, true);
+    let values = tev_fragment_values(input, true, false);
     var output: TevFragmentDepthOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1531,7 +1660,7 @@ fn fs_managed_coverage_main(input: ManagedCoverageVertexOutput) -> TevFragmentOu
     if !gx_managed_coverage_passes(input) {
         discard;
     }
-    let values = tev_fragment_values(managed_coverage_tev_input(input), false);
+    let values = tev_fragment_values(managed_coverage_tev_input(input), false, true);
     var output: TevFragmentOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1545,7 +1674,7 @@ fn fs_managed_coverage_depth_main(
     if !gx_managed_coverage_passes(input) {
         discard;
     }
-    let values = tev_fragment_values(managed_coverage_tev_input(input), true);
+    let values = tev_fragment_values(managed_coverage_tev_input(input), true, true);
     var output: TevFragmentDepthOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1975,6 +2104,8 @@ mod tests {
         assert!(shader.contains(
             "struct DrawState {\n    alpha_test: u32,\n    destination_alpha: u32,\n    fragment_flags: u32,\n    z_texture: u32,\n    fog_control: vec4<u32>,"
         ));
+        assert!(shader.contains("sampler_modes0: vec4<u32>"));
+        assert!(shader.contains("sampler_modes1: vec4<u32>"));
         assert!(shader.contains(
             "struct TevFragmentOutput {\n    @location(0) @blend_src(0) primary: vec4<f32>,\n    @location(0) @blend_src(1) secondary: vec4<f32>,\n};"
         ));
@@ -2008,6 +2139,41 @@ mod tests {
         assert_eq!(native.matches("textureSample(").count(), MAX_TEV_TEXTURES);
         assert!(!native.contains("textureSampleLevel("));
         assert!(!native.contains("textureLoad("));
+    }
+
+    #[test]
+    fn wgsl_managed_texture_path_keeps_texel_space_and_samples_exactly() {
+        let shader = shader_source();
+        let managed_start = shader.find("fn gx_managed_wrap_coord(").unwrap();
+        let managed_end = shader[managed_start..].find("fn tev_swizzle(").unwrap() + managed_start;
+        let managed = &shader[managed_start..managed_end];
+        assert!(managed.contains("var s = i32(uv.x * 128.0)"));
+        assert!(managed.contains("var t = i32(uv.y * 128.0)"));
+        assert!(!managed.contains("uv / vec2<f32>"));
+        assert!(managed.contains("textureLoad(texture, coord, 0)"));
+        assert!(managed.contains("return coord & mask"));
+        assert!(managed.contains("if (mirrored & image_size) != 0"));
+        assert!(managed.contains("mirrored = ~mirrored"));
+        assert!(managed.contains("return clamp(coord, 0, mask)"));
+        assert!(managed.contains("s -= 64"));
+        assert!(managed.contains("t -= 64"));
+        assert!(managed.contains("let fract_s = u32(s & 0x7f)"));
+        assert!(managed.contains("let fract_t = u32(t & 0x7f)"));
+        assert!(managed.contains("filtered >> vec4<u32>(14u)"));
+        for (map, field) in [
+            (0, "sampler_modes0.x"),
+            (1, "sampler_modes0.y"),
+            (2, "sampler_modes0.z"),
+            (3, "sampler_modes0.w"),
+            (4, "sampler_modes1.x"),
+            (5, "sampler_modes1.y"),
+            (6, "sampler_modes1.z"),
+            (7, "sampler_modes1.w"),
+        ] {
+            assert!(managed.contains(&format!(
+                "gx_managed_sample_texture(tev_texture{map}, draw_state.{field}, uv)"
+            )));
+        }
     }
 
     #[test]
@@ -2089,10 +2255,15 @@ mod tests {
             .find("if !gx_managed_coverage_passes(input)")
             .unwrap();
         let tev = managed
-            .find("let values = tev_fragment_values(managed_coverage_tev_input(input), false)")
+            .find(
+                "let values = tev_fragment_values(managed_coverage_tev_input(input), false, true)",
+            )
             .unwrap();
         assert!(coverage_test < tev);
         assert!(managed.contains("fn fs_managed_coverage_depth_main"));
+        assert!(managed.contains(
+            "let values = tev_fragment_values(managed_coverage_tev_input(input), true, true)"
+        ));
     }
 
     #[test]
@@ -2124,7 +2295,7 @@ mod tests {
     fn wgsl_fragment_alpha_order_and_rgba6_quantization_are_exact() {
         let shader = shader_source();
         let evaluate = shader
-            .find("let evaluation = tev_evaluate(raster_colors, tex_coords)")
+            .find("let evaluation = tev_evaluate(raster_colors, tex_coords, managed_exact_sampler)")
             .unwrap();
         let source = shader.find("let source = evaluation.source").unwrap();
         let tev_alpha = shader
@@ -2182,9 +2353,13 @@ mod tests {
     fn wgsl_z_texture_uses_last_unswizzled_sample_and_current_depth_encoding() {
         let shader = shader_source();
         let initialize = shader.find("var raw_texture = vec4<i32>(0)").unwrap();
-        let sample = shader
-            .find("texture_base = tev_sample_texture(texture_map, tex_coords[tex_coord])")
+        let managed_sample = shader
+            .find("tev_sample_texture_managed(texture_map, tex_coords[tex_coord].xy)")
             .unwrap();
+        let native_sample = shader
+            .find("tev_sample_texture_native(texture_map, tex_coords[tex_coord])")
+            .unwrap();
+        let sample = managed_sample.min(native_sample);
         let retain = shader.find("raw_texture = texture_base").unwrap();
         let swizzle = shader
             .find("let texture = tev_swizzle(texture_base")
@@ -2202,8 +2377,10 @@ mod tests {
         assert!(shader.contains("let raster_depth = gx_raster_depth24(input.depth24)"));
         assert!(shader.contains("return u32(depth24)"));
         assert!(!shader.contains("u32(round(clamp(input.position.z, 0.0, 1.0) * 16777215.0))"));
-        assert!(shader.contains("let values = tev_fragment_values(input, false)"));
-        assert!(shader.contains("let values = tev_fragment_values(input, true)"));
+        assert!(shader.contains("let values = tev_fragment_values(input, false, false)"));
+        assert!(shader.contains("let values = tev_fragment_values(input, true, false)"));
+        assert!(shader.contains("textureSample("));
+        assert!(!shader.contains("textureSampleLevel("));
         assert!(
             shader.contains(
                 "((draw_state.z_texture & 0x00ffffffu) + source + reference) & 0x00ffffffu"
@@ -2359,7 +2536,9 @@ mod tests {
             assert!(shader.contains(&format!("input.stq{coord}")));
         }
         assert!(shader.contains("let uv = stq.xy / stq.z"));
-        assert!(shader.contains("let evaluation = tev_evaluate(raster_colors, tex_coords)"));
+        assert!(shader.contains(
+            "let evaluation = tev_evaluate(raster_colors, tex_coords, managed_exact_sampler)"
+        ));
         assert!(shader.contains("let source = evaluation.source"));
         assert!(shader.contains("let unorm_source = vec4<u32>("));
         assert!(shader.contains("if !alpha_test_passes(tev_alpha, draw_state.alpha_test)"));

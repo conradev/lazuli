@@ -77,10 +77,12 @@ test("LZGX v3 carries complete raw fog state into one canonical WebGPU draw unif
     "fog_range1",
     "fog_parameters0",
     "fog_parameters1",
+    "sampler_modes0",
+    "sampler_modes1",
   ]) {
     assert.match(uniform, new RegExp(`${field}: \\[u32; 4\\]`));
   }
-  assert.match(uniform, /size_of::<DrawUniform>\(\) == 96/);
+  assert.match(uniform, /size_of::<DrawUniform>\(\) == 128/);
   assert.match(uniform, /fog_control: \[fog\.range_base, 0, 0, 0\]/);
 });
 
@@ -115,8 +117,14 @@ test("WebGPU fog consumes theoretical post-Z-texture depth before destination al
     fragment,
     /buffer_depth = select\(raster_depth, operation_depth, late_z_texture\)/,
   );
-  assert.match(fragment, /let values = tev_fragment_values\(input, false\)/);
-  assert.match(fragment, /let values = tev_fragment_values\(input, true\)/);
+  assert.match(
+    fragment,
+    /let values = tev_fragment_values\(input, false, false\)/,
+  );
+  assert.match(
+    fragment,
+    /let values = tev_fragment_values\(input, true, false\)/,
+  );
   assert.match(fragment, /values\.buffer_depth = buffer_depth/);
   assert.match(
     fragment,
