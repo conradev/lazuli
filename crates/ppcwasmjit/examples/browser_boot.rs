@@ -4443,11 +4443,59 @@ const TEMPLATE: &str = r##"<!doctype html>
       const history = resolved.kind === "mapped" && resolved.write
         ? 0x180
         : 0x100;
-      const pte1 = (resolved.pte1 | history) >>> 0;
-      if (pte1 !== resolved.pte1) {
-        view.setUint32(resolved.ptePointer + 4, pte1, false);
+      let committed = resolved;
+      let resident = null;
+      if (
+        Number.isInteger(resolved.setIndex)
+        && Number.isInteger(resolved.way)
+        && typeof dataTlbSets !== "undefined"
+      ) {
+        const set = dataTlbSets[resolved.setIndex];
+        const candidate = set?.entries[resolved.way] ?? null;
+        if (
+          candidate !== null
+          && candidate.vsid === (resolved.vsid & 0x00ffffff)
+          && candidate.pageIndex === ((resolved.effective >>> 12) & 0xffff)
+        ) {
+          resident = candidate;
+          set.lru = resolved.way ^ 1;
+        }
       }
-      return { ...resolved, pte1 };
+      if (
+        resident === null
+        && Number.isInteger(resolved.vsid)
+        && typeof fillDataTlb === "function"
+      ) {
+        const filled = fillDataTlb(
+          resolved.effective,
+          resolved.vsid,
+          {
+            pte0: resolved.pte0,
+            pte1: resolved.pte1,
+            ptePhysical: resolved.ptePhysical,
+            ptePointer: resolved.ptePointer,
+            secondary: resolved.secondary,
+            slot: resolved.slot,
+          }
+        );
+        committed = { ...resolved, ...filled, tlbHit: false };
+        resident = dataTlbSets[filled.setIndex].entries[filled.way];
+      }
+
+      // The resident PTE image is authoritative until tlbie. Only a cached
+      // R/C transition writes the table, and it ORs the current backing word
+      // so unrelated guest edits are never replaced by the stale mapping.
+      const cachedPte1 = (resident?.pte1 ?? committed.pte1) >>> 0;
+      const pte1 = (cachedPte1 | history) >>> 0;
+      if (pte1 !== cachedPte1) {
+        if (resident !== null) resident.pte1 = pte1;
+        const backingPte1 = view.getUint32(committed.ptePointer + 4, false);
+        const backingHistory = (backingPte1 | history) >>> 0;
+        if (backingHistory !== backingPte1) {
+          view.setUint32(committed.ptePointer + 4, backingHistory, false);
+        }
+      }
+      return { ...committed, pte1 };
     }
 
     function resolveDataPageAddress(
@@ -4470,6 +4518,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       const vsid = segment & 0x00ffffff;
+      const cached = typeof lookupDataTlb === "function"
+        ? lookupDataTlb(effective, vsid, updateHistory)
+        : null;
+      if (cached !== null) {
+        const resolved = resolveDataTlbEntry(
+          effective,
+          msr,
+          segment,
+          { ...cached, tlbHit: true },
+          write
+        );
+        return updateHistory ? commitDataPageHistory(resolved) : resolved;
+      }
       const pageIndex = (effective >>> 12) & 0xffff;
       const abbreviatedPageIndex = (effective >>> 22) & 0x3f;
       const primaryHash = ((vsid & 0x7ffff) ^ pageIndex) & 0x7ffff;
@@ -4521,6 +4582,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             ptePointer,
             secondary,
             slot,
+            vsid,
             key,
             protection: pte1 & 3,
             wimg: (pte1 >>> 3) & 0xf,
@@ -4753,6 +4815,82 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function instructionTlbSetIndex(effectiveAddress) {
       return ((effectiveAddress >>> 12) & 0x3f) >>> 0;
+    }
+
+    function dataTlbSetIndex(effectiveAddress) {
+      return ((effectiveAddress >>> 12) & 0x3f) >>> 0;
+    }
+
+    function lookupDataTlb(effectiveAddress, vsid, touch = false) {
+      const effective = effectiveAddress >>> 0;
+      const setIndex = dataTlbSetIndex(effective);
+      const set = dataTlbSets[setIndex];
+      const pageIndex = (effective >>> 12) & 0xffff;
+      for (let way = 0; way < 2; way += 1) {
+        const entry = set.entries[way];
+        if (
+          entry === null
+          || entry.vsid !== (vsid & 0x00ffffff)
+          || entry.pageIndex !== pageIndex
+        ) continue;
+        if (touch) set.lru = way ^ 1;
+        return { ...entry, setIndex, way };
+      }
+      return null;
+    }
+
+    function fillDataTlb(effectiveAddress, vsid, entry) {
+      const effective = effectiveAddress >>> 0;
+      const setIndex = dataTlbSetIndex(effective);
+      const set = dataTlbSets[setIndex];
+      let way = set.entries.findIndex(candidate => candidate === null);
+      if (way < 0) way = set.lru;
+      const stored = {
+        ...entry,
+        vsid: vsid & 0x00ffffff,
+        pageIndex: (effective >>> 12) & 0xffff,
+      };
+      set.entries[way] = stored;
+      set.lru = way ^ 1;
+      return { ...stored, setIndex, way };
+    }
+
+    function resolveDataTlbEntry(
+      effectiveAddress,
+      msr,
+      segment,
+      entry,
+      write = false
+    ) {
+      const effective = effectiveAddress >>> 0;
+      const pte1 = entry.pte1 >>> 0;
+      const selectedKeyMask = (msr & 0x4000) !== 0
+        ? 0x20000000
+        : 0x40000000;
+      const key = (segment & selectedKeyMask) !== 0 ? 1 : 0;
+      const translation = {
+        effective,
+        source: "page",
+        physical: ((pte1 & 0xfffff000) | (effective & 0xfff)) >>> 0,
+        pte0: entry.pte0 >>> 0,
+        pte1,
+        ptePhysical: entry.ptePhysical >>> 0,
+        ptePointer: entry.ptePointer,
+        secondary: entry.secondary === true,
+        slot: entry.slot >>> 0,
+        vsid: entry.vsid & 0x00ffffff,
+        key,
+        protection: pte1 & 3,
+        wimg: (pte1 >>> 3) & 0xf,
+        write,
+        tlbHit: entry.tlbHit === true,
+        ...(Number.isInteger(entry.setIndex) && Number.isInteger(entry.way)
+          ? { setIndex: entry.setIndex, way: entry.way }
+          : {}),
+      };
+      return dataPageAllowsAccess(msr, segment, pte1, write)
+        ? { kind: "mapped", ...translation }
+        : { kind: "protection", ...translation };
     }
 
     function lookupInstructionTlb(effectiveAddress, vsid, touch = false) {
@@ -9867,8 +10005,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function invalidateTranslationLookasideBuffer(effectiveAddress) {
-      const setIndex = instructionTlbSetIndex(effectiveAddress);
-      const invalidateSet = sets => {
+      const instructionSetIndex = instructionTlbSetIndex(effectiveAddress);
+      const dataSetIndex = typeof dataTlbSetIndex === "function"
+        ? dataTlbSetIndex(effectiveAddress)
+        : instructionSetIndex;
+      const invalidateSet = (sets, setIndex) => {
         const set = sets[setIndex];
         const invalidated = set.entries.filter(entry => entry !== null).length;
         set.entries[0] = null;
@@ -9876,8 +10017,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         set.lru = 0;
         return invalidated;
       };
-      const instructionEntries = invalidateSet(instructionTlbSets);
-      const dataEntries = invalidateSet(dataTlbSets);
+      const instructionEntries = invalidateSet(
+        instructionTlbSets,
+        instructionSetIndex
+      );
+      const dataEntries = invalidateSet(dataTlbSets, dataSetIndex);
       const blocks = invalidateInstructionTranslationSet(effectiveAddress);
       accelerations.set(
         "translationTlbInvalidations",
