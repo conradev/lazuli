@@ -166,6 +166,9 @@ export function smbReadyPlayCheckpointReport() {
   report.gxFifo = {
     decoder: {
       displayListErrors: 0,
+      droppedVertices: 0,
+      exactRequiredCaptureMisses: 0,
+      lightingRejectedVertices: 0,
       vertexDecodeErrors: 0,
       unknownOpcodes: 0,
       xfbCopyCount: 508,
@@ -183,7 +186,11 @@ export function smbReadyPlayCheckpointReport() {
     metrics: {
       scope: "current-worker",
       operations: { enqueued: 400, pending: 0, highWater: 1 },
-      webgpu: { checkHealthCalls: 400 },
+      webgpu: {
+        checkHealthCalls: 400,
+        exactRasterEmptyDraws: 0,
+        exactRequiredRejectedDraws: 0,
+      },
     },
     selectedXfb: structuredClone(terminalFrame.selectedXfb),
     temporalSelectedXfb,
