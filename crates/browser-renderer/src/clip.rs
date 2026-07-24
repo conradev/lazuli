@@ -179,6 +179,167 @@ fn gx_clip_intersection<const COMPONENTS: usize>(
         .ok_or(GxClipError::ArithmeticOverflow)
 }
 
+/// One exact GX clip vertex with the raster colors kept in the native u8
+/// domain. Dolphin's clipper does not interpolate colors through the generic
+/// f32 payload walk: it quantizes `t` to U8.8 first and applies a signed
+/// integer lerp independently to each channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GxRasterClipVertex<const COMPONENTS: usize> {
+    components: [f32; COMPONENTS],
+    raster_channels: [u8; 8],
+}
+
+impl<const COMPONENTS: usize> GxRasterClipVertex<COMPONENTS> {
+    pub(crate) const fn new(components: [f32; COMPONENTS], raster_channels: [u8; 8]) -> Self {
+        Self {
+            components,
+            raster_channels,
+        }
+    }
+
+    pub(crate) const fn components(self) -> [f32; COMPONENTS] {
+        self.components
+    }
+
+    pub(crate) const fn raster_channels(self) -> [u8; 8] {
+        self.raster_channels
+    }
+}
+
+fn gx_raster_clip_intersection<const COMPONENTS: usize>(
+    t: f32,
+    out_vertex: GxRasterClipVertex<COMPONENTS>,
+    in_vertex: GxRasterClipVertex<COMPONENTS>,
+) -> Result<GxRasterClipVertex<COMPONENTS>, GxClipError> {
+    let components = gx_clip_intersection(t, out_vertex.components, in_vertex.components)?;
+    let t_int = gx_mul(t, 256.0) as u16;
+    let raster_channels = std::array::from_fn(|channel| {
+        let out_value = i32::from(out_vertex.raster_channels[channel]);
+        let in_value = i32::from(in_vertex.raster_channels[channel]);
+        let delta = in_value - out_value;
+        let value = out_value + ((delta * i32::from(t_int)) >> 8);
+        u8::try_from(value).expect("bounded GX u8 clip interpolation")
+    });
+    Ok(GxRasterClipVertex::new(components, raster_channels))
+}
+
+fn gx_raster_clip_polygon<const COMPONENTS: usize>(
+    vertices: [GxRasterClipVertex<COMPONENTS>; 3],
+    mask: u8,
+) -> Result<Vec<GxRasterClipVertex<COMPONENTS>>, GxClipError> {
+    if mask & !GX_CLIP_PLANE_MASK != 0 {
+        return Err(GxClipError::ArithmeticOverflow);
+    }
+    let mut input = vertices.to_vec();
+    for (plane_bit, plane) in GX_CLIP_PLANES {
+        if mask & plane_bit == 0 {
+            continue;
+        }
+        let mut output = Vec::with_capacity(input.len() + 1);
+        let mut previous = input[0];
+        let mut previous_distance = gx_clip_plane_distance(&previous.components, plane)?;
+        for index in 1..=input.len() {
+            let current = input[index % input.len()];
+            let distance = gx_clip_plane_distance(&current.components, plane)?;
+            if previous_distance >= 0.0 {
+                output.push(previous);
+            }
+            if gx_clip_different_signs(distance, previous_distance) {
+                let (t, out_vertex, in_vertex) = if distance < 0.0 {
+                    (
+                        gx_div(distance, gx_sub(distance, previous_distance)),
+                        current,
+                        previous,
+                    )
+                } else {
+                    (
+                        gx_div(previous_distance, gx_sub(previous_distance, distance)),
+                        previous,
+                        current,
+                    )
+                };
+                output.push(gx_raster_clip_intersection(t, out_vertex, in_vertex)?);
+            }
+            previous = current;
+            previous_distance = distance;
+        }
+        if output.len() < 3 {
+            return Ok(Vec::new());
+        }
+        input = output;
+    }
+    Ok(input)
+}
+
+fn gx_triangulate_raster_polygon<const COMPONENTS: usize>(
+    polygon: &[GxRasterClipVertex<COMPONENTS>],
+) -> Vec<[GxRasterClipVertex<COMPONENTS>; 3]> {
+    if polygon.len() < 3 {
+        return Vec::new();
+    }
+    let mut triangles = Vec::with_capacity(polygon.len() - 2);
+    triangles.push([polygon[0], polygon[1], polygon[2]]);
+    for vertex in 3..polygon.len() {
+        triangles.push([polygon[0], polygon[vertex - 1], polygon[vertex]]);
+    }
+    triangles
+}
+
+pub(crate) fn gx_post_clip_raster_triangle<const COMPONENTS: usize>(
+    triangle: [GxRasterClipVertex<COMPONENTS>; 3],
+    cull_mode: u8,
+    viewport_height: f32,
+) -> Result<Vec<[GxRasterClipVertex<COMPONENTS>; 3]>, GxClipError> {
+    if COMPONENTS < GX_CLIP_COMPONENTS {
+        return Err(GxClipError::InvalidComponentCount);
+    }
+    if cull_mode > 3 {
+        return Err(GxClipError::InvalidCullMode(cull_mode));
+    }
+    if !viewport_height.is_finite() || viewport_height == 0.0 {
+        return Err(GxClipError::InvalidViewportHeight);
+    }
+    if triangle
+        .iter()
+        .flat_map(|vertex| vertex.components)
+        .any(|component| !component.is_finite())
+    {
+        return Err(GxClipError::NonFiniteVertex);
+    }
+
+    let masks = [
+        gx_clip_mask(&triangle[0].components)?,
+        gx_clip_mask(&triangle[1].components)?,
+        gx_clip_mask(&triangle[2].components)?,
+    ];
+    if masks[0] & masks[1] & masks[2] != 0 {
+        return Ok(Vec::new());
+    }
+
+    let component_triangle = [
+        triangle[0].components,
+        triangle[1].components,
+        triangle[2].components,
+    ];
+    let normal = gx_clip_normal_z(&component_triangle)?;
+    let mut backface = normal <= 0.0;
+    if viewport_height > 0.0 {
+        backface = !backface;
+    }
+    let survives = cull_mode == 0 || (cull_mode == 1 && backface) || (cull_mode == 2 && !backface);
+    if !survives {
+        return Ok(Vec::new());
+    }
+
+    let ordered = if backface {
+        [triangle[0], triangle[2], triangle[1]]
+    } else {
+        triangle
+    };
+    let polygon = gx_raster_clip_polygon(ordered, masks[0] | masks[1] | masks[2])?;
+    Ok(gx_triangulate_raster_polygon(&polygon))
+}
+
 fn gx_clip_polygon<const COMPONENTS: usize>(
     vertices: [[f32; COMPONENTS]; 3],
     mask: u8,

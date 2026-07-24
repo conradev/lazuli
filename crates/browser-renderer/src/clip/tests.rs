@@ -188,6 +188,72 @@ fn ordered_clipping_interpolates_payloads_and_fans_the_polygon() {
 }
 
 #[test]
+fn raster_clip_lerp_quantizes_t_and_uses_signed_arithmetic_shift() {
+    let out = GxRasterClipVertex::new([2.0, 0.0, -0.5, 1.0], [10, 250, 0, 255, 1, 2, 3, 4]);
+    let inside = GxRasterClipVertex::new([0.0, 0.0, -0.5, 1.0], [250, 10, 255, 0, 5, 6, 7, 8]);
+    let half = gx_raster_clip_intersection(0.5, out, inside).unwrap();
+    assert_eq!(
+        half.raster_channels(),
+        [130, 130, 127, 127, 3, 4, 5, 6],
+        "negative deltas must retain the signed right shift"
+    );
+
+    let just_below_one = f32::from_bits(1.0f32.to_bits() - 1);
+    assert_eq!(
+        gx_raster_clip_intersection(just_below_one, out, inside)
+            .unwrap()
+            .raster_channels()[0],
+        249,
+        "t*256 truncates to 255 below one"
+    );
+    assert_eq!(
+        gx_raster_clip_intersection(1.0, out, inside)
+            .unwrap()
+            .raster_channels(),
+        inside.raster_channels(),
+        "the exact t=1 boundary uses U8.8 value 256"
+    );
+}
+
+#[test]
+fn raster_polygon_walk_preserves_the_generic_clip_order_and_masks() {
+    let components = [
+        [0.0, 0.0, -0.5, 1.0, 0.0],
+        [2.0, 2.0, -0.5, 1.0, 2.0],
+        [0.0, 0.5, -0.5, 1.0, 4.0],
+    ];
+    let raster = [
+        GxRasterClipVertex::new(components[0], [0; 8]),
+        GxRasterClipVertex::new(components[1], [255; 8]),
+        GxRasterClipVertex::new(components[2], [64; 8]),
+    ];
+    let generic = gx_clip_polygon(components, 0x01 | 0x04).unwrap();
+    let specialized = gx_raster_clip_polygon(raster, 0x01 | 0x04).unwrap();
+    assert_eq!(
+        specialized
+            .iter()
+            .map(|vertex| vertex.components())
+            .collect::<Vec<_>>(),
+        generic,
+        "specialized raster transport must not change the ordered f32 geometry walk"
+    );
+    assert_eq!(
+        specialized
+            .iter()
+            .map(|vertex| vertex.raster_channels()[0])
+            .collect::<Vec<_>>(),
+        [0, 127, 127, 127, 64],
+        "the second plane must consume the first plane's quantized u8 endpoint",
+    );
+    assert_eq!(
+        specialized[3].raster_channels()[0],
+        127,
+        "sequential U8.8 clipping differs from a one-step original-endpoint reconstruction (128)",
+    );
+    assert_eq!(gx_triangulate_raster_polygon(&specialized).len(), 3);
+}
+
+#[test]
 fn plane_order_retains_duplicate_boundary_transitions() {
     let polygon = gx_clip_polygon(
         [
