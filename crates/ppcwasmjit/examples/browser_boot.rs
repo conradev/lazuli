@@ -4157,6 +4157,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       { length: 64 },
       () => ({ entries: [null, null], lru: 0 })
     );
+    const dataReservationGranuleBytes = 32;
+    let dataReservationPhysicalGranule = null;
     const cpFifoState = {
       control: 0,
       base: 0,
@@ -4445,6 +4447,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       user_0_24: () => sdr1Changed(),
       user_0_25: (_ctx, address) => invalidateTranslationLookasideBuffer(address),
       user_0_26: () => synchronizeTranslationLookasideBuffer(),
+      user_0_27: (_ctx, address, pointer) => loadReserveInteger(address, pointer),
+      user_0_28: (_ctx, address, value) => storeConditionalInteger(address, value),
       user_1_0: (registers, exception) => raiseException(registers, exception),
     };
 
@@ -4456,6 +4460,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         case "user_0_5": case "user_0_9": size = 4; break;
         case "user_0_6": case "user_0_10": size = 8; break;
         case "user_0_11": case "user_0_12": size = Number(result); break;
+        case "user_0_27":
+          if (Number(result) !== 1) return false;
+          size = 4;
+          break;
+        case "user_0_28":
+          if (Number(result) !== 1 && Number(result) !== 2) return false;
+          size = 4;
+          break;
         default: return false;
       }
       if (![1, 2, 4, 8].includes(size)) return false;
@@ -4467,6 +4479,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         "user_0_9",
         "user_0_10",
         "user_0_12",
+        "user_0_28",
       ].includes(name);
       return dataRamOrLockedCachePointer(address, size, write, false) !== null;
     }
@@ -5618,6 +5631,201 @@ const TEMPLATE: &str = r##"<!doctype html>
         ?? physicalLockedCachePointer(physical, size);
     }
 
+    function dataReservationGranule(physicalAddress) {
+      return (
+        (physicalAddress >>> 0)
+        & ~(dataReservationGranuleBytes - 1)
+      ) >>> 0;
+    }
+
+    function invalidateDataReservationForExternalWrite(
+      physicalAddress,
+      size
+    ) {
+      if (dataReservationPhysicalGranule === null || size === 0) return false;
+      const physical = physicalAddress >>> 0;
+      if (
+        !Number.isSafeInteger(size)
+        || size < 0
+        || size > 0x100000000 - physical
+      ) {
+        // An external writer with an unbounded range cannot safely retain a
+        // reservation. All in-tree device paths pass a bounded positive size.
+        dataReservationPhysicalGranule = null;
+        return true;
+      }
+      const writeEnd = physical + size;
+      const reservationEnd = (
+        dataReservationPhysicalGranule + dataReservationGranuleBytes
+      );
+      if (
+        physical >= reservationEnd
+        || dataReservationPhysicalGranule >= writeEnd
+      ) return false;
+      dataReservationPhysicalGranule = null;
+      return true;
+    }
+
+    function invalidateDataReservationForExternalStridedWrite(
+      physicalAddress,
+      rowBytes,
+      stride,
+      rowCount
+    ) {
+      if (dataReservationPhysicalGranule === null || rowCount === 0) return false;
+      const physical = physicalAddress >>> 0;
+      if (
+        !Number.isSafeInteger(rowBytes)
+        || !Number.isSafeInteger(stride)
+        || !Number.isSafeInteger(rowCount)
+        || rowBytes <= 0
+        || stride < 0
+        || rowCount < 0
+      ) {
+        dataReservationPhysicalGranule = null;
+        return true;
+      }
+      if (stride === 0) {
+        // A zero BP copy stride repeatedly overwrites one bounded destination
+        // row; it must not invalidate an unrelated reservation.
+        return invalidateDataReservationForExternalWrite(physical, rowBytes);
+      }
+      const finalEnd = physical + (rowCount - 1) * stride + rowBytes;
+      if (!Number.isSafeInteger(finalEnd) || finalEnd > 0x100000000) {
+        dataReservationPhysicalGranule = null;
+        return true;
+      }
+
+      const reservationStart = dataReservationPhysicalGranule;
+      const reservationEnd = reservationStart + dataReservationGranuleBytes;
+      const firstRow = Math.max(
+        0,
+        Math.floor((reservationStart - physical - rowBytes) / stride) + 1
+      );
+      const lastRow = Math.min(
+        rowCount - 1,
+        Math.ceil((reservationEnd - physical) / stride) - 1
+      );
+      if (firstRow > lastRow) return false;
+      dataReservationPhysicalGranule = null;
+      return true;
+    }
+
+    function resolveDataReservationTranslation(
+      address,
+      write,
+      value = undefined
+    ) {
+      const logical = address >>> 0;
+      const resolved = typeof resolveDataRange === "function"
+        ? resolveDataRange(logical, 4, write, true)
+        : null;
+      const physical = resolved === null
+        ? translateDataRange(logical, 4, write, true)
+        : resolved.kind === "mapped"
+          ? resolved.physical
+          : null;
+      if (physical === null) {
+        if (typeof recordDataStorageFault === "function") {
+          recordDataStorageFault(
+            resolved ?? { kind: "translation-failed", effective: logical },
+            logical,
+            4,
+            write,
+            "translation",
+            undefined,
+            value
+          );
+        }
+        return null;
+      }
+      return { logical, physical };
+    }
+
+    function resolveDataReservationBacking(
+      translation,
+      write,
+      value = undefined
+    ) {
+      const { logical, physical } = translation;
+      const lockedPointer = physicalLockedCachePointer(physical, 4);
+      const pointer = physicalRamPointer(physical, 4) ?? lockedPointer;
+      if (pointer === null) {
+        if (typeof recordDataStorageFault === "function") {
+          const device = typeof physicalMmioPointer === "function"
+            && physicalMmioPointer(physical, 4) !== null;
+          recordDataStorageFault(
+            { kind: "mapped", effective: logical, physical },
+            logical,
+            4,
+            write,
+            device ? "device" : "physical",
+            device
+              ? "reservation-device-rejected"
+              : "translated-physical-unbacked",
+            value
+          );
+        }
+        return null;
+      }
+      return { ...translation, pointer, lockedPointer };
+    }
+
+    function resolveDataReservationAccess(address, write, value = undefined) {
+      const translation = resolveDataReservationTranslation(
+        address,
+        write,
+        value
+      );
+      return translation === null
+        ? null
+        : resolveDataReservationBacking(translation, write, value);
+    }
+
+    function loadReserveInteger(address, pointer) {
+      const logical = address >>> 0;
+      // The compiler raises Alignment before invoking this hook. Preserve the
+      // previous reservation if a malformed caller reaches the runtime anyway.
+      if ((logical & 3) !== 0) return 0;
+      const access = resolveDataReservationAccess(logical, false);
+      if (access === null) return 0;
+
+      view.setUint32(pointer, view.getUint32(access.pointer, false), true);
+      if (access.lockedPointer !== null) {
+        lockedCacheReads += 1;
+        lockedCacheReadBytes += 4;
+      }
+      dataReservationPhysicalGranule = dataReservationGranule(access.physical);
+      return 1;
+    }
+
+    function storeConditionalInteger(address, value) {
+      const logical = address >>> 0;
+      // As with lwarx, alignment is architecturally handled in compiled code.
+      if ((logical & 3) !== 0) return 0;
+
+      // Resolve and commit page history before consulting the reservation.
+      // A permitted failed conditional store therefore still sets PTE R+C.
+      const translation = resolveDataReservationTranslation(
+        logical,
+        true,
+        value
+      );
+      if (translation === null) return 0;
+      if (dataReservationPhysicalGranule === null) return 1;
+      const access = resolveDataReservationBacking(translation, true, value);
+      if (access === null) return 0;
+
+      view.setUint32(access.pointer, value >>> 0, false);
+      if (access.lockedPointer !== null) {
+        lockedCacheWrites += 1;
+        lockedCacheWriteBytes += 4;
+      }
+      // MPC750 stwcx. is nonspecific: any live reservation permits the store.
+      dataReservationPhysicalGranule = null;
+      return 2;
+    }
+
     function copyFromLockedCache(target, cacheAddress, length) {
       let copied = 0;
       while (copied < length) {
@@ -5629,6 +5837,24 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
         copied += chunk;
       }
+    }
+
+    function invalidateLockedCacheReservationForExternalWrite(
+      cacheAddress,
+      length
+    ) {
+      let invalidated = false;
+      let visited = 0;
+      while (visited < length) {
+        const offset = (cacheAddress + visited) & (lockedCacheSize - 1);
+        const chunk = Math.min(length - visited, lockedCacheSize - offset);
+        invalidated = invalidateDataReservationForExternalWrite(
+          (0xe0000000 + offset) >>> 0,
+          chunk
+        ) || invalidated;
+        visited += chunk;
+      }
+      return invalidated;
     }
 
     function copyToLockedCache(cacheAddress, source, length) {
@@ -5682,9 +5908,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
       } else {
         if (fromRam) {
+          invalidateLockedCacheReservationForExternalWrite(
+            cacheAddress,
+            length
+          );
           copyToLockedCache(cacheAddress, ramTarget, length);
           lockedCacheDmaFromRam += 1;
         } else {
+          invalidateDataReservationForExternalWrite(
+            (ramTarget - ram) >>> 0,
+            length
+          );
           copyFromLockedCache(ramTarget, cacheAddress, length);
           lockedCacheDmaToRam += 1;
         }
@@ -6305,6 +6539,68 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 14: return { name: "CMPR", blockWidth: 8, blockHeight: 8, blockBytes: 32 };
         default: return null;
       }
+    }
+
+    function gxCopyTextureLayout(copyCommand, pixelControl) {
+      const copyFormat = (
+        ((copyCommand & 0x08) !== 0 ? 8 : 0)
+        | ((copyCommand >>> 4) & 7)
+      );
+      const depthCopy = (pixelControl & 7) === 3;
+      let textureFormat;
+      if (depthCopy) {
+        switch (copyFormat) {
+          case 0: textureFormat = 0; break;
+          case 1: case 8: case 9: case 10: textureFormat = 1; break;
+          case 3: case 11: case 12: textureFormat = 3; break;
+          case 6: textureFormat = 6; break;
+        }
+      } else {
+        switch (copyFormat) {
+          case 0: textureFormat = 0; break;
+          case 1: case 7: case 8: case 9: case 10: textureFormat = 1; break;
+          case 2: textureFormat = 2; break;
+          case 3: case 11: case 12: textureFormat = 3; break;
+          case 4: case 5: textureFormat = 4; break;
+          case 6: textureFormat = 6; break;
+        }
+      }
+      return textureFormat === undefined ? null : gxTextureLayout(textureFormat);
+    }
+
+    function invalidateGxCopyReservation(frame) {
+      if (frame.copyToXfb) {
+        return invalidateDataReservationForExternalStridedWrite(
+          frame.destination,
+          frame.width * 2,
+          frame.stride,
+          frame.height
+        );
+      }
+
+      const layout = gxCopyTextureLayout(
+        frame.copyState.copyCommand,
+        frame.copyState.pixelControl
+      );
+      if (layout === null) {
+        // Reserved copy formats do not provide a bounded destination shape.
+        return invalidateDataReservationForExternalWrite(
+          frame.destination,
+          Number.NaN
+        );
+      }
+      const divisor = (frame.copyState.copyCommand & 0x200) !== 0 ? 2 : 1;
+      const width = Math.floor(frame.width / divisor);
+      const height = Math.floor(frame.sourceHeight / divisor);
+      if (width === 0 || height === 0) return false;
+      const blockColumns = Math.ceil(width / layout.blockWidth);
+      const blockRows = Math.ceil(height / layout.blockHeight);
+      return invalidateDataReservationForExternalStridedWrite(
+        frame.destination,
+        blockColumns * layout.blockBytes,
+        frame.stride,
+        blockRows
+      );
     }
 
     function gxExpand3(value) {
@@ -7617,6 +7913,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
       };
       frame.displayed = false;
+      invalidateGxCopyReservation(frame);
       const frameDiagnostics = { ...frame };
       delete frameDiagnostics.copyState;
       if (copyToXfb) {
@@ -9352,6 +9649,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           (deviceEvents.get("aramDmaUnmappedRam") ?? 0) + 1
         );
       } else if (direction !== 0) {
+        invalidateDataReservationForExternalWrite(
+          (ramTarget - ram) >>> 0,
+          length
+        );
         if (aramAddress >= aram.length) {
           bytes.fill(0, ramTarget, ramTarget + length);
         } else {
@@ -11870,6 +12171,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (opcode === 0x12) {
         const target = ramPointer(dmaBase, dmaLength);
         check(target !== null && dmaLength === 32, "invalid DI identify DMA target");
+        invalidateDataReservationForExternalWrite(
+          (target - ram) >>> 0,
+          dmaLength
+        );
         bytes.set([
           0x00, 0x00, 0x00, 0x00,
           0x20, 0x02, 0x04, 0x02,
@@ -12093,6 +12398,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           const data = diskTransfer.data;
           const target = ramPointer(diskTransfer.dmaBase, diskTransfer.length);
           check(data !== null && target !== null, "missing browser disc DMA payload");
+          invalidateDataReservationForExternalWrite(
+            (target - ram) >>> 0,
+            diskTransfer.length
+          );
           bytes.set(data, target);
           const hashLength = Math.min(data.length, 1024 * 1024 - diskHashedBytes);
           for (let index = 0; index < hashLength; index += 1) {

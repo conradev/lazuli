@@ -383,6 +383,8 @@ impl Codegen {
                     HookKind::WriteI16 => self.hooks.write_i16 as usize,
                     HookKind::WriteI32 => self.hooks.write_i32 as usize,
                     HookKind::WriteI64 => self.hooks.write_i64 as usize,
+                    HookKind::LoadReserve => self.hooks.load_reserve as usize,
+                    HookKind::StoreConditional => self.hooks.store_conditional as usize,
                     HookKind::ReadQuant => self.hooks.read_quantized as usize,
                     HookKind::WriteQuant => self.hooks.write_quantized as usize,
                     HookKind::InvICache => self.hooks.invalidate_icache as usize,

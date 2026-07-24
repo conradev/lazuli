@@ -147,6 +147,18 @@ fn stwux(rs: u8, ra: u8, rb: u8) -> Ins {
     )
 }
 
+fn lwarx(rd: u8, ra: u8, rb: u8) -> Ins {
+    instruction(
+        31 << 26 | u32::from(rd) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 20 << 1,
+    )
+}
+
+fn stwcx(rs: u8, ra: u8, rb: u8) -> Ins {
+    instruction(
+        31 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 150 << 1 | 1,
+    )
+}
+
 fn mtmsr(rs: u8) -> Ins {
     instruction(31 << 26 | u32::from(rs) << 21 | 146 << 1)
 }
@@ -182,7 +194,7 @@ fn lower_portable(function: &ir::Function) -> Vec<u8> {
             .with_function_import_module("lazuli_hooks")
             .with_stack_scratch(0, 32, 8),
     )
-    .unwrap()
+    .unwrap_or_else(|error| panic!("portable lowering failed: {error:?}\n{function}"))
 }
 
 #[test]
@@ -300,6 +312,399 @@ fn address_space_hook_ids_are_stable_and_append_only() {
     assert_eq!(HookKind::Sdr1Changed as u32, 24);
     assert_eq!(HookKind::Tlbie as u32, 25);
     assert_eq!(HookKind::Tlbsync as u32, 26);
+    assert_eq!(HookKind::LoadReserve as u32, 27);
+    assert_eq!(HookKind::StoreConditional as u32, 28);
+}
+
+#[test]
+fn reservation_instructions_use_dedicated_hooks_at_stable_cycles() {
+    let load = translate_with_cycle_publication([lwarx(4, 3, 5)]);
+    let store = translate_with_cycle_publication([stwcx(6, 7, 8)]);
+
+    for (translation, hook) in [
+        (&load, HookKind::LoadReserve),
+        (&store, HookKind::StoreConditional),
+    ] {
+        assert_eq!(translation.sequence.len(), 1);
+        assert_eq!(translation.cycles, 2);
+        assert_eq!(translation.exit, TranslationExit::Fallthrough);
+        assert_eq!(user_hook_call_count(&translation.function, hook), 1);
+        assert_eq!(
+            hook_call_cycles(&translation.function, TEST_HOOK_CYCLE_OFFSET)
+                .into_iter()
+                .filter(|(namespace, _, _)| *namespace == 0)
+                .collect::<Vec<_>>(),
+            [(0, hook as u32, 0)]
+        );
+    }
+
+    assert_eq!(user_hook_call_count(&load.function, HookKind::ReadI32), 0);
+    assert_eq!(user_hook_call_count(&store.function, HookKind::WriteI32), 0);
+}
+
+#[test]
+fn portable_reservations_observe_alignment_fault_and_completion_boundaries() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let load_indexed = translate_with_cycle_publication([lwarx(4, 3, 5)]);
+    let load_zero_base = translate_with_cycle_publication([lwarx(4, 0, 5)]);
+    let store = translate_with_cycle_publication([stwcx(6, 7, 8)]);
+    for translation in [&load_indexed, &load_zero_base, &store] {
+        assert_eq!(translation.sequence.len(), 1);
+        assert_eq!(translation.cycles, 2);
+        assert_eq!(translation.exit, TranslationExit::Fallthrough);
+    }
+    let load_indexed = lower_portable(&load_indexed.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let load_zero_base = lower_portable(&load_zero_base.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let store = lower_portable(&store.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let script = r#"
+const [
+  loadIndexedHex,
+  loadZeroBaseHex,
+  storeHex,
+  cycleOffset,
+  pcOffset,
+  crOffset,
+  r0Offset,
+  r3Offset,
+  r4Offset,
+  r5Offset,
+  r6Offset,
+  r7Offset,
+  r8Offset,
+  xerOffset,
+  darOffset,
+  dsisrOffset,
+  loadReserveHook,
+  storeConditionalHook,
+  dsiException,
+  alignmentException,
+] = process.argv.slice(1).map((value, index) => index < 3 ? value : Number(value));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const initialPc = 0x80002000;
+const executedOne = 0x00020001;
+
+async function instantiate(hex, hooks) {
+  return WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory: hooks.memory },
+    lazuli_hooks: hooks.imports,
+  });
+}
+
+async function loadWithZeroBase() {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r0Offset, 0xf0000000, true);
+  view.setUint32(cpu + r4Offset, 0xdeadbeef, true);
+  view.setUint32(cpu + r5Offset, 0x00001800, true);
+  view.setUint32(cpu + darOffset, 0xaabbccdd, true);
+  view.setUint32(cpu + dsisrOffset, 0x11223344, true);
+  const imports = {
+    [`user_0_${loadReserveHook}`](hookContext, address, output) {
+      events.push(["load", view.getUint32(hookContext + cycleOffset, true), address >>> 0]);
+      view.setUint32(output, 0x12345678, true);
+      return 1;
+    },
+    user_1_0() {
+      throw new Error("zero-base lwarx raised an exception");
+    },
+  };
+  const { instance } = await instantiate(loadZeroBaseHex, { memory, imports });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== executedOne) throw new Error(`zero-base lwarx returned 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 4) {
+    throw new Error("zero-base lwarx did not complete");
+  }
+  if (view.getUint32(cpu + r4Offset, true) !== 0x12345678) {
+    throw new Error("zero-base lwarx did not commit its loaded value");
+  }
+  if (view.getUint32(cpu + darOffset, true) !== 0xaabbccdd
+      || view.getUint32(cpu + dsisrOffset, true) !== 0x11223344) {
+    throw new Error("successful lwarx changed exception state");
+  }
+  const expected = [["load", 0, 0x1800]];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`zero-base lwarx observed ${JSON.stringify(events)}`);
+  }
+}
+
+async function loadFault() {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r3Offset, 0x2000, true);
+  view.setUint32(cpu + r4Offset, 0xdeadbeef, true);
+  view.setUint32(cpu + r5Offset, 0x20, true);
+  const imports = {
+    [`user_0_${loadReserveHook}`](hookContext, address) {
+      events.push(["load", view.getUint32(hookContext + cycleOffset, true), address >>> 0]);
+      view.setUint32(cpu + dsisrOffset, 0x40000000, true);
+      return 0;
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + darOffset, true),
+        view.getUint32(registers + dsisrOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await instantiate(loadIndexedHex, { memory, imports });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== executedOne) throw new Error(`faulting lwarx returned 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("faulting lwarx advanced PC");
+  }
+  if (view.getUint32(cpu + r4Offset, true) !== 0xdeadbeef) {
+    throw new Error("faulting lwarx changed its destination");
+  }
+  const expected = [
+    ["load", 0, 0x2020],
+    ["exception", 0, cpu, dsiException, 0x2020, 0x40000000],
+  ];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`faulting lwarx observed ${JSON.stringify(events)}`);
+  }
+}
+
+async function loadAlignment() {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r3Offset, 0x3000, true);
+  view.setUint32(cpu + r4Offset, 0xdeadbeef, true);
+  view.setUint32(cpu + r5Offset, 2, true);
+  const imports = {
+    [`user_0_${loadReserveHook}`]() {
+      throw new Error("misaligned lwarx reached translation/reservation");
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + darOffset, true),
+        view.getUint32(registers + dsisrOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await instantiate(loadIndexedHex, { memory, imports });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== executedOne) throw new Error(`misaligned lwarx returned 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("misaligned lwarx advanced PC");
+  }
+  if (view.getUint32(cpu + r4Offset, true) !== 0xdeadbeef) {
+    throw new Error("misaligned lwarx changed its destination");
+  }
+  const expected = [["exception", 0, cpu, alignmentException, 0x3006, 0x00000083]];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`misaligned lwarx observed ${JSON.stringify(events)}`);
+  }
+}
+
+async function completedStore(status, expectedCr) {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + crOffset, 0xafffffff, true);
+  view.setUint32(cpu + xerOffset, 0x80000000, true);
+  view.setUint32(cpu + r6Offset, 0x12345678, true);
+  view.setUint32(cpu + r7Offset, 0x4000, true);
+  view.setUint32(cpu + r8Offset, 0x40, true);
+  view.setUint32(cpu + darOffset, 0xaabbccdd, true);
+  view.setUint32(cpu + dsisrOffset, 0x11223344, true);
+  const imports = {
+    [`user_0_${storeConditionalHook}`](hookContext, address, value) {
+      events.push([
+        "store",
+        view.getUint32(hookContext + cycleOffset, true),
+        address >>> 0,
+        value >>> 0,
+        status,
+      ]);
+      return status;
+    },
+    user_1_0() {
+      throw new Error("completed stwcx. raised an exception");
+    },
+  };
+  const { instance } = await instantiate(storeHex, { memory, imports });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== executedOne) throw new Error(`completed stwcx. returned 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 4) {
+    throw new Error("completed stwcx. did not advance PC");
+  }
+  if (view.getUint32(cpu + crOffset, true) !== expectedCr) {
+    throw new Error(`completed stwcx. produced CR 0x${view.getUint32(cpu + crOffset, true).toString(16)}`);
+  }
+  if (view.getUint32(cpu + darOffset, true) !== 0xaabbccdd
+      || view.getUint32(cpu + dsisrOffset, true) !== 0x11223344) {
+    throw new Error("completed stwcx. changed exception state");
+  }
+  const expected = [["store", 0, 0x4040, 0x12345678, status]];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`completed stwcx. observed ${JSON.stringify(events)}`);
+  }
+}
+
+async function storeFault() {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + crOffset, 0xafffffff, true);
+  view.setUint32(cpu + xerOffset, 0x80000000, true);
+  view.setUint32(cpu + r6Offset, 0x12345678, true);
+  view.setUint32(cpu + r7Offset, 0x5000, true);
+  view.setUint32(cpu + r8Offset, 0x20, true);
+  const imports = {
+    [`user_0_${storeConditionalHook}`](hookContext, address, value) {
+      events.push([
+        "store",
+        view.getUint32(hookContext + cycleOffset, true),
+        address >>> 0,
+        value >>> 0,
+      ]);
+      view.setUint32(cpu + dsisrOffset, 0x42000000, true);
+      return 0;
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + darOffset, true),
+        view.getUint32(registers + dsisrOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await instantiate(storeHex, { memory, imports });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== executedOne) throw new Error(`faulting stwcx. returned 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("faulting stwcx. advanced PC");
+  }
+  if (view.getUint32(cpu + crOffset, true) !== 0xafffffff) {
+    throw new Error("faulting stwcx. changed CR0");
+  }
+  const expected = [
+    ["store", 0, 0x5020, 0x12345678],
+    ["exception", 0, cpu, dsiException, 0x5020, 0x42000000],
+  ];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`faulting stwcx. observed ${JSON.stringify(events)}`);
+  }
+}
+
+async function storeAlignment() {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + crOffset, 0xafffffff, true);
+  view.setUint32(cpu + xerOffset, 0x80000000, true);
+  view.setUint32(cpu + r6Offset, 0x12345678, true);
+  view.setUint32(cpu + r7Offset, 0x6000, true);
+  view.setUint32(cpu + r8Offset, 2, true);
+  const imports = {
+    [`user_0_${storeConditionalHook}`]() {
+      throw new Error("misaligned stwcx. reached translation/reservation");
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + darOffset, true),
+        view.getUint32(registers + dsisrOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await instantiate(storeHex, { memory, imports });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== executedOne) throw new Error(`misaligned stwcx. returned 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("misaligned stwcx. advanced PC");
+  }
+  if (view.getUint32(cpu + crOffset, true) !== 0xafffffff) {
+    throw new Error("misaligned stwcx. changed CR0");
+  }
+  const expected = [["exception", 0, cpu, alignmentException, 0x6006, 0x000108c7]];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`misaligned stwcx. observed ${JSON.stringify(events)}`);
+  }
+}
+
+await loadWithZeroBase();
+await loadFault();
+await loadAlignment();
+await completedStore(2, 0x3fffffff);
+await completedStore(1, 0x1fffffff);
+await storeFault();
+await storeAlignment();
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &load_indexed,
+            &load_zero_base,
+            &store,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &Reg::CR.offset().to_string(),
+            &GPR::R0.offset().to_string(),
+            &GPR::R3.offset().to_string(),
+            &GPR::R4.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &GPR::R6.offset().to_string(),
+            &GPR::R7.offset().to_string(),
+            &GPR::R8.offset().to_string(),
+            &SPR::XER.offset().to_string(),
+            &SPR::DAR.offset().to_string(),
+            &SPR::DSISR.offset().to_string(),
+            &(HookKind::LoadReserve as u32).to_string(),
+            &(HookKind::StoreConditional as u32).to_string(),
+            &(Exception::DSI as u16).to_string(),
+            &(Exception::Alignment as u16).to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]

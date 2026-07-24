@@ -266,6 +266,7 @@ impl Jit {
 #[cfg(test)]
 mod tests {
     use std::alloc::Layout;
+    use std::mem::size_of;
     use std::process::Command;
     use std::ptr::NonNull;
 
@@ -274,7 +275,10 @@ mod tests {
     use gekko::disasm::{Extensions, Ins};
     use gekko::{Address, CondReg, Cpu, FPR, FloatControlReg, FloatPair, GPR, QuantReg, Reg, SPR};
     use ppcjit::block::{BlockFn, Executed as NativeExecuted, ExitReason as NativeExitReason};
-    use ppcjit::hooks::{Context as NativeContext, ExitData, Hooks};
+    use ppcjit::hooks::{
+        Context as NativeContext, ExitData, Hooks, STORE_CONDITIONAL_FAULT,
+        STORE_CONDITIONAL_NOT_STORED, STORE_CONDITIONAL_STORED,
+    };
     use ppcjit::{CodegenSettings, ExitMode, FastmemLut, TranslationConfig, Translator};
     use wasmparser::Validator;
 
@@ -325,6 +329,22 @@ mod tests {
 
     fn stw(rs: u8, ra: u8, displacement: i16) -> Ins {
         d_form(36, rs, ra, displacement as u16)
+    }
+
+    fn lwarx(rd: u8, ra: u8, rb: u8) -> Ins {
+        let code =
+            31 << 26 | u32::from(rd) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 20 << 1;
+        Ins::new(code, Extensions::gekko_broadway())
+    }
+
+    fn stwcx(rs: u8, ra: u8, rb: u8) -> Ins {
+        let code = 31 << 26
+            | u32::from(rs) << 21
+            | u32::from(ra) << 16
+            | u32::from(rb) << 11
+            | 150 << 1
+            | 1;
+        Ins::new(code, Extensions::gekko_broadway())
     }
 
     fn stb(rs: u8, ra: u8, displacement: i16) -> Ins {
@@ -411,6 +431,8 @@ mod tests {
     }
 
     impl NativeState {
+        const GUEST_BASE: u32 = 0x8000_0000;
+
         fn new() -> Self {
             let fastmem = vec![None; ppcjit::FASTMEM_LUT_COUNT].into_boxed_slice();
             let mut fastmem: Box<FastmemLut> = match fastmem.try_into() {
@@ -427,6 +449,29 @@ mod tests {
                 exit_reason: None,
                 executed: None,
             }
+        }
+
+        fn guest_offset(address: Address, size: usize) -> Option<usize> {
+            let offset = address.value().checked_sub(Self::GUEST_BASE)? as usize;
+            offset
+                .checked_add(size)
+                .filter(|&end| end <= 1 << 17)
+                .map(|_| offset)
+        }
+
+        fn read_guest_word(&self, address: Address) -> u32 {
+            let offset = Self::guest_offset(address, size_of::<u32>()).unwrap();
+            u32::from_be_bytes(
+                self.guest_page[offset..offset + size_of::<u32>()]
+                    .try_into()
+                    .unwrap(),
+            )
+        }
+
+        fn write_guest_word(&mut self, address: Address, value: u32) {
+            let offset = Self::guest_offset(address, size_of::<u32>()).unwrap();
+            self.guest_page[offset..offset + size_of::<u32>()]
+                .copy_from_slice(&value.to_be_bytes());
         }
     }
 
@@ -468,6 +513,40 @@ mod tests {
         panic!("unexpected native JIT write hook")
     }
 
+    extern "C-unwind" fn load_reserve(
+        ctx: *mut NativeContext,
+        address: Address,
+        value: *mut i32,
+    ) -> bool {
+        let state = unsafe { &mut *ctx.cast::<NativeState>() };
+        let Some(offset) = NativeState::guest_offset(address, size_of::<i32>()) else {
+            return false;
+        };
+        let bytes = state.guest_page[offset..offset + size_of::<i32>()]
+            .try_into()
+            .unwrap();
+        unsafe { value.write(i32::from_be_bytes(bytes)) };
+        state.cpu.reservation.reserve(Address(offset as u32));
+        true
+    }
+
+    extern "C-unwind" fn store_conditional(
+        ctx: *mut NativeContext,
+        address: Address,
+        value: i32,
+    ) -> u8 {
+        let state = unsafe { &mut *ctx.cast::<NativeState>() };
+        let Some(offset) = NativeState::guest_offset(address, size_of::<i32>()) else {
+            return STORE_CONDITIONAL_FAULT;
+        };
+        if !state.cpu.reservation.clear() {
+            return STORE_CONDITIONAL_NOT_STORED;
+        }
+
+        state.guest_page[offset..offset + size_of::<i32>()].copy_from_slice(&value.to_be_bytes());
+        STORE_CONDITIONAL_STORED
+    }
+
     extern "C-unwind" fn unexpected_read_quantized(
         _ctx: *mut NativeContext,
         _addr: Address,
@@ -507,6 +586,8 @@ mod tests {
             write_i32: unexpected_write::<i32>,
             read_i64: unexpected_read::<i64>,
             write_i64: unexpected_write::<i64>,
+            load_reserve,
+            store_conditional,
             read_quantized: unexpected_read_quantized,
             write_quantized: unexpected_write_quantized,
             invalidate_icache: unexpected_invalidate,
@@ -860,6 +941,112 @@ if (view.getUint32(cpu + pcOffset, true) !== 0x80001500) {
             native.cpu.user.gpr[4],
             native.cpu.user.lr,
         );
+    }
+
+    #[test]
+    fn native_jit_load_reserve_and_store_conditional_round_trip() {
+        let address = Address(NativeState::GUEST_BASE + 0x20);
+        let initial = 0x1122_3344;
+        let replacement = 0xaabb_ccdd;
+        let sequence = [lwarx(5, 0, 3), stwcx(4, 0, 3)];
+
+        let state =
+            execute_with_native_jit_initialized(&sequence, 0x8000_1000, address.value(), |state| {
+                state.cpu.user.gpr[4] = replacement;
+                state.cpu.user.xer.set_overflow_fuse(true);
+                state.write_guest_word(address, initial);
+            });
+
+        assert_eq!(state.cpu.user.gpr[5], initial);
+        assert_eq!(state.read_guest_word(address), replacement);
+        assert!(!state.cpu.reservation.is_valid());
+        let cr0 = state.cpu.user.cr.fields()[7];
+        assert!(!cr0.lt());
+        assert!(!cr0.gt());
+        assert!(cr0.eq());
+        assert!(cr0.ov());
+    }
+
+    #[test]
+    fn native_jit_store_conditional_uses_any_live_mpc750_reservation() {
+        let reserved_address = Address(NativeState::GUEST_BASE + 0x20);
+        let target_address = Address(NativeState::GUEST_BASE + 0x40);
+        let replacement = 0x5566_7788;
+        let sequence = [lwarx(5, 0, 3), stwcx(4, 3, 6)];
+
+        let state = execute_with_native_jit_initialized(
+            &sequence,
+            0x8000_1000,
+            reserved_address.value(),
+            |state| {
+                state.cpu.user.gpr[4] = replacement;
+                state.cpu.user.gpr[6] = target_address.value() - reserved_address.value();
+                state.write_guest_word(reserved_address, 0x1020_3040);
+                state.write_guest_word(target_address, 0);
+            },
+        );
+
+        assert_eq!(state.read_guest_word(reserved_address), 0x1020_3040);
+        assert_eq!(state.read_guest_word(target_address), replacement);
+        assert!(state.cpu.user.cr.fields()[7].eq());
+        assert!(!state.cpu.reservation.is_valid());
+    }
+
+    #[test]
+    fn native_jit_failed_store_conditional_does_not_write() {
+        let address = Address(NativeState::GUEST_BASE + 0x20);
+        let initial = 0x1234_5678;
+        let sequence = [stwcx(4, 0, 3)];
+
+        let state =
+            execute_with_native_jit_initialized(&sequence, 0x8000_1000, address.value(), |state| {
+                state.cpu.user.gpr[4] = 0x8765_4321;
+                state.cpu.user.xer.set_overflow_fuse(true);
+                state.write_guest_word(address, initial);
+            });
+
+        assert_eq!(state.read_guest_word(address), initial);
+        assert!(!state.cpu.reservation.is_valid());
+        let cr0 = state.cpu.user.cr.fields()[7];
+        assert!(!cr0.lt());
+        assert!(!cr0.gt());
+        assert!(!cr0.eq());
+        assert!(cr0.ov());
+    }
+
+    #[test]
+    fn native_jit_reservation_faults_preserve_existing_state() {
+        let reserved = Address(0x0000_0040);
+        let unmapped = 0x9000_0000;
+        let faulting_store = execute_with_native_jit_initialized(
+            &[stwcx(4, 0, 3)],
+            0x8000_1000,
+            unmapped,
+            |state| {
+                state.cpu.reservation.reserve(reserved);
+                state.cpu.user.gpr[4] = 0xfeed_beef;
+            },
+        );
+        assert_eq!(
+            faulting_store.cpu.reservation.physical_granule(),
+            Some(reserved)
+        );
+
+        let misaligned = NativeState::GUEST_BASE + 0x21;
+        let faulting_load = execute_with_native_jit_initialized(
+            &[lwarx(5, 0, 3)],
+            0x8000_2000,
+            misaligned,
+            |state| {
+                state.cpu.reservation.reserve(reserved);
+                state.cpu.user.gpr[5] = 0x1357_9bdf;
+            },
+        );
+        assert_eq!(
+            faulting_load.cpu.reservation.physical_granule(),
+            Some(reserved)
+        );
+        assert_eq!(faulting_load.cpu.user.gpr[5], 0x1357_9bdf);
     }
 
     #[test]

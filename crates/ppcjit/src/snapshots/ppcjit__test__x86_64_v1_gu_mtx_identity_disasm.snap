@@ -309,7 +309,7 @@ block66:
   movupd %xmm0, 0xa8(%rsi)
   movdqu <offset:1>+0x28(%rsp), %xmm0
   movupd %xmm0, 0xb8(%rsi)
-  load_ext_name userextname41+0, %rsi
+  load_ext_name userextname43+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x14000a, %ecx
@@ -329,7 +329,7 @@ block1:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname26+0, %rsi
+  load_ext_name userextname28+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x20001, %ecx
@@ -364,7 +364,7 @@ block6:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname27+0, %rsi
+  load_ext_name userextname29+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x20001, %ecx
@@ -410,7 +410,7 @@ block13:
   load_ext_name userextname0+0, %r8
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%r8
-  load_ext_name userextname28+0, %rsi
+  load_ext_name userextname30+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x40002, %ecx
@@ -448,7 +448,7 @@ block19:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname29+0, %rsi
+  load_ext_name userextname31+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x60003, %ecx
@@ -485,7 +485,7 @@ block23:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname30+0, %rsi
+  load_ext_name userextname32+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x60003, %ecx
@@ -526,7 +526,7 @@ block27:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname31+0, %rsi
+  load_ext_name userextname33+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0xa0005, %ecx
@@ -566,7 +566,7 @@ block31:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname32+0, %rsi
+  load_ext_name userextname34+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0xa0005, %ecx
@@ -609,7 +609,7 @@ block35:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname33+0, %rsi
+  load_ext_name userextname35+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0xe0007, %ecx
@@ -651,7 +651,7 @@ block39:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname34+0, %rsi
+  load_ext_name userextname36+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0xe0007, %ecx
@@ -689,7 +689,7 @@ block43:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname35+0, %rsi
+  load_ext_name userextname37+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x100008, %ecx
@@ -728,7 +728,7 @@ block47:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname36+0, %rsi
+  load_ext_name userextname38+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x100008, %ecx
@@ -765,7 +765,7 @@ block51:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname37+0, %rsi
+  load_ext_name userextname39+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x120009, %ecx
@@ -802,7 +802,7 @@ block55:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname38+0, %rsi
+  load_ext_name userextname40+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x120009, %ecx
@@ -842,7 +842,7 @@ block59:
   load_ext_name userextname0+0, %r9
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%r9
-  load_ext_name userextname39+0, %rsi
+  load_ext_name userextname41+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x14000a, %ecx
@@ -879,7 +879,7 @@ block63:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname40+0, %rsi
+  load_ext_name userextname42+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x14000a, %ecx

@@ -12,7 +12,7 @@ use bitos::integer::{UnsignedInt, u3, u4};
 use bitos::{BitUtils, TryBits, bitos};
 use bitvec::array::BitArray;
 use color::{Rgba, Rgba8};
-use gekko::Address;
+use gekko::{Address, LoadStoreReservation};
 use glam::{Mat4, Vec2, Vec3};
 use ring_arena::{Handle, RingArena};
 use seq_macro::seq;
@@ -1119,6 +1119,55 @@ fn call(sys: &mut System, address: Address, length: u32) {
     sys.gpu.cmd.queue.push_front_bytes(data);
 }
 
+fn invalidate_strided_write_rows(
+    reservation: &mut LoadStoreReservation,
+    dst: Address,
+    row_length: u32,
+    stride: u32,
+    rows: u32,
+) {
+    for row in 0..rows {
+        reservation.invalidate_range(dst + row * stride, row_length as usize);
+    }
+}
+
+fn invalidate_efb_texture_copy_rows(
+    reservation: &mut LoadStoreReservation,
+    dst: Address,
+    stride: u32,
+    width: u32,
+    height: u32,
+    format: tex::Format,
+) {
+    let tile_height = match format {
+        tex::Format::I4 => 8,
+        tex::Format::I8
+        | tex::Format::IA4
+        | tex::Format::IA8
+        | tex::Format::RGB565
+        | tex::Format::RGB5A3
+        | tex::Format::RGBA8 => 4,
+        _ => unreachable!("EFB copies cannot use texture format {format:?}"),
+    };
+    let rows = height.div_ceil(tile_height);
+    if rows == 0 {
+        return;
+    }
+
+    let row_length = tex::Encoding::length_for(width, height, format) / rows;
+    invalidate_strided_write_rows(reservation, dst, row_length, stride * 32, rows);
+}
+
+fn invalidate_efb_xfb_copy_rows(
+    reservation: &mut LoadStoreReservation,
+    dst: Address,
+    stride: u32,
+    width: u32,
+    height: u32,
+) {
+    invalidate_strided_write_rows(reservation, dst, width * 2, stride * 32, height);
+}
+
 fn efb_copy(sys: &mut System, cmd: pix::CopyCmd) {
     let args = render::CopyArgs {
         src: sys.gpu.pix.copy.src,
@@ -1141,6 +1190,9 @@ fn efb_copy(sys: &mut System, cmd: pix::CopyCmd) {
             .render
             .exec(render::Action::CopyXfb { args, id });
 
+        // The renderer keeps XFB bytes virtual, but the GX copy is still an architected external
+        // write to main memory and therefore participates in reservation snooping.
+        invalidate_efb_xfb_copy_rows(&mut sys.cpu.reservation, dst, stride, width, height);
         return;
     }
 
@@ -1199,9 +1251,110 @@ fn efb_copy(sys: &mut System, cmd: pix::CopyCmd) {
         cmd.color_format().texture_format()
     };
 
+    // The renderer may keep texture-copy bytes virtual, but GX still performs the architected
+    // external write and therefore snoops reservations over the exact tiled destination rows.
+    invalidate_efb_texture_copy_rows(&mut sys.cpu.reservation, dst, stride, width, height, format);
+
     if !sys.config.perform_efb_copies {
         let len = tex::Encoding::length_for(width, height, format) as usize;
         let data = &sys.mem.ram()[dst.value() as usize..][..len];
         sys.gpu.tex.update_tex_hash(dst, data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::audio::NopAudioModule;
+    use crate::modules::debug::NopDebugModule;
+    use crate::modules::disk::NopDiskModule;
+    use crate::modules::input::NopInputModule;
+    use crate::modules::render::NopRenderModule;
+    use crate::modules::vertex::NopVertexModule;
+    use crate::system::{Config, Modules};
+
+    fn test_system() -> System {
+        System::new(
+            Modules {
+                audio: Box::new(NopAudioModule),
+                debug: Box::new(NopDebugModule),
+                disk: Box::new(NopDiskModule),
+                input: Box::new(NopInputModule),
+                render: Box::new(NopRenderModule),
+                vertex: Box::new(NopVertexModule),
+            },
+            Config {
+                ipl_lle: false,
+                ipl: None,
+                sideload: None,
+                perform_efb_copies: false,
+                uart_escape: false,
+            },
+        )
+    }
+
+    #[test]
+    fn efb_copy_invalidation_follows_written_stride_rows() {
+        let dst = Address(0x1000);
+        let mut reservation = LoadStoreReservation::default();
+
+        reservation.reserve(dst + 132);
+        invalidate_efb_texture_copy_rows(&mut reservation, dst, 4, 8, 8, tex::Format::I8);
+        assert!(!reservation.is_valid());
+
+        reservation.reserve(dst + 64);
+        invalidate_efb_texture_copy_rows(&mut reservation, dst, 4, 8, 8, tex::Format::I8);
+        assert!(reservation.is_valid());
+    }
+
+    #[test]
+    fn xfb_copy_invalidation_preserves_stride_gaps() {
+        let dst = Address(0x2000);
+        let mut reservation = LoadStoreReservation::default();
+
+        reservation.reserve(dst + 32);
+        invalidate_efb_xfb_copy_rows(&mut reservation, dst, 2, 8, 2);
+        assert!(reservation.is_valid());
+
+        reservation.reserve(dst + 68);
+        invalidate_efb_xfb_copy_rows(&mut reservation, dst, 2, 8, 2);
+        assert!(!reservation.is_valid());
+    }
+
+    #[test]
+    fn xfb_copy_register_path_invalidates_exact_architected_rows() {
+        let mut sys = test_system();
+        let dst = Address(0x2000);
+        set_register(&mut sys, Reg::PixelCopyDimensions, 7 | (1 << 10));
+        set_register(&mut sys, Reg::PixelCopyDst, dst.value() >> 5);
+        set_register(&mut sys, Reg::PixelCopyDstStride, 2);
+
+        sys.cpu.reservation.reserve(dst + 32);
+        set_register(&mut sys, Reg::PixelCopyCmd, 1 << 14);
+        assert!(sys.cpu.reservation.is_valid());
+
+        sys.cpu.reservation.reserve(dst + 68);
+        set_register(&mut sys, Reg::PixelCopyCmd, 1 << 14);
+        assert!(!sys.cpu.reservation.is_valid());
+        assert_eq!(sys.gpu.xfb_copies.len(), 2);
+    }
+
+    #[test]
+    fn virtualized_texture_copy_register_path_invalidates_exact_tiled_rows() {
+        let mut sys = test_system();
+        let dst = Address(0x3000);
+        set_register(&mut sys, Reg::PixelCopyDimensions, 7 | (7 << 10));
+        set_register(&mut sys, Reg::PixelCopyDst, dst.value() >> 5);
+        set_register(&mut sys, Reg::PixelCopyDstStride, 4);
+
+        // An 8x8 I8 texture copy writes two 32-byte tile rows 128 bytes apart.
+        // The reservation in the gap must survive even when no copy bytes are materialized.
+        sys.cpu.reservation.reserve(dst + 64);
+        set_register(&mut sys, Reg::PixelCopyCmd, 1 << 4);
+        assert!(sys.cpu.reservation.is_valid());
+
+        sys.cpu.reservation.reserve(dst + 132);
+        set_register(&mut sys, Reg::PixelCopyCmd, 1 << 4);
+        assert!(!sys.cpu.reservation.is_valid());
     }
 }

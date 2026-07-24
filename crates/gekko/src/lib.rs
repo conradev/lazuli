@@ -1078,6 +1078,80 @@ pub struct Supervisor {
     pub misc: Miscellaneous,
 }
 
+/// Hidden load/store reservation state for the PowerPC Gekko CPU.
+///
+/// The load/store reservation is hidden processor state rather than an architected register, but
+/// it lives with the CPU so runtime memory mechanisms can invalidate it without coupling the
+/// processor model to a particular execution engine.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LoadStoreReservation {
+    physical_granule: Address,
+    valid: u32,
+}
+
+impl LoadStoreReservation {
+    /// The MPC750/Gekko reservation granule is one 32-byte cache line.
+    pub const GRANULE_SIZE: u32 = 32;
+
+    /// Whether a load/store reservation is currently held.
+    #[inline(always)]
+    pub const fn is_valid(self) -> bool {
+        self.valid != 0
+    }
+
+    /// The aligned physical granule covered by the reservation, if one is held.
+    #[inline(always)]
+    pub const fn physical_granule(self) -> Option<Address> {
+        if self.is_valid() {
+            Some(self.physical_granule)
+        } else {
+            None
+        }
+    }
+
+    /// Replaces any prior reservation with one covering `physical`.
+    #[inline(always)]
+    pub fn reserve(&mut self, physical: Address) {
+        self.physical_granule = physical.align_down(Self::GRANULE_SIZE);
+        self.valid = 1;
+    }
+
+    /// Clears the reservation, returning whether one was held.
+    #[inline(always)]
+    pub fn clear(&mut self) -> bool {
+        let was_valid = self.is_valid();
+        self.valid = 0;
+        was_valid
+    }
+
+    /// Clears the reservation if a physical write overlaps its 32-byte granule.
+    ///
+    /// This is for writes performed by external memory masters. Ordinary stores from the
+    /// reservation-holding CPU must not call it.
+    #[inline(always)]
+    pub fn invalidate_range(&mut self, physical: Address, length: usize) -> bool {
+        if !self.is_valid() || length == 0 {
+            return false;
+        }
+
+        let write_start = u64::from(physical.value());
+        let write_length = u64::try_from(length).unwrap_or(u64::MAX);
+        let write_end = write_start
+            .saturating_add(write_length)
+            .min(u64::from(u32::MAX) + 1);
+        let reservation_start = u64::from(self.physical_granule.value());
+        let reservation_end = reservation_start + u64::from(Self::GRANULE_SIZE);
+
+        if write_start < reservation_end && reservation_start < write_end {
+            self.clear();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Structure of all the registers in the PowerPC Gekko CPU.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1088,9 +1162,23 @@ pub struct Cpu {
     pub user: User,
     /// Supervisor level registers
     pub supervisor: Supervisor,
+    /// Hidden state used by `lwarx`/`stwcx.`.
+    pub reservation: LoadStoreReservation,
 }
 
 impl Cpu {
+    /// Offset of the reservation's aligned physical address in [`Cpu`].
+    #[inline(always)]
+    pub fn reservation_physical_offset() -> usize {
+        offset_of!(Cpu, reservation.physical_granule)
+    }
+
+    /// Offset of the reservation-valid word in [`Cpu`].
+    #[inline(always)]
+    pub fn reservation_valid_offset() -> usize {
+        offset_of!(Cpu, reservation.valid)
+    }
+
     /// Takes an exception.
     pub fn raise_exception(&mut self, exception: Exception) {
         if exception == Exception::Decrementer {
@@ -1526,5 +1614,75 @@ impl From<SPR> for Reg {
     #[inline(always)]
     fn from(value: SPR) -> Self {
         Self::SPR(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Address, Cpu, Exception, LoadStoreReservation};
+
+    #[test]
+    fn load_store_reservation_tracks_a_physical_cache_line() {
+        let mut reservation = LoadStoreReservation::default();
+        assert!(!reservation.is_valid());
+        assert_eq!(reservation.physical_granule(), None);
+
+        reservation.reserve(Address(0x123f));
+        assert!(reservation.is_valid());
+        assert_eq!(reservation.physical_granule(), Some(Address(0x1220)));
+
+        assert!(reservation.clear());
+        assert!(!reservation.clear());
+        assert_eq!(reservation.physical_granule(), None);
+    }
+
+    #[test]
+    fn only_overlapping_nonempty_external_writes_invalidate_a_reservation() {
+        let mut reservation = LoadStoreReservation::default();
+
+        for (start, length) in [(0x1200, 0x20), (0x1240, 1), (0x1220, 0)] {
+            reservation.reserve(Address(0x1234));
+            assert!(!reservation.invalidate_range(Address(start), length));
+            assert!(reservation.is_valid());
+        }
+
+        for (start, length) in [(0x121f, 2), (0x1220, 1), (0x123f, 1), (0x1230, 0x20)] {
+            reservation.reserve(Address(0x1234));
+            assert!(reservation.invalidate_range(Address(start), length));
+            assert!(!reservation.is_valid());
+        }
+    }
+
+    #[test]
+    fn reservation_overlap_handles_the_top_of_the_physical_address_space() {
+        let mut reservation = LoadStoreReservation::default();
+        reservation.reserve(Address(0xffff_ffff));
+
+        assert_eq!(reservation.physical_granule(), Some(Address(0xffff_ffe0)));
+        assert!(reservation.invalidate_range(Address(0xffff_ffff), 1));
+    }
+
+    #[test]
+    fn taking_an_exception_preserves_hidden_reservation_state() {
+        let mut cpu = Cpu {
+            pc: Address(0x8000_1000),
+            ..Cpu::default()
+        };
+        cpu.reservation.reserve(Address(0x0012_3456));
+
+        cpu.raise_exception(Exception::Alignment);
+
+        assert_eq!(
+            cpu.reservation.physical_granule(),
+            Some(Address(0x0012_3440))
+        );
+    }
+
+    #[test]
+    fn reservation_offsets_expose_the_stable_runtime_layout() {
+        assert_eq!(
+            Cpu::reservation_valid_offset(),
+            Cpu::reservation_physical_offset() + std::mem::size_of::<Address>()
+        );
     }
 }

@@ -240,7 +240,7 @@ block32:
   movl %r14d, 0x28c(%rsi)
   vmovupd %xmm4, 0xc8(%rsi)
   vmovupd %xmm0, 0xb8(%rsi)
-  load_ext_name userextname34+0, %rsi
+  load_ext_name userextname36+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0xc0006, %ecx
@@ -260,7 +260,7 @@ block1:
   load_ext_name userextname0+0, %r8
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%r8
-  load_ext_name userextname26+0, %rsi
+  load_ext_name userextname28+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x20001, %ecx
@@ -287,7 +287,7 @@ block5:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname27+0, %rsi
+  load_ext_name userextname29+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x20001, %ecx
@@ -314,7 +314,7 @@ block9:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname28+0, %rsi
+  load_ext_name userextname30+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x20001, %ecx
@@ -351,7 +351,7 @@ block13:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname29+0, %rsi
+  load_ext_name userextname31+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x40002, %ecx
@@ -419,7 +419,7 @@ block17:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname30+0, %rsi
+  load_ext_name userextname32+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x80004, %ecx
@@ -487,7 +487,7 @@ block21:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname31+0, %rsi
+  load_ext_name userextname33+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x80004, %ecx
@@ -572,7 +572,7 @@ block25:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname32+0, %rsi
+  load_ext_name userextname34+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0xc0006, %ecx
@@ -657,7 +657,7 @@ block29:
   load_ext_name userextname0+0, %rax
   movq <offset:1>+0x10(%rsp), %rdi
   call    *%rax
-  load_ext_name userextname33+0, %rsi
+  load_ext_name userextname35+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0xc0006, %ecx

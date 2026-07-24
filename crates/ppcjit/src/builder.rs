@@ -141,6 +141,8 @@ struct HookFuncs {
     write_i16: ir::FuncRef,
     write_i32: ir::FuncRef,
     write_i64: ir::FuncRef,
+    load_reserve: ir::FuncRef,
+    store_conditional: ir::FuncRef,
     read_quant: ir::FuncRef,
     write_quant: ir::FuncRef,
     inv_icache: ir::FuncRef,
@@ -337,6 +339,8 @@ impl<'ctx> BlockBuilder<'ctx> {
             sdr1_changed: hook(sigs.generic_hook, HookKind::Sdr1Changed),
             tlbie: hook(sigs.invalidate_icache_hook, HookKind::Tlbie),
             tlbsync: hook(sigs.generic_hook, HookKind::Tlbsync),
+            load_reserve: hook(sigs.read_i32_hook, HookKind::LoadReserve),
+            store_conditional: hook(sigs.write_i32_hook, HookKind::StoreConditional),
             raise_exception,
         };
 
@@ -705,7 +709,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Lhzx => self.lhzx(ins),
             Opcode::Lmw => self.lmw(ins),
             Opcode::Lswi => self.lswi(ins),
-            Opcode::Lwarx => self.lwzx(ins), // NOTE: same behaviour
+            Opcode::Lwarx => self.lwarx(ins),
             Opcode::Lwbrx => self.lwbrx(ins),
             Opcode::Lwz => self.lwz(ins),
             Opcode::Lwzu => self.lwzu(ins),

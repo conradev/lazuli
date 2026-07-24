@@ -28,8 +28,15 @@ pub type ExitHook =
 
 pub type ReadHook<T> = extern "C-unwind" fn(*mut Context, Address, *mut T) -> bool;
 pub type WriteHook<T> = extern "C-unwind" fn(*mut Context, Address, T) -> bool;
+pub type StoreConditionalHook = extern "C-unwind" fn(*mut Context, Address, i32) -> u8;
 pub type ReadQuantizedHook = extern "C-unwind" fn(*mut Context, Address, QuantReg, *mut f64) -> u8;
 pub type WriteQuantizedHook = extern "C-unwind" fn(*mut Context, Address, QuantReg, f64) -> u8;
+
+pub const LOAD_RESERVE_FAULT: u8 = 0;
+pub const LOAD_RESERVE_LOADED: u8 = 1;
+pub const STORE_CONDITIONAL_FAULT: u8 = 0;
+pub const STORE_CONDITIONAL_NOT_STORED: u8 = 1;
+pub const STORE_CONDITIONAL_STORED: u8 = 2;
 
 pub type InvalidateICache = extern "C-unwind" fn(*mut Context, Address);
 
@@ -65,6 +72,8 @@ pub enum HookKind {
     Sdr1Changed,
     Tlbie,
     Tlbsync,
+    LoadReserve      = 27,
+    StoreConditional = 28,
 }
 
 /// External functions that JITed code calls.
@@ -84,6 +93,8 @@ pub struct Hooks {
     pub write_i32: WriteHook<i32>,
     pub read_i64: ReadHook<i64>,
     pub write_i64: WriteHook<i64>,
+    pub load_reserve: ReadHook<i32>,
+    pub store_conditional: StoreConditionalHook,
     pub read_quantized: ReadQuantizedHook,
     pub write_quantized: WriteQuantizedHook,
 
@@ -140,6 +151,8 @@ impl Hooks {
             write_i32: stub!(),
             read_i64: stub!(),
             write_i64: stub!(),
+            load_reserve: stub!(),
+            store_conditional: stub!(),
             read_quantized: stub!(),
             write_quantized: stub!(),
             invalidate_icache: stub!(),

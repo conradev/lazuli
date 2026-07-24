@@ -246,6 +246,71 @@ fn reset_address_space_links(ctx: &mut Context, clear_mappings: bool) {
     ctx.address_space_changed = true;
 }
 
+fn invalidate_dcache_dma_destination(
+    reservation: &mut gekko::LoadStoreReservation,
+    direction: gekko::DmaDirection,
+    ram_address: Address,
+    cache_address: Address,
+    length: usize,
+) {
+    let destination = match direction {
+        gekko::DmaDirection::FromCacheToRam => ram_address,
+        gekko::DmaDirection::FromRamToCache => cache_address,
+    };
+    reservation.invalidate_range(destination, length);
+}
+
+fn record_data_reservation_fault(
+    sys: &mut System,
+    fault: system::bus::DataReservationFault,
+    write: bool,
+) {
+    sys.cpu.supervisor.exception.dsisr = fault.dsisr(write);
+}
+
+fn load_reserve_system(sys: &mut System, addr: Address, value: &mut i32) -> bool {
+    let physical = match sys.translate_data_reservation_addr(addr, false) {
+        Ok(physical) => physical,
+        Err(fault) => {
+            record_data_reservation_fault(sys, fault, false);
+            return false;
+        }
+    };
+    let Some(loaded) = sys.read_data_reservation_phys(physical) else {
+        record_data_reservation_fault(sys, system::bus::DataReservationFault::Backing, false);
+        return false;
+    };
+
+    *value = loaded;
+    sys.cpu.reservation.reserve(physical);
+    true
+}
+
+fn store_conditional_system(sys: &mut System, addr: Address, value: i32) -> u8 {
+    let physical = match sys.translate_data_reservation_addr(addr, true) {
+        Ok(physical) => physical,
+        Err(fault) => {
+            record_data_reservation_fault(sys, fault, true);
+            return STORE_CONDITIONAL_FAULT;
+        }
+    };
+
+    // A reservation-less stwcx. still performs write-class translation and protection, but it
+    // completes as failed without probing whether the translated physical address has backing.
+    if !sys.cpu.reservation.is_valid() {
+        return STORE_CONDITIONAL_NOT_STORED;
+    }
+
+    // MPC750 reservations are nonspecific to their owning processor: any completed stwcx.
+    // succeeds while the reservation is live, even when its address differs from lwarx.
+    if !sys.write_data_reservation_phys(physical, value) {
+        record_data_reservation_fault(sys, system::bus::DataReservationFault::Backing, true);
+        return STORE_CONDITIONAL_FAULT;
+    }
+    sys.cpu.reservation.clear();
+    STORE_CONDITIONAL_STORED
+}
+
 const CTX_HOOKS: Hooks = {
     extern "C-unwind" fn get_registers<'a>(ctx: &'a mut Context) -> &'a mut Cpu {
         &mut ctx.sys.cpu
@@ -388,6 +453,28 @@ const CTX_HOOKS: Hooks = {
         }
     }
 
+    extern "C-unwind" fn load_reserve(ctx: &mut Context, addr: Address, value: &mut i32) -> bool {
+        if load_reserve_system(ctx.sys, addr, value) {
+            true
+        } else {
+            std::hint::cold_path();
+            tracing::error!(pc = ?ctx.sys.cpu.pc, "failed load-reserve access at {addr}");
+            false
+        }
+    }
+
+    extern "C-unwind" fn store_conditional(ctx: &mut Context, addr: Address, value: i32) -> u8 {
+        let status = store_conditional_system(ctx.sys, addr, value);
+        if status == STORE_CONDITIONAL_FAULT {
+            std::hint::cold_path();
+            tracing::error!(
+                pc = ?ctx.sys.cpu.pc,
+                "failed store-conditional access at {addr}"
+            );
+        }
+        status
+    }
+
     extern "C-unwind" fn read_quantized(
         ctx: &mut Context,
         addr: Address,
@@ -515,6 +602,13 @@ const CTX_HOOKS: Hooks = {
                     l2c.copy_from_slice(ram);
                 }
             }
+            invalidate_dcache_dma_destination(
+                &mut ctx.sys.cpu.reservation,
+                dma.lower.direction(),
+                dma.mem_address(),
+                dma.cache_address(),
+                dma.length() as usize,
+            );
         }
 
         ctx.sys.cpu.supervisor.config.dma.lower.set_trigger(false);
@@ -608,6 +702,11 @@ const CTX_HOOKS: Hooks = {
             transmute::<_, ReadHook<i64>>(read::<i64> as extern "C-unwind" fn(_, _, _) -> _);
         let write_i64 =
             transmute::<_, WriteHook<i64>>(write::<i64> as extern "C-unwind" fn(_, _, _) -> _);
+        let load_reserve =
+            transmute::<_, ReadHook<i32>>(load_reserve as extern "C-unwind" fn(_, _, _) -> _);
+        let store_conditional = transmute::<_, StoreConditionalHook>(
+            store_conditional as extern "C-unwind" fn(_, _, _) -> _,
+        );
         let read_quantized = transmute::<_, ReadQuantizedHook>(
             read_quantized as extern "C-unwind" fn(_, _, _, _) -> _,
         );
@@ -650,6 +749,8 @@ const CTX_HOOKS: Hooks = {
             write_i32,
             read_i64,
             write_i64,
+            load_reserve,
+            store_conditional,
             read_quantized,
             write_quantized,
 
@@ -903,8 +1004,61 @@ impl CpuCore for Core {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use lazuli::gekko::disasm::{Extensions, Ins};
+    use lazuli::gekko::{Bat, CondReg};
+    use lazuli::modules::audio::NopAudioModule;
+    use lazuli::modules::debug::NopDebugModule;
+    use lazuli::modules::disk::NopDiskModule;
+    use lazuli::modules::input::NopInputModule;
+    use lazuli::modules::render::NopRenderModule;
+    use lazuli::modules::vertex::NopVertexModule;
+    use lazuli::system::{Config, Modules};
+
+    use super::*;
+
+    fn test_system() -> System {
+        System::new(
+            Modules {
+                audio: Box::new(NopAudioModule),
+                debug: Box::new(NopDebugModule),
+                disk: Box::new(NopDiskModule),
+                input: Box::new(NopInputModule),
+                render: Box::new(NopRenderModule),
+                vertex: Box::new(NopVertexModule),
+            },
+            Config {
+                ipl_lle: false,
+                ipl: None,
+                sideload: None,
+                perform_efb_copies: false,
+                uart_escape: false,
+            },
+        )
+    }
+
+    fn run_one(sys: &mut System, instruction: u32) {
+        sys.cpu.pc = Address(0);
+        sys.write_phys_slow(Address(0), instruction);
+        let mut core = Core::new(Settings {
+            instr_per_block: 1,
+            codegen: ppcjit::CodegenSettings::default(),
+            cache_path: None,
+        });
+        let info = core.step(sys);
+        assert_eq!(info.executed_instructions, 1);
+    }
+
+    fn lwarx(rd: u8, ra: u8, rb: u8) -> u32 {
+        31 << 26 | u32::from(rd) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 20 << 1
+    }
+
+    fn stwcx(rs: u8, ra: u8, rb: u8) -> u32 {
+        31 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 150 << 1 | 1
+    }
+
+    fn bat(upper: u32, lower: u32) -> Bat {
+        Bat::from_bits(u64::from(upper) << 32 | u64::from(lower))
+    }
 
     #[test]
     fn clearing_address_space_mappings_unlinks_stale_exit_targets() {
@@ -940,5 +1094,151 @@ mod tests {
                 .linked_return_from
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn locked_cache_dma_invalidates_the_physical_destination() {
+        let ram_address = Address(0x0000_2000);
+        let cache_address = Address(0xe000_4000);
+        let mut reservation = gekko::LoadStoreReservation::default();
+
+        reservation.reserve(ram_address + 4);
+        invalidate_dcache_dma_destination(
+            &mut reservation,
+            gekko::DmaDirection::FromCacheToRam,
+            ram_address,
+            cache_address,
+            32,
+        );
+        assert!(!reservation.is_valid());
+
+        reservation.reserve(cache_address + 4);
+        invalidate_dcache_dma_destination(
+            &mut reservation,
+            gekko::DmaDirection::FromRamToCache,
+            ram_address,
+            cache_address,
+            32,
+        );
+        assert!(!reservation.is_valid());
+
+        reservation.reserve(ram_address + 4);
+        invalidate_dcache_dma_destination(
+            &mut reservation,
+            gekko::DmaDirection::FromRamToCache,
+            ram_address,
+            cache_address,
+            32,
+        );
+        assert!(reservation.is_valid());
+    }
+
+    #[test]
+    fn native_reservation_instructions_preserve_state_across_precise_faults() {
+        let mut sys = test_system();
+        let reserved = Address(0x40);
+        let unbacked = Address(0x1000_0000);
+
+        sys.cpu.user.gpr[3] = unbacked.value();
+        sys.cpu.user.gpr[4] = 0xdead_beef;
+        sys.cpu.reservation.reserve(reserved);
+        sys.cpu.supervisor.exception.dsisr = 0xfeed_face;
+        run_one(&mut sys, lwarx(4, 0, 3));
+        assert_eq!(sys.cpu.user.gpr[4], 0xdead_beef);
+        assert_eq!(sys.cpu.reservation.physical_granule(), Some(reserved));
+        assert_eq!(sys.cpu.supervisor.exception.dar, unbacked.value());
+        assert_eq!(sys.cpu.supervisor.exception.dsisr, 0);
+
+        sys.cpu = Cpu::default();
+        sys.cpu.user.gpr[3] = unbacked.value();
+        sys.cpu.user.gpr[4] = 0x1122_3344;
+        sys.cpu.user.cr = CondReg::from_bits(0xafff_ffff);
+        sys.cpu.reservation.reserve(reserved);
+        run_one(&mut sys, stwcx(4, 0, 3));
+        assert_eq!(sys.cpu.user.cr.to_bits(), 0xafff_ffff);
+        assert_eq!(sys.cpu.reservation.physical_granule(), Some(reserved));
+        assert_eq!(sys.cpu.supervisor.exception.dar, unbacked.value());
+        assert_eq!(sys.cpu.supervisor.exception.dsisr, 0x0200_0000);
+
+        // Without a reservation, write translation completes but unbacked physical storage is
+        // deliberately not probed, so stwcx. completes as failed rather than raising DSI.
+        sys.cpu = Cpu::default();
+        sys.cpu.user.gpr[3] = unbacked.value();
+        sys.cpu.user.gpr[4] = 0x5566_7788;
+        sys.cpu.supervisor.exception.dsisr = 0xcafe_babe;
+        run_one(&mut sys, stwcx(4, 0, 3));
+        assert_eq!(sys.cpu.pc, Address(4));
+        assert_eq!(sys.cpu.supervisor.exception.dsisr, 0xcafe_babe);
+        assert!(!sys.cpu.user.cr.fields()[7].eq());
+
+        let effective = Address(0x9000_0020);
+        sys.cpu = Cpu::default();
+        sys.cpu
+            .supervisor
+            .config
+            .msr
+            .set_data_addr_translation(true);
+        sys.cpu.supervisor.config.msr.set_user_mode(true);
+        sys.cpu.supervisor.memory.dbat[0] = bat(0x9000_0001, 0x0000_0001);
+        sys.cpu.user.gpr[3] = effective.value();
+        sys.cpu.user.gpr[4] = 0xaabb_ccdd;
+        sys.cpu.user.cr = CondReg::from_bits(0xafff_ffff);
+        sys.cpu.reservation.reserve(reserved);
+        run_one(&mut sys, stwcx(4, 0, 3));
+        assert_eq!(sys.cpu.user.cr.to_bits(), 0xafff_ffff);
+        assert_eq!(sys.cpu.reservation.physical_granule(), Some(reserved));
+        assert_eq!(sys.cpu.supervisor.exception.dar, effective.value());
+        assert_eq!(sys.cpu.supervisor.exception.dsisr, 0x0a00_0000);
+
+        // Protection remains a fault even when no reservation is live.
+        sys.cpu = Cpu::default();
+        sys.cpu
+            .supervisor
+            .config
+            .msr
+            .set_data_addr_translation(true);
+        sys.cpu.supervisor.config.msr.set_user_mode(true);
+        sys.cpu.supervisor.memory.dbat[0] = bat(0x9000_0001, 0x0000_0001);
+        sys.cpu.user.gpr[3] = effective.value();
+        sys.cpu.user.gpr[4] = 0x0102_0304;
+        sys.cpu.user.cr = CondReg::from_bits(0xafff_ffff);
+        run_one(&mut sys, stwcx(4, 0, 3));
+        assert_eq!(sys.cpu.user.cr.to_bits(), 0xafff_ffff);
+        assert_eq!(sys.cpu.supervisor.exception.dsisr, 0x0a00_0000);
+
+        sys.cpu = Cpu::default();
+        sys.cpu
+            .supervisor
+            .config
+            .msr
+            .set_data_addr_translation(true);
+        sys.cpu.supervisor.config.msr.set_user_mode(true);
+        sys.cpu.supervisor.memory.dbat[0] = bat(0x9000_0001, 0x0000_0000);
+        sys.cpu.user.gpr[3] = effective.value();
+        sys.cpu.user.gpr[4] = 0x1357_9bdf;
+        sys.cpu.reservation.reserve(reserved);
+        run_one(&mut sys, lwarx(4, 0, 3));
+        assert_eq!(sys.cpu.user.gpr[4], 0x1357_9bdf);
+        assert_eq!(sys.cpu.reservation.physical_granule(), Some(reserved));
+        assert_eq!(sys.cpu.supervisor.exception.dar, effective.value());
+        assert_eq!(sys.cpu.supervisor.exception.dsisr, 0x0800_0000);
+    }
+
+    #[test]
+    fn native_reservation_instructions_use_checked_ram_backing() {
+        let mut sys = test_system();
+        let address = Address(0x100);
+        sys.write_phys_slow(address, 0x1122_3344u32);
+        sys.cpu.user.gpr[3] = address.value();
+
+        run_one(&mut sys, lwarx(4, 0, 3));
+        assert_eq!(sys.cpu.user.gpr[4], 0x1122_3344);
+        assert_eq!(sys.cpu.reservation.physical_granule(), Some(Address(0x100)));
+
+        sys.cpu.user.gpr[4] = 0xaabb_ccdd;
+        run_one(&mut sys, stwcx(4, 0, 3));
+        assert_eq!(sys.read_phys_slow::<u32>(address), 0xaabb_ccdd);
+        assert!(!sys.cpu.reservation.is_valid());
+        assert!(sys.cpu.user.cr.fields()[7].eq());
     }
 }

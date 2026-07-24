@@ -223,6 +223,7 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     gxFrameSkippedPrimitives: 0,
     gxFramesSkipped: 0,
     gxFlushSkippedCopyClears() {},
+    invalidateGxCopyReservation() {},
     gxSkippedFrameClearColor: null,
     gxSkippedCopyClears: [],
     gxLoadTlut() { assert.fail("unexpected TLUT load"); },

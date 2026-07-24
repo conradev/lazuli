@@ -341,6 +341,18 @@ impl BlockBuilder<'_> {
         self.update_cr(0, lt, gt, eq, ov);
     }
 
+    /// Updates CR0 after a completed `stwcx.` access.
+    ///
+    /// `stored` must be a boolean (I8). Conditional stores always clear LT and GT, set EQ only
+    /// when the reservation authorized the store, and copy XER[SO] into CR0[SO].
+    pub fn update_cr0_store_conditional(&mut self, stored: ir::Value) {
+        let clear = self.ir_value(false);
+        let xer = self.get(SPR::XER);
+        let so = self.get_bit(xer, 31);
+
+        self.update_cr(0, clear, clear, stored, so);
+    }
+
     /// Updates the FPRF field in FPSCR register with the given flags.
     pub fn update_fprf(&mut self, lt: ir::Value, gt: ir::Value, eq: ir::Value, un: ir::Value) {
         let fpscr = self.get(Reg::FPSCR);

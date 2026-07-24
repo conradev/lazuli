@@ -7,6 +7,19 @@ use gekko::{Exception, GPR, InsExt, SPR};
 use super::BlockBuilder;
 use crate::ExitMode;
 use crate::builder::{Action, InstructionInfo, MEMFLAGS, MEMFLAGS_READONLY};
+use crate::hooks::STORE_CONDITIONAL_STORED;
+
+const fn indexed_alignment_dsisr(instruction: u32) -> u32 {
+    // PowerPC OEA indexed-form projection:
+    //   instruction 29..30 -> DSISR 15..16
+    //   instruction 25     -> DSISR 17
+    //   instruction 21..24 -> DSISR 18..21
+    //   instruction 6..15  -> DSISR 22..31
+    ((instruction & 0x0000_0006) << 14)
+        | ((instruction & 0x0000_0040) << 8)
+        | ((instruction & 0x0000_0780) << 3)
+        | ((instruction & 0x03ff_0000) >> 16)
+}
 
 pub trait ReadWriteAble {
     const IR_TYPE: ir::Type;
@@ -70,6 +83,99 @@ impl BlockBuilder<'_> {
         } else {
             self.bd.ins().uextend(self.consts.ptr_type, value)
         }
+    }
+
+    fn indexed_effective_address(&mut self, ins: Ins) -> ir::Value {
+        let rb = self.get(ins.gpr_b());
+        if ins.field_ra() == 0 {
+            rb
+        } else {
+            let ra = self.get(ins.gpr_a());
+            self.bd.ins().iadd(ra, rb)
+        }
+    }
+
+    fn check_reservation_alignment(&mut self, ins: Ins, addr: ir::Value, info: InstructionInfo) {
+        let low_bits = self.bd.ins().band_imm(addr, 0b11);
+        let aligned = self.bd.ins().icmp_imm(IntCC::Equal, low_bits, 0);
+        let exception_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(exception_block);
+        self.bd
+            .ins()
+            .brif(aligned, continue_block, &[], exception_block, &[]);
+        self.bd.seal_block(exception_block);
+        self.bd.seal_block(continue_block);
+
+        self.switch_to_bb(exception_block);
+        let dar = self.bd.ins().iadd_imm(addr, 4);
+        self.set(SPR::DAR, dar);
+        self.set(SPR::DSISR, indexed_alignment_dsisr(ins.code));
+        self.raise_exception(Exception::Alignment);
+        self.exit_with(info);
+
+        self.switch_to_bb(continue_block);
+    }
+
+    fn load_reserve_i32(&mut self, addr: ir::Value) -> ir::Value {
+        let stack_slot_addr =
+            self.bd
+                .ins()
+                .stack_addr(self.consts.ptr_type, self.consts.read_stack_slot, 0);
+        self.publish_hook_cycle_offset();
+        let inst = self.bd.ins().call(
+            self.hooks.load_reserve,
+            &[self.consts.ctx_ptr, addr, stack_slot_addr],
+        );
+        let loaded = self.bd.inst_results(inst)[0];
+        let fault_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(fault_block);
+        self.bd
+            .ins()
+            .brif(loaded, continue_block, &[], fault_block, &[]);
+        self.bd.seal_block(fault_block);
+        self.bd.seal_block(continue_block);
+
+        self.switch_to_bb(fault_block);
+        self.set(SPR::DAR, addr);
+        self.raise_exception(Exception::DSI);
+        self.exit_with(LOAD_INFO);
+
+        self.switch_to_bb(continue_block);
+        self.bd
+            .ins()
+            .stack_load(ir::types::I32, self.consts.read_stack_slot, 0)
+    }
+
+    fn store_conditional_i32(&mut self, addr: ir::Value, value: ir::Value) -> ir::Value {
+        self.publish_hook_cycle_offset();
+        let inst = self.bd.ins().call(
+            self.hooks.store_conditional,
+            &[self.consts.ctx_ptr, addr, value],
+        );
+        let result = self.bd.inst_results(inst)[0];
+        // Wasm exposes narrow hook results as i32 values, so normalize the tri-state status before
+        // control flow and comparison. The native hook ABI remains an eight-bit return.
+        let result = self.bd.ins().uextend(ir::types::I32, result);
+        let fault_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(fault_block);
+        self.bd
+            .ins()
+            .brif(result, continue_block, &[], fault_block, &[]);
+        self.bd.seal_block(fault_block);
+        self.bd.seal_block(continue_block);
+
+        self.switch_to_bb(fault_block);
+        self.set(SPR::DAR, addr);
+        self.raise_exception(Exception::DSI);
+        self.exit_with(STORE_INFO);
+
+        self.switch_to_bb(continue_block);
+        self.bd
+            .ins()
+            .icmp_imm(IntCC::Equal, result, i64::from(STORE_CONDITIONAL_STORED))
     }
 
     fn portable_mem_load<P: ReadWriteAble>(&mut self, addr: ir::Value) -> ir::Value {
@@ -973,6 +1079,15 @@ impl BlockBuilder<'_> {
         )
     }
 
+    pub fn lwarx(&mut self, ins: Ins) -> InstructionInfo {
+        let addr = self.indexed_effective_address(ins);
+        self.check_reservation_alignment(ins, addr, LOAD_INFO);
+        let value = self.load_reserve_i32(addr);
+        self.set(ins.gpr_d(), value);
+
+        LOAD_INFO
+    }
+
     pub fn lwzu(&mut self, ins: Ins) -> InstructionInfo {
         self.load::<i32>(
             ins,
@@ -1624,10 +1739,11 @@ impl BlockBuilder<'_> {
     }
 
     pub fn stwcx(&mut self, ins: Ins) -> InstructionInfo {
-        self.stwx(ins);
-
-        let zero = self.ir_value(0);
-        self.update_cr0_cmpz(zero);
+        let addr = self.indexed_effective_address(ins);
+        self.check_reservation_alignment(ins, addr, STORE_INFO);
+        let value = self.get(ins.gpr_s());
+        let stored = self.store_conditional_i32(addr, value);
+        self.update_cr0_store_conditional(stored);
 
         STORE_INFO
     }
