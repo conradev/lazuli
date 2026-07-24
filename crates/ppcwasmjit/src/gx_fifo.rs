@@ -491,4 +491,134 @@ if (slowCalls !== 1) throw new Error("non-FIFO store did not use slow hook");
             String::from_utf8_lossy(&output.stderr),
         );
     }
+
+    #[test]
+    fn generated_hook_runtime_flushes_only_on_overflow_and_preserves_repeated_drains() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+            return;
+        }
+
+        let module = hook_runtime(0x100, 0x200, 8);
+        let module = module
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let script = r#"
+const wasm = Buffer.from(process.argv[1], "hex");
+const memory = new WebAssembly.Memory({ initial: 1 });
+const view = new DataView(memory.buffer);
+const metadata = 0x100;
+const data = 0x200;
+const drains = [];
+function flush() {
+  const count = view.getUint32(metadata, true);
+  const stores = view.getUint32(metadata + 4, true);
+  const quantized = view.getUint32(metadata + 8, true);
+  drains.push({
+    bytes: Buffer.from(new Uint8Array(memory.buffer, data, count)).toString("hex"),
+    count,
+    stores,
+    quantized,
+  });
+  view.setUint32(metadata, 0, true);
+  view.setUint32(metadata + 4, 0, true);
+  view.setUint32(metadata + 8, 0, true);
+}
+const unexpectedSlowHook = () => { throw new Error("unexpected slow hook"); };
+const slow = {
+  user_0_7: unexpectedSlowHook,
+  user_0_8: unexpectedSlowHook,
+  user_0_9: unexpectedSlowHook,
+  user_0_10: unexpectedSlowHook,
+  user_0_12: unexpectedSlowHook,
+};
+const { instance } = await WebAssembly.instantiate(wasm, {
+  lazuli: { memory },
+  lazuli_slow_hooks: slow,
+  lazuli_fifo: { flush },
+});
+const fifo = 0xcc008000;
+
+instance.exports.user_0_9(0, fifo, 0x01020304);
+instance.exports.user_0_9(0, fifo, 0x05060708);
+if (drains.length !== 0) throw new Error("exact-capacity writes flushed");
+if (
+  view.getUint32(metadata, true) !== 8
+  || view.getUint32(metadata + 4, true) !== 2
+  || view.getUint32(metadata + 8, true) !== 0
+  || view.getUint32(metadata + 12, true) !== 0
+) {
+  throw new Error("bad exact-capacity metadata");
+}
+
+instance.exports.user_0_7(0, fifo, 0x09);
+if (drains.length !== 1 || drains[0].bytes !== "0102030405060708") {
+  throw new Error("capacity-plus-one did not flush synchronously");
+}
+if (
+  view.getUint32(metadata, true) !== 1
+  || view.getUint8(data) !== 0x09
+  || view.getUint32(metadata + 4, true) !== 1
+  || view.getUint32(metadata + 12, true) !== 1
+) {
+  throw new Error("bad metadata after first overflow");
+}
+
+instance.exports.user_0_10(0, fifo, 0x0a0b0c0d0e0f1011n);
+instance.exports.user_0_12(0, fifo, 4, 0x12);
+for (let byte = 0x13; byte <= 0x19; byte += 1) {
+  instance.exports.user_0_7(0, fifo, byte);
+}
+instance.exports.user_0_8(0, fifo, 0x1a1b);
+if (drains.length !== 4) throw new Error(`expected four emergency drains, got ${drains.length}`);
+if (view.getUint32(metadata + 12, true) !== 4) {
+  throw new Error("emergency drain metadata did not accumulate");
+}
+flush();
+
+const expectedDrains = [
+  { bytes: "0102030405060708", count: 8, stores: 2, quantized: 0 },
+  { bytes: "09", count: 1, stores: 1, quantized: 0 },
+  { bytes: "0a0b0c0d0e0f1011", count: 8, stores: 1, quantized: 0 },
+  { bytes: "1213141516171819", count: 8, stores: 8, quantized: 1 },
+  { bytes: "1a1b", count: 2, stores: 1, quantized: 0 },
+];
+if (JSON.stringify(drains) !== JSON.stringify(expectedDrains)) {
+  throw new Error(`bad drain sequence: ${JSON.stringify(drains)}`);
+}
+const bytes = drains.map(drain => drain.bytes).join("");
+const expectedBytes = Array.from(
+  { length: 0x1b },
+  (_unused, index) => (index + 1).toString(16).padStart(2, "0"),
+).join("");
+if (bytes !== expectedBytes) throw new Error(`bad repeated-flush byte order: ${bytes}`);
+const totals = drains.reduce((result, drain) => ({
+  count: result.count + drain.count,
+  stores: result.stores + drain.stores,
+  quantized: result.quantized + drain.quantized,
+}), { count: 0, stores: 0, quantized: 0 });
+if (totals.count !== 27 || totals.stores !== 13 || totals.quantized !== 1) {
+  throw new Error(`bad repeated-flush counters: ${JSON.stringify(totals)}`);
+}
+if (
+  view.getUint32(metadata, true) !== 0
+  || view.getUint32(metadata + 4, true) !== 0
+  || view.getUint32(metadata + 8, true) !== 0
+  || view.getUint32(metadata + 12, true) !== 4
+) {
+  throw new Error("draining reset store metadata or lost emergency drain metadata");
+}
+"#;
+        let output = Command::new("node")
+            .args(["--input-type=module", "--eval", script, &module])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "node failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }

@@ -81,7 +81,7 @@ function makeContext() {
   };
   vm.createContext(context);
   vm.runInContext(
-    ["readCommandProcessorStatus", "readInteger"]
+    ["gxFifoBufferedBytes", "readCommandProcessorStatus", "readInteger"]
       .map(extractFunction)
       .join("\n\n"),
     context,
