@@ -4,6 +4,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+mod clip;
 pub(crate) mod packet;
 mod raster;
 pub(crate) mod tev;
