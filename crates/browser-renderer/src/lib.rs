@@ -23,10 +23,14 @@ pub(crate) struct RendererMetrics {
     pub(crate) copy_texture_calls: u64,
     pub(crate) copy_xfb_calls: u64,
     pub(crate) decoded_texture_queries: u64,
+    pub(crate) depth_commit_draws: u64,
     pub(crate) drain_calls: u64,
+    pub(crate) early_depth_only_commands: u64,
     pub(crate) expanded_vertex_bytes: u64,
     pub(crate) gx_frame_packet_bytes: u64,
     pub(crate) gx_frame_packet_payload_bytes: u64,
+    pub(crate) managed_early_depth_commands: u64,
+    pub(crate) managed_early_depth_primitives: u64,
     pub(crate) present_xfb_calls: u64,
     pub(crate) push_tev_draw_calls: u64,
     pub(crate) queue_submissions: u64,
@@ -770,6 +774,20 @@ pub(crate) enum GxDepthCompareLocation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxAlphaTestOutcome {
+    AlwaysPass,
+    AlwaysFail,
+    Variable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxEarlyDepthPlan {
+    FixedFunction,
+    DepthOnly,
+    PrimitiveOrdered,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GxZTextureState {
     pub(crate) bias: u32,
     pub(crate) format: GxZTextureFormat,
@@ -1232,6 +1250,89 @@ pub(crate) fn gx_blend_state(blend_mode: u32) -> GxBlendState {
         operation,
         color_write: blend_mode & (1 << 3) != 0,
         alpha_write: blend_mode & (1 << 4) != 0,
+    }
+}
+
+fn alpha_values_below(limit: u16) -> [u64; 4] {
+    std::array::from_fn(|word| {
+        let start = word as u16 * 64;
+        if limit <= start {
+            0
+        } else if limit >= start + 64 {
+            u64::MAX
+        } else {
+            (1_u64 << (limit - start)) - 1
+        }
+    })
+}
+
+fn alpha_comparison_mask(reference: u8, comparison: u8) -> [u64; 4] {
+    let less = alpha_values_below(u16::from(reference));
+    let equal = {
+        let mut values = [0; 4];
+        values[usize::from(reference) / 64] = 1_u64 << (reference & 63);
+        values
+    };
+    match comparison & 7 {
+        0 => [0; 4],
+        1 => less,
+        2 => equal,
+        3 => std::array::from_fn(|word| less[word] | equal[word]),
+        4 => std::array::from_fn(|word| !(less[word] | equal[word])),
+        5 => equal.map(|word| !word),
+        6 => less.map(|word| !word),
+        _ => [u64::MAX; 4],
+    }
+}
+
+pub(crate) fn gx_alpha_test_outcome(test: u32) -> GxAlphaTestOutcome {
+    let first = alpha_comparison_mask(test as u8, (test >> 16) as u8);
+    let second = alpha_comparison_mask((test >> 8) as u8, (test >> 19) as u8);
+    let passing: [u64; 4] = std::array::from_fn(|word| match (test >> 22) & 3 {
+        0 => first[word] & second[word],
+        1 => first[word] | second[word],
+        2 => first[word] ^ second[word],
+        _ => !(first[word] ^ second[word]),
+    });
+    if passing.iter().all(|word| *word == u64::MAX) {
+        GxAlphaTestOutcome::AlwaysPass
+    } else if passing.iter().all(|word| *word == 0) {
+        GxAlphaTestOutcome::AlwaysFail
+    } else {
+        GxAlphaTestOutcome::Variable
+    }
+}
+
+pub(crate) fn gx_early_depth_plan(
+    z_mode: u32,
+    blend_mode: u32,
+    alpha_test: u32,
+    pixel_control: u32,
+) -> GxEarlyDepthPlan {
+    let depth_test_enabled = z_mode & 1 != 0;
+    let depth_update_enabled = z_mode & (1 << 4) != 0;
+    let compare_early = pixel_control & (1 << 6) != 0;
+    if !depth_test_enabled || !depth_update_enabled || !compare_early {
+        return GxEarlyDepthPlan::FixedFunction;
+    }
+    if (z_mode >> 1) & 7 == 0 {
+        // A failing early depth test suppresses TEV, color, alpha, and the
+        // update itself. Classify it as depth-only so the browser can discard
+        // the no-op before allocating fragment resources or encoding a draw.
+        return GxEarlyDepthPlan::DepthOnly;
+    }
+
+    let blend = gx_blend_state(blend_mode);
+    let writes_guest_color =
+        blend.color_write || (blend.alpha_write && gx_efb_format(pixel_control).has_alpha());
+    if !writes_guest_color {
+        return GxEarlyDepthPlan::DepthOnly;
+    }
+
+    match gx_alpha_test_outcome(alpha_test) {
+        GxAlphaTestOutcome::AlwaysPass => GxEarlyDepthPlan::FixedFunction,
+        GxAlphaTestOutcome::AlwaysFail => GxEarlyDepthPlan::DepthOnly,
+        GxAlphaTestOutcome::Variable => GxEarlyDepthPlan::PrimitiveOrdered,
     }
 }
 
@@ -1958,20 +2059,21 @@ pub use web::WebGpuRenderer;
 #[cfg(test)]
 mod tests {
     use super::{
-        EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH24_MAX, GxBlendFactor,
-        GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxEfbFormat,
-        GxFogDecodeError, GxFogProjection, GxFogState, GxFogType, GxZTextureDecodeError,
-        GxZTextureFormat, GxZTextureOperation, RendererFailureState, RendererMetrics,
-        RendererPhaseTiming, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
-        TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
-        ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode, XfbCopyMetadata,
-        alpha_compare, alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
-        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
-        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_blend_factor_for_component,
-        gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_copy_filter_coefficients,
-        gx_copy_filter_taps, gx_depth24_to_float, gx_destination_alpha_state, gx_efb_format,
-        gx_float_to_depth24, gx_fog_reference, gx_fog_state, gx_sampler_identity,
-        gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
+        EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH24_MAX, GxAlphaTestOutcome,
+        GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation,
+        GxEarlyDepthPlan, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
+        GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
+        RendererMetrics, RendererPhaseTiming, SelectedTexture, SurfacePixelOrder,
+        SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome,
+        ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode,
+        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
+        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
+        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
+        gx_alpha_test_outcome, gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask,
+        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_to_float,
+        gx_destination_alpha_state, gx_early_depth_plan, gx_efb_format, gx_float_to_depth24,
+        gx_fog_reference, gx_fog_state, gx_sampler_identity, gx_xfb_copy_parameters,
+        gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
         materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
@@ -3089,6 +3191,137 @@ mod tests {
         assert!(alpha_test_passes(encode(7, 0, 1), 255));
         assert!(alpha_test_passes(encode(7, 0, 2), 255));
         assert!(!alpha_test_passes(encode(7, 0, 3), 255));
+    }
+
+    #[test]
+    fn gx_alpha_test_outcome_exactly_classifies_the_u8_domain() {
+        let references = [0_u8, 1, 63, 127, 128, 254, 255];
+        for first_reference in references {
+            for second_reference in references {
+                for first_comparison in 0..8 {
+                    for second_comparison in 0..8 {
+                        for logic in 0..4 {
+                            let test = u32::from(first_reference)
+                                | (u32::from(second_reference) << 8)
+                                | (first_comparison << 16)
+                                | (second_comparison << 19)
+                                | (logic << 22);
+                            let passing = (0_u16..=255)
+                                .filter(|value| alpha_test_passes(test, *value as u8))
+                                .count();
+                            let expected = match passing {
+                                0 => GxAlphaTestOutcome::AlwaysFail,
+                                256 => GxAlphaTestOutcome::AlwaysPass,
+                                _ => GxAlphaTestOutcome::Variable,
+                            };
+                            assert_eq!(
+                                gx_alpha_test_outcome(test),
+                                expected,
+                                "alpha test {test:#08x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gx_early_depth_plan_manages_only_observable_alpha_dependent_updates() {
+        let depth_test_and_update = 1 | (1 << 1) | (1 << 4);
+        let early_rgb8 = 1 << 6;
+        let early_rgba6 = (1 << 6) | 1;
+        let color_and_alpha_write = (1 << 3) | (1 << 4);
+        let alpha_write_only = 1 << 4;
+        let always_pass = 0x003f_0000;
+        let always_fail = 0;
+        let alpha_less_than_128 = 128 | (1 << 16) | (7 << 19);
+
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update,
+                color_and_alpha_write,
+                alpha_less_than_128,
+                0,
+            ),
+            GxEarlyDepthPlan::FixedFunction,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                1 | (1 << 4),
+                color_and_alpha_write,
+                alpha_less_than_128,
+                early_rgb8,
+            ),
+            GxEarlyDepthPlan::DepthOnly,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update & !1,
+                color_and_alpha_write,
+                alpha_less_than_128,
+                early_rgb8,
+            ),
+            GxEarlyDepthPlan::FixedFunction,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update & !(1 << 4),
+                color_and_alpha_write,
+                alpha_less_than_128,
+                early_rgb8,
+            ),
+            GxEarlyDepthPlan::FixedFunction,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update,
+                color_and_alpha_write,
+                always_pass,
+                early_rgb8,
+            ),
+            GxEarlyDepthPlan::FixedFunction,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update,
+                color_and_alpha_write,
+                always_fail,
+                early_rgb8,
+            ),
+            GxEarlyDepthPlan::DepthOnly,
+        );
+        assert_eq!(
+            gx_early_depth_plan(depth_test_and_update, 0, alpha_less_than_128, early_rgb8),
+            GxEarlyDepthPlan::DepthOnly,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update,
+                alpha_write_only,
+                alpha_less_than_128,
+                early_rgb8,
+            ),
+            GxEarlyDepthPlan::DepthOnly,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update,
+                alpha_write_only,
+                alpha_less_than_128,
+                early_rgba6,
+            ),
+            GxEarlyDepthPlan::PrimitiveOrdered,
+        );
+        assert_eq!(
+            gx_early_depth_plan(
+                depth_test_and_update,
+                color_and_alpha_write,
+                alpha_less_than_128,
+                early_rgb8,
+            ),
+            GxEarlyDepthPlan::PrimitiveOrdered,
+        );
     }
 
     #[test]
