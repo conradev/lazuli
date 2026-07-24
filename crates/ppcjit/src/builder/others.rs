@@ -92,8 +92,8 @@ impl BlockBuilder<'_> {
             SPR::TBL | SPR::TBU => self.call_generic_hook(self.hooks.tb_changed),
             SPR::DMAL | SPR::DMAU => self.call_generic_hook(self.hooks.dcache_dma),
             SPR::WPAR => tracing::warn!("write to WPAR"),
-            spr if spr.is_data_bat() => self.dbat_changed = true,
-            spr if spr.is_instr_bat() => self.ibat_changed = true,
+            spr if spr.is_data_bat() => self.dbat_changed_at = Some(self.executed_cycles),
+            spr if spr.is_instr_bat() => self.ibat_changed_at = Some(self.executed_cycles),
             _ => (),
         }
 
@@ -455,6 +455,7 @@ impl BlockBuilder<'_> {
         };
 
         self.flush();
+        self.publish_hook_cycle_offset();
         self.bd
             .ins()
             .call(self.hooks.inv_icache, &[self.consts.ctx_ptr, addr]);
@@ -464,6 +465,7 @@ impl BlockBuilder<'_> {
 
     pub fn isync(&mut self, _: Ins) -> InstructionInfo {
         self.flush();
+        self.publish_hook_cycle_offset();
         self.bd
             .ins()
             .call(self.hooks.clear_icache, &[self.consts.ctx_ptr]);
