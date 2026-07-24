@@ -230,7 +230,7 @@ test("strict WebGPU rendering requires dual-source blending and depth clip contr
   assert.match(shader, /enable dual_source_blending;/);
   assert.match(shader, /@location\(0\) @blend_src\(0\) primary: vec4<f32>/);
   assert.match(shader, /@location\(0\) @blend_src\(1\) secondary: vec4<f32>/);
-  assert.match(shader, /values\.secondary = source/);
+  assert.match(shader, /values\.secondary = normalized_source/);
 });
 
 test("LZGX v3 fragment-tail destination alpha reaches the draw uniform after the TEV alpha test", () => {
@@ -247,7 +247,7 @@ test("LZGX v3 fragment-tail destination alpha reaches the draw uniform after the
   );
   assert.match(
     draw,
-    /DrawUniform::from_gx\(alpha_test, destination_alpha, z_texture\)/,
+    /DrawUniform::from_gx\(alpha_test, destination_alpha, z_texture, fog\)/,
   );
   assert.match(draw, /draw: draw_uniform/);
 

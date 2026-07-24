@@ -616,6 +616,11 @@ struct DrawState {
     destination_alpha: u32,
     fragment_flags: u32,
     z_texture: u32,
+    fog_control: vec4<u32>,
+    fog_range0: vec4<u32>,
+    fog_range1: vec4<u32>,
+    fog_parameters0: vec4<u32>,
+    fog_parameters1: vec4<u32>,
 };
 
 struct TevVertexInput {
@@ -990,41 +995,8 @@ struct TevFragmentDepthOutput {
 struct TevFragmentValues {
     primary: vec4<f32>,
     secondary: vec4<f32>,
-    raw_texture: vec4<u32>,
+    depth: u32,
 };
-
-fn tev_fragment_values(input: TevVertexOutput) -> TevFragmentValues {
-    let raster_colors = array<vec4<f32>, 8>(
-        input.raster0, input.raster1,
-        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
-        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
-    );
-    let tex_coords = array<vec3<f32>, 8>(
-        input.stq0, input.stq1, input.stq2, input.stq3,
-        input.stq4, input.stq5, input.stq6, input.stq7,
-    );
-    let evaluation = tev_evaluate(raster_colors, tex_coords);
-    let source = evaluation.source;
-    let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0));
-    if !alpha_test_passes(tev_alpha, draw_state.alpha_test) {
-        discard;
-    }
-
-    var selected_alpha = tev_alpha;
-    if (draw_state.destination_alpha & 0x100u) == 0x100u {
-        selected_alpha = draw_state.destination_alpha & 0xffu;
-    }
-    var primary_alpha = source.a;
-    if (draw_state.fragment_flags & 1u) != 0u {
-        primary_alpha = f32(selected_alpha >> 2u) / 63.0;
-    }
-
-    var values: TevFragmentValues;
-    values.primary = vec4<f32>(source.rgb, primary_alpha);
-    values.secondary = source;
-    values.raw_texture = evaluation.raw_texture;
-    return values;
-}
 
 fn gx_z_texture_depth(reference_depth: u32, raw_texture: vec4<u32>) -> u32 {
     let format = (draw_state.z_texture >> 24u) & 3u;
@@ -1042,9 +1014,166 @@ fn gx_z_texture_depth(reference_depth: u32, raw_texture: vec4<u32>) -> u32 {
     return ((draw_state.z_texture & 0x00ffffffu) + source + reference) & 0x00ffffffu;
 }
 
+fn gx_fog_parameter(index: u32) -> u32 {
+    if index < 4u {
+        return draw_state.fog_parameters0[index];
+    }
+    return draw_state.fog_parameters1.x;
+}
+
+fn gx_fog_float(word: u32) -> f32 {
+    let bits =
+        ((word & 0x00080000u) << 12u) |
+        (((word >> 11u) & 0xffu) << 23u) |
+        ((word & 0x7ffu) << 12u);
+    return bitcast<f32>(bits);
+}
+
+fn gx_fog_a_and_c() -> vec2<f32> {
+    let a_word = gx_fog_parameter(0u);
+    let c_word = gx_fog_parameter(3u);
+    return vec2<f32>(gx_fog_float(a_word), gx_fog_float(c_word));
+}
+
+fn gx_fog_range_coefficient(index: u32) -> f32 {
+    let word_index = index >> 1u;
+    var word = draw_state.fog_range1.x;
+    if word_index < 4u {
+        word = draw_state.fog_range0[word_index];
+    }
+    var raw = word & 0xfffu;
+    if (index & 1u) != 0u {
+        raw = (word >> 12u) & 0xfffu;
+    }
+    return f32(raw) / 256.0;
+}
+
+fn gx_fog_range_adjustment(position_x: f32) -> f32 {
+    let center = i32(draw_state.fog_control.x & 0x3ffu) - 342;
+    let sample = clamp(abs(position_x - f32(center)) / 32.0, 0.0, 10.0);
+    if sample == 0.0 {
+        return 1.0;
+    }
+    if sample >= 10.0 {
+        return gx_fog_range_coefficient(9u);
+    }
+    let interval = u32(floor(sample));
+    let fraction = sample - f32(interval);
+    var lower = 1.0;
+    if interval != 0u {
+        lower = gx_fog_range_coefficient(interval - 1u);
+    }
+    let upper = gx_fog_range_coefficient(interval);
+    return lower + (upper - lower) * fraction;
+}
+
+fn gx_fog_color(source: vec4<u32>, position_x: f32, depth: u32) -> vec4<u32> {
+    let control = gx_fog_parameter(3u);
+    let fog_type = (control >> 21u) & 7u;
+    if fog_type == 0u {
+        return source;
+    }
+
+    let a_word = gx_fog_parameter(0u);
+    let c_word = gx_fog_parameter(3u);
+    var factor: f32;
+    if ((a_word >> 11u) & 0xffu) == 0xffu &&
+       ((c_word >> 11u) & 0xffu) == 0xffu {
+        let both_positive =
+            (a_word & 0x00080000u) == 0u &&
+            (c_word & 0x00080000u) == 0u;
+        factor = select(0.0, 1.0, both_positive);
+    } else {
+        let a_and_c = gx_fog_a_and_c();
+        var eye_depth: f32;
+        if (control & (1u << 20u)) == 0u {
+            let shifted = depth >> (gx_fog_parameter(2u) & 31u);
+            let denominator = i32(gx_fog_parameter(1u) & 0x00ffffffu) - i32(shifted);
+            eye_depth = (a_and_c.x * 16777216.0) / f32(denominator);
+        } else {
+            eye_depth = a_and_c.x * f32(depth) / 16777216.0;
+        }
+        if (draw_state.fog_control.x & (1u << 10u)) != 0u {
+            eye_depth *= gx_fog_range_adjustment(position_x);
+        }
+        factor = clamp(eye_depth - a_and_c.y, 0.0, 1.0);
+    }
+
+    if fog_type == 4u {
+        factor = 1.0 - exp2(-8.0 * factor);
+    } else if fog_type == 5u {
+        factor = 1.0 - exp2(-8.0 * factor * factor);
+    } else if fog_type == 6u {
+        factor = exp2(-8.0 * (1.0 - factor));
+    } else if fog_type == 7u {
+        let backward = 1.0 - factor;
+        factor = exp2(-8.0 * backward * backward);
+    }
+
+    let fog_factor = min(u32(floor(factor * 256.0 + 0.5)), 256u);
+    let inverse = 256u - fog_factor;
+    let color_word = gx_fog_parameter(4u);
+    let fog_color = vec3<u32>(
+        (color_word >> 16u) & 0xffu,
+        (color_word >> 8u) & 0xffu,
+        color_word & 0xffu,
+    );
+    let rgb = (source.rgb * inverse + fog_color * fog_factor) >> vec3<u32>(8u);
+    return vec4<u32>(rgb, source.a);
+}
+
+fn tev_fragment_values(input: TevVertexOutput, needs_fragment_depth: bool) -> TevFragmentValues {
+    let raster_colors = array<vec4<f32>, 8>(
+        input.raster0, input.raster1,
+        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
+        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
+    );
+    let tex_coords = array<vec3<f32>, 8>(
+        input.stq0, input.stq1, input.stq2, input.stq3,
+        input.stq4, input.stq5, input.stq6, input.stq7,
+    );
+    let evaluation = tev_evaluate(raster_colors, tex_coords);
+    let source = evaluation.source;
+    let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0));
+    if !alpha_test_passes(tev_alpha, draw_state.alpha_test) {
+        discard;
+    }
+
+    let fog_enabled = (draw_state.fragment_flags & 2u) != 0u;
+    var depth = 0u;
+    var normalized_source = source;
+    if needs_fragment_depth || fog_enabled {
+        let reference_depth =
+            u32(round(clamp(input.depth24, 0.0, 16777215.0)));
+        depth = gx_z_texture_depth(reference_depth, evaluation.raw_texture);
+        if fog_enabled {
+            let unorm_source = vec4<u32>(
+                round(clamp(source, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0)
+            );
+            normalized_source =
+                vec4<f32>(gx_fog_color(unorm_source, input.position.x, depth)) / 255.0;
+        }
+    }
+
+    var selected_alpha = tev_alpha;
+    if (draw_state.destination_alpha & 0x100u) == 0x100u {
+        selected_alpha = draw_state.destination_alpha & 0xffu;
+    }
+    var primary_alpha = normalized_source.a;
+    if (draw_state.fragment_flags & 1u) != 0u {
+        primary_alpha = f32(selected_alpha >> 2u) / 63.0;
+    }
+
+    var values: TevFragmentValues;
+    values.primary = vec4<f32>(normalized_source.rgb, primary_alpha);
+    values.secondary = normalized_source;
+    values.depth = depth;
+    return values;
+}
+
 @fragment
 fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
-    let values = tev_fragment_values(input);
+    let values = tev_fragment_values(input, false);
     var output: TevFragmentOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1053,14 +1182,11 @@ fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
 
 @fragment
 fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput {
-    let values = tev_fragment_values(input);
-    let reference_depth =
-        u32(round(clamp(input.depth24, 0.0, 16777215.0)));
+    let values = tev_fragment_values(input, true);
     var output: TevFragmentDepthOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
-    output.depth =
-        f32(gx_z_texture_depth(reference_depth, values.raw_texture)) / 16777215.0;
+    output.depth = f32(values.depth) / 16777215.0;
     return output;
 }
 ";
@@ -1483,7 +1609,7 @@ mod tests {
         assert!(shader.starts_with("enable dual_source_blending;\n"));
         assert_eq!(shader.matches("enable dual_source_blending;").count(), 1);
         assert!(shader.contains(
-            "struct DrawState {\n    alpha_test: u32,\n    destination_alpha: u32,\n    fragment_flags: u32,\n    z_texture: u32,\n};"
+            "struct DrawState {\n    alpha_test: u32,\n    destination_alpha: u32,\n    fragment_flags: u32,\n    z_texture: u32,\n    fog_control: vec4<u32>,"
         ));
         assert!(shader.contains(
             "struct TevFragmentOutput {\n    @location(0) @blend_src(0) primary: vec4<f32>,\n    @location(0) @blend_src(1) secondary: vec4<f32>,\n};"
@@ -1493,8 +1619,10 @@ mod tests {
             shader.contains("fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput")
         );
         assert!(shader.contains("@builtin(frag_depth) depth: f32"));
-        assert!(shader.contains("values.primary = vec4<f32>(source.rgb, primary_alpha)"));
-        assert!(shader.contains("values.secondary = source"));
+        assert!(
+            shader.contains("values.primary = vec4<f32>(normalized_source.rgb, primary_alpha)")
+        );
+        assert!(shader.contains("values.secondary = normalized_source"));
     }
 
     #[test]
@@ -1510,6 +1638,16 @@ mod tests {
         let alpha_test = shader
             .find("if !alpha_test_passes(tev_alpha, draw_state.alpha_test)")
             .unwrap();
+        let fog_gate = shader
+            .find("if needs_fragment_depth || fog_enabled")
+            .unwrap();
+        let z_texture = shader
+            .find("depth = gx_z_texture_depth(reference_depth, evaluation.raw_texture)")
+            .unwrap();
+        let unorm_source = shader.find("let unorm_source = vec4<u32>(").unwrap();
+        let fog = shader
+            .find("gx_fog_color(unorm_source, input.position.x, depth)")
+            .unwrap();
         let destination_alpha = shader
             .find("if (draw_state.destination_alpha & 0x100u) == 0x100u")
             .unwrap();
@@ -1520,15 +1658,19 @@ mod tests {
             .find("primary_alpha = f32(selected_alpha >> 2u) / 63.0")
             .unwrap();
         let primary = shader
-            .find("values.primary = vec4<f32>(source.rgb, primary_alpha)")
+            .find("values.primary = vec4<f32>(normalized_source.rgb, primary_alpha)")
             .unwrap();
-        let secondary = shader.find("values.secondary = source").unwrap();
+        let secondary = shader.find("values.secondary = normalized_source").unwrap();
 
         assert!(
-            evaluate < tev_alpha
-                && evaluate < source
+            evaluate < source
                 && source < tev_alpha
                 && tev_alpha < alpha_test
+                && alpha_test < fog_gate
+                && fog_gate < z_texture
+                && z_texture < unorm_source
+                && unorm_source < fog
+                && fog < destination_alpha
                 && alpha_test < destination_alpha
                 && destination_alpha < rgba6
                 && rgba6 < quantize
@@ -1537,7 +1679,7 @@ mod tests {
         );
         assert!(shader.contains("var selected_alpha = tev_alpha"));
         assert!(shader.contains("selected_alpha = draw_state.destination_alpha & 0xffu"));
-        assert!(shader.contains("var primary_alpha = source.a"));
+        assert!(shader.contains("var primary_alpha = normalized_source.a"));
         assert!(!shader.contains("alpha_test_passes(selected_alpha"));
     }
 
@@ -1564,13 +1706,49 @@ mod tests {
         assert!(shader.contains("output.depth24 = input.position.z"));
         assert!(shader.contains("u32(round(clamp(input.depth24, 0.0, 16777215.0)))"));
         assert!(!shader.contains("u32(round(clamp(input.position.z, 0.0, 1.0) * 16777215.0))"));
+        assert!(shader.contains("let values = tev_fragment_values(input, false)"));
+        assert!(shader.contains("let values = tev_fragment_values(input, true)"));
         assert!(
             shader.contains(
                 "((draw_state.z_texture & 0x00ffffffu) + source + reference) & 0x00ffffffu"
             )
         );
         assert!(shader.contains("if operation == 0u {\n        return reference_depth;"));
-        assert!(!shader.contains("16777216.0"));
+        assert!(shader.contains("output.depth = f32(values.depth) / 16777215.0"));
+        assert!(shader.contains("eye_depth = (a_and_c.x * 16777216.0)"));
+    }
+
+    #[test]
+    fn wgsl_fog_uses_post_ztexture_depth_signed_math_and_native_range_lut() {
+        let shader = shader_source();
+        assert!(shader.contains("fn gx_fog_color("));
+        assert!(
+            shader.contains(
+                "let denominator = i32(gx_fog_parameter(1u) & 0x00ffffffu) - i32(shifted)"
+            )
+        );
+        assert!(shader.contains("a_and_c.x * f32(depth) / 16777216.0"));
+        assert!(shader.contains("raw = word & 0xfffu"));
+        assert!(shader.contains("raw = (word >> 12u) & 0xfffu"));
+        assert!(shader.contains("return f32(raw) / 256.0"));
+        assert!(shader.contains("abs(position_x - f32(center)) / 32.0"));
+        assert!(!shader.contains("sqrt("));
+        assert!(shader.contains("u32(floor(factor * 256.0 + 0.5))"));
+        assert!(shader.contains("return vec4<u32>(rgb, source.a)"));
+
+        let alpha_test = shader
+            .find("if !alpha_test_passes(tev_alpha, draw_state.alpha_test)")
+            .unwrap();
+        let gate = shader
+            .find("if needs_fragment_depth || fog_enabled")
+            .unwrap();
+        let z_texture = shader
+            .find("depth = gx_z_texture_depth(reference_depth, evaluation.raw_texture)")
+            .unwrap();
+        let fog = shader
+            .find("gx_fog_color(unorm_source, input.position.x, depth)")
+            .unwrap();
+        assert!(alpha_test < gate && gate < z_texture && z_texture < fog);
     }
 
     #[test]
@@ -1653,6 +1831,7 @@ mod tests {
         assert!(shader.contains("let uv = stq.xy / stq.z"));
         assert!(shader.contains("let evaluation = tev_evaluate(raster_colors, tex_coords)"));
         assert!(shader.contains("let source = evaluation.source"));
+        assert!(shader.contains("let unorm_source = vec4<u32>("));
         assert!(shader.contains("if !alpha_test_passes(tev_alpha, draw_state.alpha_test)"));
     }
 }

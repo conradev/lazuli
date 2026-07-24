@@ -23,7 +23,7 @@ use crate::tev::{
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
     GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDepthCompareLocation,
-    GxDestinationAlphaState, GxEfbFormat, GxXfbCopyParameters, GxZTextureFormat,
+    GxDestinationAlphaState, GxEfbFormat, GxFogState, GxXfbCopyParameters, GxZTextureFormat,
     GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
     RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
     SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor,
@@ -32,10 +32,10 @@ use crate::{
     compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
     gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float, gx_destination_alpha_state,
-    gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state,
-    merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
-    reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
-    xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
+    gx_fog_state, gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height,
+    gx_z_texture_state, merge_contiguous_draw_range, requested_surface_readback_layout,
+    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
+    xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -275,6 +275,7 @@ struct TevVertex {
 const _: () = assert!(std::mem::size_of::<TevVertex>() == TEV_VERTEX_FLOATS * size_of::<f32>());
 
 const DRAW_FRAGMENT_FLAG_RGBA6: u32 = 1;
+const DRAW_FRAGMENT_FLAG_FOG: u32 = 2;
 const REQUIRED_WEBGPU_FEATURES: wgpu::Features =
     wgpu::Features::DUAL_SOURCE_BLENDING.union(wgpu::Features::DEPTH_CLIP_CONTROL);
 
@@ -285,15 +286,21 @@ struct DrawUniform {
     destination_alpha: u32,
     fragment_flags: u32,
     z_texture: u32,
+    fog_control: [u32; 4],
+    fog_range0: [u32; 4],
+    fog_range1: [u32; 4],
+    fog_parameters0: [u32; 4],
+    fog_parameters1: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<DrawUniform>() == 16);
+const _: () = assert!(std::mem::size_of::<DrawUniform>() == 96);
 
 impl DrawUniform {
     fn from_gx(
         alpha_test: u32,
         destination_alpha: GxDestinationAlphaState,
         z_texture: GxZTextureState,
+        fog: GxFogState,
     ) -> Self {
         let format = match z_texture.format {
             GxZTextureFormat::U8 => 0,
@@ -312,8 +319,27 @@ impl DrawUniform {
                 DRAW_FRAGMENT_FLAG_RGBA6
             } else {
                 0
+            } | if (fog.parameters[3] >> 21) & 7 != 0 {
+                DRAW_FRAGMENT_FLAG_FOG
+            } else {
+                0
             },
             z_texture: (z_texture.bias & GX_DEPTH24_MAX) | (format << 24) | (operation << 26),
+            fog_control: [fog.range_base, 0, 0, 0],
+            fog_range0: [
+                fog.range_coefficients[0],
+                fog.range_coefficients[1],
+                fog.range_coefficients[2],
+                fog.range_coefficients[3],
+            ],
+            fog_range1: [fog.range_coefficients[4], 0, 0, 0],
+            fog_parameters0: [
+                fog.parameters[0],
+                fog.parameters[1],
+                fog.parameters[2],
+                fog.parameters[3],
+            ],
+            fog_parameters1: [fog.parameters[4], 0, 0, 0],
         }
     }
 }
@@ -1748,6 +1774,10 @@ impl WebGpuRenderer {
             0,
             0,
             0,
+            0,
+            [0; 5],
+            [0; 5],
+            0,
             cull_mode,
             scissor_x,
             scissor_y,
@@ -1888,6 +1918,10 @@ impl WebGpuRenderer {
                     draw.record.fragment_tail.constant_alpha,
                     draw.record.fragment_tail.z_texture_bias,
                     draw.record.fragment_tail.z_texture_mode,
+                    draw.record.fragment_tail.fog_range_base,
+                    draw.record.fragment_tail.fog_range_k,
+                    draw.record.fragment_tail.fog_words,
+                    draw.record.fragment_tail.viewport_half_width_bits,
                     draw.record.cull_mode,
                     draw.record.scissor_x,
                     draw.record.scissor_y,
@@ -1957,6 +1991,10 @@ impl WebGpuRenderer {
         constant_alpha: u32,
         z_texture_bias: u32,
         z_texture_mode: u32,
+        fog_range_base: u32,
+        fog_range_coefficients: [u32; 5],
+        fog_parameters: [u32; 5],
+        viewport_half_width_bits: u32,
         cull_mode: u8,
         scissor_x: u32,
         scissor_y: u32,
@@ -1980,6 +2018,13 @@ impl WebGpuRenderer {
             required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
         let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let fog = gx_fog_state(
+            fog_range_base,
+            fog_range_coefficients,
+            fog_parameters,
+            viewport_half_width_bits,
+        )
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let expanded = expanded_indices(topology, vertex_count)
             .ok_or_else(|| JsValue::from_str("unsupported GX primitive topology"))?;
         let expanded_vertex_bytes = expanded
@@ -2018,7 +2063,12 @@ impl WebGpuRenderer {
             z_texture,
             cull_mode,
         );
-        let draw_uniform = DrawUniform::from_gx(alpha_test, destination_alpha, z_texture);
+        let fog = if pipeline.blend.color_write {
+            fog
+        } else {
+            GxFogState::default()
+        };
+        let draw_uniform = DrawUniform::from_gx(alpha_test, destination_alpha, z_texture, fog);
         let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
         else {
             return Ok(());
@@ -4186,7 +4236,7 @@ mod tests {
     };
     use crate::tev::MAX_TEV_TEXTURES;
     use crate::{
-        GxBlendFactor, SamplerIdentity, TextureAddressMode, TextureBindingIdentity,
+        GxBlendFactor, GxFogState, SamplerIdentity, TextureAddressMode, TextureBindingIdentity,
         gx_destination_alpha_state, gx_z_texture_state,
     };
 
@@ -4375,11 +4425,13 @@ mod tests {
             0x123456,
             gx_destination_alpha_state(blend_mode, 0x100, 1),
             z_texture,
+            GxFogState::default(),
         );
         let active_full = DrawUniform::from_gx(
             0x123456,
             gx_destination_alpha_state(blend_mode, 0x1ff, 1),
             z_texture,
+            GxFogState::default(),
         );
         assert_eq!(active_zero.destination_alpha, 0x100);
         assert_eq!(active_full.destination_alpha, 0x1ff);
@@ -4391,11 +4443,13 @@ mod tests {
             0x123456,
             gx_destination_alpha_state(alpha_update_disabled, 0x100, 1),
             z_texture,
+            GxFogState::default(),
         );
         let inactive_b = DrawUniform::from_gx(
             0x123456,
             gx_destination_alpha_state(alpha_update_disabled, 0x1ff, 1),
             z_texture,
+            GxFogState::default(),
         );
         assert_eq!(inactive_a.destination_alpha, 0);
         assert_eq!(binding_key(inactive_a), binding_key(inactive_b));
@@ -4404,9 +4458,34 @@ mod tests {
             0x123456,
             gx_destination_alpha_state(blend_mode, 0x1ff, 0),
             gx_z_texture_state(0, 0, 0).unwrap(),
+            GxFogState::default(),
         );
         assert_eq!(no_alpha.fragment_flags, 0);
         assert_ne!(binding_key(inactive_a), binding_key(no_alpha));
+    }
+
+    #[test]
+    fn draw_uniform_marks_active_fog_without_changing_the_rgba6_flag() {
+        let destination_alpha = gx_destination_alpha_state(0, 0, 0);
+        let z_texture = gx_z_texture_state(0, 0, 0).unwrap();
+        let disabled = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            z_texture,
+            GxFogState::default(),
+        );
+        let mut fog = GxFogState::default();
+        fog.parameters[3] = 2 << 21;
+        let enabled = DrawUniform::from_gx(0, destination_alpha, z_texture, fog);
+        assert_eq!(disabled.fragment_flags & DRAW_FRAGMENT_FLAG_FOG, 0);
+        assert_eq!(
+            enabled.fragment_flags & DRAW_FRAGMENT_FLAG_FOG,
+            DRAW_FRAGMENT_FLAG_FOG
+        );
+        assert_eq!(
+            disabled.fragment_flags & DRAW_FRAGMENT_FLAG_RGBA6,
+            enabled.fragment_flags & DRAW_FRAGMENT_FLAG_RGBA6
+        );
     }
 
     #[test]
@@ -4431,11 +4510,12 @@ mod tests {
         assert!(!pipeline(0, late).late_fragment_depth);
         assert!(!pipeline(1, disabled).late_fragment_depth);
 
-        let draw = DrawUniform::from_gx(0, destination_alpha, late);
+        let draw = DrawUniform::from_gx(0, destination_alpha, late, GxFogState::default());
         assert_eq!(draw.z_texture, 0x0612_3456);
-        let early_draw = DrawUniform::from_gx(0, destination_alpha, early);
+        let early_draw = DrawUniform::from_gx(0, destination_alpha, early, GxFogState::default());
         assert_eq!(early_draw.z_texture, draw.z_texture);
-        let disabled_draw = DrawUniform::from_gx(0, destination_alpha, disabled);
+        let disabled_draw =
+            DrawUniform::from_gx(0, destination_alpha, disabled, GxFogState::default());
         assert_eq!(disabled_draw.z_texture, 0);
         assert_ne!(binding_key(draw), binding_key(disabled_draw));
     }
