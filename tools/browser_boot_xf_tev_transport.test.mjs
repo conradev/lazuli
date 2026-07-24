@@ -247,6 +247,8 @@ test("vertex decode retains two independent raster color channels", () => {
     [1, 2, 3, 4],
     [201, 202, 203, 204],
   ]);
+  assert.deepEqual(plain(decoded.position), [1, 2, 3]);
+  assert.equal(decoded.positionMatrix, 0);
   assert.equal(decoded.texCoords.length, 8);
 });
 

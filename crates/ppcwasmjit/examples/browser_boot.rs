@@ -6108,6 +6108,104 @@ const TEMPLATE: &str = r##"<!doctype html>
       ];
     }
 
+    function gxCullF32(value) {
+      return Math.fround(value);
+    }
+
+    function gxCullMul(left, right) {
+      return gxCullF32(gxCullF32(left) * gxCullF32(right));
+    }
+
+    function gxCullAdd(left, right) {
+      return gxCullF32(gxCullF32(left) + gxCullF32(right));
+    }
+
+    function gxCullSub(left, right) {
+      return gxCullF32(gxCullF32(left) - gxCullF32(right));
+    }
+
+    function gxCullDot4Position(matrix, offset, x, y, z, w) {
+      return gxCullAdd(
+        gxCullAdd(
+          gxCullAdd(
+            gxCullMul(matrix[offset], x),
+            gxCullMul(matrix[offset + 1], y)
+          ),
+          gxCullMul(matrix[offset + 2], z)
+        ),
+        gxCullMul(matrix[offset + 3], w)
+      );
+    }
+
+    function gxCullDot4(row, vector) {
+      return gxCullDot4Position(
+        row,
+        0,
+        vector[0],
+        vector[1],
+        vector[2],
+        vector[3]
+      );
+    }
+
+    function gxCullTransformState() {
+      const projection = Array.from({ length: 6 }, (_unused, index) =>
+        gxXfFloat(0x1020 + index)
+      );
+      const projectionType = gxXfRegisters[0x1026] >>> 0;
+      if (
+        projection.some(value => !Number.isFinite(value))
+        || (projectionType !== 0 && projectionType !== 1)
+      ) {
+        return null;
+      }
+      return {
+        projection,
+        projectionType,
+        positionMatrices: Array(64),
+      };
+    }
+
+    function gxCullPositionMatrix(state, matrixIndex) {
+      if (
+        state === null
+        || !Number.isInteger(matrixIndex)
+        || matrixIndex < 0
+        || (matrixIndex + 2) * 4 + 3 >= 0x100
+      ) {
+        return null;
+      }
+      const cached = state.positionMatrices[matrixIndex];
+      if (cached !== undefined) return cached;
+      const matrix = Array.from({ length: 12 }, (_unused, index) =>
+        gxXfFloat(matrixIndex * 4 + index)
+      );
+      const valid = (
+        matrix.every(Number.isFinite)
+        && matrix.some(value => value !== 0)
+      );
+      state.positionMatrices[matrixIndex] = valid ? matrix : null;
+      return state.positionMatrices[matrixIndex];
+    }
+
+    function gxCullViewPosition(
+      position,
+      matrixIndex,
+      state = gxCullTransformState()
+    ) {
+      const matrix = gxCullPositionMatrix(state, matrixIndex);
+      if (matrix === null) return null;
+      const x = gxCullF32(position[0]);
+      const y = gxCullF32(position[1]);
+      const z = gxCullF32(position[2]);
+      const transformed = [
+        gxCullDot4Position(matrix, 0, x, y, z, 1),
+        gxCullDot4Position(matrix, 4, x, y, z, 1),
+        gxCullDot4Position(matrix, 8, x, y, z, 1),
+      ];
+      return transformed.every(Number.isFinite) ? transformed : null;
+    }
+
     function gxTransformNormal(vector, matrixIndex) {
       if (vector === null || vector === undefined) return null;
       const base = 0x400 + (matrixIndex % 32) * 3;
@@ -7511,7 +7609,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxProjectPosition(position, matrixIndex) {
-      const viewPosition = gxTransformPosition(position, matrixIndex);
+      return gxProjectViewPosition(gxTransformPosition(position, matrixIndex));
+    }
+
+    function gxProjectViewPosition(viewPosition) {
       if (viewPosition === null) return null;
       const [viewX, viewY, viewZ] = viewPosition;
       const projection = Array.from({ length: 6 }, (_unused, index) =>
@@ -7553,6 +7654,327 @@ const TEMPLATE: &str = r##"<!doctype html>
         clipZ / clipW * viewport[2] + viewport[5],
         clipW,
       ];
+    }
+
+    function gxCullClipPosition(
+      position,
+      matrixIndex,
+      state = gxCullTransformState()
+    ) {
+      const viewPosition = gxCullViewPosition(position, matrixIndex, state);
+      if (viewPosition === null || state === null) return null;
+      const [viewX, viewY, viewZ] = viewPosition;
+      const projection = state.projection;
+      let clip;
+      if (state.projectionType === 0) {
+        clip = [
+          gxCullAdd(gxCullMul(projection[0], viewX), gxCullMul(projection[1], viewZ)),
+          gxCullAdd(gxCullMul(projection[2], viewY), gxCullMul(projection[3], viewZ)),
+          gxCullAdd(gxCullMul(projection[4], viewZ), projection[5]),
+          gxCullF32(-viewZ),
+        ];
+      } else {
+        clip = [
+          gxCullAdd(gxCullMul(projection[0], viewX), projection[1]),
+          gxCullAdd(gxCullMul(projection[2], viewY), projection[3]),
+          gxCullAdd(gxCullMul(projection[4], viewZ), projection[5]),
+          1,
+        ];
+      }
+      return clip.every(Number.isFinite) ? clip : null;
+    }
+
+    function gxCullClipPositionIsInside(clip) {
+      if (
+        !Array.isArray(clip)
+        || clip.length !== 4
+        || clip.some(value => !Number.isFinite(value))
+      ) {
+        return false;
+      }
+      const [x, y, z, w] = clip.map(gxCullF32);
+      if (!(w > 0)) return false;
+      // Positive W makes the far plane exactly Z <= 0. Comparing Z directly
+      // keeps the certification conservative when f32(W * Z) would underflow.
+      const planeDistances = [
+        gxCullSub(w, x),
+        gxCullAdd(x, w),
+        gxCullSub(w, y),
+        gxCullAdd(y, w),
+        z,
+        gxCullAdd(z, w),
+      ];
+      return (
+        planeDistances.every(Number.isFinite)
+        && planeDistances[0] >= 0
+        && planeDistances[1] >= 0
+        && planeDistances[2] >= 0
+        && planeDistances[3] >= 0
+        && planeDistances[4] <= 0
+        && planeDistances[5] >= 0
+      );
+    }
+
+    function gxCullNormalZ3(v0, v1, v2) {
+      const term0 = gxCullMul(
+        gxCullSub(gxCullMul(v0[0], v2[3]), gxCullMul(v2[0], v0[3])),
+        v1[1]
+      );
+      const term1 = gxCullMul(
+        gxCullSub(gxCullMul(v2[0], v0[1]), gxCullMul(v0[0], v2[1])),
+        v1[3]
+      );
+      const term2 = gxCullMul(
+        gxCullSub(gxCullMul(v2[1], v0[3]), gxCullMul(v0[1], v2[3])),
+        v1[0]
+      );
+      const normal = gxCullAdd(gxCullAdd(term0, term1), term2);
+      return Number.isFinite(normal) ? normal : null;
+    }
+
+    function gxCullNormalZ(triangle) {
+      if (
+        !Array.isArray(triangle)
+        || triangle.length !== 3
+        || triangle.some(
+          clip => !Array.isArray(clip)
+            || clip.length !== 4
+            || clip.some(value => !Number.isFinite(value))
+        )
+      ) {
+        return null;
+      }
+      return gxCullNormalZ3(triangle[0], triangle[1], triangle[2]);
+    }
+
+    function gxSourceTriangleCount(topology, vertexCount) {
+      if (!Number.isInteger(vertexCount) || vertexCount < 0) return 0;
+      if (topology === 0 || topology === 1) {
+        return Math.floor(vertexCount / 4) * 2 + (vertexCount % 4 === 3 ? 1 : 0);
+      }
+      if (topology === 2) return Math.floor(vertexCount / 3);
+      if (topology === 3 || topology === 4) return Math.max(vertexCount - 2, 0);
+      return 0;
+    }
+
+    function gxSourceTriangleIndex(topology, vertexCount, triangle, corner) {
+      const triangleCount = gxSourceTriangleCount(topology, vertexCount);
+      if (
+        !Number.isInteger(triangle)
+        || triangle < 0
+        || triangle >= triangleCount
+        || !Number.isInteger(corner)
+        || corner < 0
+        || corner > 2
+      ) {
+        return -1;
+      }
+      if (topology === 0 || topology === 1) {
+        const quadTriangles = Math.floor(vertexCount / 4) * 2;
+        if (triangle >= quadTriangles) return vertexCount - 3 + corner;
+        const base = Math.floor(triangle / 2) * 4;
+        if (triangle % 2 === 0) return base + corner;
+        return corner === 0 ? base : base + corner + 1;
+      }
+      if (topology === 2) return triangle * 3 + corner;
+      if (topology === 3) {
+        const end = triangle + 2;
+        if (corner === 0) return end - 2;
+        const reverse = end % 2 !== 0;
+        return corner === 1
+          ? end - (reverse ? 0 : 1)
+          : end - (reverse ? 1 : 0);
+      }
+      if (topology === 4) return corner === 0 ? 0 : triangle + corner;
+      return -1;
+    }
+
+    function gxExpandedTriangleIndices(topology, vertexCount) {
+      const indices = [];
+      const triangleCount = gxSourceTriangleCount(topology, vertexCount);
+      for (let triangle = 0; triangle < triangleCount; triangle += 1) {
+        indices.push([
+          gxSourceTriangleIndex(topology, vertexCount, triangle, 0),
+          gxSourceTriangleIndex(topology, vertexCount, triangle, 1),
+          gxSourceTriangleIndex(topology, vertexCount, triangle, 2),
+        ]);
+      }
+      return indices;
+    }
+
+    function gxPostCullActionFromNormal(normal, cullMode, viewportHeight) {
+      if (!Number.isFinite(viewportHeight) || viewportHeight === 0) return null;
+      if (normal === null) return null;
+      let backface = normal <= 0;
+      if (viewportHeight > 0) backface = !backface;
+      const survives = cullMode === 0
+        || (cullMode === 1 && backface)
+        || (cullMode === 2 && !backface);
+      return (survives ? 2 : 0) | (backface ? 1 : 0);
+    }
+
+    function gxPostCullAction(triangle, cullMode, viewportHeight) {
+      return gxPostCullActionFromNormal(
+        gxCullNormalZ(triangle),
+        cullMode,
+        viewportHeight
+      );
+    }
+
+    function gxPostCullEvidence(topology, cullMode, clipPositions, viewportHeight) {
+      if (
+        !Number.isInteger(topology)
+        || topology < 0
+        || topology > 4
+        || !Number.isInteger(cullMode)
+        || cullMode < 0
+        || cullMode > 3
+        || !Array.isArray(clipPositions)
+      ) {
+        return null;
+      }
+      const triangleCount = gxSourceTriangleCount(topology, clipPositions.length);
+      if (triangleCount === 0) return null;
+      const evidence = new Uint8Array(Math.ceil(triangleCount / 4));
+      for (let index = 0; index < triangleCount; index += 1) {
+        const v0 = clipPositions[
+          gxSourceTriangleIndex(topology, clipPositions.length, index, 0)
+        ];
+        const v1 = clipPositions[
+          gxSourceTriangleIndex(topology, clipPositions.length, index, 1)
+        ];
+        const v2 = clipPositions[
+          gxSourceTriangleIndex(topology, clipPositions.length, index, 2)
+        ];
+        if (
+          !gxCullClipPositionIsInside(v0)
+          || !gxCullClipPositionIsInside(v1)
+          || !gxCullClipPositionIsInside(v2)
+        ) {
+          return null;
+        }
+        const action = gxPostCullActionFromNormal(
+          gxCullNormalZ3(v0, v1, v2),
+          cullMode,
+          viewportHeight
+        );
+        if (action === null) return null;
+        evidence[index >>> 2] |= action << ((index & 3) * 2);
+      }
+      return evidence;
+    }
+
+    function gxManagedCoverageStateCandidate(
+      topology,
+      vertexCount,
+      pipeline,
+      texturedStageCount
+    ) {
+      if (
+        gxSourceTriangleCount(topology, vertexCount) === 0
+        || pipeline.cullMode === 3
+        || texturedStageCount !== 0
+        || (pipeline.pixelControl & 7) === 2
+        || ((pipeline.zTextureMode >>> 2) & 3) !== 0
+        || ((pipeline.fogWords[3] >>> 21) & 7) !== 0
+      ) {
+        return false;
+      }
+      // The receiver currently manages only the fixed-function early-depth
+      // path. This conservative subset avoids reproducing the complete alpha
+      // outcome classifier in the producer hot loop.
+      return !(
+        (pipeline.zMode & 1) !== 0
+        && (pipeline.zMode & (1 << 4)) !== 0
+        && (pipeline.pixelControl & (1 << 6)) !== 0
+      );
+    }
+
+    function gxManagedCoverageVerticesCandidate(topology, vertices) {
+      if (
+        !Array.isArray(vertices)
+        || vertices.length === 0
+        || vertices.length % 36 !== 0
+      ) {
+        return false;
+      }
+      const vertexCount = vertices.length / 36;
+      for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+        const offset = vertex * 36;
+        for (let component = 0; component < 36; component += 1) {
+          if (!Number.isFinite(Math.fround(vertices[offset + component]))) return false;
+        }
+        const x = Math.fround(vertices[offset]);
+        const y = Math.fround(vertices[offset + 1]);
+        const z = Math.fround(vertices[offset + 2]);
+        const w = Math.fround(vertices[offset + 3]);
+        if (
+          x < 0
+          || x > 640
+          || y < 0
+          || y > 528
+          || z < 0
+          || z > 0x00ffffff
+          || !(w > 0)
+        ) {
+          return false;
+        }
+      }
+
+      const triangleCount = gxSourceTriangleCount(topology, vertexCount);
+      for (let triangle = 0; triangle < triangleCount; triangle += 1) {
+        const first = gxSourceTriangleIndex(topology, vertexCount, triangle, 0) * 36;
+        for (let corner = 1; corner < 3; corner += 1) {
+          const other =
+            gxSourceTriangleIndex(topology, vertexCount, triangle, corner) * 36;
+          for (let component = 2; component < 36; component += 1) {
+            if (component === 3) continue;
+            if (
+              !Object.is(
+                Math.fround(vertices[first + component]),
+                Math.fround(vertices[other + component])
+              )
+            ) {
+              return false;
+            }
+          }
+        }
+      }
+      return true;
+    }
+
+    function gxManagedCoveragePostCullEvidence(
+      topology,
+      cullMode,
+      positions,
+      matrixIndices,
+      viewportHeight
+    ) {
+      if (
+        !Array.isArray(positions)
+        || !Array.isArray(matrixIndices)
+        || positions.length !== matrixIndices.length
+      ) {
+        return null;
+      }
+      const state = gxCullTransformState();
+      if (state === null) return null;
+      const clipPositions = new Array(positions.length);
+      for (let vertex = 0; vertex < positions.length; vertex += 1) {
+        const clip = gxCullClipPosition(
+          positions[vertex],
+          matrixIndices[vertex],
+          state
+        );
+        if (clip === null) return null;
+        clipPositions[vertex] = clip;
+      }
+      return gxPostCullEvidence(
+        topology,
+        cullMode,
+        clipPositions,
+        viewportHeight
+      );
     }
 
     function gxDecodeVertex(source, cursor, vatIndex) {
@@ -7661,7 +8083,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
       const viewPosition = gxTransformPosition(position, positionMatrix);
-      const projected = gxProjectPosition(position, positionMatrix);
+      const projected = gxProjectViewPosition(viewPosition);
       const normal = gxTransformNormal(normalAttribute.normal, positionMatrix);
       const tangent = gxTransformNormal(normalAttribute.tangent, positionMatrix);
       const binormal = gxTransformNormal(normalAttribute.binormal, positionMatrix);
@@ -7682,6 +8104,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       return {
         cursor,
         projected,
+        position,
+        positionMatrix,
         colors,
         rasterColors,
         normal,
