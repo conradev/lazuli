@@ -4243,7 +4243,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         "user_0_10",
         "user_0_12",
       ].includes(name);
-      return dataRamOrLockedCachePointer(address, size, write) !== null;
+      return dataRamOrLockedCachePointer(address, size, write, false) !== null;
     }
 
     function withScopedCycles(scopedCycles, callback) {
@@ -4372,21 +4372,311 @@ const TEMPLATE: &str = r##"<!doctype html>
       return (physicalBase | (effective & addressMask)) >>> 0;
     }
 
-    function translateDataEffectiveAddress(effectiveAddress, msr, dataBats, write) {
+    function resolveDataEffectiveAddress(
+      effectiveAddress,
+      msr,
+      dataBats,
+      write = false
+    ) {
       const effective = effectiveAddress >>> 0;
-      if ((msr & 0x10) === 0) return effective;
-      const userMode = (msr & 0x4000) !== 0;
-      for (const [upper, lower] of dataBats) {
-        const physical = translateBatAddress(
+      if ((msr & 0x10) === 0) {
+        return {
+          kind: "mapped",
+          source: "real",
           effective,
-          upper,
-          lower,
-          userMode,
-          write
-        );
-        if (physical !== null) return physical;
+          physical: effective,
+          write,
+        };
       }
-      return null;
+      const userMode = (msr & 0x4000) !== 0;
+      for (let bat = 0; bat < dataBats.length; bat += 1) {
+        const [upper, lower] = dataBats[bat];
+        const valid = userMode ? 1 : 2;
+        if ((upper & valid) === 0) continue;
+        const blockMask = (((upper >>> 2) & 0x7ff) << 17) >>> 0;
+        const addressMask = (blockMask | 0x1ffff) >>> 0;
+        const regionMask = (~addressMask) >>> 0;
+        if ((effective & regionMask) !== ((upper >>> 0) & regionMask)) continue;
+
+        const translation = {
+          effective,
+          source: "bat",
+          bat,
+          protection: lower & 3,
+          wimg: (lower >>> 3) & 0xf,
+          write,
+        };
+        if (!batAllowsAccess(lower, write)) {
+          return { kind: "protection", ...translation };
+        }
+        const physicalBase = ((lower & 0xfffe0000) & regionMask) >>> 0;
+        return {
+          kind: "mapped",
+          ...translation,
+          physical: (physicalBase | (effective & addressMask)) >>> 0,
+        };
+      }
+      return { kind: "bat-miss", effective, write };
+    }
+
+    function dataPageAllowsAccess(msr, segment, pte1, write) {
+      const selectedKeyMask = (msr & 0x4000) !== 0
+        ? 0x20000000
+        : 0x40000000;
+      const key = (segment & selectedKeyMask) !== 0 ? 1 : 0;
+      const protection = pte1 & 3;
+      if (!write) return key === 0 || protection !== 0;
+      return key === 0 ? protection !== 3 : protection === 2;
+    }
+
+    function commitDataPageHistory(resolved) {
+      if (
+        resolved?.source !== "page"
+        || (resolved.kind !== "mapped" && resolved.kind !== "protection")
+        || !Number.isInteger(resolved.ptePointer)
+      ) {
+        return resolved;
+      }
+      const history = resolved.kind === "mapped" && resolved.write
+        ? 0x180
+        : 0x100;
+      const pte1 = (resolved.pte1 | history) >>> 0;
+      if (pte1 !== resolved.pte1) {
+        view.setUint32(resolved.ptePointer + 4, pte1, false);
+      }
+      return { ...resolved, pte1 };
+    }
+
+    function resolveDataPageAddress(
+      effectiveAddress,
+      msr,
+      segmentRegisters,
+      sdr1,
+      write = false,
+      updateHistory = false
+    ) {
+      const effective = effectiveAddress >>> 0;
+      const segment = segmentRegisters[effective >>> 28] >>> 0;
+      if ((segment & 0x80000000) !== 0) {
+        return {
+          kind: "direct-store",
+          reason: "direct-store-segment",
+          effective,
+          write,
+        };
+      }
+
+      const vsid = segment & 0x00ffffff;
+      const pageIndex = (effective >>> 12) & 0xffff;
+      const abbreviatedPageIndex = (effective >>> 22) & 0x3f;
+      const primaryHash = ((vsid & 0x7ffff) ^ pageIndex) & 0x7ffff;
+      const secondaryHash = (~primaryHash) & 0x7ffff;
+      const tableBase = sdr1 & 0xffff0000;
+      const tableMask = 0x3ff | ((sdr1 & 0x1ff) << 10);
+      const ptegAddress = hash => (
+        tableBase | (((hash & tableMask) << 6) >>> 0)
+      ) >>> 0;
+      const primaryPteg = ptegAddress(primaryHash);
+      const secondaryPteg = ptegAddress(secondaryHash);
+
+      for (const [secondary, ptegPhysical] of [
+        [false, primaryPteg],
+        [true, secondaryPteg],
+      ]) {
+        const ptegPointer = physicalRamPointer(ptegPhysical, 64);
+        if (ptegPointer === null) {
+          return {
+            kind: "page-table-unbacked",
+            effective,
+            physical: ptegPhysical,
+            secondary,
+            write,
+          };
+        }
+        const expectedPte0 = (
+          0x80000000
+          | (vsid << 7)
+          | (secondary ? 0x40 : 0)
+          | abbreviatedPageIndex
+        ) >>> 0;
+        for (let slot = 0; slot < 8; slot += 1) {
+          const ptePointer = ptegPointer + slot * 8;
+          const pte0 = view.getUint32(ptePointer, false);
+          if (pte0 !== expectedPte0) continue;
+          const pte1 = view.getUint32(ptePointer + 4, false);
+          const selectedKeyMask = (msr & 0x4000) !== 0
+            ? 0x20000000
+            : 0x40000000;
+          const key = (segment & selectedKeyMask) !== 0 ? 1 : 0;
+          const translation = {
+            effective,
+            source: "page",
+            physical: ((pte1 & 0xfffff000) | (effective & 0xfff)) >>> 0,
+            pte0,
+            pte1,
+            ptePhysical: (ptegPhysical + slot * 8) >>> 0,
+            ptePointer,
+            secondary,
+            slot,
+            key,
+            protection: pte1 & 3,
+            wimg: (pte1 >>> 3) & 0xf,
+            write,
+            tlbHit: false,
+          };
+          const resolved = dataPageAllowsAccess(msr, segment, pte1, write)
+            ? { kind: "mapped", ...translation }
+            : { kind: "protection", ...translation };
+          return updateHistory ? commitDataPageHistory(resolved) : resolved;
+        }
+      }
+      return {
+        kind: "page-fault",
+        effective,
+        primaryPteg,
+        secondaryPteg,
+        write,
+      };
+    }
+
+    function resolveDataTranslation(
+      effectiveAddress,
+      msr,
+      dataBats,
+      segmentRegisters = undefined,
+      sdr1 = 0,
+      write = false,
+      updateHistory = false
+    ) {
+      const resolved = resolveDataEffectiveAddress(
+        effectiveAddress,
+        msr,
+        dataBats,
+        write
+      );
+      if (resolved.kind !== "bat-miss") return resolved;
+      if (!Array.isArray(segmentRegisters) || segmentRegisters.length !== 16) {
+        return resolved;
+      }
+      return resolveDataPageAddress(
+        effectiveAddress,
+        msr,
+        segmentRegisters,
+        sdr1 >>> 0,
+        write,
+        updateHistory
+      );
+    }
+
+    function translateDataEffectiveAddress(
+      effectiveAddress,
+      msr,
+      dataBats,
+      write = false,
+      segmentRegisters = undefined,
+      sdr1 = 0,
+      updateHistory = false
+    ) {
+      const resolved = resolveDataTranslation(
+        effectiveAddress,
+        msr,
+        dataBats,
+        segmentRegisters,
+        sdr1,
+        write,
+        updateHistory
+      );
+      return resolved.kind === "mapped" ? resolved.physical : null;
+    }
+
+    function resolveDataEffectiveRange(
+      effectiveAddress,
+      size,
+      msr,
+      dataBats,
+      segmentRegisters = undefined,
+      sdr1 = 0,
+      write = false,
+      updateHistory = false
+    ) {
+      const effective = effectiveAddress >>> 0;
+      if (!Number.isSafeInteger(size) || size <= 0) {
+        return { kind: "invalid-range", effective, size, write };
+      }
+      if (size > 0x100000000 - effective) {
+        return { kind: "invalid-range", effective, size, write };
+      }
+
+      let physicalStart = null;
+      let offset = 0;
+      const translations = [];
+      while (offset < size) {
+        const currentEffective = (effective + offset) >>> 0;
+        const current = resolveDataTranslation(
+          currentEffective,
+          msr,
+          dataBats,
+          segmentRegisters,
+          sdr1,
+          write,
+          false
+        );
+        if (current.kind !== "mapped") {
+          const fault = updateHistory && current.kind === "protection"
+            ? commitDataPageHistory(current)
+            : current;
+          return {
+            ...fault,
+            effectiveStart: effective,
+            size,
+            faultEffective: currentEffective,
+            translations,
+          };
+        }
+        const currentPhysical = current.physical >>> 0;
+        if (physicalStart === null) {
+          physicalStart = currentPhysical;
+          if (size > 0x100000000 - physicalStart) {
+            return {
+              kind: "invalid-range",
+              effective,
+              physical: physicalStart,
+              size,
+              write,
+              translations,
+            };
+          }
+        } else if (currentPhysical !== physicalStart + offset) {
+          return {
+            kind: "non-contiguous",
+            effective,
+            physical: physicalStart,
+            size,
+            write,
+            faultEffective: currentEffective,
+            faultPhysical: currentPhysical,
+            translations,
+          };
+        }
+        translations.push(current);
+        const translationBytes = current.source === "page"
+          ? 0x1000 - (currentEffective & 0xfff)
+          : current.source === "bat"
+            ? 0x20000 - (currentEffective & 0x1ffff)
+            : size - offset;
+        offset += Math.min(size - offset, translationBytes);
+      }
+      const committed = updateHistory
+        ? translations.map(commitDataPageHistory)
+        : translations;
+      return {
+        kind: "mapped",
+        effective,
+        physical: physicalStart,
+        size,
+        write,
+        translations: committed,
+      };
     }
 
     function translateDataEffectiveRange(
@@ -4394,32 +4684,22 @@ const TEMPLATE: &str = r##"<!doctype html>
       size,
       msr,
       dataBats,
-      write
+      write = false,
+      segmentRegisters = undefined,
+      sdr1 = 0,
+      updateHistory = false
     ) {
-      const effective = effectiveAddress >>> 0;
-      if (!Number.isSafeInteger(size) || size <= 0) return null;
-      if (size > 0x100000000 - effective) return null;
-
-      let physicalStart = null;
-      let offset = 0;
-      while (offset < size) {
-        const currentEffective = (effective + offset) >>> 0;
-        const currentPhysical = translateDataEffectiveAddress(
-          currentEffective,
-          msr,
-          dataBats,
-          write
-        );
-        if (currentPhysical === null) return null;
-        if (physicalStart === null) {
-          physicalStart = currentPhysical;
-          if (size > 0x100000000 - physicalStart) return null;
-        } else if (currentPhysical !== physicalStart + offset) {
-          return null;
-        }
-        offset += Math.min(size - offset, 0x20000 - (currentEffective & 0x1ffff));
-      }
-      return physicalStart;
+      const resolved = resolveDataEffectiveRange(
+        effectiveAddress,
+        size,
+        msr,
+        dataBats,
+        segmentRegisters,
+        sdr1,
+        write,
+        updateHistory
+      );
+      return resolved.kind === "mapped" ? resolved.physical : null;
     }
 
     function resolveInstructionEffectiveAddress(effectiveAddress, msr, instructionBats) {
@@ -4713,12 +4993,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       ]);
     }
 
-    function translateDataAddress(effectiveAddress, write = false) {
+    function translateDataAddress(
+      effectiveAddress,
+      write = false,
+      updateHistory = false
+    ) {
       return translateDataEffectiveAddress(
         effectiveAddress,
         view.getUint32(cpu + msrOffset, true),
         readDataBats(),
-        write
+        write,
+        readSegmentRegisters(),
+        view.getUint32(cpu + sdr1Offset, true),
+        updateHistory
       );
     }
 
@@ -4743,13 +5030,21 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
-    function translateDataRange(effectiveAddress, size, write = false) {
+    function translateDataRange(
+      effectiveAddress,
+      size,
+      write = false,
+      updateHistory = false
+    ) {
       return translateDataEffectiveRange(
         effectiveAddress,
         size,
         view.getUint32(cpu + msrOffset, true),
         readDataBats(),
-        write
+        write,
+        readSegmentRegisters(),
+        view.getUint32(cpu + sdr1Offset, true),
+        updateHistory
       );
     }
 
@@ -4788,20 +5083,32 @@ const TEMPLATE: &str = r##"<!doctype html>
       return normalized?.kind === "mmio" ? mmio + normalized.offset : null;
     }
 
-    function dataRamPointer(address, size, write = false) {
-      const physical = translateDataRange(address, size, write);
+    function dataRamPointer(
+      address,
+      size,
+      write = false,
+      updateHistory = false
+    ) {
+      const physical = translateDataRange(address, size, write, updateHistory);
       return physical === null ? null : physicalRamPointer(physical, size);
     }
 
     function dataFastmemPointer(effectiveAddress, msr, dataBats, ramBytes, ramBase) {
-      const physical = translateDataEffectiveAddress(
+      // Hashed pages are 4 KiB while one fastmem entry spans 128 KiB.
+      // Retain them on the checked slow path; only real-mode and DBAT
+      // translations prove that the whole fastmem entry has one mapping.
+      const resolved = resolveDataEffectiveAddress(
         effectiveAddress,
         msr,
         dataBats,
         true
       );
-      if (physical === null || physical >= ramBytes) return null;
-      return ramBase + physical;
+      if (
+        resolved.kind !== "mapped"
+        || (resolved.source !== "real" && resolved.source !== "bat")
+        || resolved.physical >= ramBytes
+      ) return null;
+      return ramBase + resolved.physical;
     }
 
     function physicalLockedCachePointer(address, size) {
@@ -4864,8 +5171,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function dataRamOrLockedCachePointer(address, size, write = false) {
-      const physical = translateDataRange(address, size, write);
+    function dataRamOrLockedCachePointer(
+      address,
+      size,
+      write = false,
+      updateHistory = false
+    ) {
+      const physical = translateDataRange(address, size, write, updateHistory);
       if (physical === null) return null;
       return physicalRamPointer(physical, size)
         ?? physicalLockedCachePointer(physical, size);
@@ -8123,7 +8435,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function readInteger(address, pointer, size) {
       const logical = address >>> 0;
-      const physical = translateDataRange(logical, size, false);
+      const physical = translateDataRange(logical, size, false, true);
       if (
         physical !== null
         && physical < 0x0c000040
@@ -8653,7 +8965,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function writeInteger(address, value, size) {
       const logical = address >>> 0;
-      const physical = translateDataRange(logical, size, true);
+      const physical = translateDataRange(logical, size, true, true);
       if (
         physical !== null
         && physical < 0x0c003004
@@ -8839,7 +9151,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const type = (gqr >>> 16) & 7;
       const size = type === 0 ? 4 : (type === 4 || type === 6 ? 1 : 2);
       if (![0, 4, 5, 6, 7].includes(type)) return 0;
-      const physical = translateDataRange(address, size, false);
+      const physical = translateDataRange(address, size, false, true);
       const lockedSource = physical === null
         ? null
         : physicalLockedCachePointer(physical, size);
@@ -8872,7 +9184,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const scaled = value * (2 ** scale);
       const stored = quantizedStoreValue(type, scaled);
       const logical = address >>> 0;
-      const physical = translateDataRange(logical, size, true);
+      const physical = translateDataRange(logical, size, true, true);
       if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (type) {
           case 0: gxFifoScratch.setFloat32(0, stored, false); break;
@@ -11346,7 +11658,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       return translateDataRange(
         effectiveStart,
         byteCount,
-        cacheInstructionUsesStoreAccess(cacheInstruction)
+        cacheInstructionUsesStoreAccess(cacheInstruction),
+        true
       );
     }
 
@@ -11403,7 +11716,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (skipped === 0) return;
       const byteCount = skipped * 32;
       const guestStart = (readGpr(memsetLoop.baseRegister) + 4) >>> 0;
-      const physicalStart = translateDataRange(guestStart, byteCount, true);
+      const physicalStart = translateDataRange(guestStart, byteCount, true, true);
       if (physicalStart === null) return;
       const target = physicalRamPointer(physicalStart, byteCount)
         ?? physicalLockedCachePointer(physicalStart, byteCount);

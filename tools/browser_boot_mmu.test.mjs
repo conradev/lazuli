@@ -71,8 +71,15 @@ function extractFunction(name) {
 const mmuFunctions = [
   "batAllowsAccess",
   "translateBatAddress",
+  "resolveDataEffectiveAddress",
+  "dataPageAllowsAccess",
+  "commitDataPageHistory",
+  "resolveDataPageAddress",
+  "resolveDataTranslation",
   "translateDataEffectiveAddress",
+  "resolveDataEffectiveRange",
   "translateDataEffectiveRange",
+  "readSegmentRegisters",
   "readDataBats",
   "translateDataAddress",
   "translateDataRange",
@@ -110,6 +117,7 @@ function makeContext() {
   const context = {
     __FASTMEM_LUT_COUNT__: 1 << 15,
     __FASTMEM_PAGE_SHIFT__: 17,
+    bytes: new Uint8Array(buffer),
     cpu: 0,
     dataBatOffsets: [
       [0x40, 0x44],
@@ -135,6 +143,11 @@ function makeContext() {
     physicalMmioBase: 0x0c000000,
     ram: 0x40000,
     ramSize: 0x40000,
+    sdr1Offset: 0x180,
+    segmentRegisterOffsets: Array.from(
+      { length: 16 },
+      (_unused, index) => 0x100 + index * 4,
+    ),
     synchronizeInstructionAddressSpace() {},
     view: new DataView(buffer),
   };
@@ -469,18 +482,21 @@ test("cache-loop acceleration uses load/store translation while icbi stays virtu
 
   for (const instruction of [0x7c0018ac, 0x7c00186c]) {
     assert.equal(context.translateCacheLoopRange(instruction, 0x80001000, 0x60), 0x12340000);
-    assert.deepEqual(calls.pop(), [0x80001000, 0x60, false]);
+    assert.deepEqual(calls.pop(), [0x80001000, 0x60, false, true]);
   }
   for (const instruction of [0x7c001bac, 0x7c001fec]) {
     assert.equal(context.translateCacheLoopRange(instruction, 0x80001000, 0x60), 0x12340000);
-    assert.deepEqual(calls.pop(), [0x80001000, 0x60, true]);
+    assert.deepEqual(calls.pop(), [0x80001000, 0x60, true, true]);
   }
   assert.equal(context.translateCacheLoopRange(0x7c001fac, 0x80001000, 0x60), 0x80001000);
   assert.equal(calls.length, 0);
 
   const fastForward = extractFunction("fastForwardRecognizedLoop");
   assert.match(fastForward, /translateCacheLoopRange\(/);
-  assert.match(fastForward, /translateDataRange\(guestStart, byteCount, true\)/);
+  assert.match(
+    fastForward,
+    /translateDataRange\(guestStart, byteCount, true, true\)/,
+  );
   assert.doesNotMatch(extractFunction("translateCacheLoopRange"), /translateDataRange[\s\S]*0x7c001fac/);
 });
 
@@ -500,10 +516,10 @@ test("MSR and DBAT generic hooks rebuild mappings without delivering interrupts"
   );
   assert.match(
     extractFunction("readInteger"),
-    /translateDataRange\(logical, size, false\)/,
+    /translateDataRange\(logical, size, false, true\)/,
   );
   assert.match(
     extractFunction("writeInteger"),
-    /translateDataRange\(logical, size, true\)/,
+    /translateDataRange\(logical, size, true, true\)/,
   );
 });
