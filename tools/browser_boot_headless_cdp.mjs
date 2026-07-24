@@ -50,6 +50,7 @@ export class DevToolsSession {
     this.createSocket = createSocket;
     this.exceptions = [];
     this.generation = 0;
+    this.listeners = new Map();
     this.nextId = 1;
     this.pending = new Map();
     this.requestTimeoutMs = requestTimeoutMs;
@@ -107,6 +108,9 @@ export class DevToolsSession {
     if (message.method === "Runtime.exceptionThrown") {
       this.exceptions.push(message.params?.exceptionDetails ?? message.params ?? message);
     }
+    const listeners = this.listeners.get(message.method);
+    if (listeners === undefined) return;
+    for (const listener of listeners) listener(message.params ?? {});
   }
 
   async openSocket(timeoutMs = this.requestTimeoutMs) {
@@ -272,6 +276,25 @@ export class DevToolsSession {
       failedSocket?.close();
       throw error;
     }
+  }
+
+  on(method, listener) {
+    if (typeof method !== "string" || method.length === 0) {
+      throw new TypeError("DevTools event method must be a non-empty string");
+    }
+    if (typeof listener !== "function") {
+      throw new TypeError("DevTools event listener must be a function");
+    }
+    let listeners = this.listeners.get(method);
+    if (listeners === undefined) {
+      listeners = new Set();
+      this.listeners.set(method, listeners);
+    }
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) this.listeners.delete(method);
+    };
   }
 
   close() {
