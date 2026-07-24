@@ -47,7 +47,7 @@ test("generated public artifact contains only the release surface", async () => 
   assert.ok(!frontend.includes("/browser_renderer.js"));
   assert.ok(rendererJavascript.includes(release.renderer.wasm.url));
   assert.ok(!rendererJavascript.includes("browser_renderer_bg.wasm"));
-  assert.match(appFallback, /location\.replace\("\/"\)/);
+  assert.match(appFallback, /location\.replace\(`\/\$\{location\.search\}`\)/);
   const rootFiles = await readdir(directory);
   assert.ok(!rootFiles.includes("browser_renderer.js"));
   assert.ok(!rootFiles.includes("browser_renderer_bg.wasm"));

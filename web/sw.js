@@ -198,34 +198,6 @@ export async function backendResponse(
   });
 }
 
-export async function frontendResponse(
-  record,
-  cacheStorage = caches,
-  origin = self.location.origin,
-  fetcher = fetch,
-) {
-  if (record?.release?.schema !== RELEASE_SCHEMA) {
-    throw new Error(`release schema ${RELEASE_SCHEMA} is required to serve the frontend`);
-  }
-  const asset = record.release.frontend;
-  const cache = await cacheStorage.open(record.cacheName);
-  const url = absoluteUrl(asset.url, origin);
-  let response = await cache.match(url);
-  if (response === undefined) {
-    await fetchAndCacheAsset(asset, cache, null, fetcher, origin);
-    response = await cache.match(url);
-  }
-  if (response === undefined) throw new Error(`cached frontend is missing: ${asset.url}`);
-  const headers = new Headers(response.headers);
-  headers.set("Cache-Control", "no-store");
-  headers.set("Content-Type", "text/html; charset=utf-8");
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
 async function networkFirstBootstrap(request) {
   const cache = await caches.open(BOOTSTRAP_CACHE);
   const requested = new URL(request.url);
@@ -367,21 +339,9 @@ export async function handleFetch(request) {
   }
   if (url.pathname === "/release.json") return networkFirstRelease(request);
   if (url.pathname === APP_PATH) {
-    const active = await readActiveRelease(caches, self.location.origin);
-    if (active !== null) {
-      try {
-        return await frontendResponse(active);
-      } catch {
-        return new Response("The saved frontend is unavailable.", {
-          status: 503,
-          headers: { "Cache-Control": "no-store" },
-        });
-      }
-    }
-    return new Response("No frontend release is active.", {
-      status: 503,
-      headers: { "Cache-Control": "no-store" },
-    });
+    const root = new URL("/", url);
+    root.search = url.search;
+    return Response.redirect(root.href, 302);
   }
   if (url.pathname === "/ppcwasmjit.wasm") {
     const active = await readActiveRelease(caches, self.location.origin);

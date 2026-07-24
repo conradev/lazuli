@@ -5,10 +5,25 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  configuredPublicWarioWareUrl,
   validatePublicWarioWareSmokeEvidence,
 } from "./browser_public_warioware_smoke.mjs";
 
+function activeRelease() {
+  return {
+    schema: 2,
+    releaseId: "1".repeat(64),
+    commit: "2".repeat(40),
+    frontend: {
+      url: `/assets/frontend-${"b".repeat(64)}.html`,
+      sha256: "b".repeat(64),
+      bytes: 1_000,
+    },
+  };
+}
+
 function validEvidence() {
+  const release = activeRelease();
   return {
     schema: "lazuli-public-warioware-smoke-v1",
     dataset: { renderer: "wgpu-webgpu", status: "running" },
@@ -19,8 +34,9 @@ function validEvidence() {
       sha256: "a".repeat(64),
     },
     discStatus: "local: WarioWare, Inc. - Mega Party Game$! (USA).ciso",
-    frameUrl: "https://gekko.free/app.html?scenario=smb-ready-play",
+    frameUrl: `https://gekko.free/assets/frontend-${"b".repeat(64)}.html?scenario=smb-ready-play`,
     publicUrl: "https://gekko.free/?scenario=smb-ready-play",
+    release,
     report: {
       status: "running",
       stage: "snapshot",
@@ -36,12 +52,66 @@ function validEvidence() {
       scenario: null,
     },
     surface: "release",
+    terminalRelease: structuredClone(release),
   };
 }
 
 test("public WarioWare smoke accepts a healthy release snapshot with stale SMB query", () => {
   const evidence = validEvidence();
   assert.strictEqual(validatePublicWarioWareSmokeEvidence(evidence), evidence);
+});
+
+test("public WarioWare runtime accepts only the exact production root", () => {
+  assert.equal(
+    configuredPublicWarioWareUrl("https://gekko.free/"),
+    "https://gekko.free/?scenario=smb-ready-play",
+  );
+  for (const publicRoot of [
+    "http://gekko.free/",
+    "https://localhost/",
+    "https://user@gekko.free/",
+    "https://gekko.free:8443/",
+  ]) {
+    assert.throws(
+      () => configuredPublicWarioWareUrl(publicRoot),
+      /exact production origin https:\/\/gekko\.free/,
+      publicRoot,
+    );
+  }
+});
+
+test("public WarioWare smoke rejects the mutable app path with the exact scenario query", () => {
+  const evidence = validEvidence();
+  evidence.frameUrl = "https://gekko.free/app.html?scenario=smb-ready-play";
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(evidence),
+    /\$\.frameUrl: expected a content-addressed immutable frontend path/,
+  );
+});
+
+test("public WarioWare smoke binds its same-origin iframe to the active release", () => {
+  const crossOrigin = validEvidence();
+  crossOrigin.frameUrl =
+    `https://example.com/assets/frontend-${"b".repeat(64)}.html?scenario=smb-ready-play`;
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(crossOrigin),
+    /\$\.frameUrl: expected exact production origin https:\/\/gekko\.free/,
+  );
+
+  const wrongAsset = validEvidence();
+  wrongAsset.frameUrl =
+    `https://gekko.free/assets/frontend-${"c".repeat(64)}.html?scenario=smb-ready-play`;
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(wrongAsset),
+    /\$\.frameUrl: does not match the active release frontend identity/,
+  );
+
+  const changedRelease = validEvidence();
+  changedRelease.terminalRelease.releaseId = "f".repeat(64);
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(changedRelease),
+    /\$\.terminalRelease: active release changed/,
+  );
 });
 
 test("public WarioWare smoke rejects scenario leakage and unhealthy evidence", () => {
@@ -73,4 +143,11 @@ test("public WarioWare smoke rejects scenario leakage and unhealthy evidence", (
       label,
     );
   }
+});
+
+test("public WarioWare smoke reuses the shared iframe transport", async () => {
+  const source = await import("node:fs/promises").then(({ readFile }) =>
+    readFile(new URL("./browser_public_warioware_smoke.mjs", import.meta.url), "utf8"));
+  assert.match(source, /from "\.\/browser_public_cdp\.mjs"/);
+  assert.doesNotMatch(source, /createUncompressedDevToolsSocket|class DevToolsSession/);
 });

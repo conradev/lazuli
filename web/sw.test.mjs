@@ -11,7 +11,6 @@ import {
   activeReleaseResponse,
   backendResponse,
   cachedReleaseAsset,
-  frontendResponse,
   handleFetch,
   readActiveRelease,
   stageRelease,
@@ -262,10 +261,6 @@ test("keeps a verified schema-1 release readable until schema 2 commits", async 
     );
   }
   await assert.rejects(
-    frontendResponse(active, storage, ORIGIN),
-    /release schema 2 is required/,
-  );
-  await assert.rejects(
     backendResponse(active, storage, ORIGIN),
     /release schema 2 is required/,
   );
@@ -287,8 +282,12 @@ test("keeps a verified schema-1 release readable until schema 2 commits", async 
       return new Response("unexpected network response");
     },
     async () => {
+      const legacyApp = await handleFetch(new Request(
+        `${ORIGIN}${APP_PATH}?scenario=smb-ready-play`,
+      ));
+      assert.equal(legacyApp.status, 302);
+      assert.equal(legacyApp.headers.get("Location"), `${ORIGIN}/?scenario=smb-ready-play`);
       const blockedPaths = [
-        APP_PATH,
         legacy.backend.url,
         legacy.frontend.url,
         ...legacy.backend.chunks.map(chunk => chunk.url),
@@ -415,32 +414,36 @@ test("reuses unchanged content-addressed backend chunks across releases", async 
   assert.ok(storage.caches.has(secondRecord.cacheName));
 });
 
-test("serves changing frontend releases from one stable app URL", async () => {
+test("redirects controlled legacy app navigation without serving the active frontend", async () => {
   assert.equal(APP_PATH, "/app.html");
   const storage = new MemoryCacheStorage();
-  const first = await makeRelease(1);
-  const firstRecord = await stageRelease(first.release, {
+  const candidate = await makeRelease(7);
+  await stageRelease(candidate.release, {
     cacheStorage: storage,
-    fetcher: fetchAssets(first.responses),
+    fetcher: fetchAssets(candidate.responses),
     origin: ORIGIN,
-    cacheSuffix: "first",
+    cacheSuffix: "legacy-route",
   });
-  assert.equal(
-    await (await frontendResponse(firstRecord, storage, ORIGIN)).text(),
-    "<p>release 1</p>",
+  const networkRequests = [];
+  await withWorkerGlobals(
+    storage,
+    async request => {
+      networkRequests.push(request.url);
+      return new Response("unexpected network response");
+    },
+    async () => {
+      const response = await handleFetch(new Request(
+        `${ORIGIN}${APP_PATH}?scenario=smb-ready-play&source=legacy`,
+      ));
+      assert.equal(response.status, 302);
+      assert.equal(
+        response.headers.get("Location"),
+        `${ORIGIN}/?scenario=smb-ready-play&source=legacy`,
+      );
+      assert.equal(await response.text(), "");
+      assert.deepEqual(networkRequests, []);
+    },
   );
-
-  const second = await makeRelease(2);
-  const secondRecord = await stageRelease(second.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(second.responses),
-    origin: ORIGIN,
-    cacheSuffix: "second",
-  });
-  const response = await frontendResponse(secondRecord, storage, ORIGIN);
-  assert.equal(await response.text(), "<p>release 2</p>");
-  assert.equal(response.headers.get("Cache-Control"), "no-store");
-  assert.equal(response.headers.get("Content-Type"), "text/html; charset=utf-8");
 });
 
 test("serves only the active schema-2 browser code through public routes", async () => {
@@ -460,10 +463,6 @@ test("serves only the active schema-2 browser code through public routes", async
       return new Response("unexpected network response");
     },
     async () => {
-      const frontend = await handleFetch(new Request(`${ORIGIN}${APP_PATH}`));
-      assert.equal(frontend.status, 200);
-      assert.equal(await frontend.text(), "<p>release 7</p>");
-
       const backend = await handleFetch(new Request(`${ORIGIN}${candidate.release.backend.url}`));
       assert.equal(backend.status, 200);
       assert.deepEqual(new Uint8Array(await backend.arrayBuffer()), candidate.backendBytes);
