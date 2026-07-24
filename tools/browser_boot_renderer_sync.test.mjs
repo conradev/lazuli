@@ -175,7 +175,7 @@ test("packed renderer copies transfer one exact frame without dropping work", ()
     geometry: { drawCalls: 2, vertices: 6 },
   };
   const packCalls = [];
-  context.packGxFramePacketV2 = (copyKind, packedFrame, residentTextureKeys) => {
+  context.packGxFramePacketV3 = (copyKind, packedFrame, residentTextureKeys) => {
     packCalls.push([copyKind, packedFrame, residentTextureKeys]);
     return packet;
   };
@@ -215,7 +215,7 @@ test("gx-frame transfer detaches only the sender's packet", () => {
   const { context, messages, transfers } = workerHarness({ transferMessages: true });
   const packet = new ArrayBuffer(128);
   new Uint8Array(packet)[0] = 0x4c;
-  context.packGxFramePacketV2 = () => packet;
+  context.packGxFramePacketV3 = () => packet;
 
   context.postGxFrame(1, {
     index: 3,
@@ -233,7 +233,7 @@ test("concurrent GX packets do not trust an in-flight residency snapshot", () =>
   const { context } = workerHarness();
   context.rendererResidentTextureKeys = new Set(["resident"]);
   const residencyArguments = [];
-  context.packGxFramePacketV2 = (_copyKind, _frame, residentTextureKeys) => {
+  context.packGxFramePacketV3 = (_copyKind, _frame, residentTextureKeys) => {
     residencyArguments.push(residentTextureKeys);
     return new ArrayBuffer(128);
   };

@@ -35,7 +35,7 @@ const packetFunctions = [
   "gxFramePacketEqualBytes",
   "gxFramePacketKeyBytes",
   "gxFramePacketSampler",
-  "packGxFramePacketV2",
+  "packGxFramePacketV3",
 ];
 
 function packetContext() {
@@ -448,7 +448,7 @@ test("packs each draw's GX pipeline and f32 vertices into its canonical record",
     { length: 36 },
     (_unused, index) => index - 4.5,
   );
-  const buffer = packet.packGxFramePacketV2(2, packetFrame([{
+  const buffer = packet.packGxFramePacketV3(2, packetFrame([{
     topology: 2,
     vertices,
     tevState: tevStateForMap(),
@@ -462,13 +462,21 @@ test("packs each draw's GX pipeline and f32 vertices into its canonical record",
       scissorY: 34,
       scissorWidth: 456,
       scissorHeight: 321,
+      pixelControl: 0x111213,
+      constantAlpha: 0x141516,
+      zTextureBias: 0x171819,
+      zTextureMode: 0x1a1b1c,
+      fogRangeBase: 0x1d1e1f,
+      fogRangeK: [0x212223, 0x242526, 0x272829, 0x2a2b2c, 0x2d2e2f],
+      fogWords: [0x313233, 0x343536, 0x373839, 0x3a3b3c, 0x3d3e3f],
+      viewportHalfWidthBits: 0x43a00000,
     },
   }]));
   const bytes = new Uint8Array(buffer);
   const view = new DataView(buffer);
   const draw = 160;
 
-  assert.equal(buffer.byteLength, 896);
+  assert.equal(buffer.byteLength, 944);
   assert.equal(bytes[draw], 2);
   assert.equal(bytes[draw + 1], 1);
   assert.equal(view.getUint32(draw + 0x04, true), 1);
@@ -481,12 +489,29 @@ test("packs each draw's GX pipeline and f32 vertices into its canonical record",
   assert.equal(view.getUint32(draw + 0x20, true), 34);
   assert.equal(view.getUint32(draw + 0x24, true), 456);
   assert.equal(view.getUint32(draw + 0x28, true), 321);
+  assert.equal(view.getUint32(draw + 0x2c, true), 0);
   for (let map = 0; map < 8; map += 1) {
     assert.equal(view.getUint32(draw + 0x30 + map * 8, true), 0xffffffff);
     assert.equal(view.getUint32(draw + 0x34 + map * 8, true), 0);
   }
+  assert.equal(view.getUint32(draw + 0x70, true), 0x111213);
+  assert.equal(view.getUint32(draw + 0x74, true), 0x141516);
+  assert.equal(view.getUint32(draw + 0x78, true), 0x171819);
+  assert.equal(view.getUint32(draw + 0x7c, true), 0x1a1b1c);
+  assert.equal(view.getUint32(draw + 0x80, true), 0x1d1e1f);
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(
+      view.getUint32(draw + 0x84 + index * 4, true),
+      [0x212223, 0x242526, 0x272829, 0x2a2b2c, 0x2d2e2f][index],
+    );
+    assert.equal(
+      view.getUint32(draw + 0x98 + index * 4, true),
+      [0x313233, 0x343536, 0x373839, 0x3a3b3c, 0x3d3e3f][index],
+    );
+  }
+  assert.equal(view.getUint32(draw + 0xac, true), 0x43a00000);
   const vertexOffset = view.getUint32(0x28, true);
-  assert.equal(vertexOffset, 752);
+  assert.equal(vertexOffset, 800);
   assert.equal(view.getFloat32(vertexOffset, true), -4.5);
   assert.equal(view.getFloat32(vertexOffset + 35 * 4, true), 30.5);
 });
@@ -502,7 +527,7 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
     height: 1,
     pixels,
   };
-  const buffer = packet.packGxFramePacketV2(2, packetFrame([
+  const buffer = packet.packGxFramePacketV3(2, packetFrame([
     {
       topology: 2,
       vertices: new Float32Array(36),
@@ -530,7 +555,7 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
   ]));
   const view = new DataView(buffer);
   const firstDraw = 160;
-  const secondDraw = 288;
+  const secondDraw = 336;
   const textureTable = view.getUint32(0x20, true);
 
   assert.equal(view.getUint32(0x14, true), 2);

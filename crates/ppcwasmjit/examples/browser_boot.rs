@@ -1413,7 +1413,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       let packet;
       try {
-        packet = packGxFramePacketV2(copyKind, frame, residentTextureKeys);
+        packet = packGxFramePacketV3(copyKind, frame, residentTextureKeys);
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
@@ -1497,12 +1497,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       return wrapS | (wrapT << 2) | (magFilter << 4) | (minFilter << 5);
     }
 
-    // LZGX v2 is the deterministic Worker-to-renderer boundary. The packet is
+    // LZGX v3 is the deterministic Worker-to-renderer boundary. The packet is
     // deliberately self-contained: one transferable ArrayBuffer, fixed-size
     // little-endian records, and byte sections whose padding is always zero.
     // Textures are emitted in first-use draw/slot order and referenced by
     // table index so repeated TEV bindings do not duplicate pixel payloads.
-    function packGxFramePacketV2(copyKind, frame, residentTextureKeys = null) {
+    function packGxFramePacketV3(copyKind, frame, residentTextureKeys = null) {
       copyKind = gxFramePacketInteger(copyKind, "copyKind", 2);
       if (copyKind !== 1 && copyKind !== 2) {
         throw new RangeError("GX frame packet copyKind must be 1 or 2");
@@ -1536,6 +1536,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       const encoder = new TextEncoder();
+      const scalarBits = new DataView(new ArrayBuffer(4));
       const textures = [];
       const textureByKey = new Map();
       const normalizedDraws = [];
@@ -1763,6 +1764,24 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
         }
 
+        const fogRangeBase = gxFramePacketInteger(
+          pipeline.fogRangeBase ?? 0,
+          `${name}.fogRangeBase`,
+          0x00ffffff
+        );
+        const viewportHalfWidthBits = gxFramePacketInteger(
+          pipeline.viewportHalfWidthBits ?? 0,
+          `${name}.viewportHalfWidthBits`
+        );
+        if ((fogRangeBase & (1 << 10)) !== 0) {
+          scalarBits.setUint32(0, viewportHalfWidthBits, true);
+          const viewportHalfWidth = scalarBits.getFloat32(0, true);
+          if (!Number.isFinite(viewportHalfWidth) || viewportHalfWidth === 0) {
+            throw new RangeError(
+              `GX frame packet ${name}.viewportHalfWidthBits must encode a finite nonzero f32 when fog range adjustment is enabled`
+            );
+          }
+        }
         normalizedDraws.push({
           topology,
           vertexCount,
@@ -1771,14 +1790,20 @@ const TEMPLATE: &str = r##"<!doctype html>
           tevState,
           textureReferences,
           cullMode: gxFramePacketInteger(pipeline.cullMode ?? 0, `${name}.cullMode`, 3),
-          zMode: gxFramePacketInteger(pipeline.zMode ?? 0, `${name}.zMode`),
+          zMode: gxFramePacketInteger(
+            pipeline.zMode ?? 0,
+            `${name}.zMode`,
+            0x00ffffff
+          ),
           blendMode: gxFramePacketInteger(
             pipeline.blendMode ?? 0x18,
-            `${name}.blendMode`
+            `${name}.blendMode`,
+            0x00ffffff
           ),
           alphaTest: gxFramePacketInteger(
             pipeline.alphaTest ?? 0x003f0000,
-            `${name}.alphaTest`
+            `${name}.alphaTest`,
+            0x00ffffff
           ),
           scissorX: gxFramePacketInteger(pipeline.scissorX ?? 0, `${name}.scissorX`),
           scissorY: gxFramePacketInteger(pipeline.scissorY ?? 0, `${name}.scissorY`),
@@ -1790,6 +1815,42 @@ const TEMPLATE: &str = r##"<!doctype html>
             pipeline.scissorHeight ?? 528,
             `${name}.scissorHeight`
           ),
+          pixelControl: gxFramePacketInteger(
+            pipeline.pixelControl ?? 0,
+            `${name}.pixelControl`,
+            0x00ffffff
+          ),
+          constantAlpha: gxFramePacketInteger(
+            pipeline.constantAlpha ?? 0,
+            `${name}.constantAlpha`,
+            0x00ffffff
+          ),
+          zTextureBias: gxFramePacketInteger(
+            pipeline.zTextureBias ?? 0,
+            `${name}.zTextureBias`,
+            0x00ffffff
+          ),
+          zTextureMode: gxFramePacketInteger(
+            pipeline.zTextureMode ?? 0,
+            `${name}.zTextureMode`,
+            0x00ffffff
+          ),
+          fogRangeBase,
+          fogRangeK: Array.from({ length: 5 }, (_unused, index) =>
+            gxFramePacketInteger(
+              pipeline.fogRangeK?.[index] ?? 0,
+              `${name}.fogRangeK[${index}]`,
+              0x00ffffff
+            )
+          ),
+          fogWords: Array.from({ length: 5 }, (_unused, index) =>
+            gxFramePacketInteger(
+              pipeline.fogWords?.[index] ?? 0,
+              `${name}.fogWords[${index}]`,
+              0x00ffffff
+            )
+          ),
+          viewportHalfWidthBits,
         });
       }
 
@@ -1801,7 +1862,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       const textureCount = gxFramePacketInteger(textures.length, "textureCount");
-      const drawTableBytes = gxFramePacketMultiply(drawCount, 128, "drawTableBytes");
+      const drawTableBytes = gxFramePacketMultiply(drawCount, 176, "drawTableBytes");
       const textureTableBytes = gxFramePacketMultiply(
         textureCount,
         64,
@@ -1934,7 +1995,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const bytes = new Uint8Array(packet);
       const header = new DataView(packet);
       bytes.set([0x4c, 0x5a, 0x47, 0x58], 0x00);
-      header.setUint16(0x04, 2, true);
+      header.setUint16(0x04, 3, true);
       header.setUint16(0x06, 160, true);
       header.setUint32(0x08, packetBytes, true);
       header.setUint32(0x0c, 0, true);
@@ -1964,7 +2025,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       header.setUint32(0x6c, generation, true);
       header.setUint32(0x70, frame.clear ? 1 : 0, true);
       bytes.set(rgba, 0x74);
-      header.setUint16(0x78, 128, true);
+      header.setUint16(0x78, 176, true);
       header.setUint16(0x7a, 64, true);
       header.setUint32(0x7c, totalVertexCount, true);
       header.setUint32(0x80, terminalZMode, true);
@@ -1978,7 +2039,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
         const draw = normalizedDraws[drawIndex];
-        const recordOffset = drawTableOffset + drawIndex * 128;
+        const recordOffset = drawTableOffset + drawIndex * 176;
         bytes[recordOffset] = draw.topology;
         bytes[recordOffset + 1] = draw.cullMode;
         header.setUint16(recordOffset + 0x02, 0, true);
@@ -1992,12 +2053,35 @@ const TEMPLATE: &str = r##"<!doctype html>
         header.setUint32(recordOffset + 0x20, draw.scissorY, true);
         header.setUint32(recordOffset + 0x24, draw.scissorWidth, true);
         header.setUint32(recordOffset + 0x28, draw.scissorHeight, true);
+        header.setUint32(recordOffset + 0x2c, 0, true);
         for (let slot = 0; slot < 8; slot += 1) {
           const reference = draw.textureReferences[slot];
           const referenceOffset = recordOffset + 0x30 + slot * 8;
           header.setUint32(referenceOffset, reference.index, true);
           header.setUint32(referenceOffset + 4, reference.sampler, true);
         }
+        header.setUint32(recordOffset + 0x70, draw.pixelControl, true);
+        header.setUint32(recordOffset + 0x74, draw.constantAlpha, true);
+        header.setUint32(recordOffset + 0x78, draw.zTextureBias, true);
+        header.setUint32(recordOffset + 0x7c, draw.zTextureMode, true);
+        header.setUint32(recordOffset + 0x80, draw.fogRangeBase, true);
+        for (let index = 0; index < 5; index += 1) {
+          header.setUint32(
+            recordOffset + 0x84 + index * 4,
+            draw.fogRangeK[index],
+            true
+          );
+          header.setUint32(
+            recordOffset + 0x98 + index * 4,
+            draw.fogWords[index],
+            true
+          );
+        }
+        header.setUint32(
+          recordOffset + 0xac,
+          draw.viewportHalfWidthBits,
+          true
+        );
         bytes.set(draw.tevState, tevOffset + drawIndex * 464);
         const drawVertexOffset = vertexOffset + draw.vertexRelativeOffset;
         for (let component = 0; component < draw.vertexValues.length; component += 1) {
