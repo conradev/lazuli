@@ -1,6 +1,8 @@
 import {
   RASTER_ALWAYS_PASS,
+  RASTER_ALWAYS_UPDATE,
   RASTER_BLEND_REPLACE,
+  RASTER_EQUAL_NO_UPDATE,
   buildRasterCenterOraclePacket,
   rasterCenterOracleXfb,
 } from "./browser_boot_raster_center_oracle.mjs";
@@ -27,12 +29,28 @@ const FORCED_NATIVE_COMPONENT_OFFSET =
   VERTEX_OFFSET +
   FORCED_NATIVE_VERTEX * VERTEX_BYTES +
   FORCED_NATIVE_COMPONENT * 4;
+const EXACT_DEPTH_DRAW_COUNT = 2;
+const EXACT_DEPTH_VERTEX_COUNT = 6;
+const EXACT_DEPTH_VERTEX_OFFSET =
+  HEADER_BYTES +
+  EXACT_DEPTH_DRAW_COUNT * DRAW_BYTES +
+  EXACT_DEPTH_DRAW_COUNT * TEV_BYTES;
+const EXACT_DEPTH_BASE_PACKET_BYTES =
+  EXACT_DEPTH_VERTEX_OFFSET +
+  EXACT_DEPTH_VERTEX_COUNT * VERTEX_BYTES;
+const EXACT_DEPTH_CHUNK_BYTES = 48 + 3 * 4 * 4;
+const EXACT_DEPTH_PACKET_BYTES =
+  EXACT_DEPTH_BASE_PACKET_BYTES + EXACT_DEPTH_CHUNK_BYTES;
+const DRAW_FLAG_EXACT_CLIP_INPUT = 2;
+const DEPTH24_MAX = 0x00ffffff;
 
 export const MANAGED_COVERAGE_HASH_GENERATION = 31;
 export const MANAGED_COVERAGE_PACKET_FNV1A64 = "0xd6be3c7263790a3e";
 export const FORCED_NATIVE_PACKET_FNV1A64 = "0x3d4b519d11ddeb83";
+export const EXACT_DEPTH_PACKET_FNV1A64 = "0x4ac18aae992de512";
 export const MANAGED_COVERAGE_RGBA_FNV1A64 = "0x84cc4da0e20ecde5";
 export const FORCED_NATIVE_RGBA_FNV1A64 = "0x3e1fea1e71205fa5";
+export const EXACT_DEPTH_RGBA_FNV1A64 = "0x02d9b3fe282e87bc";
 
 export const managedCoveragePacketLayout = Object.freeze({
   headerBytes: HEADER_BYTES,
@@ -61,6 +79,34 @@ export const managedCoveragePacketLayout = Object.freeze({
 export const managedCoverageEvidenceTail = Object.freeze({
   drawFlag: DRAW_FLAG_POST_CULL_EVIDENCE,
   keep021Twice: KEEP_021_TWICE,
+});
+
+export const exactDepthPacketLayout = Object.freeze({
+  drawCount: EXACT_DEPTH_DRAW_COUNT,
+  vertexCount: EXACT_DEPTH_VERTEX_COUNT,
+  vertexOffset: EXACT_DEPTH_VERTEX_OFFSET,
+  basePacketBytes: EXACT_DEPTH_BASE_PACKET_BYTES,
+  exactChunkOffset: EXACT_DEPTH_BASE_PACKET_BYTES,
+  exactChunkBytes: EXACT_DEPTH_CHUNK_BYTES,
+  packetBytes: EXACT_DEPTH_PACKET_BYTES,
+  exactDrawOffset: DRAW_OFFSET,
+  equalDrawOffset: DRAW_OFFSET + DRAW_BYTES,
+  drawFlag: DRAW_FLAG_EXACT_CLIP_INPUT,
+});
+
+export const exactDepthPlane = Object.freeze({
+  sourcePositions: Object.freeze([
+    Object.freeze([0.5, 0.5]),
+    Object.freeze([4, 0.5]),
+    Object.freeze([0.5, 4]),
+  ]),
+  sourceDepths: Object.freeze([94.25, 136.25, 94.25]),
+  projectedDepths: Object.freeze([94, 136, 94]),
+  equalDepth: 95,
+  sampleNumerator: 7,
+  sampleDenominator: 12,
+  expectedSampleDepth: 95,
+  viewport: Object.freeze([320, -264, DEPTH24_MAX, 662, 606, DEPTH24_MAX]),
 });
 
 export const managedCoverageExactGeometry = Object.freeze({
@@ -122,6 +168,12 @@ function expectedSurface(leftColumnCovered) {
 
 const managedExpectedRgba = Object.freeze(expectedSurface(true));
 const forcedNativeExpectedRgba = Object.freeze(expectedSurface(false));
+const exactDepthExpectedRgba = Object.freeze(
+  Array.from(
+    { length: rasterCenterOracleXfb.width * rasterCenterOracleXfb.height },
+    (_, index) => (index === 0 ? white : black),
+  ).flat(),
+);
 
 export const managedCoverageOracleCases = Object.freeze([
   Object.freeze({
@@ -131,6 +183,7 @@ export const managedCoverageOracleCases = Object.freeze([
     expectedMask: 0xffff,
     expectedRgba: managedExpectedRgba,
     expectedRgbaFnv1a64: MANAGED_COVERAGE_RGBA_FNV1A64,
+    expectedManagedCoverage: Object.freeze({ draws: 1, triangles: 2 }),
   }),
   Object.freeze({
     id: "forced-native",
@@ -139,6 +192,16 @@ export const managedCoverageOracleCases = Object.freeze([
     expectedMask: 0xeeee,
     expectedRgba: forcedNativeExpectedRgba,
     expectedRgbaFnv1a64: FORCED_NATIVE_RGBA_FNV1A64,
+    expectedManagedCoverage: Object.freeze({ draws: 0, triangles: 0 }),
+  }),
+  Object.freeze({
+    id: "exact-depth",
+    name: "v5 exact varying depth reconstructs Z95 at GX 7/12",
+    forceNative: false,
+    expectedMask: 0x0001,
+    expectedRgba: exactDepthExpectedRgba,
+    expectedRgbaFnv1a64: EXACT_DEPTH_RGBA_FNV1A64,
+    expectedManagedCoverage: Object.freeze({ draws: 1, triangles: 1 }),
   }),
 ]);
 
@@ -170,12 +233,100 @@ function managedCoverageDraw() {
   };
 }
 
+function exactDepthDraws() {
+  const source = exactDepthPlane.sourcePositions;
+  return [
+    {
+      topology: 2,
+      vertices: source.map(([x, y], index) => ({
+        x,
+        y,
+        depth24: exactDepthPlane.sourceDepths[index],
+        rgba: [0, 0, 0, 1],
+      })),
+      zMode: RASTER_ALWAYS_UPDATE,
+      blendMode: RASTER_BLEND_REPLACE,
+      alphaTest: RASTER_ALWAYS_PASS,
+      pixelControl: 0,
+      scissor: { x: 0, y: 0, width: 4, height: 4 },
+    },
+    {
+      topology: 2,
+      vertices: source.map(([x, y]) => ({
+        x,
+        y,
+        depth24: exactDepthPlane.equalDepth,
+        rgba: [1, 1, 1, 1],
+      })),
+      zMode: RASTER_EQUAL_NO_UPDATE,
+      blendMode: RASTER_BLEND_REPLACE,
+      alphaTest: RASTER_ALWAYS_PASS,
+      pixelControl: 0,
+      scissor: { x: 0, y: 0, width: 1, height: 1 },
+    },
+  ];
+}
+
+function exactDepthClipPositions() {
+  return exactDepthPlane.sourcePositions.flatMap(([x, y], index) => [
+    Math.fround(Math.fround(x) / 320 - 1),
+    Math.fround(1 - Math.fround(y) / 264),
+    Math.fround(
+      (Math.fround(exactDepthPlane.sourceDepths[index]) - DEPTH24_MAX) /
+        DEPTH24_MAX,
+    ),
+    1,
+  ]);
+}
+
+function buildExactDepthOraclePacket(generation) {
+  const base = buildRasterCenterOraclePacket(exactDepthDraws(), generation);
+  if (base.length !== EXACT_DEPTH_BASE_PACKET_BYTES) {
+    throw new Error(
+      `exact depth base packet is ${base.length}, expected ${EXACT_DEPTH_BASE_PACKET_BYTES}`,
+    );
+  }
+  const packet = new Uint8Array(EXACT_DEPTH_PACKET_BYTES);
+  packet.set(base);
+  const view = new DataView(packet.buffer);
+  view.setUint16(0x04, 5, true);
+  view.setUint32(0x08, packet.length, true);
+  view.setUint16(
+    exactDepthPacketLayout.exactDrawOffset + 0x02,
+    DRAW_FLAG_EXACT_CLIP_INPUT,
+    true,
+  );
+  view.setFloat32(
+    exactDepthPacketLayout.exactDrawOffset + 0xac,
+    exactDepthPlane.viewport[0],
+    true,
+  );
+
+  const exact = exactDepthPacketLayout.exactChunkOffset;
+  view.setUint32(exact + 0x00, 1, true);
+  view.setUint32(exact + 0x04, 0, true);
+  view.setUint32(exact + 0x08, (342 << 12) | 342, true);
+  view.setUint32(exact + 0x0c, ((342 + 3) << 12) | (342 + 3), true);
+  view.setUint32(exact + 0x10, 171 | (171 << 10), true);
+  view.setUint32(exact + 0x14, 0, true);
+  exactDepthPlane.viewport.forEach((value, index) => {
+    view.setFloat32(exact + 0x18 + index * 4, value, true);
+  });
+  exactDepthClipPositions().forEach((value, index) => {
+    view.setFloat32(exact + 0x30 + index * 4, value, true);
+  });
+  return packet;
+}
+
 export function buildManagedCoverageOraclePacket(
   variant = "managed",
   generation = MANAGED_COVERAGE_HASH_GENERATION,
 ) {
   if (!managedCoverageOracleCases.some((entry) => entry.id === variant)) {
     throw new RangeError(`unknown managed coverage oracle variant ${variant}`);
+  }
+  if (variant === "exact-depth") {
+    return buildExactDepthOraclePacket(generation);
   }
   const packet = buildRasterCenterOraclePacket(
     [managedCoverageDraw()],

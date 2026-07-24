@@ -10,14 +10,14 @@ const browserOracle = readFileSync(
   "utf8",
 );
 
-test("in-app browser oracle runs v4 managed and raw-fallback coverage twice through strict WebGPU", () => {
+test("in-app browser oracle runs v4/v5 exact coverage and raw control twice through strict WebGPU", () => {
   assert.match(
     browserOracle,
     /from "\.\.\/target\/gekko-web\/browser_renderer\.js"/,
   );
   assert.match(
     browserOracle,
-    /from "\.\/browser_boot_managed_coverage_oracle\.mjs\?v=depth-flatness-control"/,
+    /from "\.\/browser_boot_managed_coverage_oracle\.mjs\?v=exact-depth-v5-metrics"/,
   );
   assert.match(browserOracle, /await WebGpuRenderer\.create\(canvas\)/);
   assert.match(browserOracle, /const RUN_COUNT = 2/);
@@ -57,11 +57,30 @@ test("in-app browser oracle runs v4 managed and raw-fallback coverage twice thro
   assert.match(browserOracle, /renderer\.check_health\(\)/);
   assert.match(
     browserOracle,
-    /byteExact && dimensionsExact && deterministic/,
+    /byteExact &&\s+dimensionsExact &&\s+deterministic &&\s+managedCoverageExact/,
   );
   assert.match(browserOracle, /const diagnostics = renderer\.diagnostics\(\)/);
-  assert.match(browserOracle, /diagnostics\.managedCoverageDraws === 2/);
-  assert.match(browserOracle, /diagnostics\.managedCoverageTriangles === 4/);
+  assert.match(browserOracle, /const diagnosticsBefore = renderer\.diagnostics\(\)/);
+  assert.match(browserOracle, /const diagnosticsAfter = renderer\.diagnostics\(\)/);
+  assert.match(
+    browserOracle,
+    /diagnosticsAfter\.managedCoverageDraws -\s+diagnosticsBefore\.managedCoverageDraws/,
+  );
+  assert.match(
+    browserOracle,
+    /diagnosticsAfter\.managedCoverageTriangles -\s+diagnosticsBefore\.managedCoverageTriangles/,
+  );
+  assert.match(
+    browserOracle,
+    /managedCoverageDelta\.draws ===\s+entry\.expectedManagedCoverage\.draws/,
+  );
+  assert.match(
+    browserOracle,
+    /managedCoverageDelta\.triangles ===\s+entry\.expectedManagedCoverage\.triangles/,
+  );
+  assert.match(browserOracle, /managedCoverageExact,/);
+  assert.match(browserOracle, /diagnostics\.managedCoverageDraws === 4/);
+  assert.match(browserOracle, /diagnostics\.managedCoverageTriangles === 6/);
   assert.match(
     browserOracle,
     /runs\.every\(entry => entry\.pass\) &&\s+managedCoverageCountersExact/,

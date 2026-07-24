@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width">
-  <title>Lazuli managed GX coverage v4 WebGPU oracle</title>
+  <title>Lazuli managed GX coverage v4/v5 WebGPU oracle</title>
   <style>
     :root {
       color-scheme: dark;
@@ -26,7 +26,7 @@
   </style>
 </head>
 <body data-status="running">
-  <h1>Lazuli managed GX coverage v4 WebGPU oracle</h1>
+  <h1>Lazuli managed GX coverage v4/v5 WebGPU oracle</h1>
   <canvas id="oracle" width="4" height="4"></canvas>
   <pre id="result">running</pre>
   <script type="module">
@@ -39,7 +39,7 @@
       managedCoverageMask,
       managedCoverageOracleCases,
       managedCoverageOracleXfb,
-    } from "./browser_boot_managed_coverage_oracle.mjs?v=depth-flatness-control";
+    } from "./browser_boot_managed_coverage_oracle.mjs?v=exact-depth-v5-metrics";
 
     const RUN_COUNT = 2;
 
@@ -69,6 +69,7 @@
             const generation =
               runIndex * managedCoverageOracleCases.length + caseIndex + 1;
             renderer.reset();
+            const diagnosticsBefore = renderer.diagnostics();
             renderer.submit_gx_frame(
               buildManagedCoverageOraclePacket(entry.id, generation),
             );
@@ -100,6 +101,20 @@
               referenceBytes.set(entry.id, actualRgba);
             }
             renderer.check_health();
+            const diagnosticsAfter = renderer.diagnostics();
+            const managedCoverageDelta = {
+              draws:
+                diagnosticsAfter.managedCoverageDraws -
+                diagnosticsBefore.managedCoverageDraws,
+              triangles:
+                diagnosticsAfter.managedCoverageTriangles -
+                diagnosticsBefore.managedCoverageTriangles,
+            };
+            const managedCoverageExact =
+              managedCoverageDelta.draws ===
+                entry.expectedManagedCoverage.draws &&
+              managedCoverageDelta.triangles ===
+                entry.expectedManagedCoverage.triangles;
             cases.push({
               id: entry.id,
               name: entry.name,
@@ -112,7 +127,14 @@
               byteExact,
               dimensionsExact,
               deterministic,
-              pass: byteExact && dimensionsExact && deterministic,
+              expectedManagedCoverage: entry.expectedManagedCoverage,
+              managedCoverageDelta,
+              managedCoverageExact,
+              pass:
+                byteExact &&
+                dimensionsExact &&
+                deterministic &&
+                managedCoverageExact,
               width: readback.width,
               height: readback.height,
               presentation,
@@ -127,8 +149,8 @@
         renderer.check_health();
         const diagnostics = renderer.diagnostics();
         const managedCoverageCountersExact =
-          diagnostics.managedCoverageDraws === 2 &&
-          diagnostics.managedCoverageTriangles === 4;
+          diagnostics.managedCoverageDraws === 4 &&
+          diagnostics.managedCoverageTriangles === 6;
         const result = {
           pass:
             runs.every(entry => entry.pass) &&

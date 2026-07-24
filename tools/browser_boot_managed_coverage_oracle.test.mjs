@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  EXACT_DEPTH_PACKET_FNV1A64,
+  EXACT_DEPTH_RGBA_FNV1A64,
   FORCED_NATIVE_PACKET_FNV1A64,
   FORCED_NATIVE_RGBA_FNV1A64,
   MANAGED_COVERAGE_HASH_GENERATION,
   MANAGED_COVERAGE_PACKET_FNV1A64,
   MANAGED_COVERAGE_RGBA_FNV1A64,
   buildManagedCoverageOraclePacket,
+  exactDepthPacketLayout,
+  exactDepthPlane,
   fnv1a64Hex,
   managedCoverageEvidenceTail,
   managedCoverageExactGeometry,
@@ -251,6 +255,133 @@ test("fragment gates ignore evidence and retain raw native fallback for varying 
   );
 });
 
+test("exact-depth oracle pins the canonical LZGX v5 clip-input packet", () => {
+  const packet = buildManagedCoverageOraclePacket(
+    "exact-depth",
+    MANAGED_COVERAGE_HASH_GENERATION,
+  );
+  const draw0 = exactDepthPacketLayout.exactDrawOffset;
+  const draw1 = exactDepthPacketLayout.equalDrawOffset;
+  const exact = exactDepthPacketLayout.exactChunkOffset;
+
+  assert.deepEqual(
+    packet,
+    buildManagedCoverageOraclePacket(
+      "exact-depth",
+      MANAGED_COVERAGE_HASH_GENERATION,
+    ),
+  );
+  assert.equal(packet.length, exactDepthPacketLayout.packetBytes);
+  assert.deepEqual([...packet.slice(0, 4)], [...Buffer.from("LZGX")]);
+  assert.equal(u16(packet, 0x04), 5);
+  assert.equal(u16(packet, 0x06), 160);
+  assert.equal(u32(packet, 0x08), 2400);
+  assert.equal(u32(packet, 0x14), exactDepthPacketLayout.drawCount);
+  assert.equal(u32(packet, 0x1c), 160);
+  assert.equal(u32(packet, 0x20), 512);
+  assert.equal(u32(packet, 0x24), 512);
+  assert.equal(u32(packet, 0x28), exactDepthPacketLayout.vertexOffset);
+  assert.equal(u32(packet, 0x2c), exactDepthPacketLayout.basePacketBytes);
+  assert.equal(u32(packet, 0x30), exactDepthPacketLayout.basePacketBytes);
+  assert.equal(u32(packet, 0x34), 352);
+  assert.equal(u32(packet, 0x3c), 928);
+  assert.equal(u32(packet, 0x40), 864);
+  assert.equal(u32(packet, 0x7c), exactDepthPacketLayout.vertexCount);
+
+  assert.equal(packet[draw0], 2);
+  assert.equal(packet[draw0 + 1], 0);
+  assert.equal(u16(packet, draw0 + 0x02), exactDepthPacketLayout.drawFlag);
+  assert.equal(u32(packet, draw0 + 0x04), 3);
+  assert.equal(u32(packet, draw0 + 0x08), 0);
+  assert.equal(u32(packet, draw0 + 0x0c), 0);
+  assert.equal(u32(packet, draw0 + 0x10), 31);
+  assert.deepEqual(
+    [0x1c, 0x20, 0x24, 0x28].map((offset) => u32(packet, draw0 + offset)),
+    [0, 0, 4, 4],
+  );
+  assert.equal(f32(packet, draw0 + 0xac), exactDepthPlane.viewport[0]);
+
+  assert.equal(packet[draw1], 2);
+  assert.equal(packet[draw1 + 1], 0);
+  assert.equal(u16(packet, draw1 + 0x02), 0);
+  assert.equal(u32(packet, draw1 + 0x04), 3);
+  assert.equal(u32(packet, draw1 + 0x08), 432);
+  assert.equal(u32(packet, draw1 + 0x0c), 464);
+  assert.equal(u32(packet, draw1 + 0x10), 5);
+  assert.deepEqual(
+    [0x1c, 0x20, 0x24, 0x28].map((offset) => u32(packet, draw1 + offset)),
+    [0, 0, 1, 1],
+  );
+
+  assert.equal(u32(packet, exact + 0x00), 1);
+  assert.equal(u32(packet, exact + 0x04), 0);
+  assert.equal(u32(packet, exact + 0x08), (342 << 12) | 342);
+  assert.equal(
+    u32(packet, exact + 0x0c),
+    ((342 + 3) << 12) | (342 + 3),
+  );
+  assert.equal(u32(packet, exact + 0x10), 171 | (171 << 10));
+  assert.equal(u32(packet, exact + 0x14), 0);
+  assert.deepEqual(
+    Array.from(
+      { length: 6 },
+      (_unused, index) => f32(packet, exact + 0x18 + index * 4),
+    ),
+    exactDepthPlane.viewport,
+  );
+
+  const expectedClip = exactDepthPlane.sourcePositions.flatMap(
+    ([x, y], index) => [
+      Math.fround(Math.fround(x) / 320 - 1),
+      Math.fround(1 - Math.fround(y) / 264),
+      Math.fround(
+        (Math.fround(exactDepthPlane.sourceDepths[index]) - 0x00ffffff) /
+          0x00ffffff,
+      ),
+      1,
+    ],
+  );
+  assert.deepEqual(
+    Array.from(
+      { length: 12 },
+      (_unused, index) => f32(packet, exact + 0x30 + index * 4),
+    ),
+    expectedClip,
+  );
+  assert.deepEqual(
+    Array.from({ length: 6 }, (_unused, index) =>
+      f32(
+        packet,
+        exactDepthPacketLayout.vertexOffset +
+          index * managedCoveragePacketLayout.vertexBytes +
+          2 * 4,
+      ),
+    ),
+    [
+      ...exactDepthPlane.sourceDepths,
+      exactDepthPlane.equalDepth,
+      exactDepthPlane.equalDepth,
+      exactDepthPlane.equalDepth,
+    ],
+  );
+  const projectedDepths = expectedClip
+    .filter((_unused, index) => index % 4 === 2)
+    .map((clipZ) =>
+      Math.fround(
+        Math.fround(
+          Math.fround(clipZ * Math.fround(1 / 1)) *
+            exactDepthPlane.viewport[2],
+        ) + exactDepthPlane.viewport[5],
+      ),
+    );
+  assert.deepEqual(projectedDepths, exactDepthPlane.projectedDepths);
+  assert.equal(
+    exactDepthPacketLayout.exactChunkBytes,
+    packet.length - exactDepthPacketLayout.exactChunkOffset,
+  );
+  assert.equal(fnv1a64Hex(packet), EXACT_DEPTH_PACKET_FNV1A64);
+});
+
 test("same-snap bracket isolates exact GX coverage from native correction", () => {
   for (const entry of managedCoverageSnapBucket) {
     assert.equal(f32Bits(entry.sourceX), entry.sourceF32Bits);
@@ -288,15 +419,31 @@ test("same-snap bracket isolates exact GX coverage from native correction", () =
   );
 });
 
-test("managed and retained-native paths have exact 4x4 RGBA oracles", () => {
+test("managed, retained-native, and exact-depth paths have exact 4x4 RGBA oracles", () => {
   assert.deepEqual(
-    managedCoverageOracleCases.map(({ id, expectedMask }) => ({
-      id,
-      expectedMask,
-    })),
+    managedCoverageOracleCases.map(
+      ({ id, expectedMask, expectedManagedCoverage }) => ({
+        id,
+        expectedMask,
+        expectedManagedCoverage,
+      }),
+    ),
     [
-      { id: "managed", expectedMask: 0xffff },
-      { id: "forced-native", expectedMask: 0xeeee },
+      {
+        id: "managed",
+        expectedMask: 0xffff,
+        expectedManagedCoverage: { draws: 1, triangles: 2 },
+      },
+      {
+        id: "forced-native",
+        expectedMask: 0xeeee,
+        expectedManagedCoverage: { draws: 0, triangles: 0 },
+      },
+      {
+        id: "exact-depth",
+        expectedMask: 0x0001,
+        expectedManagedCoverage: { draws: 1, triangles: 1 },
+      },
     ],
   );
   assert.deepEqual(managedCoverageOracleXfb, {
@@ -338,5 +485,24 @@ test("managed and retained-native paths have exact 4x4 RGBA oracles", () => {
     forcedNative.expectedRgbaFnv1a64,
     FORCED_NATIVE_RGBA_FNV1A64,
   );
+  const exactDepth = managedCoverageOracleCases[2];
+  assert.deepEqual(exactDepth.expectedRgba.slice(0, 4), [255, 255, 255, 255]);
+  assert.deepEqual(
+    exactDepth.expectedRgba.slice(4),
+    Array.from({ length: 15 }, () => [0, 0, 0, 255]).flat(),
+  );
+  assert.equal(exactDepth.expectedRgbaFnv1a64, EXACT_DEPTH_RGBA_FNV1A64);
+  assert.equal(
+    exactDepthPlane.expectedSampleDepth,
+    exactDepthPlane.projectedDepths[0] +
+      (exactDepthPlane.projectedDepths[1] -
+        exactDepthPlane.projectedDepths[0]) *
+        ((exactDepthPlane.sampleNumerator / exactDepthPlane.sampleDenominator -
+          exactDepthPlane.sourcePositions[0][0]) /
+          (exactDepthPlane.sourcePositions[1][0] -
+            exactDepthPlane.sourcePositions[0][0])),
+  );
+  assert.equal(Math.trunc(exactDepthPlane.expectedSampleDepth), 95);
+  assert.equal(Math.trunc(exactDepthPlane.sourceDepths[0]), 94);
   assert.throws(() => managedCoverageMask(new Uint8Array(4)), /4x4 RGBA/);
 });
