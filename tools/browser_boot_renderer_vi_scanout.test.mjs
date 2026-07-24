@@ -12,7 +12,7 @@ const source = readFileSync(
 function presentShader() {
   const start = source.indexOf('const PRESENT_SHADER: &str = "');
   assert.notEqual(start, -1, "missing WebGPU XFB presentation shader");
-  const end = source.indexOf('\n";\n\nconst XFB_COPY_SHADER', start);
+  const end = source.indexOf('\n";', start);
   assert.notEqual(end, -1, "unterminated WebGPU XFB presentation shader");
   return source.slice(start, end);
 }

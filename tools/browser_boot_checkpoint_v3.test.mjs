@@ -141,9 +141,29 @@ test("host diagnostics stay out while verified gameplay and temporal evidence af
   report.runtime = "Another Browser/9.0";
   report.headlessCapture.url = "http://localhost:9999/host-only";
   report.rendering.metrics.webgpu.adapterLabel = "host-only";
+  report.execution.hostTiming = {
+    execution: {
+      eligibleCalls: 50_000, sampleStride: 1024, samples: 49, totalMs: 1_234, maxMs: 42,
+    },
+  };
+  report.rendering.metrics.wall = {
+    workerStartToLastReportMs: 99_999,
+    phases: {
+      operationTotal: {
+        eligibleCalls: 400, sampleStride: 64, samples: 7, totalMs: 500, maxMs: 90,
+      },
+      topologyExpansion: {
+        eligibleCalls: 3_000_000, sampleStride: 1024, samples: 2_930, totalMs: 250, maxMs: 1,
+      },
+    },
+  };
   report.scenario.steps[0].readyState.hostDiagnostic = 123;
   report.rendering.temporalSelectedXfb.frames[0].hostTimestamp = 456;
   report.rendering.temporalSelectedXfb.frames[0].selectedXfb.gpuLabel = "host-only";
+  assert.equal(createSmbReadyCheckpointCandidate(report).sha256, digest);
+  report.execution.hostTiming.execution.totalMs = 999_999;
+  report.rendering.metrics.wall.phases.operationTotal.totalMs = 999_999;
+  report.rendering.metrics.wall.phases.topologyExpansion.samples = 1;
   assert.equal(createSmbReadyCheckpointCandidate(report).sha256, digest);
 
   const gameplayChanged = smbReadyPlayCheckpointReport();

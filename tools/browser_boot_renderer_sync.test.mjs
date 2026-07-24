@@ -36,6 +36,7 @@ function workerHarness({ transferMessages = false } = {}) {
   const context = {
     Number,
     Math,
+    performance: { now: () => 0 },
     rendererBackpressureResume: null,
     rendererBackpressureWaits: 0,
     rendererFailure: null,
@@ -67,6 +68,10 @@ function workerHarness({ transferMessages = false } = {}) {
   vm.createContext(context);
   vm.runInContext(
     [
+      "newWorkerPhaseTiming",
+      "newWorkerHostTimings",
+      "beginWorkerPhaseTiming",
+      "recordWorkerPhaseTiming",
       "postRendererFrame",
       "postGxFrame",
       "recordRendererFailure",
@@ -79,6 +84,7 @@ function workerHarness({ transferMessages = false } = {}) {
     context,
     { filename: "browser_boot.renderer-sync.worker.js" },
   );
+  context.workerHostTimings = context.newWorkerHostTimings();
   return { context, messages, reports, transfers };
 }
 

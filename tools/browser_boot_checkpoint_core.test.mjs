@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  BROWSER_BOOT_CHECKPOINT_SCHEMA,
+  BROWSER_BOOT_CHECKPOINT_SCHEMA_V1,
   CheckpointValidationError,
   canonicalStringify,
   checkpointSha256,
@@ -47,22 +49,51 @@ test("projection reacts to guest, device, VI, and selected-XFB visual state", ()
   }
 });
 
-test("host renderer metrics do not enter the deterministic checkpoint digest", () => {
+test("host timing metrics do not enter deterministic v1 or v2 checkpoint bytes", () => {
   const report = checkpointReport();
-  const digest = createCheckpointCandidate(report).sha256;
+  const schemas = [BROWSER_BOOT_CHECKPOINT_SCHEMA_V1, BROWSER_BOOT_CHECKPOINT_SCHEMA];
+  const baseline = schemas.map(schema => createCheckpointCandidate(report, undefined, schema));
+  const assertStable = () => {
+    for (const [index, schema] of schemas.entries()) {
+      const candidate = createCheckpointCandidate(report, undefined, schema);
+      assert.equal(candidate.sha256, baseline[index].sha256, schema);
+      assert.equal(canonicalStringify(candidate), canonicalStringify(baseline[index]), schema);
+    }
+  };
+  report.execution.hostTiming = {
+    execution: {
+      eligibleCalls: 20_000, sampleStride: 1024, samples: 20, totalMs: 45.5, maxMs: 3,
+    },
+    fifoDecode: {
+      eligibleCalls: 10_000, sampleStride: 1024, samples: 10, totalMs: 12, maxMs: 2,
+    },
+  };
   report.rendering.metrics = {
     operations: { enqueued: 328, highWater: 1, pending: 0 },
     queue: { drains: 328, submits: 471 },
     resources: { bindGroups: 15_000, buffers: 15_000, renderPipelines: 9, textures: 147 },
     scope: "current-worker",
-    wall: { workerStartToLastReportMs: 12_345.67 },
+    wall: {
+      workerStartToLastReportMs: 12_345.67,
+      phases: {
+        operationQueueWait: {
+          eligibleCalls: 320, sampleStride: 64, samples: 5, totalMs: 15, maxMs: 8,
+        },
+        gxFrameExecution: {
+          eligibleCalls: 328, sampleStride: 1, samples: 328, totalMs: 2_000, maxMs: 30,
+        },
+      },
+    },
     wasmBridge: { calls: 16_535, typedArrayBytes: 9_244_800 },
   };
 
-  assert.equal(createCheckpointCandidate(report).sha256, digest);
+  assertStable();
   report.rendering.metrics.queue.drains = 1;
   report.rendering.metrics.wall.workerStartToLastReportMs = 999_999;
-  assert.equal(createCheckpointCandidate(report).sha256, digest);
+  report.execution.hostTiming.execution.totalMs = 999_999;
+  report.rendering.metrics.wall.phases.operationQueueWait.maxMs = 999_999;
+  report.rendering.metrics.wall.phases.gxFrameExecution.samples = 1;
+  assertStable();
 });
 
 test("checkpoint hard gates fail at the actionable report path", () => {

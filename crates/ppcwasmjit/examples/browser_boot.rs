@@ -936,6 +936,54 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererFrameResultMisses = 0;
     let rendererFailure = null;
     let rendererResidentTextureKeys = new Set();
+    const workerExecutionTimingSampleStride = 1024;
+    let workerExecutionTimingEligibleCalls = 0;
+    function newWorkerPhaseTiming(sampleStride) {
+      return { eligibleCalls: 0, sampleStride, samples: 0, totalMs: 0, maxMs: 0 };
+    }
+    function newWorkerHostTimings() {
+      return {
+        execution: newWorkerPhaseTiming(1024),
+        fifoStagingDrainInclusive: newWorkerPhaseTiming(256),
+        fifoDecode: newWorkerPhaseTiming(1024),
+        gxPacketPacking: newWorkerPhaseTiming(64),
+        rendererBackpressure: newWorkerPhaseTiming(1),
+      };
+    }
+    function beginWorkerPhaseTiming(timing) {
+      const eligibleCall = timing.eligibleCalls;
+      timing.eligibleCalls += 1;
+      return eligibleCall % timing.sampleStride === 0 ? performance.now() : null;
+    }
+    function beginWorkerExecutionTiming() {
+      const eligibleCall = workerExecutionTimingEligibleCalls;
+      workerExecutionTimingEligibleCalls += 1;
+      return (eligibleCall & (workerExecutionTimingSampleStride - 1)) === 0
+        ? performance.now()
+        : null;
+    }
+    function recordWorkerPhaseTiming(timing, startedAt, endedAt) {
+      if (startedAt === null) return;
+      const stoppedAt = endedAt === undefined ? performance.now() : endedAt;
+      const durationMs = stoppedAt - startedAt;
+      if (!Number.isFinite(durationMs) || durationMs < 0) return;
+      timing.samples += 1;
+      timing.totalMs = Math.min(Number.MAX_VALUE, timing.totalMs + durationMs);
+      timing.maxMs = Math.max(timing.maxMs, durationMs);
+    }
+    function snapshotWorkerHostTimings(
+      timings = workerHostTimings,
+      executionEligibleCalls = workerExecutionTimingEligibleCalls
+    ) {
+      return {
+        execution: { ...timings.execution, eligibleCalls: executionEligibleCalls },
+        fifoStagingDrainInclusive: { ...timings.fifoStagingDrainInclusive },
+        fifoDecode: { ...timings.fifoDecode },
+        gxPacketPacking: { ...timings.gxPacketPacking },
+        rendererBackpressure: { ...timings.rendererBackpressure },
+      };
+    }
+    const workerHostTimings = newWorkerHostTimings();
     const smbTemporalXfbCaptureCapacity = 8;
     let smbTemporalXfbCapturesPosted = 0;
     const smbSustainedViReceiptCapacity = 120;
@@ -1307,7 +1355,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       const residentTextureKeys = rendererFramesInFlight.size === 0
         ? rendererResidentTextureKeys
         : null;
-      const packet = packGxFramePacketV2(copyKind, frame, residentTextureKeys);
+      const packingStartedAt = beginWorkerPhaseTiming(
+        workerHostTimings.gxPacketPacking
+      );
+      let packet;
+      try {
+        packet = packGxFramePacketV2(copyKind, frame, residentTextureKeys);
+      } finally {
+        recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
+      }
       postRendererFrame("gx-frame", { packet, diagnostics }, [packet]);
     }
 
@@ -6259,8 +6315,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function decodeGxFifo() {
-      const consumed = decodeGxCommands(gxDecodeBuffer, 0, gxDecodeBuffer.length);
-      if (consumed !== 0) gxDecodeBuffer.splice(0, consumed);
+      const decodeStartedAt = beginWorkerPhaseTiming(workerHostTimings.fifoDecode);
+      try {
+        const consumed = decodeGxCommands(gxDecodeBuffer, 0, gxDecodeBuffer.length);
+        if (consumed !== 0) gxDecodeBuffer.splice(0, consumed);
+      } finally {
+        recordWorkerPhaseTiming(workerHostTimings.fifoDecode, decodeStartedAt);
+      }
     }
 
     function appendGxFifoBytes(source, stores, quantizedStores = 0) {
@@ -6289,20 +6350,32 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (pendingBytes > gxFifoStagingCapacity) {
         throw new Error(`GX FIFO staging overflow: ${pendingBytes}`);
       }
-      const stores = view.getUint32(gxFifoStagingMeta + 4, true);
-      const quantizedStores = view.getUint32(gxFifoStagingMeta + 8, true);
-      view.setUint32(gxFifoStagingMeta, 0, true);
-      view.setUint32(gxFifoStagingMeta + 4, 0, true);
-      view.setUint32(gxFifoStagingMeta + 8, 0, true);
-      appendGxFifoBytes(
-        bytes.subarray(gxFifoStagingData, gxFifoStagingData + pendingBytes),
-        stores,
-        quantizedStores
+      // This boundary intentionally includes appendGxFifoBytes and its nested
+      // FIFO decode; fifoDecode reports that nested component separately.
+      const stagingStartedAt = beginWorkerPhaseTiming(
+        workerHostTimings.fifoStagingDrainInclusive
       );
-      gxFifoStagingDrains += 1;
-      gxFifoStagingStores += stores;
-      gxFifoStagingBytes += pendingBytes;
-      gxFifoStagingQuantizedStores += quantizedStores;
+      try {
+        const stores = view.getUint32(gxFifoStagingMeta + 4, true);
+        const quantizedStores = view.getUint32(gxFifoStagingMeta + 8, true);
+        view.setUint32(gxFifoStagingMeta, 0, true);
+        view.setUint32(gxFifoStagingMeta + 4, 0, true);
+        view.setUint32(gxFifoStagingMeta + 8, 0, true);
+        appendGxFifoBytes(
+          bytes.subarray(gxFifoStagingData, gxFifoStagingData + pendingBytes),
+          stores,
+          quantizedStores
+        );
+        gxFifoStagingDrains += 1;
+        gxFifoStagingStores += stores;
+        gxFifoStagingBytes += pendingBytes;
+        gxFifoStagingQuantizedStores += quantizedStores;
+      } finally {
+        recordWorkerPhaseTiming(
+          workerHostTimings.fifoStagingDrainInclusive,
+          stagingStartedAt
+        );
+      }
     }
 
     function traceDsp(event, details = {}) {
@@ -9233,6 +9306,7 @@ const TEMPLATE: &str = r##"<!doctype html>
               resultMisses: rendererFrameResultMisses,
             },
           },
+          hostTiming: snapshotWorkerHostTimings(),
         },
         recentPcs: recentPcs.map(value => hex32(value)),
         bi2Address: "0x" + bi2Address.toString(16).padStart(8, "0"),
@@ -9646,9 +9720,19 @@ const TEMPLATE: &str = r##"<!doctype html>
         && (waitWhileStopping || !runnerStopRequested)
       ) {
         rendererBackpressureWaits += 1;
-        await new Promise(resolve => {
-          rendererBackpressureResume = resolve;
-        });
+        const backpressureStartedAt = beginWorkerPhaseTiming(
+          workerHostTimings.rendererBackpressure
+        );
+        try {
+          await new Promise(resolve => {
+            rendererBackpressureResume = resolve;
+          });
+        } finally {
+          recordWorkerPhaseTiming(
+            workerHostTimings.rendererBackpressure,
+            backpressureStartedAt
+          );
+        }
         rendererBackpressureResume = null;
       }
       if (rendererFailure !== null) {
@@ -9850,6 +9934,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           view.setUint32(regionControl, 0, true);
           view.setUint32(regionControl + 4, 0, true);
           regionRunning = true;
+          const executionStartedAt = beginWorkerExecutionTiming();
           try {
             const result = region.instance.exports.run(
               0,
@@ -9865,6 +9950,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             executedBlocks = result[2] >>> 0;
           } finally {
             regionRunning = false;
+            if (executionStartedAt !== null) {
+              recordWorkerPhaseTiming(workerHostTimings.execution, executionStartedAt);
+            }
           }
           if (executedBlocks !== 0) {
             executedRegion = true;
@@ -9884,7 +9972,15 @@ const TEMPLATE: &str = r##"<!doctype html>
           stage = "execute";
           fastForwardRecognizedLoop(pc, block.maximum);
           try {
-            const executed = block.instance.exports.run(0, cpu, fastmem) >>> 0;
+            const executionStartedAt = beginWorkerExecutionTiming();
+            let executed;
+            try {
+              executed = block.instance.exports.run(0, cpu, fastmem) >>> 0;
+            } finally {
+              if (executionStartedAt !== null) {
+                recordWorkerPhaseTiming(workerHostTimings.execution, executionStartedAt);
+              }
+            }
             executedInstructions = executed & 0xffff;
             executedCycles = executed >>> 16;
             executedBlocks = 1;
@@ -10062,11 +10158,72 @@ const TEMPLATE: &str = r##"<!doctype html>
       output.textContent = failure;
       throw new Error(failure, { cause: error });
     }
+    function newRendererPhaseTiming(sampleStride) {
+      return { eligibleCalls: 0, sampleStride, samples: 0, totalMs: 0, maxMs: 0 };
+    }
+    function beginRendererPhaseTiming(timing) {
+      const eligibleCall = timing.eligibleCalls;
+      timing.eligibleCalls += 1;
+      return eligibleCall % timing.sampleStride === 0 ? performance.now() : null;
+    }
+    function recordRendererPhaseTiming(timing, startedAt, endedAt) {
+      if (startedAt === null) return;
+      const stoppedAt = endedAt === undefined ? performance.now() : endedAt;
+      const durationMs = stoppedAt - startedAt;
+      if (!Number.isFinite(durationMs) || durationMs < 0) return;
+      timing.samples += 1;
+      timing.totalMs = Math.min(Number.MAX_VALUE, timing.totalMs + durationMs);
+      timing.maxMs = Math.max(timing.maxMs, durationMs);
+    }
+    function snapshotRendererPhaseTiming(
+      timing,
+      eligibleCalls = timing?.eligibleCalls ?? timing?.samples ?? 0,
+      sampleStride = timing?.sampleStride ?? 1
+    ) {
+      return {
+        eligibleCalls: Number(eligibleCalls),
+        sampleStride: Number(sampleStride),
+        samples: Number(timing?.samples ?? 0),
+        totalMs: Number(timing?.totalMs ?? 0),
+        maxMs: Number(timing?.maxMs ?? 0),
+      };
+    }
+    function newRendererWallPhases() {
+      return {
+        operationQueueWait: newRendererPhaseTiming(64),
+        operationDispatch: newRendererPhaseTiming(64),
+        operationTotal: newRendererPhaseTiming(64),
+        queueDrain: newRendererPhaseTiming(64),
+      };
+    }
+    function snapshotRendererWallPhases(hostPhases, webgpuPhases) {
+      return {
+        operationQueueWait: snapshotRendererPhaseTiming(hostPhases.operationQueueWait),
+        operationDispatch: snapshotRendererPhaseTiming(hostPhases.operationDispatch),
+        operationTotal: snapshotRendererPhaseTiming(hostPhases.operationTotal),
+        queueDrain: snapshotRendererPhaseTiming(hostPhases.queueDrain),
+        packetParse: snapshotRendererPhaseTiming(webgpuPhases.packetParse),
+        topologyExpansion: snapshotRendererPhaseTiming(
+          webgpuPhases.topologyExpansion,
+          webgpuPhases.drawSampling.eligibleCalls,
+          webgpuPhases.drawSampling.sampleStride
+        ),
+        resourcePreparation: snapshotRendererPhaseTiming(
+          webgpuPhases.resourcePreparation,
+          webgpuPhases.drawSampling.eligibleCalls,
+          webgpuPhases.drawSampling.sampleStride
+        ),
+        gxFrameExecution: snapshotRendererPhaseTiming(webgpuPhases.gxFrameExecution),
+      };
+    }
     function newRendererHostMetrics() {
       return {
         operations: { enqueued: 0, pending: 0, highWater: 0 },
         workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
-        wall: { workerStartToLastReportMs: null },
+        wall: {
+          workerStartToLastReportMs: null,
+          phases: newRendererWallPhases(),
+        },
       };
     }
     let rendererHostMetrics = newRendererHostMetrics();
@@ -10424,13 +10581,42 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     function enqueueRendererOperation(operation) {
       const metrics = rendererHostMetrics.operations;
+      const phases = rendererHostMetrics.wall?.phases ?? null;
+      const queuedAt = phases === null
+        ? null
+        : beginRendererPhaseTiming(phases.operationTotal);
+      if (phases !== null) {
+        phases.operationQueueWait.eligibleCalls += 1;
+        phases.operationDispatch.eligibleCalls += 1;
+      }
       metrics.enqueued += 1;
       metrics.pending += 1;
       metrics.highWater = Math.max(metrics.highWater, metrics.pending);
-      const pending = appendRendererOperation(operation);
+      const measuredOperation = phases === null
+        ? operation
+        : () => {
+            const dispatchStartedAt = queuedAt === null ? null : performance.now();
+            recordRendererPhaseTiming(
+              phases.operationQueueWait,
+              queuedAt,
+              dispatchStartedAt
+            );
+            try {
+              return operation(phases);
+            } finally {
+              recordRendererPhaseTiming(phases.operationDispatch, dispatchStartedAt);
+            }
+          };
+      const pending = appendRendererOperation(measuredOperation);
+      const settle = () => {
+        metrics.pending -= 1;
+        if (phases !== null) {
+          recordRendererPhaseTiming(phases.operationTotal, queuedAt);
+        }
+      };
       pending.then(
-        () => { metrics.pending -= 1; },
-        () => { metrics.pending -= 1; }
+        settle,
+        settle
       );
       return pending;
     }
@@ -10952,6 +11138,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     function snapshotRendererPerformance(hostMetrics = rendererHostMetrics) {
       const webgpu = webGpuRenderer.diagnostics();
+      const webgpuPhases = webGpuRenderer.host_diagnostics();
       return {
         scope: "current-worker",
         wasmBridge: {
@@ -10977,7 +11164,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           textureUploadBytes: Number(webgpu.textureUploadBytes ?? 0),
           textureWrites: Number(webgpu.textureWrites ?? 0),
         },
-        wall: { ...hostMetrics.wall },
+        wall: {
+          workerStartToLastReportMs: hostMetrics.wall.workerStartToLastReportMs,
+          phases: snapshotRendererWallPhases(hostMetrics.wall.phases, webgpuPhases),
+        },
         webgpu,
       };
     }
@@ -11064,9 +11254,9 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function resetPresentation() {
       output.textContent = "STARTING";
-      return enqueueRendererOperation(async () => {
+      return enqueueRendererOperation(async phases => {
         webGpuRenderer.reset();
-        await drainWebGpuRenderer();
+        await drainWebGpuRenderer(phases);
         webGpuRenderer.reset_diagnostics();
       }).catch(handleRendererError);
     }
@@ -11575,9 +11765,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       return { residentTextureKeys };
     }
-    async function drainWebGpuRenderer() {
-      await webGpuRenderer.drain();
-      webGpuRenderer.check_health();
+    async function drainWebGpuRenderer(phases = rendererHostMetrics.wall?.phases ?? null) {
+      const drainStartedAt = phases === null
+        ? null
+        : beginRendererPhaseTiming(phases.queueDrain);
+      try {
+        await webGpuRenderer.drain();
+        webGpuRenderer.check_health();
+      } finally {
+        if (phases !== null) {
+          recordRendererPhaseTiming(phases.queueDrain, drainStartedAt);
+        }
+      }
     }
     function handleRendererFrame(message, render, sourceWorker = worker) {
       const rendererSequence = Number(message.rendererSequence);
@@ -11598,7 +11797,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         handleRendererError(error, false);
         return { ok: false, value: null };
       };
-      return enqueueRendererOperation(() => {
+      return enqueueRendererOperation(phases => {
         if (!isCurrentWorker()) return { ok: false, value: null };
         let value;
         try {
@@ -11607,7 +11806,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           return fail(error);
         }
         return (async () => {
-          await drainWebGpuRenderer();
+          await drainWebGpuRenderer(phases);
           if (!isCurrentWorker()) return { ok: false, value: null };
           if (message.frame?.temporalXfbCapture !== undefined) {
             const temporalCapture = await captureTemporalSelectedXfb(
@@ -11644,7 +11843,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
     function handleRendererOperation(render, sourceWorker = worker) {
-      return enqueueRendererOperation(() => {
+      return enqueueRendererOperation(phases => {
         if (worker !== sourceWorker) return { ok: false, value: null };
         let value;
         try {
@@ -11653,7 +11852,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (worker === sourceWorker) handleRendererError(error);
           return { ok: false, value: null };
         }
-        return drainWebGpuRenderer().then(
+        return drainWebGpuRenderer(phases).then(
           () => worker === sourceWorker
             ? { ok: true, value }
             : { ok: false, value: null },
