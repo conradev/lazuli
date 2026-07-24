@@ -11524,15 +11524,20 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function writeDspMailboxHigh(value) {
-      dspCpuMailbox = (((value & 0x7fff) << 16) | (dspCpuMailbox & 0xffff)) >>> 0;
+      dspCpuMailbox = (((value & 0xffff) << 16) | (dspCpuMailbox & 0xffff)) >>> 0;
       view.setUint16(mmio + 0x5000, value & 0x7fff, false);
     }
 
     function writeDspMailboxLow(value) {
       dspCpuMailbox = ((dspCpuMailbox & 0xffff0000) | (value & 0xffff)) >>> 0;
-      view.setUint16(mmio + 0x5000, (dspCpuMailbox >>> 16) | 0x8000, false);
+      view.setUint16(
+        mmio + 0x5000,
+        ((dspCpuMailbox >>> 16) & 0x7fff) | 0x8000,
+        false
+      );
       view.setUint16(mmio + 0x5002, dspCpuMailbox & 0xffff, false);
-      handleDspCpuMail((dspCpuMailbox | 0x80000000) >>> 0);
+      handleDspCpuMail(dspCpuMailbox >>> 0);
+      dspCpuMailbox &= 0x7fffffff;
       view.setUint16(mmio + 0x5000, (dspCpuMailbox >>> 16) & 0x7fff, false);
     }
 
