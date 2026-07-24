@@ -45,6 +45,7 @@ function workerHarness({ transferMessages = false } = {}) {
     rendererFramesAcknowledged: 0,
     rendererFramesInFlight: new Set(),
     rendererResidentTextureKeys: new Set(),
+    smbSustainedViPending: new Map(),
     rendererFrameSequence: 0,
     runnerSliceMs: 8,
     runnerStopRequested: false,

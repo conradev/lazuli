@@ -938,6 +938,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererResidentTextureKeys = new Set();
     const smbTemporalXfbCaptureCapacity = 8;
     let smbTemporalXfbCapturesPosted = 0;
+    const smbSustainedViReceiptCapacity = 120;
+    let smbSustainedViReceiptsPosted = 0;
+    const smbSustainedViReceipts = [];
+    const smbSustainedViPending = new Map();
+    let smbSustainedViFailure = null;
+    let smbReadyPlayAnchor = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -1214,22 +1220,58 @@ const TEMPLATE: &str = r##"<!doctype html>
     function claimSmbTemporalXfbCapture() {
       const step = controllerScenario?.definition.steps[controllerScenario.stepIndex] ?? null;
       if (
-        controllerScenario?.id !== "smb-ready-play"
+        (
+          controllerScenario?.id !== "smb-ready-play"
+          && controllerScenario?.id !== "smb-sustained-play"
+        )
         || step?.id !== "post-play-presented"
         || smbTemporalXfbCapturesPosted >= smbTemporalXfbCaptureCapacity
       ) return null;
       smbTemporalXfbCapturesPosted += 1;
       return {
-        scenario: controllerScenario.id,
+        // Keep the v3 ready-to-PLAY anchor byte-compatible inside the v4 run.
+        scenario: "smb-ready-play",
         step: step.id,
         ordinal: smbTemporalXfbCapturesPosted,
         capacity: smbTemporalXfbCaptureCapacity,
       };
     }
 
+    function snapshotSmbSustainedGameplayState() {
+      return {
+        gameModeRequest: guestS16(0x802f1b90),
+        gameMode: guestS16(0x802f1b92),
+        gameSubmodeRequest: guestS16(0x802f1b8c),
+        gameSubmode: guestS16(0x802f1b8e),
+        infoTimer: guestS16(0x801f3a5c),
+        attempts: guestS16(0x801f3a76),
+        floor: guestS16(0x801f3a78),
+      };
+    }
+
+    function claimSmbSustainedViReceipt() {
+      const step = controllerScenario?.definition.steps[controllerScenario.stepIndex] ?? null;
+      if (
+        controllerScenario?.id !== "smb-sustained-play"
+        || step?.id !== "sustained-play-presented"
+        || smbSustainedViReceiptsPosted >= smbSustainedViReceiptCapacity
+      ) return null;
+      smbSustainedViReceiptsPosted += 1;
+      return {
+        scenario: controllerScenario.id,
+        step: step.id,
+        ordinal: smbSustainedViReceiptsPosted,
+        capacity: smbSustainedViReceiptCapacity,
+        gameplay: snapshotSmbSustainedGameplayState(),
+      };
+    }
+
     function postRendererFrame(type, frame, transfer = []) {
       const rendererSequence = ++rendererFrameSequence;
       rendererFramesInFlight.add(rendererSequence);
+      if (type === "vi-present" && frame.sustainedPlayReceipt !== undefined) {
+        smbSustainedViPending.set(rendererSequence, frame.sustainedPlayReceipt);
+      }
       rendererFrameHighWater = Math.max(
         rendererFrameHighWater,
         rendererFramesInFlight.size
@@ -1247,6 +1289,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       } catch (error) {
         rendererFramesInFlight.delete(rendererSequence);
+        smbSustainedViPending.delete(rendererSequence);
         throw error;
       }
     }
@@ -1889,9 +1932,21 @@ const TEMPLATE: &str = r##"<!doctype html>
         rendererFrameResultMisses += 1;
         return;
       }
+      const sustainedRequest = smbSustainedViPending.get(rendererSequence) ?? null;
+      smbSustainedViPending.delete(rendererSequence);
       if (message.type === "renderer-frame-failed") {
         rendererFrameFailures += 1;
         recordRendererFailure(message.error);
+        if (sustainedRequest !== null) {
+          failSmbSustainedViReceipt(
+            null,
+            `$.sustainedPlay.receipts[${sustainedRequest.ordinal - 1}].renderer`,
+            sustainedRequest.ordinal,
+            "a drained successful WebGPU presentation",
+            String(message.error ?? "renderer frame failed"),
+            smbSustainedViReceipts.at(-1)?.rendererSequence ?? null
+          );
+        }
       } else {
         if (message.residentTextureKeys !== undefined) {
           if (
@@ -1905,6 +1960,16 @@ const TEMPLATE: &str = r##"<!doctype html>
           rendererResidentTextureKeys = new Set(message.residentTextureKeys);
         }
         rendererFramesAcknowledged += 1;
+        if (
+          sustainedRequest !== null
+          || message.sustainedPlayReceipt !== undefined
+        ) {
+          acceptSmbSustainedViReceipt(
+            message.sustainedPlayReceipt,
+            sustainedRequest,
+            rendererSequence
+          );
+        }
         if (rendererFramesInFlight.size === 0) rendererBackpressureResume?.();
       }
     }
@@ -1914,6 +1979,224 @@ const TEMPLATE: &str = r##"<!doctype html>
         rendererFailure = String(error || "WebGPU renderer failed");
       }
       rendererBackpressureResume?.();
+    }
+
+    function describeSmbSustainedViValue(value) {
+      if (value === undefined) return "undefined";
+      try {
+        return JSON.stringify(value);
+      } catch (_error) {
+        return String(value);
+      }
+    }
+
+    function failSmbSustainedViReceipt(
+      receipt,
+      path,
+      ordinal,
+      expected,
+      actual,
+      previous = null
+    ) {
+      if (smbSustainedViFailure !== null) return false;
+      if (receipt !== null && typeof receipt === "object") {
+        smbSustainedViReceipts.push(receipt);
+      }
+      const failure = {
+        path,
+        ordinal: Number.isSafeInteger(ordinal) ? ordinal : null,
+        expected,
+        actual,
+        previous,
+        reason: `sustained PLAY receipt ${Number.isSafeInteger(ordinal) ? ordinal : "?"} `
+          + `at ${path}: expected ${describeSmbSustainedViValue(expected)}, `
+          + `got ${describeSmbSustainedViValue(actual)} `
+          + `(previous ${describeSmbSustainedViValue(previous)})`,
+      };
+      smbSustainedViFailure = failure;
+      if (
+        controllerScenario?.id === "smb-sustained-play"
+        && controllerScenario.status === "running"
+      ) {
+        const step = controllerScenario.definition.steps[controllerScenario.stepIndex] ?? null;
+        controllerScenario.status = "failed";
+        controllerScenario.failure = {
+          step: step?.id ?? null,
+          cycle: cycles,
+          pollIndex: controllerScenario.pollIndex,
+          ...failure,
+        };
+        controllerScenario.pulse = null;
+      }
+      return false;
+    }
+
+    function acceptSmbSustainedViReceipt(receipt, request, rendererSequence) {
+      const ordinal = Number(receipt?.ordinal ?? request?.ordinal);
+      const path = `$.sustainedPlay.receipts[${Math.max(0, (ordinal || 1) - 1)}]`;
+      const reject = (suffix, expected, actual, previous = null) =>
+        failSmbSustainedViReceipt(
+          receipt ?? null,
+          `${path}${suffix}`,
+          ordinal,
+          expected,
+          actual,
+          previous
+        );
+      if (request === null) return reject(".request", "a pending worker request", null);
+      if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) {
+        return reject("", "a drained VI receipt object", receipt);
+      }
+      if (receipt.scenario !== request.scenario) {
+        return reject(".scenario", request.scenario, receipt.scenario);
+      }
+      if (receipt.step !== request.step) {
+        return reject(".step", request.step, receipt.step);
+      }
+      const expectedOrdinal = smbSustainedViReceipts.length + 1;
+      if (ordinal !== expectedOrdinal || ordinal !== request.ordinal) {
+        return reject(".ordinal", expectedOrdinal, receipt.ordinal);
+      }
+      if (receipt.capacity !== smbSustainedViReceiptCapacity) {
+        return reject(".capacity", smbSustainedViReceiptCapacity, receipt.capacity);
+      }
+      if (receipt.rendererSequence !== rendererSequence) {
+        return reject(".rendererSequence", rendererSequence, receipt.rendererSequence);
+      }
+      if (receipt.drained !== true) return reject(".drained", true, receipt.drained);
+      if (receipt.presented !== true) return reject(".presented", true, receipt.presented);
+
+      const presentation = receipt.presentation;
+      if (
+        presentation === null
+        || typeof presentation !== "object"
+        || Array.isArray(presentation)
+      ) return reject(".presentation", "an object", presentation);
+      const previousField = smbSustainedViReceipts.at(-1)?.presentation?.field ?? null;
+      const expectedField = previousField === null
+        ? presentation.field
+        : previousField === "top" ? "bottom" : "top";
+      if (
+        (presentation.field !== "top" && presentation.field !== "bottom")
+        || presentation.field !== expectedField
+      ) {
+        return reject(
+          ".presentation.field",
+          previousField === null ? "top or bottom" : expectedField,
+          presentation.field,
+          previousField
+        );
+      }
+      const expectedRow = expectedField === "top" ? 0 : 1;
+      if (presentation.copyRow !== expectedRow) {
+        return reject(".presentation.copyRow", expectedRow, presentation.copyRow,
+          smbSustainedViReceipts.at(-1)?.presentation?.copyRow ?? null);
+      }
+      if (presentation.width !== 640) {
+        return reject(".presentation.width", 640, presentation.width,
+          smbSustainedViReceipts.at(-1)?.presentation?.width ?? null);
+      }
+      if (presentation.height !== 448) {
+        return reject(".presentation.height", 448, presentation.height,
+          smbSustainedViReceipts.at(-1)?.presentation?.height ?? null);
+      }
+      if (typeof presentation.address !== "string" || !/^0x[0-9a-f]{8}$/.test(
+        presentation.address
+      )) {
+        return reject(
+          ".presentation.address",
+          "a lowercase 32-bit hexadecimal address",
+          presentation.address
+        );
+      }
+      const sameParity = smbSustainedViReceipts.find(candidate =>
+        candidate.presentation.field === expectedField);
+      if (
+        sameParity !== undefined
+        && presentation.address !== sameParity.presentation.address
+      ) {
+        return reject(
+          ".presentation.address",
+          sameParity.presentation.address,
+          presentation.address,
+          sameParity.presentation.address
+        );
+      }
+      const oppositeParity = smbSustainedViReceipts.find(candidate =>
+        candidate.presentation.field !== expectedField);
+      if (
+        sameParity === undefined
+        && oppositeParity !== undefined
+        && presentation.address === oppositeParity.presentation.address
+      ) {
+        return reject(
+          ".presentation.address",
+          `an address distinct from ${oppositeParity.presentation.address}`,
+          presentation.address,
+          oppositeParity.presentation.address
+        );
+      }
+      if (
+        !Number.isSafeInteger(presentation.copyIndex)
+        || presentation.copyIndex < 1
+      ) {
+        return reject(".presentation.copyIndex", "a positive safe integer",
+          presentation.copyIndex);
+      }
+      const previousReceipt = smbSustainedViReceipts.at(-1) ?? null;
+      const previousCopyIndex = previousReceipt?.presentation?.copyIndex ?? null;
+      if (
+        previousCopyIndex !== null
+        && presentation.copyIndex <= previousCopyIndex
+      ) {
+        return reject(
+          ".presentation.copyIndex",
+          `a value greater than ${previousCopyIndex}`,
+          presentation.copyIndex,
+          previousCopyIndex
+        );
+      }
+
+      const gameplay = receipt.gameplay;
+      if (gameplay === null || typeof gameplay !== "object" || Array.isArray(gameplay)) {
+        return reject(".gameplay", "an object", gameplay);
+      }
+      for (const [field, expected] of [
+        ["gameModeRequest", -1],
+        ["gameMode", 2],
+        ["gameSubmodeRequest", -1],
+        ["gameSubmode", 51],
+        ["attempts", 1],
+        ["floor", 1],
+      ]) {
+        if (gameplay[field] !== expected) {
+          return reject(`.gameplay.${field}`, expected, gameplay[field],
+            previousReceipt?.gameplay?.[field] ?? null);
+        }
+      }
+      if (!Number.isSafeInteger(gameplay.infoTimer)) {
+        return reject(".gameplay.infoTimer", "a safe integer", gameplay.infoTimer,
+          previousReceipt?.gameplay?.infoTimer ?? null);
+      }
+      if (
+        previousReceipt !== null
+        && gameplay.infoTimer !== previousReceipt.gameplay.infoTimer - 1
+      ) {
+        return reject(
+          ".gameplay.infoTimer",
+          previousReceipt.gameplay.infoTimer - 1,
+          gameplay.infoTimer,
+          previousReceipt.gameplay.infoTimer
+        );
+      }
+      if (rendererFailure !== null) {
+        return reject(".renderer.failure", null, rendererFailure);
+      }
+      if (rendererFramesInFlight.size !== 0) {
+        return reject(".renderer.inFlight", 0, rendererFramesInFlight.size);
+      }
+      smbSustainedViReceipts.push(receipt);
+      return true;
     }
 
     function controllerPacketForPoll(
@@ -2081,6 +2364,13 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
           const active = normalizeControllerState(step.input.active);
           const neutral = normalizeControllerState(step.input.neutral);
+          if (step.input.activePolls !== undefined) {
+            controllerScenarioInteger(
+              step.input.activePolls,
+              `controller scenario step ${step.id} activePolls`,
+              1
+            );
+          }
           if (controllerStatesEqual(active, neutral)) {
             throw new TypeError(
               `controller scenario step ${step.id} active and neutral states must differ`
@@ -2438,6 +2728,10 @@ const TEMPLATE: &str = r##"<!doctype html>
             state,
           });
           scenario.stepIndex += 1;
+          if (
+            scenario.id === "smb-sustained-play"
+            && step.id === "post-play-presented"
+          ) captureSmbReadyPlayAnchor(scenario, cycle, state);
           continue;
         }
 
@@ -2603,6 +2897,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const pulse = scenario.pulse;
       const entry = scenario.steps.at(-1);
       if (pulse.owner === "page") {
+        const step = scenario.definition.steps[scenario.stepIndex];
         const record = entry[pulse.state];
         if (
           record.sequence === null
@@ -2619,7 +2914,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
         if (
           pulse.state === "active"
-          && record.polls === scenario.pressPolls
+          && record.polls === (step.input.activePolls ?? scenario.pressPolls)
         ) {
           requestControllerScenarioState(scenario, entry, "neutral", observedCycle);
         }
@@ -2670,6 +2965,217 @@ const TEMPLATE: &str = r##"<!doctype html>
         pollIndex: scenario.pollIndex,
         lastState: scenario.lastState,
         steps: scenario.steps,
+      };
+    }
+
+    function cloneControllerScenarioEvidence(value) {
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    function captureSmbReadyPlayAnchor(scenario, cycle, state) {
+      if (
+        smbReadyPlayAnchor !== null
+        || scenario?.id !== "smb-sustained-play"
+        || scenario.stepIndex !== 13
+        || scenario.steps.length !== 13
+        || scenario.steps.at(-1)?.id !== "post-play-presented"
+      ) return smbReadyPlayAnchor;
+      const steps = cloneControllerScenarioEvidence(scenario.steps);
+      smbReadyPlayAnchor = {
+        status: "paused",
+        stage: "scenario-complete",
+        cycles: cycle,
+        disc: {
+          identifier: boot.identifier,
+          revision: boot.version,
+        },
+        controller: {
+          pollIndex: scenario.pollIndex,
+          appliedSequence: controllerAppliedSequence,
+          lastPolledSequence: serialLastPolledSequence,
+          lastPolledButtons: serialLastPolledButtons,
+          pendingButtons: controllerQueue.reduce(
+            (buttons, queued) => buttons | queued.state.buttons,
+            0
+          ),
+          queuedStates: controllerQueue.length,
+          queueOverflows: controllerQueueOverflows,
+        },
+        scenario: {
+          id: "smb-ready-play",
+          gameIdentifier: scenario.gameIdentifier,
+          status: "complete",
+          hardCycleLimit: 30_000_000_000,
+          startCycle: scenario.startCycle,
+          completedCycle: cycle,
+          failure: null,
+          stepIndex: steps.length,
+          currentStep: null,
+          pollIndex: scenario.pollIndex,
+          lastState: cloneControllerScenarioEvidence(state),
+          steps,
+        },
+      };
+      return smbReadyPlayAnchor;
+    }
+
+    function summarizeSmbSustainedPlay(scenario = controllerScenario) {
+      const receipts = smbSustainedViReceipts;
+      const first = receipts[0] ?? null;
+      const last = receipts.at(-1) ?? null;
+      const top = receipts.filter(receipt => receipt.presentation?.field === "top");
+      const bottom = receipts.filter(receipt => receipt.presentation?.field === "bottom");
+      const parityAddressSet = field => new Set(receipts
+        .filter(receipt => receipt.presentation?.field === field)
+        .map(receipt => receipt.presentation?.address));
+      const topAddresses = parityAddressSet("top");
+      const bottomAddresses = parityAddressSet("bottom");
+      const input = scenario?.steps.find(candidate =>
+        candidate.id === "sustained-main-stick-left") ?? null;
+      const worldTilt = state => {
+        const world = state?.gameplayInput?.world ?? null;
+        const xrot = world?.xrot ?? null;
+        const zrot = world?.zrot ?? null;
+        return {
+          xrot,
+          zrot,
+          maxAbs: Number.isSafeInteger(xrot) && Number.isSafeInteger(zrot)
+            ? Math.max(Math.abs(xrot), Math.abs(zrot))
+            : null,
+          inputLockFrames: world?.inputLockFrames ?? null,
+        };
+      };
+      const inputOracle = {
+        activePolls: input?.active?.polls ?? null,
+        neutralPolls: input?.neutral?.polls ?? null,
+        activeWireStickX: input?.active?.state?.stickX ?? null,
+        neutralWireStickX: input?.neutral?.state?.stickX ?? null,
+        activeGuestStickX: input?.guest?.activeState?.padStatus?.stickX ?? null,
+        neutralGuestStickX: input?.guest?.neutralState?.padStatus?.stickX ?? null,
+        gameplayMapping: {
+          currentPlayer:
+            input?.guest?.activeState?.gameplayInput?.currentPlayer ?? null,
+          controller: input?.guest?.activeState?.gameplayInput?.controller ?? null,
+        },
+        activeWorldTilt: worldTilt(input?.guest?.activeState),
+        neutralWorldTilt: worldTilt(input?.guest?.neutralState),
+      };
+      const strictAlternation = receipts.every((receipt, index) =>
+        (receipt.presentation?.field === "top" || receipt.presentation?.field === "bottom")
+        && (
+          index === 0
+          || receipt.presentation.field !== receipts[index - 1].presentation?.field
+        ));
+      const correctedRows = receipts.every(receipt =>
+        receipt.presentation?.copyRow === (
+          receipt.presentation?.field === "top" ? 0 : 1
+        ));
+      const stableParityAddresses = topAddresses.size === 1
+        && bottomAddresses.size === 1
+        && [...topAddresses][0] !== [...bottomAddresses][0];
+      const advancingCopyIndices = receipts.every((receipt, index) =>
+        index === 0
+        || (
+          Number.isSafeInteger(receipt.presentation?.copyIndex)
+          && Number.isSafeInteger(receipts[index - 1].presentation?.copyIndex)
+          && receipt.presentation.copyIndex > receipts[index - 1].presentation.copyIndex
+        ));
+      const dimensions640x448 = receipts.every(receipt =>
+        receipt.presentation?.width === 640 && receipt.presentation?.height === 448);
+      const playInvariants = receipts.every(receipt =>
+        receipt.gameplay?.gameModeRequest === -1
+        && receipt.gameplay.gameMode === 2
+        && receipt.gameplay.gameSubmodeRequest === -1
+        && receipt.gameplay.gameSubmode === 51
+        && receipt.gameplay.attempts === 1
+        && receipt.gameplay.floor === 1);
+      const infoTimerDelta = first === null || last === null
+        ? null
+        : Number(first.gameplay?.infoTimer) - Number(last.gameplay?.infoTimer);
+      const inputComplete = inputOracle.activePolls === 30
+        && Number.isSafeInteger(inputOracle.neutralPolls)
+        && inputOracle.neutralPolls >= 3
+        && inputOracle.activeWireStickX === 0x1c
+        && inputOracle.neutralWireStickX === 0x80
+        && inputOracle.activeGuestStickX === -60
+        && inputOracle.neutralGuestStickX === 0
+        && Number.isSafeInteger(inputOracle.gameplayMapping.currentPlayer)
+        && Number.isSafeInteger(inputOracle.gameplayMapping.controller)
+        && inputOracle.activeWorldTilt.inputLockFrames === 0
+        && Number.isSafeInteger(inputOracle.activeWorldTilt.maxAbs)
+        && inputOracle.activeWorldTilt.maxAbs >= 256
+        && inputOracle.neutralWorldTilt.xrot === 0
+        && inputOracle.neutralWorldTilt.zrot === 0
+        && inputOracle.neutralWorldTilt.maxAbs === 0
+        && inputOracle.neutralWorldTilt.inputLockFrames === 0
+        && inputOracle.gameplayMapping.currentPlayer
+          === input?.guest?.neutralState?.gameplayInput?.currentPlayer
+        && inputOracle.gameplayMapping.controller
+          === input?.guest?.neutralState?.gameplayInput?.controller;
+      const renderer = {
+        failed: rendererFrameFailures,
+        inFlight: rendererFramesInFlight.size,
+        pendingReceipts: smbSustainedViPending.size,
+      };
+      const presented = receipts.filter(receipt => receipt.presented === true).length;
+      const drained = receipts.filter(receipt => receipt.drained === true).length;
+      return {
+        capacity: smbSustainedViReceiptCapacity,
+        received: receipts.length,
+        drained,
+        presented,
+        topFields: top.length,
+        bottomFields: bottom.length,
+        strictAlternation,
+        correctedRows,
+        stableParityAddresses,
+        parityAddresses: {
+          top: topAddresses.size === 1 ? [...topAddresses][0] : null,
+          bottom: bottomAddresses.size === 1 ? [...bottomAddresses][0] : null,
+        },
+        advancingCopyIndices,
+        dimensions: { width: 640, height: 448, allMatch: dimensions640x448 },
+        playInvariants,
+        infoTimer: {
+          first: first?.gameplay?.infoTimer ?? null,
+          last: last?.gameplay?.infoTimer ?? null,
+          delta: infoTimerDelta,
+        },
+        input: inputOracle,
+        renderer,
+        readyPlayAnchorCaptured: smbReadyPlayAnchor !== null,
+        complete: receipts.length === smbSustainedViReceiptCapacity
+          && drained === smbSustainedViReceiptCapacity
+          && presented === smbSustainedViReceiptCapacity
+          && top.length === 60
+          && bottom.length === 60
+          && strictAlternation
+          && correctedRows
+          && stableParityAddresses
+          && advancingCopyIndices
+          && dimensions640x448
+          && playInvariants
+          && infoTimerDelta === 119
+          && inputComplete
+          && smbReadyPlayAnchor !== null
+          && smbSustainedViFailure === null
+          && renderer.failed === 0
+          && renderer.inFlight === 0
+          && renderer.pendingReceipts === 0,
+      };
+    }
+
+    function snapshotSmbSustainedPlay(scenario = controllerScenario) {
+      if (scenario?.id !== "smb-sustained-play") return null;
+      return {
+        schema: "lazuli-smb-sustained-play-v1",
+        capacity: smbSustainedViReceiptCapacity,
+        posted: smbSustainedViReceiptsPosted,
+        pending: smbSustainedViPending.size,
+        receipts: smbSustainedViReceipts,
+        failure: smbSustainedViFailure,
+        readyPlayAnchor: smbReadyPlayAnchor,
+        oracle: summarizeSmbSustainedPlay(scenario),
       };
     }
 
@@ -2905,6 +3411,139 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function createSuperMonkeyBallSustainedPlayScenarioDefinition() {
+      const readyPlay = createSuperMonkeyBallControllerScenarioDefinition();
+      const neutral = {
+        buttons: 0,
+        stickX: 0x80,
+        stickY: 0x80,
+        cStickX: 0x80,
+        cStickY: 0x80,
+        triggerL: 0,
+        triggerR: 0,
+        analogA: 0,
+        analogB: 0,
+      };
+      // Hold a strong left deflection long enough for SMB's input_main to
+      // normalize it and world_sub_input_main to smooth it into stage tilt.
+      // The wire byte 0x1c becomes -100 in PADRead and saturates to -60 in
+      // SMB's controllerInfo calibration.
+      const active = { ...neutral, stickX: 0x1c };
+      const activePolls = 30;
+      const minimumActiveTilt = 256;
+      const inputStepId = "sustained-main-stick-left";
+      const tiltMagnitude = state => Math.max(
+        Math.abs(state?.gameplayInput?.world?.xrot ?? 0),
+        Math.abs(state?.gameplayInput?.world?.zrot ?? 0)
+      );
+      const inputWitness = scenario => {
+        const entry = scenario.steps.find(candidate => candidate.id === inputStepId);
+        return entry?.type === "state-input"
+          && entry.owner === "page"
+          && entry.active.polls === activePolls
+          && entry.neutral.polls >= 3
+          && entry.guest?.activeState?.padStatus?.error === 0
+          && entry.guest.activeState.padStatus.stickX === -60
+          && entry.guest.activeState.gameplayInput?.world?.state === 2
+          && entry.guest.activeState.gameplayInput.world.player
+            === entry.guest.activeState.gameplayInput.currentPlayer
+          && entry.guest.activeState.gameplayInput.world.inputLockFrames === 0
+          && tiltMagnitude(entry.guest.activeState) >= minimumActiveTilt
+          && entry.guest?.neutralState?.padStatus?.error === 0
+          && entry.guest.neutralState.padStatus.stickX === 0
+          && entry.guest.neutralState.gameplayInput?.world?.state === 2
+          && entry.guest.neutralState.gameplayInput.world.player
+            === entry.guest.neutralState.gameplayInput.currentPlayer
+          && entry.guest.neutralState.gameplayInput.world.inputLockFrames === 0
+          && tiltMagnitude(entry.guest.neutralState) === 0
+          && entry.guest.activeState.gameplayInput.currentPlayer
+            === entry.guest.neutralState.gameplayInput.currentPlayer
+          && entry.guest.activeState.gameplayInput.controller
+            === entry.guest.neutralState.gameplayInput.controller;
+      };
+      const playInvariant = sample =>
+        sample.gameModeRequest === -1
+        && sample.gameMode === 2
+        && sample.gameSubmodeRequest === -1
+        && sample.gameSubmode === 51
+        && sample.attempts === 1
+        && sample.floor === 1
+        && sample.rendererFailed === false;
+      return {
+        ...readyPlay,
+        id: "smb-sustained-play",
+        hardCycleLimit: 32_000_000_000,
+        sample: inspectSuperMonkeyBallSustainedPlayState,
+        steps: [
+          ...readyPlay.steps,
+          {
+            id: inputStepId,
+            input: {
+              owner: "page",
+              activePolls,
+              active,
+              neutral,
+              activeObserved: sample =>
+                sample?.padStatus?.error === 0
+                && sample.padStatus.stickX === -60
+                && sample.gameplayInput?.world?.state === 2
+                && sample.gameplayInput.world.player === sample.gameplayInput.currentPlayer
+                && sample.gameplayInput.world.inputLockFrames === 0
+                && tiltMagnitude(sample) >= minimumActiveTilt,
+              neutralObserved: (sample, scenario) => {
+                const entry = scenario.steps.find(candidate =>
+                  candidate.id === inputStepId);
+                const activeInput = entry?.guest?.activeState?.gameplayInput;
+                return activeInput !== undefined
+                  && sample?.padStatus?.error === 0
+                  && sample.padStatus.stickX === 0
+                  && sample.gameplayInput?.world?.state === 2
+                  && sample.gameplayInput.world.player === sample.gameplayInput.currentPlayer
+                  && sample.gameplayInput.world.inputLockFrames === 0
+                  && tiltMagnitude(sample) === 0
+                  && sample.gameplayInput.currentPlayer === activeInput.currentPlayer
+                  && sample.gameplayInput.controller === activeInput.controller;
+              },
+            },
+            ready: sample =>
+              playInvariant(sample)
+              && sample.temporalXfbCapturesPosted === sample.temporalXfbCaptureCapacity
+              && sample.padStatus?.error === 0
+              && sample.padStatus.stickX === 0
+              && sample.gameplayInput?.world?.state === 2
+              && sample.gameplayInput.world.player === sample.gameplayInput.currentPlayer
+              && sample.gameplayInput.world.inputLockFrames === 0
+              && tiltMagnitude(sample) === 0
+              && sample.rendererFramesInFlight === 0,
+          },
+          {
+            id: "sustained-play-presented",
+            button: null,
+            ready: (sample, scenario) => {
+              const first = smbSustainedViReceipts[0] ?? null;
+              const last = smbSustainedViReceipts.at(-1) ?? null;
+              return inputWitness(scenario)
+                && playInvariant(sample)
+                && smbSustainedViFailure === null
+                && smbSustainedViReceiptsPosted === smbSustainedViReceiptCapacity
+                && smbSustainedViReceipts.length === smbSustainedViReceiptCapacity
+                && first !== null
+                && last !== null
+                && first.gameplay.infoTimer - last.gameplay.infoTimer === 119
+                && sample.rendererFramesInFlight === 0;
+            },
+            missed: (sample, scenario) => {
+              const input = scenario.steps.find(candidate => candidate.id === inputStepId);
+              const anchor = input?.completedCycle ?? null;
+              return anchor !== null && sample.cycle >= anchor + 3_000_000_000
+                ? `sustained PLAY deadline exceeded by ${sample.cycle - anchor - 3_000_000_000} cycles`
+                : false;
+            },
+          },
+        ],
+      };
+    }
+
     function createSuperMonkeyBallMainStickRoundtripScenarioDefinition() {
       const neutral = {
         buttons: 0,
@@ -2917,7 +3556,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         analogA: 0,
         analogB: 0,
       };
-      const active = { ...neutral, stickX: 0x40 };
+      const active = { ...neutral, stickX: 0x1c };
       return {
         id: "smb-main-stick-roundtrip",
         gameIdentifier: "GMBE8P",
@@ -2936,7 +3575,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             neutral,
             activeObserved: sample =>
               sample?.padStatus?.error === 0
-              && sample.padStatus.stickX === -64,
+              && sample.padStatus.stickX === -60,
             neutralObserved: sample =>
               sample?.padStatus?.error === 0
               && sample.padStatus.stickX === 0,
@@ -3120,6 +3759,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       : 1024;
     const stopOnFirstDsi = searchParams.get("stopOnFirstDsi") === "1";
     registerControllerScenario(createSuperMonkeyBallControllerScenarioDefinition());
+    registerControllerScenario(createSuperMonkeyBallSustainedPlayScenarioDefinition());
     // The public surface filters this diagnostic id; the debug harness keeps
     // it available as a short, independently witnessed analog bring-up path.
     registerControllerScenario(createSuperMonkeyBallMainStickRoundtripScenarioDefinition());
@@ -6622,6 +7262,38 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function inspectSuperMonkeyBallGameplayInput(currentPlayer) {
+      if (
+        boot.identifier !== "GMBE8P"
+        || !Number.isSafeInteger(currentPlayer)
+        || currentPlayer < 0
+        || currentPlayer >= 4
+      ) return null;
+      const controller = guestS32(0x80206bd0 + currentPlayer * 4);
+      if (
+        !Number.isSafeInteger(controller)
+        || controller < 0
+        || controller >= 4
+      ) return null;
+      const controllerInfo = 0x801f3b70 + controller * 0x3c;
+      const worldInfo = 0x80206bf0 + currentPlayer * 0x40;
+      return {
+        currentPlayer,
+        controller,
+        padStatus: inspectPadStatus(controllerInfo),
+        world: {
+          address: hex32(worldInfo),
+          xrot: guestS16(worldInfo),
+          zrot: guestS16(worldInfo + 2),
+          previousXrot: guestS16(worldInfo + 4),
+          previousZrot: guestS16(worldInfo + 6),
+          state: guestU8(worldInfo + 8),
+          player: guestU8(worldInfo + 9),
+          inputLockFrames: guestS32(worldInfo + 0x20),
+        },
+      };
+    }
+
     function inspectSuperMonkeyBallMainStickRoundtripState() {
       const controller = inspectSuperMonkeyBallPad0();
       if (controller === null) return null;
@@ -6721,6 +7393,21 @@ const TEMPLATE: &str = r##"<!doctype html>
         rendererFramesAcknowledged,
         rendererFramesInFlight: rendererFramesInFlight.size,
         rendererFailed: rendererFailure !== null,
+      };
+    }
+
+    function inspectSuperMonkeyBallSustainedPlayState() {
+      const state = inspectSuperMonkeyBallScenarioState();
+      if (state === null) return null;
+      const gameplayInput = inspectSuperMonkeyBallGameplayInput(state.currentPlayer);
+      return {
+        ...state,
+        padStatus: gameplayInput?.padStatus ?? null,
+        gameplayInput,
+        sustainedViReceiptCapacity: smbSustainedViReceiptCapacity,
+        sustainedViReceiptsPosted: smbSustainedViReceiptsPosted,
+        sustainedViReceiptsReceived: smbSustainedViReceipts.length,
+        sustainedViFailure: smbSustainedViFailure,
       };
     }
 
@@ -7246,6 +7933,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             ? dimensions.fieldStrideBytes / resolved.frame.stride
             : 0;
           const temporalXfbCapture = claimSmbTemporalXfbCapture();
+          const sustainedPlayReceipt = claimSmbSustainedViReceipt();
           if (resolved !== null) {
             resolved.frame.displayed = true;
             resolved.frame.displayedAtCycle = scheduledCycle;
@@ -7270,6 +7958,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             rowRepeat: dimensions.rowRepeat,
             scanoutPolicy: dimensions.scanoutPolicy,
             ...(temporalXfbCapture === null ? {} : { temporalXfbCapture }),
+            ...(sustainedPlayReceipt === null ? {} : { sustainedPlayReceipt }),
           });
           gxFramesPresented += 1;
           viPresentationCount += 1;
@@ -8739,6 +9428,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           ...controllerState,
         },
         scenario: snapshotControllerScenario(controllerScenario),
+        ...(controllerScenario?.id === "smb-sustained-play" ? {
+          sustainedPlay: snapshotSmbSustainedPlay(controllerScenario),
+        } : {}),
         guestGame: inspectSuperMonkeyBallGameState(),
         serialInterface: {
           transferInterruptAcknowledgements: serialTransferInterruptAcknowledgements,
@@ -10028,6 +10720,80 @@ const TEMPLATE: &str = r##"<!doctype html>
       frames.push(capture);
       return capture;
     }
+    function captureSmbSustainedViReceipt(message, presented) {
+      const frame = message?.frame;
+      const request = frame?.sustainedPlayReceipt;
+      const rendererSequence = Number(message?.rendererSequence);
+      const ordinal = Number(request?.ordinal);
+      const capacity = Number(request?.capacity);
+      const address = Number(frame?.address);
+      const copyIndex = Number(frame?.copyIndex);
+      const copyRow = Number(frame?.copyRow);
+      const width = Number(frame?.width);
+      const height = Number(frame?.height);
+      const gameplay = request?.gameplay;
+      if (
+        message?.type !== "vi-present"
+        || request?.scenario !== "smb-sustained-play"
+        || request?.step !== "sustained-play-presented"
+        || !Number.isSafeInteger(rendererSequence)
+        || !Number.isSafeInteger(ordinal)
+        || ordinal < 1
+        || ordinal > 120
+        || capacity !== 120
+        || (frame?.field !== "top" && frame?.field !== "bottom")
+        || !Number.isSafeInteger(address)
+        || address < 0
+        || address > 0xffff_ffff
+        || !Number.isSafeInteger(copyIndex)
+        || copyIndex < 0
+        || !Number.isSafeInteger(copyRow)
+        || copyRow < 0
+        || copyRow > 1
+        || !Number.isSafeInteger(width)
+        || width <= 0
+        || !Number.isSafeInteger(height)
+        || height <= 0
+        || gameplay === null
+        || typeof gameplay !== "object"
+        || Array.isArray(gameplay)
+      ) {
+        throw new Error("invalid sustained PLAY VI receipt request");
+      }
+      const gameplaySnapshot = {};
+      for (const field of [
+        "gameModeRequest",
+        "gameMode",
+        "gameSubmodeRequest",
+        "gameSubmode",
+        "infoTimer",
+        "attempts",
+        "floor",
+      ]) {
+        if (!Number.isSafeInteger(gameplay[field])) {
+          throw new Error(`invalid sustained PLAY gameplay field ${field}`);
+        }
+        gameplaySnapshot[field] = gameplay[field];
+      }
+      return {
+        scenario: request.scenario,
+        step: request.step,
+        ordinal,
+        capacity,
+        rendererSequence,
+        drained: true,
+        presented: presented === true,
+        presentation: {
+          field: frame.field,
+          address: "0x" + address.toString(16).padStart(8, "0"),
+          copyIndex,
+          copyRow,
+          width,
+          height,
+        },
+        gameplay: gameplaySnapshot,
+      };
+    }
     function summarizeTemporalSelectedXfb(frames) {
       const classified = frames.map(frame => {
         const selected = frame.selectedXfb;
@@ -10278,7 +11044,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     function runnerSearchForSurface(isDebugSurface, search) {
       if (isDebugSurface) return search;
       const scenario = new URLSearchParams(search).get("scenario");
-      return scenario === "smb-ready-play" ? "?scenario=smb-ready-play" : "";
+      return scenario === "smb-ready-play" || scenario === "smb-sustained-play"
+        ? `?scenario=${scenario}`
+        : "";
     }
     const defaultDiscSourceConfig = __HAS_DISC__
       ? {
@@ -10855,6 +11623,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             }
             if (!isCurrentWorker()) return { ok: false, value: null };
           }
+          const sustainedPlayReceipt = message.frame?.sustainedPlayReceipt === undefined
+            ? null
+            : captureSmbSustainedViReceipt(message, value);
           if (Number.isSafeInteger(rendererSequence)) {
             const completion = {
               type: "renderer-frame-complete",
@@ -10862,6 +11633,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             };
             if (Array.isArray(value?.residentTextureKeys)) {
               completion.residentTextureKeys = value.residentTextureKeys;
+            }
+            if (sustainedPlayReceipt !== null) {
+              completion.sustainedPlayReceipt = sustainedPlayReceipt;
             }
             sourceWorker?.postMessage(completion);
           }

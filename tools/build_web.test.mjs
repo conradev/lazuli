@@ -188,14 +188,53 @@ test("local harness retains controls removed from the public frontend", async ()
   assert.equal(harness.match(/<!-- LAZULI DEBUG UI END -->/g)?.length, 2);
 });
 
-test("public shell forwards only the SMB scenario outside passive capture", async () => {
+test("public shell forwards ready and sustained SMB scenarios outside passive capture", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   assert.doesNotMatch(shell, /url\.search\s*=\s*location\.search/);
-  assert.match(
-    shell,
-    /scenarioValues\.length === 1 && scenarioValues\[0\] === "smb-ready-play"/,
-  );
+  assert.match(shell, /scenarioValues\[0\] === "smb-ready-play"/);
+  assert.match(shell, /scenarioValues\[0\] === "smb-sustained-play"/);
   assert.doesNotMatch(shell, /searchParams\.set\("(?:cycles|dispatches|rest|renderEvery|harness)"/);
+});
+
+test("public shell forwards one supported scenario and discards all other query state", async () => {
+  const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+  const start = shell.indexOf("function publicFrontendSearch(");
+  assert.notEqual(start, -1);
+  const bodyStart = shell.indexOf("{", start);
+  let depth = 0;
+  let end = -1;
+  for (let index = bodyStart; index < shell.length; index += 1) {
+    if (shell[index] === "{") depth += 1;
+    if (shell[index] !== "}") continue;
+    depth -= 1;
+    if (depth === 0) {
+      end = index + 1;
+      break;
+    }
+  }
+  assert.notEqual(end, -1);
+  const publicFrontendSearch = Function(
+    `"use strict"; return (${shell.slice(start, end)});`,
+  )();
+  assert.equal(
+    publicFrontendSearch("?scenario=smb-ready-play&cycles=99"),
+    "?scenario=smb-ready-play",
+  );
+  assert.equal(
+    publicFrontendSearch("?scenario=smb-sustained-play&renderEvery=9"),
+    "?scenario=smb-sustained-play",
+  );
+  assert.equal(publicFrontendSearch("?scenario=other"), "");
+  assert.equal(
+    publicFrontendSearch("?scenario=smb-sustained-play&scenario=smb-sustained-play"),
+    "",
+  );
+  assert.throws(
+    () => publicFrontendSearch(
+      "?scenario=smb-sustained-play&viewportCapture=1&headlessRun=run-1",
+    ),
+    /invalid passive viewport capture request/,
+  );
 });
 
 test("public shell binds the iframe to the staged immutable frontend", async () => {

@@ -110,8 +110,12 @@
       const scenarioValues = input.getAll("scenario");
       const captureValues = input.getAll("viewportCapture");
       if (captureValues.length === 0) {
-        return scenarioValues.length === 1 && scenarioValues[0] === "smb-ready-play"
-          ? "?scenario=smb-ready-play"
+        return scenarioValues.length === 1
+          && (
+            scenarioValues[0] === "smb-ready-play"
+            || scenarioValues[0] === "smb-sustained-play"
+          )
+          ? `?scenario=${scenarioValues[0]}`
           : "";
       }
 
