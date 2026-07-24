@@ -1674,6 +1674,91 @@ mod tests {
         bytes
     }
 
+    fn exact_clip_state(cull_mode: u8) -> GxExactClipState {
+        GxExactClipState {
+            bp_gen_mode: u32::from(cull_mode) << 14,
+            bp_scissor_top_left: (342 << 12) | 342,
+            bp_scissor_bottom_right: ((342 + 639) << 12) | (342 + 527),
+            bp_scissor_offset: 171 | (171 << 10),
+            xf_clip_disable: 0,
+            viewport_bits: [
+                320.0f32.to_bits(),
+                (-264.0f32).to_bits(),
+                16_777_215.0f32.to_bits(),
+                342.0f32.to_bits(),
+                342.0f32.to_bits(),
+                0.0f32.to_bits(),
+            ],
+        }
+    }
+
+    fn exact_clip_positions() -> [[f32; 4]; 3] {
+        [
+            [0.0, 0.0, -0.5, 1.0],
+            [2.0, 0.0, -0.5, 1.0],
+            [0.0, 1.0, -0.5, 1.0],
+        ]
+    }
+
+    fn promote_v4_to_v5(
+        mut bytes: Vec<u8>,
+        exact_draws: &[(usize, GxExactClipState, &[[f32; 4]])],
+    ) -> Vec<u8> {
+        assert_eq!(read_u16(&bytes, 0x04), GX_PACKET_VERSION);
+        let draw_count = read_u32(&bytes, 0x14) as usize;
+        let draw_table_offset = read_u32(&bytes, 0x1c) as usize;
+        let draw_record_bytes = read_u16(&bytes, 0x78) as usize;
+        let mut previous_draw = None;
+        for (draw_index, state, positions) in exact_draws {
+            assert!(*draw_index < draw_count);
+            assert!(previous_draw.is_none_or(|previous| previous < *draw_index));
+            previous_draw = Some(*draw_index);
+            let record_offset = draw_table_offset + draw_index * draw_record_bytes;
+            assert_eq!(read_u16(&bytes, record_offset + 0x02), 0);
+            assert_eq!(
+                read_u32(&bytes, record_offset + 0x04) as usize,
+                positions.len()
+            );
+            put_u16(
+                &mut bytes,
+                record_offset + 0x02,
+                DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE,
+            );
+            put_u32(&mut bytes, record_offset + 0xac, state.viewport_bits[0]);
+
+            let chunk_offset = bytes.len();
+            let chunk_bytes = EXACT_CLIP_STATE_BYTES as usize
+                + positions.len() * EXACT_CLIP_VERTEX_BYTES as usize;
+            bytes.resize(chunk_offset + chunk_bytes, 0);
+            put_u32(&mut bytes, chunk_offset, EXACT_CLIP_INPUT_ENCODING_F32_V1);
+            for (offset, value) in [
+                (0x04, state.bp_gen_mode),
+                (0x08, state.bp_scissor_top_left),
+                (0x0c, state.bp_scissor_bottom_right),
+                (0x10, state.bp_scissor_offset),
+                (0x14, state.xf_clip_disable),
+            ] {
+                put_u32(&mut bytes, chunk_offset + offset, value);
+            }
+            for (index, bits) in state.viewport_bits.into_iter().enumerate() {
+                put_u32(&mut bytes, chunk_offset + 0x18 + index * 4, bits);
+            }
+            for (vertex, position) in positions.iter().enumerate() {
+                for (component, value) in position.iter().enumerate() {
+                    put_u32(
+                        &mut bytes,
+                        chunk_offset + 0x30 + vertex * 16 + component * 4,
+                        value.to_bits(),
+                    );
+                }
+            }
+        }
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V5);
+        let packet_bytes = bytes.len() as u32;
+        put_u32(&mut bytes, 0x08, packet_bytes);
+        bytes
+    }
+
     fn textured_xfb_copy() -> Vec<u8> {
         let mut bytes = vec![0; V3_PACKET_BYTES];
         bytes[0..4].copy_from_slice(b"LZGX");
@@ -2051,6 +2136,33 @@ mod tests {
             sampler
         );
 
+        let mut v5_base = textured_xfb_copy();
+        put_u16(&mut v5_base, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut v5_base, V3_DRAW_OFFSET + 0x34, sampler);
+        put_u32(&mut v5_base, V3_DRAW_OFFSET + 0x04, 3);
+        put_u32(
+            &mut v5_base,
+            V3_DRAW_OFFSET + GX_DRAW_RECORD_BYTES as usize + 0x04,
+            0,
+        );
+        put_u32(
+            &mut v5_base,
+            V3_DRAW_OFFSET + GX_DRAW_RECORD_BYTES as usize + 0x08,
+            3 * GX_VERTEX_BYTES,
+        );
+        let positions = exact_clip_positions();
+        let v5 = promote_v4_to_v5(v5_base, &[(0, exact_clip_state(2), &positions)]);
+        assert_eq!(
+            GxFramePacket::parse(&v5)
+                .unwrap()
+                .draw(0)
+                .unwrap()
+                .record
+                .textures[0]
+                .sampler_bits,
+            sampler
+        );
+
         let mut v3 = textured_xfb_copy();
         put_u32(&mut v3, V3_DRAW_OFFSET + 0x34, sampler);
         assert_eq!(
@@ -2345,6 +2457,339 @@ mod tests {
             GxPacketError::NonZeroPadding {
                 offset: evidence_offset + 1,
             }
+        );
+    }
+
+    #[test]
+    fn parses_canonical_v5_exact_clip_state_and_borrowed_positions() {
+        let state = exact_clip_state(0);
+        let positions = exact_clip_positions();
+        let v4 = single_draw_v4_texture_copy(2, 0, 3, None);
+        assert_eq!(v4.len(), 1232);
+        let bytes = promote_v4_to_v5(v4, &[(0, state, &positions)]);
+        assert_eq!(bytes.len(), 1328);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        let draw = packet.draw(0).unwrap();
+        let exact = draw.exact_clip_input.unwrap();
+        assert_eq!(draw.record.post_cull_actions, None);
+        assert_eq!(exact.state, state);
+        assert_eq!(
+            exact.state.viewport(),
+            [320.0, -264.0, 16_777_215.0, 342.0, 342.0, 0.0]
+        );
+        assert_eq!(exact.positions().collect::<Vec<_>>(), positions);
+        assert_eq!(exact.positions().len(), 3);
+        assert_eq!(exact.position_bytes.as_ptr(), bytes[1280..].as_ptr());
+
+        // Raw BP scissor state intentionally remains authoritative input even
+        // when the legacy derived rectangle disagrees.
+        assert_eq!(draw.record.scissor_width, 0);
+        assert_ne!(exact.state.bp_scissor_bottom_right, 0);
+    }
+
+    #[test]
+    fn v5_places_all_actions_before_aligned_exact_chunks_in_draw_order() {
+        let action = [GxTriangleAction::Keep012];
+        let positions = exact_clip_positions();
+        let bytes = promote_v4_to_v5(
+            v4_texture_copy(&[(2, 0, 3, None), (2, 0, 3, Some(&action))]),
+            &[(0, exact_clip_state(0), &positions)],
+        );
+        assert_eq!(bytes.len(), 2416);
+        assert_eq!(bytes[2304], 2);
+        assert!(bytes[2305..2320].iter().all(|byte| *byte == 0));
+        assert_eq!(read_u32(&bytes, 2320), EXACT_CLIP_INPUT_ENCODING_F32_V1);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(
+            packet
+                .draw(0)
+                .unwrap()
+                .exact_clip_input
+                .unwrap()
+                .positions()
+                .collect::<Vec<_>>(),
+            positions
+        );
+        assert_eq!(
+            packet.draw(1).unwrap().record.post_cull_actions.as_deref(),
+            Some(action.as_slice())
+        );
+        assert!(packet.draw(1).unwrap().exact_clip_input.is_none());
+    }
+
+    #[test]
+    fn v5_assigns_multiple_exact_chunks_in_flagged_draw_order() {
+        let first_positions = exact_clip_positions();
+        let mut second_positions = exact_clip_positions();
+        second_positions[0][0] = -3.0;
+        let mut second_state = exact_clip_state(0);
+        second_state.xf_clip_disable = 7;
+        let bytes = promote_v4_to_v5(
+            v4_texture_copy(&[(2, 0, 3, None), (2, 0, 3, None)]),
+            &[
+                (0, exact_clip_state(0), &first_positions),
+                (1, second_state, &second_positions),
+            ],
+        );
+        assert_eq!(bytes.len(), 2496);
+        assert_eq!(read_u32(&bytes, 2304), EXACT_CLIP_INPUT_ENCODING_F32_V1);
+        assert_eq!(read_u32(&bytes, 2400), EXACT_CLIP_INPUT_ENCODING_F32_V1);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(
+            packet
+                .draw(0)
+                .unwrap()
+                .exact_clip_input
+                .unwrap()
+                .positions()
+                .collect::<Vec<_>>(),
+            first_positions
+        );
+        let second = packet.draw(1).unwrap().exact_clip_input.unwrap();
+        assert_eq!(second.state, second_state);
+        assert_eq!(second.positions().collect::<Vec<_>>(), second_positions);
+    }
+
+    #[test]
+    fn rejects_noncanonical_v5_presence_and_flag_combinations() {
+        let mut without_exact = single_draw_v4_texture_copy(2, 0, 3, None);
+        put_u16(&mut without_exact, 0x04, GX_PACKET_VERSION_V5);
+        assert_eq!(
+            GxFramePacket::parse(&without_exact).unwrap_err(),
+            GxPacketError::NonCanonical("version 5 requires at least one exact clip input")
+        );
+
+        let positions = exact_clip_positions();
+        let valid = promote_v4_to_v5(
+            single_draw_v4_texture_copy(2, 0, 3, None),
+            &[(0, exact_clip_state(0), &positions)],
+        );
+        let mut conflicting = valid.clone();
+        put_u16(
+            &mut conflicting,
+            V3_DRAW_OFFSET + 0x02,
+            DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE
+                | DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE,
+        );
+        assert_eq!(
+            GxFramePacket::parse(&conflicting).unwrap_err(),
+            GxPacketError::NonCanonical(
+                "one draw cannot carry both post-cull actions and exact clip inputs"
+            )
+        );
+
+        let mut unknown = valid;
+        put_u16(&mut unknown, V3_DRAW_OFFSET + 0x02, 1 << 2);
+        assert_eq!(
+            GxFramePacket::parse(&unknown).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "draw flags",
+                value: 1 << 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_v5_exact_clip_state_and_positions() {
+        let positions = exact_clip_positions();
+        let valid = promote_v4_to_v5(
+            single_draw_v4_texture_copy(2, 0, 3, None),
+            &[(0, exact_clip_state(0), &positions)],
+        );
+        let exact_offset = 1232;
+
+        let mut encoding = valid.clone();
+        put_u32(&mut encoding, exact_offset, 2);
+        assert_eq!(
+            GxFramePacket::parse(&encoding).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "exact clip input encoding",
+                expected: 1,
+                actual: 2,
+            }
+        );
+
+        for offset in [0x04, 0x08, 0x0c, 0x10] {
+            let mut high_bp_bit = valid.clone();
+            put_u32(
+                &mut high_bp_bit,
+                exact_offset + offset,
+                read_u32(&valid, exact_offset + offset) | 0x0100_0000,
+            );
+            assert!(matches!(
+                GxFramePacket::parse(&high_bp_bit),
+                Err(GxPacketError::InvalidField { .. })
+            ));
+        }
+
+        let mut cull_mismatch = valid.clone();
+        put_u32(&mut cull_mismatch, exact_offset + 0x04, 1 << 14);
+        assert_eq!(
+            GxFramePacket::parse(&cull_mismatch).unwrap_err(),
+            GxPacketError::NonCanonical("exact clip BP generation cull mode must match the draw")
+        );
+
+        let mut xf_high_bits = valid.clone();
+        put_u32(&mut xf_high_bits, exact_offset + 0x14, 8);
+        assert_eq!(
+            GxFramePacket::parse(&xf_high_bits).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "exact clip XF clip-disable",
+                value: 8,
+            }
+        );
+
+        for (offset, bits) in [(0x1c, 0.0f32.to_bits()), (0x20, f32::INFINITY.to_bits())] {
+            let mut invalid_viewport = valid.clone();
+            put_u32(&mut invalid_viewport, exact_offset + offset, bits);
+            assert!(matches!(
+                GxFramePacket::parse(&invalid_viewport),
+                Err(GxPacketError::InvalidField {
+                    field: "exact clip viewport component",
+                    ..
+                })
+            ));
+        }
+
+        let mut viewport_mismatch = valid.clone();
+        put_u32(
+            &mut viewport_mismatch,
+            exact_offset + 0x18,
+            640.0f32.to_bits(),
+        );
+        assert_eq!(
+            GxFramePacket::parse(&viewport_mismatch).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "exact clip viewport X bits",
+                expected: u64::from(320.0f32.to_bits()),
+                actual: u64::from(640.0f32.to_bits()),
+            }
+        );
+
+        let mut nonfinite_position = valid;
+        put_u32(
+            &mut nonfinite_position,
+            exact_offset + 0x30,
+            f32::NAN.to_bits(),
+        );
+        assert!(matches!(
+            GxFramePacket::parse(&nonfinite_position),
+            Err(GxPacketError::InvalidField {
+                field: "exact clip position component",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn v5_exact_draws_require_finite_native_attributes_and_source_triangles() {
+        let positions = exact_clip_positions();
+        let valid = promote_v4_to_v5(
+            single_draw_v4_texture_copy(2, 0, 3, None),
+            &[(0, exact_clip_state(0), &positions)],
+        );
+        let vertex_offset = read_u32(&valid, 0x28) as usize;
+        for bits in [f32::INFINITY.to_bits(), 0x7fc0_0000] {
+            let mut nonfinite = valid.clone();
+            put_u32(&mut nonfinite, vertex_offset, bits);
+            assert_eq!(
+                GxFramePacket::parse(&nonfinite).unwrap_err(),
+                GxPacketError::InvalidField {
+                    field: "exact clip source vertex component",
+                    value: u64::from(bits),
+                }
+            );
+        }
+
+        for topology in 5..=7 {
+            let bytes = promote_v4_to_v5(
+                single_draw_v4_texture_copy(topology, 0, 3, None),
+                &[(0, exact_clip_state(0), &positions)],
+            );
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::NonCanonical("exact clip input must describe at least one triangle")
+            );
+        }
+
+        let bytes = promote_v4_to_v5(
+            single_draw_v4_texture_copy(2, 0, 2, None),
+            &[(0, exact_clip_state(0), &positions[..2])],
+        );
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::NonCanonical("exact clip input must describe at least one triangle")
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_trailing_and_nonzero_padding_in_v5_exact_tails() {
+        let positions = exact_clip_positions();
+        let valid = promote_v4_to_v5(
+            single_draw_v4_texture_copy(2, 0, 3, None),
+            &[(0, exact_clip_state(0), &positions)],
+        );
+
+        let mut truncated = valid.clone();
+        truncated.truncate(valid.len() - 16);
+        let truncated_len = truncated.len() as u32;
+        put_u32(&mut truncated, 0x08, truncated_len);
+        assert_eq!(
+            GxFramePacket::parse(&truncated).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "packet bytes",
+                expected: valid.len() as u64,
+                actual: u64::from(truncated_len),
+            }
+        );
+
+        let mut trailing = valid;
+        trailing.resize(trailing.len() + 16, 0);
+        let trailing_len = trailing.len() as u32;
+        put_u32(&mut trailing, 0x08, trailing_len);
+        assert_eq!(
+            GxFramePacket::parse(&trailing).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "packet bytes",
+                expected: 1328,
+                actual: u64::from(trailing_len),
+            }
+        );
+
+        let action = [GxTriangleAction::Keep012];
+        let mut padding = promote_v4_to_v5(
+            v4_texture_copy(&[(2, 0, 3, None), (2, 0, 3, Some(&action))]),
+            &[(0, exact_clip_state(0), &positions)],
+        );
+        padding[2305] = 1;
+        assert_eq!(
+            GxFramePacket::parse(&padding).unwrap_err(),
+            GxPacketError::NonZeroPadding { offset: 2305 }
+        );
+    }
+
+    #[test]
+    fn v5_parser_retains_all_defined_clip_disable_bits() {
+        let positions = exact_clip_positions();
+        let mut state = exact_clip_state(0);
+        state.xf_clip_disable = 7;
+        let bytes = promote_v4_to_v5(
+            single_draw_v4_texture_copy(2, 0, 3, None),
+            &[(0, state, &positions)],
+        );
+        assert_eq!(
+            GxFramePacket::parse(&bytes)
+                .unwrap()
+                .draw(0)
+                .unwrap()
+                .exact_clip_input
+                .unwrap()
+                .state
+                .xf_clip_disable,
+            7
         );
     }
 
