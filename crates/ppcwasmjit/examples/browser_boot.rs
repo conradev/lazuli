@@ -315,6 +315,7 @@ fn main() {
         .replace("__SDR1_OFFSET__", &SPR::SDR1.offset().to_string())
         .replace("__LR_OFFSET__", &SPR::LR.offset().to_string())
         .replace("__DAR_OFFSET__", &SPR::DAR.offset().to_string())
+        .replace("__DSISR_OFFSET__", &SPR::DSISR.offset().to_string())
         .replace("__SRR0_OFFSET__", &SPR::SRR0.offset().to_string())
         .replace("__SRR1_OFFSET__", &SPR::SRR1.offset().to_string())
         .replace("__DEC_OFFSET__", &SPR::DEC.offset().to_string())
@@ -3855,6 +3856,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const sdr1Offset = __SDR1_OFFSET__;
     const lrOffset = __LR_OFFSET__;
     const darOffset = __DAR_OFFSET__;
+    const dsisrOffset = __DSISR_OFFSET__;
     const srr0Offset = __SRR0_OFFSET__;
     const srr1Offset = __SRR1_OFFSET__;
     const decrementerOffset = __DEC_OFFSET__;
@@ -3935,6 +3937,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const exceptionTrace = [];
     const exceptionFirstByVector = {};
     let firstDsi = null;
+    let lastDataStorageFault = null;
     let lastUnmappedAccess = null;
     let dataFastmemTranslationSignature = null;
     let instructionTranslationSignature = null;
@@ -5030,22 +5033,94 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function resolveDataRange(
+      effectiveAddress,
+      size,
+      write = false,
+      updateHistory = false
+    ) {
+      return resolveDataEffectiveRange(
+        effectiveAddress,
+        size,
+        view.getUint32(cpu + msrOffset, true),
+        readDataBats(),
+        readSegmentRegisters(),
+        view.getUint32(cpu + sdr1Offset, true),
+        write,
+        updateHistory
+      );
+    }
+
+    function dataStorageCause(fault, write = false) {
+      let cause = write ? 0x02000000 : 0;
+      if (fault?.kind === "page-fault") cause |= 0x40000000;
+      if (fault?.kind === "protection") cause |= 0x08000000;
+      if (fault?.kind === "direct-store") cause |= 0x04000000;
+      return cause >>> 0;
+    }
+
+    function recordDataStorageFault(
+      fault,
+      effectiveAddress,
+      size,
+      write = false,
+      stage = "translation",
+      reason = undefined,
+      value = undefined
+    ) {
+      const effective = effectiveAddress >>> 0;
+      const cause = dataStorageCause(fault, write);
+      const record = {
+        kind: "data-storage",
+        access: write ? "write" : "read",
+        stage,
+        reason: reason ?? fault?.kind ?? "unknown",
+        resolverKind: fault?.kind ?? null,
+        source: fault?.source ?? null,
+        address: hex32(effective),
+        physical: Number.isInteger(fault?.physical)
+          ? hex32(fault.physical)
+          : null,
+        faultAddress: Number.isInteger(fault?.faultEffective)
+          ? hex32(fault.faultEffective)
+          : hex32(effective),
+        size,
+        dsisr: hex32(cause),
+        pc: hex32(view.getUint32(cpu + pcOffset, true)),
+        r1: hex32(readGpr(1)),
+        dispatch: dispatches,
+      };
+      if (value !== undefined) {
+        record.value = size === 8
+          ? "0x" + BigInt.asUintN(64, value).toString(16)
+          : hex32(value);
+      }
+      view.setUint32(cpu + dsisrOffset, cause, true);
+      lastDataStorageFault = record;
+      lastUnmappedAccess = record;
+      return 0;
+    }
+
     function translateDataRange(
       effectiveAddress,
       size,
       write = false,
       updateHistory = false
     ) {
-      return translateDataEffectiveRange(
-        effectiveAddress,
-        size,
-        view.getUint32(cpu + msrOffset, true),
-        readDataBats(),
-        write,
-        readSegmentRegisters(),
-        view.getUint32(cpu + sdr1Offset, true),
-        updateHistory
-      );
+      // Isolated device fixtures historically inject the numeric helper only.
+      const resolved = typeof resolveDataRange === "function"
+        ? resolveDataRange(effectiveAddress, size, write, updateHistory)
+        : resolveDataEffectiveRange(
+            effectiveAddress,
+            size,
+            view.getUint32(cpu + msrOffset, true),
+            readDataBats(),
+            readSegmentRegisters(),
+            view.getUint32(cpu + sdr1Offset, true),
+            write,
+            updateHistory
+          );
+      return resolved.kind === "mapped" ? resolved.physical : null;
     }
 
     function normalizePhysicalMemoryAddress(address, size, ramBytes, mmioBytes) {
@@ -8435,28 +8510,65 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function readInteger(address, pointer, size) {
       const logical = address >>> 0;
-      const physical = translateDataRange(logical, size, false, true);
+      const resolved = typeof resolveDataRange === "function"
+        ? resolveDataRange(logical, size, false, true)
+        : null;
+      const physical = resolved === null
+        ? translateDataRange(logical, size, false, true)
+        : resolved.kind === "mapped"
+          ? resolved.physical
+          : null;
+      if (physical === null) {
+        return typeof recordDataStorageFault === "function"
+          ? recordDataStorageFault(
+              resolved ?? { kind: "translation-failed", effective: logical },
+              logical,
+              size,
+              false,
+              "translation"
+            )
+          : 0;
+      }
+      const mapped = {
+        kind: "mapped",
+        effective: logical,
+        physical,
+      };
+      const reject = (stage, reason) => (
+        typeof recordDataStorageFault === "function"
+          ? recordDataStorageFault(
+              mapped,
+              logical,
+              size,
+              false,
+              stage,
+              reason
+            )
+          : 0
+      );
       if (
-        physical !== null
-        && physical < 0x0c000040
+        physical < 0x0c000040
         && physical + size > 0x0c000000
         && commandProcessorRegisterRangeOverlaps(physical, size)
       ) {
         const commandProcessorValue = readCommandProcessorRegister(physical, size);
-        if (commandProcessorValue === null) return 0;
+        if (commandProcessorValue === null) {
+          return reject("device", "command-processor-register-rejected");
+        }
         view.setUint16(pointer, commandProcessorValue, true);
         return 1;
       }
       if (
-        physical !== null
-        && physical < 0x0c00301c
+        physical < 0x0c00301c
         && physical + size > 0x0c00300c
       ) {
         const processorInterfaceFifoValue = readProcessorInterfaceFifoRegister(
           physical,
           size
         );
-        if (processorInterfaceFifoValue === null) return 0;
+        if (processorInterfaceFifoValue === null) {
+          return reject("device", "processor-interface-fifo-register-rejected");
+        }
         view.setUint32(pointer, processorInterfaceFifoValue, true);
         return 1;
       }
@@ -8470,24 +8582,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (physical === 0x0c005038 && size === 4) {
         publishDspAudioDmaBlocksLeft();
       }
-      const lockedSource = physical === null
-        ? null
-        : physicalLockedCachePointer(physical, size);
-      const source = physical === null
-        ? null
-        : physicalRamPointer(physical, size)
-          ?? physicalMmioPointer(physical, size)
-          ?? lockedSource;
+      const lockedSource = physicalLockedCachePointer(physical, size);
+      const source = physicalRamPointer(physical, size)
+        ?? physicalMmioPointer(physical, size)
+        ?? lockedSource;
       if (source === null) {
-        lastUnmappedAccess = {
-          kind: "read",
-          address: hex32(logical),
-          size,
-          pc: hex32(view.getUint32(cpu + pcOffset, true)),
-          r1: hex32(readGpr(1)),
-          dispatch: dispatches,
-        };
-        return 0;
+        return reject("physical", "translated-physical-unbacked");
       }
       switch (size) {
         case 1:
@@ -8503,7 +8603,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           view.setBigUint64(pointer, view.getBigUint64(source, false), true);
           break;
         default:
-          return 0;
+          return reject("format", "integer-size-rejected");
       }
       if (lockedSource !== null) {
         lockedCacheReads += 1;
@@ -8965,32 +9065,69 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function writeInteger(address, value, size) {
       const logical = address >>> 0;
-      const physical = translateDataRange(logical, size, true, true);
+      const resolved = typeof resolveDataRange === "function"
+        ? resolveDataRange(logical, size, true, true)
+        : null;
+      const physical = resolved === null
+        ? translateDataRange(logical, size, true, true)
+        : resolved.kind === "mapped"
+          ? resolved.physical
+          : null;
+      if (physical === null) {
+        return typeof recordDataStorageFault === "function"
+          ? recordDataStorageFault(
+              resolved ?? { kind: "translation-failed", effective: logical },
+              logical,
+              size,
+              true,
+              "translation",
+              undefined,
+              value
+            )
+          : 0;
+      }
+      const mapped = {
+        kind: "mapped",
+        effective: logical,
+        physical,
+      };
+      const reject = (stage, reason) => (
+        typeof recordDataStorageFault === "function"
+          ? recordDataStorageFault(
+              mapped,
+              logical,
+              size,
+              true,
+              stage,
+              reason,
+              value
+            )
+          : 0
+      );
       if (
-        physical !== null
-        && physical < 0x0c003004
+        physical < 0x0c003004
         && physical + size > 0x0c003000
       ) {
         if (physical === 0x0c003000 && size === 4) {
           writeProcessorInterfaceInterruptCause(value);
           return 1;
         }
-        return 0;
+        return reject("device", "processor-interface-register-rejected");
       }
       if (
-        physical !== null
-        && physical < 0x0c000040
+        physical < 0x0c000040
         && physical + size > 0x0c000000
         && commandProcessorRegisterRangeOverlaps(physical, size)
       ) {
-        return writeCommandProcessorRegister(physical, value, size) ? 1 : 0;
+        if (writeCommandProcessorRegister(physical, value, size)) return 1;
+        return reject("device", "command-processor-register-rejected");
       }
       if (
-        physical !== null
-        && physical < 0x0c00301c
+        physical < 0x0c00301c
         && physical + size > 0x0c00300c
       ) {
-        return writeProcessorInterfaceFifoRegister(physical, value, size) ? 1 : 0;
+        if (writeProcessorInterfaceFifoRegister(physical, value, size)) return 1;
+        return reject("device", "processor-interface-fifo-register-rejected");
       }
       if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (size) {
@@ -8998,7 +9135,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           case 2: gxFifoScratch.setUint16(0, value, false); break;
           case 4: gxFifoScratch.setUint32(0, value, false); break;
           case 8: gxFifoScratch.setBigUint64(0, BigInt.asUintN(64, value), false); break;
-          default: return 0;
+          default: return reject("format", "integer-size-rejected");
         }
         appendGxFifo(size);
         return 1;
@@ -9075,25 +9212,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         return 1;
       }
 
-      const lockedTarget = physical === null
-        ? null
-        : physicalLockedCachePointer(physical, size);
-      const target = physical === null
-        ? null
-        : physicalRamPointer(physical, size)
-          ?? physicalMmioPointer(physical, size)
-          ?? lockedTarget;
+      const lockedTarget = physicalLockedCachePointer(physical, size);
+      const target = physicalRamPointer(physical, size)
+        ?? physicalMmioPointer(physical, size)
+        ?? lockedTarget;
       if (target === null) {
-        lastUnmappedAccess = {
-          kind: "write",
-          address: hex32(logical),
-          size,
-          value: size === 8 ? "0x" + BigInt.asUintN(64, value).toString(16) : hex32(value),
-          pc: hex32(view.getUint32(cpu + pcOffset, true)),
-          r1: hex32(readGpr(1)),
-          dispatch: dispatches,
-        };
-        return 0;
+        return reject("physical", "translated-physical-unbacked");
       }
       switch (size) {
         case 1:
@@ -9109,7 +9233,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           view.setBigUint64(target, BigInt.asUintN(64, value), false);
           break;
         default:
-          return 0;
+          return reject("format", "integer-size-rejected");
       }
       if (physical >= 0x0c002000 && physical < 0x0c002070) {
         const start = physical - 0x0c002000;
@@ -9150,15 +9274,55 @@ const TEMPLATE: &str = r##"<!doctype html>
     function readQuantized(address, gqr, pointer) {
       const type = (gqr >>> 16) & 7;
       const size = type === 0 ? 4 : (type === 4 || type === 6 ? 1 : 2);
-      if (![0, 4, 5, 6, 7].includes(type)) return 0;
-      const physical = translateDataRange(address, size, false, true);
-      const lockedSource = physical === null
-        ? null
-        : physicalLockedCachePointer(physical, size);
-      const source = physical === null
-        ? null
-        : physicalRamPointer(physical, size) ?? lockedSource;
-      if (source === null) return 0;
+      const logical = address >>> 0;
+      const reject = (fault, stage, reason) => (
+        typeof recordDataStorageFault === "function"
+          ? recordDataStorageFault(
+              fault,
+              logical,
+              size,
+              false,
+              stage,
+              reason
+            )
+          : 0
+      );
+      if (![0, 4, 5, 6, 7].includes(type)) {
+        return reject(
+          { kind: "format-rejected", effective: logical },
+          "format",
+          "quantized-type-rejected"
+        );
+      }
+      const resolved = typeof resolveDataRange === "function"
+        ? resolveDataRange(logical, size, false, true)
+        : null;
+      const physical = resolved === null
+        ? translateDataRange(logical, size, false, true)
+        : resolved.kind === "mapped"
+          ? resolved.physical
+          : null;
+      if (physical === null) {
+        return reject(
+          resolved ?? { kind: "translation-failed", effective: logical },
+          "translation",
+          undefined
+        );
+      }
+      const mapped = { kind: "mapped", effective: logical, physical };
+      const lockedSource = physicalLockedCachePointer(physical, size);
+      const source = physicalRamPointer(physical, size) ?? lockedSource;
+      if (source === null) {
+        const device = typeof physicalMmioPointer === "function"
+          && physicalMmioPointer(physical, size) !== null;
+        return reject(
+          mapped,
+          device ? "device" : "physical",
+          device
+            ? "quantized-device-rejected"
+            : "translated-physical-unbacked"
+        );
+      }
       let value;
       switch (type) {
         case 0: value = view.getFloat32(source, false); break;
@@ -9179,12 +9343,46 @@ const TEMPLATE: &str = r##"<!doctype html>
     function writeQuantized(address, gqr, value) {
       const type = gqr & 7;
       const size = type === 0 ? 4 : (type === 4 || type === 6 ? 1 : 2);
-      if (![0, 4, 5, 6, 7].includes(type)) return 0;
+      const logical = address >>> 0;
+      const reject = (fault, stage, reason) => (
+        typeof recordDataStorageFault === "function"
+          ? recordDataStorageFault(
+              fault,
+              logical,
+              size,
+              true,
+              stage,
+              reason,
+              value
+            )
+          : 0
+      );
+      if (![0, 4, 5, 6, 7].includes(type)) {
+        return reject(
+          { kind: "format-rejected", effective: logical },
+          "format",
+          "quantized-type-rejected"
+        );
+      }
       const scale = type === 0 ? 0 : signedSix(gqr >>> 8);
       const scaled = value * (2 ** scale);
       const stored = quantizedStoreValue(type, scaled);
-      const logical = address >>> 0;
-      const physical = translateDataRange(logical, size, true, true);
+      const resolved = typeof resolveDataRange === "function"
+        ? resolveDataRange(logical, size, true, true)
+        : null;
+      const physical = resolved === null
+        ? translateDataRange(logical, size, true, true)
+        : resolved.kind === "mapped"
+          ? resolved.physical
+          : null;
+      if (physical === null) {
+        return reject(
+          resolved ?? { kind: "translation-failed", effective: logical },
+          "translation",
+          undefined
+        );
+      }
+      const mapped = { kind: "mapped", effective: logical, physical };
       if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (type) {
           case 0: gxFifoScratch.setFloat32(0, stored, false); break;
@@ -9197,13 +9395,19 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxFifoQuantizedStores += 1;
         return size;
       }
-      const lockedTarget = physical === null
-        ? null
-        : physicalLockedCachePointer(physical, size);
-      const target = physical === null
-        ? null
-        : physicalRamPointer(physical, size) ?? lockedTarget;
-      if (target === null) return 0;
+      const lockedTarget = physicalLockedCachePointer(physical, size);
+      const target = physicalRamPointer(physical, size) ?? lockedTarget;
+      if (target === null) {
+        const device = typeof physicalMmioPointer === "function"
+          && physicalMmioPointer(physical, size) !== null;
+        return reject(
+          mapped,
+          device ? "device" : "physical",
+          device
+            ? "quantized-device-rejected"
+            : "translated-physical-unbacked"
+        );
+      }
       switch (type) {
         case 0: view.setFloat32(target, stored, false); break;
         case 4: view.setUint8(target, stored); break;
@@ -11482,6 +11686,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         dar: "0x" + view.getUint32(registers + darOffset, true).toString(16).padStart(8, "0"),
         dispatch: dispatches,
       };
+      if (exception === 0x0300) {
+        sample.dsisr = hex32(view.getUint32(registers + dsisrOffset, true));
+        sample.dataStorageFault = lastDataStorageFault;
+      }
       if (exceptionFirstByVector[exceptionName] === undefined) {
         exceptionFirstByVector[exceptionName] = {
           ...sample,
