@@ -44,6 +44,8 @@ const packetFunctions = [
   "gxExpandedTriangleIndices",
   "gxFramePacketPostCullEvidence",
   "packGxFramePacketV4",
+  "gxFramePacketExactClipInput",
+  "packGxFramePacketV5",
 ];
 
 function packetContext() {
@@ -134,6 +136,27 @@ function evidencedXfbFrame(action = 3) {
       }],
     },
   };
+}
+
+function exactClipXfbFrame() {
+  const frame = evidencedXfbFrame();
+  const draw = frame.geometry.draws[0];
+  delete draw.postCullEvidence;
+  draw.pipeline.viewportHalfWidthBits = 0x43a00000;
+  draw.exactClipInput = {
+    bpGenMode: 0,
+    bpScissorTopLeft: (342 << 12) | 342,
+    bpScissorBottomRight: ((342 + 639) << 12) | (342 + 527),
+    bpScissorOffset: 171 | (171 << 10),
+    xfClipDisable: 0,
+    viewport: new Float32Array([320, -264, 16777215, 342, 342, 0]),
+    clipPositions: new Float32Array([
+      0, 0, -0.5, 1,
+      2, 0, -0.5, 1,
+      0, 1, -0.5, 1,
+    ]),
+  };
+  return frame;
 }
 
 function tevState(requiredMaps, seed) {
@@ -363,6 +386,174 @@ test("appends canonical post-cull evidence without rewriting raw draw bytes", ()
       },
     }),
     /requires a nonempty triangle topology/,
+  );
+});
+
+test("keeps packets without exact clip inputs byte-identical canonical v4", () => {
+  const context = packetContext();
+  const frame = evidencedXfbFrame();
+  const expected = context.packGxFramePacketV4(2, frame);
+  const actual = context.packGxFramePacketV5(2, frame);
+
+  assert.equal(new DataView(actual).getUint16(0x04, true), 4);
+  assert.deepEqual(packetBytes(actual), packetBytes(expected));
+  assert.equal(
+    digest(actual),
+    "5bc15cc115d3691bf0d02ee68acd75e80dff990f2be4fefcb78aa900cc57f2f9",
+  );
+});
+
+test("appends one exact GX clip-input chunk in canonical LZGX v5 layout", () => {
+  const context = packetContext();
+  const frame = exactClipXfbFrame();
+  const v4 = context.packGxFramePacketV4(2, frame);
+  const packet = context.packGxFramePacketV5(2, frame);
+  const bytes = new Uint8Array(packet);
+  const view = new DataView(packet);
+  const exactOffset = 1232;
+
+  assert.equal(v4.byteLength, exactOffset);
+  assert.equal(packet.byteLength, 1328);
+  assert.equal(view.getUint16(0x04, true), 5);
+  assert.equal(view.getUint32(0x08, true), 1328);
+  assert.equal(view.getUint16(160 + 0x02, true), 2);
+  assert.equal(view.getUint32(exactOffset + 0x00, true), 1);
+  assert.equal(view.getUint32(exactOffset + 0x04, true), 0);
+  assert.equal(
+    view.getUint32(exactOffset + 0x08, true),
+    (342 << 12) | 342,
+  );
+  assert.equal(
+    view.getUint32(exactOffset + 0x0c, true),
+    ((342 + 639) << 12) | (342 + 527),
+  );
+  assert.equal(
+    view.getUint32(exactOffset + 0x10, true),
+    171 | (171 << 10),
+  );
+  assert.equal(view.getUint32(exactOffset + 0x14, true), 0);
+  assert.deepEqual(
+    Array.from(
+      { length: 6 },
+      (_unused, index) => view.getFloat32(exactOffset + 0x18 + index * 4, true),
+    ),
+    [320, -264, 16777215, 342, 342, 0],
+  );
+  assert.deepEqual(
+    Array.from(
+      { length: 12 },
+      (_unused, index) => view.getFloat32(exactOffset + 0x30 + index * 4, true),
+    ),
+    [0, 0, -0.5, 1, 2, 0, -0.5, 1, 0, 1, -0.5, 1],
+  );
+  const expectedPrefix = new Uint8Array(v4);
+  expectedPrefix[0x04] = 5;
+  expectedPrefix[0x08] = 0x30;
+  expectedPrefix[0x09] = 0x05;
+  expectedPrefix[160 + 0x02] = 2;
+  assert.deepEqual(bytes.subarray(0, exactOffset), expectedPrefix);
+});
+
+test("places legacy actions before aligned exact chunks in mixed LZGX v5", () => {
+  const context = packetContext();
+  const actionFrame = evidencedXfbFrame();
+  const exactFrame = exactClipXfbFrame();
+  const frame = {
+    ...exactFrame,
+    geometry: {
+      drawCalls: 2,
+      vertices: 6,
+      draws: [
+        exactFrame.geometry.draws[0],
+        actionFrame.geometry.draws[0],
+      ],
+    },
+  };
+  const packet = context.packGxFramePacketV5(2, frame);
+  const bytes = new Uint8Array(packet);
+  const view = new DataView(packet);
+
+  assert.equal(packet.byteLength, 2416);
+  assert.equal(view.getUint16(0x04, true), 5);
+  assert.equal(view.getUint16(160 + 0x02, true), 2);
+  assert.equal(view.getUint16(160 + 176 + 0x02, true), 1);
+  assert.equal(view.getUint32(0x30, true), 2304);
+  assert.equal(view.getUint32(0x48, true), 0);
+  assert.equal(bytes[2304], 3);
+  assert.deepEqual([...bytes.subarray(2305, 2320)], Array(15).fill(0));
+  assert.equal(view.getUint32(2320, true), 1);
+  assert.deepEqual(
+    Array.from(
+      { length: 12 },
+      (_unused, index) => view.getFloat32(2320 + 0x30 + index * 4, true),
+    ),
+    [0, 0, -0.5, 1, 2, 0, -0.5, 1, 0, 1, -0.5, 1],
+  );
+});
+
+test("rejects conflicting or malformed LZGX v5 exact clip inputs", () => {
+  const context = packetContext();
+  const withExact = (mutate) => {
+    const frame = exactClipXfbFrame();
+    mutate(frame.geometry.draws[0], frame);
+    return frame;
+  };
+  const reject = (mutate, pattern) => assert.throws(
+    () => context.packGxFramePacketV5(2, withExact(mutate)),
+    pattern,
+  );
+
+  reject(
+    (draw) => { draw.postCullEvidence = Uint8Array.of(3); },
+    /cannot carry both post-cull and exact-clip evidence/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput = "clip"; },
+    /exactClipInput must be an object/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.clipPositions = []; },
+    /clipPositions must be a Float32Array/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.clipPositions = new Float32Array(8); },
+    /four f32 values per source vertex/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.clipPositions[0] = Number.NaN; },
+    /clipPositions must be finite/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.viewport = new Float32Array(5); },
+    /viewport must be a six-f32 Float32Array/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.viewport[1] = 0; },
+    /finite with nonzero X\/Y scales/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.viewport[0] = 640; },
+    /viewport X conflicts with the draw viewport/,
+  );
+  reject(
+    (draw) => { draw.topology = 5; },
+    /requires a nonempty triangle topology/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.bpGenMode = 1 << 14; },
+    /BP0 cull mode conflicts with the draw/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.bpScissorTopLeft = 0x01000000; },
+    /bpScissorTopLeft must be an integer/,
+  );
+  reject(
+    (draw) => { draw.exactClipInput.xfClipDisable = 8; },
+    /xfClipDisable must be an integer/,
+  );
+  reject(
+    (draw) => { draw.vertices[0] = Number.NaN; },
+    /requires finite source vertices/,
   );
 });
 

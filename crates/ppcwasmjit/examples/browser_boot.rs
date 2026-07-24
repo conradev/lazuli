@@ -2222,6 +2222,236 @@ const TEMPLATE: &str = r##"<!doctype html>
       return packet;
     }
 
+    function gxFramePacketExactClipInput(
+      value,
+      topology,
+      vertexCount,
+      cullMode,
+      viewportHalfWidthBits,
+      name
+    ) {
+      if (value === undefined || value === null) return null;
+      if (typeof value !== "object") {
+        throw new TypeError(
+          `GX frame packet ${name}.exactClipInput must be an object`
+        );
+      }
+      if (
+        topology > 4
+        || gxSourceTriangleCount(topology, vertexCount) === 0
+      ) {
+        throw new Error(
+          `GX frame packet ${name}.exactClipInput requires a nonempty triangle topology`
+        );
+      }
+      if (
+        Object.prototype.toString.call(value.clipPositions)
+        !== "[object Float32Array]"
+      ) {
+        throw new TypeError(
+          `GX frame packet ${name}.exactClipInput.clipPositions must be a Float32Array`
+        );
+      }
+      if (value.clipPositions.length !== vertexCount * 4) {
+        throw new RangeError(
+          `GX frame packet ${name}.exactClipInput.clipPositions must contain four f32 values per source vertex`
+        );
+      }
+      const clipPositions = new Float32Array(value.clipPositions);
+      if (!clipPositions.every(Number.isFinite)) {
+        throw new RangeError(
+          `GX frame packet ${name}.exactClipInput.clipPositions must be finite`
+        );
+      }
+      if (
+        Object.prototype.toString.call(value.viewport)
+        !== "[object Float32Array]"
+        || value.viewport.length !== 6
+      ) {
+        throw new TypeError(
+          `GX frame packet ${name}.exactClipInput.viewport must be a six-f32 Float32Array`
+        );
+      }
+      const viewport = new Float32Array(value.viewport);
+      if (
+        !viewport.every(Number.isFinite)
+        || viewport[0] === 0
+        || viewport[1] === 0
+      ) {
+        throw new RangeError(
+          `GX frame packet ${name}.exactClipInput.viewport must be finite with nonzero X/Y scales`
+        );
+      }
+      const scalarBits = new DataView(new ArrayBuffer(4));
+      scalarBits.setFloat32(0, viewport[0], true);
+      if (scalarBits.getUint32(0, true) !== viewportHalfWidthBits) {
+        throw new Error(
+          `GX frame packet ${name}.exactClipInput viewport X conflicts with the draw viewport`
+        );
+      }
+      const bpGenMode = gxFramePacketInteger(
+        value.bpGenMode,
+        `${name}.exactClipInput.bpGenMode`,
+        0x00ffffff
+      );
+      if (((bpGenMode >>> 14) & 3) !== cullMode) {
+        throw new Error(
+          `GX frame packet ${name}.exactClipInput BP0 cull mode conflicts with the draw`
+        );
+      }
+      return {
+        bpGenMode,
+        bpScissorTopLeft: gxFramePacketInteger(
+          value.bpScissorTopLeft,
+          `${name}.exactClipInput.bpScissorTopLeft`,
+          0x00ffffff
+        ),
+        bpScissorBottomRight: gxFramePacketInteger(
+          value.bpScissorBottomRight,
+          `${name}.exactClipInput.bpScissorBottomRight`,
+          0x00ffffff
+        ),
+        bpScissorOffset: gxFramePacketInteger(
+          value.bpScissorOffset,
+          `${name}.exactClipInput.bpScissorOffset`,
+          0x00ffffff
+        ),
+        xfClipDisable: gxFramePacketInteger(
+          value.xfClipDisable,
+          `${name}.exactClipInput.xfClipDisable`,
+          7
+        ),
+        viewport,
+        clipPositions,
+      };
+    }
+
+    // LZGX v5 extends a complete, canonical v4 packet only when at least one
+    // draw carries exact source clip inputs. The aligned v4 action prefix and
+    // every native vertex remain unchanged for strict WebGPU-path preservation.
+    function packGxFramePacketV5(copyKind, frame, residentTextureKeys = null) {
+      const v4 = packGxFramePacketV4(copyKind, frame, residentTextureKeys);
+      const exactInputs = [];
+      let exactBytes = 0;
+      let exactCount = 0;
+      for (let drawIndex = 0; drawIndex < frame.geometry.draws.length; drawIndex += 1) {
+        const draw = frame.geometry.draws[drawIndex];
+        const name = `draws[${drawIndex}]`;
+        const topology = gxFramePacketInteger(draw.topology, `${name}.topology`, 7);
+        const vertexCount = draw.vertices.length / 36;
+        const pipeline = draw.pipeline ?? {};
+        const cullMode = gxFramePacketInteger(
+          pipeline.cullMode ?? 0,
+          `${name}.cullMode`,
+          3
+        );
+        const viewportHalfWidthBits = gxFramePacketInteger(
+          pipeline.viewportHalfWidthBits ?? 0,
+          `${name}.viewportHalfWidthBits`
+        );
+        const exactInput = gxFramePacketExactClipInput(
+          draw.exactClipInput,
+          topology,
+          vertexCount,
+          cullMode,
+          viewportHalfWidthBits,
+          name
+        );
+        if (exactInput !== null) {
+          if (draw.postCullEvidence !== undefined && draw.postCullEvidence !== null) {
+            throw new Error(
+              `GX frame packet ${name} cannot carry both post-cull and exact-clip evidence`
+            );
+          }
+          if (!draw.vertices.every(Number.isFinite)) {
+            throw new RangeError(
+              `GX frame packet ${name}.exactClipInput requires finite source vertices`
+            );
+          }
+          exactCount += 1;
+          exactBytes = gxFramePacketAdd(
+            exactBytes,
+            gxFramePacketAdd(
+              48,
+              exactInput.clipPositions.byteLength,
+              `${name} exact-clip chunk bytes`
+            ),
+            "exact-clip evidence bytes"
+          );
+        }
+        exactInputs.push(exactInput);
+      }
+      if (exactCount === 0) return v4;
+
+      const packetBytes = gxFramePacketAlign16(
+        gxFramePacketAdd(v4.byteLength, exactBytes, "v5 packet bytes"),
+        "v5 packetBytes"
+      );
+      const packet = new ArrayBuffer(packetBytes);
+      const bytes = new Uint8Array(packet);
+      bytes.set(new Uint8Array(v4));
+      const view = new DataView(packet);
+      view.setUint16(0x04, 5, true);
+      view.setUint32(0x08, packetBytes, true);
+
+      const drawTableOffset = view.getUint32(0x1c, true);
+      const drawRecordBytes = view.getUint16(0x78, true);
+      let exactOffset = v4.byteLength;
+      for (let drawIndex = 0; drawIndex < exactInputs.length; drawIndex += 1) {
+        const exactInput = exactInputs[drawIndex];
+        if (exactInput === null) continue;
+        const recordOffset = drawTableOffset + drawIndex * drawRecordBytes;
+        const flags = view.getUint16(recordOffset + 0x02, true);
+        if (flags !== 0) {
+          throw new Error(
+            `GX frame packet draws[${drawIndex}] exact-clip evidence requires zero legacy flags`
+          );
+        }
+        view.setUint16(recordOffset + 0x02, 2, true);
+        view.setUint32(exactOffset + 0x00, 1, true);
+        view.setUint32(exactOffset + 0x04, exactInput.bpGenMode, true);
+        view.setUint32(
+          exactOffset + 0x08,
+          exactInput.bpScissorTopLeft,
+          true
+        );
+        view.setUint32(
+          exactOffset + 0x0c,
+          exactInput.bpScissorBottomRight,
+          true
+        );
+        view.setUint32(
+          exactOffset + 0x10,
+          exactInput.bpScissorOffset,
+          true
+        );
+        view.setUint32(exactOffset + 0x14, exactInput.xfClipDisable, true);
+        for (let component = 0; component < 6; component += 1) {
+          view.setFloat32(
+            exactOffset + 0x18 + component * 4,
+            exactInput.viewport[component],
+            true
+          );
+        }
+        for (
+          let component = 0;
+          component < exactInput.clipPositions.length;
+          component += 1
+        ) {
+          view.setFloat32(
+            exactOffset + 0x30 + component * 4,
+            exactInput.clipPositions[component],
+            true
+          );
+        }
+        exactOffset += 48 + exactInput.clipPositions.byteLength;
+      }
+      if (exactOffset !== packetBytes) {
+        throw new Error("GX frame packet v5 exact-clip layout is not canonical");
+      }
+      return packet;
+    }
+
     function completeRendererFrame(message) {
       const rendererSequence = Number(message.rendererSequence);
       if (
