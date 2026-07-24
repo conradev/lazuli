@@ -25,13 +25,33 @@ function extractFunction(name) {
 }
 
 function temporalCapture(ordinal = 1) {
-  const generation = 500 + ordinal;
+  const topGeneration = 400 + ordinal;
+  const bottomGeneration = 500 + ordinal;
+  const pairEpoch = 300 + ordinal;
   const scanout = {
     scanoutPolicy: "bob",
     fieldStrideBytes: 0x0a00,
     sourceRowStep: 2,
     fieldHeight: 224,
     rowRepeat: 2,
+  };
+  const top = {
+    field: "top",
+    address: "0x01200000",
+    copyIndex: topGeneration,
+    copyRow: 0,
+    width: 640,
+    height: 448,
+    ...scanout,
+  };
+  const bottom = {
+    field: "bottom",
+    address: "0x01200500",
+    copyIndex: bottomGeneration,
+    copyRow: 1,
+    width: 640,
+    height: 448,
+    ...scanout,
   };
   return {
     scenario: "smb-ready-play",
@@ -40,22 +60,37 @@ function temporalCapture(ordinal = 1) {
     rendererSequence: 700 + ordinal,
     presentation: {
       selected: true,
-      field: ordinal % 2 === 0 ? "bottom" : "top",
-      address: "0x01200500",
-      copyIndex: generation,
-      copyRow: 0,
+      status: "vi-interlaced-frame-ready",
+      presentationMode: "interlaced",
+      pairEpoch,
+      presentationSerial: 900 + ordinal,
+      completionField: "bottom",
+      compositionPolicy: "field-pair-weave",
+      fields: { top, bottom },
       width: 640,
       height: 448,
-      ...scanout,
     },
     presentedSurface: {
-      address: "0x01200500",
-      generation,
-      row: 0,
+      pairEpoch,
+      presentationMode: "interlaced",
+      compositionPolicy: "field-pair-weave",
       presentationSerial: 900 + ordinal,
       width: 640,
       height: 448,
-      ...scanout,
+      fields: {
+        top: {
+          address: top.address,
+          generation: topGeneration,
+          row: 0,
+          ...scanout,
+        },
+        bottom: {
+          address: bottom.address,
+          generation: bottomGeneration,
+          row: 1,
+          ...scanout,
+        },
+      },
     },
   };
 }
@@ -138,6 +173,7 @@ function coordinatorHarness() {
     "compositorGeometryEqual",
     "viScanoutProvenance",
     "viScanoutProvenanceEqual",
+    "presentedFieldMatchesExpected",
     "compositorCaptureProvenance",
     "finishCompositorCapture",
     "failCompositorCapture",
@@ -229,36 +265,57 @@ test("two stable animation frames publish one exact frozen descriptor", async ()
     "ordinal",
     "rendererSequence",
     "presentationSerial",
-    "address",
-    "generation",
-    "row",
+    "pairEpoch",
+    "presentationMode",
+    "completionField",
+    "compositionPolicy",
+    "fields",
     "width",
     "height",
-    "scanoutPolicy",
-    "fieldStrideBytes",
-    "sourceRowStep",
-    "fieldHeight",
-    "rowRepeat",
     "geometry",
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(descriptor)), {
-    protocol: "lazuli-compositor-capture-v2",
-    token: "lazuli-compositor-v2:3:1:701:901:00000000-0000-4000-8000-000000000001",
+    protocol: "lazuli-compositor-capture-v3",
+    token: "lazuli-compositor-v3:3:1:701:901:00000000-0000-4000-8000-000000000001",
     scenario: "smb-ready-play",
     step: "post-play-presented",
     ordinal: 1,
     rendererSequence: 701,
     presentationSerial: 901,
-    address: "0x01200500",
-    generation: 501,
-    row: 0,
+    pairEpoch: 301,
+    presentationMode: "interlaced",
+    completionField: "bottom",
+    compositionPolicy: "field-pair-weave",
+    fields: {
+      top: {
+        field: "top",
+        address: "0x01200000",
+        copyIndex: 401,
+        copyRow: 0,
+        width: 640,
+        height: 448,
+        scanoutPolicy: "bob",
+        fieldStrideBytes: 0x0a00,
+        sourceRowStep: 2,
+        fieldHeight: 224,
+        rowRepeat: 2,
+      },
+      bottom: {
+        field: "bottom",
+        address: "0x01200500",
+        copyIndex: 501,
+        copyRow: 1,
+        width: 640,
+        height: 448,
+        scanoutPolicy: "bob",
+        fieldStrideBytes: 0x0a00,
+        sourceRowStep: 2,
+        fieldHeight: 224,
+        rowRepeat: 2,
+      },
+    },
     width: 640,
     height: 448,
-    scanoutPolicy: "bob",
-    fieldStrideBytes: 0x0a00,
-    sourceRowStep: 2,
-    fieldHeight: 224,
-    rowRepeat: 2,
     geometry: {
       canvas: {
         bufferWidth: 640,
@@ -423,7 +480,7 @@ test("provenance mismatch and concurrent capture requests fail closed", async ()
   {
     const harness = coordinatorHarness();
     const capture = temporalCapture();
-    capture.presentedSurface.rowRepeat = 1;
+    capture.presentedSurface.fields.bottom.rowRepeat = 1;
     assert.throws(
       () => harness.context.waitForCompositorCapture(capture, harness.currentWorker),
       /provenance is invalid/,
@@ -432,8 +489,7 @@ test("provenance mismatch and concurrent capture requests fail closed", async ()
   {
     const harness = coordinatorHarness();
     const capture = temporalCapture();
-    capture.presentedSurface.generation = 0;
-    capture.presentation.copyIndex = 0;
+    capture.presentedSurface.fields.bottom.generation = 0;
     assert.throws(
       () => harness.context.waitForCompositorCapture(capture, harness.currentWorker),
       /provenance is invalid/,

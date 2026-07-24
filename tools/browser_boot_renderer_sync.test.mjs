@@ -45,6 +45,7 @@ function workerHarness({ transferMessages = false } = {}) {
     rendererFrameResultMisses: 0,
     rendererFramesAcknowledged: 0,
     rendererFramesInFlight: new Set(),
+    rendererViFrames: new Map(),
     rendererResidentTextureKeys: new Set(),
     smbSustainedViPending: new Map(),
     rendererFrameSequence: 0,
@@ -91,6 +92,16 @@ function workerHarness({ transferMessages = false } = {}) {
 function rendererOperationMetrics() {
   return {
     operations: { enqueued: 0, pending: 0, highWater: 0 },
+  };
+}
+
+function readyViPresentation(pairEpoch = 1, presentationSerial = 1) {
+  return {
+    accepted: true,
+    presented: true,
+    status: "vi-interlaced-frame-ready",
+    pairEpoch,
+    presentationSerial,
   };
 }
 
@@ -530,8 +541,10 @@ test("temporal XFB readback completes before its VI frame acknowledgement", asyn
       calls.push("drain");
       return Promise.resolve();
     },
-    captureTemporalSelectedXfb(message, presented) {
-      calls.push(`capture:${message.rendererSequence}:${presented}`);
+    captureTemporalSelectedXfb(message, presentationResult) {
+      calls.push(
+        `capture:${message.rendererSequence}:${presentationResult.presented}`,
+      );
       return new Promise(resolve => { resolveCapture = resolve; });
     },
     temporalSelectedXfbFrames: [],
@@ -551,7 +564,7 @@ test("temporal XFB readback completes before its VI frame acknowledgement", asyn
     type: "vi-present",
     rendererSequence: 9,
     frame: { temporalXfbCapture: { ordinal: 1 } },
-  }, () => true);
+  }, () => readyViPresentation(4, 7));
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(calls, ["drain", "capture:9:true"]);
   assert.deepEqual(messages, []);
@@ -561,6 +574,7 @@ test("temporal XFB readback completes before its VI frame acknowledgement", asyn
   assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
     type: "renderer-frame-complete",
     rendererSequence: 9,
+    viPresentationResult: readyViPresentation(4, 7),
   }]);
 });
 
@@ -602,7 +616,7 @@ test("a replaced worker cannot leak a pending temporal capture into the next run
     type: "vi-present",
     rendererSequence: 10,
     frame: { temporalXfbCapture: { ordinal: 1 } },
-  }, () => true);
+  }, () => readyViPresentation(5, 8));
   await new Promise(resolve => setImmediate(resolve));
   context.temporalSelectedXfbFrames = replacementFrames;
   context.worker = replacementWorker;

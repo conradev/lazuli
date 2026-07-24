@@ -42,6 +42,7 @@ function evaluate(names, values = {}) {
     rendererHostMetrics: {
       operations: { enqueued: 0, pending: 0, highWater: 0 },
     },
+    lastPresentedViProjection: null,
     Set,
     String,
     Uint8Array,
@@ -53,6 +54,64 @@ function evaluate(names, values = {}) {
     filename: "browser_boot.xfb-readback.js",
   });
   return context;
+}
+
+function rawPresentedField({
+  address,
+  generation,
+  row,
+  surfaceId,
+  scanoutPolicy,
+  fieldStrideBytes,
+  sourceRowStep,
+  fieldHeight,
+  rowRepeat,
+  logicalWidth,
+  logicalHeight,
+}) {
+  return {
+    address,
+    generation,
+    row,
+    sourceRow: row,
+    surfaceId,
+    textureWidth: logicalWidth,
+    textureHeight: logicalHeight,
+    logicalWidth,
+    logicalHeight,
+    displayHeight: fieldHeight * rowRepeat,
+    scanoutPolicy,
+    fieldStrideBytes,
+    sourceRowStep,
+    fieldHeight,
+    rowRepeat,
+  };
+}
+
+function rawSingleFieldFrame(extra = {}) {
+  return {
+    pairEpoch: 12,
+    presentationMode: "single-field",
+    scanoutPolicy: "direct",
+    displayWidth: 2,
+    displayHeight: 1,
+    fields: {
+      top: rawPresentedField({
+        address: 0x01200000,
+        generation: 7,
+        row: 0,
+        surfaceId: 3,
+        scanoutPolicy: "direct",
+        fieldStrideBytes: 8,
+        sourceRowStep: 1,
+        fieldHeight: 1,
+        rowRepeat: 1,
+        logicalWidth: 2,
+        logicalHeight: 1,
+      }),
+    },
+    ...extra,
+  };
 }
 
 test("presented XFB color statistics classify exact RGB values", () => {
@@ -104,6 +163,13 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
       "sha256Hex",
       "presentedXfbRgbBytes",
       "summarizePresentedXfbRgba",
+      "viScanoutProvenance",
+      "readPresentedFieldProvenance",
+      "readPresentedFrameProvenance",
+      "presentedFieldRows",
+      "summarizePresentedFieldRows",
+      "attachPresentedFieldEvidence",
+      "legacyPresentedXfbProjection",
       "readSelectedXfb",
       "captureSelectedXfb",
     ],
@@ -113,24 +179,14 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
         has_presented_xfb() { calls.push("has"); return true; },
         read_presented_xfb_rgba() {
           calls.push("read");
-          return {
-            address: 0x01200500,
-            generation: 7,
-            row: 1,
+          return rawSingleFieldFrame({
             presentationSerial: rawPresentationSerial,
             format: "rgba8unorm",
             layout: "top-left-row-major-tight",
-            sourceRow: 1,
             width: 2,
             height: 1,
-            textureWidth: 2,
-            textureHeight: 2,
-            logicalWidth: 2,
-            logicalHeight: 2,
-            displayWidth: 640,
-            displayHeight: 480,
             rgba,
-          };
+          });
         },
       },
     },
@@ -147,7 +203,9 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
     pending: 0,
     highWater: 0,
   });
-  assert.equal(capture.address, "0x01200500");
+  assert.equal(capture.fields.top.address, "0x01200000");
+  assert.equal(capture.pairEpoch, 12);
+  assert.equal(capture.compositionPolicy, "direct");
   assert.equal(capture.rgbaByteLength, 8);
   assert.equal(capture.rgbaSha256, createHash("sha256").update(rgba).digest("hex"));
   assert.equal(
@@ -206,16 +264,20 @@ test("presented surface capture returns canonical tight RGBA evidence", async ()
       "sha256Hex",
       "presentedXfbRgbBytes",
       "summarizePresentedXfbRgba",
+      "viScanoutProvenance",
+      "readPresentedFieldProvenance",
+      "readPresentedFrameProvenance",
+      "presentedFieldRows",
+      "summarizePresentedFieldRows",
+      "attachPresentedFieldEvidence",
+      "legacyPresentedXfbProjection",
       "readPresentedSurface",
     ],
     {
       webGpuRenderer: {
         has_presented_surface() { return true; },
         read_presented_surface_rgba() {
-          return {
-            address: 0x01200500,
-            generation: 71,
-            row: 1,
+          return rawSingleFieldFrame({
             presentationSerial: 400,
             surfaceFormat: "bgra8unorm-srgb",
             format: "rgba8unorm",
@@ -223,13 +285,13 @@ test("presented surface capture returns canonical tight RGBA evidence", async ()
             width: 2,
             height: 1,
             rgba,
-          };
+          });
         },
       },
     },
   );
   const capture = await context.readPresentedSurface();
-  assert.equal(capture.address, "0x01200500");
+  assert.equal(capture.fields.top.address, "0x01200000");
   assert.equal(capture.presentationSerial, 400);
   assert.equal(capture.surfaceFormat, "bgra8unorm-srgb");
   assert.equal(capture.rgbaByteLength, 8);
@@ -263,31 +325,75 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     fieldHeight: 224,
     rowRepeat: 2,
   };
+  const pairEpoch = 9;
+  const topExpected = {
+    field: "top",
+    address: 0x01200000,
+    copyIndex: 70,
+    copyRow: 0,
+    width: 640,
+    height: 448,
+    ...scanout,
+  };
+  const bottomExpected = {
+    field: "bottom",
+    address: 0x01200500,
+    copyIndex: 71,
+    copyRow: 1,
+    width: 640,
+    height: 448,
+    ...scanout,
+  };
+  const topPresented = rawPresentedField({
+    address: topExpected.address,
+    generation: topExpected.copyIndex,
+    row: topExpected.copyRow,
+    surfaceId: 5,
+    logicalWidth: 640,
+    logicalHeight: 448,
+    ...scanout,
+  });
+  const bottomPresented = rawPresentedField({
+    address: bottomExpected.address,
+    generation: bottomExpected.copyIndex,
+    row: bottomExpected.copyRow,
+    surfaceId: 6,
+    logicalWidth: 640,
+    logicalHeight: 448,
+    ...scanout,
+  });
+  const frameProvenance = {
+    pairEpoch,
+    presentationMode: "interlaced",
+    compositionPolicy: "field-pair-weave",
+    displayWidth: 640,
+    displayHeight: 448,
+    fields: {
+      top: {
+        ...topPresented,
+        address: "0x01200000",
+      },
+      bottom: {
+        ...bottomPresented,
+        address: "0x01200500",
+      },
+    },
+  };
   const selectedXfb = {
-    address: "0x01200500",
-    generation: 71,
-    row: 1,
+    ...frameProvenance,
     presentationSerial: 90,
     width: 640,
     height: 448,
     rgbaSha256: "abc",
     rgbSha256: "rgb-abc",
-    displayWidth: 640,
-    displayHeight: 448,
-    logicalHeight: 448,
-    ...scanout,
     rgb: { black: 0, white: 0, other: 286_720, unique: 4096 },
   };
   const selectedXfbEvidence = { ...selectedXfb };
-  delete selectedXfbEvidence.presentationSerial;
   const presentedSurface = {
-    address: "0x01200500",
-    generation: 71,
-    row: 1,
+    ...frameProvenance,
     presentationSerial: 90,
     width: 640,
     height: 448,
-    ...scanout,
     rgbaSha256: "surface-abc",
     rgbSha256: "surface-rgb-abc",
     rgb: { black: 0, white: 0, other: 286_720, unique: 4096 },
@@ -297,6 +403,9 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
   const context = evaluate([
     "viScanoutProvenance",
     "viScanoutProvenanceEqual",
+    "expectedViPairField",
+    "expectedViPairFields",
+    "presentedFieldMatchesExpected",
     "captureTemporalSelectedXfb",
   ], {
     temporalSelectedXfbCapacity: 8,
@@ -316,6 +425,13 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     rendererSequence: 44,
     frame: {
       field: "bottom",
+      presentationMode: "interlaced",
+      pairEpoch,
+      pairCompleting: true,
+      pairFields: {
+        top: topExpected,
+        bottom: bottomExpected,
+      },
       address: 0x01200500,
       copyIndex: 71,
       copyRow: 1,
@@ -335,8 +451,18 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
       },
     },
   };
+  const presentationResult = {
+    accepted: true,
+    presented: true,
+    status: "vi-interlaced-frame-ready",
+    pairEpoch,
+    presentationSerial: 90,
+  };
 
-  const capture = await context.captureTemporalSelectedXfb(message, true);
+  const capture = await context.captureTemporalSelectedXfb(
+    message,
+    presentationResult,
+  );
   assert.equal(selectedReads, 1);
   assert.equal(surfaceReads, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(capture)), {
@@ -346,6 +472,22 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     rendererSequence: 44,
     presentation: {
       selected: true,
+      status: "vi-interlaced-frame-ready",
+      presentationMode: "interlaced",
+      pairEpoch,
+      presentationSerial: 90,
+      completionField: "bottom",
+      compositionPolicy: "field-pair-weave",
+      fields: {
+        top: {
+          ...topExpected,
+          address: "0x01200000",
+        },
+        bottom: {
+          ...bottomExpected,
+          address: "0x01200500",
+        },
+      },
       field: "bottom",
       address: "0x01200500",
       copyIndex: 71,
@@ -366,10 +508,10 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     JSON.parse(JSON.stringify(context.temporalSelectedXfbFrames[0].selectedXfb)),
     selectedXfbEvidence,
   );
-  assert.notStrictEqual(context.temporalSelectedXfbFrames[0].selectedXfb, selectedXfb);
+  assert.strictEqual(context.temporalSelectedXfbFrames[0].selectedXfb, selectedXfb);
   assert.equal(
     "presentationSerial" in context.temporalSelectedXfbFrames[0].selectedXfb,
-    false,
+    true,
   );
   assert.strictEqual(
     context.temporalSelectedXfbFrames[0].presentedSurface,
@@ -384,7 +526,7 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
         ...message.frame,
         temporalXfbCapture: { ...message.frame.temporalXfbCapture, ordinal: 3 },
       },
-    }, true),
+    }, presentationResult),
     /invalid temporal selected-XFB capture request/,
   );
   assert.equal(selectedReads, 1, "invalid ordering must fail before another readback");
@@ -398,7 +540,7 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
         ...message.frame,
         temporalXfbCapture: { ...message.frame.temporalXfbCapture, ordinal: 2 },
       },
-    }, true),
+    }, presentationResult),
     /invalid temporal selected-XFB capture request/,
   );
   assert.equal(selectedReads, 1, "invalid frame type must fail before another readback");
@@ -412,21 +554,22 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
         width: Number.NaN,
         temporalXfbCapture: { ...message.frame.temporalXfbCapture, ordinal: 2 },
       },
-    }, true),
+    }, presentationResult),
     /invalid temporal selected-XFB capture request/,
   );
   assert.equal(selectedReads, 1, "invalid VI dimensions must fail before another readback");
   assert.equal(surfaceReads, 1, "invalid VI dimensions must fail before another readback");
 
   const mismatches = [
-    ["presentationSerial", 91],
-    ["address", "0x01200504"],
-    ["generation", 72],
-    ["row", 0],
+    [selectedXfb, "presentationSerial", 91],
+    [selectedXfb, "pairEpoch", 10],
+    [selectedXfb.fields.bottom, "address", "0x01200504"],
+    [selectedXfb.fields.bottom, "generation", 72],
+    [selectedXfb.fields.bottom, "row", 0],
   ];
-  for (const [field, invalid] of mismatches) {
-    const prior = selectedXfb[field];
-    selectedXfb[field] = invalid;
+  for (const [target, field, invalid] of mismatches) {
+    const prior = target[field];
+    target[field] = invalid;
     await assert.rejects(
       context.captureTemporalSelectedXfb({
         ...message,
@@ -435,10 +578,10 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
           ...message.frame,
           temporalXfbCapture: { ...message.frame.temporalXfbCapture, ordinal: 2 },
         },
-      }, true),
+      }, presentationResult),
       /presentation identity does not match/,
     );
-    selectedXfb[field] = prior;
+    target[field] = prior;
   }
   assert.equal(selectedReads, 1 + mismatches.length);
   assert.equal(surfaceReads, 1 + mismatches.length);
@@ -449,6 +592,9 @@ test("temporal surface capture fails before renderer acknowledgement when unavai
   const context = evaluate([
     "viScanoutProvenance",
     "viScanoutProvenanceEqual",
+    "expectedViPairField",
+    "expectedViPairFields",
+    "presentedFieldMatchesExpected",
     "captureTemporalSelectedXfb",
   ], {
     temporalSelectedXfbCapacity: 8,
@@ -461,10 +607,41 @@ test("temporal surface capture fails before renderer acknowledgement when unavai
       type: "vi-present",
       rendererSequence: 1,
       frame: {
-        field: "top",
+        field: "bottom",
+        presentationMode: "interlaced",
+        pairEpoch: 1,
+        pairCompleting: true,
+        pairFields: {
+          top: {
+            field: "top",
+            address: 0x01200000,
+            copyIndex: 1,
+            copyRow: 0,
+            width: 640,
+            height: 448,
+            scanoutPolicy: "bob",
+            fieldStrideBytes: 0x0a00,
+            sourceRowStep: 2,
+            fieldHeight: 224,
+            rowRepeat: 2,
+          },
+          bottom: {
+            field: "bottom",
+            address: 0x01200500,
+            copyIndex: 2,
+            copyRow: 1,
+            width: 640,
+            height: 448,
+            scanoutPolicy: "bob",
+            fieldStrideBytes: 0x0a00,
+            sourceRowStep: 2,
+            fieldHeight: 224,
+            rowRepeat: 2,
+          },
+        },
         address: 0x01200500,
-        copyIndex: 1,
-        copyRow: 0,
+        copyIndex: 2,
+        copyRow: 1,
         width: 640,
         height: 448,
         pictureConfiguration: 0x2850,
@@ -484,16 +661,26 @@ test("temporal surface capture fails before renderer acknowledgement when unavai
           capacity: 8,
         },
       },
-    }, true),
+    }, {
+      accepted: true,
+      presented: true,
+      status: "vi-interlaced-frame-ready",
+      pairEpoch: 1,
+      presentationSerial: 1,
+    }),
     /presented-surface capture is unavailable/,
   );
   assert.deepEqual(context.temporalSelectedXfbFrames, []);
 });
 
 test("swapchain capture is opt-in and copied in the presentation encoder", () => {
-  const start = rendererSource.indexOf("pub fn present_xfb");
-  const end = rendererSource.indexOf("\n}\n\nimpl WebGpuRenderer", start);
+  const bridgeStart = rendererSource.indexOf("pub fn present_xfb");
+  const bridgeEnd = rendererSource.indexOf("\n}\n\nimpl WebGpuRenderer", bridgeStart);
+  const bridge = rendererSource.slice(bridgeStart, bridgeEnd);
+  const start = rendererSource.indexOf("fn present_host_xfb_frame");
+  const end = rendererSource.indexOf("\n    fn xfb_present_bind_group", start);
   const present = rendererSource.slice(start, end);
+  assert.match(bridge, /capture_surface: bool/);
   assert.match(present, /capture_surface: bool/);
   assert.match(present, /requested_surface_readback_layout\(\s*capture_surface,/);
   assert.match(present, /let surface_capture = capture_plan\.map/);
@@ -503,11 +690,11 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
   const browserPresent = present.indexOf("output.present()", submit);
   assert.ok(allocation > present.indexOf("capture_plan.map"));
   assert.ok(allocation < copy && copy < submit && submit < browserPresent);
-  const firstRejectedPresentation = present.indexOf("if selected_address == 0");
   for (const field of ["last_presented_xfb", "last_presented_surface"]) {
-    assert.ok(
-      present.indexOf(`self.${field} = None`) < firstRejectedPresentation,
-      `every attempted presentation clears stale ${field} evidence`,
+    assert.doesNotMatch(
+      bridge,
+      new RegExp(`self\\.${field} = None`),
+      `Awaiting and rejected fields must preserve the last complete ${field}`,
     );
   }
   const resetStart = rendererSource.indexOf("pub fn reset(&mut self)");
@@ -530,7 +717,14 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
     rendererSource.slice(selectedReadStart, selectedReadEnd),
     /"presentationSerial"[\s\S]*presented\.presentation_serial/,
   );
-  assert.match(source, /frame\.temporalXfbCapture !== undefined\s*\)\s*,/);
+  const viPresentStart = source.indexOf("webGpuRenderer.present_xfb(");
+  const viPresentEnd = source.indexOf("\n          )", viPresentStart);
+  assert.notEqual(viPresentStart, -1);
+  assert.notEqual(viPresentEnd, -1);
+  assert.match(
+    source.slice(viPresentStart, viPresentEnd),
+    /frame\.temporalXfbCapture !== undefined/,
+  );
 });
 
 test("wgpu WebSurface under-reporting cannot disable the required COPY_SRC usage", () => {
@@ -546,92 +740,116 @@ test("wgpu WebSurface under-reporting cannot disable the required COPY_SRC usage
   assert.doesNotMatch(rendererSource, /CopySourceUnsupported/);
 });
 
-test("temporal selected XFB oracle detects exact monochrome alternation", () => {
+test("temporal XFB oracle distinguishes opposite source fields from host flicker", () => {
   const context = evaluate([
     "viScanoutProvenanceEqual",
+    "presentedFieldMatchesExpected",
+    "temporalPairedEvidenceMatches",
+    "temporalPairedFieldSummary",
     "summarizeTemporalSelectedXfb",
   ], {
     temporalSelectedXfbCapacity: 8,
   });
   const scanout = {
-    scanoutPolicy: "direct",
+    scanoutPolicy: "bob",
     fieldStrideBytes: 8,
-    sourceRowStep: 1,
-    fieldHeight: 2,
-    rowRepeat: 1,
+    sourceRowStep: 2,
+    fieldHeight: 1,
+    rowRepeat: 2,
   };
-  const frame = (ordinal, rgbaSha256, rgb, generation = 200 + ordinal) => ({
-    ordinal,
-    rendererSequence: 100 + ordinal,
-    presentation: {
-      selected: true,
+  const black = { black: 2, white: 0, other: 0, unique: 1 };
+  const white = { black: 0, white: 2, other: 0, unique: 1 };
+  const mixed = { black: 2, white: 2, other: 0, unique: 2 };
+  const frame = ordinal => {
+    const topGeneration = 100 + ordinal;
+    const bottomGeneration = 200 + ordinal;
+    const top = {
       address: "0x01200000",
-      copyIndex: generation,
+      copyIndex: topGeneration,
       copyRow: 0,
-      width: 2,
-      height: 2,
       ...scanout,
-    },
-    selectedXfb: {
-      address: "0x01200000",
-      generation,
-      row: 0,
-      width: 2,
-      height: 2,
-      displayWidth: 2,
-      displayHeight: 2,
+    };
+    const bottom = {
+      address: "0x01200500",
+      copyIndex: bottomGeneration,
+      copyRow: 1,
       ...scanout,
-      rgbaSha256,
-      rgbSha256: rgbaSha256,
-      rgb,
-    },
-  });
-  const black = { black: 4, white: 0, other: 0, unique: 1 };
-  const white = { black: 0, white: 4, other: 0, unique: 1 };
-  const alternating = Array.from({ length: 8 }, (_unused, index) =>
-    frame(index + 1, index % 2 === 0 ? "black" : "white", index % 2 === 0 ? black : white)
-  );
+    };
+    return {
+      ordinal,
+      rendererSequence: 1000 + ordinal,
+      presentation: {
+        selected: true,
+        presentationMode: "interlaced",
+        pairEpoch: ordinal,
+        compositionPolicy: "field-pair-weave",
+        completionField: "bottom",
+        fields: { top, bottom },
+        copyIndex: bottomGeneration,
+        width: 2,
+        height: 2,
+      },
+      selectedXfb: {
+        pairEpoch: ordinal,
+        presentationMode: "interlaced",
+        compositionPolicy: "field-pair-weave",
+        displayWidth: 2,
+        displayHeight: 2,
+        width: 2,
+        height: 2,
+        rgbaSha256: `mixed-rgba-${ordinal}`,
+        rgbSha256: `mixed-rgb-${ordinal}`,
+        rgb: mixed,
+        fields: {
+          top: {
+            address: top.address,
+            generation: topGeneration,
+            row: 0,
+            width: 2,
+            height: 1,
+            rgbaSha256: "black-rgba",
+            rgbSha256: "black-rgb",
+            rgb: black,
+            ...scanout,
+          },
+          bottom: {
+            address: bottom.address,
+            generation: bottomGeneration,
+            row: 1,
+            width: 2,
+            height: 1,
+            rgbaSha256: "white-rgba",
+            rgbSha256: "white-rgb",
+            rgb: white,
+            ...scanout,
+          },
+        },
+      },
+    };
+  };
+  const frames = Array.from({ length: 8 }, (_unused, index) => frame(index + 1));
 
   const oracle = JSON.parse(JSON.stringify(
-    context.summarizeTemporalSelectedXfb(alternating),
+    context.summarizeTemporalSelectedXfb(frames),
   ));
   assert.equal(oracle.complete, true);
-  assert.equal(oracle.distinctRgbaHashes, 2);
-  assert.equal(oracle.distinctRgbHashes, 2);
+  assert.equal(oracle.distinctRgbaHashes, 8);
+  assert.equal(oracle.distinctRgbHashes, 8);
+  assert.equal(oracle.distinctPairEpochs, 8);
   assert.equal(oracle.distinctGenerations, 8);
   assert.equal(oracle.distinctCopyIndices, 8);
   assert.deepEqual(oracle.missingOrUnselectedOrdinals, []);
   assert.deepEqual(oracle.mismatchedPresentationOrdinals, []);
   assert.deepEqual(oracle.generationRegressions, []);
   assert.deepEqual(oracle.copyIndexRegressions, []);
-  assert.deepEqual(oracle.monochromeOrdinals, [1, 2, 3, 4, 5, 6, 7, 8]);
-  assert.deepEqual(oracle.blackOrdinals, [1, 3, 5, 7]);
-  assert.deepEqual(oracle.whiteOrdinals, [2, 4, 6, 8]);
-  assert.equal(oracle.allFramesMonochrome, true);
-  assert.equal(oracle.alternatingMonochromePair, true);
-  assert.equal(oracle.blackWhiteAlternating, true);
-
-  const alphaOnly = Array.from({ length: 8 }, (_unused, index) => {
-    const sample = frame(index + 1, index % 2 === 0 ? "rgba-a" : "rgba-b", black);
-    sample.selectedXfb.rgbSha256 = "black-rgb";
-    return sample;
-  });
-  const alphaOnlyOracle = context.summarizeTemporalSelectedXfb(alphaOnly);
-  assert.equal(alphaOnlyOracle.distinctRgbaHashes, 2);
-  assert.equal(alphaOnlyOracle.distinctRgbHashes, 1);
-  assert.equal(alphaOnlyOracle.alternatingMonochromePair, false);
-  assert.equal(alphaOnlyOracle.blackWhiteAlternating, false);
-
-  alternating[3] = frame(4, "gameplay", {
-    black: 0,
-    white: 0,
-    other: 4,
-    unique: 4,
-  });
-  alternating[5].presentation.selected = false;
-  const mixed = context.summarizeTemporalSelectedXfb(alternating);
-  assert.equal(mixed.allFramesMonochrome, false);
-  assert.equal(mixed.alternatingMonochromePair, false);
-  assert.equal(mixed.blackWhiteAlternating, false);
-  assert.deepEqual(Array.from(mixed.missingOrUnselectedOrdinals), [6]);
+  assert.deepEqual(oracle.monochromeOrdinals, []);
+  assert.deepEqual(oracle.blackOrdinals, []);
+  assert.deepEqual(oracle.whiteOrdinals, []);
+  assert.equal(oracle.allFramesMonochrome, false);
+  assert.equal(oracle.alternatingMonochromePair, false);
+  assert.equal(oracle.blackWhiteAlternating, false);
+  assert.deepEqual(
+    oracle.sourceBlackWhiteSplitOrdinals,
+    [1, 2, 3, 4, 5, 6, 7, 8],
+  );
 });

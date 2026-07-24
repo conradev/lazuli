@@ -605,6 +605,9 @@ test("SMB scenario samples exact guest state and selected XFB provenance", () =>
     viLastPresentationCopyIndex: 17,
     viLastPresentationCycle: 800,
     viPresentationCount: 12,
+    viHostPresentationCount: 6,
+    viFieldStagedCount: 6,
+    viFieldRejectedCount: 0,
     rendererFramesAcknowledged: 44,
     rendererFramesInFlight: new Set(),
     rendererFailure: null,
@@ -695,6 +698,9 @@ test("SMB scenario samples exact guest state and selected XFB provenance", () =>
     demoResourcesReady: 1,
     gameVersion: 0,
     viPresentationCount: 12,
+    viHostPresentationCount: 6,
+    viFieldStagedCount: 6,
+    viFieldRejectedCount: 0,
     viLastPresentationCycle: 800,
     viLastPresentationCopyIndex: 17,
     gxXfbCopyCount: 17,
@@ -874,6 +880,8 @@ test("SMB gameplay input inspector follows player and controller mappings", () =
 
 function sustainedReceipt(index, overrides = {}) {
   const bottom = index % 2 === 1;
+  const presented = bottom;
+  const pairEpoch = Math.floor(index / 2) + 1;
   return {
     scenario: "smb-sustained-play",
     step: "sustained-play-presented",
@@ -881,8 +889,16 @@ function sustainedReceipt(index, overrides = {}) {
     capacity: 120,
     rendererSequence: 1000 + index,
     drained: true,
-    presented: true,
+    accepted: true,
+    presented,
+    status: presented
+      ? "vi-interlaced-frame-ready"
+      : "vi-field-pair-awaiting",
+    pairEpoch,
+    presentationSerial: presented ? pairEpoch : null,
     presentation: {
+      mode: "interlaced",
+      pairCompleting: presented,
       field: bottom ? "bottom" : "top",
       address: bottom ? "0x00307180" : "0x00392c80",
       copyIndex: 2000 + index,
@@ -974,6 +990,9 @@ test("host turns a drained VI present into metadata without selected-XFB readbac
     rendererSequence: receipt.rendererSequence,
     frame: {
       field: receipt.presentation.field,
+      presentationMode: receipt.presentation.mode,
+      pairEpoch: receipt.pairEpoch,
+      pairCompleting: receipt.presentation.pairCompleting,
       address: Number(receipt.presentation.address),
       copyIndex: receipt.presentation.copyIndex,
       copyRow: receipt.presentation.copyRow,
@@ -987,7 +1006,13 @@ test("host turns a drained VI present into metadata without selected-XFB readbac
         gameplay: receipt.gameplay,
       },
     },
-  }, true);
+  }, {
+    accepted: receipt.accepted,
+    presented: receipt.presented,
+    status: receipt.status,
+    pairEpoch: receipt.pairEpoch,
+    presentationSerial: receipt.presentationSerial,
+  });
   assert.deepEqual(JSON.parse(JSON.stringify(captured)), receipt);
   const body = extractFunction("captureSmbSustainedViReceipt");
   assert.doesNotMatch(body, /readSelectedXfb|readPresentedSurface|map_readback/);

@@ -404,7 +404,7 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
     metrics: { calls: 17 },
     selectedXfb: { rgbaSha256: "abc" },
     temporalSelectedXfb: {
-      scanoutEvidenceVersion: 2,
+      scanoutEvidenceVersion: 3,
       capacity: 8,
       frames: [],
       oracle: { captured: 0, capacity: 8 },

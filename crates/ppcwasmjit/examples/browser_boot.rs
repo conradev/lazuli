@@ -952,6 +952,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let runnerResume = null;
     let rendererFrameSequence = 0;
     const rendererFramesInFlight = new Set();
+    const rendererViFrames = new Map();
     let rendererBackpressureResume = null;
     let rendererBackpressureWaits = 0;
     let rendererFramesAcknowledged = 0;
@@ -1343,11 +1344,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function claimSmbSustainedViReceipt() {
+    function claimSmbSustainedViReceipt(fieldPair) {
       const step = controllerScenario?.definition.steps[controllerScenario.stepIndex] ?? null;
       if (
         controllerScenario?.id !== "smb-sustained-play"
         || step?.id !== "sustained-play-presented"
+        || (
+          smbSustainedViReceiptsPosted === 0
+          && fieldPair?.pairCompleting !== false
+        )
         || smbSustainedViReceiptsPosted >= smbSustainedViReceiptCapacity
       ) return null;
       smbSustainedViReceiptsPosted += 1;
@@ -1363,6 +1368,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function postRendererFrame(type, frame, transfer = []) {
       const rendererSequence = ++rendererFrameSequence;
       rendererFramesInFlight.add(rendererSequence);
+      if (type === "vi-present") rendererViFrames.set(rendererSequence, frame);
       if (type === "vi-present" && frame.sustainedPlayReceipt !== undefined) {
         smbSustainedViPending.set(rendererSequence, frame.sustainedPlayReceipt);
       }
@@ -1383,6 +1389,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       } catch (error) {
         rendererFramesInFlight.delete(rendererSequence);
+        rendererViFrames.delete(rendererSequence);
         smbSustainedViPending.delete(rendererSequence);
         throw error;
       }
@@ -2034,6 +2041,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         rendererFrameResultMisses += 1;
         return;
       }
+      const viFrame = rendererViFrames.get(rendererSequence) ?? null;
+      rendererViFrames.delete(rendererSequence);
       const sustainedRequest = smbSustainedViPending.get(rendererSequence) ?? null;
       smbSustainedViPending.delete(rendererSequence);
       if (message.type === "renderer-frame-failed") {
@@ -2050,6 +2059,17 @@ const TEMPLATE: &str = r##"<!doctype html>
           );
         }
       } else {
+        if (viFrame !== null) {
+          if (!acceptViPresentationResult(
+            message.viPresentationResult,
+            viFrame,
+            rendererSequence
+          )) return;
+        } else if (message.viPresentationResult !== undefined) {
+          rendererFrameFailures += 1;
+          recordRendererFailure("non-VI renderer frame returned a VI result");
+          return;
+        }
         if (message.residentTextureKeys !== undefined) {
           if (
             !Array.isArray(message.residentTextureKeys)
@@ -2074,6 +2094,87 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
         if (rendererFramesInFlight.size === 0) rendererBackpressureResume?.();
       }
+    }
+
+    function acceptViPresentationResult(result, frame, rendererSequence) {
+      const valid = result !== null
+        && typeof result === "object"
+        && !Array.isArray(result)
+        && typeof result.accepted === "boolean"
+        && typeof result.presented === "boolean"
+        && typeof result.status === "string"
+        && result.status.length !== 0
+        && Number.isSafeInteger(result.pairEpoch)
+        && result.pairEpoch === frame.pairEpoch
+        && result.pairEpoch >= 1
+        && result.pairEpoch <= 0xffff_ffff
+        && (
+          result.presentationSerial === null
+          || (
+            result.presented === true
+            && Number.isSafeInteger(result.presentationSerial)
+            && result.presentationSerial >= 1
+          )
+        )
+        && !(result.presented && !result.accepted)
+        && (
+          !result.accepted
+          || result.presented === frame.pairCompleting
+        );
+      if (!valid) {
+        rendererFrameFailures += 1;
+        recordRendererFailure("WebGPU renderer returned invalid VI pairing state");
+        return false;
+      }
+      viLastResultStatus = result.status;
+      viLastResultPairEpoch = result.pairEpoch;
+      viResultCounts.set(result.status, (viResultCounts.get(result.status) ?? 0) + 1);
+      if (result.presented) {
+        viHostPresentationCount += 1;
+        viLastHostPresentationCycle = frame.scheduledCycle;
+        viLastHostPresentationField = frame.field;
+        viLastHostPresentationAddress = frame.address;
+        viLastHostPresentationCopyIndex = frame.copyIndex;
+        viLastHostPresentationCopyRow = frame.copyRow;
+        viLastHostPresentationPairEpoch = result.pairEpoch;
+        viLastHostPresentationSerial = result.presentationSerial;
+        deviceEvents.set(
+          "viHostPresent",
+          (deviceEvents.get("viHostPresent") ?? 0) + 1
+        );
+      } else if (result.accepted) {
+        viFieldStagedCount += 1;
+        if (result.status === "vi-field-pair-superseded") {
+          viFieldSupersededCount += 1;
+          deviceEvents.set(
+            "viPairSuperseded",
+            (deviceEvents.get("viPairSuperseded") ?? 0) + 1
+          );
+        }
+        deviceEvents.set(
+          "viFieldStaged",
+          (deviceEvents.get("viFieldStaged") ?? 0) + 1
+        );
+      } else {
+        viFieldRejectedCount += 1;
+        if (viPendingFieldPair?.pairEpoch === result.pairEpoch) {
+          viPendingFieldPair = null;
+        }
+        deviceEvents.set(
+          "viFieldRejected",
+          (deviceEvents.get("viFieldRejected") ?? 0) + 1
+        );
+      }
+      traceVi("field-result", cycles, {
+        rendererSequence,
+        field: frame.field,
+        pairEpoch: result.pairEpoch,
+        accepted: result.accepted,
+        presented: result.presented,
+        status: result.status,
+        presentationSerial: result.presentationSerial,
+      });
+      return true;
     }
 
     function recordRendererFailure(error) {
@@ -2166,7 +2267,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         return reject(".rendererSequence", rendererSequence, receipt.rendererSequence);
       }
       if (receipt.drained !== true) return reject(".drained", true, receipt.drained);
-      if (receipt.presented !== true) return reject(".presented", true, receipt.presented);
+      if (receipt.accepted !== true) return reject(".accepted", true, receipt.accepted);
 
       const presentation = receipt.presentation;
       if (
@@ -2174,6 +2275,99 @@ const TEMPLATE: &str = r##"<!doctype html>
         || typeof presentation !== "object"
         || Array.isArray(presentation)
       ) return reject(".presentation", "an object", presentation);
+      if (presentation.mode !== "interlaced") {
+        return reject(".presentation.mode", "interlaced", presentation.mode);
+      }
+      const pairCompleting = presentation.pairCompleting;
+      if (typeof pairCompleting !== "boolean") {
+        return reject(
+          ".presentation.pairCompleting",
+          "a boolean",
+          pairCompleting
+        );
+      }
+      const expectedPresented = pairCompleting;
+      if (receipt.presented !== expectedPresented) {
+        return reject(".presented", expectedPresented, receipt.presented);
+      }
+      const expectedStatus = pairCompleting
+        ? "vi-interlaced-frame-ready"
+        : "vi-field-pair-awaiting";
+      if (receipt.status !== expectedStatus) {
+        return reject(".status", expectedStatus, receipt.status);
+      }
+      if (
+        !Number.isSafeInteger(receipt.pairEpoch)
+        || receipt.pairEpoch < 1
+        || receipt.pairEpoch > 0xffff_ffff
+      ) {
+        return reject(".pairEpoch", "a positive u32", receipt.pairEpoch);
+      }
+      if (pairCompleting) {
+        if (
+          !Number.isSafeInteger(receipt.presentationSerial)
+          || receipt.presentationSerial < 1
+        ) {
+          return reject(
+            ".presentationSerial",
+            "a positive safe integer",
+            receipt.presentationSerial
+          );
+        }
+      } else if (receipt.presentationSerial !== null) {
+        return reject(".presentationSerial", null, receipt.presentationSerial);
+      }
+      const previousReceipt = smbSustainedViReceipts.at(-1) ?? null;
+      if (previousReceipt === null && pairCompleting) {
+        return reject(".presentation.pairCompleting", false, pairCompleting);
+      }
+      if (previousReceipt !== null) {
+        if (pairCompleting === previousReceipt.presentation.pairCompleting) {
+          return reject(
+            ".presentation.pairCompleting",
+            !previousReceipt.presentation.pairCompleting,
+            pairCompleting,
+            previousReceipt.presentation.pairCompleting
+          );
+        }
+        const expectedPairEpoch = pairCompleting
+          ? previousReceipt.pairEpoch
+          : previousReceipt.pairEpoch + 1;
+        if (receipt.pairEpoch !== expectedPairEpoch) {
+          return reject(
+            ".pairEpoch",
+            expectedPairEpoch,
+            receipt.pairEpoch,
+            previousReceipt.pairEpoch
+          );
+        }
+        if (
+          pairCompleting
+          && previousReceipt.presentationSerial !== null
+        ) {
+          return reject(
+            ".presentationSerial",
+            "the first serial in its pair",
+            receipt.presentationSerial,
+            previousReceipt.presentationSerial
+          );
+        }
+        const previousPresented = smbSustainedViReceipts
+          .filter(candidate => candidate.presented)
+          .at(-1);
+        if (
+          pairCompleting
+          && previousPresented !== undefined
+          && receipt.presentationSerial <= previousPresented.presentationSerial
+        ) {
+          return reject(
+            ".presentationSerial",
+            `a value greater than ${previousPresented.presentationSerial}`,
+            receipt.presentationSerial,
+            previousPresented.presentationSerial
+          );
+        }
+      }
       const previousField = smbSustainedViReceipts.at(-1)?.presentation?.field ?? null;
       const expectedField = previousField === null
         ? presentation.field
@@ -2245,7 +2439,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         return reject(".presentation.copyIndex", "a positive safe integer",
           presentation.copyIndex);
       }
-      const previousReceipt = smbSustainedViReceipts.at(-1) ?? null;
       const previousCopyIndex = previousReceipt?.presentation?.copyIndex ?? null;
       if (
         previousCopyIndex !== null
@@ -3220,12 +3413,22 @@ const TEMPLATE: &str = r##"<!doctype html>
         pendingReceipts: smbSustainedViPending.size,
       };
       const presented = receipts.filter(receipt => receipt.presented === true).length;
+      const staged = receipts.filter(receipt =>
+        receipt.accepted === true && receipt.presented === false
+      ).length;
+      const rejected = receipts.filter(receipt => receipt.accepted !== true).length;
+      const completedPairEpochs = new Set(receipts
+        .filter(receipt => receipt.presented === true)
+        .map(receipt => receipt.pairEpoch)).size;
       const drained = receipts.filter(receipt => receipt.drained === true).length;
       return {
         capacity: smbSustainedViReceiptCapacity,
         received: receipts.length,
         drained,
+        staged,
         presented,
+        rejected,
+        completedPairEpochs,
         topFields: top.length,
         bottomFields: bottom.length,
         strictAlternation,
@@ -3248,7 +3451,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         readyPlayAnchorCaptured: smbReadyPlayAnchor !== null,
         complete: receipts.length === smbSustainedViReceiptCapacity
           && drained === smbSustainedViReceiptCapacity
-          && presented === smbSustainedViReceiptCapacity
+          && staged === smbSustainedViReceiptCapacity / 2
+          && presented === smbSustainedViReceiptCapacity / 2
+          && rejected === 0
+          && completedPairEpochs === smbSustainedViReceiptCapacity / 2
           && top.length === 60
           && bottom.length === 60
           && strictAlternation
@@ -3270,7 +3476,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function snapshotSmbSustainedPlay(scenario = controllerScenario) {
       if (scenario?.id !== "smb-sustained-play") return null;
       return {
-        schema: "lazuli-smb-sustained-play-v1",
+        schema: "lazuli-smb-sustained-play-v2",
         capacity: smbSustainedViReceiptCapacity,
         posted: smbSustainedViReceiptsPosted,
         pending: smbSustainedViPending.size,
@@ -4147,11 +4353,27 @@ const TEMPLATE: &str = r##"<!doctype html>
     let viMissedHalfLines = 0;
     let viPiDeliveries = 0;
     let viPresentationCount = 0;
+    let viHostPresentationCount = 0;
+    let viFieldStagedCount = 0;
+    let viFieldRejectedCount = 0;
+    let viFieldSupersededCount = 0;
+    let viLastResultStatus = null;
+    let viLastResultPairEpoch = null;
+    const viResultCounts = new Map();
+    let viLastHostPresentationCycle = null;
+    let viLastHostPresentationField = null;
+    let viLastHostPresentationAddress = 0;
+    let viLastHostPresentationCopyIndex = 0;
+    let viLastHostPresentationCopyRow = 0;
+    let viLastHostPresentationPairEpoch = null;
+    let viLastHostPresentationSerial = null;
     let viLastPresentationCycle = null;
     let viLastPresentationField = null;
     let viLastPresentationAddress = 0;
     let viLastPresentationCopyIndex = 0;
     let viLastPresentationCopyRow = 0;
+    let viNextPairEpoch = 1;
+    let viPendingFieldPair = null;
     const viComparatorMatches = [0, 0, 0, 0];
     const viStatusAssertions = [0, 0, 0, 0];
     const viInterruptAcknowledgements = [0, 0, 0, 0];
@@ -10356,6 +10578,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         demoResourcesReady: guestS32(0x802f1bb0),
         gameVersion: boot.version,
         viPresentationCount,
+        viHostPresentationCount,
+        viFieldStagedCount,
+        viFieldRejectedCount,
         viLastPresentationCycle,
         viLastPresentationCopyIndex,
         gxXfbCopyCount,
@@ -10779,6 +11004,104 @@ const TEMPLATE: &str = r##"<!doctype html>
       }).join(":");
     }
 
+    function resetViFieldPairing(reason, observedCycles) {
+      if (viPendingFieldPair !== null) {
+        traceVi("field-pair-reset", observedCycles, {
+          reason,
+          pairEpoch: viPendingFieldPair.pairEpoch,
+          field: viPendingFieldPair.field,
+        });
+      }
+      viPendingFieldPair = null;
+    }
+
+    function allocateViPairEpoch() {
+      check(
+        Number.isSafeInteger(viNextPairEpoch)
+          && viNextPairEpoch >= 1
+          && viNextPairEpoch <= 0xffff_ffff,
+        "VI field-pair epoch exhausted"
+      );
+      const pairEpoch = viNextPairEpoch;
+      viNextPairEpoch += 1;
+      return pairEpoch;
+    }
+
+    function claimViFieldPair(
+      field,
+      dimensions,
+      resolved,
+      sourceRowStep,
+      address
+    ) {
+      check(field === "top" || field === "bottom", "invalid VI field parity");
+      const presentationMode = dimensions.rowRepeat === 2
+        ? "interlaced"
+        : "single-field";
+      const member = {
+        field,
+        address,
+        copyIndex: resolved?.frame.index ?? 0,
+        copyRow: resolved?.row ?? 0,
+        width: dimensions.width,
+        height: dimensions.height,
+        fieldStrideBytes: dimensions.fieldStrideBytes,
+        sourceRowStep,
+        fieldHeight: dimensions.fieldHeight,
+        rowRepeat: dimensions.rowRepeat,
+        scanoutPolicy: dimensions.scanoutPolicy,
+      };
+      if (presentationMode !== "interlaced") {
+        viPendingFieldPair = null;
+        return {
+          presentationMode,
+          pairEpoch: allocateViPairEpoch(),
+          pairCompleting: true,
+          fields: { [field]: member },
+        };
+      }
+      const signature = [
+        presentationMode,
+        dimensions.width,
+        dimensions.height,
+        dimensions.fieldStrideBytes,
+        dimensions.fieldHeight,
+        dimensions.rowRepeat,
+        sourceRowStep,
+        resolved?.frame.stride ?? -1,
+        resolved?.frame.width ?? -1,
+        resolved?.frame.height ?? -1,
+      ].join(":");
+      if (
+        viPendingFieldPair !== null
+        && viPendingFieldPair.field !== field
+        && viPendingFieldPair.signature === signature
+      ) {
+        const pending = viPendingFieldPair;
+        viPendingFieldPair = null;
+        return {
+          presentationMode,
+          pairEpoch: pending.pairEpoch,
+          pairCompleting: true,
+          fields: {
+            [pending.field]: pending.member,
+            [field]: member,
+          },
+        };
+      }
+      // Startup can observe either parity first. A duplicate parity abandons
+      // the incomplete producer pair and opens a newer epoch rather than
+      // allowing two same-parity fields to form a host frame.
+      const pairEpoch = allocateViPairEpoch();
+      viPendingFieldPair = { pairEpoch, field, signature, member };
+      return {
+        presentationMode,
+        pairEpoch,
+        pairCompleting: false,
+        fields: { [field]: member },
+      };
+    }
+
     function ensureViSchedule(observedCycles) {
       if (!viScheduleDirty) return;
       viScheduleDirty = false;
@@ -10794,11 +11117,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         nextViCycle = null;
         nextViPresentCycle = null;
         nextSerialPollCycle = null;
+        resetViFieldPairing("timing-invalid", observedCycles);
         return;
       }
 
       if (viTiming === null || decoded.signature !== viTimingSignature) {
         const previousHalfLine = viCurrentHalfLine(observedCycles);
+        resetViFieldPairing("timing-reschedule", observedCycles);
         viTiming = decoded;
         viTimingSignature = decoded.signature;
         viEpochCycle = observedCycles;
@@ -10906,8 +11231,17 @@ const TEMPLATE: &str = r##"<!doctype html>
             && dimensions.fieldStrideBytes % resolved.frame.stride === 0
             ? dimensions.fieldStrideBytes / resolved.frame.stride
             : 0;
-          const temporalXfbCapture = claimSmbTemporalXfbCapture();
-          const sustainedPlayReceipt = claimSmbSustainedViReceipt();
+          const fieldPair = claimViFieldPair(
+            target.field,
+            dimensions,
+            resolved,
+            sourceRowStep,
+            address
+          );
+          const temporalXfbCapture = fieldPair.pairCompleting
+            ? claimSmbTemporalXfbCapture()
+            : null;
+          const sustainedPlayReceipt = claimSmbSustainedViReceipt(fieldPair);
           if (resolved !== null) {
             resolved.frame.displayed = true;
             resolved.frame.displayedAtCycle = scheduledCycle;
@@ -10915,7 +11249,12 @@ const TEMPLATE: &str = r##"<!doctype html>
             resolved.frame.displayedRow = resolved.row;
           }
           postRendererFrame("vi-present", {
+            scheduledCycle,
             field: target.field,
+            presentationMode: fieldPair.presentationMode,
+            pairEpoch: fieldPair.pairEpoch,
+            pairCompleting: fieldPair.pairCompleting,
+            pairFields: fieldPair.fields,
             address,
             width: dimensions.width,
             height: dimensions.height,
@@ -10945,6 +11284,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           traceVi("present", observedCycles, {
             scheduledCycle,
             field: target.field,
+            presentationMode: fieldPair.presentationMode,
+            pairEpoch: fieldPair.pairEpoch,
+            pairCompleting: fieldPair.pairCompleting,
             address: hex32(address),
             copyIndex: resolved?.frame.index ?? null,
             copyRow: resolved?.row ?? null,
@@ -12337,6 +12679,15 @@ const TEMPLATE: &str = r##"<!doctype html>
               highWater: rendererFrameHighWater,
               waits: rendererBackpressureWaits,
               resultMisses: rendererFrameResultMisses,
+              viFields: {
+                submitted: viPresentationCount,
+                staged: viFieldStagedCount,
+                presented: viHostPresentationCount,
+                rejected: viFieldRejectedCount,
+                superseded: viFieldSupersededCount,
+                lastStatus: viLastResultStatus,
+                lastPairEpoch: viLastResultPairEpoch,
+              },
             },
           },
           hostTiming: snapshotWorkerHostTimings(),
@@ -12682,12 +13033,41 @@ const TEMPLATE: &str = r##"<!doctype html>
             lastEventCycle: viLastEventCycle,
             lastEventInterval: viLastEventInterval,
             presentationCount: viPresentationCount,
+            hostPresentationCount: viHostPresentationCount,
+            stagedFieldCount: viFieldStagedCount,
+            rejectedFieldCount: viFieldRejectedCount,
+            supersededFieldCount: viFieldSupersededCount,
+            lastResultStatus: viLastResultStatus,
+            lastResultPairEpoch: viLastResultPairEpoch,
+            lastHostPresentationCycle: viLastHostPresentationCycle,
+            lastHostPresentationField: viLastHostPresentationField,
+            lastHostPresentationAddress: hex32(viLastHostPresentationAddress),
+            lastHostPresentationCopyIndex: viLastHostPresentationCopyIndex,
+            lastHostPresentationCopyRow: viLastHostPresentationCopyRow,
+            lastHostPresentationPairEpoch: viLastHostPresentationPairEpoch,
+            lastHostPresentationSerial: viLastHostPresentationSerial,
+            pendingFieldPair: viPendingFieldPair === null
+              ? null
+              : {
+                pairEpoch: viPendingFieldPair.pairEpoch,
+                field: viPendingFieldPair.field,
+              },
+            resultCounts: Object.fromEntries(
+              [...viResultCounts.entries()].sort(([left], [right]) =>
+                left.localeCompare(right)
+              )
+            ),
             nextPresentationCycle: nextViPresentCycle,
-            lastPresentationCycle: viLastPresentationCycle,
-            lastPresentationField: viLastPresentationField,
-            lastPresentationAddress: hex32(viLastPresentationAddress),
-            lastPresentationCopyIndex: viLastPresentationCopyIndex,
-            lastPresentationCopyRow: viLastPresentationCopyRow,
+            lastPresentationCycle: viLastHostPresentationCycle,
+            lastPresentationField: viLastHostPresentationField,
+            lastPresentationAddress: hex32(viLastHostPresentationAddress),
+            lastPresentationCopyIndex: viLastHostPresentationCopyIndex,
+            lastPresentationCopyRow: viLastHostPresentationCopyRow,
+            lastFieldCycle: viLastPresentationCycle,
+            lastFieldParity: viLastPresentationField,
+            lastFieldAddress: hex32(viLastPresentationAddress),
+            lastFieldCopyIndex: viLastPresentationCopyIndex,
+            lastFieldCopyRow: viLastPresentationCopyRow,
             serialPoll: {
               raw: hex32(view.getUint32(mmio + 0x6430, false)),
               xLines: (view.getUint32(mmio + 0x6430, false) >>> 16) & 0x03ff,
@@ -13390,6 +13770,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     let rendererHostMetrics = newRendererHostMetrics();
     let rendererWorkerStartedAt = performance.now();
+    let lastPresentedViProjection = null;
     const temporalSelectedXfbCapacity = 8;
     let temporalSelectedXfbFrames = [];
     function compositorCaptureOptIn(search) {
@@ -13502,20 +13883,21 @@ const TEMPLATE: &str = r##"<!doctype html>
       const presentation = capture?.presentation;
       const rendererSequence = Number(capture?.rendererSequence);
       const presentationSerial = Number(surface?.presentationSerial);
+      const pairEpoch = Number(surface?.pairEpoch);
       const ordinal = Number(capture?.ordinal);
-      const generation = Number(surface?.generation);
-      const row = Number(surface?.row);
       const width = Number(surface?.width);
       const height = Number(surface?.height);
       if (
         capture?.scenario !== "smb-ready-play"
         || capture?.step !== "post-play-presented"
         || presentation?.selected !== true
-        || typeof surface?.address !== "string"
-        || !/^0x[0-9a-f]{8}$/.test(surface.address)
-        || surface.address !== presentation?.address
-        || generation !== Number(presentation?.copyIndex)
-        || row !== Number(presentation?.copyRow)
+        || presentation?.status !== "vi-interlaced-frame-ready"
+        || presentation?.presentationMode !== "interlaced"
+        || presentation?.compositionPolicy !== "field-pair-weave"
+        || surface?.presentationMode !== presentation.presentationMode
+        || surface?.compositionPolicy !== presentation.compositionPolicy
+        || pairEpoch !== Number(presentation?.pairEpoch)
+        || presentationSerial !== Number(presentation?.presentationSerial)
         || width !== Number(presentation?.width)
         || height !== Number(presentation?.height)
         || !Number.isSafeInteger(ordinal)
@@ -13525,11 +13907,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         || rendererSequence < 1
         || !Number.isSafeInteger(presentationSerial)
         || presentationSerial < 1
-        || !Number.isSafeInteger(generation)
-        || generation < 1
-        || !Number.isSafeInteger(row)
-        || row < 0
-        || row > 1
+        || !Number.isSafeInteger(pairEpoch)
+        || pairEpoch < 1
+        || pairEpoch > 0xffff_ffff
         || !Number.isSafeInteger(width)
         || width <= 0
         || width > 1024
@@ -13539,13 +13919,16 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         throw new Error("compositor capture provenance is invalid");
       }
-      let scanout;
       try {
-        scanout = viScanoutProvenance(surface);
+        for (const parity of ["top", "bottom"]) {
+          if (!presentedFieldMatchesExpected(
+            surface.fields?.[parity],
+            presentation.fields?.[parity]
+          )) {
+            throw new Error("mismatch");
+          }
+        }
       } catch (_error) {
-        throw new Error("compositor capture provenance is invalid");
-      }
-      if (!viScanoutProvenanceEqual(scanout, presentation)) {
         throw new Error("compositor capture provenance is invalid");
       }
       return {
@@ -13554,12 +13937,16 @@ const TEMPLATE: &str = r##"<!doctype html>
         ordinal,
         rendererSequence,
         presentationSerial,
-        address: surface.address,
-        generation,
-        row,
+        pairEpoch,
+        presentationMode: surface.presentationMode,
+        completionField: presentation.completionField,
+        compositionPolicy: surface.compositionPolicy,
+        fields: {
+          top: { ...presentation.fields.top },
+          bottom: { ...presentation.fields.bottom },
+        },
         width,
         height,
-        ...scanout,
       };
     }
     function finishCompositorCapture(active, error = null) {
@@ -13599,7 +13986,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function buildCompositorCaptureDescriptor(provenance, geometry) {
       compositorCaptureSequence += 1;
       const token = [
-        "lazuli-compositor-v2",
+        "lazuli-compositor-v3",
         compositorCaptureWorkerEpoch,
         compositorCaptureSequence,
         provenance.rendererSequence,
@@ -13607,7 +13994,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         crypto.randomUUID(),
       ].join(":");
       return Object.freeze({
-        protocol: "lazuli-compositor-capture-v2",
+        protocol: "lazuli-compositor-capture-v3",
         token,
         ...provenance,
         geometry,
@@ -13731,6 +14118,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       rendererHostMetrics = newRendererHostMetrics();
       rendererWorkerStartedAt = performance.now();
       temporalSelectedXfbFrames = [];
+      lastPresentedViProjection = null;
     }
     let rendererOperationTail = Promise.resolve();
     function appendRendererOperation(operation) {
@@ -13884,6 +14272,213 @@ const TEMPLATE: &str = r##"<!doctype html>
         "rowRepeat",
       ].every(name => left?.[name] === right?.[name]);
     }
+    function readPresentedFieldProvenance(value) {
+      const address = Number(value?.address);
+      const generation = Number(value?.generation);
+      const row = Number(value?.row);
+      const sourceRow = Number(value?.sourceRow);
+      const textureWidth = Number(value?.textureWidth);
+      const textureHeight = Number(value?.textureHeight);
+      const logicalWidth = Number(value?.logicalWidth);
+      const logicalHeight = Number(value?.logicalHeight);
+      const surfaceId = Number(value?.surfaceId);
+      if (
+        value === null
+        || typeof value !== "object"
+        || Array.isArray(value)
+        || !Number.isSafeInteger(address)
+        || address < 0
+        || address > 0xffff_ffff
+        || !Number.isSafeInteger(generation)
+        || generation < 1
+        || !Number.isSafeInteger(row)
+        || row < 0
+        || row > 1
+        || !Number.isSafeInteger(sourceRow)
+        || sourceRow < 0
+        || !Number.isSafeInteger(textureWidth)
+        || textureWidth <= 0
+        || !Number.isSafeInteger(textureHeight)
+        || textureHeight <= 0
+        || !Number.isSafeInteger(logicalWidth)
+        || logicalWidth <= 0
+        || !Number.isSafeInteger(logicalHeight)
+        || logicalHeight <= 0
+        || !Number.isSafeInteger(surfaceId)
+        || surfaceId < 1
+      ) {
+        throw new Error("WebGPU presented field provenance is invalid");
+      }
+      const scanout = viScanoutProvenance(value);
+      return {
+        address: "0x" + address.toString(16).padStart(8, "0"),
+        generation,
+        row,
+        sourceRow,
+        surfaceId,
+        textureWidth,
+        textureHeight,
+        logicalWidth,
+        logicalHeight,
+        ...scanout,
+      };
+    }
+    function readPresentedFrameProvenance(capture) {
+      const pairEpoch = Number(capture?.pairEpoch);
+      const presentationMode = String(capture?.presentationMode);
+      const displayWidth = Number(capture?.displayWidth);
+      const displayHeight = Number(capture?.displayHeight);
+      const compositionPolicy = String(capture?.scanoutPolicy);
+      const rawFields = capture?.fields;
+      if (
+        !Number.isSafeInteger(pairEpoch)
+        || pairEpoch < 1
+        || pairEpoch > 0xffff_ffff
+        || ![
+          "progressive",
+          "single-field",
+          "interlaced",
+        ].includes(presentationMode)
+        || !Number.isSafeInteger(displayWidth)
+        || displayWidth <= 0
+        || !Number.isSafeInteger(displayHeight)
+        || displayHeight <= 0
+        || compositionPolicy !== (
+          presentationMode === "interlaced" ? "weave" : "direct"
+        )
+        || rawFields === null
+        || typeof rawFields !== "object"
+        || Array.isArray(rawFields)
+      ) {
+        throw new Error("WebGPU presented frame provenance is invalid");
+      }
+      const fields = {};
+      for (const parity of ["top", "bottom"]) {
+        if (rawFields[parity] !== undefined) {
+          fields[parity] = readPresentedFieldProvenance(rawFields[parity]);
+        }
+      }
+      const fieldNames = Object.keys(fields);
+      if (
+        (
+          presentationMode === "interlaced"
+          && (
+            fieldNames.length !== 2
+            || fields.top === undefined
+            || fields.bottom === undefined
+          )
+        )
+        || (
+          presentationMode !== "interlaced"
+          && fieldNames.length !== 1
+        )
+        || fieldNames.some(parity =>
+          fields[parity].logicalWidth !== displayWidth
+          || fields[parity].rowRepeat !== (
+            presentationMode === "interlaced" ? 2 : 1
+          )
+          || fields[parity].fieldHeight * fields[parity].rowRepeat
+            !== displayHeight
+        )
+      ) {
+        throw new Error("WebGPU presented frame fields are invalid");
+      }
+      return {
+        pairEpoch,
+        presentationMode,
+        compositionPolicy: presentationMode === "interlaced"
+          ? "field-pair-weave"
+          : "direct",
+        displayWidth,
+        displayHeight,
+        fields,
+      };
+    }
+    function presentedFieldRows(rgba, width, height, parity) {
+      const rowParity = parity === "top" ? 0 : parity === "bottom" ? 1 : -1;
+      if (
+        rowParity < 0
+        || !(rgba instanceof Uint8Array)
+        || !Number.isSafeInteger(width)
+        || width <= 0
+        || !Number.isSafeInteger(height)
+        || height <= 0
+        || rgba.byteLength !== width * height * 4
+      ) {
+        throw new Error("WebGPU paired field rows are invalid");
+      }
+      const fieldHeight = Math.floor((height + 1 - rowParity) / 2);
+      const rowBytes = width * 4;
+      const rows = new Uint8Array(rowBytes * fieldHeight);
+      for (
+        let sourceRow = rowParity, destinationRow = 0;
+        sourceRow < height;
+        sourceRow += 2, destinationRow += 1
+      ) {
+        rows.set(
+          rgba.subarray(sourceRow * rowBytes, (sourceRow + 1) * rowBytes),
+          destinationRow * rowBytes
+        );
+      }
+      return { width, height: fieldHeight, rgba: rows };
+    }
+    async function summarizePresentedFieldRows(rgba, width, height, parity) {
+      const field = presentedFieldRows(rgba, width, height, parity);
+      const [rgbaSha256, rgbSha256] = await Promise.all([
+        sha256Hex(field.rgba),
+        sha256Hex(presentedXfbRgbBytes(field.rgba, field.width, field.height)),
+      ]);
+      return {
+        width: field.width,
+        height: field.height,
+        rgbaByteLength: field.rgba.byteLength,
+        rgbaSha256,
+        rgbSha256,
+        rgb: summarizePresentedXfbRgba(field.rgba, field.width, field.height),
+      };
+    }
+    async function attachPresentedFieldEvidence(provenance, rgba, width, height) {
+      const fields = {};
+      for (const parity of Object.keys(provenance.fields)) {
+        const evidence = provenance.presentationMode === "interlaced"
+          ? await summarizePresentedFieldRows(rgba, width, height, parity)
+          : {
+            width,
+            height,
+            rgbaByteLength: rgba.byteLength,
+            rgbaSha256: await sha256Hex(rgba),
+            rgbSha256: await sha256Hex(presentedXfbRgbBytes(rgba, width, height)),
+            rgb: summarizePresentedXfbRgba(rgba, width, height),
+          };
+        fields[parity] = { ...provenance.fields[parity], ...evidence };
+      }
+      return { ...provenance, fields };
+    }
+    function legacyPresentedXfbProjection(provenance) {
+      const preferredParity = lastPresentedViProjection?.pairEpoch
+        === provenance.pairEpoch
+        ? lastPresentedViProjection.field
+        : provenance.fields.bottom === undefined ? "top" : "bottom";
+      const field = provenance.fields[preferredParity];
+      if (field === undefined) {
+        throw new Error("WebGPU presented frame has no compatibility field");
+      }
+      return {
+        address: field.address,
+        generation: field.generation,
+        row: field.row,
+        sourceRow: field.sourceRow,
+        textureWidth: field.textureWidth,
+        textureHeight: field.textureHeight,
+        logicalWidth: field.logicalWidth,
+        logicalHeight: field.logicalHeight,
+        scanoutPolicy: field.scanoutPolicy,
+        fieldStrideBytes: field.fieldStrideBytes,
+        sourceRowStep: field.sourceRowStep,
+        fieldHeight: field.fieldHeight,
+        rowRepeat: field.rowRepeat,
+      };
+    }
     async function readSelectedXfb(includePresentationSerial = false) {
       if (!webGpuRenderer.has_presented_xfb()) return null;
       const capture = await webGpuRenderer.read_presented_xfb_rgba();
@@ -13892,31 +14487,30 @@ const TEMPLATE: &str = r##"<!doctype html>
         : new Uint8Array(capture.rgba);
       const width = Number(capture.width);
       const height = Number(capture.height);
+      const provenance = await attachPresentedFieldEvidence(
+        readPresentedFrameProvenance(capture),
+        rgba,
+        width,
+        height
+      );
+      if (
+        width !== provenance.displayWidth
+        || height !== provenance.displayHeight
+      ) {
+        throw new Error("selected WebGPU XFB dimensions do not match provenance");
+      }
       const rgb = summarizePresentedXfbRgba(rgba, width, height);
       const [rgbaSha256, rgbSha256] = await Promise.all([
         sha256Hex(rgba),
         sha256Hex(presentedXfbRgbBytes(rgba, width, height)),
       ]);
       const result = {
-        address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
-        generation: Number(capture.generation),
-        row: Number(capture.row),
+        ...provenance,
+        ...legacyPresentedXfbProjection(provenance),
         format: String(capture.format),
         layout: String(capture.layout),
-        sourceRow: Number(capture.sourceRow),
         width,
         height,
-        textureWidth: Number(capture.textureWidth),
-        textureHeight: Number(capture.textureHeight),
-        logicalWidth: Number(capture.logicalWidth),
-        logicalHeight: Number(capture.logicalHeight),
-        displayWidth: Number(capture.displayWidth),
-        displayHeight: Number(capture.displayHeight),
-        scanoutPolicy: String(capture.scanoutPolicy),
-        fieldStrideBytes: Number(capture.fieldStrideBytes),
-        sourceRowStep: Number(capture.sourceRowStep),
-        fieldHeight: Number(capture.fieldHeight),
-        rowRepeat: Number(capture.rowRepeat),
         rgbaByteLength: rgba.byteLength,
         rgbaSha256,
         rgbSha256,
@@ -13939,6 +14533,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         : new Uint8Array(capture.rgba);
       const width = Number(capture.width);
       const height = Number(capture.height);
+      const provenance = await attachPresentedFieldEvidence(
+        readPresentedFrameProvenance(capture),
+        rgba,
+        width,
+        height
+      );
+      if (
+        width !== provenance.displayWidth
+        || height !== provenance.displayHeight
+      ) {
+        throw new Error("WebGPU surface dimensions do not match provenance");
+      }
       const surfaceFormat = String(capture.surfaceFormat);
       if (![
         "rgba8unorm",
@@ -13954,29 +14560,91 @@ const TEMPLATE: &str = r##"<!doctype html>
         sha256Hex(presentedXfbRgbBytes(rgba, width, height)),
       ]);
       return {
-        address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
-        generation: Number(capture.generation),
-        row: Number(capture.row),
+        ...provenance,
+        ...legacyPresentedXfbProjection(provenance),
         presentationSerial: Number(capture.presentationSerial),
         surfaceFormat,
         format: String(capture.format),
         layout: String(capture.layout),
         width,
         height,
-        scanoutPolicy: String(capture.scanoutPolicy),
-        fieldStrideBytes: Number(capture.fieldStrideBytes),
-        sourceRowStep: Number(capture.sourceRowStep),
-        fieldHeight: Number(capture.fieldHeight),
-        rowRepeat: Number(capture.rowRepeat),
         rgbaByteLength: rgba.byteLength,
         rgbaSha256,
         rgbSha256,
         rgb,
       };
     }
+    function expectedViPairField(value) {
+      const field = value?.field;
+      const address = Number(value?.address);
+      const copyIndex = Number(value?.copyIndex);
+      const copyRow = Number(value?.copyRow);
+      const width = Number(value?.width);
+      const height = Number(value?.height);
+      if (
+        (field !== "top" && field !== "bottom")
+        || !Number.isSafeInteger(address)
+        || address < 0
+        || address > 0xffff_ffff
+        || !Number.isSafeInteger(copyIndex)
+        || copyIndex < 1
+        || !Number.isSafeInteger(copyRow)
+        || copyRow < 0
+        || copyRow > 1
+        || !Number.isSafeInteger(width)
+        || width <= 0
+        || !Number.isSafeInteger(height)
+        || height <= 0
+      ) {
+        throw new Error("worker VI pair field provenance is invalid");
+      }
+      return {
+        field,
+        address: "0x" + address.toString(16).padStart(8, "0"),
+        copyIndex,
+        copyRow,
+        width,
+        height,
+        ...viScanoutProvenance({ ...value, row: copyRow }),
+      };
+    }
+    function expectedViPairFields(frame) {
+      const fields = {};
+      const rawFields = frame?.pairFields;
+      if (
+        rawFields === null
+        || typeof rawFields !== "object"
+        || Array.isArray(rawFields)
+      ) {
+        throw new Error("worker VI pair provenance is unavailable");
+      }
+      for (const parity of ["top", "bottom"]) {
+        if (rawFields[parity] !== undefined) {
+          const field = expectedViPairField(rawFields[parity]);
+          if (field.field !== parity) {
+            throw new Error("worker VI pair parity is invalid");
+          }
+          fields[parity] = field;
+        }
+      }
+      if (
+        frame.presentationMode === "interlaced"
+          ? fields.top === undefined || fields.bottom === undefined
+          : Object.keys(fields).length !== 1
+      ) {
+        throw new Error("worker VI pair is incomplete");
+      }
+      return fields;
+    }
+    function presentedFieldMatchesExpected(actual, expected) {
+      return actual?.address === expected?.address
+        && actual?.generation === expected?.copyIndex
+        && actual?.row === expected?.copyRow
+        && viScanoutProvenanceEqual(actual, expected);
+    }
     async function captureTemporalSelectedXfb(
       message,
-      presented,
+      presentationResult,
       frames = temporalSelectedXfbFrames
     ) {
       const rendererSequence = Number(message.rendererSequence);
@@ -13993,7 +14661,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         message?.type !== "vi-present"
         || request?.scenario !== "smb-ready-play"
         || request?.step !== "post-play-presented"
-        || presented !== true
+        || presentationResult?.accepted !== true
+        || presentationResult?.presented !== true
+        || presentationResult?.status !== "vi-interlaced-frame-ready"
+        || presentationResult?.pairEpoch !== Number(frame?.pairEpoch)
+        || presentationResult?.presentationSerial === null
+        || frame?.pairCompleting !== true
+        || frame?.presentationMode !== "interlaced"
         || !Number.isSafeInteger(rendererSequence)
         || !Number.isSafeInteger(ordinal)
         || ordinal !== frames.length + 1
@@ -14036,6 +14710,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         throw new Error("invalid temporal VI raw scanout geometry");
       }
       const scanout = viScanoutProvenance({ ...frame, row: copyRow });
+      const expectedFields = expectedViPairFields(frame);
       const [selectedXfb, presentedSurface] = await Promise.all([
         readSelectedXfb(true),
         readPresentedSurface(),
@@ -14047,28 +14722,47 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (
         selectedXfb === null
         || selectedXfb.presentationSerial !== presentedSurface.presentationSerial
-        || selectedXfb.address !== presentationAddress
-        || selectedXfb.address !== presentedSurface.address
-        || selectedXfb.generation !== copyIndex
-        || selectedXfb.generation !== presentedSurface.generation
-        || selectedXfb.row !== copyRow
-        || selectedXfb.row !== presentedSurface.row
-        || !viScanoutProvenanceEqual(scanout, selectedXfb)
-        || !viScanoutProvenanceEqual(scanout, presentedSurface)
+        || selectedXfb.presentationSerial !== presentationResult.presentationSerial
+        || selectedXfb.pairEpoch !== presentationResult.pairEpoch
+        || selectedXfb.pairEpoch !== presentedSurface.pairEpoch
+        || selectedXfb.presentationMode !== frame.presentationMode
+        || selectedXfb.presentationMode !== presentedSurface.presentationMode
+        || selectedXfb.compositionPolicy !== presentedSurface.compositionPolicy
+        || selectedXfb.displayWidth !== width
+        || selectedXfb.displayHeight !== height
+        || presentedSurface.displayWidth !== width
+        || presentedSurface.displayHeight !== height
+        || !["top", "bottom"].every(parity =>
+          presentedFieldMatchesExpected(
+            selectedXfb.fields?.[parity],
+            expectedFields[parity]
+          )
+          && presentedFieldMatchesExpected(
+            presentedSurface.fields?.[parity],
+            expectedFields[parity]
+          )
+          && selectedXfb.fields?.[parity]?.rgbaSha256
+            === presentedSurface.fields?.[parity]?.rgbaSha256
+          && selectedXfb.fields?.[parity]?.rgbSha256
+            === presentedSurface.fields?.[parity]?.rgbSha256
+        )
       ) {
         throw new Error("captured WebGPU presentation identity does not match");
       }
-      const {
-        presentationSerial: _selectedPresentationSerial,
-        ...selectedXfbEvidence
-      } = selectedXfb;
       const capture = {
         scenario: request.scenario,
         step: request.step,
         ordinal,
         rendererSequence,
         presentation: {
-          selected: Boolean(presented),
+          selected: presentationResult.presented,
+          status: presentationResult.status,
+          presentationMode: frame.presentationMode,
+          pairEpoch: presentationResult.pairEpoch,
+          presentationSerial: presentationResult.presentationSerial,
+          completionField: frame.field,
+          compositionPolicy: selectedXfb.compositionPolicy,
+          fields: expectedFields,
           field: frame.field,
           address: presentationAddress,
           copyIndex,
@@ -14082,13 +14776,13 @@ const TEMPLATE: &str = r##"<!doctype html>
           nonInterlaced,
           ...scanout,
         },
-        selectedXfb: selectedXfbEvidence,
+        selectedXfb,
         presentedSurface,
       };
       frames.push(capture);
       return capture;
     }
-    function captureSmbSustainedViReceipt(message, presented) {
+    function captureSmbSustainedViReceipt(message, presentationResult) {
       const frame = message?.frame;
       const request = frame?.sustainedPlayReceipt;
       const rendererSequence = Number(message?.rendererSequence);
@@ -14109,6 +14803,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         || ordinal < 1
         || ordinal > 120
         || capacity !== 120
+        || presentationResult === null
+        || typeof presentationResult !== "object"
+        || Array.isArray(presentationResult)
+        || typeof presentationResult.accepted !== "boolean"
+        || typeof presentationResult.presented !== "boolean"
+        || typeof presentationResult.status !== "string"
+        || presentationResult.pairEpoch !== Number(frame?.pairEpoch)
+        || (
+          presentationResult.presentationSerial !== null
+          && !Number.isSafeInteger(presentationResult.presentationSerial)
+        )
         || (frame?.field !== "top" && frame?.field !== "bottom")
         || !Number.isSafeInteger(address)
         || address < 0
@@ -14150,8 +14855,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         capacity,
         rendererSequence,
         drained: true,
-        presented: presented === true,
+        accepted: presentationResult.accepted,
+        presented: presentationResult.presented,
+        status: presentationResult.status,
+        pairEpoch: presentationResult.pairEpoch,
+        presentationSerial: presentationResult.presentationSerial,
         presentation: {
+          mode: frame.presentationMode,
+          pairCompleting: frame.pairCompleting,
           field: frame.field,
           address: "0x" + address.toString(16).padStart(8, "0"),
           copyIndex,
@@ -14162,22 +14873,50 @@ const TEMPLATE: &str = r##"<!doctype html>
         gameplay: gameplaySnapshot,
       };
     }
+    function temporalPairedEvidenceMatches(evidence, presentation) {
+      return evidence !== null
+        && evidence.pairEpoch === presentation.pairEpoch
+        && evidence.presentationMode === presentation.presentationMode
+        && evidence.compositionPolicy === presentation.compositionPolicy
+        && evidence.displayWidth === presentation.width
+        && evidence.displayHeight === presentation.height
+        && ["top", "bottom"].every(parity =>
+          presentedFieldMatchesExpected(
+            evidence.fields?.[parity],
+            presentation.fields?.[parity]
+          )
+        );
+    }
+    function temporalPairedFieldSummary(evidence, parity) {
+      const field = evidence?.fields?.[parity] ?? null;
+      const pixels = field === null ? 0 : field.width * field.height;
+      return {
+        address: field?.address ?? null,
+        generation: field?.generation ?? null,
+        rgbaSha256: field?.rgbaSha256 ?? null,
+        rgbSha256: field?.rgbSha256 ?? null,
+        monochrome: field !== null && field.rgb.unique === 1,
+        allBlack: field !== null && field.rgb.black === pixels,
+        allWhite: field !== null && field.rgb.white === pixels,
+      };
+    }
     function summarizeTemporalSelectedXfb(frames) {
       const classified = frames.map(frame => {
         const selected = frame.selectedXfb;
         const pixels = selected === null ? 0 : selected.width * selected.height;
-        const matchesPresentation = selected !== null
-          && selected.address === frame.presentation.address
-          && selected.generation === frame.presentation.copyIndex
-          && selected.row === frame.presentation.copyRow
-          && selected.displayWidth === frame.presentation.width
-          && selected.displayHeight === frame.presentation.height
-          && viScanoutProvenanceEqual(selected, frame.presentation);
+        const matchesPresentation = temporalPairedEvidenceMatches(
+          selected,
+          frame.presentation
+        );
+        const top = temporalPairedFieldSummary(selected, "top");
+        const bottom = temporalPairedFieldSummary(selected, "bottom");
+        const completion = selected?.fields?.[frame.presentation.completionField] ?? null;
         return {
           ordinal: frame.ordinal,
           rendererSequence: frame.rendererSequence,
+          pairEpoch: frame.presentation.pairEpoch,
           copyIndex: frame.presentation.copyIndex,
-          generation: selected?.generation ?? null,
+          generation: completion?.generation ?? null,
           rgbaSha256: selected?.rgbaSha256 ?? null,
           rgbSha256: selected?.rgbSha256 ?? null,
           selected: frame.presentation.selected && selected !== null,
@@ -14185,6 +14924,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           monochrome: selected !== null && selected.rgb.unique === 1,
           allBlack: selected !== null && selected.rgb.black === pixels,
           allWhite: selected !== null && selected.rgb.white === pixels,
+          sourceBlackWhiteSplit:
+            (top.allBlack && bottom.allWhite)
+            || (top.allWhite && bottom.allBlack),
+          fields: { top, bottom },
         };
       });
       const rgbaHashes = classified
@@ -14207,6 +14950,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         complete: classified.length === temporalSelectedXfbCapacity,
         distinctRgbaHashes: new Set(rgbaHashes).size,
         distinctRgbHashes: new Set(rgbHashes).size,
+        distinctPairEpochs: new Set(classified.map(frame => frame.pairEpoch)).size,
         distinctGenerations: new Set(classified
           .map(frame => frame.generation)
           .filter(generation => generation !== null)).size,
@@ -14237,6 +14981,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           && adjacentFramesAlternate(classified, "rgbSha256"),
         blackWhiteAlternating: blackWhite.length === classified.length
           && blackAndWhiteAlternate(classified),
+        sourceBlackWhiteSplitOrdinals: classified
+          .filter(frame => frame.sourceBlackWhiteSplit)
+          .map(frame => frame.ordinal),
         frames: classified,
       };
     }
@@ -14244,19 +14991,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       const classified = frames.map(frame => {
         const surface = frame.presentedSurface;
         const pixels = surface === null ? 0 : surface.width * surface.height;
-        const matchesPresentation = surface !== null
-          && surface.address === frame.presentation.address
-          && surface.generation === frame.presentation.copyIndex
-          && surface.row === frame.presentation.copyRow
-          && surface.width === frame.presentation.width
-          && surface.height === frame.presentation.height
-          && viScanoutProvenanceEqual(surface, frame.presentation);
+        const matchesPresentation = temporalPairedEvidenceMatches(
+          surface,
+          frame.presentation
+        );
+        const top = temporalPairedFieldSummary(surface, "top");
+        const bottom = temporalPairedFieldSummary(surface, "bottom");
+        const completion = surface?.fields?.[frame.presentation.completionField] ?? null;
         return {
           ordinal: frame.ordinal,
           rendererSequence: frame.rendererSequence,
+          pairEpoch: frame.presentation.pairEpoch,
           presentationSerial: surface?.presentationSerial ?? null,
           copyIndex: frame.presentation.copyIndex,
-          generation: surface?.generation ?? null,
+          generation: completion?.generation ?? null,
           rgbaSha256: surface?.rgbaSha256 ?? null,
           rgbSha256: surface?.rgbSha256 ?? null,
           captured: surface !== null,
@@ -14264,6 +15012,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           monochrome: surface !== null && surface.rgb.unique === 1,
           allBlack: surface !== null && surface.rgb.black === pixels,
           allWhite: surface !== null && surface.rgb.white === pixels,
+          sourceBlackWhiteSplit:
+            (top.allBlack && bottom.allWhite)
+            || (top.allWhite && bottom.allBlack),
+          fields: { top, bottom },
         };
       });
       const rgbaHashes = classified
@@ -14287,6 +15039,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           && classified.every(frame => frame.captured),
         distinctRgbaHashes: new Set(rgbaHashes).size,
         distinctRgbHashes: new Set(rgbHashes).size,
+        distinctPairEpochs: new Set(classified.map(frame => frame.pairEpoch)).size,
         distinctPresentationSerials: new Set(classified
           .map(frame => frame.presentationSerial)
           .filter(serial => serial !== null)).size,
@@ -14312,6 +15065,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           && adjacentFramesAlternate(classified, "rgbSha256"),
         blackWhiteAlternating: blackWhite.length === classified.length
           && blackAndWhiteAlternate(classified),
+        sourceBlackWhiteSplitOrdinals: classified
+          .filter(frame => frame.sourceBlackWhiteSplit)
+          .map(frame => frame.ordinal),
         frames: classified,
       };
     }
@@ -14364,17 +15120,37 @@ const TEMPLATE: &str = r##"<!doctype html>
         const metrics = snapshotRendererPerformance(hostMetrics);
         const selectedXfb = await readSelectedXfb();
         const temporalSelectedXfb = {
-          scanoutEvidenceVersion: 2,
+          scanoutEvidenceVersion: 3,
           capacity: temporalSelectedXfbCapacity,
           frames: temporalFrames.map(frame => ({
             ...frame,
-            presentation: { ...frame.presentation },
+            presentation: {
+              ...frame.presentation,
+              fields: Object.fromEntries(Object.entries(frame.presentation.fields)
+                .map(([parity, field]) => [parity, { ...field }]))
+            },
             selectedXfb: frame.selectedXfb === null
               ? null
-              : { ...frame.selectedXfb, rgb: { ...frame.selectedXfb.rgb } },
+              : {
+                ...frame.selectedXfb,
+                fields: Object.fromEntries(Object.entries(frame.selectedXfb.fields)
+                  .map(([parity, field]) => [
+                    parity,
+                    { ...field, rgb: { ...field.rgb } },
+                  ])),
+                rgb: { ...frame.selectedXfb.rgb },
+              },
             presentedSurface: frame.presentedSurface === null
               ? null
-              : { ...frame.presentedSurface, rgb: { ...frame.presentedSurface.rgb } },
+              : {
+                ...frame.presentedSurface,
+                fields: Object.fromEntries(Object.entries(frame.presentedSurface.fields)
+                  .map(([parity, field]) => [
+                    parity,
+                    { ...field, rgb: { ...field.rgb } },
+                  ])),
+                rgb: { ...frame.presentedSurface.rgb },
+              },
           })),
           oracle: summarizeTemporalSelectedXfb(temporalFrames),
           surfaceOracle: summarizeTemporalPresentedSurfaces(temporalFrames),
@@ -14960,6 +15736,79 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
     }
+    function validateViPresentationResult(frame, result) {
+      if (result === null || typeof result !== "object" || Array.isArray(result)) {
+        throw new TypeError("WebGPU VI presentation result is not an object");
+      }
+      const accepted = result.accepted;
+      const presented = result.presented;
+      const status = result.status;
+      const pairEpoch = Number(result.pairEpoch);
+      const presentationSerial = result.presentationSerial;
+      const expectedReadyStatus = new Map([
+        ["progressive", "vi-progressive-frame-ready"],
+        ["single-field", "vi-single-field-frame-ready"],
+        ["interlaced", "vi-interlaced-frame-ready"],
+      ]).get(frame?.presentationMode);
+      const readyStatuses = new Set([
+        "vi-progressive-frame-ready",
+        "vi-single-field-frame-ready",
+        "vi-interlaced-frame-ready",
+      ]);
+      const stagedStatuses = new Set([
+        "vi-field-pair-awaiting",
+        "vi-field-pair-superseded",
+      ]);
+      if (
+        typeof accepted !== "boolean"
+        || typeof presented !== "boolean"
+        || typeof status !== "string"
+        || status.length === 0
+        || expectedReadyStatus === undefined
+        || (frame?.field !== "top" && frame?.field !== "bottom")
+        || !Number.isSafeInteger(pairEpoch)
+        || pairEpoch < 1
+        || pairEpoch > 0xffff_ffff
+        || pairEpoch !== Number(frame?.pairEpoch)
+        || (presented && !accepted)
+      ) {
+        throw new TypeError("WebGPU VI presentation result is invalid");
+      }
+      if (presented) {
+        if (
+          !readyStatuses.has(status)
+          || status !== expectedReadyStatus
+          || !Number.isSafeInteger(Number(presentationSerial))
+          || Number(presentationSerial) < 1
+          || frame?.pairCompleting !== true
+        ) {
+          throw new TypeError("WebGPU VI presented result is invalid");
+        }
+      } else if (presentationSerial !== null) {
+        throw new TypeError("non-presented WebGPU VI result has a serial");
+      } else if (accepted) {
+        if (
+          !stagedStatuses.has(status)
+          || frame.presentationMode !== "interlaced"
+          || frame?.pairCompleting !== false
+        ) {
+          throw new TypeError("WebGPU VI staged result is invalid");
+        }
+      } else if (
+        readyStatuses.has(status)
+        || stagedStatuses.has(status)
+        || !status.startsWith("vi-field-")
+      ) {
+        throw new TypeError("WebGPU VI rejected result is invalid");
+      }
+      return {
+        accepted,
+        presented,
+        status,
+        pairEpoch,
+        presentationSerial: presented ? Number(presentationSerial) : null,
+      };
+    }
     function handleRendererFrame(message, render, sourceWorker = worker) {
       const rendererSequence = Number(message.rendererSequence);
       const temporalFrames = message.frame?.temporalXfbCapture === undefined
@@ -14990,7 +15839,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         return (async () => {
           await drainWebGpuRenderer(phases);
           if (!isCurrentWorker()) return { ok: false, value: null };
+          if (message.type === "vi-present" && value?.presented === true) {
+            lastPresentedViProjection = {
+              pairEpoch: value.pairEpoch,
+              field: message.frame.field,
+            };
+          }
           if (message.frame?.temporalXfbCapture !== undefined) {
+            if (value?.presented !== true) {
+              throw new Error(
+                "temporal XFB capture requires a completed WebGPU host frame"
+              );
+            }
             const temporalCapture = await captureTemporalSelectedXfb(
               message,
               value,
@@ -15017,6 +15877,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             }
             if (sustainedPlayReceipt !== null) {
               completion.sustainedPlayReceipt = sustainedPlayReceipt;
+            }
+            if (message.type === "vi-present") {
+              completion.viPresentationResult = { ...value };
             }
             sourceWorker?.postMessage(completion);
           }
@@ -15106,23 +15969,32 @@ const TEMPLATE: &str = r##"<!doctype html>
         return handleRendererFrame(message, () => submitGxFrame(message), sourceWorker);
       } else if (message?.type === "vi-present") {
         const frame = message.frame;
-        return handleRendererFrame(message, () =>
+        return handleRendererFrame(message, () => validateViPresentationResult(
+          frame,
           webGpuRenderer.present_xfb(
             frame.address,
             frame.copyIndex,
             frame.copyRow,
+            frame.presentationMode,
+            frame.field,
+            frame.pairEpoch,
             frame.width,
             frame.height,
             frame.fieldStrideBytes,
             frame.fieldHeight,
             frame.rowRepeat,
             frame.temporalXfbCapture !== undefined
-          ),
+          )
+        ),
           sourceWorker
         ).then(presentation => {
           if (!presentation.ok) return;
-          const presented = presentation.value;
+          const result = presentation.value;
           document.body.dataset.viField = frame.field;
+          document.body.dataset.viPresentationMode = frame.presentationMode;
+          document.body.dataset.viPairEpoch = String(result.pairEpoch);
+          document.body.dataset.viResult = result.status;
+          document.body.dataset.viAccepted = String(result.accepted);
           document.body.dataset.viXfbAddress =
             "0x" + frame.address.toString(16).padStart(8, "0");
           document.body.dataset.viCopyIndex = String(frame.copyIndex);
@@ -15131,9 +16003,19 @@ const TEMPLATE: &str = r##"<!doctype html>
           document.body.dataset.viFields = String(
             Number(document.body.dataset.viFields ?? 0) + 1
           );
-          if (presented) {
+          if (result.presented) {
             document.body.dataset.viPresents = String(
               Number(document.body.dataset.viPresents ?? 0) + 1
+            );
+            document.body.dataset.viPresentationSerial =
+              String(result.presentationSerial);
+          } else if (result.accepted) {
+            document.body.dataset.viStaged = String(
+              Number(document.body.dataset.viStaged ?? 0) + 1
+            );
+          } else {
+            document.body.dataset.viRejected = String(
+              Number(document.body.dataset.viRejected ?? 0) + 1
             );
           }
         });

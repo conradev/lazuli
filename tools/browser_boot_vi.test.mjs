@@ -261,6 +261,9 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       "viActiveFieldTargets",
       "gxXfbCopyRowOffset",
       "gxResolveXfbCopy",
+      "resetViFieldPairing",
+      "allocateViPairEpoch",
+      "claimViFieldPair",
       "claimSmbTemporalXfbCapture",
       "postRendererFrame",
       "serviceVideoPresentation",
@@ -269,6 +272,9 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       deviceEvents: new Map(),
       gxFramesPresented: 0,
       gxXfbCopies: [frame],
+      check(condition, message) {
+        if (!condition) throw new Error(message);
+      },
       hex32(value) { return `0x${value.toString(16).padStart(8, "0")}`; },
       nextViPresentCycle: 420,
       nextViPresentationCycleAfter() { return 5670; },
@@ -276,6 +282,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       rendererFrameHighWater: 0,
       rendererFrameSequence: 0,
       rendererFramesInFlight: new Set(),
+      rendererViFrames: new Map(),
       controllerScenario: null,
       claimSmbSustainedViReceipt() { return null; },
       smbTemporalXfbCaptureCapacity: 8,
@@ -287,6 +294,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       viLastPresentationCopyRow: 0,
       viLastPresentationCycle: null,
       viLastPresentationField: null,
+      viNextPairEpoch: 1,
       viOutputDimensions() {
         return {
           pictureConfiguration: 0x2850,
@@ -303,6 +311,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
         };
       },
       viPresentationCount: 0,
+      viPendingFieldPair: null,
       viTiming: {
         equ: 6,
         acv: 240,
@@ -322,6 +331,25 @@ test("VI field service selects a cached XFB independently of comparators", () =>
     type: "vi-present",
     frame: {
       field: "top",
+      scheduledCycle: 420,
+      presentationMode: "interlaced",
+      pairEpoch: 1,
+      pairCompleting: false,
+      pairFields: {
+        top: {
+          field: "top",
+          address: 0x01200000,
+          copyIndex: 12,
+          copyRow: 0,
+          width: 640,
+          height: 480,
+          fieldStrideBytes: 2560,
+          sourceRowStep: 2,
+          fieldHeight: 240,
+          rowRepeat: 2,
+          scanoutPolicy: "bob",
+        },
+      },
       address: 0x01200000,
       width: 640,
       height: 480,
@@ -363,6 +391,38 @@ test("VI field service selects a cached XFB independently of comparators", () =>
     type: "vi-present",
     frame: {
       field: "bottom",
+      scheduledCycle: 5670,
+      presentationMode: "interlaced",
+      pairEpoch: 1,
+      pairCompleting: true,
+      pairFields: {
+        top: {
+          field: "top",
+          address: 0x01200000,
+          copyIndex: 12,
+          copyRow: 0,
+          width: 640,
+          height: 480,
+          fieldStrideBytes: 2560,
+          sourceRowStep: 2,
+          fieldHeight: 240,
+          rowRepeat: 2,
+          scanoutPolicy: "bob",
+        },
+        bottom: {
+          field: "bottom",
+          address: 0x01200500,
+          copyIndex: 12,
+          copyRow: 1,
+          width: 640,
+          height: 480,
+          fieldStrideBytes: 2560,
+          sourceRowStep: 2,
+          fieldHeight: 240,
+          rowRepeat: 2,
+          scanoutPolicy: "bob",
+        },
+      },
       address: 0x01200500,
       width: 640,
       height: 480,
@@ -395,6 +455,7 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
       "appendRendererOperation",
       "enqueueRendererOperation",
       "submitGxFrame",
+      "validateViPresentationResult",
       "handleRendererFrame",
       "handleRendererOperation",
       "handleWorkerMessage",
@@ -422,7 +483,13 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
         },
         present_xfb(...args) {
           calls.push(["vi-present", ...args]);
-          return true;
+          return {
+            accepted: true,
+            presented: true,
+            status: "vi-interlaced-frame-ready",
+            pairEpoch: 1,
+            presentationSerial: 1,
+          };
         },
       },
     },
@@ -460,6 +527,9 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
       type: "vi-present",
       frame: {
         field: "bottom",
+        presentationMode: "interlaced",
+        pairEpoch: 1,
+        pairCompleting: true,
         address: 0x01200500,
         width: 640,
         height: 480,
@@ -478,6 +548,9 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
     0x01200500,
     7,
     1,
+    "interlaced",
+    "bottom",
+    1,
     640,
     480,
     2560,
@@ -494,5 +567,12 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
   assert.deepEqual(JSON.parse(JSON.stringify(workerMessages.at(-1))), {
     type: "renderer-frame-complete",
     rendererSequence: 20,
+    viPresentationResult: {
+      accepted: true,
+      presented: true,
+      status: "vi-interlaced-frame-ready",
+      pairEpoch: 1,
+      presentationSerial: 1,
+    },
   });
 });

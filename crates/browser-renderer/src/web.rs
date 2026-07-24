@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
@@ -25,13 +25,15 @@ use crate::{
     GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxEfbFormat, GxXfbCopyParameters,
     RendererFailureState, RendererHostTimings, RendererMetrics, RendererPhaseTiming,
     SamplerIdentity, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
-    TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan,
-    clipped_copy_extent, compact_surface_readback_rows, compact_xfb_scanout_rows,
-    decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_state, gx_copy_clear_mask,
-    gx_copy_clear_rgba, gx_depth24_to_float, gx_sampler_identity, gx_xfb_copy_parameters,
-    gx_xfb_output_height, merge_contiguous_draw_range, requested_surface_readback_layout,
-    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
-    xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
+    TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor, ViFieldPairOutcome,
+    ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField, ViPresentationMode,
+    XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
+    compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
+    decoded_texture_is_available, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
+    gx_depth24_to_float, gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height,
+    merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
+    reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
+    xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -43,15 +45,18 @@ extern "C" {
 const PRESENT_SHADER: &str = "
 struct XfbPresentUniform {
     geometry: vec4<u32>,
-    scanout: vec4<u32>,
+    top_scanout: vec4<u32>,
+    bottom_scanout: vec4<u32>,
+    options: vec4<u32>,
 };
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
 };
 
-@group(0) @binding(0) var source_texture: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> present: XfbPresentUniform;
+@group(0) @binding(0) var top_texture: texture_2d<f32>;
+@group(0) @binding(1) var bottom_texture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> present: XfbPresentUniform;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
@@ -71,20 +76,35 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let logical_height = present.geometry.y;
     let display_width = present.geometry.z;
     let display_height = present.geometry.w;
-    let selected_row = present.scanout.x;
-    let source_row_step = present.scanout.y;
-    let field_height = present.scanout.z;
-    let row_repeat = present.scanout.w;
     let output_x = min(u32(input.position.x), display_width - 1u);
     let output_y = min(u32(input.position.y), display_height - 1u);
     let logical_x = min(output_x * logical_width / display_width, logical_width - 1u);
+    if present.options.x == 1u && (output_y & 1u) == 1u {
+        let selected_row = present.bottom_scanout.x;
+        let source_row_step = present.bottom_scanout.y;
+        let field_height = present.bottom_scanout.z;
+        let row_repeat = present.bottom_scanout.w;
+        let field_line = min(output_y / row_repeat, field_height - 1u);
+        let logical_y = selected_row + field_line * source_row_step;
+        let source_size = textureDimensions(bottom_texture);
+        let source_x = min(logical_x * source_size.x / logical_width, source_size.x - 1u);
+        let source_y = min(logical_y * source_size.y / logical_height, source_size.y - 1u);
+        return vec4<f32>(
+            textureLoad(bottom_texture, vec2<i32>(i32(source_x), i32(source_y)), 0).rgb,
+            1.0,
+        );
+    }
+    let selected_row = present.top_scanout.x;
+    let source_row_step = present.top_scanout.y;
+    let field_height = present.top_scanout.z;
+    let row_repeat = present.top_scanout.w;
     let field_line = min(output_y / row_repeat, field_height - 1u);
     let logical_y = selected_row + field_line * source_row_step;
-    let source_size = textureDimensions(source_texture);
+    let source_size = textureDimensions(top_texture);
     let source_x = min(logical_x * source_size.x / logical_width, source_size.x - 1u);
     let source_y = min(logical_y * source_size.y / logical_height, source_size.y - 1u);
     return vec4<f32>(
-        textureLoad(source_texture, vec2<i32>(i32(source_x), i32(source_y)), 0).rgb,
+        textureLoad(top_texture, vec2<i32>(i32(source_x), i32(source_y)), 0).rgb,
         1.0,
     );
 }
@@ -238,6 +258,8 @@ fn fs_main() -> FragmentOutput {
 ";
 
 const DECODED_TEXTURE_CACHE_CAPACITY: usize = 128;
+const XFB_PRESENT_BIND_GROUP_CACHE_CAPACITY: usize = 32;
+const XFB_SURFACES_PER_DESTINATION: usize = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -277,7 +299,9 @@ impl CopyClearUniform {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct XfbPresentUniform {
     geometry: [u32; 4],
-    scanout: [u32; 4],
+    top_scanout: [u32; 4],
+    bottom_scanout: [u32; 4],
+    options: [u32; 4],
 }
 
 impl XfbPresentUniform {
@@ -285,21 +309,30 @@ impl XfbPresentUniform {
         logical_width: u32,
         logical_height: u32,
         display_width: u32,
-        plan: XfbScanoutPlan,
+        top: XfbScanoutPlan,
+        bottom: XfbScanoutPlan,
+        interlaced: bool,
     ) -> Self {
         Self {
             geometry: [
                 logical_width,
                 logical_height,
                 display_width,
-                plan.display_height,
+                top.display_height,
             ],
-            scanout: [
-                plan.selected_row,
-                plan.source_row_step,
-                plan.field_height,
-                plan.row_repeat,
+            top_scanout: [
+                top.selected_row,
+                top.source_row_step,
+                top.field_height,
+                top.row_repeat,
             ],
+            bottom_scanout: [
+                bottom.selected_row,
+                bottom.source_row_step,
+                bottom.field_height,
+                bottom.row_repeat,
+            ],
+            options: [u32::from(interlaced), 0, 0, 0],
         }
     }
 }
@@ -471,25 +504,33 @@ struct CachedXfbSurface {
     id: u64,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
-    present_uniform: wgpu::Buffer,
-    present_bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
 }
 
+struct CachedXfbPresentBinding {
+    top_surface_id: u64,
+    bottom_surface_id: u64,
+    bind_group: wgpu::BindGroup,
+}
+
+struct XfbPresentResources {
+    uniform: wgpu::Buffer,
+    bindings: VecDeque<CachedXfbPresentBinding>,
+}
+
 struct CachedXfb {
     surface: CachedXfbSurface,
-    spare: Option<CachedXfbSurface>,
+    spares: Vec<CachedXfbSurface>,
     metadata: XfbCopyMetadata,
     output_width: u32,
     output_height: u32,
 }
 
 #[derive(Clone)]
-struct PresentedXfb {
+struct PresentedXfbField {
     surface_id: u64,
     texture: wgpu::Texture,
-    presentation_serial: u64,
     selected_address: u32,
     generation: u32,
     scanout: XfbScanoutPlan,
@@ -497,7 +538,51 @@ struct PresentedXfb {
     source_height: u32,
     logical_width: u32,
     logical_height: u32,
+}
+
+#[derive(Clone)]
+struct PresentedFieldProvenance {
+    surface_id: u64,
+    selected_address: u32,
+    generation: u32,
+    scanout: XfbScanoutPlan,
+    source_width: u32,
+    source_height: u32,
+    logical_width: u32,
+    logical_height: u32,
+}
+
+impl PresentedXfbField {
+    fn provenance(&self) -> PresentedFieldProvenance {
+        PresentedFieldProvenance {
+            surface_id: self.surface_id,
+            selected_address: self.selected_address,
+            generation: self.generation,
+            scanout: self.scanout,
+            source_width: self.source_width,
+            source_height: self.source_height,
+            logical_width: self.logical_width,
+            logical_height: self.logical_height,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PresentedFrameProvenance {
+    pair_epoch: u32,
+    mode: ViPresentationMode,
+    top: Option<PresentedFieldProvenance>,
+    bottom: Option<PresentedFieldProvenance>,
     display_width: u32,
+    display_height: u32,
+}
+
+#[derive(Clone)]
+struct PresentedXfb {
+    presentation_serial: u64,
+    provenance: PresentedFrameProvenance,
+    top: Option<PresentedXfbField>,
+    bottom: Option<PresentedXfbField>,
 }
 
 #[derive(Clone)]
@@ -507,9 +592,7 @@ struct PresentedSurface {
     pixel_order: SurfacePixelOrder,
     surface_format: wgpu::TextureFormat,
     presentation_serial: u64,
-    selected_address: u32,
-    generation: u32,
-    scanout: XfbScanoutPlan,
+    provenance: PresentedFrameProvenance,
 }
 
 struct Pipelines {
@@ -632,6 +715,7 @@ pub struct WebGpuRenderer {
     efb_depth_view: wgpu::TextureView,
     copy_clear: CopyClearResources,
     xfb_copy: XfbCopyResources,
+    xfb_present: XfbPresentResources,
     tev_draw_layout: wgpu::BindGroupLayout,
     tev_texture_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
@@ -640,6 +724,7 @@ pub struct WebGpuRenderer {
     texture_cache: HashMap<String, CachedTexture>,
     efb_copy_cache: HashMap<u32, CachedTexture>,
     xfb_cache: HashMap<u32, CachedXfb>,
+    vi_field_pairs: ViFieldPairState<CachedXfbSurface>,
     last_presented_xfb: Option<PresentedXfb>,
     last_presented_surface: Option<PresentedSurface>,
     presentation_serial: u64,
@@ -865,6 +950,269 @@ fn surface_readback_error(
     JsValue::from_str(&detail)
 }
 
+fn vi_presentation_mode(value: &str) -> Option<ViPresentationMode> {
+    match value {
+        "progressive" => Some(ViPresentationMode::Progressive),
+        "single-field" => Some(ViPresentationMode::SingleField),
+        "interlaced" => Some(ViPresentationMode::Interlaced),
+        _ => None,
+    }
+}
+
+fn vi_presentation_mode_name(mode: ViPresentationMode) -> &'static str {
+    match mode {
+        ViPresentationMode::Progressive => "progressive",
+        ViPresentationMode::SingleField => "single-field",
+        ViPresentationMode::Interlaced => "interlaced",
+    }
+}
+
+fn vi_field_parity(value: &str) -> Option<ViFieldParity> {
+    match value {
+        "top" => Some(ViFieldParity::Top),
+        "bottom" => Some(ViFieldParity::Bottom),
+        _ => None,
+    }
+}
+
+fn xfb_presentation_result(
+    accepted: bool,
+    presented: bool,
+    status: &str,
+    pair_epoch: u32,
+    presentation_serial: Option<u64>,
+) -> Result<Object, JsValue> {
+    let result = Object::new();
+    Reflect::set(
+        &result,
+        &JsValue::from_str("accepted"),
+        &JsValue::from_bool(accepted),
+    )?;
+    Reflect::set(
+        &result,
+        &JsValue::from_str("presented"),
+        &JsValue::from_bool(presented),
+    )?;
+    Reflect::set(
+        &result,
+        &JsValue::from_str("status"),
+        &JsValue::from_str(status),
+    )?;
+    Reflect::set(
+        &result,
+        &JsValue::from_str("pairEpoch"),
+        &JsValue::from_f64(f64::from(pair_epoch)),
+    )?;
+    Reflect::set(
+        &result,
+        &JsValue::from_str("presentationSerial"),
+        &presentation_serial.map_or(JsValue::NULL, |serial| JsValue::from_f64(serial as f64)),
+    )?;
+    Ok(result)
+}
+
+fn presented_field_object(field: &PresentedFieldProvenance) -> Result<Object, JsValue> {
+    let result = Object::new();
+    let source_row = u32::try_from(
+        u64::from(field.scanout.selected_row)
+            .checked_mul(u64::from(field.source_height))
+            .ok_or_else(|| JsValue::from_str("presented WebGPU XFB row overflow"))?
+            / u64::from(field.logical_height),
+    )
+    .map_err(|_| JsValue::from_str("presented WebGPU XFB row overflow"))?;
+    for (name, value) in [
+        ("address", field.selected_address),
+        ("generation", field.generation),
+        ("row", field.scanout.selected_row),
+        ("sourceRow", source_row),
+        ("textureWidth", field.source_width),
+        ("textureHeight", field.source_height),
+        ("logicalWidth", field.logical_width),
+        ("logicalHeight", field.logical_height),
+        ("displayHeight", field.scanout.display_height),
+        ("fieldStrideBytes", field.scanout.field_stride_bytes),
+        ("sourceRowStep", field.scanout.source_row_step),
+        ("fieldHeight", field.scanout.field_height),
+        ("rowRepeat", field.scanout.row_repeat),
+    ] {
+        Reflect::set(
+            &result,
+            &JsValue::from_str(name),
+            &JsValue::from_f64(f64::from(value)),
+        )?;
+    }
+    Reflect::set(
+        &result,
+        &JsValue::from_str("surfaceId"),
+        &JsValue::from_f64(field.surface_id as f64),
+    )?;
+    Reflect::set(
+        &result,
+        &JsValue::from_str("scanoutPolicy"),
+        &JsValue::from_str(if field.scanout.row_repeat == 2 {
+            "bob"
+        } else {
+            "direct"
+        }),
+    )?;
+    Ok(result)
+}
+
+fn set_presented_frame_provenance(
+    result: &Object,
+    provenance: &PresentedFrameProvenance,
+) -> Result<(), JsValue> {
+    Reflect::set(
+        result,
+        &JsValue::from_str("pairEpoch"),
+        &JsValue::from_f64(f64::from(provenance.pair_epoch)),
+    )?;
+    Reflect::set(
+        result,
+        &JsValue::from_str("presentationMode"),
+        &JsValue::from_str(vi_presentation_mode_name(provenance.mode)),
+    )?;
+    Reflect::set(
+        result,
+        &JsValue::from_str("displayWidth"),
+        &JsValue::from_f64(f64::from(provenance.display_width)),
+    )?;
+    Reflect::set(
+        result,
+        &JsValue::from_str("displayHeight"),
+        &JsValue::from_f64(f64::from(provenance.display_height)),
+    )?;
+    Reflect::set(
+        result,
+        &JsValue::from_str("scanoutPolicy"),
+        &JsValue::from_str(if provenance.mode == ViPresentationMode::Interlaced {
+            "weave"
+        } else {
+            "direct"
+        }),
+    )?;
+    let fields = Object::new();
+    if let Some(top) = provenance.top.as_ref() {
+        let top: JsValue = presented_field_object(top)?.into();
+        Reflect::set(&fields, &JsValue::from_str("top"), &top)?;
+    }
+    if let Some(bottom) = provenance.bottom.as_ref() {
+        let bottom: JsValue = presented_field_object(bottom)?.into();
+        Reflect::set(&fields, &JsValue::from_str("bottom"), &bottom)?;
+    }
+    Reflect::set(result, &JsValue::from_str("fields"), &fields)?;
+    Ok(())
+}
+
+struct EncodedXfbReadback {
+    buffer: wgpu::Buffer,
+    layout: XfbReadbackLayout,
+    logical_height: u32,
+    scanout: XfbScanoutPlan,
+}
+
+fn encode_presented_xfb_field_readback(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    field: &PresentedXfbField,
+) -> Result<EncodedXfbReadback, JsValue> {
+    let layout = xfb_readback_layout(
+        field.source_width,
+        field.source_height,
+        field.logical_height,
+        0,
+    )
+    .ok_or_else(|| JsValue::from_str("presented WebGPU XFB has no readable pixels"))?;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("browser presented XFB field readback"),
+        size: layout.buffer_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &field.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(layout.padded_bytes_per_row),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width: layout.width,
+            height: layout.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(EncodedXfbReadback {
+        buffer,
+        layout,
+        logical_height: field.logical_height,
+        scanout: field.scanout,
+    })
+}
+
+async fn finish_presented_xfb_field_readback(
+    readback: EncodedXfbReadback,
+) -> Result<Vec<u8>, JsValue> {
+    BufferMap::new(&readback.buffer)
+        .await
+        .map_err(|error| JsValue::from_str(&format!("WebGPU XFB map failed: {error}")))?;
+    let pixels = {
+        let mapped = readback.buffer.slice(..).get_mapped_range();
+        let pixels = compact_xfb_scanout_rows(
+            &mapped,
+            readback.layout,
+            readback.logical_height,
+            readback.scanout,
+        );
+        drop(mapped);
+        readback.buffer.unmap();
+        pixels.ok_or_else(|| JsValue::from_str("WebGPU XFB map returned truncated rows"))?
+    };
+    Ok(pixels)
+}
+
+fn interleave_presented_xfb_fields(
+    top: &[u8],
+    bottom: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let row_bytes = usize::try_from(width).ok()?.checked_mul(4)?;
+    let expected = row_bytes.checked_mul(usize::try_from(height).ok()?)?;
+    if top.len() != expected || bottom.len() != expected {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(expected);
+    for row in 0..usize::try_from(height).ok()? {
+        let offset = row.checked_mul(row_bytes)?;
+        let source = if row & 1 == 0 { top } else { bottom };
+        pixels.extend_from_slice(source.get(offset..offset.checked_add(row_bytes)?)?);
+    }
+    Some(pixels)
+}
+
+fn presented_xfb_field(field: &ViOwnedField<CachedXfbSurface>) -> PresentedXfbField {
+    PresentedXfbField {
+        surface_id: field.payload.id,
+        texture: field.payload.texture.clone(),
+        selected_address: field.descriptor.selected_address,
+        generation: field.descriptor.selected_generation,
+        scanout: field.descriptor.scanout,
+        source_width: field.payload.width,
+        source_height: field.payload.height,
+        logical_width: field.descriptor.source_width,
+        logical_height: field.descriptor.source_height,
+    }
+}
+
 #[wasm_bindgen]
 impl WebGpuRenderer {
     pub async fn create(canvas: HtmlCanvasElement) -> Result<WebGpuRenderer, JsValue> {
@@ -875,6 +1223,10 @@ impl WebGpuRenderer {
 
     pub fn reset(&mut self) -> Result<(), JsValue> {
         self.record_wasm_bridge_call(0);
+        // Pending fields own XFB surfaces. Release them before any fallible
+        // health check so reset never strands pair state in a failed renderer.
+        self.vi_field_pairs.reset();
+        self.xfb_present.bindings.clear();
         // A failed reset must never leave a previously presented frame observable.
         self.last_presented_xfb = None;
         self.last_presented_surface = None;
@@ -1122,69 +1474,53 @@ impl WebGpuRenderer {
             ensure_renderer_healthy(&failure_state)?;
             let presented =
                 presented.ok_or_else(|| JsValue::from_str("no WebGPU XFB has been presented"))?;
-            let layout = xfb_readback_layout(
-                presented.source_width,
-                presented.source_height,
-                presented.logical_height,
-                0,
-            )
-            .ok_or_else(|| JsValue::from_str("presented WebGPU XFB has no readable pixels"))?;
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("browser presented XFB readback"),
-                size: layout.buffer_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("browser presented XFB readback encoder"),
             });
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &presented.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(layout.padded_bytes_per_row),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d {
-                    width: layout.width,
-                    height: layout.height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            let top_readback = presented
+                .top
+                .as_ref()
+                .map(|field| encode_presented_xfb_field_readback(&device, &mut encoder, field))
+                .transpose()?;
+            let bottom_readback = presented
+                .bottom
+                .as_ref()
+                .map(|field| encode_presented_xfb_field_readback(&device, &mut encoder, field))
+                .transpose()?;
             queue.submit([encoder.finish()]);
-            BufferMap::new(&buffer)
-                .await
-                .map_err(|error| JsValue::from_str(&format!("WebGPU XFB map failed: {error}")))?;
-            let pixels = {
-                let mapped = buffer.slice(..).get_mapped_range();
-                let pixels = compact_xfb_scanout_rows(
-                    &mapped,
-                    layout,
-                    presented.logical_height,
-                    presented.scanout,
-                );
-                drop(mapped);
-                buffer.unmap();
-                pixels.ok_or_else(|| JsValue::from_str("WebGPU XFB map returned truncated rows"))?
+            let top_pixels = match top_readback {
+                Some(readback) => Some(finish_presented_xfb_field_readback(readback).await?),
+                None => None,
+            };
+            let bottom_pixels = match bottom_readback {
+                Some(readback) => Some(finish_presented_xfb_field_readback(readback).await?),
+                None => None,
+            };
+            let pixels = match presented.provenance.mode {
+                ViPresentationMode::Interlaced => {
+                    let top = top_pixels.as_deref().ok_or_else(|| {
+                        JsValue::from_str("paired WebGPU XFB has no top-field pixels")
+                    })?;
+                    let bottom = bottom_pixels.as_deref().ok_or_else(|| {
+                        JsValue::from_str("paired WebGPU XFB has no bottom-field pixels")
+                    })?;
+                    interleave_presented_xfb_fields(
+                        top,
+                        bottom,
+                        presented.provenance.display_width,
+                        presented.provenance.display_height,
+                    )
+                    .ok_or_else(|| {
+                        JsValue::from_str("paired WebGPU XFB fields have incompatible rows")
+                    })?
+                }
+                ViPresentationMode::Progressive | ViPresentationMode::SingleField => top_pixels
+                    .or(bottom_pixels)
+                    .ok_or_else(|| JsValue::from_str("presented WebGPU XFB has no field pixels"))?,
             };
             ensure_renderer_healthy(&failure_state)?;
 
             let result = Object::new();
-            let source_row = u32::try_from(
-                u64::from(presented.scanout.selected_row)
-                    .checked_mul(u64::from(presented.source_height))
-                    .ok_or_else(|| JsValue::from_str("presented WebGPU XFB row overflow"))?
-                    / u64::from(presented.logical_height),
-            )
-            .map_err(|_| JsValue::from_str("presented WebGPU XFB row overflow"))?;
             Reflect::set(
                 &result,
                 &JsValue::from_str("format"),
@@ -1196,22 +1532,8 @@ impl WebGpuRenderer {
                 &JsValue::from_str("top-left-row-major-tight"),
             )?;
             for (name, value) in [
-                ("address", presented.selected_address),
-                ("generation", presented.generation),
-                ("row", presented.scanout.selected_row),
-                ("sourceRow", source_row),
-                ("width", layout.width),
-                ("height", presented.scanout.display_height),
-                ("textureWidth", presented.source_width),
-                ("textureHeight", presented.source_height),
-                ("logicalWidth", presented.logical_width),
-                ("logicalHeight", presented.logical_height),
-                ("displayWidth", presented.display_width),
-                ("displayHeight", presented.scanout.display_height),
-                ("fieldStrideBytes", presented.scanout.field_stride_bytes),
-                ("sourceRowStep", presented.scanout.source_row_step),
-                ("fieldHeight", presented.scanout.field_height),
-                ("rowRepeat", presented.scanout.row_repeat),
+                ("width", presented.provenance.display_width),
+                ("height", presented.provenance.display_height),
             ] {
                 Reflect::set(
                     &result,
@@ -1224,15 +1546,7 @@ impl WebGpuRenderer {
                 &JsValue::from_str("presentationSerial"),
                 &JsValue::from_f64(presented.presentation_serial as f64),
             )?;
-            Reflect::set(
-                &result,
-                &JsValue::from_str("scanoutPolicy"),
-                &JsValue::from_str(if presented.scanout.row_repeat == 2 {
-                    "bob"
-                } else {
-                    "direct"
-                }),
-            )?;
+            set_presented_frame_provenance(&result, &presented.provenance)?;
             Reflect::set(
                 &result,
                 &JsValue::from_str("rgba"),
@@ -1282,15 +1596,8 @@ impl WebGpuRenderer {
                 Reflect::set(&result, &JsValue::from_str(name), &JsValue::from_str(value))?;
             }
             for (name, value) in [
-                ("address", presented.selected_address),
-                ("generation", presented.generation),
-                ("row", presented.scanout.selected_row),
                 ("width", presented.layout.width),
                 ("height", presented.layout.height),
-                ("fieldStrideBytes", presented.scanout.field_stride_bytes),
-                ("sourceRowStep", presented.scanout.source_row_step),
-                ("fieldHeight", presented.scanout.field_height),
-                ("rowRepeat", presented.scanout.row_repeat),
             ] {
                 Reflect::set(
                     &result,
@@ -1303,15 +1610,7 @@ impl WebGpuRenderer {
                 &JsValue::from_str("presentationSerial"),
                 &JsValue::from_f64(presented.presentation_serial as f64),
             )?;
-            Reflect::set(
-                &result,
-                &JsValue::from_str("scanoutPolicy"),
-                &JsValue::from_str(if presented.scanout.row_repeat == 2 {
-                    "bob"
-                } else {
-                    "direct"
-                }),
-            )?;
+            set_presented_frame_provenance(&result, &presented.provenance)?;
             Reflect::set(
                 &result,
                 &JsValue::from_str("rgba"),
@@ -2140,32 +2439,46 @@ impl WebGpuRenderer {
             });
             return self.ensure_healthy();
         };
-        let protected_surface = self
-            .last_presented_xfb
-            .as_ref()
-            .map(|presented| presented.surface_id);
-        let mut surfaces = Vec::with_capacity(2);
+        let mut protected_surfaces = HashSet::with_capacity(3);
+        if let Some(pending) = self.vi_field_pairs.pending() {
+            protected_surfaces.insert(pending.payload.id);
+        }
+        if let Some(presented) = self.last_presented_xfb.as_ref() {
+            protected_surfaces.extend(
+                presented
+                    .top
+                    .iter()
+                    .chain(presented.bottom.iter())
+                    .map(|field| field.surface_id),
+            );
+        }
+        let mut surfaces = Vec::with_capacity(XFB_SURFACES_PER_DESTINATION);
         if let Some(cached) = self.xfb_cache.remove(&destination) {
             surfaces.push(cached.surface);
-            surfaces.extend(cached.spare);
+            surfaces.extend(cached.spares);
         }
         let surface_descriptors = surfaces
             .iter()
             .map(|surface| (surface.id, surface.width, surface.height))
             .collect::<Vec<_>>();
-        let surface = reusable_xfb_surface_index(
+        let protected_surface_ids = protected_surfaces.into_iter().collect::<Vec<_>>();
+        let reusable = reusable_xfb_surface_index(
             &surface_descriptors,
-            protected_surface,
+            &protected_surface_ids,
             xfb_width,
             xfb_height,
-        )
-        .map_or_else(
+        );
+        let surface = reusable.map_or_else(
             || self.create_xfb_surface(xfb_width, xfb_height),
             |index| surfaces.remove(index),
         );
-        let spare = surfaces.into_iter().find(|candidate| {
-            xfb_surface_extent_matches(candidate.width, candidate.height, xfb_width, xfb_height)
-        });
+        let spares = surfaces
+            .into_iter()
+            .filter(|candidate| {
+                xfb_surface_extent_matches(candidate.width, candidate.height, xfb_width, xfb_height)
+            })
+            .take(XFB_SURFACES_PER_DESTINATION - 1)
+            .collect();
         let linear_filter = parameters.uses_linear_filter();
         let uniform = XfbCopyUniform::new(source_x, source_y, width, source_height, parameters);
         self.queue
@@ -2222,7 +2535,7 @@ impl WebGpuRenderer {
             destination,
             CachedXfb {
                 surface,
-                spare,
+                spares,
                 metadata: XfbCopyMetadata {
                     destination,
                     stride,
@@ -2251,24 +2564,56 @@ impl WebGpuRenderer {
         selected_address: u32,
         expected_generation: u32,
         selected_row: u32,
+        presentation_mode: &str,
+        field_parity: &str,
+        pair_epoch: u32,
         output_width: u32,
         output_height: u32,
         field_stride_bytes: u32,
         field_height: u32,
         row_repeat: u32,
         capture_surface: bool,
-    ) -> Result<bool, JsValue> {
+    ) -> Result<Object, JsValue> {
         self.record_wasm_bridge_call(0);
-        // Evidence proves one exact presentation. Never let a rejected plan,
-        // renderer failure, or uncaptured presentation expose stale metadata.
-        self.last_presented_xfb = None;
-        self.last_presented_surface = None;
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.present_xfb_calls = metrics.present_xfb_calls.saturating_add(1);
         });
+        if pair_epoch == 0 {
+            return xfb_presentation_result(
+                false,
+                false,
+                "vi-field-invalid-epoch",
+                pair_epoch,
+                None,
+            );
+        }
+        let Some(mode) = vi_presentation_mode(presentation_mode) else {
+            return xfb_presentation_result(
+                false,
+                false,
+                "vi-field-invalid-mode",
+                pair_epoch,
+                None,
+            );
+        };
+        let Some(parity) = vi_field_parity(field_parity) else {
+            return xfb_presentation_result(
+                false,
+                false,
+                "vi-field-invalid-parity",
+                pair_epoch,
+                None,
+            );
+        };
         if selected_address == 0 || expected_generation == 0 {
-            return Ok(false);
+            return xfb_presentation_result(
+                false,
+                false,
+                "vi-field-xfb-unavailable",
+                pair_epoch,
+                None,
+            );
         }
         let Some((surface, metadata, cached_width, cached_height)) = self
             .xfb_cache
@@ -2290,7 +2635,13 @@ impl WebGpuRenderer {
                 )
             })
         else {
-            return Ok(false);
+            return xfb_presentation_result(
+                false,
+                false,
+                "vi-field-xfb-unavailable",
+                pair_epoch,
+                None,
+            );
         };
         if output_width == 0
             || output_width > GX_MAX_COPY_DIMENSION
@@ -2298,7 +2649,13 @@ impl WebGpuRenderer {
             || output_height > GX_MAX_COPY_DIMENSION
             || output_width != cached_width
         {
-            return Ok(false);
+            return xfb_presentation_result(
+                false,
+                false,
+                "vi-field-invalid-geometry",
+                pair_epoch,
+                None,
+            );
         }
         let Some(scanout) = xfb_scanout_plan(
             metadata,
@@ -2308,9 +2665,93 @@ impl WebGpuRenderer {
             row_repeat,
             output_height,
         ) else {
-            return Ok(false);
+            return xfb_presentation_result(
+                false,
+                false,
+                "vi-field-invalid-geometry",
+                pair_epoch,
+                None,
+            );
         };
-        let uniform = XfbPresentUniform::new(cached_width, cached_height, output_width, scanout);
+        let descriptor = ViFieldDescriptor {
+            mode,
+            pair_epoch,
+            parity,
+            copy: metadata,
+            selected_address,
+            selected_generation: expected_generation,
+            selected_row,
+            source_width: cached_width,
+            source_height: cached_height,
+            display_width: output_width,
+            scanout,
+        };
+        let outcome = self.vi_field_pairs.submit(descriptor, surface);
+        let status = outcome.telemetry_code();
+        match outcome {
+            ViFieldPairOutcome::Awaiting(_) => {
+                xfb_presentation_result(true, false, status, pair_epoch, None)
+            }
+            ViFieldPairOutcome::Rejected(_) => {
+                xfb_presentation_result(false, false, status, pair_epoch, None)
+            }
+            ViFieldPairOutcome::Ready(frame) => {
+                let ready_epoch = frame.pair_epoch();
+                let presentation_serial = self.present_host_xfb_frame(frame, capture_surface)?;
+                xfb_presentation_result(true, true, status, ready_epoch, Some(presentation_serial))
+            }
+        }
+    }
+}
+
+impl WebGpuRenderer {
+    fn present_host_xfb_frame(
+        &mut self,
+        frame: ViHostFrame<CachedXfbSurface>,
+        capture_surface: bool,
+    ) -> Result<u64, JsValue> {
+        let pair_epoch = frame.pair_epoch();
+        let (mode, top, bottom) = match frame {
+            ViHostFrame::Immediate(field) => {
+                let mode = field.descriptor.mode;
+                match field.descriptor.parity {
+                    ViFieldParity::Top => (mode, Some(field), None),
+                    ViFieldParity::Bottom => (mode, None, Some(field)),
+                }
+            }
+            ViHostFrame::Interlaced { top, bottom, .. } => {
+                (ViPresentationMode::Interlaced, Some(top), Some(bottom))
+            }
+        };
+        let primary = top
+            .as_ref()
+            .or(bottom.as_ref())
+            .ok_or_else(|| JsValue::from_str("ready WebGPU VI frame has no source field"))?;
+        let shader_top = if mode == ViPresentationMode::Interlaced {
+            top.as_ref()
+                .ok_or_else(|| JsValue::from_str("paired WebGPU VI frame has no top field"))?
+        } else {
+            primary
+        };
+        let shader_bottom = if mode == ViPresentationMode::Interlaced {
+            bottom
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("paired WebGPU VI frame has no bottom field"))?
+        } else {
+            primary
+        };
+        let output_width = primary.descriptor.display_width;
+        let output_height = primary.descriptor.scanout.display_height;
+        let uniform = XfbPresentUniform::new(
+            primary.descriptor.source_width,
+            primary.descriptor.source_height,
+            output_width,
+            shader_top.descriptor.scanout,
+            shader_bottom.descriptor.scanout,
+            mode == ViPresentationMode::Interlaced,
+        );
+        let present_bind_group =
+            self.xfb_present_bind_group(&shader_top.payload, &shader_bottom.payload);
         self.resize_surface(output_width, output_height);
         let capture_plan = requested_surface_readback_layout(
             capture_surface,
@@ -2347,15 +2788,25 @@ impl WebGpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.queue
-            .write_buffer(&surface.present_uniform, 0, bytemuck::bytes_of(&uniform));
+            .write_buffer(&self.xfb_present.uniform, 0, bytemuck::bytes_of(&uniform));
+        let presented_top = top.as_ref().map(presented_xfb_field);
+        let presented_bottom = bottom.as_ref().map(presented_xfb_field);
+        let provenance = PresentedFrameProvenance {
+            pair_epoch,
+            mode,
+            top: presented_top.as_ref().map(PresentedXfbField::provenance),
+            bottom: presented_bottom.as_ref().map(PresentedXfbField::provenance),
+            display_width: output_width,
+            display_height: output_height,
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("browser XFB presentation encoder"),
+                label: Some("browser XFB paired presentation encoder"),
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("browser XFB presentation pass"),
+                label: Some("browser XFB paired presentation pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &output_view,
                     depth_slice: None,
@@ -2371,7 +2822,7 @@ impl WebGpuRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipelines.present);
-            pass.set_bind_group(0, &surface.present_bind_group, &[]);
+            pass.set_bind_group(0, &present_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         let surface_capture = capture_plan.map(|(layout, pixel_order)| {
@@ -2408,9 +2859,7 @@ impl WebGpuRenderer {
                 pixel_order,
                 surface_format: self.surface_config.format,
                 presentation_serial: next_presentation_serial,
-                selected_address,
-                generation: metadata.generation,
-                scanout,
+                provenance: provenance.clone(),
             }
         });
         self.queue.submit([encoder.finish()]);
@@ -2418,31 +2867,69 @@ impl WebGpuRenderer {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
         output.present();
+        self.ensure_healthy()?;
         self.presentation_serial = next_presentation_serial;
         self.last_presented_surface = surface_capture;
         self.last_presented_xfb = Some(PresentedXfb {
-            surface_id: surface.id,
-            texture: surface.texture,
             presentation_serial: next_presentation_serial,
-            selected_address,
-            generation: metadata.generation,
-            scanout,
-            source_width: surface.width,
-            source_height: surface.height,
-            logical_width: cached_width,
-            logical_height: cached_height,
-            display_width: output_width,
+            provenance,
+            top: presented_top,
+            bottom: presented_bottom,
         });
-        if let Err(error) = self.ensure_healthy() {
-            self.last_presented_xfb = None;
-            self.last_presented_surface = None;
-            return Err(error);
-        }
-        Ok(true)
+        Ok(next_presentation_serial)
     }
-}
 
-impl WebGpuRenderer {
+    fn xfb_present_bind_group(
+        &mut self,
+        top: &CachedXfbSurface,
+        bottom: &CachedXfbSurface,
+    ) -> wgpu::BindGroup {
+        if let Some(index) = self.xfb_present.bindings.iter().position(|binding| {
+            binding.top_surface_id == top.id && binding.bottom_surface_id == bottom.id
+        }) {
+            let binding = self
+                .xfb_present
+                .bindings
+                .remove(index)
+                .expect("located WebGPU XFB presentation binding disappeared");
+            let result = binding.bind_group.clone();
+            self.xfb_present.bindings.push_back(binding);
+            return result;
+        }
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser XFB paired presentation bind group"),
+            layout: &self.present_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&top.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&bottom.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.xfb_present.uniform.as_entire_binding(),
+                },
+            ],
+        });
+        if self.xfb_present.bindings.len() == XFB_PRESENT_BIND_GROUP_CACHE_CAPACITY {
+            self.xfb_present.bindings.pop_front();
+        }
+        self.xfb_present
+            .bindings
+            .push_back(CachedXfbPresentBinding {
+                top_surface_id: top.id,
+                bottom_surface_id: bottom.id,
+                bind_group: bind_group.clone(),
+            });
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
+        });
+        bind_group
+    }
+
     async fn create_inner(canvas: HtmlCanvasElement) -> Result<Self, String> {
         let descriptor = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
@@ -2622,6 +3109,16 @@ impl WebGpuRenderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -2634,6 +3131,7 @@ impl WebGpuRenderer {
         let samplers = create_samplers(&device);
         let copy_clear = create_copy_clear_resources(&device);
         let xfb_copy = create_xfb_copy_resources(&device, &efb_color_view, &samplers);
+        let xfb_present = create_xfb_present_resources(&device);
         let pipelines = create_pipelines(
             &device,
             &tev_draw_layout,
@@ -2667,6 +3165,7 @@ impl WebGpuRenderer {
             efb_depth_view,
             copy_clear,
             xfb_copy,
+            xfb_present,
             tev_draw_layout,
             tev_texture_layout,
             present_layout,
@@ -2675,6 +3174,7 @@ impl WebGpuRenderer {
             texture_cache: HashMap::new(),
             efb_copy_cache: HashMap::new(),
             xfb_cache: HashMap::new(),
+            vi_field_pairs: ViFieldPairState::default(),
             last_presented_xfb: None,
             last_presented_surface: None,
             presentation_serial: 0,
@@ -2737,35 +3237,8 @@ impl WebGpuRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let initial_uniform = XfbPresentUniform {
-            geometry: [0; 4],
-            scanout: [0; 4],
-        };
-        let present_uniform = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("browser XFB scanout plan"),
-                contents: bytemuck::bytes_of(&initial_uniform),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let present_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("browser XFB presentation bind group"),
-            layout: &self.present_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: present_uniform.as_entire_binding(),
-                },
-            ],
-        });
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.textures_created = metrics.textures_created.saturating_add(1);
-            metrics.buffers_created = metrics.buffers_created.saturating_add(1);
-            metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
         });
         let id = self.next_xfb_surface_id;
         self.next_xfb_surface_id = self.next_xfb_surface_id.wrapping_add(1).max(1);
@@ -2773,8 +3246,6 @@ impl WebGpuRenderer {
             id,
             texture,
             view,
-            present_uniform,
-            present_bind_group,
             width,
             height,
         }
@@ -3352,6 +3823,24 @@ fn create_xfb_copy_resources(
         nearest_bind_group,
         linear_bind_group,
         pipeline,
+    }
+}
+
+fn create_xfb_present_resources(device: &wgpu::Device) -> XfbPresentResources {
+    let initial_uniform = XfbPresentUniform {
+        geometry: [0; 4],
+        top_scanout: [0; 4],
+        bottom_scanout: [0; 4],
+        options: [0; 4],
+    };
+    let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("browser XFB paired scanout plan"),
+        contents: bytemuck::bytes_of(&initial_uniform),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    XfbPresentResources {
+        uniform,
+        bindings: VecDeque::with_capacity(XFB_PRESENT_BIND_GROUP_CACHE_CAPACITY),
     }
 }
 
