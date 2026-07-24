@@ -1,5 +1,6 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -735,6 +736,158 @@ pub(crate) fn gx_depth24_to_float(depth: u32) -> f32 {
 
 pub(crate) fn gx_float_to_depth24(depth: f32) -> u32 {
     (depth.clamp(0.0, 1.0) * GX_DEPTH24_MAX as f32).round() as u32
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxZTextureFormat {
+    U8,
+    U16,
+    U24,
+}
+
+impl GxZTextureFormat {
+    #[cfg(any(test, not(target_arch = "wasm32")))]
+    pub(crate) const fn decode_texel(self, rgba: [u8; 4]) -> u32 {
+        match self {
+            Self::U8 => rgba[3] as u32,
+            Self::U16 => ((rgba[3] as u32) << 8) | rgba[0] as u32,
+            Self::U24 => ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxZTextureOperation {
+    Disabled,
+    Add,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxDepthCompareLocation {
+    Early,
+    Late,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GxZTextureState {
+    pub(crate) bias: u32,
+    pub(crate) format: GxZTextureFormat,
+    pub(crate) operation: GxZTextureOperation,
+    pub(crate) depth_compare_location: GxDepthCompareLocation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxZTextureDecodeError {
+    ReservedFormat(u8),
+    ReservedOperation(u8),
+}
+
+impl fmt::Display for GxZTextureDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservedFormat(value) => {
+                write!(formatter, "reserved GX Z-texture format {value}")
+            }
+            Self::ReservedOperation(value) => {
+                write!(formatter, "reserved GX Z-texture operation {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GxZTextureDecodeError {}
+
+pub(crate) fn gx_z_texture_state(
+    z_texture_bias: u32,
+    z_texture_mode: u32,
+    pixel_control: u32,
+) -> Result<GxZTextureState, GxZTextureDecodeError> {
+    let operation = match (z_texture_mode >> 2) & 3 {
+        0 => GxZTextureOperation::Disabled,
+        1 => GxZTextureOperation::Add,
+        2 => GxZTextureOperation::Replace,
+        value => return Err(GxZTextureDecodeError::ReservedOperation(value as u8)),
+    };
+    // The format and bias are not observed at all while the operation is
+    // disabled, including a reserved format encoding. Canonicalize before
+    // validating the active-only format so inert BP state cannot reject a draw.
+    let format = if operation == GxZTextureOperation::Disabled {
+        GxZTextureFormat::U8
+    } else {
+        match z_texture_mode & 3 {
+            0 => GxZTextureFormat::U8,
+            1 => GxZTextureFormat::U16,
+            2 => GxZTextureFormat::U24,
+            value => return Err(GxZTextureDecodeError::ReservedFormat(value as u8)),
+        }
+    };
+    let depth_compare_location = if pixel_control & (1 << 6) != 0 {
+        GxDepthCompareLocation::Early
+    } else {
+        GxDepthCompareLocation::Late
+    };
+
+    Ok(if operation == GxZTextureOperation::Disabled {
+        // Format and bias are unobservable while BP F5 disables Z-texturing.
+        // Collapse every disabled encoding into one cache-key state while
+        // preserving PEControl's independent early/late depth-test location.
+        GxZTextureState {
+            bias: 0,
+            format: GxZTextureFormat::U8,
+            operation,
+            depth_compare_location,
+        }
+    } else {
+        GxZTextureState {
+            bias: z_texture_bias & GX_DEPTH24_MAX,
+            format,
+            operation,
+            depth_compare_location,
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub(crate) struct GxZTextureReference {
+    pub(crate) source_depth: u32,
+    pub(crate) sampled_depth: u32,
+    pub(crate) operation_depth: u32,
+    pub(crate) zbuffer_depth: u32,
+}
+
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub(crate) fn gx_z_texture_reference(
+    state: GxZTextureState,
+    fragment_depth: f32,
+    raw_texture_rgba: [u8; 4],
+) -> GxZTextureReference {
+    // Lazuli's depth convention is the nearest 24-bit integer, including at
+    // half steps. Keep the conversion in this shared oracle so the eventual
+    // shader implementation cannot silently switch to truncation or 2^24.
+    let source_depth = gx_float_to_depth24(fragment_depth);
+    let sampled_depth = if state.operation == GxZTextureOperation::Disabled {
+        0
+    } else {
+        state.format.decode_texel(raw_texture_rgba)
+    };
+    let biased_depth = sampled_depth.wrapping_add(state.bias) & GX_DEPTH24_MAX;
+    let operation_depth = match state.operation {
+        GxZTextureOperation::Disabled => source_depth,
+        GxZTextureOperation::Add => source_depth.wrapping_add(biased_depth) & GX_DEPTH24_MAX,
+        GxZTextureOperation::Replace => biased_depth,
+    };
+    let zbuffer_depth = match state.depth_compare_location {
+        GxDepthCompareLocation::Early => source_depth,
+        GxDepthCompareLocation::Late => operation_depth,
+    };
+    GxZTextureReference {
+        source_depth,
+        sampled_depth,
+        operation_depth,
+        zbuffer_depth,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1554,7 +1707,8 @@ pub use web::WebGpuRenderer;
 mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH24_MAX, GxBlendFactor,
-        GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxEfbFormat, RendererFailureState,
+        GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxEfbFormat,
+        GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
         RendererMetrics, RendererPhaseTiming, SelectedTexture, SurfacePixelOrder,
         SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome,
         ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode,
@@ -1564,9 +1718,10 @@ mod tests {
         gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
         gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_to_float,
         gx_destination_alpha_state, gx_efb_format, gx_float_to_depth24, gx_sampler_identity,
-        gx_xfb_copy_parameters, gx_xfb_output_height, materialize_xfb_rgba8_reference,
-        merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
-        resolve_xfb_copy, reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
+        gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
+        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
+        requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
+        reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
         xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_scanout_plan,
         xfb_scanout_source_row, xfb_surface_extent_matches,
     };
@@ -3043,6 +3198,84 @@ mod tests {
         for depth in [0, 1, 0x12_3456, 0x44_5566, 0xab_cdef, 0xff_fffe, 0xff_ffff] {
             assert_eq!(gx_float_to_depth24(gx_depth24_to_float(depth)), depth);
         }
+    }
+
+    #[test]
+    fn gx_z_texture_decodes_raw_bp_state_and_canonicalizes_disabled_encodings() {
+        let state = gx_z_texture_state(0xff12_3456, 1 | (1 << 2), 1 << 6).unwrap();
+        assert_eq!(state.bias, 0x12_3456);
+        assert_eq!(state.format, GxZTextureFormat::U16);
+        assert_eq!(state.operation, GxZTextureOperation::Add);
+        assert_eq!(state.depth_compare_location, GxDepthCompareLocation::Early);
+
+        let disabled = gx_z_texture_state(0x12_3456, 0, 0).unwrap();
+        for format in 0..=3 {
+            assert_eq!(gx_z_texture_state(0xff_fffe, format, 0).unwrap(), disabled);
+        }
+        assert_eq!(disabled.bias, 0);
+        assert_eq!(disabled.format, GxZTextureFormat::U8);
+        assert_eq!(disabled.operation, GxZTextureOperation::Disabled);
+        assert_eq!(
+            disabled.depth_compare_location,
+            GxDepthCompareLocation::Late
+        );
+        assert_eq!(
+            gx_z_texture_state(0, 3 | (1 << 2), 0),
+            Err(GxZTextureDecodeError::ReservedFormat(3)),
+        );
+        assert_eq!(
+            gx_z_texture_state(0, 3 << 2, 0),
+            Err(GxZTextureDecodeError::ReservedOperation(3)),
+        );
+    }
+
+    #[test]
+    fn gx_z_texture_formats_decode_unswizzled_raw_rgba_channels() {
+        let rgba = [0x11, 0x22, 0x33, 0x44];
+        assert_eq!(GxZTextureFormat::U8.decode_texel(rgba), 0x44);
+        assert_eq!(GxZTextureFormat::U16.decode_texel(rgba), 0x4411);
+        assert_eq!(GxZTextureFormat::U24.decode_texel(rgba), 0x11_2233);
+    }
+
+    #[test]
+    fn gx_z_texture_reference_applies_add_replace_and_twenty_four_bit_wrap() {
+        let add = gx_z_texture_state(2, 2 | (1 << 2), 0).unwrap();
+        let added = gx_z_texture_reference(add, 0.5, [0, 0, 3, 0]);
+        assert_eq!(added.source_depth, 0x80_0000);
+        assert_eq!(added.sampled_depth, 3);
+        assert_eq!(added.operation_depth, 0x80_0005);
+        assert_eq!(added.zbuffer_depth, 0x80_0005);
+
+        let replace = gx_z_texture_state(0x10, 1 | (2 << 2), 0).unwrap();
+        let replaced = gx_z_texture_reference(replace, 0.75, [0x34, 0, 0, 0x12]);
+        assert_eq!(replaced.sampled_depth, 0x1234);
+        assert_eq!(replaced.operation_depth, 0x1244);
+        assert_eq!(replaced.zbuffer_depth, 0x1244);
+
+        let wrapping_add = gx_z_texture_state(2, 0 | (1 << 2), 0).unwrap();
+        assert_eq!(
+            gx_z_texture_reference(wrapping_add, 1.0, [0, 0, 0, 3]).operation_depth,
+            4,
+        );
+        let wrapping_replace = gx_z_texture_state(1, 2 | (2 << 2), 0).unwrap();
+        assert_eq!(
+            gx_z_texture_reference(wrapping_replace, 0.0, [0xff; 4]).operation_depth,
+            0,
+        );
+    }
+
+    #[test]
+    fn gx_z_texture_early_depth_uses_pretexture_z_while_late_uses_the_operation() {
+        let late = gx_z_texture_state(4, 0 | (1 << 2), 0).unwrap();
+        let early = gx_z_texture_state(4, 0 | (1 << 2), 1 << 6).unwrap();
+        let late_result = gx_z_texture_reference(late, 0.25, [0, 0, 0, 7]);
+        let early_result = gx_z_texture_reference(early, 0.25, [0, 0, 0, 7]);
+
+        assert_eq!(late_result.source_depth, early_result.source_depth);
+        assert_eq!(late_result.operation_depth, early_result.operation_depth);
+        assert_ne!(late_result.operation_depth, late_result.source_depth);
+        assert_eq!(late_result.zbuffer_depth, late_result.operation_depth);
+        assert_eq!(early_result.zbuffer_depth, early_result.source_depth);
     }
 
     #[test]
