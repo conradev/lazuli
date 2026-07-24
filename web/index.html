@@ -105,6 +105,18 @@
       return result;
     }
 
+    function selectStagedRelease(latest, staged) {
+      if (latest.offline !== true && staged.ok !== true) {
+        throw new Error(
+          `latest release could not be activated: ${staged.error ?? "staging failed"}`,
+        );
+      }
+      return {
+        release: staged.release,
+        saved: latest.offline === true,
+      };
+    }
+
     function publicFrontendSearch(search) {
       const input = new URLSearchParams(search);
       const scenarioValues = input.getAll("scenario");
@@ -143,12 +155,11 @@
       const worker = await registerWorker();
       if (worker === null) throw new Error("this browser does not support offline applications");
       const latest = await fetchLatestRelease();
-      let release = latest.release;
-      let saved = latest.offline;
       detail.textContent = latest.offline ? "Opening the saved release…" : "Preparing the latest release…";
-      const staged = await stageLatestRelease(release);
-      release = staged.release;
-      saved ||= !staged.ok;
+      const staged = await stageLatestRelease(latest.release);
+      const selected = selectStagedRelease(latest, staged);
+      const release = selected.release;
+      const saved = selected.saved;
 
       const frontendSearch = publicFrontendSearch(location.search);
       const url = new URL(release.frontend.url, location.href);

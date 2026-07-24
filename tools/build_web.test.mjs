@@ -259,6 +259,51 @@ test("public shell binds the iframe to the staged immutable frontend", async () 
   }
 });
 
+test("public shell never launches an older saved release after an online stage failure", async () => {
+  const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+  const start = shell.indexOf("function selectStagedRelease(");
+  assert.notEqual(start, -1);
+  const bodyStart = shell.indexOf("{", start);
+  let depth = 0;
+  let end = -1;
+  for (let index = bodyStart; index < shell.length; index += 1) {
+    if (shell[index] === "{") depth += 1;
+    if (shell[index] !== "}") continue;
+    depth -= 1;
+    if (depth === 0) {
+      end = index + 1;
+      break;
+    }
+  }
+  assert.notEqual(end, -1);
+  const selectStagedRelease = Function(
+    `"use strict"; return (${shell.slice(start, end)});`,
+  )();
+  const current = { releaseId: "current" };
+  const saved = { releaseId: "saved" };
+  assert.deepEqual(
+    selectStagedRelease(
+      { offline: false, release: current },
+      { ok: true, release: current },
+    ),
+    { release: current, saved: false },
+  );
+  assert.throws(
+    () => selectStagedRelease(
+      { offline: false, release: current },
+      { ok: false, release: saved, error: "asset hash mismatch" },
+    ),
+    /latest release could not be activated: asset hash mismatch/,
+  );
+  assert.deepEqual(
+    selectStagedRelease(
+      { offline: true, release: saved },
+      { ok: false, release: saved, error: "offline" },
+    ),
+    { release: saved, saved: true },
+  );
+});
+
 test("public shell forwards only an exact passive capture trio", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   assert.match(shell, /function publicFrontendSearch\(search\)/);
@@ -288,6 +333,8 @@ test("public shell requires a schema-2 worker and never launches a legacy releas
   assert.match(shell, /release\?\.schema !== EXPECTED_RELEASE_SCHEMA/);
   assert.match(shell, /requireCompatibleRelease\(await response\.json\(\)\)/);
   assert.match(shell, /result\.release = requireCompatibleRelease\(result\.release\)/);
+  assert.match(shell, /selectStagedRelease\(latest, staged\)/);
+  assert.doesNotMatch(shell, /saved\s*\|\|=/);
   assert.match(shell, /mandatory WebGPU service worker did not take control/);
   assert.doesNotMatch(shell, /verified saved release while the network-dependent upgrade waits/);
 });
