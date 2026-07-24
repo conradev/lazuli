@@ -95,7 +95,13 @@ test("VI single-field timing excludes the unused even field", () => {
     [0x206c, 0],
   ]);
   const context = evaluateFunctions(["decodeViTiming"], {
+    hex32(value) {
+      return "0x" + (value >>> 0).toString(16).padStart(8, "0");
+    },
     mmio: 0,
+    viActiveAcv: null,
+    viActiveEvenVBlank: null,
+    viActiveOddVBlank: null,
     viClockFrequencies: [27_000_000, 54_000_000],
     viCpuCyclesPerSecond: 486_000_000,
     view: {
@@ -275,6 +281,9 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       check(condition, message) {
         if (!condition) throw new Error(message);
       },
+      cloneViScanoutEntry(entry) {
+        return entry === null ? null : { ...entry };
+      },
       hex32(value) { return `0x${value.toString(16).padStart(8, "0")}`; },
       nextViPresentCycle: 420,
       nextViPresentationCycleAfter() { return 5670; },
@@ -312,7 +321,21 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       },
       viPresentationCount: 0,
       viPendingFieldPair: null,
+      viScanoutBoundarySnapshots: [],
+      viScanoutStateSnapshot() {
+        return {
+          topBase: null,
+          bottomBase: null,
+          picture: null,
+        };
+      },
+      viScanoutActive: {
+        topBase: null,
+        bottomBase: null,
+        picture: null,
+      },
       viTiming: {
+        displayEnabled: true,
         equ: 6,
         acv: 240,
         oddPrb: 24,
@@ -321,7 +344,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
         evenPsb: 2,
         totalHalfLines: 1050,
       },
-      viXfbAddress() { return 0x01200000; },
+      viActiveXfbAddress() { return 0x01200000; },
     },
   );
 
@@ -348,6 +371,10 @@ test("VI field service selects a cached XFB independently of comparators", () =>
           fieldHeight: 240,
           rowRepeat: 2,
           scanoutPolicy: "bob",
+          scanoutProvenance: {
+            base: null,
+            picture: null,
+          },
         },
       },
       address: 0x01200000,
@@ -380,7 +407,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
   assert.deepEqual([...context.rendererFramesInFlight], [1]);
 
   context.viCurrentHalfLine = () => 567;
-  context.viXfbAddress = () => 0x01200500;
+  context.viActiveXfbAddress = () => 0x01200500;
   context.serviceVideoPresentation(5670);
   assert.equal(messages.length, 1, "an in-flight presentation must backpressure VI");
   assert.equal(context.nextViPresentCycle, 5670);
@@ -408,6 +435,10 @@ test("VI field service selects a cached XFB independently of comparators", () =>
           fieldHeight: 240,
           rowRepeat: 2,
           scanoutPolicy: "bob",
+          scanoutProvenance: {
+            base: null,
+            picture: null,
+          },
         },
         bottom: {
           field: "bottom",
@@ -421,6 +452,10 @@ test("VI field service selects a cached XFB independently of comparators", () =>
           fieldHeight: 240,
           rowRepeat: 2,
           scanoutPolicy: "bob",
+          scanoutProvenance: {
+            base: null,
+            picture: null,
+          },
         },
       },
       address: 0x01200500,

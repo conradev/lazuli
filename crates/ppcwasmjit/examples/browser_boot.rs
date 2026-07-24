@@ -4346,8 +4346,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     let viScheduleDirty = true;
     let viEpochCycle = 0;
     let viEpochHalfLine = 0;
+    let viBeamEnabled = false;
+    let viFrozenBeam = { halfLine: 0, sample: 0, sampleCycle: 0 };
     let nextViCycle = null;
     let nextViPresentCycle = null;
+    let nextViBoundaryCycle = null;
+    let nextViTimingBoundaryCycle = null;
     let nextSerialPollCycle = null;
     let viLastEventCycle = null;
     let viLastEventInterval = null;
@@ -4379,7 +4383,25 @@ const TEMPLATE: &str = r##"<!doctype html>
     const viComparatorMatches = [0, 0, 0, 0];
     const viStatusAssertions = [0, 0, 0, 0];
     const viInterruptAcknowledgements = [0, 0, 0, 0];
-    const viPreviousInterruptRaw = [0, 0, 0, 0];
+    let viActiveAcv = null;
+    let viPendingAcv = null;
+    let viActiveOddVBlank = null;
+    let viPendingOddVBlank = null;
+    let viActiveEvenVBlank = null;
+    let viPendingEvenVBlank = null;
+    let viScanoutWriteSerial = 0;
+    let viScanoutLatchSerial = 0;
+    const viScanoutPending = {
+      topBase: null,
+      bottomBase: null,
+      picture: null,
+    };
+    const viScanoutActive = {
+      topBase: null,
+      bottomBase: null,
+      picture: null,
+    };
+    const viScanoutBoundarySnapshots = [];
     const viTrace = [];
     let decrementerLastCycle = 0;
     let nextDecrementerCycle = null;
@@ -9203,6 +9225,32 @@ const TEMPLATE: &str = r##"<!doctype html>
             )
           : 0
       );
+      if (physical >= 0x0c002000 && physical < 0x0c003000) {
+        const videoInterfaceRead = readVideoInterfaceRegister(
+          physical,
+          size,
+          cycles
+        );
+        if (videoInterfaceRead.handled) {
+          if (videoInterfaceRead.value === null) {
+            return reject("device", "video-interface-register-rejected");
+          }
+          switch (size) {
+            case 1:
+              view.setUint8(pointer, videoInterfaceRead.value);
+              break;
+            case 2:
+              view.setUint16(pointer, videoInterfaceRead.value, true);
+              break;
+            case 4:
+              view.setUint32(pointer, videoInterfaceRead.value, true);
+              break;
+            default:
+              return reject("format", "integer-size-rejected");
+          }
+          return 1;
+        }
+      }
       if (
         physical < 0x0c000040
         && physical + size > 0x0c000000
@@ -9766,6 +9814,13 @@ const TEMPLATE: &str = r##"<!doctype html>
           : 0
       );
       if (
+        physical >= 0x0c002000
+        && physical < 0x0c003000
+      ) {
+        if (writeVideoInterfaceRegister(physical, value, size, cycles)) return 1;
+        return reject("device", "video-interface-register-rejected");
+      }
+      if (
         physical < 0x0c003004
         && physical + size > 0x0c003000
       ) {
@@ -9895,17 +9950,6 @@ const TEMPLATE: &str = r##"<!doctype html>
           break;
         default:
           return reject("format", "integer-size-rejected");
-      }
-      if (physical >= 0x0c002000 && physical < 0x0c002070) {
-        const start = physical - 0x0c002000;
-        const end = start + size;
-        if (
-          (start < 0x14 && end > 0x00)
-          || (start < 0x40 && end > 0x30)
-          || (start < 0x6e && end > 0x6c)
-        ) {
-          viScheduleDirty = true;
-        }
       }
       if (physical < 0x0c006434 && physical + size > 0x0c006430) {
         viScheduleDirty = true;
@@ -11054,6 +11098,267 @@ const TEMPLATE: &str = r##"<!doctype html>
       return view.getUint32(cpu + gprOffsets[index], true);
     }
 
+    function viRegisterAccess(physical, size) {
+      const address = physical >>> 0;
+      if (address < 0x0c002000 || address >= 0x0c003000) return null;
+      const offset = address - 0x0c000000;
+      const aligned = size === 1
+        || (size === 2 && (offset & 1) === 0)
+        || (size === 4 && (offset & 3) === 0);
+      if (!aligned || offset + size > 0x3000) {
+        return { offset, valid: false };
+      }
+      return { offset, valid: true };
+    }
+
+    function viBeamPositionAtCycle(observedCycles) {
+      if (viTiming === null) {
+        return { halfLine: 0, vct: 1, hct: 1, sample: 0 };
+      }
+      if (!viBeamEnabled) {
+        const halfLine = viFrozenBeam.halfLine % viTiming.totalHalfLines;
+        const sample = Math.min(viFrozenBeam.sample, viTiming.hlw - 1);
+        return {
+          halfLine,
+          vct: 1 + Math.floor(halfLine / 2),
+          hct: 1 + (halfLine & 1) * viTiming.hlw + sample,
+          sample,
+        };
+      }
+      const elapsedCycles = Math.max(0, observedCycles - viEpochCycle);
+      const elapsedHalfLines = Math.floor(
+        elapsedCycles / viTiming.cyclesPerHalfLine
+      );
+      const halfLine = (
+        viEpochHalfLine + elapsedHalfLines
+      ) % viTiming.totalHalfLines;
+      const halfLineCycles = elapsedCycles % viTiming.cyclesPerHalfLine;
+      const sample = Math.min(
+        viTiming.hlw - 1,
+        Math.floor(halfLineCycles / viTiming.cyclesPerSample)
+      );
+      return {
+        halfLine,
+        vct: 1 + Math.floor(halfLine / 2),
+        hct: 1 + (halfLine & 1) * viTiming.hlw + sample,
+        sample,
+      };
+    }
+
+    function synchronizeVideoInterfaceAtCycle(observedCycles) {
+      ensureViSchedule(observedCycles);
+      serviceViDueEvents(observedCycles);
+      updateViInterruptLevel(observedCycles, false);
+    }
+
+    function readVideoInterfaceRegister(physical, size, observedCycles) {
+      const access = viRegisterAccess(physical, size);
+      if (access === null) return { handled: false, value: null };
+      if (!access.valid || ![1, 2, 4].includes(size)) {
+        return { handled: true, value: null };
+      }
+      synchronizeVideoInterfaceAtCycle(observedCycles);
+      const offset = access.offset;
+      if (offset < 0x202c + 4 && offset + size > 0x202c) {
+        const beam = viBeamPositionAtCycle(observedCycles);
+        const packed = ((beam.vct & 0xffff) << 16) | (beam.hct & 0xffff);
+        const scratch = new DataView(new ArrayBuffer(4));
+        scratch.setUint32(0, packed >>> 0, false);
+        const beamOffset = offset - 0x202c;
+        if (beamOffset < 0 || beamOffset + size > 4) {
+          return { handled: true, value: null };
+        }
+        return {
+          handled: true,
+          value: size === 1
+            ? scratch.getUint8(beamOffset)
+            : size === 2
+              ? scratch.getUint16(beamOffset, false)
+              : scratch.getUint32(beamOffset, false),
+        };
+      }
+      return {
+        handled: true,
+        value: size === 1
+          ? view.getUint8(mmio + offset)
+          : size === 2
+            ? view.getUint16(mmio + offset, false)
+            : view.getUint32(mmio + offset, false),
+      };
+    }
+
+    function writeViDisplayControl(value, observedCycles) {
+      const written = value & 0x03ff;
+      const reset = (written & 2) !== 0;
+      view.setUint16(mmio + 0x2002, written & ~2, false);
+      if (reset) {
+        for (let index = 0; index < viInterruptOffsets.length; index += 1) {
+          view.setUint32(mmio + viInterruptOffsets[index], 0, false);
+        }
+        view.setUint32(
+          mmio + 0x3000,
+          view.getUint32(mmio + 0x3000, false) & ~0x00000100,
+          false
+        );
+        viTiming = null;
+        viTimingSignature = null;
+        viComparatorSignature = null;
+        viSerialPollSignature = null;
+        viBeamEnabled = false;
+        viFrozenBeam = { halfLine: 0, sample: 0, sampleCycle: 0 };
+        viEpochCycle = observedCycles;
+        viEpochHalfLine = 0;
+        nextViCycle = null;
+        nextViPresentCycle = null;
+        nextViBoundaryCycle = null;
+        nextViTimingBoundaryCycle = null;
+        nextSerialPollCycle = null;
+        resetViFieldPairing("display-reset", observedCycles);
+        viScanoutActive.topBase = null;
+        viScanoutActive.bottomBase = null;
+        viScanoutActive.picture = null;
+        viScanoutPending.topBase = null;
+        viScanoutPending.bottomBase = null;
+        viScanoutPending.picture = null;
+        viScanoutBoundarySnapshots.length = 0;
+        viActiveAcv = null;
+        viPendingAcv = null;
+        viActiveOddVBlank = null;
+        viPendingOddVBlank = null;
+        viActiveEvenVBlank = null;
+        viPendingEvenVBlank = null;
+        traceVi("display-reset", observedCycles);
+      }
+      viScheduleDirty = true;
+    }
+
+    function writeViInterruptHalf(index, high, value, observedCycles) {
+      const offset = viInterruptOffsets[index];
+      const previous = view.getUint32(mmio + offset, false);
+      let written = high
+        ? (((value & 0xffff) << 16) | (previous & 0xffff)) >>> 0
+        : ((previous & 0xffff0000) | (value & 0xffff)) >>> 0;
+      if (high) {
+        const retainedStatus = previous & written & 0x80000000;
+        written = ((written & ~0x80000000) | retainedStatus) >>> 0;
+        if (
+          (previous & 0x80000000) !== 0
+          && (written & 0x80000000) === 0
+        ) {
+          viInterruptAcknowledgements[index] += 1;
+          traceVi("ack", observedCycles, {
+            index,
+            rawBefore: hex32(previous),
+            rawAfter: hex32(written),
+          });
+        }
+      }
+      view.setUint32(mmio + offset, written, false);
+      viComparatorSignature = null;
+    }
+
+    function recordViScanoutWrite(kind, value, observedCycles) {
+      viScanoutWriteSerial += 1;
+      viScanoutPending[kind] = {
+        value: value >>> 0,
+        writeCycle: observedCycles,
+        writeSerial: viScanoutWriteSerial,
+      };
+    }
+
+    function captureViPendingRegisters(offset, size, observedCycles) {
+      const end = offset + size;
+      if (offset < 0x2002 && end > 0x2000) {
+        viPendingAcv = (view.getUint16(mmio + 0x2000, false) >>> 4) & 0x03ff;
+      }
+      if (offset < 0x2010 && end > 0x200c) {
+        viPendingOddVBlank = view.getUint32(mmio + 0x200c, false);
+      }
+      if (offset < 0x2014 && end > 0x2010) {
+        viPendingEvenVBlank = view.getUint32(mmio + 0x2010, false);
+      }
+      if (offset < 0x2020 && end > 0x201c) {
+        recordViScanoutWrite(
+          "topBase",
+          view.getUint32(mmio + 0x201c, false),
+          observedCycles
+        );
+      }
+      if (offset < 0x2028 && end > 0x2024) {
+        recordViScanoutWrite(
+          "bottomBase",
+          view.getUint32(mmio + 0x2024, false),
+          observedCycles
+        );
+      }
+      if (offset < 0x204a && end > 0x2048) {
+        recordViScanoutWrite(
+          "picture",
+          view.getUint16(mmio + 0x2048, false),
+          observedCycles
+        );
+      }
+    }
+
+    function writeViHalfword(offset, value, observedCycles) {
+      const written = value & 0xffff;
+      if (offset === 0x202c || offset === 0x202e) return true;
+      if (offset === 0x2002) {
+        writeViDisplayControl(written, observedCycles);
+        return true;
+      }
+      if (offset >= 0x2030 && offset < 0x2040) {
+        const delta = offset - 0x2030;
+        if ((delta & 1) !== 0) return false;
+        writeViInterruptHalf(
+          Math.floor(delta / 4),
+          (delta & 2) === 0,
+          written,
+          observedCycles
+        );
+        return true;
+      }
+      view.setUint16(mmio + offset, written, false);
+      if ([0x201c, 0x2020, 0x2024, 0x2028].includes(offset)) {
+        const raw = view.getUint32(mmio + offset, false);
+        if ((raw & 0xe0000000) !== 0) {
+          view.setUint32(mmio + offset, raw & ~0x10000000, false);
+        }
+      }
+      return true;
+    }
+
+    function writeVideoInterfaceRegister(physical, value, size, observedCycles) {
+      const access = viRegisterAccess(physical, size);
+      if (access === null || !access.valid || ![2, 4].includes(size)) {
+        return false;
+      }
+      synchronizeVideoInterfaceAtCycle(observedCycles);
+      const offset = access.offset;
+      if (size === 2) {
+        if (!writeViHalfword(offset, value, observedCycles)) return false;
+      } else {
+        if (!writeViHalfword(offset, Number(value) >>> 16, observedCycles)) {
+          return false;
+        }
+        if (!writeViHalfword(offset + 2, Number(value) & 0xffff, observedCycles)) {
+          return false;
+        }
+      }
+      captureViPendingRegisters(offset, size, observedCycles);
+      const end = offset + size;
+      if (
+        (offset < 0x2014 && end > 0x2000)
+        || (offset < 0x2040 && end > 0x2030)
+        || (offset < 0x206e && end > 0x206c)
+      ) {
+        viScheduleDirty = true;
+      }
+      ensureViSchedule(observedCycles);
+      updateViInterruptLevel(observedCycles, false);
+      return true;
+    }
+
     function traceVi(event, observedCycles, details = {}) {
       const halfLine = viCurrentHalfLine(observedCycles);
       viTrace.push({
@@ -11079,12 +11384,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       const evenVBlank = view.getUint32(mmio + 0x2010, false);
       const clock = view.getUint16(mmio + 0x206c, false);
       const equ = verticalTiming & 0x000f;
-      const acv = (verticalTiming >>> 4) & 0x03ff;
+      const programmedAcv = (verticalTiming >>> 4) & 0x03ff;
+      const acv = viActiveAcv ?? programmedAcv;
       const hlw = horizontalTiming0 & 0x03ff;
-      const oddPrb = oddVBlank & 0x03ff;
-      const oddPsb = (oddVBlank >>> 16) & 0x03ff;
-      const evenPrb = evenVBlank & 0x03ff;
-      const evenPsb = (evenVBlank >>> 16) & 0x03ff;
+      const activeOddVBlank = viActiveOddVBlank ?? oddVBlank;
+      const activeEvenVBlank = viActiveEvenVBlank ?? evenVBlank;
+      const oddPrb = activeOddVBlank & 0x03ff;
+      const oddPsb = (activeOddVBlank >>> 16) & 0x03ff;
+      const evenPrb = activeEvenVBlank & 0x03ff;
+      const evenPsb = (activeEvenVBlank >>> 16) & 0x03ff;
       const clockSelect = clock & 1;
       const clockHz = viClockFrequencies[clockSelect];
       const cyclesPerSample = 2 * viCpuCyclesPerSecond / clockHz;
@@ -11101,12 +11409,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       return {
         valid,
         signature: [
-          verticalTiming,
-          displayControl,
-          horizontalTiming0,
-          oddVBlank,
-          evenVBlank,
-          clock,
+          equ,
+          acv,
+          displayControl & 0x0005,
+          hlw,
+          oddPrb,
+          oddPsb,
+          evenPrb,
+          evenPsb,
+          clockSelect,
         ].join(":"),
         raw: {
           verticalTiming: "0x" + verticalTiming.toString(16).padStart(4, "0"),
@@ -11115,6 +11426,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           oddVBlank: "0x" + oddVBlank.toString(16).padStart(8, "0"),
           evenVBlank: "0x" + evenVBlank.toString(16).padStart(8, "0"),
           clock: "0x" + clock.toString(16).padStart(4, "0"),
+        },
+        programmed: {
+          acv: programmedAcv,
+          oddVBlank: hex32(oddVBlank),
+          evenVBlank: hex32(evenVBlank),
         },
         displayEnabled: (displayControl & 1) !== 0,
         singleField,
@@ -11179,21 +11495,131 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function viOutputDimensions() {
+    function programmedViScanoutEntry(kind, observedCycles) {
+      const value = kind === "topBase"
+        ? view.getUint32(mmio + 0x201c, false)
+        : kind === "bottomBase"
+          ? view.getUint32(mmio + 0x2024, false)
+          : view.getUint16(mmio + 0x2048, false);
+      return {
+        value,
+        writeCycle: observedCycles,
+        writeSerial: 0,
+      };
+    }
+
+    function cloneViScanoutEntry(entry) {
+      return entry === null ? null : { ...entry };
+    }
+
+    function viScanoutStateSnapshot() {
+      return {
+        topBase: cloneViScanoutEntry(viScanoutActive.topBase),
+        bottomBase: cloneViScanoutEntry(viScanoutActive.bottomBase),
+        picture: cloneViScanoutEntry(viScanoutActive.picture),
+      };
+    }
+
+    function latchViScanoutBoundary(field, observedCycles) {
+      check(field === "top" || field === "bottom", "invalid VI scanout field");
+      const latch = (kind, details = {}) => {
+        const pending = viScanoutPending[kind]
+          ?? programmedViScanoutEntry(kind, observedCycles);
+        viScanoutLatchSerial += 1;
+        viScanoutActive[kind] = {
+          ...pending,
+          ...details,
+          field,
+          latchedAtCycle: observedCycles,
+          latchSerial: viScanoutLatchSerial,
+        };
+      };
+
+      if (field === "top") {
+        latch("topBase");
+        latch("picture", {
+          displayControl: view.getUint16(mmio + 0x2002, false),
+          activeLines: viActiveAcv
+            ?? ((view.getUint16(mmio + 0x2000, false) >>> 4) & 0x03ff),
+          oddVBlank: (
+            viActiveOddVBlank ?? view.getUint32(mmio + 0x200c, false)
+          ) >>> 0,
+        });
+      } else {
+        latch("bottomBase");
+      }
+
+      const snapshot = viScanoutStateSnapshot();
+      traceVi("scanout-latch", observedCycles, {
+        field,
+        topBaseLatch: snapshot.topBase?.latchSerial ?? null,
+        bottomBaseLatch: snapshot.bottomBase?.latchSerial ?? null,
+        pictureLatch: snapshot.picture?.latchSerial ?? null,
+      });
+      return snapshot;
+    }
+
+    function latchViTimingBoundary(field, observedCycles) {
+      check(field === "top" || field === "bottom", "invalid VI timing field");
+      let changed = false;
+      if (field === "top") {
+        const nextAcv = viPendingAcv
+          ?? viActiveAcv
+          ?? ((view.getUint16(mmio + 0x2000, false) >>> 4) & 0x03ff);
+        const nextOddVBlank = viPendingOddVBlank
+          ?? viActiveOddVBlank
+          ?? view.getUint32(mmio + 0x200c, false);
+        changed = viActiveAcv !== nextAcv
+          || viActiveOddVBlank !== nextOddVBlank;
+        viActiveAcv = nextAcv;
+        viActiveOddVBlank = nextOddVBlank;
+        viPendingAcv = null;
+        viPendingOddVBlank = null;
+      } else {
+        const nextEvenVBlank = viPendingEvenVBlank
+          ?? viActiveEvenVBlank
+          ?? view.getUint32(mmio + 0x2010, false);
+        changed = viActiveEvenVBlank !== nextEvenVBlank;
+        viActiveEvenVBlank = nextEvenVBlank;
+        viPendingEvenVBlank = null;
+      }
+      if (changed) viScheduleDirty = true;
+      traceVi("timing-latch", observedCycles, {
+        field,
+        activeAcv: viActiveAcv,
+        activeOddVBlank: viActiveOddVBlank === null
+          ? null
+          : hex32(viActiveOddVBlank),
+        activeEvenVBlank: viActiveEvenVBlank === null
+          ? null
+          : hex32(viActiveEvenVBlank),
+      });
+      return changed;
+    }
+
+    function viOutputDimensions(scanoutState = viScanoutActive) {
+      const picture = scanoutState.picture;
       return decodeViOutputDimensions(
-        view.getUint16(mmio + 0x2048, false),
-        view.getUint16(mmio + 0x2002, false),
-        viTiming?.acv ?? 0
+        picture?.value ?? view.getUint16(mmio + 0x2048, false),
+        picture?.displayControl ?? view.getUint16(mmio + 0x2002, false),
+        picture?.activeLines ?? viTiming?.acv ?? 0
       );
     }
 
+    function viActiveXfbAddress(field, scanoutState = viScanoutActive) {
+      const topRaw = scanoutState.topBase?.value
+        ?? view.getUint32(mmio + 0x201c, false);
+      const raw = field === "top"
+        ? topRaw
+        : scanoutState.bottomBase?.value
+          ?? view.getUint32(mmio + 0x2024, false);
+      return viXfbAddressFromRaw(raw, topRaw);
+    }
+
     function viCurrentHalfLine(observedCycles) {
-      if (viTiming === null) return null;
-      const elapsed = Math.max(
-        0,
-        Math.floor((observedCycles - viEpochCycle) / viTiming.cyclesPerHalfLine)
-      );
-      return (viEpochHalfLine + elapsed) % viTiming.totalHalfLines;
+      return viTiming === null
+        ? null
+        : viBeamPositionAtCycle(observedCycles).halfLine;
     }
 
     function viCycleForHalfLineAfter(targetHalfLine, observedCycles) {
@@ -11217,11 +11643,32 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function viComparatorTarget(raw) {
       if (viTiming === null) return null;
-      const hct = raw & 0x07ff;
-      const vct = (raw >>> 16) & 0x07ff;
-      if (vct === 0) return null;
-      const target = 2 * (vct - 1) + (hct > viTiming.hlw ? 1 : 0);
-      return target < viTiming.totalHalfLines ? target : null;
+      const hct = raw & 0x03ff;
+      const vct = (raw >>> 16) & 0x03ff;
+      if (vct === 0 || hct === 0 || hct > 2 * viTiming.hlw) return null;
+      const targetSample = (vct - 1) * 2 * viTiming.hlw + (hct - 1);
+      if (targetSample >= viTiming.totalHalfLines * viTiming.hlw) return null;
+      return {
+        hct,
+        vct,
+        targetSample,
+        halfLine: Math.floor(targetSample / viTiming.hlw),
+        sample: targetSample % viTiming.hlw,
+      };
+    }
+
+    function viCycleForRasterSampleAfter(targetSample, observedCycles) {
+      if (viTiming === null) return null;
+      const frameSamples = viTiming.totalHalfLines * viTiming.hlw;
+      const epochSample = viEpochHalfLine * viTiming.hlw;
+      const elapsedSamples = Math.floor(
+        Math.max(0, observedCycles - viEpochCycle) / viTiming.cyclesPerSample
+      );
+      const currentSample = (epochSample + elapsedSamples) % frameSamples;
+      let distance = (targetSample - currentSample + frameSamples) % frameSamples;
+      if (distance === 0) distance = frameSamples;
+      return viEpochCycle
+        + (elapsedSamples + distance) * viTiming.cyclesPerSample;
     }
 
     function nextViComparatorCycle(observedCycles) {
@@ -11229,7 +11676,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const candidates = viInterruptOffsets
         .map(offset => viComparatorTarget(view.getUint32(mmio + offset, false)))
         .filter(target => target !== null)
-        .map(target => viCycleForHalfLineAfter(target, observedCycles));
+        .map(target =>
+          viCycleForRasterSampleAfter(target.targetSample, observedCycles)
+        );
       return candidates.length === 0 ? null : Math.min(...candidates);
     }
 
@@ -11239,6 +11688,98 @@ const TEMPLATE: &str = r##"<!doctype html>
         viCycleForHalfLineAfter(target.halfLine, observedCycles)
       );
       return candidates.length === 0 ? null : Math.min(...candidates);
+    }
+
+    function viTimingFieldTargets(timing) {
+      const targets = [{ field: "top", halfLine: 0 }];
+      if (!timing.singleField) {
+        targets.push({ field: "bottom", halfLine: timing.oddHalfLines });
+      }
+      return targets;
+    }
+
+    function nextViTimingBoundaryCycleAfter(observedCycles) {
+      if (viTiming === null || !viTiming.displayEnabled) return null;
+      const candidates = viTimingFieldTargets(viTiming).map(target =>
+        viCycleForHalfLineAfter(target.halfLine, observedCycles)
+      );
+      return candidates.length === 0 ? null : Math.min(...candidates);
+    }
+
+    function nextViDueEventCycle(observedCycles) {
+      let next = null;
+      for (const candidate of [
+        nextViCycle,
+        nextViTimingBoundaryCycle,
+        nextViBoundaryCycle,
+      ]) {
+        if (
+          candidate !== null
+          && candidate <= observedCycles
+          && (next === null || candidate < next)
+        ) {
+          next = candidate;
+        }
+      }
+      return next;
+    }
+
+    function serviceViDueEvents(observedCycles) {
+      for (;;) {
+        const scheduledCycle = nextViDueEventCycle(observedCycles);
+        if (scheduledCycle === null) return;
+
+        const comparatorDue = nextViCycle === scheduledCycle;
+        const timingDue = nextViTimingBoundaryCycle === scheduledCycle;
+        const scanoutDue = nextViBoundaryCycle === scheduledCycle;
+        const halfLine = viCurrentHalfLine(scheduledCycle);
+        const timingTarget = timingDue
+          ? viTimingFieldTargets(viTiming)
+              .find(candidate => candidate.halfLine === halfLine)
+          : undefined;
+        const scanoutTarget = scanoutDue
+          ? viActiveFieldTargets(viTiming)
+              .find(candidate => candidate.halfLine === halfLine)
+          : undefined;
+        const duePresentationCycle = nextViPresentCycle;
+
+        // Stable same-cycle order is architectural: the comparator samples
+        // the old raster image, documented timing buffers are promoted, then
+        // the active scanout snapshot owns the promoted field geometry.
+        if (comparatorDue) {
+          serviceViComparatorEvent(scheduledCycle, observedCycles);
+        }
+        if (timingDue) {
+          if (timingTarget !== undefined) {
+            latchViTimingBoundary(timingTarget.field, scheduledCycle);
+          }
+          nextViTimingBoundaryCycle = nextViTimingBoundaryCycleAfter(
+            scheduledCycle
+          );
+        }
+        if (scanoutDue) {
+          if (scanoutTarget !== undefined) {
+            const snapshot = latchViScanoutBoundary(
+              scanoutTarget.field,
+              scheduledCycle
+            );
+            viScanoutBoundarySnapshots.push({
+              scheduledCycle,
+              field: scanoutTarget.field,
+              snapshot,
+            });
+            if (viScanoutBoundarySnapshots.length > 8) {
+              viScanoutBoundarySnapshots.shift();
+            }
+          }
+          nextViBoundaryCycle = nextViPresentationCycleAfter(scheduledCycle);
+        }
+
+        if (viScheduleDirty) ensureViSchedule(scheduledCycle);
+        if (scanoutDue && duePresentationCycle === scheduledCycle) {
+          nextViPresentCycle = scheduledCycle;
+        }
+      }
     }
 
     function nextViSerialPollCycle(observedCycles) {
@@ -11301,7 +11842,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function currentViComparatorSignature() {
       return viInterruptOffsets.map(offset => {
         const raw = view.getUint32(mmio + offset, false);
-        return raw & 0x07ff07ff;
+        return raw & 0x03ff03ff;
       }).join(":");
     }
 
@@ -11333,7 +11874,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       dimensions,
       resolved,
       sourceRowStep,
-      address
+      address,
+      scanoutState
     ) {
       check(field === "top" || field === "bottom", "invalid VI field parity");
       const presentationMode = dimensions.rowRepeat === 2
@@ -11351,6 +11893,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         fieldHeight: dimensions.fieldHeight,
         rowRepeat: dimensions.rowRepeat,
         scanoutPolicy: dimensions.scanoutPolicy,
+        scanoutProvenance: {
+          base: cloneViScanoutEntry(
+            field === "top"
+              ? scanoutState.topBase
+              : scanoutState.bottomBase
+          ),
+          picture: cloneViScanoutEntry(scanoutState.picture),
+        },
       };
       if (presentationMode !== "interlaced") {
         viPendingFieldPair = null;
@@ -11369,6 +11919,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         dimensions.fieldHeight,
         dimensions.rowRepeat,
         sourceRowStep,
+        scanoutState.picture?.latchSerial ?? 0,
         resolved?.frame.stride ?? -1,
         resolved?.frame.width ?? -1,
         resolved?.frame.height ?? -1,
@@ -11406,39 +11957,105 @@ const TEMPLATE: &str = r##"<!doctype html>
     function ensureViSchedule(observedCycles) {
       if (!viScheduleDirty) return;
       viScheduleDirty = false;
+      const previousTiming = viTiming;
+      const wasEnabled = viBeamEnabled;
+      const previousBeam = previousTiming === null
+        ? { halfLine: viFrozenBeam.halfLine, sample: viFrozenBeam.sample }
+        : viBeamPositionAtCycle(observedCycles);
+      const previousSampleCycle = previousTiming !== null && wasEnabled
+        ? Math.max(0, observedCycles - viEpochCycle)
+            % previousTiming.cyclesPerSample
+        : viFrozenBeam.sampleCycle ?? 0;
+      const wantsEnabled = (
+        view.getUint16(mmio + 0x2002, false) & 1
+      ) !== 0;
+      if (wantsEnabled && !wasEnabled) {
+        viActiveAcv = viPendingAcv
+          ?? ((view.getUint16(mmio + 0x2000, false) >>> 4) & 0x03ff);
+        viActiveOddVBlank = viPendingOddVBlank
+          ?? view.getUint32(mmio + 0x200c, false);
+        viActiveEvenVBlank = viPendingEvenVBlank
+          ?? view.getUint32(mmio + 0x2010, false);
+        viPendingAcv = null;
+        viPendingOddVBlank = null;
+        viPendingEvenVBlank = null;
+      }
       const decoded = decodeViTiming();
       if (!decoded.valid) {
         if (viTiming !== null) {
           traceVi("timing-invalid", observedCycles, { raw: decoded.raw });
         }
         viTiming = null;
+        viBeamEnabled = false;
+        viFrozenBeam = {
+          halfLine: previousBeam.halfLine,
+          sample: previousBeam.sample,
+          sampleCycle: previousSampleCycle,
+        };
         viTimingSignature = decoded.signature;
         viComparatorSignature = null;
         viSerialPollSignature = null;
         nextViCycle = null;
         nextViPresentCycle = null;
+        nextViBoundaryCycle = null;
+        nextViTimingBoundaryCycle = null;
         nextSerialPollCycle = null;
         resetViFieldPairing("timing-invalid", observedCycles);
         return;
       }
 
-      if (viTiming === null || decoded.signature !== viTimingSignature) {
-        const previousHalfLine = viCurrentHalfLine(observedCycles);
-        resetViFieldPairing("timing-reschedule", observedCycles);
+      const timingChanged = viTiming === null
+        || decoded.signature !== viTimingSignature;
+      const enabled = decoded.displayEnabled;
+      if (timingChanged || enabled !== wasEnabled) {
+        if (
+          enabled !== wasEnabled
+          || previousTiming === null
+          || decoded.singleField !== previousTiming.singleField
+          || decoded.acv !== previousTiming.acv
+        ) {
+          resetViFieldPairing("timing-reschedule", observedCycles);
+        }
         viTiming = decoded;
         viTimingSignature = decoded.signature;
-        viEpochCycle = observedCycles;
-        viEpochHalfLine = previousHalfLine === null
-          ? 0
-          : previousHalfLine % viTiming.totalHalfLines;
+        const retainedHalfLine = previousBeam.halfLine % viTiming.totalHalfLines;
+        const retainedSample = Math.min(previousBeam.sample, viTiming.hlw - 1);
+        const retainedSampleCycle = Math.min(
+          previousSampleCycle,
+          viTiming.cyclesPerSample - 1
+        );
+        viEpochHalfLine = retainedHalfLine;
+        viEpochCycle = observedCycles
+          - retainedSample * viTiming.cyclesPerSample
+          - retainedSampleCycle;
+        viFrozenBeam = {
+          halfLine: retainedHalfLine,
+          sample: retainedSample,
+          sampleCycle: retainedSampleCycle,
+        };
+        viBeamEnabled = enabled;
         viComparatorSignature = currentViComparatorSignature();
         viSerialPollSignature = view.getUint32(mmio + 0x6430, false);
-        nextViCycle = nextViComparatorCycle(observedCycles);
-        nextViPresentCycle = nextViPresentationCycleAfter(observedCycles);
-        nextSerialPollCycle = nextViSerialPollCycle(observedCycles);
+        nextViCycle = enabled ? nextViComparatorCycle(observedCycles) : null;
+        nextViPresentCycle = enabled
+          ? nextViPresentationCycleAfter(observedCycles)
+          : null;
+        nextViBoundaryCycle = enabled
+          ? nextViPresentationCycleAfter(observedCycles)
+          : null;
+        nextViTimingBoundaryCycle = enabled
+          ? nextViTimingBoundaryCycleAfter(observedCycles)
+          : null;
+        nextSerialPollCycle = enabled
+          ? nextViSerialPollCycle(observedCycles)
+          : null;
         viTimingReschedules += 1;
         traceVi("timing-reschedule", observedCycles, {
           raw: decoded.raw,
+          enabled,
+          retainedHalfLine,
+          retainedSample,
+          retainedSampleCycle,
           clockHz: decoded.clockHz,
           cyclesPerHalfLine: decoded.cyclesPerHalfLine,
           oddFieldCycles: decoded.oddFieldCycles,
@@ -11466,30 +12083,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function detectViAcknowledgements(observedCycles) {
-      for (let index = 0; index < viInterruptOffsets.length; index += 1) {
-        const raw = view.getUint32(mmio + viInterruptOffsets[index], false);
-        const previous = viPreviousInterruptRaw[index];
-        if ((previous & 0x80000000) !== 0 && (raw & 0x80000000) === 0) {
-          viInterruptAcknowledgements[index] += 1;
-          traceVi("ack", observedCycles, {
-            index,
-            rawBefore: hex32(previous),
-            rawAfter: hex32(raw),
-          });
-        }
-        viPreviousInterruptRaw[index] = raw;
-      }
-    }
-
-    function videoInterruptConfigured() {
-      if (viTiming === null || !viTiming.displayEnabled) return false;
-      return viInterruptOffsets.some(offset => {
-        const raw = view.getUint32(mmio + offset, false);
-        return (raw & 0x10000000) !== 0 && viComparatorTarget(raw) !== null;
-      });
-    }
-
     function gxXfbCopyRowOffset(frame, address) {
       if (address < frame.destination) return null;
       const delta = address - frame.destination;
@@ -11514,18 +12107,33 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function serviceVideoPresentation(observedCycles) {
-      while (
-        rendererFramesInFlight.size === 0
-        && nextViPresentCycle !== null
-        && nextViPresentCycle <= observedCycles
-      ) {
-        const scheduledCycle = nextViPresentCycle;
+      while (rendererFramesInFlight.size === 0) {
+        const queuedBoundary = viScanoutBoundarySnapshots[0] ?? null;
+        const queuedCycle = queuedBoundary?.scheduledCycle ?? null;
+        let scheduledCycle = null;
+        if (queuedCycle !== null && queuedCycle <= observedCycles) {
+          scheduledCycle = queuedCycle;
+        } else if (
+          nextViPresentCycle !== null
+          && nextViPresentCycle <= observedCycles
+        ) {
+          scheduledCycle = nextViPresentCycle;
+        }
+        if (scheduledCycle === null) break;
         const halfLine = viCurrentHalfLine(scheduledCycle);
-        const target = viActiveFieldTargets(viTiming)
-          .find(candidate => candidate.halfLine === halfLine);
+        const boundary = queuedCycle !== scheduledCycle
+          ? null
+          : viScanoutBoundarySnapshots.shift();
+        const target = boundary === null
+          ? viActiveFieldTargets(viTiming)
+              .find(candidate => candidate.halfLine === halfLine)
+          : { field: boundary.field, halfLine };
         if (target !== undefined) {
-          const address = viXfbAddress(target.registerOffset);
-          const dimensions = viOutputDimensions();
+          const scanoutState = boundary === null
+            ? viScanoutStateSnapshot()
+            : boundary.snapshot;
+          const address = viActiveXfbAddress(target.field, scanoutState);
+          const dimensions = viOutputDimensions(scanoutState);
           const resolved = gxResolveXfbCopy(address);
           const sourceRowStep = resolved !== null
             && resolved.frame.stride > 0
@@ -11537,7 +12145,8 @@ const TEMPLATE: &str = r##"<!doctype html>
             dimensions,
             resolved,
             sourceRowStep,
-            address
+            address,
+            scanoutState
           );
           const temporalXfbCapture = fieldPair.pairCompleting
             ? claimSmbTemporalXfbCapture()
@@ -11593,53 +12202,58 @@ const TEMPLATE: &str = r##"<!doctype html>
             copyRow: resolved?.row ?? null,
           });
         }
-        nextViPresentCycle = nextViPresentationCycleAfter(scheduledCycle);
+        if (
+          viTiming?.displayEnabled
+          && (
+            nextViPresentCycle === null
+            || nextViPresentCycle <= scheduledCycle
+          )
+        ) {
+          nextViPresentCycle = nextViPresentationCycleAfter(scheduledCycle);
+        }
       }
     }
 
-    function serviceVideoInterrupt(observedCycles) {
-      detectViAcknowledgements(observedCycles);
+    function serviceViComparatorEvent(scheduledCycle, observedCycles) {
+      const beam = viBeamPositionAtCycle(scheduledCycle);
+      const lateness = observedCycles - scheduledCycle;
+      viMissedHalfLines += Math.floor(lateness / viTiming.cyclesPerHalfLine);
 
-      while (nextViCycle !== null && nextViCycle <= observedCycles) {
-        const scheduledCycle = nextViCycle;
-        const halfLine = viCurrentHalfLine(scheduledCycle);
-        const lateness = observedCycles - scheduledCycle;
-        viMissedHalfLines += Math.floor(lateness / viTiming.cyclesPerHalfLine);
-        view.setUint16(mmio + 0x202c, 1 + Math.floor(halfLine / 2), false);
-        view.setUint16(
-          mmio + 0x202e,
-          (halfLine & 1) === 0 ? 1 : viTiming.hlw + 1,
-          false
-        );
-
-        const matches = [];
-        for (let index = 0; index < viInterruptOffsets.length; index += 1) {
-          const offset = viInterruptOffsets[index];
-          const raw = view.getUint32(mmio + offset, false);
-          if (viComparatorTarget(raw) !== halfLine) continue;
-          matches.push(index);
-          viComparatorMatches[index] += 1;
-          if ((raw & 0x80000000) === 0) viStatusAssertions[index] += 1;
-          const asserted = (raw | 0x80000000) >>> 0;
-          view.setUint32(mmio + offset, asserted, false);
-          viPreviousInterruptRaw[index] = asserted;
+      const matches = [];
+      for (let index = 0; index < viInterruptOffsets.length; index += 1) {
+        const offset = viInterruptOffsets[index];
+        const raw = view.getUint32(mmio + offset, false);
+        const target = viComparatorTarget(raw);
+        if (
+          target === null
+          || target.vct !== beam.vct
+          || target.hct !== beam.hct
+        ) {
+          continue;
         }
-
-        if (viLastEventCycle !== null) {
-          viLastEventInterval = scheduledCycle - viLastEventCycle;
-        }
-        viLastEventCycle = scheduledCycle;
-        deviceEvents.set("viCompare", (deviceEvents.get("viCompare") ?? 0) + 1);
-        traceVi("compare", observedCycles, {
-          scheduledCycle,
-          lateness,
-          matches,
-          beamVct: 1 + Math.floor(halfLine / 2),
-          beamHct: (halfLine & 1) === 0 ? 1 : viTiming.hlw + 1,
-        });
-        nextViCycle = nextViComparatorCycle(scheduledCycle);
+        matches.push(index);
+        viComparatorMatches[index] += 1;
+        if ((raw & 0x80000000) === 0) viStatusAssertions[index] += 1;
+        const asserted = (raw | 0x80000000) >>> 0;
+        view.setUint32(mmio + offset, asserted, false);
       }
 
+      if (viLastEventCycle !== null) {
+        viLastEventInterval = scheduledCycle - viLastEventCycle;
+      }
+      viLastEventCycle = scheduledCycle;
+      deviceEvents.set("viCompare", (deviceEvents.get("viCompare") ?? 0) + 1);
+      traceVi("compare", observedCycles, {
+        scheduledCycle,
+        lateness,
+        matches,
+        beamVct: beam.vct,
+        beamHct: beam.hct,
+      });
+      nextViCycle = nextViComparatorCycle(scheduledCycle);
+    }
+
+    function updateViInterruptLevel(observedCycles, deliver) {
       const active = viInterruptOffsets.some(offset => {
         const value = view.getUint32(mmio + offset, false);
         return ((value & 0x90000000) >>> 0) === 0x90000000;
@@ -11649,12 +12263,21 @@ const TEMPLATE: &str = r##"<!doctype html>
       view.setUint32(mmio + 0x3000, cause, false);
       const mask = view.getUint32(mmio + 0x3004, false);
       const msr = view.getUint32(cpu + msrOffset, true);
-      if (active && (mask & 0x00000100) !== 0 && (msr & 0x00008000) !== 0) {
+      if (
+        deliver
+        && active
+        && (mask & 0x00000100) !== 0
+        && (msr & 0x00008000) !== 0
+      ) {
         viPiDeliveries += 1;
         deviceEvents.set("externalInterrupt", (deviceEvents.get("externalInterrupt") ?? 0) + 1);
         traceVi("pi-deliver", observedCycles, { cause: hex32(cause), mask: hex32(mask) });
         raiseException(cpu, 0x0500);
       }
+    }
+
+    function serviceVideoInterrupt(observedCycles) {
+      updateViInterruptLevel(observedCycles, true);
     }
 
     function servicePixelEngine(observedCycles) {
@@ -11772,6 +12395,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       serviceCommandProcessorInterrupt(observedCycles);
       ensureViSchedule(observedCycles);
+      serviceViDueEvents(observedCycles);
       for (const offset of [0x680c, 0x6820, 0x6834]) {
         const control = view.getUint32(mmio + offset, false);
         if ((control & 1) === 0) continue;
@@ -12757,6 +13381,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       const candidates = [
         viTiming?.displayEnabled ? nextViCycle : null,
         viTiming?.displayEnabled ? nextViPresentCycle : null,
+        viTiming?.displayEnabled ? nextViBoundaryCycle : null,
+        viTiming?.displayEnabled ? nextViTimingBoundaryCycle : null,
         nextSerialPollCycle,
         nextDecrementerCycle,
         diskTransfer?.completionCycle ?? null,
@@ -13325,12 +13951,15 @@ const TEMPLATE: &str = r##"<!doctype html>
           viTiming: viTiming === null ? decodeViTiming() : {
             ...viTiming,
             currentHalfLine: viCurrentHalfLine(cycles),
-            currentVct: 1 + Math.floor(viCurrentHalfLine(cycles) / 2),
+            currentVct: viBeamPositionAtCycle(cycles).vct,
+            currentHct: viBeamPositionAtCycle(cycles).hct,
             currentFieldParity: viCurrentHalfLine(cycles) < viTiming.oddHalfLines
               ? "odd"
               : "even",
             epochCycle: viEpochCycle,
             epochHalfLine: viEpochHalfLine,
+            beamEnabled: viBeamEnabled,
+            frozenBeam: viFrozenBeam,
           },
           viInterruptModel: {
             comparatorMatches: viComparatorMatches,
@@ -13367,6 +13996,14 @@ const TEMPLATE: &str = r##"<!doctype html>
               )
             ),
             nextPresentationCycle: nextViPresentCycle,
+            nextScanoutBoundaryCycle: nextViBoundaryCycle,
+            nextTimingBoundaryCycle: nextViTimingBoundaryCycle,
+            scanoutPending: {
+              topBase: cloneViScanoutEntry(viScanoutPending.topBase),
+              bottomBase: cloneViScanoutEntry(viScanoutPending.bottomBase),
+              picture: cloneViScanoutEntry(viScanoutPending.picture),
+            },
+            scanoutActive: viScanoutStateSnapshot(),
             lastPresentationCycle: viLastHostPresentationCycle,
             lastPresentationField: viLastHostPresentationField,
             lastPresentationAddress: hex32(viLastHostPresentationAddress),

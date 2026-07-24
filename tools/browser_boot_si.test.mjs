@@ -145,6 +145,8 @@ function makeContext(functionNames, overrides = {}) {
     viTiming: null,
     viEpochCycle: 0,
     viEpochHalfLine: 0,
+    viBeamEnabled: true,
+    viFrozenBeam: { halfLine: 0, sample: 0, sampleCycle: 0 },
     viSiPollHalfLines: 15,
     deviceEvents: new Map(),
     padUseOrigin: 0x0080,
@@ -651,6 +653,7 @@ test("absent direct transfers mutate only COMCSR and the exact NOREP bit", () =>
 
 test("SI cadence is stateful across X changes and field boundaries", () => {
   const context = makeContext([
+    "viBeamPositionAtCycle",
     "viCurrentHalfLine",
     "viCycleForHalfLineAfter",
     "nextStatefulSerialPollCycle",
@@ -658,7 +661,9 @@ test("SI cadence is stateful across X changes and field boundaries", () => {
   const { view } = context;
   context.viTiming = {
     displayEnabled: true,
+    cyclesPerSample: 1,
     cyclesPerHalfLine: 1,
+    hlw: 1,
     oddHalfLines: 525,
     totalHalfLines: 1050,
   };

@@ -275,9 +275,17 @@ test("VI worker pairs either starting parity under one positive epoch", () => {
       check(condition, message) {
         if (!condition) throw new Error(message);
       },
+      cloneViScanoutEntry(entry) {
+        return entry === null ? null : { ...entry };
+      },
       traceVi(...args) { trace.push(args); },
       viNextPairEpoch: 1,
       viPendingFieldPair: null,
+      viScanoutActive: {
+        topBase: null,
+        bottomBase: null,
+        picture: null,
+      },
     },
   );
   const interlaced = {
@@ -305,6 +313,11 @@ test("VI worker pairs either starting parity under one positive epoch", () => {
     },
     dimensions.rowRepeat,
     field === "top" ? 0x01200000 : 0x01200500,
+    {
+      topBase: null,
+      bottomBase: null,
+      picture: null,
+    },
   );
   const summary = outcome => ({
     presentationMode: outcome.presentationMode,
@@ -343,6 +356,10 @@ test("VI worker pairs either starting parity under one positive epoch", () => {
       fieldHeight: 240,
       rowRepeat: 2,
       scanoutPolicy: "bob",
+      scanoutProvenance: {
+        base: null,
+        picture: null,
+      },
     },
     bottom: {
       field: "bottom",
@@ -356,6 +373,10 @@ test("VI worker pairs either starting parity under one positive epoch", () => {
       fieldHeight: 240,
       rowRepeat: 2,
       scanoutPolicy: "bob",
+      scanoutProvenance: {
+        base: null,
+        picture: null,
+      },
     },
   });
   assert.deepEqual(
