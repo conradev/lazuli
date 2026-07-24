@@ -30,7 +30,6 @@ pub(crate) enum GxExactGeometryError {
     UnsupportedMultisampling,
     UnsupportedZFreeze,
     UnsupportedSourceRaster,
-    UnsupportedPostClipDepthOrRaster,
     UnsupportedPostClipW,
     UnsupportedPostClipPosition,
     UnsupportedPostClipDepth,
@@ -59,12 +58,6 @@ impl fmt::Display for GxExactGeometryError {
             Self::UnsupportedZFreeze => write!(formatter, "GX Z-freeze is not yet exact"),
             Self::UnsupportedSourceRaster => {
                 write!(formatter, "GX source raster channels are not flat")
-            }
-            Self::UnsupportedPostClipDepthOrRaster => {
-                write!(
-                    formatter,
-                    "GX post-clip depth or raster channels are not flat"
-                )
             }
             Self::UnsupportedPostClipW => {
                 write!(formatter, "GX post-clip W is not strictly positive")
@@ -222,9 +215,6 @@ fn gx_exact_raster_geometry(
             if !gx_projected_triangle_is_supported(&projected) {
                 return Err(gx_projected_triangle_error(&projected));
             }
-            if !gx_triangle_array_components_are_flat(&projected, [2].into_iter().chain(4..12)) {
-                return Err(GxExactGeometryError::UnsupportedPostClipDepthOrRaster);
-            }
             for vertex in projected {
                 vertices.extend_from_slice(&vertex);
             }
@@ -270,18 +260,6 @@ fn gx_triangle_components_are_flat(
         indices[1..]
             .iter()
             .all(|index| vertices[index * TEV_VERTEX_FLOATS + component].to_bits() == expected)
-    })
-}
-
-fn gx_triangle_array_components_are_flat(
-    vertices: &[[f32; TEV_VERTEX_FLOATS]; 3],
-    components: impl Iterator<Item = usize>,
-) -> bool {
-    components.into_iter().all(|component| {
-        let expected = vertices[0][component].to_bits();
-        vertices[1..]
-            .iter()
-            .all(|vertex| vertex[component].to_bits() == expected)
     })
 }
 

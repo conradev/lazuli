@@ -138,7 +138,7 @@ test("exact managed geometry wins and unsafe exact input falls back natively", (
   ]);
   assert.match(
     draw,
-    /let exact_managed = qualified_exact\.filter\([\s\S]*ManagedCoverageEvidence::TrustedPostCull[\s\S]*exact\.vertices[\s\S]*&exact\.expanded[\s\S]*scissor/,
+    /let exact_managed = qualified_exact\.filter\([\s\S]*ManagedCoverageEvidence::TrustedExactClip[\s\S]*exact\.vertices[\s\S]*&exact\.expanded[\s\S]*scissor/,
   );
   assert.match(
     draw,
@@ -176,8 +176,9 @@ test("exact activation retains every managed shader-safety gate", () => {
     "managed_coverage_samplers_are_safe",
     "fog != GxFogState::default()",
     "z_texture.operation != GxZTextureOperation::Disabled",
-    "source_triangle_depth_and_rasters_are_bitwise_flat",
-    "managed_coverage_attribute_payload",
+    "source_triangle_depth_is_bitwise_flat",
+    "source_triangle_rasters_are_bitwise_flat",
+    "managed_coverage_attribute_payload_for_depth",
     "managed_coverage_payload_is_safe",
   ]) {
     assert.match(qualification, new RegExp(requirement.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -188,6 +189,11 @@ test("exact activation retains every managed shader-safety gate", () => {
   );
   assert.match(qualification, /vertex\[3\] <= 0\.0/);
   assert.match(qualification, /GX_DEPTH24_MAX/);
+  assert.match(rendererSource, /fn managed_coverage_depth_plane_is_safe/);
+  assert.match(
+    qualification,
+    /evidence == ManagedCoverageEvidence::TrustedPostCull && !depth_is_flat/,
+  );
 });
 
 test("the activated path remains wgpu WebGPU-only and disables GPU reculling", () => {

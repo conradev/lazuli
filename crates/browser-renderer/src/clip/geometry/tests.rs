@@ -236,9 +236,18 @@ fn post_clip_shader_restrictions_are_explicit() {
 
     let mut varying_depth = flat;
     varying_depth[1][2] = -0.25;
+    let varying = gx_exact_raster_geometry(2, 0, &source, &varying_depth, exact_state(0)).unwrap();
     assert_eq!(
-        gx_exact_raster_geometry(2, 0, &source, &varying_depth, exact_state(0)),
-        Err(GxExactGeometryError::UnsupportedPostClipDepthOrRaster)
+        vertex_slices(varying.vertices())
+            .iter()
+            .map(|vertex| vertex[2].to_bits())
+            .collect::<Vec<_>>(),
+        [
+            8_388_607.5f32.to_bits(),
+            12_582_911.0f32.to_bits(),
+            8_388_607.5f32.to_bits(),
+        ],
+        "exact projected depth remains screen-linear instead of being forced flat"
     );
 
     let mut outside_position = exact_state(0);

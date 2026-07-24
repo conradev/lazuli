@@ -694,8 +694,8 @@ struct ManagedCoverageVertexInput {
     @location(6) stq3: vec3<f32>,
     @location(7) stq4: vec3<f32>,
     @location(8) stq5: vec3<f32>,
-    @location(11) coverage_xy01_28_4: vec4<i32>,
-    @location(12) coverage_xy2_28_4: vec2<i32>,
+    @location(11) packed_xy28_4_depth0: vec4<i32>,
+    @location(12) depth12: vec2<i32>,
 };
 
 struct ManagedCoverageVertexOutput {
@@ -708,9 +708,8 @@ struct ManagedCoverageVertexOutput {
     @location(5) @interpolate(flat) stq3: vec3<f32>,
     @location(6) @interpolate(flat) stq4: vec3<f32>,
     @location(7) @interpolate(flat) stq5: vec3<f32>,
-    @location(10) @interpolate(flat) depth24: f32,
-    @location(11) @interpolate(flat) coverage_xy01_28_4: vec4<i32>,
-    @location(12) @interpolate(flat) coverage_xy2_28_4: vec2<i32>,
+    @location(10) @interpolate(flat) source_depth24: vec3<f32>,
+    @location(11) @interpolate(flat) packed_xy28_4: vec3<i32>,
 };
 
 struct CanonicalDepthOutput {
@@ -821,9 +820,12 @@ fn vs_managed_coverage(
     output.stq3 = input.stq3;
     output.stq4 = input.stq4;
     output.stq5 = input.stq5;
-    output.depth24 = input.position.z;
-    output.coverage_xy01_28_4 = input.coverage_xy01_28_4;
-    output.coverage_xy2_28_4 = input.coverage_xy2_28_4;
+    output.source_depth24 = vec3<f32>(
+        bitcast<f32>(u32(input.packed_xy28_4_depth0.w)),
+        bitcast<f32>(u32(input.depth12.x)),
+        bitcast<f32>(u32(input.depth12.y)),
+    );
+    output.packed_xy28_4 = input.packed_xy28_4_depth0.xyz;
     return output;
 }
 
@@ -873,7 +875,9 @@ fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOu
     output.stq5 = reconstructed_stq;
     output.stq6 = reconstructed_stq;
     output.stq7 = reconstructed_stq;
-    output.depth24 = input.depth24;
+    output.depth24 = gx_managed_attribute_at_sample(
+        source_x, source_y, input.source_depth24, sample_x, sample_y,
+    );
     return output;
 }
 
@@ -930,9 +934,12 @@ fn gx_managed_coverage_passes(input: ManagedCoverageVertexOutput) -> bool {
     let pixel_y = i32(floor(input.position.y));
     let sample_x_48 = pixel_x * 48 + 28;
     let sample_y_48 = pixel_y * 48 + 28;
-    let point0 = input.coverage_xy01_28_4.xy;
-    let point1 = input.coverage_xy01_28_4.zw;
-    let point2 = input.coverage_xy2_28_4;
+    let packed0 = u32(input.packed_xy28_4.x);
+    let packed1 = u32(input.packed_xy28_4.y);
+    let packed2 = u32(input.packed_xy28_4.z);
+    let point0 = vec2<i32>(i32(packed0 & 0xffffu), i32(packed0 >> 16u));
+    let point1 = vec2<i32>(i32(packed1 & 0xffffu), i32(packed1 >> 16u));
+    let point2 = vec2<i32>(i32(packed2 & 0xffffu), i32(packed2 >> 16u));
     return gx_managed_edge_covers(point0, point1, sample_x_48, sample_y_48)
         && gx_managed_edge_covers(point1, point2, sample_x_48, sample_y_48)
         && gx_managed_edge_covers(point2, point0, sample_x_48, sample_y_48);
@@ -2182,17 +2189,20 @@ mod tests {
         let native_interfaces_start = shader.find("struct TevVertexInput").unwrap();
         let managed_interfaces_start = shader.find("struct ManagedCoverageVertexInput").unwrap();
         let native_interfaces = &shader[native_interfaces_start..managed_interfaces_start];
-        assert!(!native_interfaces.contains("coverage_xy"));
-        assert!(shader.contains("@location(11) coverage_xy01_28_4: vec4<i32>"));
-        assert!(shader.contains("@location(12) coverage_xy2_28_4: vec2<i32>"));
-        assert!(shader.contains("@location(11) @interpolate(flat) coverage_xy01_28_4: vec4<i32>"));
-        assert!(shader.contains("@location(12) @interpolate(flat) coverage_xy2_28_4: vec2<i32>"));
+        assert!(!native_interfaces.contains("packed_xy28_4"));
+        assert!(shader.contains("@location(11) packed_xy28_4_depth0: vec4<i32>"));
+        assert!(shader.contains("@location(12) depth12: vec2<i32>"));
+        assert!(shader.contains("@location(10) @interpolate(flat) source_depth24: vec3<f32>"));
+        assert!(shader.contains("@location(11) @interpolate(flat) packed_xy28_4: vec3<i32>"));
         assert!(shader.contains("input: ManagedCoverageVertexInput,"));
         assert!(shader.contains(") -> ManagedCoverageVertexOutput"));
         for location in 0..=7 {
             assert!(shader.contains(&format!("@location({location}) @interpolate(flat)")));
         }
-        assert!(shader.contains("@location(10) @interpolate(flat) depth24: f32"));
+        assert!(shader.contains("bitcast<f32>(u32(input.packed_xy28_4_depth0.w))"));
+        assert!(shader.contains("bitcast<f32>(u32(input.depth12.x))"));
+        assert!(shader.contains("bitcast<f32>(u32(input.depth12.y))"));
+        assert!(shader.contains("source_x, source_y, input.source_depth24, sample_x, sample_y,"));
         for coord in 0..MAX_TEV_TEXTURES {
             assert!(shader.contains(&format!("output.stq{coord} = reconstructed_stq")));
         }
@@ -2221,7 +2231,7 @@ mod tests {
             .unwrap()
             + native_vertex_start;
         assert!(
-            !shader[native_vertex_start..managed_vertex_start].contains("coverage_xy"),
+            !shader[native_vertex_start..managed_vertex_start].contains("packed_xy28_4"),
             "the native vertex entry must retain its original interface",
         );
 
