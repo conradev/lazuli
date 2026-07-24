@@ -909,13 +909,229 @@ test("exact projection and viewport model pins scalar f32 operation order", () =
   assert.doesNotMatch(
     extractFunction("gxDecodeVertex"),
     /\bgxExact/,
-    "live vertex decode must remain unchanged until clipped geometry is transportable",
+    "live vertex decode remains unchanged while exact inputs are captured beside it",
   );
-  assert.doesNotMatch(
+  assert.match(
     extractFunction("recordGxPrimitive"),
-    /\bgxExact/,
-    "draw capture must not activate the proof model",
+    /postCullEvidence === null[\s\S]*gxManagedCoverageExactClipInput\([\s\S]*exactClipInput/,
+    "draw capture emits exact inputs only when the existing post-cull proof cannot",
   );
+  assert.match(
+    extractFunction("postGxFrame"),
+    /packGxFramePacketV4\(/,
+    "source-state capture stays transport- and render-inert in this layer",
+  );
+  assert.doesNotMatch(extractFunction("postGxFrame"), /packGxFramePacketV5\(/);
+});
+
+test("exact input capture snapshots raw GX state and homogeneous f32 positions", () => {
+  const xf = new Float32Array(0x1100);
+  xf.set([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+  ], 0);
+  xf.set([
+    1.0000001192092896,
+    -0.3333333432674408,
+    0.75,
+    0.125,
+    1.25,
+    -0.5,
+  ], 0x1020);
+  xf.set([320, -264, 16777215, 342, 342, 0], 0x101a);
+  const registers = new Uint32Array(xf.buffer);
+  registers.set([
+    0x43a00000,
+    0xc3840000,
+    0x4b7fffff,
+    0x80000000,
+    0x00000001,
+    0x80000001,
+  ], 0x101a);
+  registers[0x1005] = 7;
+  registers[0x1026] = 0;
+  const bp = new Uint32Array(0x100);
+  bp[0x00] = (0x00c3b2a1 & ~(3 << 14)) | (2 << 14);
+  bp[0x20] = 0x00fedcba;
+  bp[0x21] = 0x00123456;
+  bp[0x59] = 0x00c0ffee;
+  let xfFloatReads = 0;
+  const context = {
+    Array,
+    Float32Array,
+    Math,
+    Number,
+    Uint32Array,
+    gxBpRegisters: bp,
+    gxXfRegisters: registers,
+    gxXfFloat(address) {
+      xfFloatReads += 1;
+      return xf[address];
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "gxCullF32",
+      "gxCullMul",
+      "gxCullAdd",
+      "gxCullSub",
+      "gxCullDot4Position",
+      "gxCullTransformState",
+      "gxCullPositionMatrix",
+      "gxCullViewPosition",
+      "gxExactClipViewPosition",
+      "gxExactClipPosition",
+      "gxSourceTriangleCount",
+      "gxManagedCoverageExactClipInput",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.gx-exact-input.js" },
+  );
+
+  const positions = [
+    [0.9999999403953552, -1.25, -3.5],
+    [0, 0, -1],
+    [0.25, 0.5, -2],
+  ];
+  const input = context.gxManagedCoverageExactClipInput(
+    2,
+    2,
+    positions,
+    [0, 0, 0],
+  );
+  assert.notEqual(input, null);
+  assert.equal(input.bpGenMode, bp[0x00]);
+  assert.equal(input.bpScissorTopLeft, bp[0x20]);
+  assert.equal(input.bpScissorBottomRight, bp[0x21]);
+  assert.equal(input.bpScissorOffset, bp[0x59]);
+  assert.equal(input.xfClipDisable, 7);
+  assert.deepEqual(
+    f32BitPatterns(input.viewport),
+    Array.from(registers.slice(0x101a, 0x1020)),
+    "viewport words are copied without a numeric re-encoding step",
+  );
+  assert.deepEqual(
+    f32BitPatterns(input.clipPositions.slice(0, 4)),
+    [0x400aaaab, 0xbfb00000, 0xc09bffff, 0x40600000],
+  );
+  assert.equal(input.clipPositions.length, positions.length * 4);
+  assert.equal(
+    xfFloatReads,
+    18,
+    "one projection snapshot and one cached position matrix serve the whole draw",
+  );
+
+  const stripPositions = [
+    [10, 1, -1],
+    [20, 2, -2],
+    [30, 3, -4],
+    [40, 4, -8],
+  ];
+  const stripInput = context.gxManagedCoverageExactClipInput(
+    3,
+    2,
+    stripPositions,
+    [0, 0, 0, 0],
+  );
+  const stripExpected = stripPositions.flatMap(position =>
+    context.gxExactClipPosition(position, 0)
+  );
+  assert.deepEqual(
+    f32BitPatterns(stripInput.clipPositions),
+    f32BitPatterns(stripExpected),
+    "triangle strips retain all original source vertices without expansion or reordering",
+  );
+  assert.deepEqual(
+    Array.from({ length: 4 }, (_unused, vertex) =>
+      stripInput.clipPositions[vertex * 4 + 3]
+    ),
+    [1, 2, 4, 8],
+  );
+
+  bp[0x20] = 0;
+  registers[0x101a] = f32Bits(640);
+  positions[0][0] = 99;
+  assert.notEqual(input.bpScissorTopLeft, bp[0x20]);
+  assert.equal(f32BitPatterns(input.viewport)[0], f32Bits(320));
+  assert.deepEqual(
+    f32BitPatterns(input.clipPositions.slice(0, 4)),
+    [0x400aaaab, 0xbfb00000, 0xc09bffff, 0x40600000],
+    "later register and source mutations cannot stale a captured draw",
+  );
+});
+
+test("exact input capture rejects incomplete or noncanonical GX state", () => {
+  const xf = new Float32Array(0x1100);
+  xf.set([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+  ], 0);
+  xf.set([320, -264, 16777215, 342, 342, 0], 0x101a);
+  xf.set([1, 0, 1, 0, 1, 0], 0x1020);
+  const registers = new Uint32Array(xf.buffer);
+  registers[0x1026] = 0;
+  const bp = new Uint32Array(0x100);
+  bp[0x00] = 1 << 14;
+  const context = {
+    Array,
+    Float32Array,
+    Math,
+    Number,
+    Uint32Array,
+    gxBpRegisters: bp,
+    gxXfRegisters: registers,
+    gxXfFloat(address) {
+      return xf[address];
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "gxCullF32",
+      "gxCullMul",
+      "gxCullAdd",
+      "gxCullSub",
+      "gxCullDot4Position",
+      "gxCullTransformState",
+      "gxCullPositionMatrix",
+      "gxCullViewPosition",
+      "gxExactClipViewPosition",
+      "gxExactClipPosition",
+      "gxSourceTriangleCount",
+      "gxManagedCoverageExactClipInput",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.gx-exact-input-invalid.js" },
+  );
+  const positions = [[0, 0, -1], [1, 0, -1], [0, 1, -1]];
+  const matrices = [0, 0, 0];
+  const capture = () =>
+    context.gxManagedCoverageExactClipInput(2, 1, positions, matrices);
+
+  assert.notEqual(capture(), null);
+  assert.equal(
+    context.gxManagedCoverageExactClipInput(2, 1, positions, [0, 0]),
+    null,
+  );
+  assert.equal(
+    context.gxManagedCoverageExactClipInput(2, 2, positions, matrices),
+    null,
+  );
+  assert.equal(
+    context.gxManagedCoverageExactClipInput(2, 1, positions.slice(0, 2), [0, 0]),
+    null,
+  );
+  registers[0x1005] = 8;
+  assert.equal(capture(), null);
+  registers[0x1005] = 0;
+  registers[0x101a] = 0;
+  assert.equal(capture(), null);
+  registers[0x101a] = f32Bits(320);
+  registers[0x101b] = 0x7fc00000;
+  assert.equal(capture(), null);
 });
 
 test("one per-draw cull state reuses exact position matrices", () => {

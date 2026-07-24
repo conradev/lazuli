@@ -403,6 +403,16 @@ test("keeps packets without exact clip inputs byte-identical canonical v4", () =
   );
 });
 
+test("source-only exact clip metadata cannot change live v4 packet bytes", () => {
+  const context = packetContext();
+  const frame = exactClipXfbFrame();
+  const withExact = context.packGxFramePacketV4(2, frame);
+  delete frame.geometry.draws[0].exactClipInput;
+  const withoutExact = context.packGxFramePacketV4(2, frame);
+
+  assert.deepEqual(packetBytes(withExact), packetBytes(withoutExact));
+});
+
 test("appends one exact GX clip-input chunk in canonical LZGX v5 layout", () => {
   const context = packetContext();
   const frame = exactClipXfbFrame();

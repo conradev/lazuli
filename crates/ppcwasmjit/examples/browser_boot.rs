@@ -8789,6 +8789,78 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function gxManagedCoverageExactClipInput(
+      topology,
+      cullMode,
+      positions,
+      matrixIndices
+    ) {
+      if (
+        !Number.isInteger(topology)
+        || topology < 0
+        || topology > 4
+        || !Number.isInteger(cullMode)
+        || cullMode < 0
+        || cullMode > 3
+        || !Array.isArray(positions)
+        || !Array.isArray(matrixIndices)
+        || positions.length !== matrixIndices.length
+        || gxSourceTriangleCount(topology, positions.length) === 0
+      ) {
+        return null;
+      }
+      const bpGenMode = gxBpRegisters[0x00] >>> 0;
+      const bpScissorTopLeft = gxBpRegisters[0x20] >>> 0;
+      const bpScissorBottomRight = gxBpRegisters[0x21] >>> 0;
+      const bpScissorOffset = gxBpRegisters[0x59] >>> 0;
+      if (
+        bpGenMode > 0x00ffffff
+        || bpScissorTopLeft > 0x00ffffff
+        || bpScissorBottomRight > 0x00ffffff
+        || bpScissorOffset > 0x00ffffff
+        || ((bpGenMode >>> 14) & 3) !== cullMode
+      ) {
+        return null;
+      }
+      const xfClipDisable = gxXfRegisters[0x1005] >>> 0;
+      if (xfClipDisable > 7) return null;
+
+      const viewport = new Float32Array(6);
+      const viewportBits = new Uint32Array(viewport.buffer);
+      for (let component = 0; component < viewport.length; component += 1) {
+        viewportBits[component] = gxXfRegisters[0x101a + component] >>> 0;
+      }
+      if (
+        !viewport.every(Number.isFinite)
+        || viewport[0] === 0
+        || viewport[1] === 0
+      ) {
+        return null;
+      }
+
+      const state = gxCullTransformState();
+      if (state === null) return null;
+      const clipPositions = new Float32Array(positions.length * 4);
+      for (let vertex = 0; vertex < positions.length; vertex += 1) {
+        const clip = gxExactClipPosition(
+          positions[vertex],
+          matrixIndices[vertex],
+          state
+        );
+        if (clip === null) return null;
+        clipPositions.set(clip, vertex * 4);
+      }
+      return {
+        bpGenMode,
+        bpScissorTopLeft,
+        bpScissorBottomRight,
+        bpScissorOffset,
+        xfClipDisable,
+        viewport,
+        clipPositions,
+      };
+    }
+
     function gxDecodeVertex(source, cursor, vatIndex) {
       const descriptorLow = gxCpRegisters[0x50];
       const vat0 = gxCpRegisters[0x70 + vatIndex];
@@ -9080,6 +9152,17 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxXfFloat(0x101b)
         )
         : null;
+      const exactClipInput = (
+        collectCullSources
+        && postCullEvidence === null
+      )
+        ? gxManagedCoverageExactClipInput(
+          topology,
+          pipeline.cullMode,
+          cullPositions,
+          cullMatrixIndices
+        )
+        : null;
       const draw = {
         topology,
         vat: opcode & 7,
@@ -9092,6 +9175,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         tevState: gxPackTevState(stages),
         pipeline,
         ...(postCullEvidence === null ? {} : { postCullEvidence }),
+        ...(exactClipInput === null ? {} : { exactClipInput }),
       };
       gxFrameDraws.push(draw);
       const vatIndex = opcode & 7;
