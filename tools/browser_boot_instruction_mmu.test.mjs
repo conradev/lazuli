@@ -102,6 +102,8 @@ const instructionFunctions = [
   "compiledRegion",
   "resetInstructionLinkingState",
   "invalidateAllCompiledCode",
+  "instructionRangeTouchesTlbSet",
+  "invalidateInstructionTranslationSet",
   "invalidateTranslationLookasideBuffer",
   "synchronizeTranslationLookasideBuffer",
   "synchronizeInstructionAddressSpace",
@@ -210,7 +212,7 @@ function writeInstructionBat(context, index, upper, lower) {
   context.view.setUint32(context.cpu + lowerOffset, lower >>> 0, true);
 }
 
-test("TLB hooks conservatively invalidate all resident translations and compiled code", () => {
+test("TLB hooks invalidate the addressed resident set and compiled aliases", () => {
   assert.match(
     source,
     /user_0_25:\s*\(_ctx,\s*address\)\s*=>\s*invalidateTranslationLookasideBuffer\(address\)/,
@@ -221,35 +223,52 @@ test("TLB hooks conservatively invalidate all resident translations and compiled
   );
 
   const context = makeContext();
-  context.blocks.set("stable:80001000", { id: "block" });
-  context.regionsByPc.set("stable:80001000", { id: "region" });
-  context.instructionTlbSets[3] = {
+  const effective = 0x80001000;
+  const setIndex = (effective >>> 12) & 0x3f;
+  const retainedSet = (setIndex + 1) & 0x3f;
+  context.blocks.set("stable:80001000", {
+    effectiveStart: effective,
+    effectiveBytes: 4,
+  });
+  context.regionsByPc.set("stable:80001000", {
+    instructionAddressSpaceKey: "stable",
+    pcs: [effective],
+  });
+  context.instructionTlbSets[setIndex] = {
     entries: [{ id: "instruction-0" }, { id: "instruction-1" }],
     lru: 1,
   };
-  context.dataTlbSets[7] = {
+  context.dataTlbSets[setIndex] = {
     entries: [{ id: "data-0" }, { id: "data-1" }],
     lru: 1,
   };
+  context.instructionTlbSets[retainedSet].entries[0] = {
+    id: "instruction-retained",
+  };
+  context.dataTlbSets[retainedSet].entries[0] = { id: "data-retained" };
 
-  assert.equal(context.invalidateTranslationLookasideBuffer(0x80001000), 1);
+  assert.equal(context.invalidateTranslationLookasideBuffer(effective), 1);
   assert.equal(context.blocks.size, 0);
   assert.equal(context.regionsByPc.size, 0);
   assert.equal(context.recentPcs.length, 0);
+  assert.deepEqual(context.instructionTlbSets[setIndex], {
+    entries: [null, null],
+    lru: 0,
+  });
+  assert.deepEqual(context.dataTlbSets[setIndex], {
+    entries: [null, null],
+    lru: 0,
+  });
   assert.equal(
-    context.instructionTlbSets.every(set =>
-      set.lru === 0 && set.entries.every(entry => entry === null)
-    ),
-    true,
+    context.instructionTlbSets[retainedSet].entries[0].id,
+    "instruction-retained",
   );
   assert.equal(
-    context.dataTlbSets.every(set =>
-      set.lru === 0 && set.entries.every(entry => entry === null)
-    ),
-    true,
+    context.dataTlbSets[retainedSet].entries[0].id,
+    "data-retained",
   );
   assert.equal(context.accelerations.get("translationTlbInvalidations"), 1);
-  assert.equal(context.accelerations.get("instructionAddressSpaceInvalidations"), 1);
+  assert.equal(context.accelerations.get("instructionTlbInvalidations"), 1);
 
   context.synchronizeTranslationLookasideBuffer();
   assert.equal(context.accelerations.get("translationTlbSynchronizations"), 1);

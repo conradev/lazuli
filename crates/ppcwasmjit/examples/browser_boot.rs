@@ -9157,6 +9157,112 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function instructionRangeTouchesTlbSet(effectiveStart, byteCount, setIndex) {
+      if (
+        !Number.isSafeInteger(byteCount) || byteCount <= 0
+        || byteCount > 0x100000000
+        || !Number.isInteger(setIndex) || setIndex < 0 || setIndex >= 64
+      ) return false;
+
+      let effective = effectiveStart >>> 0;
+      let remaining = byteCount;
+      while (remaining > 0) {
+        if (((effective >>> 12) & 0x3f) === setIndex) return true;
+        const chunk = Math.min(
+          remaining,
+          0x1000 - (effective & 0xfff),
+          0x100000000 - effective
+        );
+        effective = (effective + chunk) >>> 0;
+        remaining -= chunk;
+      }
+      return false;
+    }
+
+    function invalidateInstructionTranslationSet(effectiveAddress) {
+      const setIndex = instructionTlbSetIndex(effectiveAddress);
+      const invalidatedBlockKeys = new Set();
+      for (const [key, block] of blocks) {
+        if (instructionRangeTouchesTlbSet(
+          block.effectiveStart,
+          block.effectiveBytes,
+          setIndex
+        )) {
+          invalidatedBlockKeys.add(key);
+        }
+      }
+      for (const key of invalidatedBlockKeys) blocks.delete(key);
+
+      const invalidatedRegions = new Set();
+      for (const region of new Set(regionsByPc.values())) {
+        if (region.pcs.some(regionPc => invalidatedBlockKeys.has(
+          region.instructionAddressSpaceKey
+            + ":"
+            + (regionPc >>> 0).toString(16).padStart(8, "0")
+        ))) {
+          invalidatedRegions.add(region);
+        }
+      }
+      for (const [key, region] of regionsByPc) {
+        if (invalidatedRegions.has(region)) regionsByPc.delete(key);
+      }
+
+      if (invalidatedBlockKeys.size !== 0 || invalidatedRegions.size !== 0) {
+        resetInstructionLinkingState();
+      }
+      accelerations.set(
+        "instructionTlbInvalidations",
+        (accelerations.get("instructionTlbInvalidations") ?? 0) + 1
+      );
+      accelerations.set(
+        "instructionTlbInvalidatedBlocks",
+        (accelerations.get("instructionTlbInvalidatedBlocks") ?? 0)
+          + invalidatedBlockKeys.size
+      );
+      accelerations.set(
+        "instructionTlbInvalidatedRegions",
+        (accelerations.get("instructionTlbInvalidatedRegions") ?? 0)
+          + invalidatedRegions.size
+      );
+      return invalidatedBlockKeys.size;
+    }
+
+    function invalidateTranslationLookasideBuffer(effectiveAddress) {
+      const setIndex = instructionTlbSetIndex(effectiveAddress);
+      const invalidateSet = sets => {
+        const set = sets[setIndex];
+        const invalidated = set.entries.filter(entry => entry !== null).length;
+        set.entries[0] = null;
+        set.entries[1] = null;
+        set.lru = 0;
+        return invalidated;
+      };
+      const instructionEntries = invalidateSet(instructionTlbSets);
+      const dataEntries = invalidateSet(dataTlbSets);
+      const blocks = invalidateInstructionTranslationSet(effectiveAddress);
+      accelerations.set(
+        "translationTlbInvalidations",
+        (accelerations.get("translationTlbInvalidations") ?? 0) + 1
+      );
+      accelerations.set(
+        "instructionTlbInvalidatedEntries",
+        (accelerations.get("instructionTlbInvalidatedEntries") ?? 0)
+          + instructionEntries
+      );
+      accelerations.set(
+        "dataTlbInvalidatedEntries",
+        (accelerations.get("dataTlbInvalidatedEntries") ?? 0) + dataEntries
+      );
+      return blocks;
+    }
+
+    function synchronizeTranslationLookasideBuffer() {
+      accelerations.set(
+        "translationTlbSynchronizations",
+        (accelerations.get("translationTlbSynchronizations") ?? 0) + 1
+      );
+    }
+
     function synchronizeInstructionStream() {
       accelerations.set(
         "instructionStreamSynchronizations",
@@ -9183,25 +9289,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         "instructionAddressSpaceInvalidatedRegions",
         (accelerations.get("instructionAddressSpaceInvalidatedRegions") ?? 0)
           + invalidatedRegions
-      );
-    }
-
-    function invalidateTranslationLookasideBuffer(_effectiveAddress) {
-      const invalidatedBlocks = blocks.size;
-      resetTranslationLookasideBuffer(instructionTlbSets);
-      resetTranslationLookasideBuffer(dataTlbSets);
-      invalidateAllCompiledCode("tlbie");
-      accelerations.set(
-        "translationTlbInvalidations",
-        (accelerations.get("translationTlbInvalidations") ?? 0) + 1
-      );
-      return invalidatedBlocks;
-    }
-
-    function synchronizeTranslationLookasideBuffer() {
-      accelerations.set(
-        "translationTlbSynchronizations",
-        (accelerations.get("translationTlbSynchronizations") ?? 0) + 1
       );
     }
 
