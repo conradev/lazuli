@@ -188,14 +188,32 @@ impl Jit {
         Self::with_exit_mode(ExitMode::ReturnExecutedWithSlowMemory)
     }
 
+    /// Creates the browser compiler with instruction-start hook-cycle publication enabled.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn with_slow_memory_hook_cycle_offset(hook_cycle_offset: i32) -> Self {
+        Self::with_exit_mode_and_hook_cycle_offset(
+            ExitMode::ReturnExecutedWithSlowMemory,
+            Some(hook_cycle_offset),
+        )
+    }
+
     fn with_exit_mode(exit_mode: ExitMode) -> Self {
+        Self::with_exit_mode_and_hook_cycle_offset(exit_mode, None)
+    }
+
+    fn with_exit_mode_and_hook_cycle_offset(
+        exit_mode: ExitMode,
+        hook_cycle_offset: Option<i32>,
+    ) -> Self {
+        let mut config = TranslationConfig::new(
+            CodegenSettings::default(),
+            ir::types::I32,
+            CallConv::Fast,
+            exit_mode,
+        );
+        config.hook_cycle_offset = hook_cycle_offset;
         Self {
-            translator: Translator::new(TranslationConfig::new(
-                CodegenSettings::default(),
-                ir::types::I32,
-                CallConv::Fast,
-                exit_mode,
-            )),
+            translator: Translator::new(config),
         }
     }
 
@@ -692,6 +710,7 @@ const memory = new WebAssembly.Memory({ initial: 8 });
 const view = new DataView(memory.buffer);
 const cpu = 64;
 const control = 0x2000;
+const blockContext = 0x2100;
 const pcOffset = Number(pcOffsetText);
 const maximumCycles = Number(maximumCyclesText);
 const expectedInstructions = Number(expectedInstructionsText);
@@ -700,14 +719,25 @@ const blockBytes = Buffer.from(blockHex, "hex");
 const { instance: blockInstance } = await WebAssembly.instantiate(blockBytes, {
   lazuli: { memory },
 });
+const blockCyclePrefixes = [];
+function observedBlock(ctx, registers, fastmem) {
+  if (ctx !== blockContext) throw new Error(`region forwarded wrong block context: ${ctx}`);
+  const hookCycleOffset = view.getUint32(control + 8, true);
+  if (hookCycleOffset !== 0) {
+    throw new Error(`region did not reset hook-cycle offset: ${hookCycleOffset}`);
+  }
+  blockCyclePrefixes.push(view.getUint32(control, true));
+  view.setUint32(control + 8, 0xfeedbeef, true);
+  return blockInstance.exports.run(ctx, registers, fastmem);
+}
 const { instance: regionInstance } = await WebAssembly.instantiate(
   Buffer.from(regionHex, "hex"),
   {
     lazuli: { memory },
     lazuli_blocks: {
-      b0: blockInstance.exports.run,
-      b1: blockInstance.exports.run,
-      b2: blockInstance.exports.run,
+      b0: observedBlock,
+      b1: observedBlock,
+      b2: observedBlock,
     },
   },
 );
@@ -717,6 +747,8 @@ function reset(pc) {
   view.setUint32(cpu + pcOffset, pc, true);
   view.setUint32(control, 0, true);
   view.setUint32(control + 4, 0, true);
+  view.setUint32(control + 8, 0xfeedbeef, true);
+  blockCyclePrefixes.length = 0;
 }
 function expectResult(actual, expected, label) {
   if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) {
@@ -726,27 +758,33 @@ function expectResult(actual, expected, label) {
 
 reset(0x80001000);
 expectResult(
-  run(0, cpu, 0, pcOffset, control, expectedCycles, 10),
+  run(blockContext, cpu, 0, pcOffset, control, expectedCycles, 10),
   [expectedInstructions, expectedCycles, 3],
   "full region",
 );
 if (view.getUint32(cpu + pcOffset, true) !== 0x80004000) {
   throw new Error("full region ended at the wrong PC");
 }
+expectResult(
+  blockCyclePrefixes,
+  [0, maximumCycles, maximumCycles * 2],
+  "full-region cycle prefixes",
+);
 
 reset(0x80001000);
 expectResult(
-  run(0, cpu, 0, pcOffset, control, expectedCycles, 2),
+  run(blockContext, cpu, 0, pcOffset, control, expectedCycles, 2),
   [expectedInstructions / 3 * 2, expectedCycles / 3 * 2, 2],
   "block budget",
 );
 if (view.getUint32(cpu + pcOffset, true) !== 0x80003000) {
   throw new Error("block-budget run ended at the wrong PC");
 }
+expectResult(blockCyclePrefixes, [0, maximumCycles], "block-budget cycle prefixes");
 
 reset(0x80001000);
 expectResult(
-  run(0, cpu, 0, pcOffset, control, maximumCycles - 1, 10),
+  run(blockContext, cpu, 0, pcOffset, control, maximumCycles - 1, 10),
   [0, 0, 0],
   "cycle budget",
 );
@@ -755,7 +793,11 @@ if (view.getUint32(cpu + pcOffset, true) !== 0x80001000) {
 }
 
 reset(0x80001500);
-expectResult(run(0, cpu, 0, pcOffset, control, expectedCycles, 10), [0, 0, 0], "missing PC");
+expectResult(
+  run(blockContext, cpu, 0, pcOffset, control, expectedCycles, 10),
+  [0, 0, 0],
+  "missing PC",
+);
 if (view.getUint32(cpu + pcOffset, true) !== 0x80001500) {
   throw new Error("missing-PC run changed the PC");
 }

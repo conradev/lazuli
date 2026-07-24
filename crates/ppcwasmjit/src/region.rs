@@ -186,7 +186,8 @@ pub fn link_region(blocks: &[RegionBlock]) -> Result<Vec<u8>, RegionError> {
     );
 
     // Parameters 0..=6 are ctx, cpu, fastmem, pc_offset, control, cycle_budget, and block_budget.
-    // The two control words are the current region-cycle offset and a hook-requested exit flag.
+    // The three control words are the current region-cycle prefix, a hook-requested exit flag,
+    // and the current block's instruction-start hook-cycle offset.
     // Locals 7..=12 are result, instructions, cycles, blocks, pc, and packed dispatch target.
     const RESULT: u32 = 7;
     const INSTRUCTIONS: u32 = 8;
@@ -237,6 +238,13 @@ pub fn link_region(blocks: &[RegionBlock]) -> Result<Vec<u8>, RegionError> {
     body.instruction(&Instruction::LocalGet(CYCLES));
     body.instruction(&Instruction::I32Store(MemArg {
         offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    body.instruction(&Instruction::LocalGet(4));
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::I32Store(MemArg {
+        offset: 8,
         align: 2,
         memory_index: 0,
     }));

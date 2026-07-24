@@ -3774,6 +3774,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     const view = new DataView(memory.buffer);
     const cpu = __CPU_PTR__;
     const regionControl = 0xf000;
+    const regionCyclePrefixOffset = 0;
+    const regionExitRequestOffset = 4;
+    const hookCycleOffset = 8;
     const fastmem = __FASTMEM_PTR__;
     const ram = __RAM_PTR__;
     const ramSize = __RAM_SIZE__;
@@ -4098,29 +4101,83 @@ const TEMPLATE: &str = r##"<!doctype html>
       return ramPointer(address, size) !== null || lockedCachePointer(address, size) !== null;
     }
 
-    const hooks = new Proxy(hookFunctions, {
-      get(target, name) {
-        return (...arguments_) => {
-          drainGxFifoStaging();
-          hookCalls.set(name, (hookCalls.get(name) ?? 0) + 1);
-          if (!regionRunning) return target[name]?.(...arguments_) ?? 0;
+    function withScopedCycles(scopedCycles, callback) {
+      const baseCycles = cycles;
+      cycles = scopedCycles;
+      try {
+        return callback();
+      } finally {
+        cycles = baseCycles;
+      }
+    }
 
-          const baseCycles = cycles;
-          cycles += view.getUint32(regionControl, true);
-          try {
-            const result = target[name]?.(...arguments_) ?? 0;
-            if (regionHookCanContinue(name, arguments_, result)) {
-              regionContinuableHookCalls += 1;
-            } else {
-              view.setUint32(regionControl + 4, 1, true);
-            }
-            return result;
-          } finally {
-            cycles = baseCycles;
-          }
-        };
-      },
-    });
+    function withPublishedHookCycles(callback) {
+      const regionCyclePrefix = regionRunning
+        ? view.getUint32(regionControl + regionCyclePrefixOffset, true)
+        : 0;
+      const instructionCycleOffset = view.getUint32(
+        regionControl + hookCycleOffset,
+        true
+      );
+      return withScopedCycles(
+        cycles + regionCyclePrefix + instructionCycleOffset,
+        callback
+      );
+    }
+
+    function drainGxFifoStagingForJit() {
+      return withPublishedHookCycles(() => {
+        const result = drainGxFifoStaging();
+        if (regionRunning) {
+          view.setUint32(regionControl + regionExitRequestOffset, 1, true);
+        }
+        return result;
+      });
+    }
+
+    function drainGxFifoStagingAtCycle(observedCycles) {
+      return withScopedCycles(observedCycles, drainGxFifoStaging);
+    }
+
+    function jitHookDrainsFifo(name) {
+      // BAT callbacks are deferred until block exit but retain the originating
+      // mtspr timestamp. Later writes in the same block must drain at the
+      // returned block boundary rather than being moved back to that timestamp.
+      return name !== "user_0_17" && name !== "user_0_18";
+    }
+
+    function invokeJitHook(target, name, arguments_) {
+      return withPublishedHookCycles(() => {
+        const drainsFifo = jitHookDrainsFifo(name);
+        const drainedFifo = drainsFifo
+          && view.getUint32(gxFifoStagingMeta, true) !== 0;
+        if (drainsFifo) drainGxFifoStaging();
+        hookCalls.set(name, (hookCalls.get(name) ?? 0) + 1);
+        if (!regionRunning) return target[name]?.(...arguments_) ?? 0;
+
+        const result = target[name]?.(...arguments_) ?? 0;
+        const hookCanContinue = regionHookCanContinue(name, arguments_, result);
+        if (hookCanContinue) {
+          regionContinuableHookCalls += 1;
+        }
+        // A successful pre-hook FIFO drain can create a new PE deadline that
+        // was absent when this region's cycle budget was chosen.
+        if (drainedFifo || !hookCanContinue) {
+          view.setUint32(regionControl + regionExitRequestOffset, 1, true);
+        }
+        return result;
+      });
+    }
+
+    function createJitHookProxy(target) {
+      return new Proxy(target, {
+        get(hookTarget, name) {
+          return (...arguments_) => invokeJitHook(hookTarget, name, arguments_);
+        },
+      });
+    }
+
+    const hooks = createJitHookProxy(hookFunctions);
 
     function decode(hex) {
       const result = new Uint8Array(hex.length / 2);
@@ -9906,7 +9963,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         {
           lazuli: { memory },
           lazuli_slow_hooks: hooks,
-          lazuli_fifo: { flush: drainGxFifoStaging },
+          lazuli_fifo: { flush: drainGxFifoStagingForJit },
         }
       );
       const gxFifoHookExports = gxFifoHookInstance.exports;
@@ -10013,13 +10070,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         const regionBlockBudget = Math.min(4096, dispatchLimit - dispatches);
         if (region !== undefined && regionCycleBudget > 0 && regionBlockBudget > 0) {
           stage = "execute-region";
-          view.setUint32(regionControl, 0, true);
-          view.setUint32(regionControl + 4, 0, true);
+          view.setUint32(regionControl + regionCyclePrefixOffset, 0, true);
+          view.setUint32(regionControl + regionExitRequestOffset, 0, true);
+          view.setUint32(regionControl + hookCycleOffset, 0, true);
           regionRunning = true;
           const executionStartedAt = beginWorkerExecutionTiming();
           try {
             const result = region.instance.exports.run(
-              0,
+              regionControl,
               cpu,
               fastmem,
               pcOffset,
@@ -10038,7 +10096,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
           if (executedBlocks !== 0) {
             executedRegion = true;
-            regionRequestedExit = view.getUint32(regionControl + 4, true) !== 0;
+            regionRequestedExit = view.getUint32(
+              regionControl + regionExitRequestOffset,
+              true
+            ) !== 0;
             accelerations.set(
               "wasmRegionCalls",
               (accelerations.get("wasmRegionCalls") ?? 0) + 1
@@ -10053,11 +10114,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (executedBlocks === 0) {
           stage = "execute";
           fastForwardRecognizedLoop(pc, block.maximum);
+          view.setUint32(regionControl + regionCyclePrefixOffset, 0, true);
+          view.setUint32(regionControl + regionExitRequestOffset, 0, true);
+          view.setUint32(regionControl + hookCycleOffset, 0, true);
           try {
             const executionStartedAt = beginWorkerExecutionTiming();
             let executed;
             try {
-              executed = block.instance.exports.run(0, cpu, fastmem) >>> 0;
+              executed = block.instance.exports.run(regionControl, cpu, fastmem) >>> 0;
             } finally {
               if (executionStartedAt !== null) {
                 recordWorkerPhaseTiming(workerHostTimings.execution, executionStartedAt);
@@ -10081,9 +10145,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
         }
 
-        drainGxFifoStaging();
-
         const observedCycles = cycles + executedCycles;
+        drainGxFifoStagingAtCycle(observedCycles);
         const diskWait = dueDiskTransferPromise(observedCycles);
         if (diskWait !== null) await diskWait;
         serviceMmio(observedCycles);
