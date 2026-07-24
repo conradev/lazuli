@@ -217,3 +217,6 @@ fn gx_exact_no_wrap_scissor_axis(
         u16::try_from(clipped_end).map_err(|_| GxExactProjectionError::InvalidScissor)?,
     ))
 }
+
+#[cfg(test)]
+mod tests;
