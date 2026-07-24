@@ -2454,6 +2454,79 @@ const TEMPLATE: &str = r##"<!doctype html>
       return packet;
     }
 
+    // LZGX v6 is negotiated only when a producer marks at least one exact
+    // source draw as required. Optional exact inputs remain canonical v5 and
+    // frames without exact inputs remain byte-identical canonical v4.
+    function packGxFramePacketV6(copyKind, frame, residentTextureKeys = null) {
+      const packet = packGxFramePacketV5(
+        copyKind,
+        frame,
+        residentTextureKeys
+      );
+      const requiredDraws = [];
+      let requiredCount = 0;
+      for (
+        let drawIndex = 0;
+        drawIndex < frame.geometry.draws.length;
+        drawIndex += 1
+      ) {
+        const draw = frame.geometry.draws[drawIndex];
+        const name = `draws[${drawIndex}]`;
+        const hasRequired = "exactGeometryRequired" in draw;
+        if (
+          hasRequired
+          && typeof draw.exactGeometryRequired !== "boolean"
+        ) {
+          throw new TypeError(
+            `GX frame packet ${name}.exactGeometryRequired must be a boolean`
+          );
+        }
+        const required = hasRequired && draw.exactGeometryRequired;
+        if (required) {
+          if (
+            draw.postCullEvidence !== undefined
+            && draw.postCullEvidence !== null
+          ) {
+            throw new Error(
+              `GX frame packet ${name} required exact geometry cannot carry post-cull evidence`
+            );
+          }
+          if (
+            draw.exactClipInput === undefined
+            || draw.exactClipInput === null
+          ) {
+            throw new Error(
+              `GX frame packet ${name}.exactGeometryRequired requires exactClipInput`
+            );
+          }
+          requiredCount += 1;
+        }
+        requiredDraws.push(required);
+      }
+      if (requiredCount === 0) return packet;
+
+      const view = new DataView(packet);
+      if (view.getUint16(0x04, true) !== 5) {
+        throw new Error(
+          "GX frame packet required exact geometry requires canonical LZGX v5"
+        );
+      }
+      const drawTableOffset = view.getUint32(0x1c, true);
+      const drawRecordBytes = view.getUint16(0x78, true);
+      for (let drawIndex = 0; drawIndex < requiredDraws.length; drawIndex += 1) {
+        if (!requiredDraws[drawIndex]) continue;
+        const flagsOffset = drawTableOffset + drawIndex * drawRecordBytes + 0x02;
+        if (view.getUint16(flagsOffset, true) !== 2) {
+          throw new Error(
+            `GX frame packet draws[${drawIndex}] required exact geometry needs exact-only flags`
+          );
+        }
+        view.setUint16(flagsOffset, 6, true);
+      }
+      view.setUint16(0x04, 6, true);
+      return packet;
+    }
+
     function completeRendererFrame(message) {
       const rendererSequence = Number(message.rendererSequence);
       if (
