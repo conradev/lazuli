@@ -11,6 +11,7 @@ pub(crate) const EFB_WIDTH: u32 = 640;
 pub(crate) const EFB_HEIGHT: u32 = 528;
 pub(crate) const GX_MAX_COPY_DIMENSION: u32 = 1024;
 pub(crate) const WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
+pub(crate) const GX_DEPTH16_MAX: u32 = 0x0000_ffff;
 pub(crate) const GX_DEPTH24_MAX: u32 = 0x00ff_ffff;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -734,12 +735,167 @@ pub(crate) fn gx_copy_clear_mask(
     }
 }
 
-pub(crate) fn gx_depth24_to_float(depth: u32) -> f32 {
-    (depth & GX_DEPTH24_MAX) as f32 / GX_DEPTH24_MAX as f32
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxDepthCompression {
+    Linear,
+    Near,
+    Mid,
+    Far,
 }
 
+impl GxDepthCompression {
+    const fn shader_code(self) -> u32 {
+        match self {
+            Self::Linear => 1,
+            Self::Near => 2,
+            Self::Mid => 3,
+            Self::Far => 4,
+        }
+    }
+
+    /// Encodes a GX Z24 value in Flipper's 16-bit EFB depth representation.
+    ///
+    /// The nonlinear formats store a leading-ones exponent and omit the first
+    /// following zero from the mantissa. Once the exponent saturates, that bit
+    /// is no longer known to be zero and remains in the mantissa. Flipper's far
+    /// format uses only exponents 0 through 12 even though four bits could
+    /// represent larger values.
+    const fn compress_z24(self, depth: u32) -> u32 {
+        let depth = depth & GX_DEPTH24_MAX;
+        if matches!(self, Self::Linear) {
+            return depth >> 8;
+        }
+
+        let (exponent_bits, maximum_exponent) = match self {
+            Self::Linear => unreachable!(),
+            Self::Near => (2, 3),
+            Self::Mid => (3, 7),
+            Self::Far => (4, 12),
+        };
+        let source_leading_ones = (depth << 8).leading_ones();
+        let exponent = if source_leading_ones < maximum_exponent {
+            source_leading_ones
+        } else {
+            maximum_exponent
+        };
+        let exponent_was_clamped = source_leading_ones >= maximum_exponent;
+        let mantissa_bits = 16 - exponent_bits;
+        let mut mantissa_top = if 24 - exponent > mantissa_bits {
+            24 - exponent
+        } else {
+            mantissa_bits
+        };
+        if !exponent_was_clamped {
+            // The first bit after the leading ones is known to be zero.
+            mantissa_top -= 1;
+        }
+        let mantissa_bottom = mantissa_top - mantissa_bits;
+        let mantissa_mask = (1 << mantissa_bits) - 1;
+        let mantissa = (depth >> mantissa_bottom) & mantissa_mask;
+        (exponent << mantissa_bits) | mantissa
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxEfbDepthEncoding {
+    Z24,
+    Z16(GxDepthCompression),
+}
+
+impl GxEfbDepthEncoding {
+    pub(crate) const fn shader_code(self) -> u32 {
+        match self {
+            Self::Z24 => 0,
+            Self::Z16(compression) => compression.shader_code(),
+        }
+    }
+
+    /// Converts canonical GX Z24 units into the integer represented by the EFB
+    /// depth plane. The result is 24 bits for Z24 and 16 bits for RGB565_Z16.
+    pub(crate) const fn quantize_depth24(self, depth: u32) -> u32 {
+        match self {
+            Self::Z24 => depth & GX_DEPTH24_MAX,
+            Self::Z16(compression) => compression.compress_z24(depth),
+        }
+    }
+
+    /// Normalizes an encoded GX depth exactly over the full Depth32Float range.
+    ///
+    /// Every valid 16- and 24-bit integer survives a normalize/denormalize
+    /// round trip through f32, so WebGPU compares the same ordered EFB code
+    /// that Flipper stores rather than an approximate 1/2^N surrogate.
+    pub(crate) fn depth32_float(self, depth: u32) -> f32 {
+        let maximum = match self {
+            Self::Z24 => GX_DEPTH24_MAX,
+            Self::Z16(_) => GX_DEPTH16_MAX,
+        };
+        self.quantize_depth24(depth) as f32 / maximum as f32
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxEfbDepthDecodeError {
+    UnsupportedInverseCompression(u8),
+}
+
+impl fmt::Display for GxEfbDepthDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedInverseCompression(value) => {
+                write!(formatter, "unsupported inverse GX Z16 compression {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GxEfbDepthDecodeError {}
+
+pub(crate) fn gx_efb_depth_encoding(
+    pixel_control: u32,
+) -> Result<GxEfbDepthEncoding, GxEfbDepthDecodeError> {
+    if gx_efb_format(pixel_control) != GxEfbFormat::Rgb565Z16 {
+        // BP43's compression field is inert for every 24-bit EFB format.
+        return Ok(GxEfbDepthEncoding::Z24);
+    }
+
+    Ok(GxEfbDepthEncoding::Z16(match (pixel_control >> 3) & 7 {
+        0 => GxDepthCompression::Linear,
+        1 => GxDepthCompression::Near,
+        2 => GxDepthCompression::Mid,
+        3 => GxDepthCompression::Far,
+        value => {
+            return Err(GxEfbDepthDecodeError::UnsupportedInverseCompression(
+                value as u8,
+            ));
+        }
+    }))
+}
+
+pub(crate) fn gx_depth24_to_float(depth: u32) -> f32 {
+    GxEfbDepthEncoding::Z24.depth32_float(depth)
+}
+
+/// Canonicalizes an interpolated nonnegative depth in GX Z24 units.
+///
+/// Both Dolphin's software rasterizer and generated GPU shaders truncate the
+/// interpolated value. Spell out the NaN and range behavior before flooring so
+/// native Rust and WGSL cannot diverge through language-specific float casts.
+pub(crate) fn gx_depth24_from_units(depth: f32) -> u32 {
+    if depth.is_nan() || depth <= 0.0 {
+        return 0;
+    }
+    if depth >= GX_DEPTH24_MAX as f32 {
+        return GX_DEPTH24_MAX;
+    }
+    depth.floor() as u32
+}
+
+/// Maps normalized raster depth to GX units using Flipper's 2^24 scale.
+///
+/// This is intentionally distinct from denormalizing a Depth32Float EFB code,
+/// whose inclusive integer range uses 0xffffff as its divisor.
 pub(crate) fn gx_float_to_depth24(depth: f32) -> u32 {
-    (depth.clamp(0.0, 1.0) * GX_DEPTH24_MAX as f32).round() as u32
+    gx_depth24_from_units(depth * (GX_DEPTH24_MAX as f32 + 1.0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -881,9 +1037,8 @@ pub(crate) fn gx_z_texture_reference(
     fragment_depth: f32,
     raw_texture_rgba: [u8; 4],
 ) -> GxZTextureReference {
-    // Lazuli's depth convention is the nearest 24-bit integer, including at
-    // half steps. Keep the conversion in this shared oracle so the eventual
-    // shader implementation cannot silently switch to truncation or 2^24.
+    // Keep Dolphin's raster-depth truncation in this shared oracle so shader
+    // implementations cannot silently switch to nearest rounding.
     let source_depth = gx_float_to_depth24(fragment_depth);
     let sampled_depth = if state.operation == GxZTextureOperation::Disabled {
         0
@@ -2059,9 +2214,10 @@ pub use web::WebGpuRenderer;
 #[cfg(test)]
 mod tests {
     use super::{
-        EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH24_MAX, GxAlphaTestOutcome,
-        GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation,
-        GxEarlyDepthPlan, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
+        EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX,
+        GxAlphaTestOutcome, GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxCopyGamma,
+        GxDepthCompareLocation, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthDecodeError,
+        GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
         GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
         RendererMetrics, RendererPhaseTiming, SelectedTexture, SurfacePixelOrder,
         SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome,
@@ -2070,8 +2226,9 @@ mod tests {
         compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
         decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
         gx_alpha_test_outcome, gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask,
-        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_to_float,
-        gx_destination_alpha_state, gx_early_depth_plan, gx_efb_format, gx_float_to_depth24,
+        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
+        gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
+        gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
         gx_fog_reference, gx_fog_state, gx_sampler_identity, gx_xfb_copy_parameters,
         gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
         materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
@@ -3522,6 +3679,136 @@ mod tests {
     }
 
     #[test]
+    fn efb_depth_encoding_exhausts_raw_format_compression_and_early_test_bits() {
+        let compression = [
+            GxDepthCompression::Linear,
+            GxDepthCompression::Near,
+            GxDepthCompression::Mid,
+            GxDepthCompression::Far,
+        ];
+
+        for pixel_control in 0..=0x7f {
+            let format = pixel_control & 7;
+            let raw_compression = (pixel_control >> 3) & 7;
+            let expected = if format != 2 {
+                Ok(GxEfbDepthEncoding::Z24)
+            } else if raw_compression < 4 {
+                Ok(GxEfbDepthEncoding::Z16(
+                    compression[raw_compression as usize],
+                ))
+            } else {
+                Err(GxEfbDepthDecodeError::UnsupportedInverseCompression(
+                    raw_compression as u8,
+                ))
+            };
+
+            assert_eq!(gx_efb_depth_encoding(pixel_control), expected);
+            assert_eq!(
+                gx_efb_depth_encoding(0x00ff_ff80 | pixel_control),
+                expected,
+                "untransported high BP bits must not affect depth encoding",
+            );
+        }
+
+        let encodings = [
+            GxEfbDepthEncoding::Z24,
+            GxEfbDepthEncoding::Z16(GxDepthCompression::Linear),
+            GxEfbDepthEncoding::Z16(GxDepthCompression::Near),
+            GxEfbDepthEncoding::Z16(GxDepthCompression::Mid),
+            GxEfbDepthEncoding::Z16(GxDepthCompression::Far),
+        ];
+        for (shader_code, encoding) in encodings.into_iter().enumerate() {
+            assert_eq!(encoding.shader_code(), shader_code as u32);
+        }
+    }
+
+    #[test]
+    fn gx_depth_units_truncate_deterministically_before_efb_encoding() {
+        let cases = [
+            (f32::NEG_INFINITY, 0),
+            (-1.0, 0),
+            (-0.0, 0),
+            (0.0, 0),
+            (f32::from_bits(0x3eff_ffff), 0),
+            (0.5, 0),
+            (f32::from_bits(0x3f7f_ffff), 0),
+            (1.0, 1),
+            (1.5, 1),
+            (2.999_999_8, 2),
+            (3.0, 3),
+            (GX_DEPTH24_MAX as f32, GX_DEPTH24_MAX),
+            (f32::INFINITY, GX_DEPTH24_MAX),
+        ];
+        for (depth, expected) in cases {
+            assert_eq!(gx_depth24_from_units(depth), expected, "{depth:?}");
+        }
+        assert_eq!(gx_depth24_from_units(f32::NAN), 0);
+        assert_eq!(gx_depth24_from_units(-f32::NAN), 0);
+    }
+
+    #[test]
+    fn gx_z16_compression_matches_dolphin_at_exponent_and_mantissa_boundaries() {
+        let cases = [
+            (0x00_0000, [0x0000, 0x0000, 0x0000, 0x0000]),
+            (0x12_3456, [0x1234, 0x091a, 0x048d, 0x0246]),
+            (0x7f_ffff, [0x7fff, 0x3fff, 0x1fff, 0x0fff]),
+            (0x80_0000, [0x8000, 0x4000, 0x2000, 0x1000]),
+            (0xbf_ffff, [0xbfff, 0x7fff, 0x3fff, 0x1fff]),
+            (0xc0_0000, [0xc000, 0x8000, 0x4000, 0x2000]),
+            (0xdf_ffff, [0xdfff, 0xbfff, 0x5fff, 0x2fff]),
+            (0xe0_0000, [0xe000, 0xc000, 0x6000, 0x3000]),
+            (0xef_ffff, [0xefff, 0xdfff, 0x7fff, 0x3fff]),
+            (0xf0_0000, [0xf000, 0xe000, 0x8000, 0x4000]),
+            (0xfb_ffff, [0xfbff, 0xf7ff, 0xbfff, 0x5fff]),
+            (0xfc_0000, [0xfc00, 0xf800, 0xc000, 0x6000]),
+            (0xfd_ffff, [0xfdff, 0xfbff, 0xdfff, 0x6fff]),
+            (0xfe_0000, [0xfe00, 0xfc00, 0xe000, 0x7000]),
+            (0xff_efff, [0xffef, 0xffdf, 0xfeff, 0xbfff]),
+            (0xff_f000, [0xfff0, 0xffe0, 0xff00, 0xc000]),
+            (0xff_fffe, [0xffff, 0xffff, 0xffff, 0xcffe]),
+            (0xff_ffff, [0xffff, 0xffff, 0xffff, 0xcfff]),
+        ];
+        let compression = [
+            GxDepthCompression::Linear,
+            GxDepthCompression::Near,
+            GxDepthCompression::Mid,
+            GxDepthCompression::Far,
+        ];
+
+        for (depth, expected) in cases {
+            for (compression, expected) in compression.into_iter().zip(expected) {
+                assert_eq!(
+                    GxEfbDepthEncoding::Z16(compression).quantize_depth24(depth),
+                    expected,
+                    "depth {depth:#08x}, compression {compression:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn depth32_float_normalization_round_trips_every_integer_attachment_code() {
+        for depth in 0..=GX_DEPTH24_MAX {
+            let normalized = GxEfbDepthEncoding::Z24.depth32_float(depth);
+            assert_eq!(
+                gx_depth24_from_units(normalized * GX_DEPTH24_MAX as f32),
+                depth,
+                "Z24 code {depth:#08x}",
+            );
+        }
+
+        let linear = GxEfbDepthEncoding::Z16(GxDepthCompression::Linear);
+        for code in 0..=GX_DEPTH16_MAX {
+            let normalized = linear.depth32_float(code << 8);
+            assert_eq!(
+                (normalized * GX_DEPTH16_MAX as f32).floor() as u32,
+                code,
+                "Z16 code {code:#06x}",
+            );
+        }
+    }
+
+    #[test]
     fn gx_destination_alpha_canonicalizes_every_enable_update_and_format_combination() {
         for value in [0, 1, 0x80, 0xff] {
             for replacement_enable in [false, true] {
@@ -3686,8 +3973,13 @@ mod tests {
         assert_eq!(gx_depth24_to_float(0), 0.0);
         assert_eq!(gx_depth24_to_float(GX_DEPTH24_MAX), 1.0);
         assert_eq!(gx_float_to_depth24(1.0), GX_DEPTH24_MAX);
+        assert_eq!(gx_float_to_depth24(0.5), 0x80_0000);
+        assert_eq!(gx_float_to_depth24(0.75), 0xc0_0000);
         for depth in [0, 1, 0x12_3456, 0x44_5566, 0xab_cdef, 0xff_fffe, 0xff_ffff] {
-            assert_eq!(gx_float_to_depth24(gx_depth24_to_float(depth)), depth);
+            assert_eq!(
+                gx_depth24_from_units(gx_depth24_to_float(depth) * GX_DEPTH24_MAX as f32),
+                depth,
+            );
         }
     }
 
