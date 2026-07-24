@@ -438,7 +438,8 @@ test("draw transport is counted before empty, clipped, and culled exits", () => 
   assert.notEqual(record, -1);
   for (const exit of [
     "if expanded.is_empty()",
-    "let Some(scissor) = clipped_scissor",
+    "QualifiedExactDraw::is_empty",
+    "let native_scissor = clipped_scissor",
     "if pipeline.cull == CullMode::All",
   ]) {
     const position = push.indexOf(exit);
