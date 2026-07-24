@@ -353,3 +353,6 @@ pub(crate) fn gx_exact_clip_triangles<const COMPONENTS: usize>(
     }
     Ok(clipped)
 }
+
+#[cfg(test)]
+mod tests;
