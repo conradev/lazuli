@@ -50,6 +50,7 @@ fn is_cacheable(reg: Reg) -> bool {
             | SPR::SDR1
             | SPR::SRR0
             | SPR::SRR1
+            | SPR::DSISR
             | SPR::DAR => false,
             spr if spr.is_bat() => false,
             spr if spr.is_gqr() => false,

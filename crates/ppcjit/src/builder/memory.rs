@@ -1269,11 +1269,11 @@ impl BlockBuilder<'_> {
             value = self.bd.ins().ireduce(P::IR_TYPE, value);
         }
 
+        self.mem_store::<P>(addr, value);
+
         if update {
             self.set(ins.gpr_a(), addr);
         }
-
-        self.mem_store::<P>(addr, value);
 
         STORE_INFO
     }
@@ -1301,11 +1301,11 @@ impl BlockBuilder<'_> {
             value = self.bd.ins().bswap(value);
         }
 
+        self.mem_store::<P>(addr, value);
+
         if update {
             self.set(ins.gpr_a(), addr);
         }
-
-        self.mem_store::<P>(addr, value);
 
         STORE_INFO
     }

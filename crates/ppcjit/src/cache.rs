@@ -10,7 +10,7 @@ use crate::{Artifact, CodegenSettings, Sequence};
 // Increment whenever the translated artifact ABI or frontend semantics change. Cached machine
 // code is intentionally invalidated across these boundaries even when the guest sequence and
 // Cranelift settings are otherwise identical.
-const ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 2;
+const ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 3;
 
 struct Hash128(twox_hash::XxHash3_128);
 

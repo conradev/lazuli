@@ -135,6 +135,18 @@ fn mtspr(rs: u8, spr: u16) -> Ins {
     instruction(31 << 26 | u32::from(rs) << 21 | encoded_spr | 467 << 1)
 }
 
+fn stwu(rs: u8, ra: u8, displacement: i16) -> Ins {
+    instruction(
+        37 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(displacement as u16),
+    )
+}
+
+fn stwux(rs: u8, ra: u8, rb: u8) -> Ins {
+    instruction(
+        31 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 183 << 1,
+    )
+}
+
 fn mtmsr(rs: u8) -> Ins {
     instruction(31 << 26 | u32::from(rs) << 21 | 146 << 1)
 }
@@ -824,17 +836,20 @@ fn portable_hooks_observe_exact_instruction_start_cycles_and_dsi_state() {
         return;
     }
 
-    // addi r3,r0,0x1000; lwz r4,0(r3); addi r4,r4,1; stw r4,4(r3)
+    // addi r5,r0,0x1234; mtspr DSISR,r5; addi r3,r0,0x1000; lwz r4,0(r3);
+    // addi r4,r4,1; stw r4,4(r3)
     let fixture = [
+        instruction(0x38a0_1234),
+        mtspr(5, SPR::DSISR as u16),
         instruction(0x3860_1000),
         instruction(0x8083_0000),
         instruction(0x3884_0001),
         instruction(0x9083_0004),
     ];
     let success = translate_with_cycle_publication(fixture);
-    let failure = translate_with_cycle_publication(fixture[..2].iter().copied());
-    assert_eq!(success.cycles, 8);
-    assert_eq!(failure.cycles, 4);
+    let failure = translate_with_cycle_publication(fixture[..4].iter().copied());
+    assert_eq!(success.cycles, 11);
+    assert_eq!(failure.cycles, 7);
 
     let success = lower_portable(&success.function)
         .iter()
@@ -852,6 +867,7 @@ const [
   pcOffset,
   r4Offset,
   darOffset,
+  dsisrOffset,
   readI32Hook,
   writeI32Hook,
   dsiException,
@@ -889,15 +905,15 @@ async function executeSuccess() {
     lazuli_hooks: hooks,
   });
   const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
-  if (executed !== 0x00080004) throw new Error(`bad success execution: 0x${executed.toString(16)}`);
-  if (view.getUint32(cpu + pcOffset, true) !== 0x80001010) throw new Error("bad success PC");
+  if (executed !== 0x000b0006) throw new Error(`bad success execution: 0x${executed.toString(16)}`);
+  if (view.getUint32(cpu + pcOffset, true) !== 0x80001018) throw new Error("bad success PC");
   if (view.getUint32(cpu + r4Offset, true) !== 0x11223345) throw new Error("bad success r4");
-  const expected = [["read", 2, 0x1000], ["write", 6, 0x1004, 0x11223345]];
+  const expected = [["read", 5, 0x1000], ["write", 9, 0x1004, 0x11223345]];
   if (JSON.stringify(events) !== JSON.stringify(expected)) {
     throw new Error(`bad success hook events: ${JSON.stringify(events)}`);
   }
   const cycleBytes = Array.from(new Uint8Array(memory.buffer, context + cycleOffset, 4));
-  if (cycleBytes.join(",") !== "6,0,0,0") throw new Error(`cycle offset was not LE: ${cycleBytes}`);
+  if (cycleBytes.join(",") !== "9,0,0,0") throw new Error(`cycle offset was not LE: ${cycleBytes}`);
 }
 
 async function executeFailure() {
@@ -911,6 +927,7 @@ async function executeFailure() {
   const hooks = {
     [`user_0_${readI32Hook}`](hookContext, address) {
       events.push(["read", view.getUint32(hookContext + cycleOffset, true), address >>> 0]);
+      view.setUint32(cpu + dsisrOffset, 0x4a01beef, true);
       return 0;
     },
     user_1_0(registers, exception) {
@@ -919,6 +936,7 @@ async function executeFailure() {
         view.getUint32(context + cycleOffset, true),
         registers,
         exception,
+        view.getUint32(registers + dsisrOffset, true),
       ]);
     },
   };
@@ -927,14 +945,20 @@ async function executeFailure() {
     lazuli_hooks: hooks,
   });
   const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
-  if (executed !== 0x00040002) throw new Error(`bad DSI execution: 0x${executed.toString(16)}`);
+  if (executed !== 0x00070004) throw new Error(`bad DSI execution: 0x${executed.toString(16)}`);
   if (view.getUint32(cpu + darOffset, true) !== 0x1000) throw new Error("bad DSI DAR");
-  const expected = [["read", 2, 0x1000], ["exception", 2, cpu, dsiException]];
+  if (view.getUint32(cpu + dsisrOffset, true) !== 0x4a01beef) {
+    throw new Error("DSI hook syndrome was overwritten by the exception flush");
+  }
+  const expected = [
+    ["read", 5, 0x1000],
+    ["exception", 5, cpu, dsiException, 0x4a01beef],
+  ];
   if (JSON.stringify(events) !== JSON.stringify(expected)) {
     throw new Error(`bad DSI hook events: ${JSON.stringify(events)}`);
   }
   const cycleBytes = Array.from(new Uint8Array(memory.buffer, context + cycleOffset, 4));
-  if (cycleBytes.join(",") !== "2,0,0,0") throw new Error(`DSI cycle offset was not LE: ${cycleBytes}`);
+  if (cycleBytes.join(",") !== "5,0,0,0") throw new Error(`DSI cycle offset was not LE: ${cycleBytes}`);
 }
 
 await executeSuccess();
@@ -951,7 +975,144 @@ await executeFailure();
             &Reg::PC.offset().to_string(),
             &GPR::R4.offset().to_string(),
             &SPR::DAR.offset().to_string(),
+            &SPR::DSISR.offset().to_string(),
             &(HookKind::ReadI32 as u32).to_string(),
+            &(HookKind::WriteI32 as u32).to_string(),
+            &(Exception::DSI as u16).to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_failed_store_update_preserves_base_register_at_fault_boundary() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    // stwu r4,4(r3); addi r5,r0,0x1234
+    let immediate = translate_with_cycle_publication([stwu(4, 3, 4), instruction(0x38a0_1234)]);
+    // stwux r4,r3,r6; addi r5,r0,0x1234
+    let indexed = translate_with_cycle_publication([stwux(4, 3, 6), instruction(0x38a0_1234)]);
+    assert_eq!(immediate.cycles, 4);
+    assert_eq!(indexed.cycles, 4);
+
+    let immediate = lower_portable(&immediate.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let indexed = lower_portable(&indexed.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let script = r#"
+const [
+  immediateHex,
+  indexedHex,
+  cycleOffset,
+  pcOffset,
+  r3Offset,
+  r4Offset,
+  r5Offset,
+  r6Offset,
+  darOffset,
+  writeI32Hook,
+  dsiException,
+] = process.argv.slice(1).map((value, index) => index < 2 ? value : Number(value));
+
+async function execute(hex, initialRa, rb, expectedAddress, label) {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const context = 32;
+  const cpu = 128;
+  const fastmem = 0x10000;
+  const initialPc = 0x80002000;
+  const storedValue = 0x11223344;
+  const untouched = 0xdeadbeef;
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r3Offset, initialRa, true);
+  view.setUint32(cpu + r4Offset, storedValue, true);
+  view.setUint32(cpu + r5Offset, untouched, true);
+  view.setUint32(cpu + r6Offset, rb, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`](hookContext, address, value) {
+      events.push([
+        "write",
+        view.getUint32(hookContext + cycleOffset, true),
+        address >>> 0,
+        value >>> 0,
+      ]);
+      return 0;
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + r3Offset, true),
+        view.getUint32(registers + darOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00020001) {
+    throw new Error(`${label} returned past the fault boundary: 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error(`${label} advanced PC across the failed store`);
+  }
+  if (view.getUint32(cpu + r3Offset, true) !== initialRa) {
+    throw new Error(`${label} committed RA before the store succeeded`);
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== untouched) {
+    throw new Error(`${label} executed the instruction after the failed store`);
+  }
+  if (view.getUint32(cpu + darOffset, true) !== expectedAddress) {
+    throw new Error(`${label} recorded the wrong DAR`);
+  }
+  const expected = [
+    ["write", 0, expectedAddress, storedValue],
+    ["exception", 0, cpu, dsiException, initialRa, expectedAddress],
+  ];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`${label} observed ${JSON.stringify(events)}`);
+  }
+  const cycleBytes = Array.from(new Uint8Array(memory.buffer, context + cycleOffset, 4));
+  if (cycleBytes.join(",") !== "0,0,0,0") {
+    throw new Error(`${label} fault cycle offset was not exact LE zero: ${cycleBytes}`);
+  }
+}
+
+await execute(immediateHex, 0x2000, 0, 0x2004, "stwu");
+await execute(indexedHex, 0x3000, 0x20, 0x3020, "stwux");
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &immediate,
+            &indexed,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &GPR::R3.offset().to_string(),
+            &GPR::R4.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &GPR::R6.offset().to_string(),
+            &SPR::DAR.offset().to_string(),
             &(HookKind::WriteI32 as u32).to_string(),
             &(Exception::DSI as u16).to_string(),
         ])
