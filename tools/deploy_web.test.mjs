@@ -11,6 +11,13 @@ test("deployment serves static assets without a request handler", async () => {
   assert.match(wrangler, /^html_handling\s*=\s*"auto-trailing-slash"$/m);
 });
 
+test("deployment keeps the WarioWare public alias in the release artifact", async () => {
+  const builder = await readFile(new URL("./build_web.mjs", import.meta.url), "utf8");
+  const alias = await readFile(new URL("../web/warioware.html", import.meta.url), "utf8");
+  assert.match(builder, /^\s+"warioware\.html",$/m);
+  assert.match(alias, /location\.replace\(`\/\$\{location\.search\}`\)/);
+});
+
 test("deployment pins the verified Wrangler release", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/deploy-web.yml", import.meta.url),

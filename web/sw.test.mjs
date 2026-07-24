@@ -7,6 +7,7 @@ import {
   ACTIVE_RECORD_PATH,
   APP_PATH,
   META_CACHE,
+  WARIOWARE_PATH,
   WORKER_STATUS_PATH,
   activeReleaseResponse,
   backendResponse,
@@ -441,6 +442,36 @@ test("redirects controlled legacy app navigation without serving the active fron
         `${ORIGIN}/?scenario=smb-ready-play&source=legacy`,
       );
       assert.equal(await response.text(), "");
+      assert.deepEqual(networkRequests, []);
+    },
+  );
+});
+
+test("redirects every controlled WarioWare alias to the public picker", async () => {
+  assert.equal(WARIOWARE_PATH, "/warioware");
+  const networkRequests = [];
+  await withWorkerGlobals(
+    new MemoryCacheStorage(),
+    async request => {
+      networkRequests.push(request.url);
+      return new Response("unexpected network response");
+    },
+    async () => {
+      for (const path of [
+        WARIOWARE_PATH,
+        `${WARIOWARE_PATH}/`,
+        `${WARIOWARE_PATH}.html`,
+      ]) {
+        const response = await handleFetch(
+          new Request(`${ORIGIN}${path}?source=public-alias`),
+        );
+        assert.equal(response.status, 302);
+        assert.equal(
+          response.headers.get("Location"),
+          `${ORIGIN}/?source=public-alias`,
+        );
+        assert.equal(await response.text(), "");
+      }
       assert.deepEqual(networkRequests, []);
     },
   );

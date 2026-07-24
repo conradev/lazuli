@@ -118,10 +118,17 @@ new URL("/ppcwasmjit.wasm", location.href)</script></main></body>`,
   assert.ok(!frontend.includes("/browser_renderer.js"));
 
   const firstManifest = await readFile(join(outputPath, "release.json"), "utf8");
+  const warioware = await readFile(join(outputPath, "warioware.html"), "utf8");
+  assert.match(warioware, /Opening WarioWare in Gekko/);
+  assert.match(warioware, /location\.replace\(`\/\$\{location\.search\}`\)/);
   const secondRelease = await buildWeb({ appPath, wasmPath, outputPath, commit });
   assert.equal(secondRelease.releaseId, release.releaseId);
   assert.equal(await readFile(join(outputPath, "release.json"), "utf8"), firstManifest);
   assert.match(await readFile(join(outputPath, "_headers"), "utf8"), /\/release\.json\n  Cache-Control: no-store/);
+  assert.match(
+    await readFile(join(outputPath, "_headers"), "utf8"),
+    /\/warioware\n  Cache-Control: no-store/,
+  );
   const rootFiles = await readdir(outputPath);
   assert.ok(!rootFiles.includes("ppcwasmjit.wasm"), "backend must remain chunk-only");
   assert.ok(!rootFiles.includes("browser_renderer.js"), "renderer JavaScript must be content-addressed");
@@ -240,22 +247,28 @@ test("public shell forwards one supported scenario and discards all other query 
 test("public shell binds the iframe to the staged immutable frontend", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   const fallback = await readFile(new URL("../web/app.html", import.meta.url), "utf8");
+  const warioware = await readFile(
+    new URL("../web/warioware.html", import.meta.url),
+    "utf8",
+  );
   assert.match(shell, /new URL\(release\.frontend\.url, location\.href\)/);
   assert.doesNotMatch(shell, /new URL\("\/app\.html", location\.href\)/);
-  const redirect = fallback.match(/<script>(?<source>.*?)<\/script>/s);
-  assert.ok(redirect?.groups?.source);
-  for (const [search, expected] of [
-    ["", "/"],
-    ["?scenario=smb-ready-play&source=legacy", "/?scenario=smb-ready-play&source=legacy"],
-  ]) {
-    const navigations = [];
-    Function("location", redirect.groups.source)({
-      search,
-      replace(url) {
-        navigations.push(url);
-      },
-    });
-    assert.deepEqual(navigations, [expected]);
+  for (const html of [fallback, warioware]) {
+    const redirect = html.match(/<script>(?<source>.*?)<\/script>/s);
+    assert.ok(redirect?.groups?.source);
+    for (const [search, expected] of [
+      ["", "/"],
+      ["?scenario=smb-ready-play&source=legacy", "/?scenario=smb-ready-play&source=legacy"],
+    ]) {
+      const navigations = [];
+      Function("location", redirect.groups.source)({
+        search,
+        replace(url) {
+          navigations.push(url);
+        },
+      });
+      assert.deepEqual(navigations, [expected]);
+    }
   }
 });
 

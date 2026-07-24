@@ -9,6 +9,10 @@ test("generated public artifact contains only the release surface", async () => 
   const directory = new URL("../web/dist/", import.meta.url);
   const release = JSON.parse(await readFile(new URL("release.json", directory), "utf8"));
   const appFallback = await readFile(new URL("app.html", directory), "utf8");
+  const wariowareFallback = await readFile(
+    new URL("warioware.html", directory),
+    "utf8",
+  );
   const frontend = await readFile(new URL(`.${release.frontend.url}`, directory), "utf8");
   const rendererJavascript = await readFile(
     new URL(`.${release.renderer.javascript.url}`, directory),
@@ -48,6 +52,10 @@ test("generated public artifact contains only the release surface", async () => 
   assert.ok(rendererJavascript.includes(release.renderer.wasm.url));
   assert.ok(!rendererJavascript.includes("browser_renderer_bg.wasm"));
   assert.match(appFallback, /location\.replace\(`\/\$\{location\.search\}`\)/);
+  assert.match(
+    wariowareFallback,
+    /location\.replace\(`\/\$\{location\.search\}`\)/,
+  );
   const rootFiles = await readdir(directory);
   assert.ok(!rootFiles.includes("browser_renderer.js"));
   assert.ok(!rootFiles.includes("browser_renderer_bg.wasm"));

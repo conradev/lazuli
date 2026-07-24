@@ -26,6 +26,7 @@ const STATIC_FILES = [
   "icon.svg",
   "release.mjs",
   "sw.js",
+  "warioware.html",
 ];
 const DEBUG_UI_START = "<!-- LAZULI DEBUG UI START -->";
 const DEBUG_UI_END = "<!-- LAZULI DEBUG UI END -->";
@@ -164,6 +165,12 @@ function cloudflareHeaders() {
   Cache-Control: no-store
 
 /app.html
+  Cache-Control: no-store
+
+/warioware
+  Cache-Control: no-store
+
+/warioware.html
   Cache-Control: no-store
 
 /release.json

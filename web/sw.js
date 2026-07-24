@@ -15,6 +15,7 @@ export const ACTIVE_RECORD_PATH = "/.gekko/active-release";
 export const STAGE_RELEASE_PATH = "/.gekko/stage-release";
 export const WORKER_STATUS_PATH = "/.gekko/worker-status";
 export const APP_PATH = "/app.html";
+export const WARIOWARE_PATH = "/warioware";
 
 const BOOTSTRAP_ASSETS = [
   "/index.html",
@@ -338,7 +339,12 @@ export async function handleFetch(request) {
     return networkFirstBootstrap(request);
   }
   if (url.pathname === "/release.json") return networkFirstRelease(request);
-  if (url.pathname === APP_PATH) {
+  if (
+    url.pathname === APP_PATH
+    || url.pathname === WARIOWARE_PATH
+    || url.pathname === `${WARIOWARE_PATH}/`
+    || url.pathname === `${WARIOWARE_PATH}.html`
+  ) {
     const root = new URL("/", url);
     root.search = url.search;
     return Response.redirect(root.href, 302);
