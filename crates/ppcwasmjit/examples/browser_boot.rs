@@ -4403,21 +4403,40 @@ const TEMPLATE: &str = r##"<!doctype html>
       return physicalStart;
     }
 
-    function translateInstructionEffectiveAddress(effectiveAddress, msr, instructionBats) {
+    function resolveInstructionEffectiveAddress(effectiveAddress, msr, instructionBats) {
       const effective = effectiveAddress >>> 0;
-      if ((msr & 0x20) === 0) return effective;
+      if ((msr & 0x20) === 0) {
+        return { kind: "mapped", effective, physical: effective };
+      }
       const userMode = (msr & 0x4000) !== 0;
       for (const [upper, lower] of instructionBats) {
-        const physical = translateBatAddress(
+        const valid = userMode ? 1 : 2;
+        if ((upper & valid) === 0) continue;
+        const blockMask = (((upper >>> 2) & 0x7ff) << 17) >>> 0;
+        const addressMask = (blockMask | 0x1ffff) >>> 0;
+        const regionMask = (~addressMask) >>> 0;
+        if ((effective & regionMask) !== ((upper >>> 0) & regionMask)) continue;
+        if (!batAllowsAccess(lower, false)) {
+          return { kind: "protection", effective };
+        }
+        // MPC750 IBAT pairs have no G attribute; their fetches are nonguarded.
+        const physicalBase = ((lower & 0xfffe0000) & regionMask) >>> 0;
+        return {
+          kind: "mapped",
           effective,
-          upper,
-          lower,
-          userMode,
-          false
-        );
-        if (physical !== null) return physical;
+          physical: (physicalBase | (effective & addressMask)) >>> 0,
+        };
       }
-      return null;
+      return { kind: "bat-miss", effective };
+    }
+
+    function translateInstructionEffectiveAddress(effectiveAddress, msr, instructionBats) {
+      const resolved = resolveInstructionEffectiveAddress(
+        effectiveAddress,
+        msr,
+        instructionBats
+      );
+      return resolved.kind === "mapped" ? resolved.physical : null;
     }
 
     function translateInstructionEffectiveRange(
@@ -4564,6 +4583,41 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (physical === null) return null;
       return physicalRamPointer(physical, size)
         ?? physicalLockedCachePointer(physical, size);
+    }
+
+    function resolveInstructionFetch(effectiveAddress, size = 4) {
+      const effective = effectiveAddress >>> 0;
+      if (
+        !Number.isSafeInteger(size) || size <= 0
+        || size > 0x100000000 - effective
+      ) {
+        return { kind: "invalid-range", effective };
+      }
+      const resolved = resolveInstructionEffectiveAddress(
+        effective,
+        view.getUint32(cpu + msrOffset, true),
+        readInstructionBats()
+      );
+      if (resolved.kind !== "mapped") return resolved;
+      const pointer = physicalRamPointer(resolved.physical, size)
+        ?? physicalLockedCachePointer(resolved.physical, size);
+      if (pointer === null) {
+        return {
+          kind: "unbacked",
+          effective,
+          physical: resolved.physical,
+        };
+      }
+      return { ...resolved, pointer };
+    }
+
+    function fetchInstructionWord(effectiveAddress) {
+      const resolved = resolveInstructionFetch(effectiveAddress, 4);
+      if (resolved.kind !== "mapped") return resolved;
+      return {
+        ...resolved,
+        word: view.getUint32(resolved.pointer, false),
+      };
     }
 
     function dataRamOrLockedCachePointer(address, size, write = false) {
@@ -8959,6 +9013,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       return view.getUint32(pointer, false);
     }
 
+    function instructionDiagnostic(pc) {
+      const fetched = fetchInstructionWord(pc);
+      return fetched.kind === "mapped"
+        ? "0x" + fetched.word.toString(16).padStart(8, "0")
+        : null;
+    }
+
+    function probeInstructionWord(pc) {
+      const fetched = fetchInstructionWord(pc);
+      return fetched.kind === "mapped" ? fetched.word : null;
+    }
+
     function cpuSignature() {
       let signature = 0x811c9dc5;
       for (let offset = 0; offset < 1024; offset += 4) {
@@ -10576,7 +10642,30 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function raiseException(registers, exception) {
+    function instructionStorageCause(fault) {
+      if (fault?.kind === "page-fault") return 0x40000000;
+      if (fault?.kind === "guarded" || fault?.kind === "no-execute") {
+        return 0x10000000;
+      }
+      if (fault?.kind === "protection") return 0x08000000;
+      return null;
+    }
+
+    function raiseInstructionFetchFault(fault) {
+      const cause = instructionStorageCause(fault);
+      if (cause === null) return false;
+      lastUnmappedAccess = {
+        kind: "instruction-fetch",
+        reason: fault.kind,
+        address: hex32(fault.effective),
+        pc: hex32(view.getUint32(cpu + pcOffset, true)),
+        dispatch: dispatches,
+      };
+      raiseException(cpu, 0x0400, cause, null);
+      return true;
+    }
+
+    function raiseException(registers, exception, specialSrr1 = 0, instruction = undefined) {
       const oldPc = view.getUint32(registers + pcOffset, true);
       const oldMsr = view.getUint32(registers + msrOffset, true);
       const exceptionName = "0x" + exception.toString(16).padStart(4, "0");
@@ -10584,7 +10673,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const sample = {
         exception: exceptionName,
         pc: "0x" + oldPc.toString(16).padStart(8, "0"),
-        instruction: "0x" + fetchWord(oldPc).toString(16).padStart(8, "0"),
+        instruction: instruction === undefined ? instructionDiagnostic(oldPc) : instruction,
         msr: "0x" + oldMsr.toString(16).padStart(8, "0"),
         dar: "0x" + view.getUint32(registers + darOffset, true).toString(16).padStart(8, "0"),
         dispatch: dispatches,
@@ -10612,6 +10701,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const msrToSrr1Mask = 0x07c0ffff;
       const specialSrr1Mask = 0x783c0000;
       srr1 = ((srr1 & ~msrToSrr1Mask) | (oldMsr & msrToSrr1Mask)) & ~specialSrr1Mask;
+      srr1 |= specialSrr1 & specialSrr1Mask;
       view.setUint32(registers + srr0Offset, oldPc + (exception === 0x0c00 ? 4 : 0), true);
       view.setUint32(registers + srr1Offset, srr1, true);
 
@@ -10708,8 +10798,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function decodeMemset32ByteLoop(currentPc) {
-      const firstStore = fetchWord(currentPc);
-      const decrement = fetchWord(currentPc + 4);
+      const firstStore = probeInstructionWord(currentPc);
+      const decrement = probeInstructionWord((currentPc + 4) >>> 0);
+      if (firstStore === null || decrement === null) return null;
       const valueRegister = (firstStore >>> 21) & 31;
       const baseRegister = (firstStore >>> 16) & 31;
       const counterRegister = (decrement >>> 21) & 31;
@@ -10721,7 +10812,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         || (decrement & 0xffff) !== 0xffff
       ) return null;
       for (let index = 1; index < 7; index += 1) {
-        const store = fetchWord(currentPc + 4 + index * 4);
+        const store = probeInstructionWord((currentPc + 4 + index * 4) >>> 0);
+        if (store === null) return null;
         if (
           (store >>> 26) !== 36
           || ((store >>> 21) & 31) !== valueRegister
@@ -10729,23 +10821,24 @@ const TEMPLATE: &str = r##"<!doctype html>
           || (store & 0xffff) !== (index + 1) * 4
         ) return null;
       }
-      const finalStore = fetchWord(currentPc + 0x20);
+      const finalStore = probeInstructionWord((currentPc + 0x20) >>> 0);
       if (
-        (finalStore >>> 26) !== 37
+        finalStore === null
+        || (finalStore >>> 26) !== 37
         || ((finalStore >>> 21) & 31) !== valueRegister
         || ((finalStore >>> 16) & 31) !== baseRegister
         || (finalStore & 0xffff) !== 32
-        || fetchWord(currentPc + 0x24) !== 0x4082ffdc
+        || probeInstructionWord((currentPc + 0x24) >>> 0) !== 0x4082ffdc
       ) return null;
       return { baseRegister, counterRegister, valueRegister };
     }
 
     function isCacheLineLoop(currentPc) {
-      const cacheInstruction = fetchWord(currentPc);
+      const cacheInstruction = probeInstructionWord(currentPc);
       return [0x7c0018ac, 0x7c00186c, 0x7c001bac, 0x7c001fec, 0x7c001fac]
         .includes(cacheInstruction)
-        && fetchWord(currentPc + 4) === 0x38630020
-        && fetchWord(currentPc + 8) === 0x4200fff8;
+        && probeInstructionWord((currentPc + 4) >>> 0) === 0x38630020
+        && probeInstructionWord((currentPc + 8) >>> 0) === 0x4200fff8;
     }
 
     function cacheInstructionUsesStoreAccess(cacheInstruction) {
@@ -10872,13 +10965,31 @@ const TEMPLATE: &str = r##"<!doctype html>
       return candidates.length === 0 ? null : Math.min(...candidates);
     }
 
+    function stageInstructionBlock(compilerView, inputPointer, pc, maximumWords = 64) {
+      if (
+        !Number.isSafeInteger(maximumWords)
+        || maximumWords <= 0
+        || maximumWords > 64
+      ) {
+        throw new RangeError("instruction block size must be between 1 and 64 words");
+      }
+      for (let index = 0; index < maximumWords; index += 1) {
+        const fetched = fetchInstructionWord((pc + index * 4) >>> 0);
+        if (fetched.kind !== "mapped") {
+          return { wordCount: index, fault: fetched };
+        }
+        compilerView.setUint32(inputPointer + index * 4, fetched.word, true);
+      }
+      return { wordCount: maximumWords, fault: null };
+    }
+
     function compileBlock(compiler, inputPointer, pc) {
       const compilerView = new DataView(compiler.memory.buffer);
-      for (let index = 0; index < 64; index += 1) {
-        compilerView.setUint32(inputPointer + index * 4, fetchWord(pc + index * 4), true);
-      }
+      const staged = stageInstructionBlock(compilerView, inputPointer, pc);
+      const { wordCount } = staged;
+      if (wordCount === 0) return { fault: staged.fault };
 
-      const succeeded = compiler.ppcwasmjit_compile(inputPointer, 64);
+      const succeeded = compiler.ppcwasmjit_compile(inputPointer, wordCount);
       if (succeeded !== 1) {
         const pointer = compiler.ppcwasmjit_error_pointer();
         const length = compiler.ppcwasmjit_error_length();
@@ -11693,8 +11804,38 @@ const TEMPLATE: &str = r##"<!doctype html>
             await finishAfterRendererDrain("stopped", {
               stage,
               pc: "0x" + pc.toString(16).padStart(8, "0"),
-              instruction: "0x" + fetchWord(pc).toString(16).padStart(8, "0"),
+              instruction: instructionDiagnostic(pc),
               error: String(error?.message ?? error),
+              instructions,
+              cycles,
+              dispatches,
+              compiledBlocks: blocks.size,
+            });
+            throw Symbol.for("reported");
+          }
+          if (block.fault !== undefined) {
+            if (raiseInstructionFetchFault(block.fault)) {
+              pc = view.getUint32(cpu + pcOffset, true);
+              continue;
+            }
+            lastUnmappedAccess = {
+              kind: "instruction-fetch",
+              reason: block.fault.kind,
+              address: hex32(block.fault.effective),
+              physical: block.fault.physical === undefined
+                ? null
+                : hex32(block.fault.physical),
+              pc: hex32(pc),
+              dispatch: dispatches,
+            };
+            await finishAfterRendererDrain("stopped", {
+              stage: "instruction-fetch",
+              pc: hex32(pc),
+              instruction: null,
+              error: block.fault.kind === "unbacked"
+                ? "instruction fetch reached unbacked physical storage"
+                : "instruction fetch requires segment/page-table translation",
+              instructionFetch: lastUnmappedAccess,
               instructions,
               cycles,
               dispatches,
@@ -11810,7 +11951,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             await finishAfterRendererDrain("stopped", {
               stage,
               pc: "0x" + pc.toString(16).padStart(8, "0"),
-              instruction: "0x" + fetchWord(pc).toString(16).padStart(8, "0"),
+              instruction: instructionDiagnostic(pc),
               error: String(error?.message ?? error),
               instructions,
               cycles,
