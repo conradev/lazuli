@@ -11,7 +11,7 @@ use std::fmt;
 use crate::tev::{MAX_TEV_STAGES, MAX_TEV_TEXTURES, required_texture_maps};
 
 pub(crate) const GX_PACKET_MAGIC: [u8; 4] = *b"LZGX";
-pub(crate) const GX_PACKET_VERSION: u16 = 3;
+pub(crate) const GX_PACKET_VERSION: u16 = 4;
 pub(crate) const GX_PACKET_HEADER_BYTES: u16 = 160;
 pub(crate) const GX_DRAW_RECORD_BYTES: u16 = 176;
 pub(crate) const GX_TEXTURE_RECORD_BYTES: u16 = 64;
@@ -20,9 +20,11 @@ pub(crate) const GX_VERTEX_BYTES: u32 = 144;
 pub(crate) const GX_TEXTURE_REFERENCE_ABSENT: u32 = u32::MAX;
 
 const GX_PACKET_VERSION_V2: u16 = 2;
+const GX_PACKET_VERSION_V3: u16 = 3;
 const GX_DRAW_RECORD_BYTES_V2: u16 = 128;
 const PACKET_ALIGNMENT: u32 = 16;
 const COPY_FLAG_CLEAR: u32 = 1;
+const DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE: u16 = 1;
 const TEXTURE_FLAG_PAYLOAD: u32 = 1;
 const SAMPLER_BITS_MASK: u32 = 0xff;
 const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
@@ -125,6 +127,45 @@ pub(crate) struct GxDrawRecord {
     pub(crate) scissor_height: u32,
     pub(crate) textures: [GxTextureSlot; MAX_TEV_TEXTURES],
     pub(crate) fragment_tail: GxFragmentTailState,
+    pub(crate) post_cull_actions: Option<Vec<GxTriangleAction>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxTriangleAction {
+    Reject012,
+    Reject021,
+    Keep012,
+    Keep021,
+}
+
+impl GxTriangleAction {
+    fn parse(value: u8) -> Self {
+        match value {
+            0 => Self::Reject012,
+            1 => Self::Reject021,
+            2 => Self::Keep012,
+            3 => Self::Keep021,
+            _ => unreachable!("a two-bit GX triangle action is in range"),
+        }
+    }
+
+    fn is_permitted_for_cull_mode(self, cull_mode: u8) -> bool {
+        matches!(
+            (cull_mode, self),
+            (0, Self::Keep012 | Self::Keep021)
+                | (1, Self::Reject012 | Self::Keep021)
+                | (2, Self::Reject021 | Self::Keep012)
+                | (3, Self::Reject012 | Self::Reject021)
+        )
+    }
+
+    pub(crate) fn is_kept(self) -> bool {
+        matches!(self, Self::Keep012 | Self::Keep021)
+    }
+
+    pub(crate) fn uses_021_order(self) -> bool {
+        matches!(self, Self::Reject021 | Self::Keep021)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,7 +228,7 @@ impl<'a> GxFramePacket<'a> {
         let version = read_u16(bytes, 0x04);
         let draw_record_bytes = match version {
             GX_PACKET_VERSION_V2 => GX_DRAW_RECORD_BYTES_V2,
-            GX_PACKET_VERSION => GX_DRAW_RECORD_BYTES,
+            GX_PACKET_VERSION_V3 | GX_PACKET_VERSION => GX_DRAW_RECORD_BYTES,
             _ => return Err(GxPacketError::UnsupportedVersion(version)),
         };
         expect_u16(
@@ -343,7 +384,7 @@ impl<'a> GxFramePacket<'a> {
         )?;
         let key_end = checked_add(expected_key_offset, key_bytes, "key section end")?;
         let expected_pixel_offset = align_packet(key_end, "pixel section offset")?;
-        let expected_packet_bytes =
+        let packet_base_bytes =
             checked_add(expected_pixel_offset, pixel_bytes, "packet byte length")?;
         for (field, actual, expected) in [
             ("draw table offset", draw_table_offset, expected_draw_offset),
@@ -360,9 +401,15 @@ impl<'a> GxFramePacket<'a> {
             ),
             ("key section offset", key_offset, expected_key_offset),
             ("pixel section offset", pixel_offset, expected_pixel_offset),
-            ("packet bytes", packet_bytes, expected_packet_bytes),
         ] {
             expect_u32(field, actual, expected)?;
+        }
+        if version == GX_PACKET_VERSION {
+            if packet_bytes < packet_base_bytes {
+                return Err(GxPacketError::SectionOutOfBounds("base packet"));
+            }
+        } else {
+            expect_u32("packet bytes", packet_bytes, packet_base_bytes)?;
         }
         if !pixel_bytes.is_multiple_of(PACKET_ALIGNMENT) {
             return Err(GxPacketError::NonCanonical(
@@ -417,13 +464,24 @@ impl<'a> GxFramePacket<'a> {
         let mut draws = Vec::with_capacity(to_usize(draw_count));
         let mut next_vertex_relative_offset = 0u32;
         let mut counted_vertices = 0u32;
+        let mut evidence_tail_bytes = 0u32;
         for draw_index in 0..to_usize(draw_count) {
             let record_offset =
                 to_usize(draw_table_offset) + draw_index * usize::from(draw_record_bytes);
             let record = &bytes[record_offset..record_offset + usize::from(draw_record_bytes)];
             let topology = record[0x00];
             let cull_mode = record[0x01];
-            expect_u16("draw flags", read_u16(record, 0x02), 0)?;
+            let draw_flags = read_u16(record, 0x02);
+            if version == GX_PACKET_VERSION {
+                if draw_flags & !DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE != 0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "draw flags",
+                        value: u64::from(draw_flags),
+                    });
+                }
+            } else {
+                expect_u16("draw flags", draw_flags, 0)?;
+            }
             if topology > 7 {
                 return Err(GxPacketError::InvalidField {
                     field: "draw topology",
@@ -437,6 +495,21 @@ impl<'a> GxFramePacket<'a> {
                 });
             }
             let vertex_count = read_u32(record, 0x04);
+            let has_post_cull_actions =
+                draw_flags & DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE != 0;
+            if has_post_cull_actions {
+                let triangle_count = source_triangle_count(topology, vertex_count);
+                if triangle_count == 0 {
+                    return Err(GxPacketError::NonCanonical(
+                        "post-cull evidence must describe at least one triangle",
+                    ));
+                }
+                evidence_tail_bytes = checked_add(
+                    evidence_tail_bytes,
+                    triangle_action_bytes(triangle_count),
+                    "post-cull evidence byte length",
+                )?;
+            }
             let vertex_relative_offset = read_u32(record, 0x08);
             let tev_relative_offset = read_u32(record, 0x0c);
             expect_u32(
@@ -632,6 +705,7 @@ impl<'a> GxFramePacket<'a> {
                 scissor_height: read_u32(record, 0x28),
                 textures: texture_slots,
                 fragment_tail,
+                post_cull_actions: has_post_cull_actions.then(Vec::new),
             });
         }
         expect_u32("summed draw vertices", counted_vertices, total_vertex_count)?;
@@ -646,6 +720,57 @@ impl<'a> GxFramePacket<'a> {
                     .expect("texture count originated as u32"),
             });
         }
+
+        let evidence_end = checked_add(
+            packet_base_bytes,
+            evidence_tail_bytes,
+            "post-cull evidence end",
+        )?;
+        let expected_packet_bytes = if version == GX_PACKET_VERSION {
+            align_packet(evidence_end, "post-cull evidence padding")?
+        } else {
+            packet_base_bytes
+        };
+        expect_u32("packet bytes", packet_bytes, expected_packet_bytes)?;
+
+        let mut evidence_offset = to_usize(packet_base_bytes);
+        for (draw_index, draw) in draws.iter_mut().enumerate() {
+            let Some(actions) = &mut draw.post_cull_actions else {
+                continue;
+            };
+            let triangle_count = source_triangle_count(draw.topology, draw.vertex_count);
+            let action_bytes = triangle_action_bytes(triangle_count);
+            let chunk_end = evidence_offset + to_usize(action_bytes);
+            let chunk = &bytes[evidence_offset..chunk_end];
+            actions.reserve(to_usize(triangle_count));
+            for triangle in 0..to_usize(triangle_count) {
+                let action_bits = (chunk[triangle / 4] >> ((triangle % 4) * 2)) & 3;
+                let action = GxTriangleAction::parse(action_bits);
+                if !action.is_permitted_for_cull_mode(draw.cull_mode) {
+                    return Err(GxPacketError::InvalidTriangleAction {
+                        draw: draw_index,
+                        triangle,
+                        action,
+                        cull_mode: draw.cull_mode,
+                    });
+                }
+                actions.push(action);
+            }
+            let trailing_actions = triangle_count % 4;
+            if trailing_actions != 0 {
+                let used_bits = u8::try_from(trailing_actions * 2)
+                    .expect("at most three trailing GX triangle actions");
+                let unused_mask = !((1u8 << used_bits) - 1);
+                if chunk.last().copied().expect("nonempty evidence chunk") & unused_mask != 0 {
+                    return Err(GxPacketError::NonZeroPadding {
+                        offset: chunk_end - 1,
+                    });
+                }
+            }
+            evidence_offset = chunk_end;
+        }
+        debug_assert_eq!(evidence_offset, to_usize(evidence_end));
+        require_zero(bytes, evidence_offset, to_usize(expected_packet_bytes))?;
 
         let mut textures = Vec::with_capacity(texture_count_usize);
         let mut texture_keys = HashSet::with_capacity(texture_count_usize);
@@ -879,6 +1004,12 @@ pub(crate) enum GxPacketError {
         map: usize,
         sampler_bits: u32,
     },
+    InvalidTriangleAction {
+        draw: usize,
+        triangle: usize,
+        action: GxTriangleAction,
+        cull_mode: u8,
+    },
     MissingTextureReference {
         draw: usize,
         map: usize,
@@ -964,6 +1095,15 @@ impl fmt::Display for GxPacketError {
             } => write!(
                 formatter,
                 "LZGX draw {draw} texture map {map} has invalid sampler bits {sampler_bits:#x}"
+            ),
+            Self::InvalidTriangleAction {
+                draw,
+                triangle,
+                action,
+                cull_mode,
+            } => write!(
+                formatter,
+                "LZGX draw {draw} triangle {triangle} action {action:?} is invalid for cull mode {cull_mode}"
             ),
             Self::MissingTextureReference { draw, map } => write!(
                 formatter,
@@ -1082,6 +1222,20 @@ fn align_packet(value: u32, field: &'static str) -> Result<u32, GxPacketError> {
     checked_add(value, PACKET_ALIGNMENT - 1, field).map(|value| value & !(PACKET_ALIGNMENT - 1))
 }
 
+fn source_triangle_count(topology: u8, vertex_count: u32) -> u32 {
+    match topology {
+        0 | 1 => (vertex_count / 4) * 2 + u32::from(vertex_count % 4 == 3),
+        2 => vertex_count / 3,
+        3 | 4 => vertex_count.saturating_sub(2),
+        5..=7 => 0,
+        _ => unreachable!("validated GX draw topology"),
+    }
+}
+
+fn triangle_action_bytes(triangle_count: u32) -> u32 {
+    triangle_count / 4 + u32::from(triangle_count % 4 != 0)
+}
+
 fn to_usize(value: u32) -> usize {
     usize::try_from(value).expect("u32 LZGX offset fits target usize")
 }
@@ -1174,10 +1328,112 @@ mod tests {
         bytes
     }
 
+    fn single_draw_v4_texture_copy(
+        topology: u8,
+        cull_mode: u8,
+        vertex_count: u32,
+        actions: Option<&[GxTriangleAction]>,
+    ) -> Vec<u8> {
+        v4_texture_copy(&[(topology, cull_mode, vertex_count, actions)])
+    }
+
+    fn v4_texture_copy(draws: &[(u8, u8, u32, Option<&[GxTriangleAction]>)]) -> Vec<u8> {
+        const DRAW_OFFSET: usize = 160;
+        let texture_and_tev_offset = DRAW_OFFSET + draws.len() * GX_DRAW_RECORD_BYTES as usize;
+        let vertex_offset = texture_and_tev_offset + draws.len() * GX_TEV_STATE_BYTES as usize;
+        let total_vertex_count = draws
+            .iter()
+            .map(|(_, _, vertex_count, _)| *vertex_count)
+            .sum::<u32>();
+        let vertex_bytes = total_vertex_count as usize * GX_VERTEX_BYTES as usize;
+        let pixel_offset = vertex_offset + vertex_bytes;
+        let action_bytes = draws
+            .iter()
+            .map(|(topology, _, vertex_count, actions)| {
+                let triangle_count = source_triangle_count(*topology, *vertex_count);
+                actions
+                    .map(|actions| {
+                        assert_eq!(actions.len(), triangle_count as usize);
+                        triangle_action_bytes(triangle_count) as usize
+                    })
+                    .unwrap_or(0)
+            })
+            .sum::<usize>();
+        let packet_bytes = (pixel_offset + action_bytes + 15) & !15;
+
+        let mut bytes = empty_texture_copy();
+        bytes.resize(packet_bytes, 0);
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut bytes, 0x08, packet_bytes as u32);
+        put_u32(&mut bytes, 0x14, draws.len() as u32);
+        put_u32(&mut bytes, 0x1c, DRAW_OFFSET as u32);
+        put_u32(&mut bytes, 0x20, texture_and_tev_offset as u32);
+        put_u32(&mut bytes, 0x24, texture_and_tev_offset as u32);
+        put_u32(&mut bytes, 0x28, vertex_offset as u32);
+        put_u32(&mut bytes, 0x2c, pixel_offset as u32);
+        put_u32(&mut bytes, 0x30, pixel_offset as u32);
+        put_u32(
+            &mut bytes,
+            0x34,
+            draws.len() as u32 * u32::from(GX_DRAW_RECORD_BYTES),
+        );
+        put_u32(&mut bytes, 0x3c, draws.len() as u32 * GX_TEV_STATE_BYTES);
+        put_u32(&mut bytes, 0x40, vertex_bytes as u32);
+        put_u16(&mut bytes, 0x78, GX_DRAW_RECORD_BYTES);
+        put_u32(&mut bytes, 0x7c, total_vertex_count);
+
+        let mut vertex_relative_offset = 0u32;
+        let mut evidence_offset = pixel_offset;
+        for (draw_index, (topology, cull_mode, vertex_count, actions)) in draws.iter().enumerate() {
+            let draw_offset = DRAW_OFFSET + draw_index * GX_DRAW_RECORD_BYTES as usize;
+            bytes[draw_offset] = *topology;
+            bytes[draw_offset + 1] = *cull_mode;
+            put_u16(
+                &mut bytes,
+                draw_offset + 0x02,
+                actions
+                    .is_some()
+                    .then_some(DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE)
+                    .unwrap_or(0),
+            );
+            put_u32(&mut bytes, draw_offset + 0x04, *vertex_count);
+            put_u32(&mut bytes, draw_offset + 0x08, vertex_relative_offset);
+            put_u32(
+                &mut bytes,
+                draw_offset + 0x0c,
+                draw_index as u32 * GX_TEV_STATE_BYTES,
+            );
+            for map in 0..MAX_TEV_TEXTURES {
+                put_u32(
+                    &mut bytes,
+                    draw_offset + 0x30 + map * 8,
+                    GX_TEXTURE_REFERENCE_ABSENT,
+                );
+            }
+            vertex_relative_offset += *vertex_count * GX_VERTEX_BYTES;
+
+            for (triangle, action) in actions.unwrap_or_default().iter().enumerate() {
+                let bits = match action {
+                    GxTriangleAction::Reject012 => 0,
+                    GxTriangleAction::Reject021 => 1,
+                    GxTriangleAction::Keep012 => 2,
+                    GxTriangleAction::Keep021 => 3,
+                };
+                bytes[evidence_offset + triangle / 4] |= bits << ((triangle % 4) * 2);
+            }
+            evidence_offset += actions
+                .map(|_| {
+                    triangle_action_bytes(source_triangle_count(*topology, *vertex_count)) as usize
+                })
+                .unwrap_or(0);
+        }
+        bytes
+    }
+
     fn textured_xfb_copy() -> Vec<u8> {
         let mut bytes = vec![0; V3_PACKET_BYTES];
         bytes[0..4].copy_from_slice(b"LZGX");
-        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V3);
         put_u16(&mut bytes, 0x06, 160);
         put_u32(&mut bytes, 0x08, V3_PACKET_BYTES as u32);
         put_u32(&mut bytes, 0x10, 2);
@@ -1436,6 +1692,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_empty_v4_packet_without_an_evidence_tail() {
+        let mut bytes = empty_texture_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u16(&mut bytes, 0x78, GX_DRAW_RECORD_BYTES);
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(packet.header().packet_bytes, GX_PACKET_HEADER_BYTES.into());
+        assert_eq!(packet.draws().len(), 0);
+    }
+
+    #[test]
     fn parses_v2_draw_with_default_fragment_tail() {
         let bytes = single_draw_v2_texture_copy();
         let packet = GxFramePacket::parse(&bytes).unwrap();
@@ -1443,6 +1709,7 @@ mod tests {
             packet.draw(0).unwrap().record.fragment_tail,
             GxFragmentTailState::default()
         );
+        assert_eq!(packet.draw(0).unwrap().record.post_cull_actions, None);
     }
 
     #[test]
@@ -1488,6 +1755,7 @@ mod tests {
         assert_eq!(draw.vertex_floats().len(), 72);
         assert_eq!(draw.vertex_floats().nth(71), Some(6.75));
         assert_eq!(draw.record.textures[0].texture, Some(0));
+        assert_eq!(draw.record.post_cull_actions, None);
         assert_eq!(
             draw.record.fragment_tail,
             GxFragmentTailState {
@@ -1525,6 +1793,266 @@ mod tests {
         let texture = packet.texture(0).unwrap();
         assert_eq!(texture.key, "alpha");
         assert_eq!(texture.pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn derives_source_triangle_counts_for_every_topology() {
+        for topology in [0, 1] {
+            assert_eq!(source_triangle_count(topology, 0), 0);
+            assert_eq!(source_triangle_count(topology, 2), 0);
+            assert_eq!(source_triangle_count(topology, 3), 1);
+            assert_eq!(source_triangle_count(topology, 4), 2);
+            assert_eq!(source_triangle_count(topology, 7), 3);
+            assert_eq!(source_triangle_count(topology, 8), 4);
+            assert_eq!(source_triangle_count(topology, 11), 5);
+        }
+        assert_eq!(source_triangle_count(2, 2), 0);
+        assert_eq!(source_triangle_count(2, 3), 1);
+        assert_eq!(source_triangle_count(2, 8), 2);
+        for topology in [3, 4] {
+            assert_eq!(source_triangle_count(topology, 0), 0);
+            assert_eq!(source_triangle_count(topology, 2), 0);
+            assert_eq!(source_triangle_count(topology, 3), 1);
+            assert_eq!(source_triangle_count(topology, 8), 6);
+        }
+        for topology in 5..=7 {
+            assert_eq!(source_triangle_count(topology, u32::MAX), 0);
+        }
+    }
+
+    #[test]
+    fn parses_v4_low_bit_first_byte_aligned_post_cull_chunks() {
+        let first_actions = [
+            GxTriangleAction::Keep012,
+            GxTriangleAction::Keep021,
+            GxTriangleAction::Keep012,
+            GxTriangleAction::Keep021,
+            GxTriangleAction::Keep012,
+        ];
+        let second_actions = [GxTriangleAction::Keep021];
+        let bytes = v4_texture_copy(&[
+            (0, 0, 11, Some(&first_actions)),
+            (2, 1, 3, Some(&second_actions)),
+        ]);
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        let evidence_offset = (packet.header().pixel_offset + packet.header().pixel_bytes) as usize;
+
+        assert_eq!(
+            bytes[evidence_offset..evidence_offset + 3],
+            [0xee, 0x02, 0x03]
+        );
+        assert!(bytes[evidence_offset + 3..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            packet.draw(0).unwrap().record.post_cull_actions.as_deref(),
+            Some(first_actions.as_slice())
+        );
+        assert_eq!(
+            packet.draw(1).unwrap().record.post_cull_actions.as_deref(),
+            Some(second_actions.as_slice())
+        );
+        assert!(first_actions.iter().all(|action| action.is_kept()));
+        assert!(!first_actions[0].uses_021_order());
+        assert!(first_actions[1].uses_021_order());
+    }
+
+    #[test]
+    fn parses_v4_evidence_after_nonempty_texture_pixels() {
+        let mut bytes = textured_xfb_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u32(
+            &mut bytes,
+            V3_DRAW_OFFSET + GX_DRAW_RECORD_BYTES as usize + 0x04,
+            0,
+        );
+        put_u32(
+            &mut bytes,
+            V3_DRAW_OFFSET + GX_DRAW_RECORD_BYTES as usize + 0x08,
+            3 * GX_VERTEX_BYTES,
+        );
+        put_u32(&mut bytes, V3_DRAW_OFFSET + 0x04, 3);
+        put_u16(
+            &mut bytes,
+            V3_DRAW_OFFSET + 0x02,
+            DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE,
+        );
+        bytes.resize(V3_PACKET_BYTES + PACKET_ALIGNMENT as usize, 0);
+        let packet_bytes = bytes.len() as u32;
+        put_u32(&mut bytes, 0x08, packet_bytes);
+        bytes[V3_PACKET_BYTES] = 2;
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(
+            packet.draw(0).unwrap().record.post_cull_actions.as_deref(),
+            Some([GxTriangleAction::Keep012].as_slice())
+        );
+        assert_eq!(packet.draw(1).unwrap().record.post_cull_actions, None);
+        assert_eq!(packet.texture(0).unwrap().pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(packet.texture(1).unwrap().pixels, [0xfa, 0xfb, 0xfc, 0xfd]);
+        let evidence_offset = (packet.header().pixel_offset + packet.header().pixel_bytes) as usize;
+        assert_eq!(evidence_offset, V3_PACKET_BYTES);
+        assert_eq!(bytes[evidence_offset], 2);
+        assert!(bytes[evidence_offset + 1..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn v4_evidence_chunks_skip_unflagged_draws_without_losing_byte_alignment() {
+        let first = [GxTriangleAction::Keep012];
+        let third = [GxTriangleAction::Keep021, GxTriangleAction::Keep012];
+        let bytes = v4_texture_copy(&[
+            (2, 0, 3, Some(&first)),
+            (2, 0, 3, None),
+            (0, 0, 4, Some(&third)),
+        ]);
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        let evidence_offset = (packet.header().pixel_offset + packet.header().pixel_bytes) as usize;
+
+        assert_eq!(bytes[evidence_offset..evidence_offset + 2], [0x02, 0x0b]);
+        assert_eq!(
+            packet.draw(0).unwrap().record.post_cull_actions.as_deref(),
+            Some(first.as_slice())
+        );
+        assert_eq!(packet.draw(1).unwrap().record.post_cull_actions, None);
+        assert_eq!(
+            packet.draw(2).unwrap().record.post_cull_actions.as_deref(),
+            Some(third.as_slice())
+        );
+    }
+
+    #[test]
+    fn v4_post_cull_actions_must_match_raw_cull_mode() {
+        let actions = [
+            GxTriangleAction::Reject012,
+            GxTriangleAction::Reject021,
+            GxTriangleAction::Keep012,
+            GxTriangleAction::Keep021,
+        ];
+        for cull_mode in 0..=3 {
+            for action in actions {
+                let bytes = single_draw_v4_texture_copy(
+                    2,
+                    cull_mode,
+                    3,
+                    Some(std::slice::from_ref(&action)),
+                );
+                if action.is_permitted_for_cull_mode(cull_mode) {
+                    assert_eq!(
+                        GxFramePacket::parse(&bytes)
+                            .unwrap()
+                            .draw(0)
+                            .unwrap()
+                            .record
+                            .post_cull_actions
+                            .as_deref(),
+                        Some(std::slice::from_ref(&action))
+                    );
+                } else {
+                    assert_eq!(
+                        GxFramePacket::parse(&bytes).unwrap_err(),
+                        GxPacketError::InvalidTriangleAction {
+                            draw: 0,
+                            triangle: 0,
+                            action,
+                            cull_mode,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_v4_evidence_on_draws_without_triangles() {
+        for (topology, vertex_count) in [(2, 2), (5, 2), (6, 3), (7, 1)] {
+            let bytes = single_draw_v4_texture_copy(topology, 0, vertex_count, Some(&[]));
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::NonCanonical(
+                    "post-cull evidence must describe at least one triangle"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_v4_draw_flags() {
+        let mut bytes = single_draw_v4_texture_copy(2, 0, 3, None);
+        put_u16(&mut bytes, 160 + 0x02, 2);
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "draw flags",
+                value: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_or_unclaimed_v4_evidence_tail() {
+        let action = [GxTriangleAction::Keep012];
+        let mut truncated = single_draw_v4_texture_copy(2, 0, 3, Some(&action));
+        let expected = truncated.len() as u32;
+        let base = read_u32(&truncated, 0x30) as usize;
+        truncated.truncate(base);
+        put_u32(&mut truncated, 0x08, base as u32);
+        assert_eq!(
+            GxFramePacket::parse(&truncated).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "packet bytes",
+                expected: u64::from(expected),
+                actual: base as u64,
+            }
+        );
+
+        let mut unclaimed = single_draw_v4_texture_copy(2, 0, 3, None);
+        let base = unclaimed.len();
+        unclaimed.resize(base + PACKET_ALIGNMENT as usize, 0);
+        let actual = unclaimed.len() as u32;
+        put_u32(&mut unclaimed, 0x08, actual);
+        assert_eq!(
+            GxFramePacket::parse(&unclaimed).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "packet bytes",
+                expected: base as u64,
+                actual: u64::from(actual),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_v4_packet_truncated_below_its_base_before_section_slicing() {
+        let mut bytes = single_draw_v4_texture_copy(2, 0, 3, None);
+        bytes.pop();
+        let truncated_bytes = bytes.len() as u32;
+        put_u32(&mut bytes, 0x08, truncated_bytes);
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::SectionOutOfBounds("base packet")
+        );
+    }
+
+    #[test]
+    fn rejects_nonzero_v4_action_and_final_padding() {
+        let action = [GxTriangleAction::Keep012];
+        let valid = single_draw_v4_texture_copy(2, 0, 3, Some(&action));
+        let evidence_offset = read_u32(&valid, 0x30) as usize;
+
+        let mut action_padding = valid.clone();
+        action_padding[evidence_offset] |= 1 << 2;
+        assert_eq!(
+            GxFramePacket::parse(&action_padding).unwrap_err(),
+            GxPacketError::NonZeroPadding {
+                offset: evidence_offset,
+            }
+        );
+
+        let mut final_padding = valid;
+        final_padding[evidence_offset + 1] = 1;
+        assert_eq!(
+            GxFramePacket::parse(&final_padding).unwrap_err(),
+            GxPacketError::NonZeroPadding {
+                offset: evidence_offset + 1,
+            }
+        );
     }
 
     #[test]
@@ -1661,6 +2189,17 @@ mod tests {
         put_u16(&mut v3_with_v2_record_size, 0x78, GX_DRAW_RECORD_BYTES_V2);
         assert_eq!(
             GxFramePacket::parse(&v3_with_v2_record_size).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "draw record bytes",
+                expected: u64::from(GX_DRAW_RECORD_BYTES),
+                actual: u64::from(GX_DRAW_RECORD_BYTES_V2),
+            }
+        );
+
+        let mut v4_with_v2_record_size = single_draw_v4_texture_copy(2, 0, 3, None);
+        put_u16(&mut v4_with_v2_record_size, 0x78, GX_DRAW_RECORD_BYTES_V2);
+        assert_eq!(
+            GxFramePacket::parse(&v4_with_v2_record_size).unwrap_err(),
             GxPacketError::FieldMismatch {
                 field: "draw record bytes",
                 expected: u64::from(GX_DRAW_RECORD_BYTES),
