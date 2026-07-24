@@ -5,7 +5,15 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod packet;
+mod raster;
 pub(crate) mod tev;
+
+#[allow(unused_imports)]
+pub(crate) use raster::{
+    GxRasterBounds, GxRasterError, GxRasterMask2x2, GxRasterPoint28_4, GxRasterSample12,
+    GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
+    gx_non_aa_raster_coord_28_4, gx_non_aa_raster_sample_12,
+};
 
 pub(crate) const EFB_WIDTH: u32 = 640;
 pub(crate) const EFB_HEIGHT: u32 = 528;
