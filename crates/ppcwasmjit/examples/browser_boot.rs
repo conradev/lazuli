@@ -1413,7 +1413,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       let packet;
       try {
-        packet = packGxFramePacketV3(copyKind, frame, residentTextureKeys);
+        packet = packGxFramePacketV4(copyKind, frame, residentTextureKeys);
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
@@ -1497,12 +1497,68 @@ const TEMPLATE: &str = r##"<!doctype html>
       return wrapS | (wrapT << 2) | (magFilter << 4) | (minFilter << 5);
     }
 
-    // LZGX v3 is the deterministic Worker-to-renderer boundary. The packet is
+    function gxFramePacketPostCullEvidence(
+      value,
+      topology,
+      vertexCount,
+      cullMode,
+      name
+    ) {
+      if (value === undefined || value === null) return null;
+      if (Object.prototype.toString.call(value) !== "[object Uint8Array]") {
+        throw new TypeError(
+          `GX frame packet ${name}.postCullEvidence must be a Uint8Array`
+        );
+      }
+      const triangleCount = gxSourceTriangleCount(topology, vertexCount);
+      if (topology > 4 || triangleCount === 0) {
+        throw new Error(
+          `GX frame packet ${name}.postCullEvidence requires a nonempty triangle topology`
+        );
+      }
+      const expectedBytes = Math.ceil(triangleCount / 4);
+      if (value.byteLength !== expectedBytes) {
+        throw new RangeError(
+          `GX frame packet ${name}.postCullEvidence must contain ${expectedBytes} bytes`
+        );
+      }
+      const evidence = new Uint8Array(value);
+      const finalActions = triangleCount % 4;
+      if (
+        finalActions !== 0
+        && (evidence[evidence.length - 1] >>> (finalActions * 2)) !== 0
+      ) {
+        throw new Error(
+          `GX frame packet ${name}.postCullEvidence has nonzero high padding bits`
+        );
+      }
+      for (let triangle = 0; triangle < triangleCount; triangle += 1) {
+        const action =
+          (evidence[triangle >>> 2] >>> ((triangle & 3) * 2)) & 3;
+        const permitted = cullMode === 0
+          ? action >= 2
+          : cullMode === 1
+            ? action === 0 || action === 3
+            : cullMode === 2
+              ? action === 1 || action === 2
+              : action <= 1;
+        if (!permitted) {
+          throw new Error(
+            `GX frame packet ${name}.postCullEvidence action ${action} conflicts with cull mode ${cullMode}`
+          );
+        }
+      }
+      return evidence;
+    }
+
+    // LZGX v4 is the deterministic Worker-to-renderer boundary. The packet is
     // deliberately self-contained: one transferable ArrayBuffer, fixed-size
     // little-endian records, and byte sections whose padding is always zero.
     // Textures are emitted in first-use draw/slot order and referenced by
     // table index so repeated TEV bindings do not duplicate pixel payloads.
-    function packGxFramePacketV3(copyKind, frame, residentTextureKeys = null) {
+    // A compact tail can certify homogeneous cull/reorder decisions while raw
+    // topology, cull state, and vertices remain unchanged for native fallback.
+    function packGxFramePacketV4(copyKind, frame, residentTextureKeys = null) {
       copyKind = gxFramePacketInteger(copyKind, "copyKind", 2);
       if (copyKind !== 1 && copyKind !== 2) {
         throw new RangeError("GX frame packet copyKind must be 1 or 2");
@@ -1544,6 +1600,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       let vertexBytes = 0;
       let keyBytes = 0;
       let pixelBytes = 0;
+      let evidenceBytes = 0;
 
       for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
         const draw = draws[drawIndex];
@@ -1782,6 +1839,26 @@ const TEMPLATE: &str = r##"<!doctype html>
             );
           }
         }
+        const cullMode = gxFramePacketInteger(
+          pipeline.cullMode ?? 0,
+          `${name}.cullMode`,
+          3
+        );
+        const postCullEvidence = gxFramePacketPostCullEvidence(
+          draw.postCullEvidence,
+          topology,
+          vertexCount,
+          cullMode,
+          name
+        );
+        const evidenceRelativeOffset = evidenceBytes;
+        if (postCullEvidence !== null) {
+          evidenceBytes = gxFramePacketAdd(
+            evidenceBytes,
+            postCullEvidence.byteLength,
+            "post-cull evidence bytes"
+          );
+        }
         normalizedDraws.push({
           topology,
           vertexCount,
@@ -1789,7 +1866,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           vertexValues: draw.vertices,
           tevState,
           textureReferences,
-          cullMode: gxFramePacketInteger(pipeline.cullMode ?? 0, `${name}.cullMode`, 3),
+          cullMode,
+          postCullEvidence,
+          evidenceRelativeOffset,
           zMode: gxFramePacketInteger(
             pipeline.zMode ?? 0,
             `${name}.zMode`,
@@ -1887,8 +1966,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxFramePacketAdd(keyOffset, keyBytes, "key section end"),
         "pixelOffset"
       );
+      const evidenceOffset = gxFramePacketAdd(
+        pixelOffset,
+        pixelBytes,
+        "post-cull evidence offset"
+      );
       const packetBytes = gxFramePacketAlign16(
-        gxFramePacketAdd(pixelOffset, pixelBytes, "packet section end"),
+        gxFramePacketAdd(evidenceOffset, evidenceBytes, "packet section end"),
         "packetBytes"
       );
 
@@ -1995,7 +2079,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const bytes = new Uint8Array(packet);
       const header = new DataView(packet);
       bytes.set([0x4c, 0x5a, 0x47, 0x58], 0x00);
-      header.setUint16(0x04, 3, true);
+      header.setUint16(0x04, 4, true);
       header.setUint16(0x06, 160, true);
       header.setUint32(0x08, packetBytes, true);
       header.setUint32(0x0c, 0, true);
@@ -2042,7 +2126,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         const recordOffset = drawTableOffset + drawIndex * 176;
         bytes[recordOffset] = draw.topology;
         bytes[recordOffset + 1] = draw.cullMode;
-        header.setUint16(recordOffset + 0x02, 0, true);
+        header.setUint16(
+          recordOffset + 0x02,
+          draw.postCullEvidence === null ? 0 : 1,
+          true
+        );
         header.setUint32(recordOffset + 0x04, draw.vertexCount, true);
         header.setUint32(recordOffset + 0x08, draw.vertexRelativeOffset, true);
         header.setUint32(recordOffset + 0x0c, drawIndex * 464, true);
@@ -2112,6 +2200,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
         bytes.set(texture.encodedKey, keyOffset + texture.keyRelativeOffset);
         bytes.set(texture.pixels, pixelOffset + texture.pixelRelativeOffset);
+      }
+      for (const draw of normalizedDraws) {
+        if (draw.postCullEvidence === null) continue;
+        bytes.set(
+          draw.postCullEvidence,
+          evidenceOffset + draw.evidenceRelativeOffset
+        );
       }
       return packet;
     }
@@ -8178,11 +8273,26 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxFrameSkippedPrimitives += 1;
         return;
       }
+      const topology = (opcode >>> 3) & 7;
+      const pipeline = gxDrawPipelineState();
+      const stageCount = Math.min(16, ((gxBpRegisters[0x00] >>> 10) & 0xf) + 1);
+      const stages = Array.from({ length: stageCount }, (_unused, stageIndex) =>
+        gxTevStageState(stageIndex)
+      );
+      const texturedStages = stages.filter(stage => stage.textureEnabled);
+      const collectCullSources = gxManagedCoverageStateCandidate(
+        topology,
+        vertexCount,
+        pipeline,
+        texturedStages.length
+      );
       const vertices = [];
       const texCoordSets = Array.from({ length: 8 }, () => []);
       const rawTextureCoordSets = Array.from({ length: 8 }, () => []);
       const rasterColorSets = Array.from({ length: 2 }, () => []);
       const normalSet = [];
+      const cullPositions = collectCullSources ? [] : null;
+      const cullMatrixIndices = collectCullSources ? [] : null;
       let textureMatrices = null;
       let complete = true;
       for (let vertex = 0; vertex < vertexCount; vertex += 1) {
@@ -8215,14 +8325,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         rasterColorSets[0].push(raster0);
         rasterColorSets[1].push(raster1);
         normalSet.push(decoded.normal);
+        if (collectCullSources) {
+          cullPositions.push(decoded.position);
+          cullMatrixIndices.push(decoded.positionMatrix);
+        }
         textureMatrices = decoded.textureMatrices;
       }
       if (!complete || vertices.length === 0) return;
       gxFrameDrawVertices += vertexCount;
-      const stageCount = Math.min(16, ((gxBpRegisters[0x00] >>> 10) & 0xf) + 1);
-      const stages = Array.from({ length: stageCount }, (_unused, stageIndex) =>
-        gxTevStageState(stageIndex)
-      );
       for (const stage of stages) {
         if (!stage.textureEnabled) continue;
         const coords = texCoordSets[stage.texCoordIndex];
@@ -8233,7 +8343,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
       const textures = gxTevTextures(stages);
-      const texturedStages = stages.filter(stage => stage.textureEnabled);
       if (texturedStages.length !== 0) {
         gxTexturedDraws += 1;
         statusDataset.gxTextures = String(gxTexturedDraws);
@@ -8242,8 +8351,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       gxTevModeCounts.set(tevMode, (gxTevModeCounts.get(tevMode) ?? 0) + 1);
       const texCoordIndex = texturedStages[0]?.texCoordIndex ?? 0;
       const selectedTexCoords = texCoordSets[texCoordIndex];
+      const postCullEvidence = (
+        collectCullSources
+        && gxManagedCoverageVerticesCandidate(topology, vertices)
+      )
+        ? gxManagedCoveragePostCullEvidence(
+          topology,
+          pipeline.cullMode,
+          cullPositions,
+          cullMatrixIndices,
+          gxXfFloat(0x101b)
+        )
+        : null;
       const draw = {
-        topology: (opcode >>> 3) & 7,
+        topology,
         vat: opcode & 7,
         vertexCount,
         // Renderer frames cross a Worker boundary. Keep the GPU-bound payload
@@ -8252,7 +8373,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         vertices: new Float32Array(vertices),
         textures,
         tevState: gxPackTevState(stages),
-        pipeline: gxDrawPipelineState(),
+        pipeline,
+        ...(postCullEvidence === null ? {} : { postCullEvidence }),
       };
       gxFrameDraws.push(draw);
       const vatIndex = opcode & 7;

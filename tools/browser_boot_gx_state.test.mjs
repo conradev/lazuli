@@ -35,7 +35,11 @@ const packetFunctions = [
   "gxFramePacketEqualBytes",
   "gxFramePacketKeyBytes",
   "gxFramePacketSampler",
-  "packGxFramePacketV3",
+  "gxSourceTriangleCount",
+  "gxSourceTriangleIndex",
+  "gxExpandedTriangleIndices",
+  "gxFramePacketPostCullEvidence",
+  "packGxFramePacketV4",
 ];
 
 function packetContext() {
@@ -118,7 +122,11 @@ vm.runInContext(extractFunction("gxDrawPipelineState"), context, {
   filename: "browser_boot.gx-state.js",
 });
 vm.runInContext(
-  [extractFunction("gxTransformPosition"), extractFunction("gxProjectPosition")].join("\n\n"),
+  [
+    extractFunction("gxTransformPosition"),
+    extractFunction("gxProjectViewPosition"),
+    extractFunction("gxProjectPosition"),
+  ].join("\n\n"),
   context,
   {
   filename: "browser_boot.gx-projection.js",
@@ -448,7 +456,7 @@ test("packs each draw's GX pipeline and f32 vertices into its canonical record",
     { length: 36 },
     (_unused, index) => index - 4.5,
   );
-  const buffer = packet.packGxFramePacketV3(2, packetFrame([{
+  const buffer = packet.packGxFramePacketV4(2, packetFrame([{
     topology: 2,
     vertices,
     tevState: tevStateForMap(),
@@ -527,7 +535,7 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
     height: 1,
     pixels,
   };
-  const buffer = packet.packGxFramePacketV3(2, packetFrame([
+  const buffer = packet.packGxFramePacketV4(2, packetFrame([
     {
       topology: 2,
       vertices: new Float32Array(36),

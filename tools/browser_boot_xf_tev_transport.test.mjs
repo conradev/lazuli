@@ -348,5 +348,11 @@ test("worker draw capture routes XF attributes through the TEV transport", () =>
   assert.match(capture, /vertices:\s*new Float32Array\(vertices\)/);
   assert.match(capture, /decoded\.colors\s*\[\s*0\s*\]/);
   assert.match(capture, /decoded\.colors\s*\[\s*1\s*\]/);
+  assert.match(capture, /gxManagedCoverageStateCandidate\s*\(/);
+  assert.match(capture, /cullPositions\.push\(decoded\.position\)/);
+  assert.match(capture, /cullMatrixIndices\.push\(decoded\.positionMatrix\)/);
+  assert.match(capture, /gxManagedCoveragePostCullEvidence\s*\(/);
+  assert.match(capture, /\{\s*postCullEvidence\s*\}/);
+  assert.doesNotMatch(capture, /cullClipPositions/);
   assert.doesNotMatch(capture, /gxTextureForDraw\s*\(/);
 });
