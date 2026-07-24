@@ -603,7 +603,8 @@ const _: () = {
 /// - call `tev_evaluate(raster_colors, tex_coords)` from a fragment entry point;
 /// - provide post-texture-matrix STQ coordinates; sampling performs `st / q` in
 ///   the fragment stage so interpolation remains projective.
-pub(crate) const TEV_VERTEX_WGSL: &str = "
+pub(crate) const TEV_VERTEX_WGSL: &str = "enable dual_source_blending;
+
 struct DrawState {
     alpha_test: u32,
     _padding0: u32,
@@ -956,8 +957,13 @@ fn tev_evaluate(
 ";
 
 pub(crate) const TEV_FRAGMENT_WGSL: &str = "
+struct TevFragmentOutput {
+    @location(0) @blend_src(0) primary: vec4<f32>,
+    @location(0) @blend_src(1) secondary: vec4<f32>,
+};
+
 @fragment
-fn fs_main(input: TevVertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
     let raster_colors = array<vec4<f32>, 8>(
         input.raster0, input.raster1,
         vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
@@ -967,12 +973,16 @@ fn fs_main(input: TevVertexOutput) -> @location(0) vec4<f32> {
         input.stq0, input.stq1, input.stq2, input.stq3,
         input.stq4, input.stq5, input.stq6, input.stq7,
     );
-    let color = tev_evaluate(raster_colors, tex_coords);
-    let alpha = u32(round(clamp(color.a, 0.0, 1.0) * 255.0));
-    if !alpha_test_passes(alpha, draw_state.alpha_test) {
+    let source = tev_evaluate(raster_colors, tex_coords);
+    let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0));
+    if !alpha_test_passes(tev_alpha, draw_state.alpha_test) {
         discard;
     }
-    return color;
+
+    var output: TevFragmentOutput;
+    output.primary = source;
+    output.secondary = source;
+    return output;
 }
 ";
 
@@ -1360,6 +1370,19 @@ mod tests {
     }
 
     #[test]
+    fn wgsl_fragment_contract_is_strict_dual_source_webgpu() {
+        let shader = shader_source();
+        assert!(shader.starts_with("enable dual_source_blending;\n"));
+        assert_eq!(shader.matches("enable dual_source_blending;").count(), 1);
+        assert!(shader.contains(
+            "struct TevFragmentOutput {\n    @location(0) @blend_src(0) primary: vec4<f32>,\n    @location(0) @blend_src(1) secondary: vec4<f32>,\n};"
+        ));
+        assert!(shader.contains("fn fs_main(input: TevVertexOutput) -> TevFragmentOutput"));
+        assert!(shader.contains("output.primary = source"));
+        assert!(shader.contains("output.secondary = source"));
+    }
+
+    #[test]
     fn browser_transport_requires_the_exact_pod_and_eight_texture_slots() {
         assert_eq!(
             validate_draw_transport(
@@ -1437,7 +1460,7 @@ mod tests {
             assert!(shader.contains(&format!("input.stq{coord}")));
         }
         assert!(shader.contains("let uv = stq.xy / stq.z"));
-        assert!(shader.contains("let color = tev_evaluate(raster_colors, tex_coords)"));
-        assert!(shader.contains("if !alpha_test_passes(alpha, draw_state.alpha_test)"));
+        assert!(shader.contains("let source = tev_evaluate(raster_colors, tex_coords)"));
+        assert!(shader.contains("if !alpha_test_passes(tev_alpha, draw_state.alpha_test)"));
     }
 }

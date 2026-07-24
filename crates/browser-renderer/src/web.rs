@@ -22,18 +22,19 @@ use crate::tev::{
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
-    GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxEfbFormat, GxXfbCopyParameters,
-    RendererFailureState, RendererHostTimings, RendererMetrics, RendererPhaseTiming,
-    SamplerIdentity, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
-    TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor, ViFieldPairOutcome,
-    ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField, ViPresentationMode,
-    XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
+    GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDestinationAlphaState, GxEfbFormat,
+    GxXfbCopyParameters, RendererFailureState, RendererHostTimings, RendererMetrics,
+    RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
+    SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor,
+    ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField,
+    ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
     compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
-    decoded_texture_is_available, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
-    gx_depth24_to_float, gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height,
-    merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
-    reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
-    xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
+    decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
+    gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float, gx_destination_alpha_state,
+    gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height, merge_contiguous_draw_range,
+    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
+    rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
+    xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -272,6 +273,8 @@ struct TevVertex {
 
 const _: () = assert!(std::mem::size_of::<TevVertex>() == TEV_VERTEX_FLOATS * size_of::<f32>());
 
+const REQUIRED_WEBGPU_FEATURES: wgpu::Features = wgpu::Features::DUAL_SOURCE_BLENDING;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DrawUniform {
@@ -429,11 +432,17 @@ struct DepthPipelineState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct BlendPipelineState {
-    enabled: bool,
+struct BlendComponentState {
     source: wgpu::BlendFactor,
     destination: wgpu::BlendFactor,
     operation: wgpu::BlendOperation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BlendPipelineState {
+    enabled: bool,
+    color: BlendComponentState,
+    alpha: BlendComponentState,
     color_write: bool,
     alpha_write: bool,
 }
@@ -1698,6 +1707,7 @@ impl WebGpuRenderer {
             z_mode,
             blend_mode,
             alpha_test,
+            0,
             cull_mode,
             scissor_x,
             scissor_y,
@@ -1834,6 +1844,7 @@ impl WebGpuRenderer {
                     draw.record.z_mode,
                     draw.record.blend_mode,
                     draw.record.alpha_test,
+                    draw.record.fragment_tail.pixel_control,
                     draw.record.cull_mode,
                     draw.record.scissor_x,
                     draw.record.scissor_y,
@@ -1899,6 +1910,7 @@ impl WebGpuRenderer {
         z_mode: u32,
         blend_mode: u32,
         alpha_test: u32,
+        pixel_control: u32,
         cull_mode: u8,
         scissor_x: u32,
         scissor_y: u32,
@@ -1948,7 +1960,9 @@ impl WebGpuRenderer {
             7 => Primitive::Points,
             _ => Primitive::Triangles,
         };
-        let pipeline = PipelineKey::from_gx(primitive, z_mode, blend_mode, cull_mode);
+        let destination_alpha = gx_destination_alpha_state(blend_mode, 0, pixel_control);
+        let pipeline =
+            PipelineKey::from_gx(primitive, z_mode, blend_mode, destination_alpha, cull_mode);
         let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
         else {
             return Ok(());
@@ -2947,17 +2961,28 @@ impl WebGpuRenderer {
             })
             .await
             .map_err(|error| format!("WebGPU is required: {error}"))?;
+        let required_features = REQUIRED_WEBGPU_FEATURES;
+        if !adapter.features().contains(required_features) {
+            return Err(
+                "WebGPU dual-source blending is required for exact GX component blending; this adapter exposes no compatible feature and Lazuli has no rendering fallback"
+                    .to_owned(),
+            );
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Lazuli browser WebGPU device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::defaults().using_resolution(adapter.limits()),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(|error| format!("failed to create WebGPU device: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "failed to create required dual-source-blending WebGPU device; exact GX component blending has no fallback: {error}"
+                )
+            })?;
         let failure_state = RendererFailureState::default();
         let uncaptured_failure_state = failure_state.clone();
         device.on_uncaptured_error(Arc::new(move |error| {
@@ -3358,7 +3383,13 @@ impl WebGpuRenderer {
 }
 
 impl PipelineKey {
-    fn from_gx(primitive: Primitive, z_mode: u32, blend_mode: u32, cull_mode: u8) -> Self {
+    fn from_gx(
+        primitive: Primitive,
+        z_mode: u32,
+        blend_mode: u32,
+        destination_alpha: GxDestinationAlphaState,
+        cull_mode: u8,
+    ) -> Self {
         let depth_enabled = z_mode & 1 != 0;
         let depth = DepthPipelineState {
             compare: if depth_enabled {
@@ -3370,6 +3401,8 @@ impl PipelineKey {
         };
 
         let blend = gx_blend_state(blend_mode);
+        let color_blend = color_blend_component(blend, destination_alpha.target_has_guest_alpha);
+        let alpha_blend = alpha_blend_component(blend, destination_alpha.target_has_guest_alpha);
         let cull = if primitive == Primitive::Triangles {
             match cull_mode & 3 {
                 1 => CullMode::Back,
@@ -3386,13 +3419,34 @@ impl PipelineKey {
             depth,
             blend: BlendPipelineState {
                 enabled: blend.enabled,
-                source: blend_factor(blend.source),
-                destination: blend_factor(blend.destination),
-                operation: blend_operation(blend.operation),
+                color: color_blend,
+                alpha: alpha_blend,
                 color_write: blend.color_write,
-                alpha_write: blend.alpha_write,
+                alpha_write: blend.alpha_write && destination_alpha.target_has_guest_alpha,
             },
         }
+    }
+}
+
+fn color_blend_component(
+    blend: crate::GxBlendState,
+    target_has_guest_alpha: bool,
+) -> BlendComponentState {
+    BlendComponentState {
+        source: color_blend_factor(blend.source, target_has_guest_alpha),
+        destination: color_blend_factor(blend.destination, target_has_guest_alpha),
+        operation: blend_operation(blend.operation),
+    }
+}
+
+fn alpha_blend_component(
+    blend: crate::GxBlendState,
+    target_has_guest_alpha: bool,
+) -> BlendComponentState {
+    BlendComponentState {
+        source: alpha_blend_factor(blend.source, target_has_guest_alpha),
+        destination: alpha_blend_factor(blend.destination, target_has_guest_alpha),
+        operation: blend_operation(blend.operation),
     }
 }
 
@@ -3409,14 +3463,30 @@ fn compare_function(value: u8) -> wgpu::CompareFunction {
     }
 }
 
+fn color_blend_factor(factor: GxBlendFactor, target_has_guest_alpha: bool) -> wgpu::BlendFactor {
+    blend_factor(gx_blend_factor_for_component(
+        factor,
+        false,
+        target_has_guest_alpha,
+    ))
+}
+
+fn alpha_blend_factor(factor: GxBlendFactor, target_has_guest_alpha: bool) -> wgpu::BlendFactor {
+    blend_factor(gx_blend_factor_for_component(
+        factor,
+        true,
+        target_has_guest_alpha,
+    ))
+}
+
 fn blend_factor(factor: GxBlendFactor) -> wgpu::BlendFactor {
     match factor {
         GxBlendFactor::Zero => wgpu::BlendFactor::Zero,
         GxBlendFactor::One => wgpu::BlendFactor::One,
-        GxBlendFactor::Source => wgpu::BlendFactor::Src,
-        GxBlendFactor::OneMinusSource => wgpu::BlendFactor::OneMinusSrc,
-        GxBlendFactor::SourceAlpha => wgpu::BlendFactor::SrcAlpha,
-        GxBlendFactor::OneMinusSourceAlpha => wgpu::BlendFactor::OneMinusSrcAlpha,
+        GxBlendFactor::Source => wgpu::BlendFactor::Src1,
+        GxBlendFactor::OneMinusSource => wgpu::BlendFactor::OneMinusSrc1,
+        GxBlendFactor::SourceAlpha => wgpu::BlendFactor::Src1Alpha,
+        GxBlendFactor::OneMinusSourceAlpha => wgpu::BlendFactor::OneMinusSrc1Alpha,
         GxBlendFactor::Destination => wgpu::BlendFactor::Dst,
         GxBlendFactor::OneMinusDestination => wgpu::BlendFactor::OneMinusDst,
         GxBlendFactor::DestinationAlpha => wgpu::BlendFactor::DstAlpha,
@@ -3429,6 +3499,17 @@ fn blend_operation(operation: GxBlendOperation) -> wgpu::BlendOperation {
         GxBlendOperation::Add => wgpu::BlendOperation::Add,
         GxBlendOperation::ReverseSubtract => wgpu::BlendOperation::ReverseSubtract,
     }
+}
+
+fn blend_write_mask(blend: BlendPipelineState) -> wgpu::ColorWrites {
+    let mut write_mask = wgpu::ColorWrites::empty();
+    if blend.color_write {
+        write_mask |= wgpu::ColorWrites::COLOR;
+    }
+    if blend.alpha_write {
+        write_mask |= wgpu::ColorWrites::ALPHA;
+    }
+    write_mask
 }
 
 fn clipped_scissor(x: u32, y: u32, width: u32, height: u32) -> Option<ScissorRect> {
@@ -3636,23 +3717,17 @@ fn create_tev_geometry_pipeline(
     };
     let blend = key.blend.enabled.then_some(wgpu::BlendState {
         color: wgpu::BlendComponent {
-            src_factor: key.blend.source,
-            dst_factor: key.blend.destination,
-            operation: key.blend.operation,
+            src_factor: key.blend.color.source,
+            dst_factor: key.blend.color.destination,
+            operation: key.blend.color.operation,
         },
         alpha: wgpu::BlendComponent {
-            src_factor: key.blend.source,
-            dst_factor: key.blend.destination,
-            operation: key.blend.operation,
+            src_factor: key.blend.alpha.source,
+            dst_factor: key.blend.alpha.destination,
+            operation: key.blend.alpha.operation,
         },
     });
-    let mut write_mask = wgpu::ColorWrites::empty();
-    if key.blend.color_write {
-        write_mask |= wgpu::ColorWrites::COLOR;
-    }
-    if key.blend.alpha_write {
-        write_mask |= wgpu::ColorWrites::ALPHA;
-    }
+    let write_mask = blend_write_mask(key.blend);
     let vertex_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<TevVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
@@ -4036,7 +4111,33 @@ fn create_pipelines(
 
 #[cfg(test)]
 mod tests {
-    use super::expanded_indices;
+    use super::{
+        PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES, alpha_blend_factor, blend_write_mask,
+        color_blend_factor, expanded_indices,
+    };
+    use crate::{GxBlendFactor, gx_destination_alpha_state};
+
+    fn encoded_blend_mode(
+        source: u32,
+        destination: u32,
+        color_write: bool,
+        alpha_write: bool,
+    ) -> u32 {
+        1 | (u32::from(color_write) << 3)
+            | (u32::from(alpha_write) << 4)
+            | ((destination & 7) << 5)
+            | ((source & 7) << 8)
+    }
+
+    fn pipeline_key(blend_mode: u32, pixel_control: u32) -> PipelineKey {
+        PipelineKey::from_gx(
+            Primitive::Triangles,
+            0,
+            blend_mode,
+            gx_destination_alpha_state(blend_mode, 0, pixel_control),
+            0,
+        )
+    }
 
     #[test]
     fn expands_gamecube_topologies_for_webgpu() {
@@ -4045,5 +4146,85 @@ mod tests {
         assert_eq!(expanded_indices(3, 4).unwrap(), [0, 1, 2, 1, 3, 2]);
         assert_eq!(expanded_indices(4, 4).unwrap(), [0, 1, 2, 0, 2, 3]);
         assert_eq!(expanded_indices(6, 3).unwrap(), [0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn dual_source_factors_keep_color_and_alpha_semantics_independent() {
+        use GxBlendFactor as Gx;
+        use wgpu::BlendFactor as Web;
+
+        let cases = [
+            (Gx::Zero, Web::Zero, Web::Zero),
+            (Gx::One, Web::One, Web::One),
+            (Gx::Source, Web::Src1, Web::Src1Alpha),
+            (
+                Gx::OneMinusSource,
+                Web::OneMinusSrc1,
+                Web::OneMinusSrc1Alpha,
+            ),
+            (Gx::SourceAlpha, Web::Src1Alpha, Web::Src1Alpha),
+            (
+                Gx::OneMinusSourceAlpha,
+                Web::OneMinusSrc1Alpha,
+                Web::OneMinusSrc1Alpha,
+            ),
+            (Gx::Destination, Web::Dst, Web::DstAlpha),
+            (
+                Gx::OneMinusDestination,
+                Web::OneMinusDst,
+                Web::OneMinusDstAlpha,
+            ),
+            (Gx::DestinationAlpha, Web::DstAlpha, Web::DstAlpha),
+            (
+                Gx::OneMinusDestinationAlpha,
+                Web::OneMinusDstAlpha,
+                Web::OneMinusDstAlpha,
+            ),
+        ];
+        for (gx, color, alpha) in cases {
+            assert_eq!(color_blend_factor(gx, true), color);
+            assert_eq!(alpha_blend_factor(gx, true), alpha);
+        }
+        assert!(REQUIRED_WEBGPU_FEATURES.contains(wgpu::Features::DUAL_SOURCE_BLENDING));
+    }
+
+    #[test]
+    fn no_alpha_efb_removes_only_destination_alpha_dependencies() {
+        use GxBlendFactor as Gx;
+        use wgpu::BlendFactor as Web;
+
+        assert_eq!(color_blend_factor(Gx::Destination, false), Web::Dst);
+        assert_eq!(
+            color_blend_factor(Gx::OneMinusDestination, false),
+            Web::OneMinusDst
+        );
+        assert_eq!(color_blend_factor(Gx::DestinationAlpha, false), Web::One);
+        assert_eq!(
+            color_blend_factor(Gx::OneMinusDestinationAlpha, false),
+            Web::Zero
+        );
+        for factor in [Gx::Destination, Gx::DestinationAlpha] {
+            assert_eq!(alpha_blend_factor(factor, false), Web::One);
+        }
+        for factor in [Gx::OneMinusDestination, Gx::OneMinusDestinationAlpha] {
+            assert_eq!(alpha_blend_factor(factor, false), Web::Zero);
+        }
+    }
+
+    #[test]
+    fn write_masks_keep_color_and_guest_alpha_updates_independent() {
+        let neither = pipeline_key(encoded_blend_mode(1, 0, false, false), 1);
+        let color = pipeline_key(encoded_blend_mode(1, 0, true, false), 1);
+        let alpha = pipeline_key(encoded_blend_mode(1, 0, false, true), 1);
+        let both = pipeline_key(encoded_blend_mode(1, 0, true, true), 1);
+        assert_eq!(blend_write_mask(neither.blend), wgpu::ColorWrites::empty());
+        assert_eq!(blend_write_mask(color.blend), wgpu::ColorWrites::COLOR);
+        assert_eq!(blend_write_mask(alpha.blend), wgpu::ColorWrites::ALPHA);
+        assert_eq!(blend_write_mask(both.blend), wgpu::ColorWrites::ALL);
+
+        let no_alpha = pipeline_key(encoded_blend_mode(1, 0, true, true), 0);
+        assert_eq!(blend_write_mask(no_alpha.blend), wgpu::ColorWrites::COLOR);
+        assert!(no_alpha.blend.color_write);
+        assert!(!no_alpha.blend.alpha_write);
     }
 }

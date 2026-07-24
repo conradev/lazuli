@@ -201,3 +201,30 @@ test("GX depth endpoints span the full unsigned 24-bit range in clears and draws
   assert.match(readbackConversion, /\* GX_DEPTH24_MAX as f32\)\.round\(\) as u32/);
   assert.doesNotMatch(rendererCoreSource, /GX_DEPTH24_SCALE|GX_DEPTH24_MAX_FLOAT/);
 });
+
+test("strict WebGPU rendering requires the canonical component-exact dual-source contract", () => {
+  assert.match(
+    rendererSource,
+    /const REQUIRED_WEBGPU_FEATURES: wgpu::Features = wgpu::Features::DUAL_SOURCE_BLENDING/,
+  );
+  const create = rendererSection("async fn create_inner", "fn upload_texture(");
+  assert.match(create, /backends: wgpu::Backends::BROWSER_WEBGPU/);
+  assert.match(
+    create,
+    /adapter\.features\(\)\.contains\(required_features\)/,
+  );
+  assert.match(create, /required_features,/);
+  assert.match(create, /dual-source blending is required/);
+  assert.match(create, /no rendering fallback/);
+  assert.doesNotMatch(create, /required_features: wgpu::Features::empty\(\)/);
+
+  const shader = sourceSection(
+    tevSource,
+    "pub(crate) const TEV_VERTEX_WGSL",
+    "pub(crate) fn shader_source",
+  );
+  assert.match(shader, /enable dual_source_blending;/);
+  assert.match(shader, /@location\(0\) @blend_src\(0\) primary: vec4<f32>/);
+  assert.match(shader, /@location\(0\) @blend_src\(1\) secondary: vec4<f32>/);
+  assert.match(shader, /output\.secondary = source/);
+});
