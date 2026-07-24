@@ -102,6 +102,24 @@ fn context_store_count(function: &ir::Function, offset: i32) -> usize {
         .count()
 }
 
+fn user_hook_call_count(function: &ir::Function, hook: HookKind) -> usize {
+    function
+        .layout
+        .blocks()
+        .flat_map(|block| function.layout.block_insts(block))
+        .filter(|&instruction| {
+            let InstructionData::Call { func_ref, .. } = function.dfg.insts[instruction] else {
+                return false;
+            };
+            let ExternalName::User(name_ref) = &function.dfg.ext_funcs[func_ref].name else {
+                return false;
+            };
+            let name = &function.params.user_named_funcs()[*name_ref];
+            name.namespace == 0 && name.index == hook as u32
+        })
+        .count()
+}
+
 fn psq(opcode: u32, fr: u8, ra: u8, displacement: i16, w: bool, gqr: u8) -> Ins {
     let word = opcode << 26
         | u32::from(fr) << 21
@@ -115,6 +133,10 @@ fn psq(opcode: u32, fr: u8, ra: u8, displacement: i16, w: bool, gqr: u8) -> Ins 
 fn mtspr(rs: u8, spr: u16) -> Ins {
     let encoded_spr = (u32::from(spr) & 0x1f) << 16 | (u32::from(spr) >> 5) << 11;
     instruction(31 << 26 | u32::from(rs) << 21 | encoded_spr | 467 << 1)
+}
+
+fn mtmsr(rs: u8) -> Ins {
+    instruction(31 << 26 | u32::from(rs) << 21 | 146 << 1)
 }
 
 fn lower_portable(function: &ir::Function) -> Vec<u8> {
@@ -277,16 +299,19 @@ fn every_portable_semantic_hook_is_immediately_cycle_stamped() {
         [(0, HookKind::DecChanged as u32, 0)]
     );
 
-    // Deferred BAT hooks retain the most recent originating instruction's start cycle.
-    let deferred = translate_with_cycle_publication([
+    // BAT hooks run at their originating instruction and stop the translated block.
+    let barrier = translate_with_cycle_publication([
         instruction(0x3860_1000),
         mtspr(3, SPR::DBAT0U as u16),
         instruction(0x3884_0001),
     ]);
     assert_eq!(
-        hook_call_cycles(&deferred.function, TEST_HOOK_CYCLE_OFFSET),
+        hook_call_cycles(&barrier.function, TEST_HOOK_CYCLE_OFFSET),
         [(0, HookKind::DBatChanged as u32, 2)]
     );
+    assert_eq!(barrier.sequence.len(), 2);
+    assert_eq!(barrier.cycles, 3);
+    assert_eq!(barrier.exit, TranslationExit::Synchronous);
 
     // icbi r0,r3; isync; sc
     for (word, expected) in [
@@ -300,6 +325,143 @@ fn every_portable_semantic_hook_is_immediately_cycle_stamped() {
             [expected]
         );
     }
+}
+
+#[test]
+fn address_space_writes_are_exact_cycle_translation_barriers() {
+    let prefix = instruction(0x3860_1000); // addi r3,r0,0x1000
+    let later_load = instruction(0x8083_0000); // lwz r4,0(r3)
+    let later_store = instruction(0x9083_0004); // stw r4,4(r3)
+
+    for (barrier, hook) in [
+        (mtmsr(3), HookKind::MsrChanged),
+        (mtspr(3, SPR::DBAT0U as u16), HookKind::DBatChanged),
+        (mtspr(3, SPR::IBAT0L as u16), HookKind::IBatChanged),
+    ] {
+        let fixture = [prefix, barrier, later_load, later_store];
+        let portable = translate_with_cycle_publication(fixture);
+
+        assert_eq!(portable.sequence.0, fixture[..2]);
+        assert_eq!(portable.cycles, 3);
+        assert_eq!(portable.exit, TranslationExit::Synchronous);
+        assert_eq!(
+            hook_call_cycles(&portable.function, TEST_HOOK_CYCLE_OFFSET),
+            [(0, hook as u32, 2)]
+        );
+
+        let mut native = Translator::new(TranslationConfig::new(
+            CodegenSettings::default(),
+            ir::types::I64,
+            CallConv::SystemV,
+            ExitMode::Native,
+        ));
+        let native = native.translate(fixture.into_iter()).unwrap();
+        assert_eq!(native.sequence.0, fixture[..2]);
+        assert_eq!(native.cycles, portable.cycles);
+        assert_eq!(native.exit, TranslationExit::Synchronous);
+        assert_eq!(user_hook_call_count(&native.function, hook), 1);
+    }
+}
+
+#[test]
+fn portable_address_space_barriers_return_the_exact_executed_boundary() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let prefix = instruction(0x3860_1000); // addi r3,r0,0x1000
+    let later_load = instruction(0x8083_0000); // lwz r4,0(r3)
+    let later_store = instruction(0x9083_0004); // stw r4,4(r3)
+    let barriers = [
+        (mtmsr(3), HookKind::MsrChanged, Reg::MSR.offset()),
+        (
+            mtspr(3, SPR::DBAT0U as u16),
+            HookKind::DBatChanged,
+            SPR::DBAT0U.offset(),
+        ),
+        (
+            mtspr(3, SPR::IBAT0L as u16),
+            HookKind::IBatChanged,
+            SPR::IBAT0L.offset(),
+        ),
+    ];
+    let mut modules = Vec::new();
+    for (barrier, _, _) in barriers {
+        let translated =
+            translate_with_cycle_publication([prefix, barrier, later_load, later_store]);
+        assert_eq!(translated.sequence.len(), 2);
+        assert_eq!(translated.cycles, 3);
+        assert_eq!(translated.exit, TranslationExit::Synchronous);
+        modules.push(
+            lower_portable(&translated.function)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+    }
+
+    let script = r#"
+const args = process.argv.slice(1);
+const modules = args.slice(0, 3);
+const [cycleOffset, pcOffset, ...barrierData] = args.slice(3).map(Number);
+
+for (let index = 0; index < modules.length; index += 1) {
+  const hookKind = barrierData[index * 2];
+  const registerOffset = barrierData[index * 2 + 1];
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const context = 32;
+  const cpu = 128;
+  const fastmem = 0x10000;
+  const events = [];
+  view.setUint32(cpu + pcOffset, 0x80001000, true);
+
+  const hooks = {
+    [`user_0_${hookKind}`](hookContext) {
+      events.push([
+        view.getUint32(hookContext + cycleOffset, true),
+        view.getUint32(cpu + registerOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await WebAssembly.instantiate(Buffer.from(modules[index], "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00030002) {
+    throw new Error(`barrier ${index} returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== 0x80001008) {
+    throw new Error(`barrier ${index} did not stop PC after two instructions`);
+  }
+  if (JSON.stringify(events) !== JSON.stringify([[2, 0x1000]])) {
+    throw new Error(`barrier ${index} observed ${JSON.stringify(events)}`);
+  }
+  const cycleBytes = Array.from(new Uint8Array(memory.buffer, context + cycleOffset, 4));
+  if (cycleBytes.join(",") !== "2,0,0,0") {
+    throw new Error(`barrier ${index} cycle offset was not LE: ${cycleBytes}`);
+  }
+}
+"#;
+    let mut command = Command::new("node");
+    command.args(["--input-type=module", "--eval", script]);
+    command.args(&modules);
+    command.args([
+        TEST_HOOK_CYCLE_OFFSET.to_string(),
+        Reg::PC.offset().to_string(),
+    ]);
+    for (_, hook, register_offset) in barriers {
+        command.args([(hook as u32).to_string(), register_offset.to_string()]);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]
