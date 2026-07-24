@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+mod geometry;
 mod project;
 
 const GX_CLIP_COMPONENTS: usize = 4;

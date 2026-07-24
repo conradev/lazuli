@@ -369,6 +369,10 @@ impl GxRasterScissor {
             y_offset: 0,
         }
     }
+
+    pub(crate) const fn rect(self) -> [u16; 4] {
+        [self.left, self.top, self.right, self.bottom]
+    }
 }
 
 /// Sign of the original, unsnapped screen-space area.
