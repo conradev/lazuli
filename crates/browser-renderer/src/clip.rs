@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+mod project;
+
 const GX_CLIP_COMPONENTS: usize = 4;
 const GX_CLIP_PLANE_MASK: u8 = 0x3f;
 const GX_CLIP_PLANES: [(u8, [f32; 4]); 6] = [
