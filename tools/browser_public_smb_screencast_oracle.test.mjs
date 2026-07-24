@@ -143,7 +143,7 @@ function summarizedFrame(index) {
   const digit = ((index % 4) + 7).toString(16);
   return {
     ordinal: index + 1,
-    sessionId: index + 1,
+    sessionId: 1,
     receivedAtMs: 1_700_000_000_000 + index * 16,
     metadata: {
       offsetTop: 0,
@@ -308,6 +308,20 @@ test("strict passive oracle accepts diverse non-serial public viewport summaries
     monochromeOrdinals: [],
     oppositeExtremeTransitions: [],
   });
+});
+
+test("screencast acknowledgement tokens may be reused while frame clocks stay ordered", () => {
+  const report = validReport();
+  assert.deepEqual(new Set(report.screencast.frames.map(frame => frame.sessionId)), new Set([1]));
+  assert.doesNotThrow(() => verifyPublicSmbScreencastReport(report));
+
+  const invalid = validReport();
+  invalid.screencast.frames[7].sessionId = 0;
+  assert.throws(
+    () => verifyPublicSmbScreencastReport(invalid),
+    error => error instanceof PublicSmbScreencastValidationError
+      && error.path === "$.screencast.frames[7].sessionId",
+  );
 });
 
 test("passive oracle accepts a healthy 73-second tail and rejects a tail over 180 seconds", () => {
