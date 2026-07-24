@@ -7639,6 +7639,20 @@ const TEMPLATE: &str = r##"<!doctype html>
         scissorY,
         scissorWidth: Math.min(width, 640 - scissorX),
         scissorHeight: Math.min(height, 528 - scissorY),
+        pixelControl: gxBpRegisters[0x43] >>> 0,
+        constantAlpha: gxBpRegisters[0x42] >>> 0,
+        zTextureBias: gxBpRegisters[0xf4] >>> 0,
+        zTextureMode: gxBpRegisters[0xf5] >>> 0,
+        fogRangeBase: gxBpRegisters[0xe8] >>> 0,
+        fogRangeK: Array.from(
+          { length: 5 },
+          (_unused, index) => gxBpRegisters[0xe9 + index] >>> 0
+        ),
+        fogWords: Array.from(
+          { length: 5 },
+          (_unused, index) => gxBpRegisters[0xee + index] >>> 0
+        ),
+        viewportHalfWidthBits: gxXfRegisters[0x101a] >>> 0,
       };
     }
 

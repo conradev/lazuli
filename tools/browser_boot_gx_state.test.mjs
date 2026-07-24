@@ -138,13 +138,28 @@ function offset(xPlus342Div2, yPlus342Div2) {
 
 test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
   gxBpRegisters.fill(0);
+  gxXfRegisters.fill(0);
   gxBpRegisters[0x00] = 2 << 14;
   gxBpRegisters[0x20] = corner(342, 342);
   gxBpRegisters[0x21] = corner(342 + 639, 342 + 527);
   gxBpRegisters[0x40] = 1 | (6 << 1) | (1 << 4);
   gxBpRegisters[0x41] = 1 | (1 << 3) | (1 << 4) | (5 << 5) | (4 << 8);
+  gxBpRegisters[0x42] = 0x131415;
+  gxBpRegisters[0x43] = 0x101112;
+  gxBpRegisters[0xe8] = 0x1c1d1e;
+  gxBpRegisters.set(
+    [0x010001, 0x010002, 0x010003, 0x010004, 0x010005],
+    0xe9,
+  );
+  gxBpRegisters.set(
+    [0x020001, 0x020002, 0x020003, 0x020004, 0x020005],
+    0xee,
+  );
   gxBpRegisters[0xf3] = 0x00240000;
+  gxBpRegisters[0xf4] = 0x161718;
+  gxBpRegisters[0xf5] = 0x191a1b;
   gxBpRegisters[0x59] = offset(171, 171);
+  gxXfRegisters[0x101a] = 0x43a00000;
 
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.gxDrawPipelineState())),
@@ -157,12 +172,21 @@ test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
       scissorY: 0,
       scissorWidth: 640,
       scissorHeight: 528,
+      pixelControl: 0x101112,
+      constantAlpha: 0x131415,
+      zTextureBias: 0x161718,
+      zTextureMode: 0x191a1b,
+      fogRangeBase: 0x1c1d1e,
+      fogRangeK: [0x010001, 0x010002, 0x010003, 0x010004, 0x010005],
+      fogWords: [0x020001, 0x020002, 0x020003, 0x020004, 0x020005],
+      viewportHalfWidthBits: 0x43a00000,
     },
   );
 });
 
 test("applies independent GX X/Y scissor offsets and clips to the EFB", () => {
   gxBpRegisters.fill(0);
+  gxXfRegisters.fill(0);
   gxBpRegisters[0x20] = corner(400, 370);
   gxBpRegisters[0x21] = corner(700, 500);
   gxBpRegisters[0x59] = offset(176, 168);
@@ -178,6 +202,14 @@ test("applies independent GX X/Y scissor offsets and clips to the EFB", () => {
       scissorY: 34,
       scissorWidth: 301,
       scissorHeight: 131,
+      pixelControl: 0,
+      constantAlpha: 0,
+      zTextureBias: 0,
+      zTextureMode: 0,
+      fogRangeBase: 0,
+      fogRangeK: [0, 0, 0, 0, 0],
+      fogWords: [0, 0, 0, 0, 0],
+      viewportHalfWidthBits: 0,
     },
   );
 
