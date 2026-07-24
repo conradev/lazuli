@@ -26,7 +26,8 @@ const PACKET_ALIGNMENT: u32 = 16;
 const COPY_FLAG_CLEAR: u32 = 1;
 const DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE: u16 = 1;
 const TEXTURE_FLAG_PAYLOAD: u32 = 1;
-const SAMPLER_BITS_MASK: u32 = 0xff;
+const SAMPLER_BITS_MASK_V3: u32 = 0xff;
+const SAMPLER_BITS_MASK_V4: u32 = SAMPLER_BITS_MASK_V3 | (3 << 19);
 const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
 const FOG_RANGE_ADJUSTMENT_ENABLE: u32 = 1 << 10;
 
@@ -636,11 +637,16 @@ impl<'a> GxFramePacket<'a> {
                 texture: None,
                 sampler_bits: 0,
             }; MAX_TEV_TEXTURES];
+            let sampler_bits_mask = if version == GX_PACKET_VERSION {
+                SAMPLER_BITS_MASK_V4
+            } else {
+                SAMPLER_BITS_MASK_V3
+            };
             for map in 0..MAX_TEV_TEXTURES {
                 let slot_offset = 0x30 + map * 8;
                 let reference = read_u32(record, slot_offset);
                 let sampler_bits = read_u32(record, slot_offset + 4);
-                if sampler_bits & !SAMPLER_BITS_MASK != 0 {
+                if sampler_bits & !sampler_bits_mask != 0 {
                     return Err(GxPacketError::InvalidSampler {
                         draw: draw_index,
                         map,
@@ -1793,6 +1799,45 @@ mod tests {
         let texture = packet.texture(0).unwrap();
         assert_eq!(texture.key, "alpha");
         assert_eq!(texture.pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn v4_sampler_words_transport_anisotropy_without_weakening_older_packets() {
+        let sampler = 0xb9 | (3 << 19);
+        let mut v4 = textured_xfb_copy();
+        put_u16(&mut v4, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut v4, V3_DRAW_OFFSET + 0x34, sampler);
+        let packet = GxFramePacket::parse(&v4).unwrap();
+        assert_eq!(
+            packet.draw(0).unwrap().record.textures[0].sampler_bits,
+            sampler
+        );
+
+        let mut v3 = textured_xfb_copy();
+        put_u32(&mut v3, V3_DRAW_OFFSET + 0x34, sampler);
+        assert_eq!(
+            GxFramePacket::parse(&v3).unwrap_err(),
+            GxPacketError::InvalidSampler {
+                draw: 0,
+                map: 0,
+                sampler_bits: sampler,
+            },
+        );
+
+        let mut reserved = v4;
+        put_u32(
+            &mut reserved,
+            V3_DRAW_OFFSET + 0x34,
+            sampler | (1 << 18),
+        );
+        assert_eq!(
+            GxFramePacket::parse(&reserved).unwrap_err(),
+            GxPacketError::InvalidSampler {
+                draw: 0,
+                map: 0,
+                sampler_bits: sampler | (1 << 18),
+            },
+        );
     }
 
     #[test]

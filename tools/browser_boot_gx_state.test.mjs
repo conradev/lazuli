@@ -546,6 +546,7 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
         wrapT: 2,
         magFilter: 1,
         minFilter: 5,
+        maxAnisotropy: 2,
       }],
     },
     {
@@ -558,6 +559,7 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
         wrapT: 3,
         magFilter: 0,
         minFilter: 1,
+        maxAnisotropy: 1,
       }],
     },
   ]));
@@ -569,9 +571,9 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
   assert.equal(view.getUint32(0x14, true), 2);
   assert.equal(view.getUint32(0x18, true), 1);
   assert.equal(view.getUint32(firstDraw + 0x30, true), 0);
-  assert.equal(view.getUint32(firstDraw + 0x34, true), 0xb9);
+  assert.equal(view.getUint32(firstDraw + 0x34, true), 0x001000b9);
   assert.equal(view.getUint32(secondDraw + 0x30, true), 0);
-  assert.equal(view.getUint32(secondDraw + 0x34, true), 0x2e);
+  assert.equal(view.getUint32(secondDraw + 0x34, true), 0x0008002e);
   assert.equal(view.getUint32(textureTable + 0x0c, true), 4);
   assert.equal(view.getUint32(textureTable + 0x20, true), 1);
   assert.equal(view.getUint32(0x48, true), 16);

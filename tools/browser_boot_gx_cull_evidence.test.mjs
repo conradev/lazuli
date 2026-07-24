@@ -42,6 +42,8 @@ const pureFunctions = [
   "gxPostCullActionFromNormal",
   "gxPostCullAction",
   "gxPostCullEvidence",
+  "gxTextureRegisters",
+  "gxTextureSamplerState",
   "gxManagedCoverageStateCandidate",
   "gxManagedCoverageVerticesCandidate",
 ];
@@ -53,6 +55,7 @@ function pureContext() {
     Number,
     Object,
     Uint8Array,
+    gxBpRegisters: new Uint32Array(0x100),
   };
   vm.createContext(context);
   vm.runInContext(pureFunctions.map(extractFunction).join("\n\n"), context, {
@@ -263,8 +266,24 @@ test("producer gates exact cull work to the receiver's current managed subset", 
     fogWords: [0, 0, 0, 0, 0],
     zMode: 0,
   };
+  const stage = (texCoordIndex, textureMap) => ({
+    textureEnabled: true,
+    texCoordIndex,
+    textureMap,
+  });
+  const setTextureMode = (
+    textureMap,
+    magFilter,
+    minFilter,
+    maxAnisotropy = 0,
+  ) => {
+    const { mode0 } = context.gxTextureRegisters(textureMap);
+    context.gxBpRegisters[mode0] =
+      (magFilter << 4) | (minFilter << 5) | (maxAnisotropy << 19);
+  };
+
   assert.equal(
-    context.gxManagedCoverageStateCandidate(2, 3, pipeline, 0),
+    context.gxManagedCoverageStateCandidate(2, 3, pipeline, []),
     true,
   );
   for (const override of [
@@ -279,38 +298,188 @@ test("producer gates exact cull work to the receiver's current managed subset", 
         2,
         3,
         { ...pipeline, ...override },
-        0,
+        [],
       ),
       false,
     );
   }
+
+  setTextureMode(0, 1, 4);
   assert.equal(
-    context.gxManagedCoverageStateCandidate(2, 3, pipeline, 1),
+    context.gxManagedCoverageStateCandidate(0, 4, pipeline, [stage(0, 0)]),
+    true,
+    "saved SMB min-linear/mag-linear coord0 draws enter the coarse evidence subset",
+  );
+
+  setTextureMode(1, 0, 0);
+  assert.equal(
+    context.gxManagedCoverageStateCandidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0), stage(0, 1)],
+    ),
+    true,
+    "every unique map may share the one live texcoord",
+  );
+  setTextureMode(1, 1, 0);
+  assert.equal(
+    context.gxManagedCoverageStateCandidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0), stage(0, 1)],
+    ),
     false,
+    "one mismatched required map rejects the draw",
+  );
+  setTextureMode(1, 0, 0);
+
+  for (const [name, magFilter, minFilter] of [
+    ["nearest min with linear mag", 1, 0],
+    ["linear min with nearest mag", 0, 4],
+    ["mipmapped min mode", 0, 1],
+  ]) {
+    setTextureMode(0, magFilter, minFilter);
+    assert.equal(
+      context.gxManagedCoverageStateCandidate(0, 4, pipeline, [stage(0, 0)]),
+      false,
+      name,
+    );
+  }
+  setTextureMode(0, 1, 4, 1);
+  assert.equal(
+    context.gxManagedCoverageStateCandidate(0, 4, pipeline, [stage(0, 0)]),
+    false,
+    "anisotropic sampling exceeds the managed sampler contract",
+  );
+  setTextureMode(0, 1, 4);
+  assert.equal(
+    context.gxManagedCoverageStateCandidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0), stage(1, 0)],
+    ),
+    false,
+    "two live texcoords exceed the producer subset",
   );
   assert.equal(
-    context.gxManagedCoverageStateCandidate(5, 3, pipeline, 0),
+    context.gxManagedCoverageStateCandidate(5, 3, pipeline, []),
+    false,
+  );
+});
+
+test("texture sampling state is a complete per-draw snapshot outside decode identity", () => {
+  const context = pureContext();
+  const mode0 =
+    2
+    | (1 << 2)
+    | (1 << 4)
+    | (4 << 5)
+    | (3 << 19);
+  assert.deepEqual(
+    { ...context.gxTextureSamplerState(mode0) },
+    {
+      wrapS: 2,
+      wrapT: 1,
+      magFilter: 1,
+      minFilter: 4,
+      maxAnisotropy: 3,
+    },
+  );
+  assert.match(
+    source,
+    /const sampler = gxTextureSamplerState\(mode0\)/,
+  );
+  assert.match(
+    source,
+    /return \{ \.\.\.cached, \.\.\.sampler \}/,
+    "cache hits must snapshot current mode0 without mutating earlier draws",
+  );
+  assert.match(
+    source,
+    /maxAnisotropy << 19/,
+    "LZGX v4 must carry the anisotropy certificate to the receiver",
+  );
+});
+
+test("saved-SMB-shaped textured quad keeps only depth and raster flatness gates", () => {
+  const context = pureContext();
+  const positions = [
+    [96, 64],
+    [544, 64],
+    [544, 464],
+    [96, 464],
+  ];
+  const liveStq = [
+    [0, 0, 1],
+    [2, 0, 1.5],
+    [2, 2, 2],
+    [0, 2, 0.75],
+  ];
+  const savedSmbVertices = positions.flatMap(([x, y], vertex) => [
+    x,
+    y,
+    0x123456,
+    [0.5, 1, 2, 4][vertex],
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    ...liveStq[vertex],
+    ...Array.from(
+      { length: 7 },
+      (_unused, coord) => [
+        vertex + coord / 8,
+        vertex * 2 - coord / 16,
+        1 + vertex + coord / 4,
+      ],
+    ).flat(),
+  ]);
+  assert.equal(savedSmbVertices.length, 4 * 36);
+  assert.equal(
+    context.gxManagedCoverageVerticesCandidate(0, savedSmbVertices),
+    true,
+    "varying W, live STQ, and unused STQ do not defeat producer evidence",
+  );
+
+  const varyingRaster = savedSmbVertices.slice();
+  varyingRaster[2 * 36 + 4] = 0.5;
+  assert.equal(
+    context.gxManagedCoverageVerticesCandidate(0, varyingRaster),
     false,
   );
 
-  const vertices = [
-    [0, 0],
-    [4, 0],
-    [0, 4],
-  ].flatMap(([x, y]) => [
-    x, y, 0, 1,
-    ...Array(32).fill(0.5),
-  ]);
-  assert.equal(context.gxManagedCoverageVerticesCandidate(2, vertices), true);
-  const varyingAttribute = vertices.slice();
-  varyingAttribute[2 * 36 + 35] = 1;
+  const varyingDepth = savedSmbVertices.slice();
+  varyingDepth[2 * 36 + 2] += 1;
   assert.equal(
-    context.gxManagedCoverageVerticesCandidate(2, varyingAttribute),
+    context.gxManagedCoverageVerticesCandidate(0, varyingDepth),
     false,
   );
-  const invalidW = vertices.slice();
+
+  const invalidW = savedSmbVertices.slice();
   invalidW[3] = 0;
-  assert.equal(context.gxManagedCoverageVerticesCandidate(2, invalidW), false);
+  assert.equal(context.gxManagedCoverageVerticesCandidate(0, invalidW), false);
+});
+
+test("draw capture gates cull-source collection with the actual textured stages", () => {
+  assert.match(
+    source,
+    /const collectCullSources = gxManagedCoverageStateCandidate\(\s*topology,\s*vertexCount,\s*pipeline,\s*texturedStages\s*\)/,
+  );
+  assert.match(
+    source,
+    /const cullPositions = collectCullSources \? \[\] : null;\s*const cullMatrixIndices = collectCullSources \? \[\] : null;/,
+  );
+  assert.doesNotMatch(
+    source,
+    /gxManagedCoverageStateCandidate\([\s\S]{0,180}texturedStages\.length/,
+  );
 });
 
 test("canonical cull clip transform rounds every scalar operation to f32", () => {

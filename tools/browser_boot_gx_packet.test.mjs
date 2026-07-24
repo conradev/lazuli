@@ -163,6 +163,7 @@ function representativeXfbFrame() {
     wrapT: 2,
     magFilter: 1,
     minFilter: 5,
+    maxAnisotropy: 2,
     pixels: alphaPixels,
   };
   const beta = {
@@ -176,6 +177,7 @@ function representativeXfbFrame() {
     wrapT: 0,
     magFilter: 0,
     minFilter: 7,
+    maxAnisotropy: 3,
     pixels: betaPixels,
   };
   const repeatedAlpha = {
@@ -184,6 +186,7 @@ function representativeXfbFrame() {
     wrapT: 3,
     magFilter: 0,
     minFilter: 1,
+    maxAnisotropy: 1,
     pixels: alphaPixels.slice(),
   };
   const firstVertices = Float32Array.from(
@@ -423,11 +426,11 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.equal(view.getUint32(firstDraw + 0x14, true), 0x040506);
   assert.equal(view.getUint32(firstDraw + 0x18, true), 0x070809);
   assert.equal(view.getUint32(firstDraw + 0x30, true), 0);
-  assert.equal(view.getUint32(firstDraw + 0x34, true), 0xb9);
+  assert.equal(view.getUint32(firstDraw + 0x34, true), 0x001000b9);
   assert.equal(view.getUint32(firstDraw + 0x38, true), 0xffffffff);
   assert.equal(view.getUint32(firstDraw + 0x3c, true), 0);
   assert.equal(view.getUint32(firstDraw + 0x40, true), 1);
-  assert.equal(view.getUint32(firstDraw + 0x44, true), 0xe3);
+  assert.equal(view.getUint32(firstDraw + 0x44, true), 0x001800e3);
   assert.equal(view.getUint32(firstDraw + 0x70, true), 0x111213);
   assert.equal(view.getUint32(firstDraw + 0x74, true), 0x141516);
   assert.equal(view.getUint32(firstDraw + 0x78, true), 0x171819);
@@ -454,7 +457,7 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.equal(view.getUint32(secondDraw + 0x18, true), 0x171819);
   assert.equal(view.getUint32(secondDraw + 0x30, true), 0xffffffff);
   assert.equal(view.getUint32(secondDraw + 0x38, true), 0);
-  assert.equal(view.getUint32(secondDraw + 0x3c, true), 0x2e);
+  assert.equal(view.getUint32(secondDraw + 0x3c, true), 0x0008002e);
   assert.equal(view.getUint32(secondDraw + 0x70, true), 0x414243);
   assert.equal(view.getUint32(secondDraw + 0xac, true), 0x43b40000);
 
@@ -491,9 +494,9 @@ test("packs deterministic first-use texture tables and aligned payload sections"
   assert.deepEqual(packetBytes(first), packetBytes(second));
   assert.equal(
     digest(first),
-    "13e2c85d19ea182e497d3724967fa4be06fdc6da352a27aa76806651621d2e9a",
+    "dd6ee1a23d0f0dd23e762b5b7a71de3f2a66360adb04e2fc7f9cc2abf0090916",
   );
-  assert.equal(fnv1a64(first), "0adaab4222b31024");
+  assert.equal(fnv1a64(first), "5241754f97893d94");
 });
 
 test("rejects conflicting content for one frame-local texture key", () => {

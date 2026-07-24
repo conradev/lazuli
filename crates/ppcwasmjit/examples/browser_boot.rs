@@ -1494,7 +1494,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         `${name}.minFilter`,
         7
       );
-      return wrapS | (wrapT << 2) | (magFilter << 4) | (minFilter << 5);
+      const maxAnisotropy = gxFramePacketInteger(
+        texture.maxAnisotropy ?? 0,
+        `${name}.maxAnisotropy`,
+        3
+      );
+      return (
+        wrapS
+        | (wrapT << 2)
+        | (magFilter << 4)
+        | (minFilter << 5)
+        | (maxAnisotropy << 19)
+      ) >>> 0;
     }
 
     function gxFramePacketPostCullEvidence(
@@ -7031,10 +7042,21 @@ const TEMPLATE: &str = r##"<!doctype html>
       // so a TLUT upload does not invalidate unrelated or identical entries.
     }
 
+    function gxTextureSamplerState(mode0) {
+      return {
+        wrapS: mode0 & 3,
+        wrapT: (mode0 >>> 2) & 3,
+        magFilter: (mode0 >>> 4) & 1,
+        minFilter: (mode0 >>> 5) & 7,
+        maxAnisotropy: (mode0 >>> 19) & 3,
+      };
+    }
+
     function gxDecodeTexture(textureMap) {
       const registers = gxTextureRegisters(textureMap);
       const image0 = gxBpRegisters[registers.image0];
       const mode0 = gxBpRegisters[registers.mode0];
+      const sampler = gxTextureSamplerState(mode0);
       const width = (image0 & 0x3ff) + 1;
       const height = ((image0 >>> 10) & 0x3ff) + 1;
       const format = (image0 >>> 20) & 0xf;
@@ -7085,7 +7107,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       const cached = gxTextureCache.get(key);
       if (cached !== undefined) {
         gxTextureCacheHits += 1;
-        return cached;
+        // Sampling state is draw state, not decoded-image identity. Return a
+        // fresh snapshot so a BP mode change cannot rewrite an earlier draw or
+        // inherit the sampler from the cache entry's first decode.
+        return { ...cached, ...sampler };
       }
 
       const pixels = new Uint8ClampedArray(width * height * 4);
@@ -7209,10 +7234,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         formatName: layout.name,
         encodedBytes,
         hash: "0x" + hash.toString(16).padStart(8, "0"),
-        wrapS: mode0 & 3,
-        wrapT: (mode0 >>> 2) & 3,
-        magFilter: (mode0 >>> 4) & 1,
-        minFilter: (mode0 >>> 5) & 7,
+        ...sampler,
         pixels,
       };
       if (textureCopyIndex !== undefined) texture.textureCopyIndex = textureCopyIndex;
@@ -7963,17 +7985,52 @@ const TEMPLATE: &str = r##"<!doctype html>
       topology,
       vertexCount,
       pipeline,
-      texturedStageCount
+      texturedStages
     ) {
       if (
         gxSourceTriangleCount(topology, vertexCount) === 0
         || pipeline.cullMode === 3
-        || texturedStageCount !== 0
+        || !Array.isArray(texturedStages)
         || (pipeline.pixelControl & 7) === 2
         || ((pipeline.zTextureMode >>> 2) & 3) !== 0
         || ((pipeline.fogWords[3] >>> 21) & 7) !== 0
       ) {
         return false;
+      }
+      let liveTexCoordMask = 0;
+      let requiredTextureMapMask = 0;
+      for (const stage of texturedStages) {
+        if (
+          stage === null
+          || typeof stage !== "object"
+          || !Number.isInteger(stage.texCoordIndex)
+          || stage.texCoordIndex < 0
+          || stage.texCoordIndex > 7
+          || !Number.isInteger(stage.textureMap)
+          || stage.textureMap < 0
+          || stage.textureMap > 7
+        ) {
+          return false;
+        }
+        liveTexCoordMask |= 1 << stage.texCoordIndex;
+        requiredTextureMapMask |= 1 << stage.textureMap;
+      }
+      if ((liveTexCoordMask & (liveTexCoordMask - 1)) !== 0) return false;
+      for (let textureMap = 0; textureMap < 8; textureMap += 1) {
+        if ((requiredTextureMapMask & (1 << textureMap)) === 0) continue;
+        const mode0Register =
+          0x80 + (textureMap >= 4 ? 0x20 : 0) + (textureMap & 3);
+        const mode0 = gxBpRegisters[mode0Register] >>> 0;
+        const magFilter = (mode0 >>> 4) & 1;
+        const minFilter = (mode0 >>> 5) & 7;
+        const maxAnisotropy = (mode0 >>> 19) & 3;
+        if (
+          (minFilter & 3) !== 0
+          || magFilter !== (minFilter >>> 2)
+          || maxAnisotropy !== 0
+        ) {
+          return false;
+        }
       }
       // The receiver currently manages only the fixed-function early-depth
       // path. This conservative subset avoids reproducing the complete alpha
@@ -8022,7 +8079,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         for (let corner = 1; corner < 3; corner += 1) {
           const other =
             gxSourceTriangleIndex(topology, vertexCount, triangle, corner) * 36;
-          for (let component = 2; component < 36; component += 1) {
+          for (let component = 2; component < 12; component += 1) {
             if (component === 3) continue;
             if (
               !Object.is(
@@ -8284,7 +8341,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         topology,
         vertexCount,
         pipeline,
-        texturedStages.length
+        texturedStages
       );
       const vertices = [];
       const texCoordSets = Array.from({ length: 8 }, () => []);
