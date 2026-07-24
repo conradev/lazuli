@@ -77,6 +77,9 @@ function makeContext() {
     gxDecodeBuffer: [],
     gxFifoStagingMeta: 0x40,
     mmio: 0,
+    translateDataRange: address => (
+      address >= 0xc0000000 ? (address - 0xc0000000) >>> 0 : address >>> 0
+    ),
     view: new DataView(memory),
   };
   vm.createContext(context);

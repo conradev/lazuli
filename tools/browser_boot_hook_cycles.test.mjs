@@ -78,7 +78,6 @@ const hookFunctions = [
   "withPublishedHookCycles",
   "drainGxFifoStagingForJit",
   "drainGxFifoStagingAtCycle",
-  "jitHookDrainsFifo",
   "invokeJitHook",
   "createJitHookProxy",
 ];
@@ -92,8 +91,7 @@ function makeContext() {
     gxFifoStagingMeta: 0,
     hookCalls: new Map(),
     hookCycleOffset: 8,
-    lockedCachePointer() { return null; },
-    ramPointer(address, size) {
+    dataRamOrLockedCachePointer(address, size) {
       return address === 0x8000 && size === 1 ? 0 : null;
     },
     regionContinuableHookCalls: 0,
@@ -257,27 +255,32 @@ test("post-execution FIFO drains use returned aggregate cycles", () => {
   assert.equal(context.cycles, 1_000);
 });
 
-test("deferred BAT hooks leave later FIFO bytes for the block boundary", () => {
-  const context = makeContext();
-  context.regionRunning = true;
-  publish(context, { prefix: 40, offset: 2 });
-  context.view.setUint32(context.gxFifoStagingMeta, 32, true);
-  const hooks = context.createJitHookProxy({
-    user_0_17() {
-      context.events.push(["ibat", context.cycles]);
-    },
-  });
+test("inline BAT barriers drain prior FIFO bytes at their exact cycle", () => {
+  for (const [name, label] of [
+    ["user_0_17", "ibat"],
+    ["user_0_18", "dbat"],
+  ]) {
+    const context = makeContext();
+    context.regionRunning = true;
+    publish(context, { prefix: 40, offset: 2 });
+    context.view.setUint32(context.gxFifoStagingMeta, 32, true);
+    const hooks = context.createJitHookProxy({
+      [name]() {
+        context.events.push([label, context.cycles]);
+      },
+    });
 
-  assert.equal(hooks.user_0_17(), 0);
-  assert.deepEqual(context.events, [["ibat", 1_042]]);
-  assert.equal(context.view.getUint32(context.gxFifoStagingMeta, true), 32);
-  assert.equal(context.view.getUint32(context.regionControl + 4, true), 1);
-  assert.equal(context.cycles, 1_000);
+    assert.equal(hooks[name](), 0);
+    assert.deepEqual(context.events, [
+      ["drain", 1_042],
+      [label, 1_042],
+    ]);
+    assert.equal(context.view.getUint32(context.gxFifoStagingMeta, true), 0);
+    assert.equal(context.view.getUint32(context.regionControl + 4, true), 1);
+    assert.equal(context.cycles, 1_000);
 
-  context.drainGxFifoStagingAtCycle(1_060);
-  assert.deepEqual(context.events, [["ibat", 1_042], ["drain", 1_060]]);
-  assert.equal(context.view.getUint32(context.gxFifoStagingMeta, true), 0);
-  assert.equal(context.cycles, 1_000);
+    assert.equal(context.cycles, 1_000);
+  }
 });
 
 test("browser execution wires one control record through blocks, regions, and FIFO drains", () => {
