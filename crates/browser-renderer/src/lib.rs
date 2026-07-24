@@ -49,6 +49,8 @@ pub(crate) struct RendererMetrics {
     pub(crate) expanded_vertex_bytes: u64,
     pub(crate) gx_frame_packet_bytes: u64,
     pub(crate) gx_frame_packet_payload_bytes: u64,
+    pub(crate) managed_coverage_draws: u64,
+    pub(crate) managed_coverage_triangles: u64,
     pub(crate) managed_early_depth_commands: u64,
     pub(crate) managed_early_depth_primitives: u64,
     pub(crate) present_xfb_calls: u64,
@@ -643,11 +645,11 @@ pub(crate) fn gx_efb_format(pixel_control: u32) -> GxEfbFormat {
     }
 }
 
-/// Raster-center evidence conservatively inferable from LZGX v3's BP43 state.
+/// Raster-center evidence conservatively inferable from LZGX's BP43 state.
 ///
 /// RGB565_Z16 is the EFB format associated with Flipper's three-sample AA, but
-/// the actual AA enable and sample locations live in BP0 and BP1..4, which v3
-/// does not transport. BP43 alone therefore cannot call that format
+/// the actual AA enable and sample locations live in BP0 and BP1..4, which the
+/// current packet does not transport. BP43 alone therefore cannot call it
 /// antialiased or unsupported; it only makes the raster-center state ambiguous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum GxRasterCenterEvidence {

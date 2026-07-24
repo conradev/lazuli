@@ -652,6 +652,35 @@ struct TevVertexOutput {
     @location(10) @interpolate(linear) depth24: f32,
 };
 
+struct ManagedCoverageVertexInput {
+    @location(0) position: vec4<f32>,
+    @location(1) raster0: vec4<f32>,
+    @location(2) raster1: vec4<f32>,
+    @location(3) stq0: vec3<f32>,
+    @location(4) stq1: vec3<f32>,
+    @location(5) stq2: vec3<f32>,
+    @location(6) stq3: vec3<f32>,
+    @location(7) stq4: vec3<f32>,
+    @location(8) stq5: vec3<f32>,
+    @location(11) coverage_xy01_28_4: vec4<i32>,
+    @location(12) coverage_xy2_28_4: vec2<i32>,
+};
+
+struct ManagedCoverageVertexOutput {
+    @invariant @builtin(position) position: vec4<f32>,
+    @location(0) raster0: vec4<f32>,
+    @location(1) raster1: vec4<f32>,
+    @location(2) stq0: vec3<f32>,
+    @location(3) stq1: vec3<f32>,
+    @location(4) stq2: vec3<f32>,
+    @location(5) stq3: vec3<f32>,
+    @location(6) stq4: vec3<f32>,
+    @location(7) stq5: vec3<f32>,
+    @location(10) @interpolate(linear) depth24: f32,
+    @location(11) @interpolate(flat) coverage_xy01_28_4: vec4<i32>,
+    @location(12) @interpolate(flat) coverage_xy2_28_4: vec2<i32>,
+};
+
 struct CanonicalDepthOutput {
     @builtin(frag_depth) depth: f32,
 };
@@ -739,6 +768,77 @@ fn vs_main(input: TevVertexInput) -> TevVertexOutput {
     output.stq7 = input.stq7;
     output.depth24 = input.position.z;
     return output;
+}
+
+@vertex
+fn vs_managed_coverage(
+    input: ManagedCoverageVertexInput,
+) -> ManagedCoverageVertexOutput {
+    var output: ManagedCoverageVertexOutput;
+    output.position = vec4<f32>(
+        (input.position.x / 320.0 - 1.0) * input.position.w,
+        (1.0 - input.position.y / 264.0) * input.position.w,
+        (input.position.z / 16777215.0) * input.position.w,
+        input.position.w,
+    );
+    output.raster0 = input.raster0;
+    output.raster1 = input.raster1;
+    output.stq0 = input.stq0;
+    output.stq1 = input.stq1;
+    output.stq2 = input.stq2;
+    output.stq3 = input.stq3;
+    output.stq4 = input.stq4;
+    output.stq5 = input.stq5;
+    output.depth24 = input.position.z;
+    output.coverage_xy01_28_4 = input.coverage_xy01_28_4;
+    output.coverage_xy2_28_4 = input.coverage_xy2_28_4;
+    return output;
+}
+
+fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOutput {
+    var output: TevVertexOutput;
+    output.position = input.position;
+    output.raster0 = input.raster0;
+    output.raster1 = input.raster1;
+    output.stq0 = input.stq0;
+    output.stq1 = input.stq1;
+    output.stq2 = input.stq2;
+    output.stq3 = input.stq3;
+    output.stq4 = input.stq4;
+    output.stq5 = input.stq5;
+    output.stq6 = vec3<f32>(0.0);
+    output.stq7 = vec3<f32>(0.0);
+    output.depth24 = input.depth24;
+    return output;
+}
+
+fn gx_managed_edge_covers(
+    a: vec2<i32>,
+    b: vec2<i32>,
+    sample_x_48: i32,
+    sample_y_48: i32,
+) -> bool {
+    // Match the CPU 28.4 model exactly. A GX 7/12 sample is 28/3 in
+    // 28.4 units, so E3 multiplies the complete edge equation by three.
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let constant = dy * a.x - dx * a.y;
+    let edge_3 = 3 * constant + dx * sample_y_48 - dy * sample_x_48;
+    let inclusive = dy < 0 || (dy == 0 && dx > 0);
+    return edge_3 > 0 || (inclusive && edge_3 == 0);
+}
+
+fn gx_managed_coverage_passes(input: ManagedCoverageVertexOutput) -> bool {
+    let pixel_x = i32(floor(input.position.x));
+    let pixel_y = i32(floor(input.position.y));
+    let sample_x_48 = pixel_x * 48 + 28;
+    let sample_y_48 = pixel_y * 48 + 28;
+    let point0 = input.coverage_xy01_28_4.xy;
+    let point1 = input.coverage_xy01_28_4.zw;
+    let point2 = input.coverage_xy2_28_4;
+    return gx_managed_edge_covers(point0, point1, sample_x_48, sample_y_48)
+        && gx_managed_edge_covers(point1, point2, sample_x_48, sample_y_48)
+        && gx_managed_edge_covers(point2, point0, sample_x_48, sample_y_48);
 }
 
 // Browser WebGPU cannot force early fragment tests. Early GX depth commits use
@@ -1296,6 +1396,34 @@ fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput {
     output.depth = gx_efb_depth_to_attachment(values.buffer_depth, depth_encoding);
     return output;
 }
+
+@fragment
+fn fs_managed_coverage_main(input: ManagedCoverageVertexOutput) -> TevFragmentOutput {
+    if !gx_managed_coverage_passes(input) {
+        discard;
+    }
+    let values = tev_fragment_values(managed_coverage_tev_input(input), false);
+    var output: TevFragmentOutput;
+    output.primary = values.primary;
+    output.secondary = values.secondary;
+    return output;
+}
+
+@fragment
+fn fs_managed_coverage_depth_main(
+    input: ManagedCoverageVertexOutput,
+) -> TevFragmentDepthOutput {
+    if !gx_managed_coverage_passes(input) {
+        discard;
+    }
+    let values = tev_fragment_values(managed_coverage_tev_input(input), true);
+    var output: TevFragmentDepthOutput;
+    output.primary = values.primary;
+    output.secondary = values.secondary;
+    let depth_encoding = (draw_state.fragment_flags >> 2u) & 7u;
+    output.depth = gx_efb_depth_to_attachment(values.buffer_depth, depth_encoding);
+    return output;
+}
 ";
 
 pub(crate) fn shader_source() -> String {
@@ -1730,6 +1858,70 @@ mod tests {
             shader.contains("values.primary = vec4<f32>(normalized_source.rgb, primary_alpha)")
         );
         assert!(shader.contains("values.secondary = normalized_source"));
+    }
+
+    #[test]
+    fn wgsl_managed_coverage_uses_exact_e3_and_leaves_native_entries_untouched() {
+        let shader = shader_source();
+        let native_interfaces_start = shader.find("struct TevVertexInput").unwrap();
+        let managed_interfaces_start = shader.find("struct ManagedCoverageVertexInput").unwrap();
+        let native_interfaces = &shader[native_interfaces_start..managed_interfaces_start];
+        assert!(!native_interfaces.contains("coverage_xy"));
+        assert!(shader.contains("@location(11) coverage_xy01_28_4: vec4<i32>"));
+        assert!(shader.contains("@location(12) coverage_xy2_28_4: vec2<i32>"));
+        assert!(shader.contains("@location(11) @interpolate(flat) coverage_xy01_28_4: vec4<i32>"));
+        assert!(shader.contains("@location(12) @interpolate(flat) coverage_xy2_28_4: vec2<i32>"));
+        assert!(shader.contains("input: ManagedCoverageVertexInput,"));
+        assert!(shader.contains(") -> ManagedCoverageVertexOutput"));
+        assert!(shader.contains("output.stq6 = vec3<f32>(0.0)"));
+        assert!(shader.contains("output.stq7 = vec3<f32>(0.0)"));
+
+        let native_vertex_start = shader
+            .find("@vertex\nfn vs_main(input: TevVertexInput)")
+            .unwrap();
+        let managed_vertex_start = shader[native_vertex_start..]
+            .find("@vertex\nfn vs_managed_coverage(")
+            .unwrap()
+            + native_vertex_start;
+        assert!(
+            !shader[native_vertex_start..managed_vertex_start].contains("coverage_xy"),
+            "the native vertex entry must retain its original interface",
+        );
+
+        let edge_start = shader.find("fn gx_managed_edge_covers(").unwrap();
+        let edge_end = shader[edge_start..]
+            .find("// Browser WebGPU cannot force early fragment tests.")
+            .unwrap()
+            + edge_start;
+        let coverage = &shader[edge_start..edge_end];
+        assert!(coverage.contains("let sample_x_48 = pixel_x * 48 + 28"));
+        assert!(coverage.contains("let sample_y_48 = pixel_y * 48 + 28"));
+        assert!(
+            coverage.contains("let edge_3 = 3 * constant + dx * sample_y_48 - dy * sample_x_48")
+        );
+        assert!(coverage.contains("let inclusive = dy < 0 || (dy == 0 && dx > 0)"));
+        assert!(coverage.contains("return edge_3 > 0 || (inclusive && edge_3 == 0)"));
+        assert!(!coverage.contains("0.583"));
+        assert!(!coverage.contains("0.5625"));
+
+        let native_start = shader
+            .find("@fragment\nfn fs_main(input: TevVertexOutput)")
+            .unwrap();
+        let managed_start = shader
+            .find("@fragment\nfn fs_managed_coverage_main(input: ManagedCoverageVertexOutput)")
+            .unwrap();
+        let native = &shader[native_start..managed_start];
+        assert!(!native.contains("gx_managed_coverage_passes"));
+
+        let managed = &shader[managed_start..];
+        let coverage_test = managed
+            .find("if !gx_managed_coverage_passes(input)")
+            .unwrap();
+        let tev = managed
+            .find("let values = tev_fragment_values(managed_coverage_tev_input(input), false)")
+            .unwrap();
+        assert!(coverage_test < tev);
+        assert!(managed.contains("fn fs_managed_coverage_depth_main"));
     }
 
     #[test]

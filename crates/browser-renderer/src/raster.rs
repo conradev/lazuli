@@ -43,8 +43,7 @@ impl std::error::Error for GxRasterError {}
 pub(crate) struct GxRasterCoord28_4(i32);
 
 impl GxRasterCoord28_4 {
-    #[cfg(test)]
-    const fn raw(self) -> i32 {
+    pub(crate) const fn raw(self) -> i32 {
         self.0
     }
 }
@@ -107,6 +106,10 @@ impl GxRasterPoint28_4 {
             x: gx_non_aa_raster_coord_28_4(x, scissor_offset_x)?,
             y: gx_non_aa_raster_coord_28_4(y, scissor_offset_y)?,
         })
+    }
+
+    pub(crate) const fn raw(self) -> [i32; 2] {
+        [self.x.raw(), self.y.raw()]
     }
 }
 

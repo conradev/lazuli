@@ -53,7 +53,7 @@ test("LZGX v3 Z-texture tail selects late operation depth within canonical GX de
   assert.match(pipeline, /unclipped_depth: key\.unclipped_depth/);
   assert.match(
     pipeline,
-    /entry_point: Some\(if key\.canonical_fragment_depth \{\s*"fs_depth_main"\s*\} else \{\s*"fs_main"/s,
+    /entry_point: Some\(match \(key\.managed_coverage, key\.canonical_fragment_depth\) \{\s*\(true, true\) => "fs_managed_coverage_depth_main",\s*\(true, false\) => "fs_managed_coverage_main",\s*\(false, true\) => "fs_depth_main",\s*\(false, false\) => "fs_main"/s,
   );
 
   const fragment = sourceSection(
