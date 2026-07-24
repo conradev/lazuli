@@ -1042,8 +1042,20 @@ const TEMPLATE: &str = r##"<!doctype html>
     let serialLastPublishedChannels = 0;
     let serialLastUpdatedChannels = 0;
     let serialLastEnabledChannels = 0;
+    const cpStatusHighWatermark = 0x0001;
+    const cpStatusLowWatermark = 0x0002;
     const cpStatusReadIdle = 0x0004;
     const cpStatusCommandIdle = 0x0008;
+    const cpStatusBreakpoint = 0x0010;
+    const cpControlReadEnable = 0x0001;
+    const cpControlBreakpointEnable = 0x0002;
+    const cpControlMask = 0x003f;
+    const cpControlLinkEnable = 0x0010;
+    const cpFifoAddressMask = 0x03ffffe0;
+    const cpFifoLowWordMask = 0xffe0;
+    const cpFifoHighWordMask = 0x03ff;
+    const piFifoEndMask = 0x07ffffe0;
+    const piFifoWrap = 0x20000000;
     const diBreakRequest = 0x00000001;
     const diInterruptMasks = 0x0000002a;
     const diInterruptStatuses = 0x00000054;
@@ -3908,6 +3920,23 @@ const TEMPLATE: &str = r##"<!doctype html>
     let firstDsi = null;
     let lastUnmappedAccess = null;
     let dataFastmemTranslationSignature = null;
+    const cpFifoState = {
+      control: 0,
+      base: 0,
+      end: 0,
+      highWatermark: 0,
+      lowWatermark: 0,
+      distance: 0,
+      writePointer: 0,
+      readPointer: 0,
+      breakpoint: 0,
+    };
+    const piFifoState = {
+      base: 0,
+      end: 0,
+      current: 0,
+      wrap: false,
+    };
     let lockedCacheReads = 0;
     let lockedCacheReadBytes = 0;
     let lockedCacheWrites = 0;
@@ -6794,19 +6823,221 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function resetFifoRegisterState() {
+      cpFifoState.control = 0;
+      cpFifoState.base = 0;
+      cpFifoState.end = 0;
+      cpFifoState.highWatermark = 0;
+      cpFifoState.lowWatermark = 0;
+      cpFifoState.distance = 0;
+      cpFifoState.writePointer = 0;
+      cpFifoState.readPointer = 0;
+      cpFifoState.breakpoint = 0;
+      piFifoState.base = 0;
+      piFifoState.end = 0;
+      piFifoState.current = 0;
+      piFifoState.wrap = false;
+    }
+
+    function resetCommandProcessorFifoFromPi() {
+      cpFifoState.control = cpControlLinkEnable;
+      cpFifoState.highWatermark = cpFifoAddressMask;
+      cpFifoState.lowWatermark = 0;
+    }
+
+    function commandProcessorBreakpointLevel() {
+      return (cpFifoState.control & cpControlBreakpointEnable) !== 0
+        && cpFifoState.readPointer === cpFifoState.breakpoint;
+    }
+
     function readCommandProcessorStatus() {
-      const idleMask = cpStatusReadIdle | cpStatusCommandIdle;
-      const pendingStagingBytes = view.getUint32(gxFifoStagingMeta, true);
-      const idle = pendingStagingBytes === 0 && gxFifoBufferedBytes() === 0;
-      const stored = view.getUint16(mmio, false) & ~idleMask;
-      return stored | (idle ? idleMask : 0);
+      // The browser command processor is synchronous for now, unlike the
+      // hardware's independently consuming GP. Guest-published distance is
+      // therefore the canonical empty/read-idle source. Later gather and GP
+      // routing must advance distance in lockstep with their write/read
+      // pointers (including wrap); pointer equality cannot distinguish empty
+      // from full and must never silently replace that invariant.
+      const empty = cpFifoState.distance === 0;
+      const breakpoint = commandProcessorBreakpointLevel();
+      const readEnabled = (cpFifoState.control & cpControlReadEnable) !== 0;
+      return (
+        (cpFifoState.distance > cpFifoState.highWatermark
+          ? cpStatusHighWatermark
+          : 0)
+        | (cpFifoState.distance < cpFifoState.lowWatermark
+          ? cpStatusLowWatermark
+          : 0)
+        | (empty ? cpStatusReadIdle : 0)
+        | (empty || !readEnabled || breakpoint ? cpStatusCommandIdle : 0)
+        | (breakpoint ? cpStatusBreakpoint : 0)
+      );
+    }
+
+    function commandProcessorPairValue(lowOffset) {
+      switch (lowOffset) {
+        case 0x20: return cpFifoState.base;
+        case 0x24: return cpFifoState.end;
+        case 0x28: return cpFifoState.highWatermark;
+        case 0x2c: return cpFifoState.lowWatermark;
+        case 0x30: return cpFifoState.distance;
+        case 0x34: return cpFifoState.writePointer;
+        case 0x38: return cpFifoState.readPointer;
+        case 0x3c: return cpFifoState.breakpoint;
+        default: return null;
+      }
+    }
+
+    function writeCommandProcessorPairValue(lowOffset, value) {
+      const masked = value & cpFifoAddressMask;
+      switch (lowOffset) {
+        case 0x20: cpFifoState.base = masked; break;
+        case 0x24: cpFifoState.end = masked; break;
+        case 0x28: cpFifoState.highWatermark = masked; break;
+        case 0x2c: cpFifoState.lowWatermark = masked; break;
+        case 0x30: cpFifoState.distance = masked; break;
+        case 0x34: cpFifoState.writePointer = masked; break;
+        case 0x38: cpFifoState.readPointer = masked; break;
+        case 0x3c: cpFifoState.breakpoint = masked; break;
+        default: return false;
+      }
+      return true;
+    }
+
+    function commandProcessorRegisterRangeOverlaps(physical, size) {
+      if (!Number.isInteger(physical) || !Number.isInteger(size) || size <= 0) {
+        return false;
+      }
+      const end = physical + size;
+      return (
+        physical < 0x0c000006 && end > 0x0c000000
+      ) || (
+        physical < 0x0c000040 && end > 0x0c000020
+      );
+    }
+
+    function readCommandProcessorRegister(physical, size) {
+      if (size !== 2 || physical < 0x0c000000 || physical > 0x0c00003e) {
+        return null;
+      }
+      const offset = physical - 0x0c000000;
+      if (offset === 0x00) return readCommandProcessorStatus();
+      if (offset === 0x02) return cpFifoState.control;
+      if (offset === 0x04) return 0;
+      if (offset < 0x20 || (offset & 1) !== 0) return null;
+      const lowOffset = offset & ~0x02;
+      const pair = commandProcessorPairValue(lowOffset);
+      if (pair === null) return null;
+      return (offset & 0x02) === 0
+        ? pair & 0xffff
+        : (pair >>> 16) & cpFifoHighWordMask;
+    }
+
+    function writeCommandProcessorRegister(physical, value, size) {
+      if (size !== 2 || physical < 0x0c000000 || physical > 0x0c00003e) {
+        return false;
+      }
+      const offset = physical - 0x0c000000;
+      if (offset === 0x00 || offset === 0x04) return true;
+      if (offset === 0x02) {
+        cpFifoState.control = value & cpControlMask;
+        return true;
+      }
+      if (offset < 0x20 || (offset & 1) !== 0) return false;
+      const lowOffset = offset & ~0x02;
+      const current = commandProcessorPairValue(lowOffset);
+      if (current === null) return false;
+      const next = (offset & 0x02) === 0
+        ? (current & 0x03ff0000) | (value & cpFifoLowWordMask)
+        : (current & 0x0000ffff) | ((value & cpFifoHighWordMask) << 16);
+      return writeCommandProcessorPairValue(lowOffset, next);
+    }
+
+    function readProcessorInterfaceFifoRegister(physical, size) {
+      if (size !== 4) return null;
+      switch (physical) {
+        case 0x0c00300c: return piFifoState.base;
+        case 0x0c003010: return piFifoState.end;
+        case 0x0c003014:
+          return (piFifoState.current | (piFifoState.wrap ? piFifoWrap : 0)) >>> 0;
+        case 0x0c003018: return 0;
+        default: return null;
+      }
+    }
+
+    function writeProcessorInterfaceFifoRegister(physical, value, size) {
+      if (size !== 4) return false;
+      const written = value >>> 0;
+      switch (physical) {
+        case 0x0c00300c:
+          piFifoState.base = written & cpFifoAddressMask;
+          return true;
+        case 0x0c003010:
+          piFifoState.end = written & piFifoEndMask;
+          return true;
+        case 0x0c003014:
+          piFifoState.current = written & cpFifoAddressMask;
+          piFifoState.wrap = (written & piFifoWrap) !== 0;
+          return true;
+        case 0x0c003018:
+          if ((written & 1) !== 0) resetCommandProcessorFifoFromPi();
+          return true;
+        default: return false;
+      }
+    }
+
+    function snapshotCommandProcessorFifo() {
+      return {
+        status: "0x" + readCommandProcessorStatus().toString(16).padStart(4, "0"),
+        control: "0x" + cpFifoState.control.toString(16).padStart(4, "0"),
+        base: hex32(cpFifoState.base),
+        end: hex32(cpFifoState.end),
+        highWatermark: hex32(cpFifoState.highWatermark),
+        lowWatermark: hex32(cpFifoState.lowWatermark),
+        distance: hex32(cpFifoState.distance),
+        writePointer: hex32(cpFifoState.writePointer),
+        readPointer: hex32(cpFifoState.readPointer),
+        breakpoint: hex32(cpFifoState.breakpoint),
+        breakpointLevel: commandProcessorBreakpointLevel(),
+      };
+    }
+
+    function snapshotProcessorInterfaceFifo() {
+      return {
+        base: hex32(piFifoState.base),
+        end: hex32(piFifoState.end),
+        current: hex32(piFifoState.current),
+        wrap: piFifoState.wrap,
+        currentRegister: hex32(
+          (piFifoState.current | (piFifoState.wrap ? piFifoWrap : 0)) >>> 0
+        ),
+      };
     }
 
     function readInteger(address, pointer, size) {
       const logical = address >>> 0;
       const physical = translateDataRange(logical, size, false);
-      if (physical === 0x0c000000 && size === 2) {
-        view.setUint16(pointer, readCommandProcessorStatus(), true);
+      if (
+        physical !== null
+        && physical < 0x0c000040
+        && physical + size > 0x0c000000
+        && commandProcessorRegisterRangeOverlaps(physical, size)
+      ) {
+        const commandProcessorValue = readCommandProcessorRegister(physical, size);
+        if (commandProcessorValue === null) return 0;
+        view.setUint16(pointer, commandProcessorValue, true);
+        return 1;
+      }
+      if (
+        physical !== null
+        && physical < 0x0c00301c
+        && physical + size > 0x0c00300c
+      ) {
+        const processorInterfaceFifoValue = readProcessorInterfaceFifoRegister(
+          physical,
+          size
+        );
+        if (processorInterfaceFifoValue === null) return 0;
+        view.setUint32(pointer, processorInterfaceFifoValue, true);
         return 1;
       }
       if (physical === 0x0c006c08 && size === 4) {
@@ -7315,6 +7546,21 @@ const TEMPLATE: &str = r##"<!doctype html>
     function writeInteger(address, value, size) {
       const logical = address >>> 0;
       const physical = translateDataRange(logical, size, true);
+      if (
+        physical !== null
+        && physical < 0x0c000040
+        && physical + size > 0x0c000000
+        && commandProcessorRegisterRangeOverlaps(physical, size)
+      ) {
+        return writeCommandProcessorRegister(physical, value, size) ? 1 : 0;
+      }
+      if (
+        physical !== null
+        && physical < 0x0c00301c
+        && physical + size > 0x0c00300c
+      ) {
+        return writeProcessorInterfaceFifoRegister(physical, value, size) ? 1 : 0;
+      }
       if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (size) {
           case 1: gxFifoScratch.setUint8(0, value); break;
@@ -9965,12 +10211,23 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
         mmioState: {
           commandProcessor: Object.fromEntries(
-            [0x0000, 0x0002, 0x0004, 0x0030, 0x0032, 0x0034, 0x0036, 0x0038, 0x003a]
+            [
+              0x0000, 0x0002, 0x0004,
+              0x0020, 0x0022, 0x0024, 0x0026,
+              0x0028, 0x002a, 0x002c, 0x002e,
+              0x0030, 0x0032, 0x0034, 0x0036,
+              0x0038, 0x003a, 0x003c, 0x003e,
+            ]
               .map(offset => [
                 "0x" + offset.toString(16).padStart(4, "0"),
-                "0x" + view.getUint16(mmio + offset, false).toString(16).padStart(4, "0"),
+                "0x" + readCommandProcessorRegister(
+                  0x0c000000 + offset,
+                  2
+                ).toString(16).padStart(4, "0"),
               ])
           ),
+          commandProcessorFifo: snapshotCommandProcessorFifo(),
+          processorInterfaceFifo: snapshotProcessorInterfaceFifo(),
           pixelEngine: Object.fromEntries(
             [0x100a, 0x100e].map(offset => [
               "0x" + offset.toString(16),
@@ -10191,6 +10448,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const blocks = new Map();
     try {
       bytes.fill(0, ram, ram + ramSize);
+      resetFifoRegisterState();
       bytes.fill(0, mmio, mmio + mmioSize);
       // PI cause bit 16 is the active-low physical reset button input. Games
       // treat a cleared bit as a held reset button and eventually call
