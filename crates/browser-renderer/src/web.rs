@@ -15,6 +15,7 @@ use wasm_bindgen_futures::future_to_promise;
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
+use crate::clip::gx_exact_draw_raster_geometry;
 use crate::packet::{GxCopyKind, GxCopyState, GxFramePacket, GxTriangleAction};
 use crate::raster::GxRasterAttributePlaneF32;
 use crate::tev::{
@@ -320,6 +321,44 @@ enum ManagedCoverageEvidence {
     #[default]
     None,
     TrustedPostCull,
+}
+
+/// Exact raster geometry prepared while a complete packet is still immutable.
+///
+/// Keeping both the triangle-list indices and raw-derived scissor here lets
+/// live submission select the exact path without topology expansion or legacy
+/// scissor reconstruction after the segment has begun.
+struct QualifiedExactDraw {
+    vertices: Vec<f32>,
+    expanded: Vec<usize>,
+    scissor: Option<ScissorRect>,
+}
+
+impl QualifiedExactDraw {
+    fn is_empty(&self) -> bool {
+        self.expanded.is_empty()
+    }
+}
+
+/// The three exact-input states must remain distinct. An exact draw that is
+/// not yet supported falls back to its original native geometry, but must not
+/// accidentally borrow legacy managed evidence intended for an absent input.
+enum PreparedExactDraw {
+    Unqualified,
+    Qualified(QualifiedExactDraw),
+}
+
+impl PreparedExactDraw {
+    fn qualified(&self) -> Option<&QualifiedExactDraw> {
+        match self {
+            Self::Unqualified => None,
+            Self::Qualified(exact) => Some(exact),
+        }
+    }
+
+    fn is_authoritative_empty(&self) -> bool {
+        self.qualified().is_some_and(QualifiedExactDraw::is_empty)
+    }
 }
 
 const DRAW_FRAGMENT_FLAG_RGBA6: u32 = 1;
@@ -1875,6 +1914,7 @@ impl WebGpuRenderer {
             None,
             texture_pixel_bytes,
             None,
+            None,
             z_mode,
             blend_mode,
             alpha_test,
@@ -1916,10 +1956,32 @@ impl WebGpuRenderer {
             .collect::<HashSet<_>>();
 
         self.ensure_healthy()?;
+        let mut source_vertices =
+            Vec::with_capacity(header.total_vertex_count as usize * TEV_VERTEX_FLOATS);
+        for draw in packet.draws() {
+            source_vertices.extend(draw.vertex_floats());
+        }
+        let prepared_exact_draws = packet
+            .draws()
+            .map(|draw| {
+                let vertex_start = draw.record.vertex_relative_offset as usize / size_of::<f32>();
+                let vertex_len = draw.record.vertex_count as usize * TEV_VERTEX_FLOATS;
+                prepare_exact_draw(
+                    draw,
+                    &source_vertices[vertex_start..vertex_start + vertex_len],
+                )
+            })
+            .collect::<Vec<_>>();
         // Resolve every required texture before beginning the segment. Packet
         // syntax is already validated above; this preflight also makes a
         // missing resident payload fail without leaving earlier draws queued.
-        for draw in packet.draws() {
+        for (draw, prepared_exact) in packet.draws().zip(&prepared_exact_draws) {
+            if prepared_exact
+                .as_ref()
+                .is_some_and(PreparedExactDraw::is_authoritative_empty)
+            {
+                continue;
+            }
             if gx_early_depth_plan(
                 draw.record.z_mode,
                 draw.record.blend_mode,
@@ -1966,11 +2028,6 @@ impl WebGpuRenderer {
                 .map_err(|error| JsValue::from_str(&error))?;
             }
         }
-        let mut source_vertices =
-            Vec::with_capacity(header.total_vertex_count as usize * TEV_VERTEX_FLOATS);
-        for draw in packet.draws() {
-            source_vertices.extend(draw.vertex_floats());
-        }
         drop(packet_parse_timer);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.submit_gx_frame_calls = metrics.submit_gx_frame_calls.saturating_add(1);
@@ -1989,7 +2046,7 @@ impl WebGpuRenderer {
         let gx_frame_execution_timer = self.host_phase_timer(RendererHostPhase::GxFrameExecution);
         let render = (|| {
             self.begin_segment_inner()?;
-            for draw in packet.draws() {
+            for (draw, prepared_exact) in packet.draws().zip(&prepared_exact_draws) {
                 let vertex_start = draw.record.vertex_relative_offset as usize / size_of::<f32>();
                 let vertex_len = draw.record.vertex_count as usize * TEV_VERTEX_FLOATS;
                 let draw_vertices = &source_vertices[vertex_start..vertex_start + vertex_len];
@@ -2029,6 +2086,7 @@ impl WebGpuRenderer {
                     Some(&packet_texture_keys),
                     0,
                     draw.record.post_cull_actions.as_deref(),
+                    prepared_exact.as_ref(),
                     draw.record.z_mode,
                     draw.record.blend_mode,
                     draw.record.alpha_test,
@@ -2103,6 +2161,7 @@ impl WebGpuRenderer {
         packet_protected_keys: Option<&HashSet<&str>>,
         transport_texture_pixel_bytes: usize,
         managed_coverage_actions: Option<&[GxTriangleAction]>,
+        prepared_exact: Option<&PreparedExactDraw>,
         z_mode: u32,
         blend_mode: u32,
         alpha_test: u32,
@@ -2162,9 +2221,16 @@ impl WebGpuRenderer {
             _ => Primitive::Triangles,
         };
         let raster_position_correction = browser_raster_position_correction(pixel_control);
+        let qualified_exact = prepared_exact.and_then(PreparedExactDraw::qualified);
+        if qualified_exact.is_some_and(QualifiedExactDraw::is_empty) {
+            // Exact clipping/culling and raw scissor qualification prove that
+            // this draw contributes no fragments. Do not let legacy projected
+            // geometry or scissor state resurrect it.
+            return Ok(());
+        }
+        let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
         let depth_encoding = draw_depth_encoding(z_mode, pixel_control)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
         if early_depth == GxEarlyDepthPlan::DepthOnly {
             let Some(scissor) =
                 clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
@@ -2219,37 +2285,76 @@ impl WebGpuRenderer {
         )
         .color_pipeline_for_early_depth(early_depth);
         let source_cull = pipeline.cull;
-        let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
-        else {
-            return Ok(());
-        };
-        let managed_expanded = (source_cull != CullMode::All
-            && managed_coverage_actions.is_some()
-            && primitive == Primitive::Triangles
-            && gx_raster_center_evidence(pixel_control)
-                == GxRasterCenterEvidence::KnownNonAntialiased
-            && early_depth == GxEarlyDepthPlan::FixedFunction
-            && fog == GxFogState::default()
-            && z_texture.operation == GxZTextureOperation::Disabled)
-            .then(|| managed_post_cull_indices(&expanded, managed_coverage_actions))
-            .flatten();
-        let managed_coverage = managed_expanded.as_deref().is_some_and(|post_cull| {
-            managed_coverage_draw_is_safe(
-                ManagedCoverageEvidence::TrustedPostCull,
-                primitive,
-                gx_raster_center_evidence(pixel_control),
-                early_depth,
-                required_maps,
-                required_coords,
-                sampler_modes,
-                sampler_identities,
-                fog,
-                z_texture,
-                source_vertices,
-                post_cull,
-                scissor,
-            )
+        let native_scissor = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height);
+        let raster_center = gx_raster_center_evidence(pixel_control);
+        let exact_managed = qualified_exact.filter(|exact| {
+            let Some(scissor) = exact.scissor else {
+                return false;
+            };
+            source_cull != CullMode::All
+                && managed_coverage_draw_is_safe(
+                    ManagedCoverageEvidence::TrustedPostCull,
+                    primitive,
+                    raster_center,
+                    early_depth,
+                    required_maps,
+                    required_coords,
+                    sampler_modes,
+                    sampler_identities,
+                    fog,
+                    z_texture,
+                    &exact.vertices,
+                    &exact.expanded,
+                    scissor,
+                )
         });
+        let managed_expanded = prepared_exact
+            .is_none()
+            .then(|| {
+                let scissor = native_scissor?;
+                let post_cull = (source_cull != CullMode::All
+                    && managed_coverage_actions.is_some()
+                    && primitive == Primitive::Triangles
+                    && raster_center == GxRasterCenterEvidence::KnownNonAntialiased
+                    && early_depth == GxEarlyDepthPlan::FixedFunction
+                    && fog == GxFogState::default()
+                    && z_texture.operation == GxZTextureOperation::Disabled)
+                    .then(|| managed_post_cull_indices(&expanded, managed_coverage_actions))
+                    .flatten()?;
+                managed_coverage_draw_is_safe(
+                    ManagedCoverageEvidence::TrustedPostCull,
+                    primitive,
+                    raster_center,
+                    early_depth,
+                    required_maps,
+                    required_coords,
+                    sampler_modes,
+                    sampler_identities,
+                    fog,
+                    z_texture,
+                    source_vertices,
+                    &post_cull,
+                    scissor,
+                )
+                .then_some(post_cull)
+            })
+            .flatten();
+        let managed_evidence = if exact_managed.is_some() || managed_expanded.is_some() {
+            ManagedCoverageEvidence::TrustedPostCull
+        } else {
+            ManagedCoverageEvidence::None
+        };
+        let managed_coverage = managed_evidence != ManagedCoverageEvidence::None;
+        let scissor = if let Some(exact) = exact_managed {
+            exact
+                .scissor
+                .expect("nonempty exact geometry has a raw-derived scissor")
+        } else {
+            let Some(scissor) = native_scissor else {
+                return Ok(());
+            };
+            scissor
+        };
         if managed_coverage {
             pipeline = pipeline.with_managed_coverage();
         }
@@ -2440,22 +2545,23 @@ impl WebGpuRenderer {
             binding,
         };
         drop(resource_preparation_timer);
-        let draw_expanded = if managed_coverage {
-            managed_expanded
-                .as_deref()
-                .expect("qualified managed draw has post-cull evidence")
-        } else {
-            &expanded
-        };
+        let (draw_vertices, draw_expanded, raster_position_correction) =
+            if let Some(exact) = exact_managed {
+                (exact.vertices.as_slice(), exact.expanded.as_slice(), 0.0)
+            } else if let Some(post_cull) = managed_expanded.as_deref() {
+                (source_vertices, post_cull, 0.0)
+            } else {
+                (
+                    source_vertices,
+                    expanded.as_slice(),
+                    raster_position_correction,
+                )
+            };
         self.push_expanded_draw(
-            source_vertices,
+            draw_vertices,
             draw_expanded,
             raster_position_correction,
-            if managed_coverage {
-                ManagedCoverageEvidence::TrustedPostCull
-            } else {
-                ManagedCoverageEvidence::None
-            },
+            managed_evidence,
             managed_coverage_texture_coord(required_coords).flatten(),
             state,
         )
@@ -4474,6 +4580,33 @@ fn clipped_scissor(x: u32, y: u32, width: u32, height: u32) -> Option<ScissorRec
         width,
         height,
     })
+}
+
+fn prepare_exact_draw(
+    draw: crate::packet::GxDraw<'_>,
+    source_vertices: &[f32],
+) -> Option<PreparedExactDraw> {
+    draw.exact_clip_input?;
+    let Ok(geometry) = gx_exact_draw_raster_geometry(draw, source_vertices) else {
+        return Some(PreparedExactDraw::Unqualified);
+    };
+    debug_assert_eq!(geometry.triangle_count(), geometry.source_indices().len());
+    let expanded = (0..geometry.triangle_count() * 3).collect::<Vec<_>>();
+    let [left, top, right, bottom] = geometry.scissor_rect().map(u32::from);
+    let scissor = (left < right && top < bottom).then_some(ScissorRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    });
+    if !expanded.is_empty() && scissor.is_none() {
+        return Some(PreparedExactDraw::Unqualified);
+    }
+    Some(PreparedExactDraw::Qualified(QualifiedExactDraw {
+        vertices: geometry.into_vertices(),
+        expanded,
+        scissor,
+    }))
 }
 
 fn expanded_indices(topology: u8, count: usize) -> Option<Vec<usize>> {

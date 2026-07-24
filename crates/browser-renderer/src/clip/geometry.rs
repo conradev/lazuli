@@ -107,6 +107,10 @@ impl GxExactRasterGeometry {
         &self.vertices
     }
 
+    pub(crate) fn into_vertices(self) -> Vec<f32> {
+        self.vertices
+    }
+
     pub(crate) fn triangle_count(&self) -> usize {
         self.vertices.len() / (TEV_VERTEX_FLOATS * 3)
     }
