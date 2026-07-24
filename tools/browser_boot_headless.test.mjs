@@ -500,6 +500,7 @@ test("completed-run evidence validators fail independently and aggregate", () =>
       calls.push("selected");
       throw new Error("selected failed");
     },
+    verifyScenarioSustainedPlay() { calls.push("sustained"); },
   });
   vm.runInContext([
     extractFunction("collectVerificationFailures"),
@@ -519,6 +520,7 @@ test("completed-run evidence validators fail independently and aggregate", () =>
     "backend",
     "selected",
     "surface",
+    "sustained",
     "compositor",
   ]);
   assert.deepEqual(report.headlessCapture.compositor.oracle, { derived: true });
@@ -713,6 +715,10 @@ test("SMB headless captures delegate temporal XFB verification", () => {
   );
   assert.match(
     source,
+    /import \{ verifySmbSustainedPlay \} from "\.\/browser_boot_smb_sustained_play\.mjs"/,
+  );
+  assert.match(
+    source,
     /verifySmbTemporalSelectedXfb\(rendering\.temporalSelectedXfb\)/,
   );
   assert.match(
@@ -722,27 +728,41 @@ test("SMB headless captures delegate temporal XFB verification", () => {
   const completed = extractFunction("verifyCompletedRunEvidence");
   assert.match(completed, /verifyScenarioSelectedXfb\(report, options\)/);
   assert.match(completed, /verifyScenarioPresentedSurfaces\(report, options\)/);
+  assert.match(completed, /verifyScenarioSustainedPlay\(report, options\)/);
   assert.doesNotMatch(source, /distinctGenerations >= 2/);
   assert.doesNotMatch(source, /selected\.rgb\.unique > 1/);
   assert.doesNotMatch(source, /selected\.rgb\.other > 0/);
 });
 
-test("SMB headless captures attach a canonical gameplay transcript", () => {
+test("SMB headless captures attach the canonical ready-play gameplay transcript", () => {
   assert.match(
     source,
     /import \{\s*deriveSmbReadyPlayGameplayTranscript,?\s*\} from "\.\/browser_boot_gameplay_transcript\.mjs"/,
   );
   const marker = Symbol("gameplay-transcript");
+  const sources = [];
   const context = vm.createContext({
     deriveSmbReadyPlayGameplayTranscript(report) {
       assert.equal(report.status, "paused");
+      sources.push(report);
       return marker;
     },
   });
   vm.runInContext(extractFunction("attachScenarioGameplayTranscript"), context);
-  const report = { status: "paused" };
-  context.attachScenarioGameplayTranscript(report, { scenario: "warioware-ready" });
-  assert.equal(Object.hasOwn(report, "gameplayTranscript"), false);
-  context.attachScenarioGameplayTranscript(report, { scenario: "smb-ready-play" });
-  assert.strictEqual(report.gameplayTranscript, marker);
+  const unrelated = { status: "paused" };
+  context.attachScenarioGameplayTranscript(unrelated, { scenario: "warioware-ready" });
+  assert.equal(Object.hasOwn(unrelated, "gameplayTranscript"), false);
+
+  const ready = { status: "paused" };
+  context.attachScenarioGameplayTranscript(ready, { scenario: "smb-ready-play" });
+  assert.strictEqual(ready.gameplayTranscript, marker);
+  assert.strictEqual(sources.at(-1), ready);
+
+  const anchor = { status: "paused" };
+  const sustained = { status: "paused", sustainedPlay: { readyPlayAnchor: anchor } };
+  context.attachScenarioGameplayTranscript(sustained, {
+    scenario: "smb-sustained-play",
+  });
+  assert.strictEqual(sustained.gameplayTranscript, marker);
+  assert.strictEqual(sources.at(-1), anchor);
 });

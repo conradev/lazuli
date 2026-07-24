@@ -34,6 +34,7 @@ import {
 } from "./browser_boot_headless_compositor_oracle.mjs";
 import { verifySmbTemporalPresentedSurfaces } from "./browser_boot_temporal_surface.mjs";
 import { verifySmbTemporalSelectedXfb } from "./browser_boot_temporal_xfb.mjs";
+import { verifySmbSustainedPlay } from "./browser_boot_smb_sustained_play.mjs";
 
 const COMPOSITOR_CAPTURE_MAX_POLL_MS = 1_000;
 
@@ -626,12 +627,21 @@ function verifyScenarioReport(report, options) {
 }
 
 function attachScenarioGameplayTranscript(report, options) {
-  if (options.scenario !== "smb-ready-play") return;
-  report.gameplayTranscript = deriveSmbReadyPlayGameplayTranscript(report);
+  const source = options.scenario === "smb-ready-play"
+    ? report
+    : options.scenario === "smb-sustained-play"
+      ? report.sustainedPlay?.readyPlayAnchor
+      : null;
+  if (source === null) return;
+  report.gameplayTranscript = deriveSmbReadyPlayGameplayTranscript(source);
+}
+
+function isSmbTemporalScenario(scenario) {
+  return scenario === "smb-ready-play" || scenario === "smb-sustained-play";
 }
 
 function verifyScenarioRenderingBackend(report, options) {
-  if (options.scenario !== "smb-ready-play") return;
+  if (!isSmbTemporalScenario(options.scenario)) return;
   const rendering = report.rendering;
   if (rendering?.backend !== "wgpu-webgpu") {
     throw new Error(
@@ -641,15 +651,20 @@ function verifyScenarioRenderingBackend(report, options) {
 }
 
 function verifyScenarioSelectedXfb(report, options) {
-  if (options.scenario !== "smb-ready-play") return;
+  if (!isSmbTemporalScenario(options.scenario)) return;
   const rendering = report.rendering;
   verifySmbTemporalSelectedXfb(rendering.temporalSelectedXfb);
 }
 
 function verifyScenarioPresentedSurfaces(report, options) {
-  if (options.scenario !== "smb-ready-play") return;
+  if (!isSmbTemporalScenario(options.scenario)) return;
   const rendering = report.rendering;
   verifySmbTemporalPresentedSurfaces(rendering.temporalSelectedXfb);
+}
+
+function verifyScenarioSustainedPlay(report, options) {
+  if (options.scenario !== "smb-sustained-play") return;
+  verifySmbSustainedPlay(report);
 }
 
 function collectVerificationFailures(verifications) {
@@ -681,6 +696,7 @@ function verifyCompletedRunEvidence(report, options) {
     () => verifyScenarioRenderingBackend(report, options),
     () => verifyScenarioSelectedXfb(report, options),
     () => verifyScenarioPresentedSurfaces(report, options),
+    () => verifyScenarioSustainedPlay(report, options),
     () => verifyCompositorCaptureReport(report, options),
   ]));
 }
