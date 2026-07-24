@@ -13219,7 +13219,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         "rowRepeat",
       ].every(name => left?.[name] === right?.[name]);
     }
-    async function readSelectedXfb() {
+    async function readSelectedXfb(includePresentationSerial = false) {
       if (!webGpuRenderer.has_presented_xfb()) return null;
       const capture = await webGpuRenderer.read_presented_xfb_rgba();
       const rgba = capture.rgba instanceof Uint8Array
@@ -13232,7 +13232,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         sha256Hex(rgba),
         sha256Hex(presentedXfbRgbBytes(rgba, width, height)),
       ]);
-      return {
+      const result = {
         address: "0x" + Number(capture.address).toString(16).padStart(8, "0"),
         generation: Number(capture.generation),
         row: Number(capture.row),
@@ -13257,6 +13257,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         rgbSha256,
         rgb,
       };
+      if (includePresentationSerial) {
+        const presentationSerial = Number(capture.presentationSerial);
+        if (!Number.isSafeInteger(presentationSerial) || presentationSerial < 1) {
+          throw new Error("selected WebGPU XFB presentation serial is invalid");
+        }
+        result.presentationSerial = presentationSerial;
+      }
+      return result;
     }
     async function readPresentedSurface() {
       if (!webGpuRenderer.has_presented_surface()) return null;
@@ -13364,19 +13372,31 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       const scanout = viScanoutProvenance({ ...frame, row: copyRow });
       const [selectedXfb, presentedSurface] = await Promise.all([
-        readSelectedXfb(),
+        readSelectedXfb(true),
         readPresentedSurface(),
       ]);
       if (presentedSurface === null) {
         throw new Error("requested WebGPU presented-surface capture is unavailable");
       }
+      const presentationAddress = "0x" + address.toString(16).padStart(8, "0");
       if (
         selectedXfb === null
+        || selectedXfb.presentationSerial !== presentedSurface.presentationSerial
+        || selectedXfb.address !== presentationAddress
+        || selectedXfb.address !== presentedSurface.address
+        || selectedXfb.generation !== copyIndex
+        || selectedXfb.generation !== presentedSurface.generation
+        || selectedXfb.row !== copyRow
+        || selectedXfb.row !== presentedSurface.row
         || !viScanoutProvenanceEqual(scanout, selectedXfb)
         || !viScanoutProvenanceEqual(scanout, presentedSurface)
       ) {
-        throw new Error("captured WebGPU scanout provenance does not match presentation");
+        throw new Error("captured WebGPU presentation identity does not match");
       }
+      const {
+        presentationSerial: _selectedPresentationSerial,
+        ...selectedXfbEvidence
+      } = selectedXfb;
       const capture = {
         scenario: request.scenario,
         step: request.step,
@@ -13385,7 +13405,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         presentation: {
           selected: Boolean(presented),
           field: frame.field,
-          address: "0x" + address.toString(16).padStart(8, "0"),
+          address: presentationAddress,
           copyIndex,
           copyRow,
           width,
@@ -13397,7 +13417,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           nonInterlaced,
           ...scanout,
         },
-        selectedXfb,
+        selectedXfb: selectedXfbEvidence,
         presentedSurface,
       };
       frames.push(capture);

@@ -97,6 +97,7 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
     0, 0, 0, 255,
     12, 34, 56, 255,
   ]);
+  let rawPresentationSerial = 12;
   const context = evaluate(
     [
       "appendRendererOperation",
@@ -116,6 +117,7 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
             address: 0x01200500,
             generation: 7,
             row: 1,
+            presentationSerial: rawPresentationSerial,
             format: "rgba8unorm",
             layout: "top-left-row-major-tight",
             sourceRow: 1,
@@ -159,6 +161,16 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
     unique: 2,
   });
   assert.equal("rgba" in capture, false);
+  assert.equal("presentationSerial" in capture, false);
+  const pairedCapture = await context.readSelectedXfb(true);
+  assert.equal(pairedCapture.presentationSerial, 12);
+  for (const invalid of [undefined, 0, Number.MAX_SAFE_INTEGER + 1]) {
+    rawPresentationSerial = invalid;
+    await assert.rejects(
+      context.readSelectedXfb(true),
+      /presentation serial is invalid/,
+    );
+  }
 });
 
 test("selected XFB capture reports no image after a renderer reset", async () => {
@@ -255,6 +267,7 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     address: "0x01200500",
     generation: 71,
     row: 1,
+    presentationSerial: 90,
     width: 640,
     height: 448,
     rgbaSha256: "abc",
@@ -265,6 +278,8 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
     ...scanout,
     rgb: { black: 0, white: 0, other: 286_720, unique: 4096 },
   };
+  const selectedXfbEvidence = { ...selectedXfb };
+  delete selectedXfbEvidence.presentationSerial;
   const presentedSurface = {
     address: "0x01200500",
     generation: 71,
@@ -286,7 +301,8 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
   ], {
     temporalSelectedXfbCapacity: 8,
     temporalSelectedXfbFrames: [],
-    async readSelectedXfb() {
+    async readSelectedXfb(includePresentationSerial) {
+      assert.equal(includePresentationSerial, true);
       selectedReads += 1;
       return selectedXfb;
     },
@@ -343,10 +359,18 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
       nonInterlaced: false,
       ...scanout,
     },
-    selectedXfb,
+    selectedXfb: selectedXfbEvidence,
     presentedSurface,
   });
-  assert.strictEqual(context.temporalSelectedXfbFrames[0].selectedXfb, selectedXfb);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.temporalSelectedXfbFrames[0].selectedXfb)),
+    selectedXfbEvidence,
+  );
+  assert.notStrictEqual(context.temporalSelectedXfbFrames[0].selectedXfb, selectedXfb);
+  assert.equal(
+    "presentationSerial" in context.temporalSelectedXfbFrames[0].selectedXfb,
+    false,
+  );
   assert.strictEqual(
     context.temporalSelectedXfbFrames[0].presentedSurface,
     presentedSurface,
@@ -393,6 +417,32 @@ test("temporal selected XFB capture preserves ordered presentation provenance", 
   );
   assert.equal(selectedReads, 1, "invalid VI dimensions must fail before another readback");
   assert.equal(surfaceReads, 1, "invalid VI dimensions must fail before another readback");
+
+  const mismatches = [
+    ["presentationSerial", 91],
+    ["address", "0x01200504"],
+    ["generation", 72],
+    ["row", 0],
+  ];
+  for (const [field, invalid] of mismatches) {
+    const prior = selectedXfb[field];
+    selectedXfb[field] = invalid;
+    await assert.rejects(
+      context.captureTemporalSelectedXfb({
+        ...message,
+        rendererSequence: 45,
+        frame: {
+          ...message.frame,
+          temporalXfbCapture: { ...message.frame.temporalXfbCapture, ordinal: 2 },
+        },
+      }, true),
+      /presentation identity does not match/,
+    );
+    selectedXfb[field] = prior;
+  }
+  assert.equal(selectedReads, 1 + mismatches.length);
+  assert.equal(surfaceReads, 1 + mismatches.length);
+  assert.equal(context.temporalSelectedXfbFrames.length, 1);
 });
 
 test("temporal surface capture fails before renderer acknowledgement when unavailable", async () => {
@@ -453,16 +503,32 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
   const browserPresent = present.indexOf("output.present()", submit);
   assert.ok(allocation > present.indexOf("capture_plan.map"));
   assert.ok(allocation < copy && copy < submit && submit < browserPresent);
-  assert.ok(
-    present.indexOf("self.last_presented_surface = None")
-      < present.indexOf("if selected_address == 0"),
-    "every attempted presentation clears stale surface evidence",
-  );
+  const firstRejectedPresentation = present.indexOf("if selected_address == 0");
+  for (const field of ["last_presented_xfb", "last_presented_surface"]) {
+    assert.ok(
+      present.indexOf(`self.${field} = None`) < firstRejectedPresentation,
+      `every attempted presentation clears stale ${field} evidence`,
+    );
+  }
   const resetStart = rendererSource.indexOf("pub fn reset(&mut self)");
   const resetEnd = rendererSource.indexOf("pub fn reset_diagnostics", resetStart);
+  const reset = rendererSource.slice(resetStart, resetEnd);
+  for (const field of ["last_presented_xfb", "last_presented_surface"]) {
+    assert.ok(
+      reset.indexOf(`self.${field} = None`) < reset.indexOf("self.ensure_healthy()?"),
+      `reset must clear stale ${field} evidence before its fallible health check`,
+    );
+  }
   assert.match(
-    rendererSource.slice(resetStart, resetEnd),
-    /self\.last_presented_surface = None/,
+    present,
+    /last_presented_xfb = Some\(PresentedXfb \{[\s\S]*presentation_serial: next_presentation_serial/,
+    "the selected XFB and swapchain capture must share one presentation serial",
+  );
+  const selectedReadStart = rendererSource.indexOf("pub fn read_presented_xfb_rgba");
+  const selectedReadEnd = rendererSource.indexOf("pub fn has_presented_surface", selectedReadStart);
+  assert.match(
+    rendererSource.slice(selectedReadStart, selectedReadEnd),
+    /"presentationSerial"[\s\S]*presented\.presentation_serial/,
   );
   assert.match(source, /frame\.temporalXfbCapture !== undefined\s*\)\s*,/);
 });

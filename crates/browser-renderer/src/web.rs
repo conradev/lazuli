@@ -489,6 +489,7 @@ struct CachedXfb {
 struct PresentedXfb {
     surface_id: u64,
     texture: wgpu::Texture,
+    presentation_serial: u64,
     selected_address: u32,
     generation: u32,
     scanout: XfbScanoutPlan,
@@ -874,14 +875,15 @@ impl WebGpuRenderer {
 
     pub fn reset(&mut self) -> Result<(), JsValue> {
         self.record_wasm_bridge_call(0);
+        // A failed reset must never leave a previously presented frame observable.
+        self.last_presented_xfb = None;
+        self.last_presented_surface = None;
+        self.presentation_serial = 0;
         self.ensure_healthy()?;
         self.clear_segment();
         self.texture_cache.clear();
         self.efb_copy_cache.clear();
         self.xfb_cache.clear();
-        self.last_presented_xfb = None;
-        self.last_presented_surface = None;
-        self.presentation_serial = 0;
         self.reset_efb_inner()
     }
 
@@ -1217,6 +1219,11 @@ impl WebGpuRenderer {
                     &JsValue::from_f64(f64::from(value)),
                 )?;
             }
+            Reflect::set(
+                &result,
+                &JsValue::from_str("presentationSerial"),
+                &JsValue::from_f64(presented.presentation_serial as f64),
+            )?;
             Reflect::set(
                 &result,
                 &JsValue::from_str("scanoutPolicy"),
@@ -2416,6 +2423,7 @@ impl WebGpuRenderer {
         self.last_presented_xfb = Some(PresentedXfb {
             surface_id: surface.id,
             texture: surface.texture,
+            presentation_serial: next_presentation_serial,
             selected_address,
             generation: metadata.generation,
             scanout,
