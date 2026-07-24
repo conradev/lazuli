@@ -22,19 +22,20 @@ use crate::tev::{
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
-    GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDestinationAlphaState, GxEfbFormat,
-    GxXfbCopyParameters, RendererFailureState, RendererHostTimings, RendererMetrics,
-    RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
+    GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDepthCompareLocation,
+    GxDestinationAlphaState, GxEfbFormat, GxXfbCopyParameters, GxZTextureFormat,
+    GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
+    RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
     SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor,
     ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField,
     ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
     compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
     gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float, gx_destination_alpha_state,
-    gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height, merge_contiguous_draw_range,
-    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
-    rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
-    xfb_scanout_plan, xfb_surface_extent_matches,
+    gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state,
+    merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
+    reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection,
+    xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -274,7 +275,8 @@ struct TevVertex {
 const _: () = assert!(std::mem::size_of::<TevVertex>() == TEV_VERTEX_FLOATS * size_of::<f32>());
 
 const DRAW_FRAGMENT_FLAG_RGBA6: u32 = 1;
-const REQUIRED_WEBGPU_FEATURES: wgpu::Features = wgpu::Features::DUAL_SOURCE_BLENDING;
+const REQUIRED_WEBGPU_FEATURES: wgpu::Features =
+    wgpu::Features::DUAL_SOURCE_BLENDING.union(wgpu::Features::DEPTH_CLIP_CONTROL);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Pod, Zeroable)]
@@ -282,13 +284,27 @@ struct DrawUniform {
     alpha_test: u32,
     destination_alpha: u32,
     fragment_flags: u32,
-    _padding: u32,
+    z_texture: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<DrawUniform>() == 16);
 
 impl DrawUniform {
-    fn from_gx(alpha_test: u32, destination_alpha: GxDestinationAlphaState) -> Self {
+    fn from_gx(
+        alpha_test: u32,
+        destination_alpha: GxDestinationAlphaState,
+        z_texture: GxZTextureState,
+    ) -> Self {
+        let format = match z_texture.format {
+            GxZTextureFormat::U8 => 0,
+            GxZTextureFormat::U16 => 1,
+            GxZTextureFormat::U24 => 2,
+        };
+        let operation = match z_texture.operation {
+            GxZTextureOperation::Disabled => 0,
+            GxZTextureOperation::Add => 1,
+            GxZTextureOperation::Replace => 2,
+        };
         Self {
             alpha_test: alpha_test & 0x00ff_ffff,
             destination_alpha: u32::from(destination_alpha.effective_constant),
@@ -297,7 +313,7 @@ impl DrawUniform {
             } else {
                 0
             },
-            _padding: 0,
+            z_texture: (z_texture.bias & GX_DEPTH24_MAX) | (format << 24) | (operation << 26),
         }
     }
 }
@@ -473,6 +489,7 @@ struct PipelineKey {
     cull: CullMode,
     depth: DepthPipelineState,
     blend: BlendPipelineState,
+    late_fragment_depth: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1729,6 +1746,8 @@ impl WebGpuRenderer {
             alpha_test,
             0,
             0,
+            0,
+            0,
             cull_mode,
             scissor_x,
             scissor_y,
@@ -1867,6 +1886,8 @@ impl WebGpuRenderer {
                     draw.record.alpha_test,
                     draw.record.fragment_tail.pixel_control,
                     draw.record.fragment_tail.constant_alpha,
+                    draw.record.fragment_tail.z_texture_bias,
+                    draw.record.fragment_tail.z_texture_mode,
                     draw.record.cull_mode,
                     draw.record.scissor_x,
                     draw.record.scissor_y,
@@ -1934,6 +1955,8 @@ impl WebGpuRenderer {
         alpha_test: u32,
         pixel_control: u32,
         constant_alpha: u32,
+        z_texture_bias: u32,
+        z_texture_mode: u32,
         cull_mode: u8,
         scissor_x: u32,
         scissor_y: u32,
@@ -1955,6 +1978,8 @@ impl WebGpuRenderer {
         .map_err(|error| JsValue::from_str(&error))?;
         let required_maps =
             required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
+        let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let expanded = expanded_indices(topology, vertex_count)
             .ok_or_else(|| JsValue::from_str("unsupported GX primitive topology"))?;
         let expanded_vertex_bytes = expanded
@@ -1985,9 +2010,15 @@ impl WebGpuRenderer {
         };
         let destination_alpha =
             gx_destination_alpha_state(blend_mode, constant_alpha, pixel_control);
-        let pipeline =
-            PipelineKey::from_gx(primitive, z_mode, blend_mode, destination_alpha, cull_mode);
-        let draw_uniform = DrawUniform::from_gx(alpha_test, destination_alpha);
+        let pipeline = PipelineKey::from_gx(
+            primitive,
+            z_mode,
+            blend_mode,
+            destination_alpha,
+            z_texture,
+            cull_mode,
+        );
+        let draw_uniform = DrawUniform::from_gx(alpha_test, destination_alpha, z_texture);
         let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
         else {
             return Ok(());
@@ -2986,7 +3017,7 @@ impl WebGpuRenderer {
         let required_features = REQUIRED_WEBGPU_FEATURES;
         if !adapter.features().contains(required_features) {
             return Err(
-                "WebGPU dual-source blending is required for exact GX destination alpha; this adapter exposes no compatible feature and Lazuli has no rendering fallback"
+                "WebGPU dual-source blending and depth clip control are required for exact GX destination alpha and Z-texture depth; this adapter exposes no compatible feature set and Lazuli has no rendering fallback"
                     .to_owned(),
             );
         }
@@ -3002,7 +3033,7 @@ impl WebGpuRenderer {
             .await
             .map_err(|error| {
                 format!(
-                    "failed to create required dual-source-blending WebGPU device; exact GX destination alpha has no fallback: {error}"
+                    "failed to create the required dual-source-blending and depth-clip-control WebGPU device; exact GX destination alpha and Z-texture depth have no fallback: {error}"
                 )
             })?;
         let failure_state = RendererFailureState::default();
@@ -3410,6 +3441,7 @@ impl PipelineKey {
         z_mode: u32,
         blend_mode: u32,
         destination_alpha: GxDestinationAlphaState,
+        z_texture: GxZTextureState,
         cull_mode: u8,
     ) -> Self {
         let depth_enabled = z_mode & 1 != 0;
@@ -3454,6 +3486,9 @@ impl PipelineKey {
                 color_write: blend.color_write,
                 alpha_write: blend.alpha_write && destination_alpha.target_has_guest_alpha,
             },
+            late_fragment_depth: depth_enabled
+                && z_texture.operation != GxZTextureOperation::Disabled
+                && z_texture.depth_compare_location == GxDepthCompareLocation::Late,
         }
     }
 }
@@ -3789,7 +3824,7 @@ fn create_tev_geometry_pipeline(
             strip_index_format: None,
             front_face: wgpu::FrontFace::Cw,
             cull_mode,
-            unclipped_depth: false,
+            unclipped_depth: key.late_fragment_depth,
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
@@ -3803,7 +3838,11 @@ fn create_tev_geometry_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(if key.late_fragment_depth {
+                "fs_depth_main"
+            } else {
+                "fs_main"
+            }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8Unorm,
@@ -4148,7 +4187,7 @@ mod tests {
     use crate::tev::MAX_TEV_TEXTURES;
     use crate::{
         GxBlendFactor, SamplerIdentity, TextureAddressMode, TextureBindingIdentity,
-        gx_destination_alpha_state,
+        gx_destination_alpha_state, gx_z_texture_state,
     };
 
     fn encoded_blend_mode(
@@ -4169,6 +4208,7 @@ mod tests {
             0,
             blend_mode,
             gx_destination_alpha_state(blend_mode, constant_alpha, pixel_control),
+            gx_z_texture_state(0, 0, pixel_control).unwrap(),
             0,
         )
     }
@@ -4235,6 +4275,7 @@ mod tests {
             assert_eq!(alpha_blend_factor(gx, true), alpha);
         }
         assert!(REQUIRED_WEBGPU_FEATURES.contains(wgpu::Features::DUAL_SOURCE_BLENDING));
+        assert!(REQUIRED_WEBGPU_FEATURES.contains(wgpu::Features::DEPTH_CLIP_CONTROL));
     }
 
     #[test]
@@ -4329,10 +4370,17 @@ mod tests {
     #[test]
     fn draw_binding_cache_keys_canonicalize_inactive_state_without_aliasing_active_values() {
         let blend_mode = encoded_blend_mode(1, 0, true, true);
-        let active_zero =
-            DrawUniform::from_gx(0x123456, gx_destination_alpha_state(blend_mode, 0x100, 1));
-        let active_full =
-            DrawUniform::from_gx(0x123456, gx_destination_alpha_state(blend_mode, 0x1ff, 1));
+        let z_texture = gx_z_texture_state(0, 0, 1).unwrap();
+        let active_zero = DrawUniform::from_gx(
+            0x123456,
+            gx_destination_alpha_state(blend_mode, 0x100, 1),
+            z_texture,
+        );
+        let active_full = DrawUniform::from_gx(
+            0x123456,
+            gx_destination_alpha_state(blend_mode, 0x1ff, 1),
+            z_texture,
+        );
         assert_eq!(active_zero.destination_alpha, 0x100);
         assert_eq!(active_full.destination_alpha, 0x1ff);
         assert_eq!(active_zero.fragment_flags, 1);
@@ -4342,17 +4390,53 @@ mod tests {
         let inactive_a = DrawUniform::from_gx(
             0x123456,
             gx_destination_alpha_state(alpha_update_disabled, 0x100, 1),
+            z_texture,
         );
         let inactive_b = DrawUniform::from_gx(
             0x123456,
             gx_destination_alpha_state(alpha_update_disabled, 0x1ff, 1),
+            z_texture,
         );
         assert_eq!(inactive_a.destination_alpha, 0);
         assert_eq!(binding_key(inactive_a), binding_key(inactive_b));
 
-        let no_alpha =
-            DrawUniform::from_gx(0x123456, gx_destination_alpha_state(blend_mode, 0x1ff, 0));
+        let no_alpha = DrawUniform::from_gx(
+            0x123456,
+            gx_destination_alpha_state(blend_mode, 0x1ff, 0),
+            gx_z_texture_state(0, 0, 0).unwrap(),
+        );
         assert_eq!(no_alpha.fragment_flags, 0);
         assert_ne!(binding_key(inactive_a), binding_key(no_alpha));
+    }
+
+    #[test]
+    fn z_texture_state_selects_only_the_late_depth_pipeline_and_packs_the_draw_uniform() {
+        let destination_alpha = gx_destination_alpha_state(0, 0, 0);
+        let late = gx_z_texture_state(0x12_3456, 2 | (1 << 2), 0).unwrap();
+        let early = gx_z_texture_state(0x12_3456, 2 | (1 << 2), 1 << 6).unwrap();
+        let disabled = gx_z_texture_state(0xff_ffff, 2, 0).unwrap();
+
+        let pipeline = |z_mode, z_texture| {
+            PipelineKey::from_gx(
+                Primitive::Triangles,
+                z_mode,
+                0,
+                destination_alpha,
+                z_texture,
+                0,
+            )
+        };
+        assert!(pipeline(1, late).late_fragment_depth);
+        assert!(!pipeline(1, early).late_fragment_depth);
+        assert!(!pipeline(0, late).late_fragment_depth);
+        assert!(!pipeline(1, disabled).late_fragment_depth);
+
+        let draw = DrawUniform::from_gx(0, destination_alpha, late);
+        assert_eq!(draw.z_texture, 0x0612_3456);
+        let early_draw = DrawUniform::from_gx(0, destination_alpha, early);
+        assert_eq!(early_draw.z_texture, draw.z_texture);
+        let disabled_draw = DrawUniform::from_gx(0, destination_alpha, disabled);
+        assert_eq!(disabled_draw.z_texture, 0);
+        assert_ne!(binding_key(draw), binding_key(disabled_draw));
     }
 }

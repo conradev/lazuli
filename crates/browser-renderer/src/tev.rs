@@ -226,6 +226,8 @@ pub(crate) struct TevEvaluation {
     pub(crate) raw: TevColor,
     /// Final color as written to an RGBA8 render target.
     pub(crate) rgba8: [u8; 4],
+    /// Unswizzled sample from the last texture-enabled stage, or zero.
+    pub(crate) last_texture: TevColor,
     pub(crate) registers: [TevColor; 4],
     pub(crate) last_color_destination: usize,
     pub(crate) last_alpha_destination: usize,
@@ -463,6 +465,7 @@ pub(crate) fn evaluate_alpha_combiner(
 
 pub(crate) fn evaluate(state: &TevDrawState, inputs: &TevFragmentInputs) -> TevEvaluation {
     let mut registers = state.color_registers;
+    let mut last_texture = ZERO;
     let mut last_color_destination = 3;
     let mut last_alpha_destination = 3;
 
@@ -473,7 +476,9 @@ pub(crate) fn evaluate(state: &TevDrawState, inputs: &TevFragmentInputs) -> TevE
         .take((state.stage_count as usize).min(MAX_TEV_STAGES))
     {
         let texture_base = if stage.texture_enabled() {
-            inputs.textures[stage.texture_map()]
+            let texture = inputs.textures[stage.texture_map()];
+            last_texture = texture;
+            texture
         } else {
             WHITE
         };
@@ -577,6 +582,7 @@ pub(crate) fn evaluate(state: &TevDrawState, inputs: &TevFragmentInputs) -> TevE
     TevEvaluation {
         raw,
         rgba8: raw.map(|value| value.clamp(0, 255) as u8),
+        last_texture,
         registers,
         last_color_destination,
         last_alpha_destination,
@@ -609,7 +615,7 @@ struct DrawState {
     alpha_test: u32,
     destination_alpha: u32,
     fragment_flags: u32,
-    padding: u32,
+    z_texture: u32,
 };
 
 struct TevVertexInput {
@@ -638,6 +644,7 @@ struct TevVertexOutput {
     @location(7) stq5: vec3<f32>,
     @location(8) stq6: vec3<f32>,
     @location(9) stq7: vec3<f32>,
+    @location(10) @interpolate(linear) depth24: f32,
 };
 
 @group(0) @binding(2) var<uniform> draw_state: DrawState;
@@ -661,6 +668,7 @@ fn vs_main(input: TevVertexInput) -> TevVertexOutput {
     output.stq5 = input.stq5;
     output.stq6 = input.stq6;
     output.stq7 = input.stq7;
+    output.depth24 = input.position.z;
     return output;
 }
 
@@ -906,11 +914,17 @@ fn tev_alpha_combiner(
     return tev_clamp_result(d + select(0, c & 255, selected), combiner);
 }
 
+struct TevEvaluation {
+    source: vec4<f32>,
+    raw_texture: vec4<u32>,
+};
+
 fn tev_evaluate(
     raster_colors: array<vec4<f32>, 8>,
     tex_coords: array<vec3<f32>, 8>,
-) -> vec4<f32> {
+) -> TevEvaluation {
     var registers = tev_state.color_registers;
+    var raw_texture = vec4<i32>(0);
     var last_color_destination = 3u;
     var last_alpha_destination = 3u;
     var stage_index = 0u;
@@ -922,6 +936,7 @@ fn tev_evaluate(
         var texture_base = vec4<i32>(255);
         if (stage.refs & (1u << 6u)) != 0u {
             texture_base = tev_sample_texture(texture_map, tex_coords[tex_coord]);
+            raw_texture = texture_base;
         }
         let texture = tev_swizzle(texture_base, (stage.alpha_combiner >> 2u) & 3u);
         let raster_channel = (stage.refs >> 7u) & 7u;
@@ -952,7 +967,11 @@ fn tev_evaluate(
         stage_index += 1u;
     }
     let raw = vec4<i32>(registers[last_color_destination].rgb, registers[last_alpha_destination].a);
-    return clamp(vec4<f32>(raw) / 255.0, vec4<f32>(0.0), vec4<f32>(1.0));
+    var evaluation: TevEvaluation;
+    evaluation.source =
+        clamp(vec4<f32>(raw) / 255.0, vec4<f32>(0.0), vec4<f32>(1.0));
+    evaluation.raw_texture = vec4<u32>(clamp(raw_texture, vec4<i32>(0), vec4<i32>(255)));
+    return evaluation;
 }
 ";
 
@@ -962,8 +981,19 @@ struct TevFragmentOutput {
     @location(0) @blend_src(1) secondary: vec4<f32>,
 };
 
-@fragment
-fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
+struct TevFragmentDepthOutput {
+    @location(0) @blend_src(0) primary: vec4<f32>,
+    @location(0) @blend_src(1) secondary: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
+struct TevFragmentValues {
+    primary: vec4<f32>,
+    secondary: vec4<f32>,
+    raw_texture: vec4<u32>,
+};
+
+fn tev_fragment_values(input: TevVertexOutput) -> TevFragmentValues {
     let raster_colors = array<vec4<f32>, 8>(
         input.raster0, input.raster1,
         vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
@@ -973,7 +1003,8 @@ fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
         input.stq0, input.stq1, input.stq2, input.stq3,
         input.stq4, input.stq5, input.stq6, input.stq7,
     );
-    let source = tev_evaluate(raster_colors, tex_coords);
+    let evaluation = tev_evaluate(raster_colors, tex_coords);
+    let source = evaluation.source;
     let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0));
     if !alpha_test_passes(tev_alpha, draw_state.alpha_test) {
         discard;
@@ -988,9 +1019,48 @@ fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
         primary_alpha = f32(selected_alpha >> 2u) / 63.0;
     }
 
+    var values: TevFragmentValues;
+    values.primary = vec4<f32>(source.rgb, primary_alpha);
+    values.secondary = source;
+    values.raw_texture = evaluation.raw_texture;
+    return values;
+}
+
+fn gx_z_texture_depth(reference_depth: u32, raw_texture: vec4<u32>) -> u32 {
+    let format = (draw_state.z_texture >> 24u) & 3u;
+    let operation = (draw_state.z_texture >> 26u) & 3u;
+    if operation == 0u {
+        return reference_depth;
+    }
+    var source = raw_texture.a;
+    if format == 1u {
+        source = (raw_texture.a << 8u) | raw_texture.r;
+    } else if format == 2u {
+        source = (raw_texture.r << 16u) | (raw_texture.g << 8u) | raw_texture.b;
+    }
+    let reference = select(0u, reference_depth, operation == 1u);
+    return ((draw_state.z_texture & 0x00ffffffu) + source + reference) & 0x00ffffffu;
+}
+
+@fragment
+fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
+    let values = tev_fragment_values(input);
     var output: TevFragmentOutput;
-    output.primary = vec4<f32>(source.rgb, primary_alpha);
-    output.secondary = source;
+    output.primary = values.primary;
+    output.secondary = values.secondary;
+    return output;
+}
+
+@fragment
+fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput {
+    let values = tev_fragment_values(input);
+    let reference_depth =
+        u32(round(clamp(input.depth24, 0.0, 16777215.0)));
+    var output: TevFragmentDepthOutput;
+    output.primary = values.primary;
+    output.secondary = values.secondary;
+    output.depth =
+        f32(gx_z_texture_depth(reference_depth, values.raw_texture)) / 16777215.0;
     return output;
 }
 ";
@@ -1294,6 +1364,7 @@ mod tests {
 
         let evaluated = evaluate(&state, &inputs);
         assert_eq!(evaluated.raw, [30, 20, 10, 50]);
+        assert_eq!(evaluated.last_texture, [10, 20, 30, 40]);
         assert_eq!(evaluated.registers[0][..3], [30, 20, 10]);
         assert_eq!(evaluated.registers[1][3], 50);
         assert_eq!(evaluated.last_color_destination, 0);
@@ -1348,6 +1419,7 @@ mod tests {
         let empty = evaluate(&state, &TevFragmentInputs::default());
         assert_eq!(empty.raw, [-5, 10, 260, 300]);
         assert_eq!(empty.rgba8, [0, 10, 255, 255]);
+        assert_eq!(empty.last_texture, ZERO);
 
         let pass_texture = TevStage::from_bp(
             color_combiner([15, 15, 15, 8], 0, 0),
@@ -1359,7 +1431,34 @@ mod tests {
         state.set_stages(&[pass_texture]);
         let mut inputs = TevFragmentInputs::default();
         inputs.textures[4] = [1, 2, 3, 4];
-        assert_eq!(evaluate(&state, &inputs).raw, WHITE);
+        let evaluated = evaluate(&state, &inputs);
+        assert_eq!(evaluated.raw, WHITE);
+        assert_eq!(evaluated.last_texture, ZERO);
+    }
+
+    #[test]
+    fn last_texture_is_unswizzled_and_survives_later_texture_disabled_stages() {
+        let sample = TevStage::from_bp(
+            color_combiner([15, 15, 15, 8], 0, 0),
+            alpha_combiner([7, 7, 7, 4], 0, 0) | (1 << 2),
+            refs(2, 0, true, 7),
+            0,
+            0,
+        );
+        let disabled = TevStage::from_bp(
+            color_combiner([15, 15, 15, 8], 0, 0),
+            alpha_combiner([7, 7, 7, 4], 0, 0),
+            refs(7, 0, false, 7),
+            0,
+            0,
+        );
+        let mut state = TevDrawState::default();
+        state.set_stages(&[sample, disabled]);
+        state.swap_tables[1] = [3, 2, 1, 0];
+        let mut inputs = TevFragmentInputs::default();
+        inputs.textures[2] = [11, 22, 33, 44];
+        inputs.textures[7] = [55, 66, 77, 88];
+        assert_eq!(evaluate(&state, &inputs).last_texture, [11, 22, 33, 44]);
     }
 
     #[test]
@@ -1384,22 +1483,27 @@ mod tests {
         assert!(shader.starts_with("enable dual_source_blending;\n"));
         assert_eq!(shader.matches("enable dual_source_blending;").count(), 1);
         assert!(shader.contains(
-            "struct DrawState {\n    alpha_test: u32,\n    destination_alpha: u32,\n    fragment_flags: u32,\n    padding: u32,\n};"
+            "struct DrawState {\n    alpha_test: u32,\n    destination_alpha: u32,\n    fragment_flags: u32,\n    z_texture: u32,\n};"
         ));
         assert!(shader.contains(
             "struct TevFragmentOutput {\n    @location(0) @blend_src(0) primary: vec4<f32>,\n    @location(0) @blend_src(1) secondary: vec4<f32>,\n};"
         ));
         assert!(shader.contains("fn fs_main(input: TevVertexOutput) -> TevFragmentOutput"));
-        assert!(shader.contains("output.primary = vec4<f32>(source.rgb, primary_alpha)"));
-        assert!(shader.contains("output.secondary = source"));
+        assert!(
+            shader.contains("fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput")
+        );
+        assert!(shader.contains("@builtin(frag_depth) depth: f32"));
+        assert!(shader.contains("values.primary = vec4<f32>(source.rgb, primary_alpha)"));
+        assert!(shader.contains("values.secondary = source"));
     }
 
     #[test]
     fn wgsl_fragment_alpha_order_and_rgba6_quantization_are_exact() {
         let shader = shader_source();
         let evaluate = shader
-            .find("let source = tev_evaluate(raster_colors, tex_coords)")
+            .find("let evaluation = tev_evaluate(raster_colors, tex_coords)")
             .unwrap();
+        let source = shader.find("let source = evaluation.source").unwrap();
         let tev_alpha = shader
             .find("let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0))")
             .unwrap();
@@ -1416,12 +1520,14 @@ mod tests {
             .find("primary_alpha = f32(selected_alpha >> 2u) / 63.0")
             .unwrap();
         let primary = shader
-            .find("output.primary = vec4<f32>(source.rgb, primary_alpha)")
+            .find("values.primary = vec4<f32>(source.rgb, primary_alpha)")
             .unwrap();
-        let secondary = shader.find("output.secondary = source").unwrap();
+        let secondary = shader.find("values.secondary = source").unwrap();
 
         assert!(
             evaluate < tev_alpha
+                && evaluate < source
+                && source < tev_alpha
                 && tev_alpha < alpha_test
                 && alpha_test < destination_alpha
                 && destination_alpha < rgba6
@@ -1433,6 +1539,38 @@ mod tests {
         assert!(shader.contains("selected_alpha = draw_state.destination_alpha & 0xffu"));
         assert!(shader.contains("var primary_alpha = source.a"));
         assert!(!shader.contains("alpha_test_passes(selected_alpha"));
+    }
+
+    #[test]
+    fn wgsl_z_texture_uses_last_unswizzled_sample_and_current_depth_encoding() {
+        let shader = shader_source();
+        let initialize = shader.find("var raw_texture = vec4<i32>(0)").unwrap();
+        let sample = shader
+            .find("texture_base = tev_sample_texture(texture_map, tex_coords[tex_coord])")
+            .unwrap();
+        let retain = shader.find("raw_texture = texture_base").unwrap();
+        let swizzle = shader
+            .find("let texture = tev_swizzle(texture_base")
+            .unwrap();
+        assert!(initialize < sample && sample < retain && retain < swizzle);
+        assert!(shader.contains("source = raw_texture.a"));
+        assert!(shader.contains("source = (raw_texture.a << 8u) | raw_texture.r"));
+        assert!(
+            shader.contains(
+                "source = (raw_texture.r << 16u) | (raw_texture.g << 8u) | raw_texture.b"
+            )
+        );
+        assert!(shader.contains("@location(10) @interpolate(linear) depth24: f32"));
+        assert!(shader.contains("output.depth24 = input.position.z"));
+        assert!(shader.contains("u32(round(clamp(input.depth24, 0.0, 16777215.0)))"));
+        assert!(!shader.contains("u32(round(clamp(input.position.z, 0.0, 1.0) * 16777215.0))"));
+        assert!(
+            shader.contains(
+                "((draw_state.z_texture & 0x00ffffffu) + source + reference) & 0x00ffffffu"
+            )
+        );
+        assert!(shader.contains("if operation == 0u {\n        return reference_depth;"));
+        assert!(!shader.contains("16777216.0"));
     }
 
     #[test]
@@ -1513,7 +1651,8 @@ mod tests {
             assert!(shader.contains(&format!("input.stq{coord}")));
         }
         assert!(shader.contains("let uv = stq.xy / stq.z"));
-        assert!(shader.contains("let source = tev_evaluate(raster_colors, tex_coords)"));
+        assert!(shader.contains("let evaluation = tev_evaluate(raster_colors, tex_coords)"));
+        assert!(shader.contains("let source = evaluation.source"));
         assert!(shader.contains("if !alpha_test_passes(tev_alpha, draw_state.alpha_test)"));
     }
 }

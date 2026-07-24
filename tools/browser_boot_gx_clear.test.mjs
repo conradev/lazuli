@@ -202,10 +202,14 @@ test("GX depth endpoints span the full unsigned 24-bit range in clears and draws
   assert.doesNotMatch(rendererCoreSource, /GX_DEPTH24_SCALE|GX_DEPTH24_MAX_FLOAT/);
 });
 
-test("strict WebGPU rendering requires the canonical dual-source destination-alpha contract", () => {
+test("strict WebGPU rendering requires dual-source blending and depth clip control", () => {
   assert.match(
     rendererSource,
-    /const REQUIRED_WEBGPU_FEATURES: wgpu::Features = wgpu::Features::DUAL_SOURCE_BLENDING/,
+    /const REQUIRED_WEBGPU_FEATURES: wgpu::Features =\s*wgpu::Features::DUAL_SOURCE_BLENDING/,
+  );
+  assert.match(
+    rendererSource,
+    /\.union\(wgpu::Features::DEPTH_CLIP_CONTROL\)/,
   );
   const create = rendererSection("async fn create_inner", "fn upload_texture(");
   assert.match(create, /backends: wgpu::Backends::BROWSER_WEBGPU/);
@@ -214,7 +218,7 @@ test("strict WebGPU rendering requires the canonical dual-source destination-alp
     /adapter\.features\(\)\.contains\(required_features\)/,
   );
   assert.match(create, /required_features,/);
-  assert.match(create, /dual-source blending is required/);
+  assert.match(create, /dual-source blending and depth clip control are required/);
   assert.match(create, /no rendering fallback/);
   assert.doesNotMatch(create, /required_features: wgpu::Features::empty\(\)/);
 
@@ -226,7 +230,7 @@ test("strict WebGPU rendering requires the canonical dual-source destination-alp
   assert.match(shader, /enable dual_source_blending;/);
   assert.match(shader, /@location\(0\) @blend_src\(0\) primary: vec4<f32>/);
   assert.match(shader, /@location\(0\) @blend_src\(1\) secondary: vec4<f32>/);
-  assert.match(shader, /output\.secondary = source/);
+  assert.match(shader, /values\.secondary = source/);
 });
 
 test("LZGX v3 fragment-tail destination alpha reaches the draw uniform after the TEV alpha test", () => {
@@ -241,7 +245,10 @@ test("LZGX v3 fragment-tail destination alpha reaches the draw uniform after the
     draw,
     /gx_destination_alpha_state\(blend_mode, constant_alpha, pixel_control\)/,
   );
-  assert.match(draw, /DrawUniform::from_gx\(alpha_test, destination_alpha\)/);
+  assert.match(
+    draw,
+    /DrawUniform::from_gx\(alpha_test, destination_alpha, z_texture\)/,
+  );
   assert.match(draw, /draw: draw_uniform/);
 
   const gate = sourceSection(
