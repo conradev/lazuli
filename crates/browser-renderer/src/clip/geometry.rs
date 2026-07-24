@@ -302,3 +302,6 @@ fn gx_projected_triangle_error(vertices: &[[f32; TEV_VERTEX_FLOATS]; 3]) -> GxEx
     }
     GxExactGeometryError::UnsupportedPostClipDepth
 }
+
+#[cfg(test)]
+mod tests;
