@@ -4758,6 +4758,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxDecodedVertices = 0;
     let gxProjectedVertices = 0;
     let gxDroppedVertices = 0;
+    let gxLightingRejectedVertices = 0;
     let gxLegacyProjectionNullVertices = 0;
     let gxExactRequiredDraws = 0;
     let gxExactRequiredVertices = 0;
@@ -6515,12 +6516,23 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (matrix.some(value => !Number.isFinite(value)) || matrix.every(value => value === 0)) {
         return null;
       }
-      const [x, y, z] = position;
-      return [
-        matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3],
-        matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7],
-        matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11],
-      ];
+      const x = Math.fround(position[0]);
+      const y = Math.fround(position[1]);
+      const z = Math.fround(position[2]);
+      const transformed = [];
+      for (let row = 0; row < 3; row += 1) {
+        const offset = row * 4;
+        let value = Math.fround(matrix[offset] * x);
+        value = Math.fround(
+          value + Math.fround(matrix[offset + 1] * y)
+        );
+        value = Math.fround(
+          value + Math.fround(matrix[offset + 2] * z)
+        );
+        value = Math.fround(value + matrix[offset + 3]);
+        transformed.push(value);
+      }
+      return transformed;
     }
 
     function gxCullF32(value) {
@@ -6625,7 +6637,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       return transformed.every(Number.isFinite) ? transformed : null;
     }
 
-    function gxTransformNormal(vector, matrixIndex) {
+    function gxTransformNormalVector(vector, matrixIndex) {
       if (vector === null || vector === undefined) return null;
       const base = 0x400 + (matrixIndex % 32) * 3;
       if (base + 8 >= gxXfRegisters.length) return null;
@@ -6635,11 +6647,41 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (matrix.some(value => !Number.isFinite(value)) || matrix.every(value => value === 0)) {
         return null;
       }
-      return gxNormalize3([
-        matrix[0] * vector[0] + matrix[1] * vector[1] + matrix[2] * vector[2],
-        matrix[3] * vector[0] + matrix[4] * vector[1] + matrix[5] * vector[2],
-        matrix[6] * vector[0] + matrix[7] * vector[1] + matrix[8] * vector[2],
-      ]);
+      const x = Math.fround(vector[0]);
+      const y = Math.fround(vector[1]);
+      const z = Math.fround(vector[2]);
+      const transformed = [];
+      for (let row = 0; row < 3; row += 1) {
+        const offset = row * 3;
+        let value = Math.fround(matrix[offset] * x);
+        value = Math.fround(
+          value + Math.fround(matrix[offset + 1] * y)
+        );
+        value = Math.fround(
+          value + Math.fround(matrix[offset + 2] * z)
+        );
+        transformed.push(value);
+      }
+      return transformed;
+    }
+
+    function gxTransformNormal(vector, matrixIndex) {
+      const transformed = gxTransformNormalVector(vector, matrixIndex);
+      if (transformed === null) return null;
+      let lengthSquared = Math.fround(
+        transformed[0] * transformed[0]
+      );
+      lengthSquared = Math.fround(
+        lengthSquared + Math.fround(transformed[1] * transformed[1])
+      );
+      lengthSquared = Math.fround(
+        lengthSquared + Math.fround(transformed[2] * transformed[2])
+      );
+      const length = Math.fround(Math.sqrt(lengthSquared));
+      // Common::Vec3::Normalized divides even when the length is zero.
+      // Preserve the resulting NaNs so lighting can reject them only when
+      // the active channel actually consumes its normal.
+      return transformed.map(value => Math.fround(value / length));
     }
 
     function gxTransformTexCoord(attributes, matrixIndex, texgenIndex) {
@@ -6948,13 +6990,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function gxXfColor(address) {
+    function gxXfColorU8(address) {
       const value = gxXfRegisters[address] >>> 0;
       return [
-        (value >>> 24) / 255,
-        ((value >>> 16) & 0xff) / 255,
-        ((value >>> 8) & 0xff) / 255,
-        (value & 0xff) / 255,
+        value >>> 24,
+        (value >>> 16) & 0xff,
+        (value >>> 8) & 0xff,
+        value & 0xff,
       ];
     }
 
@@ -6962,7 +7004,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const base = 0x603 + index * 0x10;
       if (base + 12 >= gxXfRegisters.length) return null;
       const light = {
-        color: gxXfColor(base),
+        color: gxXfColorU8(base),
         cosAtten: Array.from({ length: 3 }, (_unused, component) =>
           gxXfFloat(base + 1 + component)
         ),
@@ -6980,46 +7022,112 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxDot3(left, right) {
-      return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
+      return gxCullAdd(
+        gxCullAdd(
+          gxCullMul(left[0], right[0]),
+          gxCullMul(left[1], right[1])
+        ),
+        gxCullMul(left[2], right[2])
+      );
     }
 
     function gxVectorSubtract(left, right) {
-      return [left[0] - right[0], left[1] - right[1], left[2] - right[2]];
+      return [
+        gxCullSub(left[0], right[0]),
+        gxCullSub(left[1], right[1]),
+        gxCullSub(left[2], right[2]),
+      ];
     }
 
-    function gxLightDiffuse(control, light, position, normal) {
+    function gxLightNormalize3(vector) {
+      const length = gxCullF32(Math.sqrt(gxDot3(vector, vector)));
+      return vector.map(value => gxCullDiv(value, length));
+    }
+
+    function gxLightMaxZero(value) {
+      return value > 0 ? gxCullF32(value) : 0;
+    }
+
+    function gxLightSafeDivide(numerator, denominator) {
+      const n = gxCullF32(numerator);
+      const d = gxCullF32(denominator);
+      return d === 0 ? (n > 0 ? 1 : 0) : gxCullDiv(n, d);
+    }
+
+    function gxLightDiffuse(control, direction, normal) {
       const mode = (control >>> 7) & 3;
-      if (mode === 0 || mode === 3) return 1;
-      const vertexToLight = gxVectorSubtract(light.position, position);
-      const length = Math.hypot(...vertexToLight);
-      const value = length < 1e-12 ? 0 : gxDot3(vertexToLight, normal) / length;
-      return mode === 2 ? Math.max(value, 0) : value;
+      if (mode === 0) return 1;
+      if (mode === 3) return null;
+      const value = gxDot3(direction, normal);
+      return mode === 2 ? gxLightMaxZero(value) : value;
     }
 
-    function gxPolynomial(coefficients, value) {
-      return coefficients[0] + value * coefficients[1] + value * value * coefficients[2];
+    function gxLightSpotCosPolynomial(coefficients, value) {
+      return gxCullAdd(
+        gxCullAdd(
+          coefficients[0],
+          gxCullMul(coefficients[1], value)
+        ),
+        gxCullMul(gxCullMul(coefficients[2], value), value)
+      );
+    }
+
+    function gxLightSpotDistancePolynomial(
+      coefficients, distance, distanceSquared
+    ) {
+      return gxCullAdd(
+        gxCullAdd(
+          coefficients[0],
+          gxCullMul(coefficients[1], distance)
+        ),
+        gxCullMul(coefficients[2], distanceSquared)
+      );
     }
 
     function gxLightPosition(control, light, position, normal) {
-      if ((control & (1 << 9)) === 0) return 1;
-      let angularValue;
-      let distanceValue;
-      if ((control & (1 << 10)) === 0) {
-        const lightDirection = gxNormalize3(light.position) ?? [0, 0, 0];
-        const normalDotLight = gxDot3(normal, lightDirection);
-        angularValue = normalDotLight > 0
-          ? Math.max(gxDot3(normal, light.direction), 0)
+      let direction = gxVectorSubtract(light.position, position);
+      let attenuation = 1;
+      const attenuationMode = (control >>> 9) & 3;
+      if (attenuationMode === 0 || attenuationMode === 2) {
+        direction = gxLightNormalize3(direction);
+        if (direction.every(value => value === 0)) {
+          direction = normal.slice();
+        }
+      } else if (attenuationMode === 1) {
+        direction = gxLightNormalize3(direction);
+        const normalDotDirection = gxDot3(direction, normal);
+        attenuation = normalDotDirection >= 0
+          ? gxLightMaxZero(gxDot3(light.direction, normal))
           : 0;
-        distanceValue = angularValue;
+        const attenuationLength = [
+          1,
+          attenuation,
+          gxCullMul(attenuation, attenuation),
+        ];
+        const distanceAttenuation = ((control >>> 7) & 3) === 0
+          ? light.distAtten
+          : gxLightNormalize3(light.distAtten);
+        attenuation = gxLightSafeDivide(
+          gxLightMaxZero(gxDot3(attenuationLength, light.cosAtten)),
+          gxDot3(attenuationLength, distanceAttenuation)
+        );
       } else {
-        const vertexToLight = gxVectorSubtract(light.position, position);
-        const direction = gxNormalize3(vertexToLight) ?? [0, 0, 0];
-        angularValue = Math.max(gxDot3(direction, light.direction), 0);
-        distanceValue = Math.hypot(...vertexToLight);
+        const distanceSquared = gxDot3(direction, direction);
+        const distance = gxCullF32(Math.sqrt(distanceSquared));
+        direction = direction.map(value => gxCullDiv(value, distance));
+        const angularValue = gxLightMaxZero(gxDot3(direction, light.direction));
+        const numerator = gxLightMaxZero(
+          gxLightSpotCosPolynomial(light.cosAtten, angularValue)
+        );
+        const denominator = gxLightSpotDistancePolynomial(
+          light.distAtten,
+          distance,
+          distanceSquared
+        );
+        attenuation = gxLightSafeDivide(numerator, denominator);
       }
-      const numerator = Math.max(gxPolynomial(light.cosAtten, angularValue), 0);
-      const denominator = gxPolynomial(light.distAtten, distanceValue);
-      return Math.abs(denominator) < 1e-12 ? 0 : numerator / denominator;
+      if (!Number.isFinite(attenuation)) return null;
+      return { attenuation: gxCullF32(attenuation), direction };
     }
 
     function gxChannelLightEnabled(control, lightIndex) {
@@ -7033,43 +7141,117 @@ const TEMPLATE: &str = r##"<!doctype html>
     ) {
       const materialValue = (control & 1) !== 0 ? vertexColor[component] : material[component];
       if ((control & 2) === 0) return materialValue;
-      let lightFunction = (control & (1 << 6)) !== 0
+      let lightFunction = gxCullF32((control & (1 << 6)) !== 0
         ? vertexColor[component]
-        : ambient[component];
+        : ambient[component]);
       for (let lightIndex = 0; lightIndex < 8; lightIndex += 1) {
         if (!gxChannelLightEnabled(control, lightIndex)) continue;
+        if (position === null) return null;
+        const diffuseMode = (control >>> 7) & 3;
+        const attenuationMode = (control >>> 9) & 3;
+        const normalIsRequired = (
+          diffuseMode !== 0
+          || attenuationMode === 1
+        );
+        if (normalIsRequired && normal === null) return null;
+        const effectiveNormal = normal ?? [Number.NaN, Number.NaN, Number.NaN];
         const light = gxXfLight(lightIndex);
-        if (light === null) continue;
-        lightFunction += light.color[component]
-          * gxLightDiffuse(control, light, position, normal)
-          * gxLightPosition(control, light, position, normal);
+        if (light === null) return null;
+        const lightPosition = gxLightPosition(
+          control, light, position, effectiveNormal
+        );
+        if (lightPosition === null) return null;
+        const diffuse = gxLightDiffuse(
+          control, lightPosition.direction, effectiveNormal
+        );
+        if (diffuse === null) return null;
+        let contribution;
+        if (diffuseMode === 0) {
+          contribution = gxCullMul(
+            light.color[component],
+            lightPosition.attenuation
+          );
+        } else if (component === 3) {
+          contribution = gxCullMul(
+            gxCullMul(
+              light.color[component],
+              lightPosition.attenuation
+            ),
+            diffuse
+          );
+        } else {
+          contribution = gxCullMul(
+            light.color[component],
+            gxCullMul(lightPosition.attenuation, diffuse)
+          );
+        }
+        lightFunction = gxCullAdd(
+          lightFunction,
+          contribution
+        );
       }
-      return materialValue * Math.max(0, Math.min(1, lightFunction));
+      if (
+        !Number.isFinite(lightFunction)
+        || lightFunction < -0x80000000
+        || lightFunction >= 0x80000000
+      ) {
+        return null;
+      }
+      const lightInteger = Math.max(0, Math.min(255, Math.trunc(lightFunction)));
+      return (
+        materialValue * (lightInteger + (lightInteger >> 7))
+      ) >> 8;
     }
 
     function gxLightRasterChannels(position, normal, colors) {
-      const transformedNormal = normal ?? [0, 0, 0];
-      return Array.from({ length: 2 }, (_unused, channel) => {
-        const vertexColor = colors[channel].map(value => value / 255);
-        const material = gxXfColor(0x100c + channel);
-        const ambient = gxXfColor(0x100a + channel);
+      if (
+        !Array.isArray(colors)
+        || colors.length < 2
+        || colors.some(color =>
+          !Array.isArray(color)
+          || color.length < 4
+          || color.some(value =>
+            !Number.isInteger(value) || value < 0 || value > 255
+          )
+        )
+      ) {
+        return null;
+      }
+      const transformedPosition = position === null
+        ? null
+        : position.map(gxCullF32);
+      const transformedNormal = normal === null
+        ? null
+        : normal.map(gxCullF32);
+      const channels = [];
+      for (let channel = 0; channel < 2; channel += 1) {
+        const vertexColor = colors[channel];
+        const material = gxXfColorU8(0x100c + channel);
+        const ambient = gxXfColorU8(0x100a + channel);
         const colorControl = gxXfRegisters[0x100e + channel] >>> 0;
         const alphaControl = gxXfRegisters[0x1010 + channel] >>> 0;
-        return [
+        const bytes = [
           gxLightChannelComponent(
-            colorControl, 0, material, ambient, vertexColor, position, transformedNormal
+            colorControl, 0, material, ambient, vertexColor,
+            transformedPosition, transformedNormal
           ),
           gxLightChannelComponent(
-            colorControl, 1, material, ambient, vertexColor, position, transformedNormal
+            colorControl, 1, material, ambient, vertexColor,
+            transformedPosition, transformedNormal
           ),
           gxLightChannelComponent(
-            colorControl, 2, material, ambient, vertexColor, position, transformedNormal
+            colorControl, 2, material, ambient, vertexColor,
+            transformedPosition, transformedNormal
           ),
           gxLightChannelComponent(
-            alphaControl, 3, material, ambient, vertexColor, position, transformedNormal
+            alphaControl, 3, material, ambient, vertexColor,
+            transformedPosition, transformedNormal
           ),
         ];
-      });
+        if (bytes.some(value => value === null)) return null;
+        channels.push(bytes.map(value => gxCullDiv(value, 255)));
+      }
+      return channels;
     }
 
     function gxTextureRegisters(textureMap) {
@@ -9055,11 +9237,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       const viewPosition = gxTransformPosition(position, positionMatrix);
       const projected = gxProjectViewPosition(viewPosition);
       const normal = gxTransformNormal(normalAttribute.normal, positionMatrix);
-      const tangent = gxTransformNormal(normalAttribute.tangent, positionMatrix);
-      const binormal = gxTransformNormal(normalAttribute.binormal, positionMatrix);
-      const rasterColors = viewPosition === null
-        ? colors.map(color => color.map(value => value / 255))
-        : gxLightRasterChannels(viewPosition, normal, colors);
+      const tangent = gxTransformNormalVector(
+        normalAttribute.tangent, positionMatrix
+      );
+      const binormal = gxTransformNormalVector(
+        normalAttribute.binormal, positionMatrix
+      );
+      const rasterColors = gxLightRasterChannels(
+        viewPosition, normal, colors
+      );
+      if (rasterColors === null) {
+        gxLightingRejectedVertices += 1;
+        return { cursor, skipped: true };
+      }
       const texgenAttributes = {
         position,
         normal: normalAttribute.normal,
@@ -9192,10 +9382,19 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else {
           gxProjectedVertices += 1;
         }
-        const raster0 = decoded.rasterColors?.[0]
-          ?? decoded.colors[0].map(value => value / 255);
-        const raster1 = decoded.rasterColors?.[1]
-          ?? decoded.colors[1].map(value => value / 255);
+        if (
+          !Array.isArray(decoded.rasterColors)
+          || decoded.rasterColors.length !== 2
+          || decoded.rasterColors.some(channel =>
+            !Array.isArray(channel) || channel.length !== 4
+          )
+        ) {
+          gxVertexDecodeErrors += 1;
+          gxDroppedVertices += 1;
+          decodeComplete = false;
+          continue;
+        }
+        const [raster0, raster1] = decoded.rasterColors;
         vertices.push(
           projected[0], projected[1], projected[2], projected[3],
           ...raster0,
@@ -15291,6 +15490,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             decodedVertices: gxDecodedVertices,
             projectedVertices: gxProjectedVertices,
             droppedVertices: gxDroppedVertices,
+            lightingRejectedVertices: gxLightingRejectedVertices,
             legacyProjectionNullVertices: gxLegacyProjectionNullVertices,
             exactRequiredDraws: gxExactRequiredDraws,
             exactRequiredVertices: gxExactRequiredVertices,
