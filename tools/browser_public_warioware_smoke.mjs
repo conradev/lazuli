@@ -37,6 +37,31 @@ function requiredObject(value, path) {
   return value;
 }
 
+function requirePositiveInteger(value, path) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    evidenceFailure(path, "expected a positive integer");
+  }
+  return value;
+}
+
+function requireNonNegativeInteger(value, path) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    evidenceFailure(path, "expected a non-negative integer");
+  }
+  return value;
+}
+
+function requireFieldRow(value, path) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1) {
+    evidenceFailure(path, "expected field row 0 or 1");
+  }
+  return value;
+}
+
+function requireZero(value, path) {
+  if (value !== 0) evidenceFailure(path, "expected zero");
+}
+
 function evidenceUrl(value, path) {
   try {
     return new URL(value);
@@ -63,6 +88,141 @@ export function configuredPublicWarioWareUrl(value) {
   }
   url.searchParams.set("scenario", PUBLIC_SCENARIO);
   return url.href;
+}
+
+export function publicWarioWareSnapshotHasCoherentXfb(report) {
+  requiredObject(report, "$.report");
+  if (report.status !== "running") {
+    evidenceFailure("$.report.status", "expected running");
+  }
+  if (report.stage !== "snapshot") {
+    evidenceFailure("$.report.stage", "expected snapshot");
+  }
+  if (report.error !== undefined && report.error !== null) {
+    evidenceFailure("$.report.error", "expected no terminal error");
+  }
+  const mmioState = requiredObject(report.mmioState, "$.report.mmioState");
+  const vi = requiredObject(
+    mmioState.viInterruptModel,
+    "$.report.mmioState.viInterruptModel",
+  );
+  const presentationCount = requireNonNegativeInteger(
+    vi.presentationCount,
+    "$.report.mmioState.viInterruptModel.presentationCount",
+  );
+  const rendering = requiredObject(report.rendering, "$.report.rendering");
+  if (rendering.backend !== "wgpu-webgpu") {
+    evidenceFailure("$.report.rendering.backend", "expected wgpu-webgpu");
+  }
+  if (rendering.error !== undefined && rendering.error !== null) {
+    evidenceFailure("$.report.rendering.error", "expected no renderer error");
+  }
+  const selectedXfb = rendering.selectedXfb;
+  const copyIndex = vi.lastPresentationCopyIndex;
+  if (selectedXfb === null && copyIndex === 0) return false;
+  if (selectedXfb === null) {
+    evidenceFailure(
+      "$.report.rendering.selectedXfb",
+      `expected selected copy ${String(copyIndex)} after VI presentation`,
+    );
+  }
+  requiredObject(selectedXfb, "$.report.rendering.selectedXfb");
+  requirePositiveInteger(
+    presentationCount,
+    "$.report.mmioState.viInterruptModel.presentationCount",
+  );
+  const address = vi.lastPresentationAddress;
+  if (typeof address !== "string" || !/^0x[0-9a-f]{8}$/.test(address)) {
+    evidenceFailure(
+      "$.report.mmioState.viInterruptModel.lastPresentationAddress",
+      "expected a lowercase 32-bit hexadecimal address",
+    );
+  }
+  requirePositiveInteger(
+    copyIndex,
+    "$.report.mmioState.viInterruptModel.lastPresentationCopyIndex",
+  );
+  if (
+    typeof selectedXfb.address !== "string"
+    || !/^0x[0-9a-f]{8}$/.test(selectedXfb.address)
+  ) {
+    evidenceFailure(
+      "$.report.rendering.selectedXfb.address",
+      "expected a lowercase 32-bit hexadecimal address",
+    );
+  }
+  if (selectedXfb.address !== address) {
+    evidenceFailure(
+      "$.report.rendering.selectedXfb.address",
+      `expected last VI presentation address ${address}, got ${selectedXfb.address}`,
+    );
+  }
+  requirePositiveInteger(
+    selectedXfb.generation,
+    "$.report.rendering.selectedXfb.generation",
+  );
+  if (selectedXfb.generation !== copyIndex) {
+    evidenceFailure(
+      "$.report.rendering.selectedXfb.generation",
+      `expected last VI presentation copy ${copyIndex}, got ${selectedXfb.generation}`,
+    );
+  }
+  const copyRow = requireFieldRow(
+    vi.lastPresentationCopyRow,
+    "$.report.mmioState.viInterruptModel.lastPresentationCopyRow",
+  );
+  const selectedRow = requireFieldRow(
+    selectedXfb.row,
+    "$.report.rendering.selectedXfb.row",
+  );
+  if (selectedRow !== copyRow) {
+    evidenceFailure(
+      "$.report.rendering.selectedXfb.row",
+      `expected last VI presentation row ${copyRow}, got ${selectedRow}`,
+    );
+  }
+  return true;
+}
+
+async function capturePublicWarioWareSnapshot(session, { deadline, pollMs }) {
+  if (await requestPublicSnapshot(session) !== true) {
+    throw new Error("public WarioWare cycle runner cannot publish a snapshot");
+  }
+  return waitForPublicSnapshot(session, { deadline, pollMs });
+}
+
+export async function waitForCoherentPublicWarioWareSnapshot(
+  session,
+  {
+    captureSnapshot = capturePublicWarioWareSnapshot,
+    deadline,
+    delay = publicDelay,
+    now = Date.now,
+    pollMs,
+  },
+) {
+  let lastSnapshot = null;
+  while (now() < deadline) {
+    try {
+      lastSnapshot = await captureSnapshot(session, { deadline, pollMs });
+    } catch (error) {
+      if (lastSnapshot === null) throw error;
+      throw new Error(
+        "public WarioWare snapshot capture failed after the last retryable snapshot: "
+        + `${JSON.stringify(lastSnapshot)}; capture error: ${error?.message ?? String(error)}`,
+        { cause: error },
+      );
+    }
+    if (publicWarioWareSnapshotHasCoherentXfb(lastSnapshot.report)) {
+      return lastSnapshot;
+    }
+    const remainingMs = deadline - now();
+    if (remainingMs > 0) await delay(Math.min(pollMs, remainingMs));
+  }
+  throw new Error(
+    "public WarioWare snapshot did not present a coherent XFB before the deadline; "
+    + `last snapshot: ${JSON.stringify(lastSnapshot)}`,
+  );
 }
 
 export function validatePublicWarioWareSmokeEvidence(evidence) {
@@ -156,10 +316,170 @@ export function validatePublicWarioWareSmokeEvidence(evidence) {
   if (rendering.error !== undefined && rendering.error !== null) {
     evidenceFailure("$.report.rendering.error", "expected no renderer error");
   }
+  if (!publicWarioWareSnapshotHasCoherentXfb(report)) {
+    evidenceFailure(
+      "$.report.rendering.selectedXfb",
+      "expected a selected XFB with matching VI presentation provenance",
+    );
+  }
   for (const name of ["cycles", "dispatches", "instructions"]) {
-    if (!Number.isSafeInteger(report[name]) || report[name] <= 0) {
-      evidenceFailure(`$.report.${name}`, "expected positive execution progress");
+    requirePositiveInteger(report[name], `$.report.${name}`);
+  }
+
+  const gxFifo = requiredObject(report.gxFifo, "$.report.gxFifo");
+  requirePositiveInteger(gxFifo.bytes, "$.report.gxFifo.bytes");
+  const staging = requiredObject(gxFifo.staging, "$.report.gxFifo.staging");
+  requirePositiveInteger(staging.drains, "$.report.gxFifo.staging.drains");
+  requirePositiveInteger(staging.bytes, "$.report.gxFifo.staging.bytes");
+  requireZero(staging.emergencyDrains, "$.report.gxFifo.staging.emergencyDrains");
+  requireZero(staging.pendingBytes, "$.report.gxFifo.staging.pendingBytes");
+
+  const decoder = requiredObject(gxFifo.decoder, "$.report.gxFifo.decoder");
+  for (const name of ["commands", "xfbCopyCount", "framesPresented"]) {
+    requirePositiveInteger(decoder[name], `$.report.gxFifo.decoder.${name}`);
+  }
+  const maximumBufferedBytes = requirePositiveInteger(
+    decoder.maximumBufferedBytes,
+    "$.report.gxFifo.decoder.maximumBufferedBytes",
+  );
+  if (maximumBufferedBytes !== 16 * 1024 * 1024) {
+    evidenceFailure(
+      "$.report.gxFifo.decoder.maximumBufferedBytes",
+      "expected the deployed 16 MiB decoder carry bound",
+    );
+  }
+  const capacityWatermarkBytes = requirePositiveInteger(
+    decoder.capacityWatermarkBytes,
+    "$.report.gxFifo.decoder.capacityWatermarkBytes",
+  );
+  const retryAtBufferedBytes = requirePositiveInteger(
+    decoder.retryAtBufferedBytes,
+    "$.report.gxFifo.decoder.retryAtBufferedBytes",
+  );
+  const preDecodeHighWaterBytes = requirePositiveInteger(
+    decoder.preDecodeHighWaterBytes,
+    "$.report.gxFifo.decoder.preDecodeHighWaterBytes",
+  );
+  if (
+    !Number.isSafeInteger(decoder.bufferedBytes)
+    || decoder.bufferedBytes < 0
+    || decoder.bufferedBytes > maximumBufferedBytes
+  ) {
+    evidenceFailure(
+      "$.report.gxFifo.decoder.bufferedBytes",
+      "expected a bounded non-negative decoder tail",
+    );
+  }
+  if (
+    capacityWatermarkBytes < decoder.bufferedBytes
+    || capacityWatermarkBytes > maximumBufferedBytes
+  ) {
+    evidenceFailure(
+      "$.report.gxFifo.decoder.capacityWatermarkBytes",
+      "expected a bounded watermark covering the decoder tail",
+    );
+  }
+  if (
+    preDecodeHighWaterBytes < decoder.bufferedBytes
+    || preDecodeHighWaterBytes > capacityWatermarkBytes
+  ) {
+    evidenceFailure(
+      "$.report.gxFifo.decoder.preDecodeHighWaterBytes",
+      "expected a pre-decode high-water mark covering the tail within capacity",
+    );
+  }
+  if (retryAtBufferedBytes > maximumBufferedBytes) {
+    evidenceFailure(
+      "$.report.gxFifo.decoder.retryAtBufferedBytes",
+      "expected a retry requirement within the decoder carry bound",
+    );
+  }
+  if (decoder.bufferedBytes > 0) {
+    if (
+      retryAtBufferedBytes <= decoder.bufferedBytes
+    ) {
+      evidenceFailure(
+        "$.report.gxFifo.decoder.retryAtBufferedBytes",
+        "expected an unmet bounded command requirement for the decoder tail",
+      );
     }
+  }
+  for (const name of [
+    "unknownOpcodes",
+    "displayListErrors",
+    "vertexDecodeErrors",
+  ]) {
+    requireZero(decoder[name], `$.report.gxFifo.decoder.${name}`);
+  }
+  const textures = requiredObject(decoder.textures, "$.report.gxFifo.decoder.textures");
+  requirePositiveInteger(textures.draws, "$.report.gxFifo.decoder.textures.draws");
+  requirePositiveInteger(textures.decodes, "$.report.gxFifo.decoder.textures.decodes");
+  requireZero(textures.decodeErrors, "$.report.gxFifo.decoder.textures.decodeErrors");
+  requireZero(textures.tlutErrors, "$.report.gxFifo.decoder.textures.tlutErrors");
+
+  const metrics = requiredObject(rendering.metrics, "$.report.rendering.metrics");
+  if (metrics.scope !== "current-worker") {
+    evidenceFailure("$.report.rendering.metrics.scope", "expected current-worker");
+  }
+  const workerMessages = requiredObject(
+    metrics.workerMessages,
+    "$.report.rendering.metrics.workerMessages",
+  );
+  requirePositiveInteger(
+    workerMessages.gxFrames,
+    "$.report.rendering.metrics.workerMessages.gxFrames",
+  );
+  requirePositiveInteger(
+    workerMessages.drawCalls,
+    "$.report.rendering.metrics.workerMessages.drawCalls",
+  );
+  const operations = requiredObject(
+    metrics.operations,
+    "$.report.rendering.metrics.operations",
+  );
+  requireZero(operations.pending, "$.report.rendering.metrics.operations.pending");
+  const webgpu = requiredObject(metrics.webgpu, "$.report.rendering.metrics.webgpu");
+  requirePositiveInteger(
+    webgpu.copyXfbCalls,
+    "$.report.rendering.metrics.webgpu.copyXfbCalls",
+  );
+  requirePositiveInteger(
+    webgpu.presentXfbCalls,
+    "$.report.rendering.metrics.webgpu.presentXfbCalls",
+  );
+
+  const selectedXfb = requiredObject(
+    rendering.selectedXfb,
+    "$.report.rendering.selectedXfb",
+  );
+  if (
+    selectedXfb.width !== 640
+    || selectedXfb.height !== 448
+    || selectedXfb.format !== "rgba8unorm"
+    || selectedXfb.layout !== "top-left-row-major-tight"
+    || selectedXfb.rgbaByteLength !== 640 * 448 * 4
+  ) {
+    evidenceFailure("$.report.rendering.selectedXfb", "expected a complete 640x448 RGBA8 XFB");
+  }
+  for (const [name, value] of [
+    ["rgbaSha256", selectedXfb.rgbaSha256],
+    ["rgbSha256", selectedXfb.rgbSha256],
+  ]) {
+    if (!/^[0-9a-f]{64}$/.test(value ?? "")) {
+      evidenceFailure(`$.report.rendering.selectedXfb.${name}`, "expected a SHA-256 digest");
+    }
+  }
+  const rgb = requiredObject(selectedXfb.rgb, "$.report.rendering.selectedXfb.rgb");
+  if (
+    !Number.isSafeInteger(rgb.other)
+    || rgb.other <= 0
+    || !Number.isSafeInteger(rgb.unique)
+    || rgb.unique < 2
+  ) {
+    evidenceFailure(
+      "$.report.rendering.selectedXfb.rgb",
+      "expected visible non-black content with at least two RGB values",
+    );
   }
   return evidence;
 }
@@ -171,7 +491,6 @@ function parseArguments(argv) {
     endpoint: "http://127.0.0.1:9222",
     output: null,
     pollMs: 250,
-    settleMs: 5_000,
     timeoutMs: 120_000,
     url: null,
   };
@@ -187,7 +506,6 @@ function parseArguments(argv) {
       case "--endpoint": options.endpoint = value(); break;
       case "--output": options.output = value(); break;
       case "--poll-ms": options.pollMs = Number(value()); break;
-      case "--settle-ms": options.settleMs = Number(value()); break;
       case "--timeout-ms": options.timeoutMs = Number(value()); break;
       case "--url": options.url = value(); break;
       default: throw new Error(`unknown argument ${argument}`);
@@ -197,9 +515,6 @@ function parseArguments(argv) {
   if (options.url === null) throw new Error("--url must name the public Gekko surface");
   if (!Number.isInteger(options.pollMs) || options.pollMs < 10) {
     throw new Error("--poll-ms must be an integer >= 10");
-  }
-  if (!Number.isInteger(options.settleMs) || options.settleMs < 0) {
-    throw new Error("--settle-ms must be a non-negative integer");
   }
   if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < options.pollMs) {
     throw new Error("--timeout-ms must be an integer >= --poll-ms");
@@ -259,14 +574,7 @@ async function main() {
       pollMs: options.pollMs,
       stoppedLabel: "WarioWare",
     });
-    if (Date.now() + options.settleMs >= deadline) {
-      throw new Error("public WarioWare smoke deadline expired before its settle interval");
-    }
-    await publicDelay(options.settleMs);
-    if (await requestPublicSnapshot(session) !== true) {
-      throw new Error("public WarioWare cycle runner cannot publish a snapshot");
-    }
-    const { report, state } = await waitForPublicSnapshot(session, {
+    const { report, state } = await waitForCoherentPublicWarioWareSnapshot(session, {
       deadline,
       pollMs: options.pollMs,
     });

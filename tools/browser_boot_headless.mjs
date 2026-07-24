@@ -536,6 +536,16 @@ function parseReport(text) {
   }
 }
 
+function isCompletedRunReport(report) {
+  return report !== null
+    && typeof report === "object"
+    && !Array.isArray(report)
+    && ["paused", "progress", "stopped"].includes(report.status)
+    && typeof report.stage === "string"
+    && report.stage.length > 0
+    && report.stage !== "snapshot";
+}
+
 function terminalReportFailure(report) {
   const rootError = report?.error ?? null;
   const rendererError = report?.rendering?.error ?? null;
@@ -820,7 +830,7 @@ async function main() {
         }
       }
       const report = parseReport(state.result);
-      if (report !== null) {
+      if (isCompletedRunReport(report)) {
         const reportDetectedAt = Date.now();
         const terminalRelease = await observeActiveReleaseIfPinned(
           session,
