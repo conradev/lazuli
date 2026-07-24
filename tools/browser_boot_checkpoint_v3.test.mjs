@@ -130,7 +130,7 @@ test("v3 candidate projects exactly the verified transcript and canonical tempor
   assert.equal(candidate.sha256, checkpointSha256(state));
   assert.equal(
     candidate.sha256,
-    "b1fda70448f54e03a36231d8c2b5a40d6223ffa23f90072101b0e73d16257010",
+    "1c606faae5ebb5c5fe44acca0402728720f84f18e9e858528a7470682013d3cb",
   );
   assert.deepEqual(candidate.state, state);
 });

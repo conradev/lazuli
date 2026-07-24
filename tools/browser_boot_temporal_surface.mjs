@@ -4,6 +4,7 @@ import {
   SMB_TEMPORAL_XFB_CAPACITY,
   TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
   TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3,
   temporalXfbScanoutEvidenceVersion,
 } from "./browser_boot_temporal_xfb.mjs";
 
@@ -195,6 +196,328 @@ function validateRgbCounts(rgb, path, pixelCount) {
     );
   }
   return counts;
+}
+
+function validateV3PresentationField(value, parity, path, width, height) {
+  const field = requireObject(value, path);
+  requireExact(field.field, parity, `${path}.field`);
+  const address = requireHex32(field.address, `${path}.address`);
+  const copyIndex = requirePositiveInteger(field.copyIndex, `${path}.copyIndex`);
+  const copyRow = requireNonNegativeInteger(field.copyRow, `${path}.copyRow`);
+  if (copyRow > 1) {
+    fail("envelope", `${path}.copyRow`, `expected 0 or 1, got ${copyRow}`);
+  }
+  requireExact(requirePositiveInteger(field.width, `${path}.width`), width, `${path}.width`);
+  requireExact(
+    requirePositiveInteger(field.height, `${path}.height`),
+    height,
+    `${path}.height`,
+  );
+  const scanout = validateScanoutProvenance(field, path, height);
+  requireExact(scanout.scanoutPolicy, "bob", `${path}.scanoutPolicy`);
+  requireExact(scanout.rowRepeat, 2, `${path}.rowRepeat`);
+  return { address, copyIndex, copyRow, ...scanout };
+}
+
+function validateV3EvidenceField(value, path, expected, width, height) {
+  const field = requireObject(value, path);
+  requireExact(requireHex32(field.address, `${path}.address`), expected.address, `${path}.address`);
+  requireExact(
+    requirePositiveInteger(field.generation, `${path}.generation`),
+    expected.copyIndex,
+    `${path}.generation`,
+  );
+  const row = requireNonNegativeInteger(field.row, `${path}.row`);
+  if (row > 1) fail("envelope", `${path}.row`, `expected 0 or 1, got ${row}`);
+  requireExact(row, expected.copyRow, `${path}.row`);
+  const sourceRow = requireNonNegativeInteger(field.sourceRow, `${path}.sourceRow`);
+  const textureHeight = requirePositiveInteger(field.textureHeight, `${path}.textureHeight`);
+  const logicalHeight = requirePositiveInteger(field.logicalHeight, `${path}.logicalHeight`);
+  requirePositiveInteger(field.textureWidth, `${path}.textureWidth`);
+  requireExact(
+    requirePositiveInteger(field.logicalWidth, `${path}.logicalWidth`),
+    width,
+    `${path}.logicalWidth`,
+  );
+  requireExact(
+    sourceRow,
+    Math.floor(row * textureHeight / logicalHeight),
+    `${path}.sourceRow`,
+  );
+  const scanout = validateScanoutProvenance(field, path, height);
+  requireMatchingScanoutProvenance(expected, scanout, path);
+  const lastLogicalRow = row + (scanout.fieldHeight - 1) * scanout.sourceRowStep;
+  if (lastLogicalRow >= logicalHeight) {
+    fail(
+      "provenance",
+      `${path}.fieldHeight`,
+      `last VI source row ${lastLogicalRow} exceeds logical height ${logicalHeight}`,
+    );
+  }
+  const evidenceWidth = requirePositiveInteger(field.width, `${path}.width`);
+  const evidenceHeight = requirePositiveInteger(field.height, `${path}.height`);
+  requireExact(evidenceWidth, width, `${path}.width`);
+  requireExact(evidenceHeight, scanout.fieldHeight, `${path}.height`);
+  const pixelCount = evidenceWidth * evidenceHeight;
+  requireExact(
+    requirePositiveInteger(field.rgbaByteLength, `${path}.rgbaByteLength`),
+    pixelCount * 4,
+    `${path}.rgbaByteLength`,
+  );
+  requireSha256(field.rgbaSha256, `${path}.rgbaSha256`);
+  requireSha256(field.rgbSha256, `${path}.rgbSha256`);
+  validateRgbCounts(requireObject(field.rgb, `${path}.rgb`), `${path}.rgb`, pixelCount);
+  return field;
+}
+
+function requireV3EvidenceIdentity(value, path, presentation, expectedFields) {
+  const evidence = requireObject(value, path);
+  requireExact(evidence.pairEpoch, presentation.pairEpoch, `${path}.pairEpoch`);
+  requireExact(
+    evidence.presentationMode,
+    presentation.presentationMode,
+    `${path}.presentationMode`,
+  );
+  requireExact(
+    evidence.presentationSerial,
+    presentation.presentationSerial,
+    `${path}.presentationSerial`,
+  );
+  requireExact(
+    evidence.compositionPolicy,
+    presentation.compositionPolicy,
+    `${path}.compositionPolicy`,
+  );
+  const width = requirePositiveInteger(evidence.displayWidth, `${path}.displayWidth`);
+  const height = requirePositiveInteger(evidence.displayHeight, `${path}.displayHeight`);
+  requireExact(width, presentation.width, `${path}.displayWidth`);
+  requireExact(height, presentation.height, `${path}.displayHeight`);
+  const fields = requireObject(evidence.fields, `${path}.fields`);
+  requireExactKeys(fields, ["top", "bottom"], `${path}.fields`);
+  for (const parity of ["top", "bottom"]) {
+    validateV3EvidenceField(
+      fields[parity],
+      `${path}.fields.${parity}`,
+      expectedFields[parity],
+      width,
+      height,
+    );
+  }
+  const completion = fields[presentation.completionField];
+  for (const field of [
+    "address",
+    "generation",
+    "row",
+    "sourceRow",
+    "textureWidth",
+    "textureHeight",
+    "logicalWidth",
+    "logicalHeight",
+    "scanoutPolicy",
+    "fieldStrideBytes",
+    "sourceRowStep",
+    "fieldHeight",
+    "rowRepeat",
+  ]) {
+    requireExact(evidence[field], completion[field], `${path}.${field}`);
+  }
+  requireExact(evidence.format, "rgba8unorm", `${path}.format`);
+  requireExact(evidence.layout, "top-left-row-major-tight", `${path}.layout`);
+  requireExact(requirePositiveInteger(evidence.width, `${path}.width`), width, `${path}.width`);
+  requireExact(
+    requirePositiveInteger(evidence.height, `${path}.height`),
+    height,
+    `${path}.height`,
+  );
+  const pixelCount = width * height;
+  requireExact(
+    requirePositiveInteger(evidence.rgbaByteLength, `${path}.rgbaByteLength`),
+    pixelCount * 4,
+    `${path}.rgbaByteLength`,
+  );
+  requireSha256(evidence.rgbaSha256, `${path}.rgbaSha256`);
+  requireSha256(evidence.rgbSha256, `${path}.rgbSha256`);
+  validateRgbCounts(requireObject(evidence.rgb, `${path}.rgb`), `${path}.rgb`, pixelCount);
+  return evidence;
+}
+
+function validateV3Frame(frame, index, previous) {
+  const path = framePath(index);
+  requireObject(frame, path);
+  requireExact(frame.scenario, "smb-ready-play", `${path}.scenario`);
+  requireExact(frame.step, "post-play-presented", `${path}.step`);
+  requireExact(frame.ordinal, index + 1, `${path}.ordinal`);
+  const rendererSequence = requirePositiveInteger(
+    frame.rendererSequence,
+    `${path}.rendererSequence`,
+  );
+  if (previous !== null && rendererSequence <= previous.rendererSequence) {
+    fail(
+      "ordering",
+      `${path}.rendererSequence`,
+      `expected a value greater than ${previous.rendererSequence}, got ${rendererSequence}`,
+    );
+  }
+  const presentation = requireObject(frame.presentation, `${path}.presentation`);
+  requireExact(presentation.selected, true, `${path}.presentation.selected`);
+  requireExact(
+    presentation.status,
+    "vi-interlaced-frame-ready",
+    `${path}.presentation.status`,
+  );
+  requireExact(
+    presentation.presentationMode,
+    "interlaced",
+    `${path}.presentation.presentationMode`,
+  );
+  requireExact(
+    presentation.compositionPolicy,
+    "field-pair-weave",
+    `${path}.presentation.compositionPolicy`,
+  );
+  const pairEpoch = requirePositiveInteger(
+    presentation.pairEpoch,
+    `${path}.presentation.pairEpoch`,
+  );
+  if (pairEpoch > 0xffff_ffff) {
+    fail("envelope", `${path}.presentation.pairEpoch`, "expected a positive u32");
+  }
+  const serial = requirePositiveInteger(
+    presentation.presentationSerial,
+    `${path}.presentation.presentationSerial`,
+  );
+  if (previous !== null) {
+    if (pairEpoch <= previous.presentation.pairEpoch) {
+      fail("ordering", `${path}.presentation.pairEpoch`, "pair epoch did not increase");
+    }
+    if (serial <= previous.presentation.presentationSerial) {
+      fail(
+        "ordering",
+        `${path}.presentation.presentationSerial`,
+        "presentation serial did not increase",
+      );
+    }
+  }
+  const completionField = presentation.completionField;
+  if (completionField !== "top" && completionField !== "bottom") {
+    fail(
+      "envelope",
+      `${path}.presentation.completionField`,
+      `expected "top" or "bottom", got ${describe(completionField)}`,
+    );
+  }
+  requireExact(presentation.field, completionField, `${path}.presentation.field`);
+  const width = requirePositiveInteger(presentation.width, `${path}.presentation.width`);
+  const height = requirePositiveInteger(presentation.height, `${path}.presentation.height`);
+  if (width > 1024 || height > 1024) {
+    fail("envelope", `${path}.presentation`, "dimensions exceed 1024x1024");
+  }
+  const presentationFields = requireObject(
+    presentation.fields,
+    `${path}.presentation.fields`,
+  );
+  requireExactKeys(presentationFields, ["top", "bottom"], `${path}.presentation.fields`);
+  const expectedFields = {};
+  for (const parity of ["top", "bottom"]) {
+    expectedFields[parity] = validateV3PresentationField(
+      presentationFields[parity],
+      parity,
+      `${path}.presentation.fields.${parity}`,
+      width,
+      height,
+    );
+  }
+  const completion = expectedFields[completionField];
+  requireExact(presentation.address, completion.address, `${path}.presentation.address`);
+  requireExact(presentation.copyIndex, completion.copyIndex, `${path}.presentation.copyIndex`);
+  requireExact(presentation.copyRow, completion.copyRow, `${path}.presentation.copyRow`);
+  const presentationScanout = validateScanoutProvenance(
+    presentation,
+    `${path}.presentation`,
+    height,
+  );
+  requireMatchingScanoutProvenance(
+    completion,
+    presentationScanout,
+    `${path}.presentation`,
+  );
+
+  const selected = requireV3EvidenceIdentity(
+    frame.selectedXfb,
+    `${path}.selectedXfb`,
+    presentation,
+    expectedFields,
+  );
+  const surface = requireV3EvidenceIdentity(
+    frame.presentedSurface,
+    `${path}.presentedSurface`,
+    presentation,
+    expectedFields,
+  );
+  requireExactKeys(surface, [
+    "pairEpoch",
+    "presentationMode",
+    "presentationSerial",
+    "compositionPolicy",
+    "displayWidth",
+    "displayHeight",
+    "fields",
+    "address",
+    "generation",
+    "row",
+    "sourceRow",
+    "textureWidth",
+    "textureHeight",
+    "logicalWidth",
+    "logicalHeight",
+    "scanoutPolicy",
+    "fieldStrideBytes",
+    "sourceRowStep",
+    "fieldHeight",
+    "rowRepeat",
+    "surfaceFormat",
+    "format",
+    "layout",
+    "width",
+    "height",
+    "rgbaByteLength",
+    "rgbaSha256",
+    "rgbSha256",
+    "rgb",
+  ], `${path}.presentedSurface`);
+  if (!SURFACE_FORMATS.has(surface.surfaceFormat)) {
+    fail(
+      "envelope",
+      `${path}.presentedSurface.surfaceFormat`,
+      `expected RGBA8/BGRA8 WebGPU surface format, got ${describe(surface.surfaceFormat)}`,
+    );
+  }
+  for (const parity of ["top", "bottom"]) {
+    for (const field of ["rgbaByteLength", "rgbaSha256", "rgbSha256"]) {
+      requireExact(
+        surface.fields[parity][field],
+        selected.fields[parity][field],
+        `${path}.presentedSurface.fields.${parity}.${field}`,
+      );
+    }
+    requireExact(
+      JSON.stringify(surface.fields[parity].rgb),
+      JSON.stringify(selected.fields[parity].rgb),
+      `${path}.presentedSurface.fields.${parity}.rgb`,
+    );
+  }
+  for (const field of ["rgbaByteLength", "rgbaSha256", "rgbSha256"]) {
+    requireExact(
+      surface[field],
+      selected[field],
+      `${path}.presentedSurface.${field}`,
+    );
+  }
+  requireExact(
+    JSON.stringify(surface.rgb),
+    JSON.stringify(selected.rgb),
+    `${path}.presentedSurface.rgb`,
+  );
 }
 
 function validateFrame(
@@ -460,11 +783,12 @@ export function validateTemporalPresentedSurfaceFrames(
   if (
     scanoutEvidenceVersion !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1
     && scanoutEvidenceVersion !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2
+    && scanoutEvidenceVersion !== TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3
   ) {
     fail(
       "envelope",
       "$.scanoutEvidenceVersion",
-      `expected 1 or 2, got ${describe(scanoutEvidenceVersion)}`,
+      `expected 1, 2, or 3, got ${describe(scanoutEvidenceVersion)}`,
     );
   }
   if (!Number.isSafeInteger(capacity) || capacity <= 0) {
@@ -477,12 +801,12 @@ export function validateTemporalPresentedSurfaceFrames(
     fail("envelope", "$.frames", `expected ${capacity} frames, got ${frames.length}`);
   }
   for (let index = 0; index < frames.length; index += 1) {
-    validateFrame(
-      frames[index],
-      index,
-      index === 0 ? null : frames[index - 1],
-      scanoutEvidenceVersion,
-    );
+    const previous = index === 0 ? null : frames[index - 1];
+    if (scanoutEvidenceVersion === TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3) {
+      validateV3Frame(frames[index], index, previous);
+    } else {
+      validateFrame(frames[index], index, previous, scanoutEvidenceVersion);
+    }
   }
   return frames;
 }
@@ -494,24 +818,73 @@ export function deriveTemporalPresentedSurfaceOracle(
   if (!Array.isArray(frames)) {
     fail("envelope", "$.frames", `expected an array, got ${describe(frames)}`);
   }
+  const paired = frames.length !== 0
+    && frames.every(frame => frame?.presentation?.pairEpoch !== undefined);
   const classified = frames.map(frame => {
     const surface = frame.presentedSurface;
     const pixels = surface === null ? 0 : surface.width * surface.height;
-    const matchesPresentation = surface !== null
-      && surface.address === frame.presentation.address
-      && surface.generation === frame.presentation.copyIndex
-      && surface.row === frame.presentation.copyRow
-      && surface.width === frame.presentation.width
-      && surface.height === frame.presentation.height
-      && VI_SCANOUT_PROVENANCE_FIELDS.every(
-        field => surface[field] === frame.presentation[field],
-      );
-    return {
+    let matchesPresentation;
+    let generation;
+    let fields;
+    let sourceBlackWhiteSplit;
+    if (paired) {
+      matchesPresentation = surface !== null
+        && surface.pairEpoch === frame.presentation.pairEpoch
+        && surface.presentationMode === frame.presentation.presentationMode
+        && surface.presentationSerial === frame.presentation.presentationSerial
+        && surface.compositionPolicy === frame.presentation.compositionPolicy
+        && surface.displayWidth === frame.presentation.width
+        && surface.displayHeight === frame.presentation.height
+        && ["top", "bottom"].every(parity => {
+          const actual = surface.fields?.[parity];
+          const expected = frame.presentation.fields?.[parity];
+          return actual?.address === expected?.address
+            && actual?.generation === expected?.copyIndex
+            && actual?.row === expected?.copyRow
+            && VI_SCANOUT_PROVENANCE_FIELDS.every(
+              field => actual?.[field] === expected?.[field],
+            );
+        });
+      const summarizeField = parity => {
+        const field = surface?.fields?.[parity] ?? null;
+        const fieldPixels = field === null ? 0 : field.width * field.height;
+        return {
+          address: field?.address ?? null,
+          generation: field?.generation ?? null,
+          rgbaSha256: field?.rgbaSha256 ?? null,
+          rgbSha256: field?.rgbSha256 ?? null,
+          monochrome: field !== null && field.rgb.unique === 1,
+          allBlack: field !== null && field.rgb.black === fieldPixels,
+          allWhite: field !== null && field.rgb.white === fieldPixels,
+        };
+      };
+      const top = summarizeField("top");
+      const bottom = summarizeField("bottom");
+      fields = { top, bottom };
+      sourceBlackWhiteSplit =
+        (top.allBlack && bottom.allWhite)
+        || (top.allWhite && bottom.allBlack);
+      generation = surface?.fields?.[frame.presentation.completionField]?.generation
+        ?? null;
+    } else {
+      matchesPresentation = surface !== null
+        && surface.address === frame.presentation.address
+        && surface.generation === frame.presentation.copyIndex
+        && surface.row === frame.presentation.copyRow
+        && surface.width === frame.presentation.width
+        && surface.height === frame.presentation.height
+        && VI_SCANOUT_PROVENANCE_FIELDS.every(
+          field => surface[field] === frame.presentation[field],
+        );
+      generation = surface?.generation ?? null;
+    }
+    const classifiedFrame = {
       ordinal: frame.ordinal,
       rendererSequence: frame.rendererSequence,
+      ...(paired ? { pairEpoch: frame.presentation.pairEpoch } : {}),
       presentationSerial: surface?.presentationSerial ?? null,
       copyIndex: frame.presentation.copyIndex,
-      generation: surface?.generation ?? null,
+      generation,
       rgbaSha256: surface?.rgbaSha256 ?? null,
       rgbSha256: surface?.rgbSha256 ?? null,
       captured: surface !== null,
@@ -520,6 +893,11 @@ export function deriveTemporalPresentedSurfaceOracle(
       allBlack: surface !== null && surface.rgb.black === pixels,
       allWhite: surface !== null && surface.rgb.white === pixels,
     };
+    if (paired) {
+      classifiedFrame.sourceBlackWhiteSplit = sourceBlackWhiteSplit;
+      classifiedFrame.fields = fields;
+    }
+    return classifiedFrame;
   });
   const rgbaHashes = classified
     .map(frame => frame.rgbaSha256)
@@ -535,7 +913,7 @@ export function deriveTemporalPresentedSurfaceOracle(
   const blackAndWhiteAlternate = candidates => candidates.length >= 2
     && candidates.every((frame, index) => index === 0
       || frame.allBlack !== candidates[index - 1].allBlack);
-  return {
+  const oracle = {
     captured: classified.filter(frame => frame.captured).length,
     capacity,
     complete: classified.length === capacity && classified.every(frame => frame.captured),
@@ -564,8 +942,15 @@ export function deriveTemporalPresentedSurfaceOracle(
       && adjacentFramesAlternate(classified, "rgbSha256"),
     blackWhiteAlternating: blackWhite.length === classified.length
       && blackAndWhiteAlternate(classified),
-    frames: classified,
   };
+  if (paired) {
+    oracle.distinctPairEpochs = new Set(classified.map(frame => frame.pairEpoch)).size;
+    oracle.sourceBlackWhiteSplitOrdinals = classified
+      .filter(frame => frame.sourceBlackWhiteSplit)
+      .map(frame => frame.ordinal);
+  }
+  oracle.frames = classified;
+  return oracle;
 }
 
 function deriveFlickerDiagnosticsFromClassifiedFrames(classified) {

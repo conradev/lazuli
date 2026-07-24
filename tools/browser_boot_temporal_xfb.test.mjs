@@ -9,6 +9,7 @@ import {
   SMB_TEMPORAL_XFB_CAPACITY,
   TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
   TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3,
   TemporalXfbValidationError,
   deriveTemporalSelectedXfbOracle,
   projectSmbTemporalSelectedXfb,
@@ -16,6 +17,9 @@ import {
   validateTemporalSelectedXfbFrames,
   verifySmbTemporalSelectedXfb,
 } from "./browser_boot_temporal_xfb.mjs";
+import {
+  smbReadyPlayTemporalSelectedXfb,
+} from "./browser_boot_checkpoint_v3_fixture.mjs";
 
 function digest(index) {
   return (index + 1).toString(16).padStart(64, "0");
@@ -269,6 +273,91 @@ test("v2 binds raw VI geometry to an exact integer-row bob plan", () => {
   }
 });
 
+test("v3 binds complete top/bottom ownership to one woven WebGPU presentation", () => {
+  const temporal = smbReadyPlayTemporalSelectedXfb();
+  const evidence = verifySmbTemporalSelectedXfb(temporal);
+  assert.equal(evidence.scanoutEvidenceVersion, TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3);
+  assert.equal(evidence.calibration.schema, "lazuli-temporal-xfb-calibration-vector-v3");
+  assert.equal(evidence.calibration.scanoutEvidenceVersion, 3);
+  assert.equal(evidence.oracle.distinctPairEpochs, SMB_TEMPORAL_XFB_CAPACITY);
+
+  const projected = projectSmbTemporalSelectedXfb(temporal);
+  assert.equal(projected.scanoutEvidenceVersion, 3);
+  assert.equal(projected.frames[0].presentation.status, "vi-interlaced-frame-ready");
+  assert.equal(projected.frames[0].presentation.presentationMode, "interlaced");
+  assert.equal(projected.frames[0].presentation.compositionPolicy, "field-pair-weave");
+  assert.deepEqual(Object.keys(projected.frames[0].presentation.fields), ["top", "bottom"]);
+  assert.notEqual(
+    projected.frames[0].presentation.fields.top.address,
+    projected.frames[0].presentation.fields.bottom.address,
+  );
+  assert.equal(projected.frames[0].selectedXfb.surfaceId, undefined);
+  assert.equal(projected.frames[0].selectedXfb.fields.top.surfaceId, undefined);
+});
+
+test("v3 permits black/white source fields when the woven composite is not monochrome", () => {
+  const temporal = smbReadyPlayTemporalSelectedXfb();
+  for (const [index, frame] of temporal.frames.entries()) {
+    const top = frame.selectedXfb.fields.top;
+    const bottom = frame.selectedXfb.fields.bottom;
+    const fieldPixels = top.width * top.height;
+    top.rgbaSha256 = (index + 40).toString(16).padStart(64, "0");
+    top.rgbSha256 = (index + 60).toString(16).padStart(64, "0");
+    top.rgb = { black: fieldPixels, white: 0, other: 0, unique: 1 };
+    bottom.rgbaSha256 = (index + 80).toString(16).padStart(64, "0");
+    bottom.rgbSha256 = (index + 100).toString(16).padStart(64, "0");
+    bottom.rgb = { black: 0, white: fieldPixels, other: 0, unique: 1 };
+    const compositePixels = frame.selectedXfb.width * frame.selectedXfb.height;
+    frame.selectedXfb.rgbaSha256 = (index + 120).toString(16).padStart(64, "0");
+    frame.selectedXfb.rgbSha256 = (index + 140).toString(16).padStart(64, "0");
+    frame.selectedXfb.rgb = {
+      black: compositePixels / 2,
+      white: compositePixels / 2,
+      other: 0,
+      unique: 2,
+    };
+  }
+  updateOracle(temporal);
+  const evidence = verifySmbTemporalSelectedXfb(temporal);
+  assert.deepEqual(
+    evidence.oracle.sourceBlackWhiteSplitOrdinals,
+    [1, 2, 3, 4, 5, 6, 7, 8],
+  );
+  assert.deepEqual(evidence.oracle.monochromeOrdinals, []);
+  assert.equal(evidence.oracle.blackWhiteAlternating, false);
+});
+
+test("v3 rejects cross-pair source identity and completion provenance", () => {
+  const cases = [
+    [
+      temporal => { temporal.frames[0].selectedXfb.pairEpoch += 1; },
+      /selectedXfb\.pairEpoch$/,
+    ],
+    [
+      temporal => { temporal.frames[0].selectedXfb.fields.top.generation += 1; },
+      /fields\.top\.generation$/,
+    ],
+    [
+      temporal => { temporal.frames[0].presentation.completionField = "top"; },
+      /presentation\.field$/,
+    ],
+    [
+      temporal => { temporal.frames[0].presentation.status = "vi-field-pair-awaiting"; },
+      /presentation\.status$/,
+    ],
+  ];
+  for (const [mutate, path] of cases) {
+    const temporal = smbReadyPlayTemporalSelectedXfb();
+    mutate(temporal);
+    assert.throws(
+      () => verifySmbTemporalSelectedXfb(temporal),
+      error => error instanceof TemporalXfbValidationError
+        && error.code !== "oracle-mismatch"
+        && path.test(error.path),
+    );
+  }
+});
+
 test("v2 fails closed on scanout plan, raw geometry, and version mismatches", () => {
   const cases = [
     [
@@ -310,10 +399,10 @@ test("v2 fails closed on scanout plan, raw geometry, and version mismatches", ()
   }
 
   const unknown = makeV2Temporal();
-  unknown.scanoutEvidenceVersion = 3;
+  unknown.scanoutEvidenceVersion = 4;
   expectFailure(unknown, "envelope", /scanoutEvidenceVersion$/);
   assert.throws(
-    () => validateTemporalSelectedXfbFrames(unknown.frames, unknown.capacity, 3),
+    () => validateTemporalSelectedXfbFrames(unknown.frames, unknown.capacity, 4),
     error => error instanceof TemporalXfbValidationError
       && /scanoutEvidenceVersion$/.test(error.path),
   );
@@ -410,21 +499,19 @@ test("Node recomputation stays in deep parity with the page oracle", () => {
     new URL("../crates/ppcwasmjit/examples/browser_boot.rs", import.meta.url),
     "utf8",
   );
-  const start = browserSource.indexOf("function summarizeTemporalSelectedXfb(");
-  assert.notEqual(start, -1);
-  const bodyStart = browserSource.indexOf("{", start);
-  let depth = 0;
-  let end = -1;
-  for (let index = bodyStart; index < browserSource.length; index += 1) {
-    if (browserSource[index] === "{") depth += 1;
-    if (browserSource[index] !== "}") continue;
-    depth -= 1;
-    if (depth === 0) {
-      end = index + 1;
-      break;
+  const extract = name => {
+    const start = browserSource.indexOf(`function ${name}(`);
+    assert.notEqual(start, -1, `missing ${name}`);
+    const bodyStart = browserSource.indexOf("{", start);
+    let depth = 0;
+    for (let index = bodyStart; index < browserSource.length; index += 1) {
+      if (browserSource[index] === "{") depth += 1;
+      if (browserSource[index] !== "}") continue;
+      depth -= 1;
+      if (depth === 0) return browserSource.slice(start, index + 1);
     }
-  }
-  assert.notEqual(end, -1);
+    assert.fail(`unterminated ${name}`);
+  };
   const context = vm.createContext({
     Set,
     temporalSelectedXfbCapacity: SMB_TEMPORAL_XFB_CAPACITY,
@@ -436,9 +523,14 @@ test("Node recomputation stays in deep parity with the page oracle", () => {
       "rowRepeat",
     ].every(name => left?.[name] === right?.[name]),
   });
-  vm.runInContext(browserSource.slice(start, end), context);
+  vm.runInContext([
+    "presentedFieldMatchesExpected",
+    "temporalPairedEvidenceMatches",
+    "temporalPairedFieldSummary",
+    "summarizeTemporalSelectedXfb",
+  ].map(extract).join("\n"), context);
 
-  const frames = makeFrames();
+  const frames = smbReadyPlayTemporalSelectedXfb().frames;
   const expected = deriveTemporalSelectedXfbOracle(frames);
   const actual = context.summarizeTemporalSelectedXfb(structuredClone(frames));
   assert.deepEqual(JSON.parse(JSON.stringify(actual)), expected);

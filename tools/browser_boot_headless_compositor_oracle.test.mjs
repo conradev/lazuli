@@ -157,6 +157,82 @@ function validV2Report() {
   return report;
 }
 
+function validV3Report() {
+  const report = validReport();
+  report.headlessCapture.compositor.protocol = "lazuli-compositor-capture-v3";
+  report.rendering.temporalSelectedXfb.scanoutEvidenceVersion = 3;
+  const scanout = {
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0x0a00,
+    sourceRowStep: 2,
+    fieldHeight: 224,
+    rowRepeat: 2,
+  };
+  for (let index = 0; index < 8; index += 1) {
+    const descriptor = report.headlessCapture.compositor.frames[index].descriptor;
+    const surface = report.rendering.temporalSelectedXfb.frames[index].presentedSurface;
+    const pairEpoch = 1000 + index;
+    const top = {
+      field: "top",
+      address: "0x81234000",
+      copyIndex: 500 + index * 2,
+      copyRow: 0,
+      width: WIDTH,
+      height: HEIGHT,
+      ...scanout,
+    };
+    const bottom = {
+      field: "bottom",
+      address: "0x81234567",
+      copyIndex: 501 + index * 2,
+      copyRow: 1,
+      width: WIDTH,
+      height: HEIGHT,
+      ...scanout,
+    };
+    Object.assign(descriptor, {
+      protocol: "lazuli-compositor-capture-v3",
+      pairEpoch,
+      presentationMode: "interlaced",
+      completionField: "bottom",
+      compositionPolicy: "field-pair-weave",
+      fields: { top, bottom },
+    });
+    delete descriptor.address;
+    delete descriptor.generation;
+    delete descriptor.row;
+    const presentedFields = {
+      top: {
+        address: top.address,
+        generation: top.copyIndex,
+        row: top.copyRow,
+        ...scanout,
+      },
+      bottom: {
+        address: bottom.address,
+        generation: bottom.copyIndex,
+        row: bottom.copyRow,
+        ...scanout,
+      },
+    };
+    Object.assign(surface, {
+      pairEpoch,
+      presentationMode: "interlaced",
+      compositionPolicy: "field-pair-weave",
+      fields: presentedFields,
+    });
+    report.rendering.temporalSelectedXfb.frames[index].presentation = {
+      pairEpoch,
+      presentationMode: "interlaced",
+      presentationSerial: descriptor.presentationSerial,
+      completionField: "bottom",
+      compositionPolicy: "field-pair-weave",
+      fields: { top, bottom },
+    };
+  }
+  return report;
+}
+
 test("eight exact compositor screenshots join terminal surface content", () => {
   const report = validReport();
   const oracle = verifyCompositorCaptureReport(report, { compositorCapture: true });
@@ -193,6 +269,27 @@ test("v2 compositor evidence binds exact scanout provenance while v1 remains rep
   assert.throws(
     () => verifyCompositorCaptureReport(mismatched, { compositorCapture: true }),
     /descriptor\.sourceRowStep/,
+  );
+});
+
+test("v3 compositor evidence binds each screenshot to one complete field pair", () => {
+  const report = validV3Report();
+  assert.doesNotThrow(() =>
+    verifyCompositorCaptureReport(report, { compositorCapture: true }));
+
+  const wrongEpoch = validV3Report();
+  wrongEpoch.rendering.temporalSelectedXfb.frames[0].presentedSurface.pairEpoch += 1;
+  assert.throws(
+    () => verifyCompositorCaptureReport(wrongEpoch, { compositorCapture: true }),
+    /descriptor\.pairEpoch/,
+  );
+
+  const staleTop = validV3Report();
+  staleTop.rendering.temporalSelectedXfb.frames[0]
+    .presentedSurface.fields.top.generation += 1;
+  assert.throws(
+    () => verifyCompositorCaptureReport(staleTop, { compositorCapture: true }),
+    /descriptor\.fields\.top\.copyIndex/,
   );
 });
 

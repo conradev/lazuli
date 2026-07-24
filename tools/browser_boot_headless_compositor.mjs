@@ -5,7 +5,8 @@ import { Buffer } from "node:buffer";
 import { decodeCompositorPng } from "./browser_boot_compositor_png.mjs";
 
 export const LEGACY_COMPOSITOR_CAPTURE_PROTOCOL = "lazuli-compositor-capture-v1";
-export const COMPOSITOR_CAPTURE_PROTOCOL = "lazuli-compositor-capture-v2";
+export const SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL = "lazuli-compositor-capture-v2";
+export const COMPOSITOR_CAPTURE_PROTOCOL = "lazuli-compositor-capture-v3";
 export const COMPOSITOR_CAPTURE_COUNT = 8;
 const COMPOSITOR_DEVICE_METRICS = Object.freeze({
   deviceScaleFactor: 1,
@@ -132,6 +133,7 @@ function compositorPositiveInteger(value, path) {
 function compositorProtocol(value, path) {
   if (
     value !== COMPOSITOR_CAPTURE_PROTOCOL
+    && value !== SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL
     && value !== LEGACY_COMPOSITOR_CAPTURE_PROTOCOL
   ) {
     throw compositorFailure(`${path} must be a supported compositor capture protocol`);
@@ -159,6 +161,36 @@ function validateCompositorScanout(value, path, height) {
   if (fieldStrideBytes % sourceRowStep !== 0) {
     throw compositorFailure(`${path}.fieldStrideBytes must be divisible by sourceRowStep`);
   }
+}
+
+function validateCompositorField(value, parity, path, width, height) {
+  compositorObject(value, path);
+  compositorExactKeys(value, [
+    "address",
+    "copyIndex",
+    "copyRow",
+    "field",
+    "fieldHeight",
+    "fieldStrideBytes",
+    "height",
+    "rowRepeat",
+    "scanoutPolicy",
+    "sourceRowStep",
+    "width",
+  ], path);
+  compositorExact(value.field, parity, `${path}.field`);
+  if (!/^0x[0-9a-f]{8}$/.test(value.address)) {
+    throw compositorFailure(`${path}.address must be lowercase 32-bit hexadecimal`);
+  }
+  compositorPositiveInteger(value.copyIndex, `${path}.copyIndex`);
+  const row = compositorNonNegativeInteger(value.copyRow, `${path}.copyRow`);
+  if (row > 1) throw compositorFailure(`${path}.copyRow must be 0 or 1`);
+  compositorExact(value.width, width, `${path}.width`);
+  compositorExact(value.height, height, `${path}.height`);
+  validateCompositorScanout(value, path, height);
+  compositorExact(value.scanoutPolicy, "bob", `${path}.scanoutPolicy`);
+  compositorExact(value.rowRepeat, 2, `${path}.rowRepeat`);
+  return value;
 }
 
 function compositorExact(value, expected, path) {
@@ -318,21 +350,29 @@ function validateCompositorDescriptor(pending, frames, liveGeometry) {
   compositorObject(pending, path);
   const protocol = compositorProtocol(pending.protocol, `${path}.protocol`);
   const keys = [
-    "address",
-    "generation",
     "geometry",
     "height",
     "ordinal",
     "presentationSerial",
     "protocol",
     "rendererSequence",
-    "row",
     "scenario",
     "step",
     "token",
     "width",
   ];
   if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    keys.push(
+      "completionField",
+      "compositionPolicy",
+      "fields",
+      "pairEpoch",
+      "presentationMode",
+    );
+  } else {
+    keys.push("address", "generation", "row");
+  }
+  if (protocol === SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL) {
     keys.push(
       "fieldHeight",
       "fieldStrideBytes",
@@ -352,9 +392,6 @@ function validateCompositorDescriptor(pending, frames, liveGeometry) {
   ) {
     throw compositorFailure(`${path}.token must be a non-empty bounded string`);
   }
-  if (!/^0x[0-9a-f]{8}$/.test(pending.address)) {
-    throw compositorFailure(`${path}.address must be lowercase 32-bit hexadecimal`);
-  }
   const rendererSequence = compositorPositiveInteger(
     pending.rendererSequence,
     `${path}.rendererSequence`,
@@ -363,15 +400,50 @@ function validateCompositorDescriptor(pending, frames, liveGeometry) {
     pending.presentationSerial,
     `${path}.presentationSerial`,
   );
-  compositorPositiveInteger(pending.generation, `${path}.generation`);
-  const row = compositorNonNegativeInteger(pending.row, `${path}.row`);
-  if (row > 1) throw compositorFailure(`${path}.row must be 0 or 1`);
   const width = compositorPositiveInteger(pending.width, `${path}.width`);
   const height = compositorPositiveInteger(pending.height, `${path}.height`);
   if (width > 1024 || height > 1024) {
     throw compositorFailure(`${path} dimensions exceed 1024x1024`);
   }
+  let pairEpoch = null;
   if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    compositorExact(
+      pending.presentationMode,
+      "interlaced",
+      `${path}.presentationMode`,
+    );
+    compositorExact(
+      pending.compositionPolicy,
+      "field-pair-weave",
+      `${path}.compositionPolicy`,
+    );
+    if (pending.completionField !== "top" && pending.completionField !== "bottom") {
+      throw compositorFailure(`${path}.completionField must be top or bottom`);
+    }
+    pairEpoch = compositorPositiveInteger(pending.pairEpoch, `${path}.pairEpoch`);
+    if (pairEpoch > 0xffff_ffff) {
+      throw compositorFailure(`${path}.pairEpoch must be a positive u32`);
+    }
+    const fields = compositorObject(pending.fields, `${path}.fields`);
+    compositorExactKeys(fields, ["bottom", "top"], `${path}.fields`);
+    for (const parity of ["top", "bottom"]) {
+      validateCompositorField(
+        fields[parity],
+        parity,
+        `${path}.fields.${parity}`,
+        width,
+        height,
+      );
+    }
+  } else {
+    if (!/^0x[0-9a-f]{8}$/.test(pending.address)) {
+      throw compositorFailure(`${path}.address must be lowercase 32-bit hexadecimal`);
+    }
+    compositorPositiveInteger(pending.generation, `${path}.generation`);
+    const row = compositorNonNegativeInteger(pending.row, `${path}.row`);
+    if (row > 1) throw compositorFailure(`${path}.row must be 0 or 1`);
+  }
+  if (protocol === SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL) {
     validateCompositorScanout(pending, path, height);
   }
   validateCompositorGeometry(pending.geometry, { height, width }, `${path}.geometry`);
@@ -386,6 +458,12 @@ function validateCompositorDescriptor(pending, frames, liveGeometry) {
     }
     if (presentationSerial <= previous.presentationSerial) {
       throw compositorFailure(`${path}.presentationSerial is not strictly increasing`);
+    }
+    if (
+      protocol === COMPOSITOR_CAPTURE_PROTOCOL
+      && pairEpoch <= previous.pairEpoch
+    ) {
+      throw compositorFailure(`${path}.pairEpoch is not strictly increasing`);
     }
     if (frames.some(frame => frame.descriptor.token === pending.token)) {
       throw compositorFailure(`${path}.token was already acknowledged`);

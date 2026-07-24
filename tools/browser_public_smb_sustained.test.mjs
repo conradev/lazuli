@@ -7,6 +7,10 @@ import test from "node:test";
 
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import {
+  SMB_SUSTAINED_PLAY_SCHEMA_V1,
+  SMB_SUSTAINED_PLAY_SCHEMA_V2,
+} from "./browser_boot_smb_sustained_play.mjs";
+import {
   PUBLIC_SMB_SUSTAINED_SCHEMA,
   configuredPublicSmbSustainedUrl,
   parsePublicSmbSustainedArguments,
@@ -201,10 +205,28 @@ test("public sustained evidence delegates the terminal report to the strict orac
       source: { kind: "local-file" },
     },
     rendering: { backend: "wgpu-webgpu", error: null },
+    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V2 },
   };
   assert.throws(
     () => validatePublicSmbSustainedEvidence(evidence),
     /SMB sustained PLAY invariant at \$\.status/,
+  );
+});
+
+test("public sustained evidence requires paired-field v2 cadence", () => {
+  const evidence = validEnvelope();
+  evidence.report = {
+    disc: {
+      identifier: "GMBE8P",
+      revision: 0,
+      source: { kind: "local-file" },
+    },
+    rendering: { backend: "wgpu-webgpu", error: null },
+    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V1 },
+  };
+  assert.throws(
+    () => validatePublicSmbSustainedEvidence(evidence),
+    /report\.sustainedPlay\.schema: expected lazuli-smb-sustained-play-v2/,
   );
 });
 

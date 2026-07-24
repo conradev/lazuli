@@ -89,6 +89,7 @@ function validEvidence() {
           address: "0x0041c980",
           generation: 3,
           row: 0,
+          pairEpoch: 9,
           width: 640,
           height: 448,
           format: "rgba8unorm",
@@ -102,6 +103,13 @@ function validEvidence() {
       mmioState: {
         viInterruptModel: {
           presentationCount: 11,
+          hostPresentationCount: 5,
+          lastHostPresentationField: "top",
+          lastHostPresentationAddress: "0x0041c980",
+          lastHostPresentationCopyIndex: 3,
+          lastHostPresentationCopyRow: 0,
+          lastHostPresentationPairEpoch: 9,
+          lastHostPresentationSerial: 5,
           lastPresentationAddress: "0x0041c980",
           lastPresentationCopyIndex: 3,
           lastPresentationCopyRow: 0,
@@ -114,9 +122,66 @@ function validEvidence() {
   };
 }
 
+const HOST_PRESENTATION_PROPERTIES = [
+  "lastHostPresentationField",
+  "lastHostPresentationAddress",
+  "lastHostPresentationCopyIndex",
+  "lastHostPresentationCopyRow",
+  "lastHostPresentationPairEpoch",
+  "lastHostPresentationSerial",
+];
+
+function removeExplicitHostPresentation(report) {
+  for (const property of HOST_PRESENTATION_PROPERTIES) {
+    delete report.mmioState.viInterruptModel[property];
+  }
+  delete report.mmioState.viInterruptModel.hostPresentationCount;
+}
+
+function setNoHostPresentation(report) {
+  const vi = report.mmioState.viInterruptModel;
+  vi.presentationCount = 0;
+  vi.hostPresentationCount = 0;
+  vi.lastHostPresentationField = null;
+  vi.lastHostPresentationAddress = "0x00000000";
+  vi.lastHostPresentationCopyIndex = 0;
+  vi.lastHostPresentationCopyRow = 0;
+  vi.lastHostPresentationPairEpoch = null;
+  vi.lastHostPresentationSerial = null;
+  vi.lastPresentationAddress = "0x00000000";
+  vi.lastPresentationCopyIndex = 0;
+  vi.lastPresentationCopyRow = 0;
+  report.rendering.selectedXfb = null;
+}
+
 test("public WarioWare smoke accepts a healthy release snapshot with stale SMB query", () => {
   const evidence = validEvidence();
   assert.strictEqual(validatePublicWarioWareSmokeEvidence(evidence), evidence);
+});
+
+test("public WarioWare smoke prefers explicit host presentation identity", () => {
+  const evidence = validEvidence();
+  const vi = evidence.report.mmioState.viInterruptModel;
+  vi.lastPresentationAddress = "0x00500000";
+  vi.lastPresentationCopyIndex = 99;
+  vi.lastPresentationCopyRow = 1;
+  assert.strictEqual(validatePublicWarioWareSmokeEvidence(evidence), evidence);
+});
+
+test("public WarioWare smoke accepts legacy presentation identity fixtures", () => {
+  const evidence = validEvidence();
+  removeExplicitHostPresentation(evidence.report);
+  delete evidence.report.rendering.selectedXfb.pairEpoch;
+  assert.strictEqual(validatePublicWarioWareSmokeEvidence(evidence), evidence);
+});
+
+test("public WarioWare smoke rejects partial explicit host presentation identity", () => {
+  const evidence = validEvidence();
+  delete evidence.report.mmioState.viInterruptModel.lastHostPresentationSerial;
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(evidence),
+    /expected a complete lastHostPresentation identity/,
+  );
 });
 
 test("public WarioWare runtime accepts only the exact production root", () => {
@@ -193,9 +258,21 @@ test("public WarioWare smoke rejects scenario leakage and unhealthy evidence", (
     ["VI presentation count", value => {
       value.report.mmioState.viInterruptModel.presentationCount = 0;
     }, /viInterruptModel\.presentationCount/],
+    ["VI host presentation field", value => {
+      value.report.mmioState.viInterruptModel.lastHostPresentationField = "odd";
+    }, /viInterruptModel\.lastHostPresentationField/],
+    ["VI host presentation pair epoch", value => {
+      value.report.mmioState.viInterruptModel.lastHostPresentationPairEpoch = 0;
+    }, /viInterruptModel\.lastHostPresentationPairEpoch/],
+    ["VI host presentation serial", value => {
+      value.report.mmioState.viInterruptModel.lastHostPresentationSerial = 0;
+    }, /viInterruptModel\.lastHostPresentationSerial/],
+    ["selected XFB pair epoch", value => {
+      value.report.rendering.selectedXfb.pairEpoch = 10;
+    }, /selectedXfb\.pairEpoch: expected last host presentation pair epoch 9, got 10/],
     ["VI presentation row", value => {
-      value.report.mmioState.viInterruptModel.lastPresentationCopyRow = -1;
-    }, /viInterruptModel\.lastPresentationCopyRow/],
+      value.report.mmioState.viInterruptModel.lastHostPresentationCopyRow = -1;
+    }, /viInterruptModel\.lastHostPresentationCopyRow/],
     ["selected XFB row", value => {
       value.report.rendering.selectedXfb.row = -1;
     }, /selectedXfb\.row/],
@@ -203,9 +280,9 @@ test("public WarioWare smoke rejects scenario leakage and unhealthy evidence", (
       value.report.rendering.selectedXfb.row = 1;
     }, /selectedXfb\.row: expected last VI presentation row 0, got 1/],
     ["equal out-of-range XFB rows", value => {
-      value.report.mmioState.viInterruptModel.lastPresentationCopyRow = 2;
+      value.report.mmioState.viInterruptModel.lastHostPresentationCopyRow = 2;
       value.report.rendering.selectedXfb.row = 2;
-    }, /viInterruptModel\.lastPresentationCopyRow: expected field row 0 or 1/],
+    }, /viInterruptModel\.lastHostPresentationCopyRow: expected field row 0 or 1/],
     ["progress", value => { value.report.instructions = 0; }, /report\.instructions/],
     ["FIFO progress", value => { value.report.gxFifo.decoder.commands = 0; }, /decoder\.commands/],
     ["FIFO tail bound", value => { value.report.gxFifo.decoder.bufferedBytes = -1; }, /decoder\.bufferedBytes/],
@@ -265,11 +342,7 @@ test("public WarioWare smoke accepts a bounded incomplete command tail", () => {
 
 test("public WarioWare snapshot wait retries early null then accepts generation 3", async () => {
   const early = structuredClone(validEvidence().report);
-  early.mmioState.viInterruptModel.presentationCount = 0;
-  early.mmioState.viInterruptModel.lastPresentationAddress = "0x00000000";
-  early.mmioState.viInterruptModel.lastPresentationCopyIndex = 0;
-  early.mmioState.viInterruptModel.lastPresentationCopyRow = 0;
-  early.rendering.selectedXfb = null;
+  setNoHostPresentation(early);
   const ready = structuredClone(validEvidence().report);
   const snapshots = [
     { report: early, state: { attempt: "early-null" } },
@@ -316,11 +389,8 @@ test("public WarioWare snapshot wait hard-fails mismatched presentation provenan
 
 test("public WarioWare snapshot wait does not retry terminal snapshot errors", async () => {
   const report = structuredClone(validEvidence().report);
+  setNoHostPresentation(report);
   report.mmioState.viInterruptModel.presentationCount = 4;
-  report.mmioState.viInterruptModel.lastPresentationAddress = "0x00000000";
-  report.mmioState.viInterruptModel.lastPresentationCopyIndex = 0;
-  report.mmioState.viInterruptModel.lastPresentationCopyRow = 0;
-  report.rendering.selectedXfb = null;
   report.error = "terminal renderer failure";
   let captures = 0;
   await assert.rejects(
@@ -351,11 +421,8 @@ test("public WarioWare snapshot wait hard-fails renderer fallback and backend er
     ],
   ]) {
     const report = structuredClone(validEvidence().report);
+    setNoHostPresentation(report);
     report.mmioState.viInterruptModel.presentationCount = 4;
-    report.mmioState.viInterruptModel.lastPresentationAddress = "0x00000000";
-    report.mmioState.viInterruptModel.lastPresentationCopyIndex = 0;
-    report.mmioState.viInterruptModel.lastPresentationCopyRow = 0;
-    report.rendering.selectedXfb = null;
     mutate(report);
     let captures = 0;
     await assert.rejects(
@@ -377,11 +444,8 @@ test("public WarioWare snapshot wait hard-fails renderer fallback and backend er
 
 test("public WarioWare snapshot wait reports its last state at the deadline", async () => {
   const report = structuredClone(validEvidence().report);
+  setNoHostPresentation(report);
   report.mmioState.viInterruptModel.presentationCount = 4;
-  report.mmioState.viInterruptModel.lastPresentationAddress = "0x00000000";
-  report.mmioState.viInterruptModel.lastPresentationCopyIndex = 0;
-  report.mmioState.viInterruptModel.lastPresentationCopyRow = 0;
-  report.rendering.selectedXfb = null;
   let clockReads = 0;
   await assert.rejects(
     waitForCoherentPublicWarioWareSnapshot(null, {
@@ -404,11 +468,8 @@ test("public WarioWare snapshot wait reports its last state at the deadline", as
 
 test("public WarioWare snapshot wait preserves a production-shaped retry on inner timeout", async () => {
   const report = structuredClone(validEvidence().report);
+  setNoHostPresentation(report);
   report.mmioState.viInterruptModel.presentationCount = 4;
-  report.mmioState.viInterruptModel.lastPresentationAddress = "0x00000000";
-  report.mmioState.viInterruptModel.lastPresentationCopyIndex = 0;
-  report.mmioState.viInterruptModel.lastPresentationCopyRow = 0;
-  report.rendering.selectedXfb = null;
   const state = {
     dataset: { renderer: "wgpu-webgpu", status: "running" },
     discStatus: "local: WarioWare, Inc. - Mega Party Game$! (USA).ciso",

@@ -16,6 +16,7 @@ import {
 } from "./browser_boot_gameplay_transcript.mjs";
 import {
   SMB_TEMPORAL_XFB_CAPACITY,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3,
   projectSmbTemporalSelectedXfb,
 } from "./browser_boot_temporal_xfb.mjs";
 
@@ -307,25 +308,29 @@ function validateTerminalPresentation(report, rendering, temporalSelectedXfb, sy
     "$.rendering.selectedXfb",
   );
   for (const field of [
+    "pairEpoch",
+    "presentationMode",
+    "presentationSerial",
+    "compositionPolicy",
+    "displayWidth",
+    "displayHeight",
     "address",
     "generation",
     "row",
-    "format",
-    "layout",
     "sourceRow",
-    "width",
-    "height",
     "textureWidth",
     "textureHeight",
     "logicalWidth",
     "logicalHeight",
-    "displayWidth",
-    "displayHeight",
     "scanoutPolicy",
     "fieldStrideBytes",
     "sourceRowStep",
     "fieldHeight",
     "rowRepeat",
+    "format",
+    "layout",
+    "width",
+    "height",
     "rgbaByteLength",
     "rgbaSha256",
     "rgbSha256",
@@ -335,6 +340,54 @@ function validateTerminalPresentation(report, rendering, temporalSelectedXfb, sy
       lastFrame.selectedXfb[field],
       `$.rendering.selectedXfb.${field}`,
     );
+  }
+  const selectedFields = requireCheckpointObject(
+    selected.fields,
+    "$.rendering.selectedXfb.fields",
+  );
+  for (const parity of ["top", "bottom"]) {
+    const actual = requireCheckpointObject(
+      selectedFields[parity],
+      `$.rendering.selectedXfb.fields.${parity}`,
+    );
+    const expected = lastFrame.selectedXfb.fields[parity];
+    for (const field of [
+      "address",
+      "generation",
+      "row",
+      "sourceRow",
+      "textureWidth",
+      "textureHeight",
+      "logicalWidth",
+      "logicalHeight",
+      "scanoutPolicy",
+      "fieldStrideBytes",
+      "sourceRowStep",
+      "fieldHeight",
+      "rowRepeat",
+      "width",
+      "height",
+      "rgbaByteLength",
+      "rgbaSha256",
+      "rgbSha256",
+    ]) {
+      requireExact(
+        actual[field],
+        expected[field],
+        `$.rendering.selectedXfb.fields.${parity}.${field}`,
+      );
+    }
+    const actualRgb = requireCheckpointObject(
+      actual.rgb,
+      `$.rendering.selectedXfb.fields.${parity}.rgb`,
+    );
+    for (const field of ["black", "white", "other", "unique"]) {
+      requireExact(
+        actualRgb[field],
+        expected.rgb[field],
+        `$.rendering.selectedXfb.fields.${parity}.rgb.${field}`,
+      );
+    }
   }
   const selectedRgb = requireCheckpointObject(selected.rgb, "$.rendering.selectedXfb.rgb");
   for (const field of ["black", "white", "other", "unique"]) {
@@ -397,6 +450,11 @@ function validateCheckpointEvidence(report, expected) {
   );
   const temporalSelectedXfb = projectSmbTemporalSelectedXfb(
     renderer.rendering.temporalSelectedXfb,
+  );
+  requireExact(
+    temporalSelectedXfb.scanoutEvidenceVersion,
+    TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3,
+    "$.rendering.temporalSelectedXfb.scanoutEvidenceVersion",
   );
   requireExact(
     temporalSelectedXfb.capacity,

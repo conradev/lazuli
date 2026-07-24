@@ -6,7 +6,7 @@ import {
 } from "./browser_boot_gameplay_transcript_fixture.mjs";
 import {
   SMB_TEMPORAL_XFB_CAPACITY,
-  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3,
   deriveTemporalSelectedXfbOracle,
 } from "./browser_boot_temporal_xfb.mjs";
 
@@ -15,34 +15,87 @@ function digest(index) {
 }
 
 function temporalFrame(index) {
-  const bottom = index % 2 === 1;
-  const generation = 500 + index;
   const width = 640;
-  const textureHeight = 448;
-  const sourceRow = bottom ? 1 : 0;
   const height = 448;
-  const pixels = width * height;
-  const address = bottom ? "0x00307180" : "0x00306c80";
+  const fieldHeight = 224;
+  const pairEpoch = 1000 + index;
+  const presentationSerial = 2000 + index;
   const scanout = {
     scanoutPolicy: "bob",
     fieldStrideBytes: 0xa00,
     sourceRowStep: 2,
-    fieldHeight: 224,
+    fieldHeight,
     rowRepeat: 2,
   };
+  const presentationFields = {
+    top: {
+      field: "top",
+      address: "0x00306c80",
+      copyIndex: 500 + index * 2,
+      copyRow: 0,
+      width,
+      height,
+      ...scanout,
+    },
+    bottom: {
+      field: "bottom",
+      address: "0x00307180",
+      copyIndex: 501 + index * 2,
+      copyRow: 1,
+      width,
+      height,
+      ...scanout,
+    },
+  };
+  const evidenceField = (parity, digestBase) => {
+    const expected = presentationFields[parity];
+    const pixels = width * fieldHeight;
+    return {
+      address: expected.address,
+      generation: expected.copyIndex,
+      row: expected.copyRow,
+      sourceRow: expected.copyRow,
+      surfaceId: parity === "top" ? 1 : 2,
+      textureWidth: width,
+      textureHeight: height,
+      logicalWidth: width,
+      logicalHeight: height,
+      ...scanout,
+      width,
+      height: fieldHeight,
+      rgbaByteLength: pixels * 4,
+      rgbaSha256: digest(digestBase),
+      rgbSha256: digest(digestBase + 32),
+      rgb: { black: 0, white: 0, other: pixels, unique: 4 },
+    };
+  };
+  const compositePixels = width * height;
+  const completion = presentationFields.bottom;
+  const selectedFields = {
+    top: evidenceField("top", 100 + index * 2),
+    bottom: evidenceField("bottom", 101 + index * 2),
+  };
+  const legacy = selectedFields.bottom;
   return {
     scenario: "smb-ready-play",
     step: "post-play-presented",
     ordinal: index + 1,
-    rendererSequence: 393 + index,
+    rendererSequence: 386 + index * 2,
     presentation: {
       selected: true,
-      field: bottom ? "bottom" : "top",
-      address,
-      copyIndex: generation,
-      copyRow: sourceRow,
+      status: "vi-interlaced-frame-ready",
+      presentationMode: "interlaced",
+      pairEpoch,
+      presentationSerial,
+      completionField: "bottom",
+      compositionPolicy: "field-pair-weave",
+      fields: presentationFields,
+      field: "bottom",
+      address: completion.address,
+      copyIndex: completion.copyIndex,
+      copyRow: completion.copyRow,
       width,
-      height: textureHeight,
+      height,
       pictureConfiguration: 0x2850,
       wordsPerLine: 40,
       standardWordsPerLine: 80,
@@ -51,25 +104,34 @@ function temporalFrame(index) {
       ...scanout,
     },
     selectedXfb: {
-      address,
-      generation,
-      row: sourceRow,
+      pairEpoch,
+      presentationMode: "interlaced",
+      presentationSerial,
+      compositionPolicy: "field-pair-weave",
+      displayWidth: width,
+      displayHeight: height,
+      fields: selectedFields,
+      address: legacy.address,
+      generation: legacy.generation,
+      row: legacy.row,
+      sourceRow: legacy.sourceRow,
+      textureWidth: legacy.textureWidth,
+      textureHeight: legacy.textureHeight,
+      logicalWidth: legacy.logicalWidth,
+      logicalHeight: legacy.logicalHeight,
+      scanoutPolicy: legacy.scanoutPolicy,
+      fieldStrideBytes: legacy.fieldStrideBytes,
+      sourceRowStep: legacy.sourceRowStep,
+      fieldHeight: legacy.fieldHeight,
+      rowRepeat: legacy.rowRepeat,
       format: "rgba8unorm",
       layout: "top-left-row-major-tight",
-      sourceRow,
       width,
       height,
-      textureWidth: width,
-      textureHeight,
-      logicalWidth: width,
-      logicalHeight: textureHeight,
-      displayWidth: width,
-      displayHeight: textureHeight,
-      ...scanout,
-      rgbaByteLength: pixels * 4,
+      rgbaByteLength: compositePixels * 4,
       rgbaSha256: digest(index + 1),
       rgbSha256: digest(index + 17),
-      rgb: { black: 0, white: 0, other: pixels, unique: 4 },
+      rgb: { black: 0, white: 0, other: compositePixels, unique: 4 },
     },
   };
 }
@@ -80,7 +142,7 @@ export function smbReadyPlayTemporalSelectedXfb() {
     (_unused, index) => temporalFrame(index),
   );
   return {
-    scanoutEvidenceVersion: TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
+    scanoutEvidenceVersion: TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3,
     capacity: SMB_TEMPORAL_XFB_CAPACITY,
     frames,
     oracle: deriveTemporalSelectedXfbOracle(frames),

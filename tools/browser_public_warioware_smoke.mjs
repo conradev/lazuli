@@ -58,6 +58,64 @@ function requireFieldRow(value, path) {
   return value;
 }
 
+function requirePositiveU32(value, path) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 0xffff_ffff) {
+    evidenceFailure(path, "expected a positive u32");
+  }
+  return value;
+}
+
+const HOST_PRESENTATION_PROPERTIES = [
+  "lastHostPresentationField",
+  "lastHostPresentationAddress",
+  "lastHostPresentationCopyIndex",
+  "lastHostPresentationCopyRow",
+  "lastHostPresentationPairEpoch",
+  "lastHostPresentationSerial",
+];
+
+function viPresentationIdentity(vi) {
+  const root = "$.report.mmioState.viInterruptModel";
+  const explicitProperties = HOST_PRESENTATION_PROPERTIES.filter(property =>
+    Object.prototype.hasOwnProperty.call(vi, property)
+  );
+  if (
+    explicitProperties.length !== 0
+    && explicitProperties.length !== HOST_PRESENTATION_PROPERTIES.length
+  ) {
+    evidenceFailure(
+      root,
+      "expected a complete lastHostPresentation identity",
+    );
+  }
+  if (explicitProperties.length === HOST_PRESENTATION_PROPERTIES.length) {
+    return {
+      explicit: true,
+      field: vi.lastHostPresentationField,
+      fieldPath: `${root}.lastHostPresentationField`,
+      address: vi.lastHostPresentationAddress,
+      addressPath: `${root}.lastHostPresentationAddress`,
+      copyIndex: vi.lastHostPresentationCopyIndex,
+      copyIndexPath: `${root}.lastHostPresentationCopyIndex`,
+      copyRow: vi.lastHostPresentationCopyRow,
+      copyRowPath: `${root}.lastHostPresentationCopyRow`,
+      pairEpoch: vi.lastHostPresentationPairEpoch,
+      pairEpochPath: `${root}.lastHostPresentationPairEpoch`,
+      serial: vi.lastHostPresentationSerial,
+      serialPath: `${root}.lastHostPresentationSerial`,
+    };
+  }
+  return {
+    explicit: false,
+    address: vi.lastPresentationAddress,
+    addressPath: `${root}.lastPresentationAddress`,
+    copyIndex: vi.lastPresentationCopyIndex,
+    copyIndexPath: `${root}.lastPresentationCopyIndex`,
+    copyRow: vi.lastPresentationCopyRow,
+    copyRowPath: `${root}.lastPresentationCopyRow`,
+  };
+}
+
 function requireZero(value, path) {
   if (value !== 0) evidenceFailure(path, "expected zero");
 }
@@ -118,7 +176,8 @@ export function publicWarioWareSnapshotHasCoherentXfb(report) {
     evidenceFailure("$.report.rendering.error", "expected no renderer error");
   }
   const selectedXfb = rendering.selectedXfb;
-  const copyIndex = vi.lastPresentationCopyIndex;
+  const presentation = viPresentationIdentity(vi);
+  const copyIndex = presentation.copyIndex;
   if (selectedXfb === null && copyIndex === 0) return false;
   if (selectedXfb === null) {
     evidenceFailure(
@@ -131,17 +190,52 @@ export function publicWarioWareSnapshotHasCoherentXfb(report) {
     presentationCount,
     "$.report.mmioState.viInterruptModel.presentationCount",
   );
-  const address = vi.lastPresentationAddress;
+  const address = presentation.address;
   if (typeof address !== "string" || !/^0x[0-9a-f]{8}$/.test(address)) {
     evidenceFailure(
-      "$.report.mmioState.viInterruptModel.lastPresentationAddress",
+      presentation.addressPath,
       "expected a lowercase 32-bit hexadecimal address",
     );
   }
   requirePositiveInteger(
     copyIndex,
-    "$.report.mmioState.viInterruptModel.lastPresentationCopyIndex",
+    presentation.copyIndexPath,
   );
+  if (presentation.explicit) {
+    if (presentation.field !== "top" && presentation.field !== "bottom") {
+      evidenceFailure(
+        presentation.fieldPath,
+        "expected top or bottom",
+      );
+    }
+    const pairEpoch = requirePositiveU32(
+      presentation.pairEpoch,
+      presentation.pairEpochPath,
+    );
+    requirePositiveInteger(presentation.serial, presentation.serialPath);
+    const selectedPairEpoch = requirePositiveU32(
+      selectedXfb.pairEpoch,
+      "$.report.rendering.selectedXfb.pairEpoch",
+    );
+    if (selectedPairEpoch !== pairEpoch) {
+      evidenceFailure(
+        "$.report.rendering.selectedXfb.pairEpoch",
+        `expected last host presentation pair epoch ${pairEpoch}, got ${selectedPairEpoch}`,
+      );
+    }
+    if (selectedXfb.presentationSerial !== undefined) {
+      const selectedSerial = requirePositiveInteger(
+        selectedXfb.presentationSerial,
+        "$.report.rendering.selectedXfb.presentationSerial",
+      );
+      if (selectedSerial !== presentation.serial) {
+        evidenceFailure(
+          "$.report.rendering.selectedXfb.presentationSerial",
+          `expected last host presentation serial ${presentation.serial}, got ${selectedSerial}`,
+        );
+      }
+    }
+  }
   if (
     typeof selectedXfb.address !== "string"
     || !/^0x[0-9a-f]{8}$/.test(selectedXfb.address)
@@ -168,8 +262,8 @@ export function publicWarioWareSnapshotHasCoherentXfb(report) {
     );
   }
   const copyRow = requireFieldRow(
-    vi.lastPresentationCopyRow,
-    "$.report.mmioState.viInterruptModel.lastPresentationCopyRow",
+    presentation.copyRow,
+    presentation.copyRowPath,
   );
   const selectedRow = requireFieldRow(
     selectedXfb.row,

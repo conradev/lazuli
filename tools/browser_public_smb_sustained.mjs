@@ -12,7 +12,10 @@ import {
   deriveSmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
 import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
-import { verifySmbSustainedPlay } from "./browser_boot_smb_sustained_play.mjs";
+import {
+  SMB_SUSTAINED_PLAY_SCHEMA_V2,
+  verifySmbSustainedPlay,
+} from "./browser_boot_smb_sustained_play.mjs";
 import {
   assignPublicDisc,
   expectedPublicFrameUrl,
@@ -245,6 +248,12 @@ export function validatePublicSmbSustainedEvidence(evidence) {
   }
   if (report.rendering?.error !== undefined && report.rendering.error !== null) {
     evidenceFailure("$.report.rendering.error", "expected no renderer error");
+  }
+  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V2) {
+    evidenceFailure(
+      "$.report.sustainedPlay.schema",
+      `expected ${SMB_SUSTAINED_PLAY_SCHEMA_V2}`,
+    );
   }
   const derived = verifySmbSustainedPlay(report);
   exactJson(

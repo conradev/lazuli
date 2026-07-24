@@ -83,6 +83,54 @@ function descriptor(geometry = compositorGeometry()) {
   };
 }
 
+function pairedDescriptor(geometry = compositorGeometry()) {
+  const width = geometry.canvas.bufferWidth;
+  const height = geometry.canvas.bufferHeight;
+  const scanout = {
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0x0a00,
+    sourceRowStep: 2,
+    fieldHeight: height / 2,
+    rowRepeat: 2,
+  };
+  return {
+    protocol: "lazuli-compositor-capture-v3",
+    token: "run-1:1:42",
+    scenario: "smb-ready-play",
+    step: "post-play-presented",
+    ordinal: 1,
+    rendererSequence: 41,
+    presentationSerial: 42,
+    pairEpoch: 21,
+    presentationMode: "interlaced",
+    completionField: "bottom",
+    compositionPolicy: "field-pair-weave",
+    fields: {
+      top: {
+        field: "top",
+        address: "0x81234000",
+        copyIndex: 16,
+        copyRow: 0,
+        width,
+        height,
+        ...scanout,
+      },
+      bottom: {
+        field: "bottom",
+        address: "0x81234567",
+        copyIndex: 17,
+        copyRow: 1,
+        width,
+        height,
+        ...scanout,
+      },
+    },
+    width,
+    height,
+    geometry,
+  };
+}
+
 test("compositor viewport commands are exact and reversible", async () => {
   const calls = [];
   const session = {
@@ -159,15 +207,7 @@ test("pending compositor frames use an exact pinned CDP canvas screenshot", asyn
   assert.equal(capture.baselineLayout, null);
   assert.strictEqual(capture.viewport, geometry.viewport);
   let acknowledged = null;
-  const pending = {
-    ...descriptor(geometry),
-    protocol: "lazuli-compositor-capture-v2",
-    scanoutPolicy: "bob",
-    fieldStrideBytes: 0x0a00,
-    sourceRowStep: 2,
-    fieldHeight: 224,
-    rowRepeat: 2,
-  };
+  const pending = pairedDescriptor(geometry);
   const evidence = await capturePendingCompositorFrame(
     session,
     capture,
@@ -241,7 +281,7 @@ test("pending compositor frames use an exact pinned CDP canvas screenshot", asyn
     loaderId: "loader-fresh",
     oracle: null,
     oraclePassed: false,
-    protocol: "lazuli-compositor-capture-v2",
+    protocol: "lazuli-compositor-capture-v3",
     schemaValid: false,
     target: "#display",
     url: runUrl,

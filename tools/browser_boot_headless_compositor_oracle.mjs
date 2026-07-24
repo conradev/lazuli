@@ -4,6 +4,7 @@ import {
   COMPOSITOR_CAPTURE_COUNT,
   COMPOSITOR_CAPTURE_PROTOCOL,
   LEGACY_COMPOSITOR_CAPTURE_PROTOCOL,
+  SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL,
   compositorFailure,
 } from "./browser_boot_headless_compositor.mjs";
 
@@ -56,6 +57,7 @@ function positiveInteger(value, path) {
 function captureProtocol(value, path) {
   if (
     value !== COMPOSITOR_CAPTURE_PROTOCOL
+    && value !== SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL
     && value !== LEGACY_COMPOSITOR_CAPTURE_PROTOCOL
   ) {
     throw compositorFailure(`${path} must be a supported compositor capture protocol`);
@@ -76,6 +78,36 @@ function validateScanout(value, path, height) {
   if (fieldStrideBytes % sourceRowStep !== 0) {
     throw compositorFailure(`${path}.fieldStrideBytes must be divisible by sourceRowStep`);
   }
+}
+
+function validateDescriptorField(value, parity, path, width, height) {
+  object(value, path);
+  exactKeys(value, [
+    "address",
+    "copyIndex",
+    "copyRow",
+    "field",
+    "fieldHeight",
+    "fieldStrideBytes",
+    "height",
+    "rowRepeat",
+    "scanoutPolicy",
+    "sourceRowStep",
+    "width",
+  ], path);
+  exact(value.field, parity, `${path}.field`);
+  if (typeof value.address !== "string" || !LOWERCASE_HEX_32.test(value.address)) {
+    throw compositorFailure(`${path}.address must be lowercase 32-bit hexadecimal`);
+  }
+  positiveInteger(value.copyIndex, `${path}.copyIndex`);
+  const row = nonNegativeInteger(value.copyRow, `${path}.copyRow`);
+  if (row > 1) throw compositorFailure(`${path}.copyRow must be 0 or 1`);
+  exact(value.width, width, `${path}.width`);
+  exact(value.height, height, `${path}.height`);
+  validateScanout(value, path, height);
+  exact(value.scanoutPolicy, "bob", `${path}.scanoutPolicy`);
+  exact(value.rowRepeat, 2, `${path}.rowRepeat`);
+  return value;
 }
 
 function finite(value, path) {
@@ -234,21 +266,29 @@ function validateGeometry(geometry, path, width, height) {
 function validateDescriptor(descriptor, path, index, previous, protocol) {
   object(descriptor, path);
   const keys = [
-    "address",
-    "generation",
     "geometry",
     "height",
     "ordinal",
     "presentationSerial",
     "protocol",
     "rendererSequence",
-    "row",
     "scenario",
     "step",
     "token",
     "width",
   ];
   if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    keys.push(
+      "completionField",
+      "compositionPolicy",
+      "fields",
+      "pairEpoch",
+      "presentationMode",
+    );
+  } else {
+    keys.push("address", "generation", "row");
+  }
+  if (protocol === SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL) {
     keys.push(
       "fieldHeight",
       "fieldStrideBytes",
@@ -269,20 +309,45 @@ function validateDescriptor(descriptor, path, index, previous, protocol) {
   ) {
     throw compositorFailure(`${path}.token must be a non-empty bounded string`);
   }
-  if (typeof descriptor.address !== "string" || !LOWERCASE_HEX_32.test(descriptor.address)) {
-    throw compositorFailure(`${path}.address must be lowercase 32-bit hexadecimal`);
-  }
   positiveInteger(descriptor.rendererSequence, `${path}.rendererSequence`);
   positiveInteger(descriptor.presentationSerial, `${path}.presentationSerial`);
-  positiveInteger(descriptor.generation, `${path}.generation`);
-  const row = nonNegativeInteger(descriptor.row, `${path}.row`);
-  if (row > 1) throw compositorFailure(`${path}.row must be 0 or 1`);
   const width = positiveInteger(descriptor.width, `${path}.width`);
   const height = positiveInteger(descriptor.height, `${path}.height`);
   if (width > 1024 || height > 1024) {
     throw compositorFailure(`${path} dimensions exceed 1024x1024`);
   }
-  if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) validateScanout(descriptor, path, height);
+  if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+    exact(descriptor.presentationMode, "interlaced", `${path}.presentationMode`);
+    exact(descriptor.compositionPolicy, "field-pair-weave", `${path}.compositionPolicy`);
+    if (descriptor.completionField !== "top" && descriptor.completionField !== "bottom") {
+      throw compositorFailure(`${path}.completionField must be top or bottom`);
+    }
+    const pairEpoch = positiveInteger(descriptor.pairEpoch, `${path}.pairEpoch`);
+    if (pairEpoch > 0xffff_ffff) {
+      throw compositorFailure(`${path}.pairEpoch must be a positive u32`);
+    }
+    const fields = object(descriptor.fields, `${path}.fields`);
+    exactKeys(fields, ["bottom", "top"], `${path}.fields`);
+    for (const parity of ["top", "bottom"]) {
+      validateDescriptorField(
+        fields[parity],
+        parity,
+        `${path}.fields.${parity}`,
+        width,
+        height,
+      );
+    }
+  } else {
+    if (typeof descriptor.address !== "string" || !LOWERCASE_HEX_32.test(descriptor.address)) {
+      throw compositorFailure(`${path}.address must be lowercase 32-bit hexadecimal`);
+    }
+    positiveInteger(descriptor.generation, `${path}.generation`);
+    const row = nonNegativeInteger(descriptor.row, `${path}.row`);
+    if (row > 1) throw compositorFailure(`${path}.row must be 0 or 1`);
+  }
+  if (protocol === SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL) {
+    validateScanout(descriptor, path, height);
+  }
   validateGeometry(descriptor.geometry, `${path}.geometry`, width, height);
   if (previous !== null) {
     if (descriptor.rendererSequence <= previous.rendererSequence) {
@@ -290,6 +355,12 @@ function validateDescriptor(descriptor, path, index, previous, protocol) {
     }
     if (descriptor.presentationSerial <= previous.presentationSerial) {
       throw compositorFailure(`${path}.presentationSerial is not strictly increasing`);
+    }
+    if (
+      protocol === COMPOSITOR_CAPTURE_PROTOCOL
+      && descriptor.pairEpoch <= previous.pairEpoch
+    ) {
+      throw compositorFailure(`${path}.pairEpoch is not strictly increasing`);
     }
     if (descriptor.token === previous.token) {
       throw compositorFailure(`${path}.token was already acknowledged`);
@@ -450,6 +521,12 @@ export function verifyCompositorCaptureReport(report, options) {
   if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
     exact(
       report.rendering?.temporalSelectedXfb?.scanoutEvidenceVersion,
+      3,
+      "$.rendering.temporalSelectedXfb.scanoutEvidenceVersion",
+    );
+  } else if (protocol === SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL) {
+    exact(
+      report.rendering?.temporalSelectedXfb?.scanoutEvidenceVersion,
       2,
       "$.rendering.temporalSelectedXfb.scanoutEvidenceVersion",
     );
@@ -516,18 +593,68 @@ export function verifyCompositorCaptureReport(report, options) {
       terminal.rendererSequence,
       `${path}.descriptor.rendererSequence`,
     );
-    for (const field of ["address", "generation", "row", "width", "height"]) {
-      exact(descriptor[field], surface[field], `${path}.descriptor.${field}`);
-    }
     if (protocol === COMPOSITOR_CAPTURE_PROTOCOL) {
+      const presentation = object(terminal.presentation, `${path}.presentation`);
       for (const field of [
-        "fieldHeight",
-        "fieldStrideBytes",
-        "rowRepeat",
-        "scanoutPolicy",
-        "sourceRowStep",
+        "pairEpoch",
+        "presentationMode",
+        "completionField",
+        "compositionPolicy",
+        "presentationSerial",
+      ]) {
+        exact(descriptor[field], presentation[field], `${path}.descriptor.${field}`);
+      }
+      for (const field of [
+        "pairEpoch",
+        "presentationMode",
+        "compositionPolicy",
+        "presentationSerial",
       ]) {
         exact(descriptor[field], surface[field], `${path}.descriptor.${field}`);
+      }
+      exact(descriptor.width, surface.width, `${path}.descriptor.width`);
+      exact(descriptor.height, surface.height, `${path}.descriptor.height`);
+      for (const parity of ["top", "bottom"]) {
+        const expected = descriptor.fields[parity];
+        const presented = object(
+          surface.fields?.[parity],
+          `${path}.presentedSurface.fields.${parity}`,
+        );
+        exact(expected.address, presented.address, `${path}.descriptor.fields.${parity}.address`);
+        exact(
+          expected.copyIndex,
+          presented.generation,
+          `${path}.descriptor.fields.${parity}.copyIndex`,
+        );
+        exact(expected.copyRow, presented.row, `${path}.descriptor.fields.${parity}.copyRow`);
+        for (const field of [
+          "fieldHeight",
+          "fieldStrideBytes",
+          "rowRepeat",
+          "scanoutPolicy",
+          "sourceRowStep",
+        ]) {
+          exact(
+            expected[field],
+            presented[field],
+            `${path}.descriptor.fields.${parity}.${field}`,
+          );
+        }
+      }
+    } else {
+      for (const field of ["address", "generation", "row", "width", "height"]) {
+        exact(descriptor[field], surface[field], `${path}.descriptor.${field}`);
+      }
+      if (protocol === SCANOUT_COMPOSITOR_CAPTURE_PROTOCOL) {
+        for (const field of [
+          "fieldHeight",
+          "fieldStrideBytes",
+          "rowRepeat",
+          "scanoutPolicy",
+          "sourceRowStep",
+        ]) {
+          exact(descriptor[field], surface[field], `${path}.descriptor.${field}`);
+        }
       }
     }
     exact(

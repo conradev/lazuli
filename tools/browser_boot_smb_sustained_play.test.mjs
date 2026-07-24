@@ -12,6 +12,7 @@ import {
 } from "./browser_boot_temporal_surface.mjs";
 import {
   SMB_SUSTAINED_PLAY_SCHEMA_V1,
+  SMB_SUSTAINED_PLAY_SCHEMA_V2,
   SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
   SmbSustainedPlayValidationError,
   deriveSmbSustainedPlayOracle,
@@ -94,40 +95,39 @@ function receipt(index) {
   };
 }
 
+function pairedReceipt(index) {
+  const value = receipt(index);
+  const pairCompleting = index % 2 === 1;
+  return {
+    ...value,
+    accepted: true,
+    presented: pairCompleting,
+    status: pairCompleting
+      ? "vi-interlaced-frame-ready"
+      : "vi-field-pair-awaiting",
+    pairEpoch: 500 + Math.floor(index / 2),
+    presentationSerial: pairCompleting ? 900 + Math.floor(index / 2) : null,
+    presentation: {
+      mode: "interlaced",
+      pairCompleting,
+      ...value.presentation,
+    },
+  };
+}
+
 function addPresentedSurfaces(temporal) {
   for (let index = 0; index < temporal.frames.length; index += 1) {
     const frame = temporal.frames[index];
     const selected = frame.selectedXfb;
     frame.presentedSurface = {
-      address: selected.address,
-      generation: selected.generation,
-      row: selected.row,
-      presentationSerial: 800 + index,
+      ...structuredClone(selected),
       surfaceFormat: index % 2 === 0 ? "bgra8unorm" : "rgba8unorm",
-      format: "rgba8unorm",
-      layout: "top-left-row-major-tight",
-      width: frame.presentation.width,
-      height: frame.presentation.height,
-      scanoutPolicy: frame.presentation.scanoutPolicy,
-      fieldStrideBytes: frame.presentation.fieldStrideBytes,
-      sourceRowStep: frame.presentation.sourceRowStep,
-      fieldHeight: frame.presentation.fieldHeight,
-      rowRepeat: frame.presentation.rowRepeat,
-      rgbaByteLength: frame.presentation.width * frame.presentation.height * 4,
-      rgbaSha256: (100 + index).toString(16).padStart(64, "0"),
-      rgbSha256: (200 + index).toString(16).padStart(64, "0"),
-      rgb: {
-        black: 0,
-        white: 0,
-        other: frame.presentation.width * frame.presentation.height,
-        unique: 4,
-      },
     };
   }
   temporal.surfaceOracle = deriveTemporalPresentedSurfaceOracle(temporal.frames);
 }
 
-function sustainedReport() {
+function sustainedReport(schema = SMB_SUSTAINED_PLAY_SCHEMA_V1) {
   const report = smbReadyPlayCheckpointReport();
   addPresentedSurfaces(report.rendering.temporalSelectedXfb);
   const readyPlayAnchor = structuredClone({
@@ -164,13 +164,15 @@ function sustainedReport() {
   report.execution.scheduler.rendererSync.inFlight = 0;
   report.execution.scheduler.rendererSync.resultMisses = 0;
   report.sustainedPlay = {
-    schema: SMB_SUSTAINED_PLAY_SCHEMA_V1,
+    schema,
     capacity: SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
     posted: SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
     pending: 0,
     receipts: Array.from(
       { length: SMB_SUSTAINED_VI_RECEIPT_CAPACITY },
-      (_unused, index) => receipt(index),
+      (_unused, index) => schema === SMB_SUSTAINED_PLAY_SCHEMA_V2
+        ? pairedReceipt(index)
+        : receipt(index),
     ),
     failure: null,
     readyPlayAnchor,
@@ -192,7 +194,7 @@ function expectFailure(report, path, ordinal = null) {
   );
 }
 
-test("120 drained VI receipts independently prove sustained PLAY", () => {
+test("legacy v1 receipts remain replayable", () => {
   const report = sustainedReport();
   const oracle = verifySmbSustainedPlay(report);
   assert.deepEqual(oracle, {
@@ -235,6 +237,87 @@ test("120 drained VI receipts independently prove sustained PLAY", () => {
     readyPlayAnchorCaptured: true,
     complete: true,
   });
+});
+
+test("v2 independently proves 60 staged and 60 presented field pairs", () => {
+  const report = sustainedReport(SMB_SUSTAINED_PLAY_SCHEMA_V2);
+  const oracle = verifySmbSustainedPlay(report);
+  assert.equal(oracle.received, 120);
+  assert.equal(oracle.drained, 120);
+  assert.equal(oracle.staged, 60);
+  assert.equal(oracle.presented, 60);
+  assert.equal(oracle.rejected, 0);
+  assert.equal(oracle.completedPairEpochs, 60);
+  assert.equal(oracle.topFields, 60);
+  assert.equal(oracle.bottomFields, 60);
+  assert.equal(oracle.complete, true);
+});
+
+test("v2 rejects untruthful pairing status, epochs, and presentation serials", () => {
+  const cases = [
+    [
+      report => { report.sustainedPlay.receipts[0].accepted = false; },
+      "$.sustainedPlay.receipts[0].accepted",
+      1,
+    ],
+    [
+      report => { report.sustainedPlay.receipts[0].presented = true; },
+      "$.sustainedPlay.receipts[0].presented",
+      1,
+    ],
+    [
+      report => {
+        report.sustainedPlay.receipts[0].status = "vi-interlaced-frame-ready";
+      },
+      "$.sustainedPlay.receipts[0].status",
+      1,
+    ],
+    [
+      report => {
+        report.sustainedPlay.receipts[0].presentation.pairCompleting = true;
+      },
+      "$.sustainedPlay.receipts[0].presentation.pairCompleting",
+      1,
+    ],
+    [
+      report => { report.sustainedPlay.receipts[1].pairEpoch += 1; },
+      "$.sustainedPlay.receipts[1].pairEpoch",
+      2,
+    ],
+    [
+      report => { report.sustainedPlay.receipts[2].pairEpoch += 1; },
+      "$.sustainedPlay.receipts[2].pairEpoch",
+      3,
+    ],
+    [
+      report => { report.sustainedPlay.receipts[0].presentationSerial = 1; },
+      "$.sustainedPlay.receipts[0].presentationSerial",
+      1,
+    ],
+    [
+      report => { report.sustainedPlay.receipts[1].presentationSerial = null; },
+      "$.sustainedPlay.receipts[1].presentationSerial",
+      2,
+    ],
+    [
+      report => {
+        report.sustainedPlay.receipts[3].presentationSerial =
+          report.sustainedPlay.receipts[1].presentationSerial;
+      },
+      "$.sustainedPlay.receipts[3].presentationSerial",
+      4,
+    ],
+    [
+      report => { report.sustainedPlay.receipts[0].presentation.mode = "single-field"; },
+      "$.sustainedPlay.receipts[0].presentation.mode",
+      1,
+    ],
+  ];
+  for (const [mutate, path, ordinal] of cases) {
+    const report = sustainedReport(SMB_SUSTAINED_PLAY_SCHEMA_V2);
+    mutate(report);
+    expectFailure(report, path, ordinal);
+  }
 });
 
 test("strict 60/60 alternation permits either first field parity", () => {

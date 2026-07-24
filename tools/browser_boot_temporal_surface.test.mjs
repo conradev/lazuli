@@ -9,9 +9,13 @@ import {
   SMB_TEMPORAL_XFB_CAPACITY,
   TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V1,
   TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V2,
+  TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3,
   deriveTemporalSelectedXfbOracle,
   projectSmbTemporalSelectedXfb,
 } from "./browser_boot_temporal_xfb.mjs";
+import {
+  smbReadyPlayTemporalSelectedXfb,
+} from "./browser_boot_checkpoint_v3_fixture.mjs";
 import {
   TemporalSurfaceValidationError,
   deriveTemporalPresentedSurfaceFlickerDiagnostics,
@@ -201,6 +205,18 @@ function v2Temporal() {
   };
 }
 
+function v3Temporal() {
+  const value = smbReadyPlayTemporalSelectedXfb();
+  for (const [index, sample] of value.frames.entries()) {
+    sample.presentedSurface = {
+      ...structuredClone(sample.selectedXfb),
+      surfaceFormat: index % 2 === 0 ? "bgra8unorm-srgb" : "rgba8unorm-srgb",
+    };
+  }
+  value.surfaceOracle = deriveTemporalPresentedSurfaceOracle(value.frames);
+  return value;
+}
+
 function expectFailure(value, code, pathPattern) {
   assert.throws(
     () => verifySmbTemporalPresentedSurfaces(value),
@@ -262,10 +278,95 @@ test("presented-surface replay keeps legacy v1 separate from exact scanout v2", 
     }
   }
   assert.throws(
-    () => validateTemporalPresentedSurfaceFrames(exact.frames, exact.capacity, 3),
+    () => validateTemporalPresentedSurfaceFrames(exact.frames, exact.capacity, 4),
     error => error instanceof TemporalSurfaceValidationError
       && /scanoutEvidenceVersion$/.test(error.path),
   );
+});
+
+test("v3 surface evidence binds one swapchain composite to both owned fields", () => {
+  const value = v3Temporal();
+  const evidence = verifySmbTemporalPresentedSurfaces(value);
+  assert.equal(evidence.scanoutEvidenceVersion, TEMPORAL_XFB_SCANOUT_EVIDENCE_VERSION_V3);
+  assert.equal(evidence.oracle.distinctPairEpochs, SMB_TEMPORAL_XFB_CAPACITY);
+  assert.equal(evidence.oracle.distinctPresentationSerials, SMB_TEMPORAL_XFB_CAPACITY);
+  assert.deepEqual(evidence.oracle.mismatchedPresentationOrdinals, []);
+  assert.deepEqual(evidence.diagnostics.adjacentExactBlackWhiteTransitions, []);
+  for (const sample of value.frames) {
+    assert.equal(
+      sample.presentedSurface.presentationSerial,
+      sample.selectedXfb.presentationSerial,
+    );
+    assert.equal(sample.presentedSurface.compositionPolicy, "field-pair-weave");
+    assert.deepEqual(Object.keys(sample.presentedSurface.fields), ["top", "bottom"]);
+  }
+});
+
+test("v3 surface flicker guards classify the woven composite, not its source fields", () => {
+  const value = v3Temporal();
+  for (const [index, sample] of value.frames.entries()) {
+    const top = sample.selectedXfb.fields.top;
+    const bottom = sample.selectedXfb.fields.bottom;
+    const fieldPixels = top.width * top.height;
+    top.rgbaSha256 = (index + 40).toString(16).padStart(64, "0");
+    top.rgbSha256 = (index + 60).toString(16).padStart(64, "0");
+    top.rgb = { black: fieldPixels, white: 0, other: 0, unique: 1 };
+    bottom.rgbaSha256 = (index + 80).toString(16).padStart(64, "0");
+    bottom.rgbSha256 = (index + 100).toString(16).padStart(64, "0");
+    bottom.rgb = { black: 0, white: fieldPixels, other: 0, unique: 1 };
+    const compositePixels = sample.selectedXfb.width * sample.selectedXfb.height;
+    sample.selectedXfb.rgbaSha256 = (index + 120).toString(16).padStart(64, "0");
+    sample.selectedXfb.rgbSha256 = (index + 140).toString(16).padStart(64, "0");
+    sample.selectedXfb.rgb = {
+      black: compositePixels / 2,
+      white: compositePixels / 2,
+      other: 0,
+      unique: 2,
+    };
+    sample.presentedSurface = {
+      ...structuredClone(sample.selectedXfb),
+      surfaceFormat: index % 2 === 0 ? "bgra8unorm-srgb" : "rgba8unorm-srgb",
+    };
+  }
+  value.oracle = deriveTemporalSelectedXfbOracle(value.frames);
+  value.surfaceOracle = deriveTemporalPresentedSurfaceOracle(value.frames);
+  const evidence = verifySmbTemporalPresentedSurfaces(value);
+  assert.deepEqual(
+    evidence.oracle.sourceBlackWhiteSplitOrdinals,
+    [1, 2, 3, 4, 5, 6, 7, 8],
+  );
+  assert.deepEqual(evidence.oracle.monochromeOrdinals, []);
+});
+
+test("v3 rejects surface pair identity, field content, and completion projection drift", () => {
+  const cases = [
+    [
+      value => { value.frames[0].presentedSurface.pairEpoch += 1; },
+      /presentedSurface\.pairEpoch$/,
+    ],
+    [
+      value => { value.frames[0].presentedSurface.fields.top.generation += 1; },
+      /presentedSurface\.fields\.top\.generation$/,
+    ],
+    [
+      value => { value.frames[0].presentedSurface.fields.bottom.rgbSha256 = "f".repeat(64); },
+      /presentedSurface\.fields\.bottom\.rgbSha256$/,
+    ],
+    [
+      value => { value.frames[0].presentedSurface.address = "0x00306c80"; },
+      /presentedSurface\.address$/,
+    ],
+  ];
+  for (const [mutate, path] of cases) {
+    const value = v3Temporal();
+    mutate(value);
+    assert.throws(
+      () => verifySmbTemporalPresentedSurfaces(value),
+      error => error instanceof TemporalSurfaceValidationError
+        && error.code !== "oracle-mismatch"
+        && path.test(error.path),
+    );
+  }
 });
 
 test("v2 compositor evidence rejects stale or impossible scanout provenance", () => {
@@ -327,15 +428,19 @@ test("the browser envelope and strict verifier derive the same surface oracle", 
     ].every(name => left?.[name] === right?.[name]),
   };
   vm.createContext(context);
-  vm.runInContext(extractFunction("summarizeTemporalPresentedSurfaces"), context, {
+  vm.runInContext([
+    "presentedFieldMatchesExpected",
+    "temporalPairedEvidenceMatches",
+    "temporalPairedFieldSummary",
+    "summarizeTemporalPresentedSurfaces",
+  ].map(extractFunction).join("\n"), context, {
     filename: "browser_boot.temporal-surface.js",
   });
-  for (const value of [temporal(), v2Temporal()]) {
-    assert.deepEqual(
-      JSON.parse(JSON.stringify(context.summarizeTemporalPresentedSurfaces(value.frames))),
-      deriveTemporalPresentedSurfaceOracle(value.frames),
-    );
-  }
+  const value = v3Temporal();
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.summarizeTemporalPresentedSurfaces(value.frames))),
+    deriveTemporalPresentedSurfaceOracle(value.frames),
+  );
 });
 
 test("presentation serials are strictly increasing and the reported oracle is exact", () => {

@@ -12,6 +12,7 @@ import {
 } from "./browser_boot_gameplay_transcript.mjs";
 
 export const SMB_SUSTAINED_PLAY_SCHEMA_V1 = "lazuli-smb-sustained-play-v1";
+export const SMB_SUSTAINED_PLAY_SCHEMA_V2 = "lazuli-smb-sustained-play-v2";
 export const SMB_SUSTAINED_VI_RECEIPT_CAPACITY = 120;
 
 const HEX_32 = /^0x[0-9a-f]{8}$/;
@@ -94,6 +95,13 @@ function positiveInteger(value, path, ordinal = null, previous = null) {
   return result;
 }
 
+function positiveU32(value, path, ordinal = null, previous = null) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 0xffff_ffff) {
+    fail("envelope", path, ordinal, "a positive u32", value, previous);
+  }
+  return value;
+}
+
 function exactKeys(value, expectedKeys, path, ordinal = null) {
   requireObject(value, path, ordinal);
   const actual = Object.keys(value).sort();
@@ -107,20 +115,48 @@ function exactKeys(value, expectedKeys, path, ordinal = null) {
   return value;
 }
 
-function validateReceipt(receipt, index, previous, parityAddresses) {
+function validateReceipt(
+  receipt,
+  index,
+  previous,
+  parityAddresses,
+  pairedReceipts,
+  pairingState,
+) {
   const ordinal = index + 1;
   const path = `$.sustainedPlay.receipts[${index}]`;
-  exactKeys(receipt, [
-    "scenario",
-    "step",
-    "ordinal",
-    "capacity",
-    "rendererSequence",
-    "drained",
-    "presented",
-    "presentation",
-    "gameplay",
-  ], path, ordinal);
+  exactKeys(
+    receipt,
+    pairedReceipts
+      ? [
+        "scenario",
+        "step",
+        "ordinal",
+        "capacity",
+        "rendererSequence",
+        "drained",
+        "accepted",
+        "presented",
+        "status",
+        "pairEpoch",
+        "presentationSerial",
+        "presentation",
+        "gameplay",
+      ]
+      : [
+        "scenario",
+        "step",
+        "ordinal",
+        "capacity",
+        "rendererSequence",
+        "drained",
+        "presented",
+        "presentation",
+        "gameplay",
+      ],
+    path,
+    ordinal,
+  );
   exact(receipt.scenario, "smb-sustained-play", `${path}.scenario`, ordinal);
   exact(receipt.step, "sustained-play-presented", `${path}.step`, ordinal);
   exact(receipt.ordinal, ordinal, `${path}.ordinal`, ordinal, previous?.ordinal ?? null);
@@ -147,16 +183,118 @@ function validateReceipt(receipt, index, previous, parityAddresses) {
     );
   }
   exact(receipt.drained, true, `${path}.drained`, ordinal);
-  exact(receipt.presented, true, `${path}.presented`, ordinal);
-
-  const presentation = exactKeys(receipt.presentation, [
-    "field",
-    "address",
-    "copyIndex",
-    "copyRow",
-    "width",
-    "height",
-  ], `${path}.presentation`, ordinal);
+  const presentation = exactKeys(
+    receipt.presentation,
+    pairedReceipts
+      ? [
+        "mode",
+        "pairCompleting",
+        "field",
+        "address",
+        "copyIndex",
+        "copyRow",
+        "width",
+        "height",
+      ]
+      : [
+        "field",
+        "address",
+        "copyIndex",
+        "copyRow",
+        "width",
+        "height",
+      ],
+    `${path}.presentation`,
+    ordinal,
+  );
+  if (pairedReceipts) {
+    exact(receipt.accepted, true, `${path}.accepted`, ordinal);
+    exact(presentation.mode, "interlaced", `${path}.presentation.mode`, ordinal);
+    const pairCompleting = presentation.pairCompleting;
+    if (typeof pairCompleting !== "boolean") {
+      fail(
+        "envelope",
+        `${path}.presentation.pairCompleting`,
+        ordinal,
+        "a boolean",
+        pairCompleting,
+        previous?.presentation.pairCompleting ?? null,
+      );
+    }
+    const expectedPairCompleting = previous === null
+      ? false
+      : !previous.presentation.pairCompleting;
+    exact(
+      pairCompleting,
+      expectedPairCompleting,
+      `${path}.presentation.pairCompleting`,
+      ordinal,
+      previous?.presentation.pairCompleting ?? null,
+    );
+    exact(
+      receipt.presented,
+      pairCompleting,
+      `${path}.presented`,
+      ordinal,
+      previous?.presented ?? null,
+    );
+    exact(
+      receipt.status,
+      pairCompleting
+        ? "vi-interlaced-frame-ready"
+        : "vi-field-pair-awaiting",
+      `${path}.status`,
+      ordinal,
+      previous?.status ?? null,
+    );
+    const pairEpoch = positiveU32(
+      receipt.pairEpoch,
+      `${path}.pairEpoch`,
+      ordinal,
+      previous?.pairEpoch ?? null,
+    );
+    if (previous !== null) {
+      exact(
+        pairEpoch,
+        pairCompleting ? previous.pairEpoch : previous.pairEpoch + 1,
+        `${path}.pairEpoch`,
+        ordinal,
+        previous.pairEpoch,
+      );
+    }
+    if (pairCompleting) {
+      const serial = positiveInteger(
+        receipt.presentationSerial,
+        `${path}.presentationSerial`,
+        ordinal,
+        pairingState.lastPresentedSerial,
+      );
+      if (
+        pairingState.lastPresentedSerial !== null
+        && serial <= pairingState.lastPresentedSerial
+      ) {
+        fail(
+          "ordering",
+          `${path}.presentationSerial`,
+          ordinal,
+          `a value greater than ${pairingState.lastPresentedSerial}`,
+          serial,
+          pairingState.lastPresentedSerial,
+        );
+      }
+      pairingState.lastPresentedSerial = serial;
+    } else {
+      exact(
+        receipt.presentationSerial,
+        null,
+        `${path}.presentationSerial`,
+        ordinal,
+        pairingState.lastPresentedSerial,
+      );
+    }
+  } else {
+    exact(receipt.presented, true, `${path}.presented`, ordinal);
+  }
   const previousField = previous?.presentation.field ?? null;
   const expectedField = previousField === null
     ? presentation.field
@@ -577,7 +715,16 @@ export function deriveSmbSustainedPlayOracle(report) {
   const input = validateInputWitness(scenario);
 
   const sustained = requireObject(report.sustainedPlay, "$.sustainedPlay");
-  exact(sustained.schema, SMB_SUSTAINED_PLAY_SCHEMA_V1, "$.sustainedPlay.schema");
+  const pairedReceipts = sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V2;
+  if (!pairedReceipts && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V1) {
+    fail(
+      "invariant",
+      "$.sustainedPlay.schema",
+      null,
+      [SMB_SUSTAINED_PLAY_SCHEMA_V1, SMB_SUSTAINED_PLAY_SCHEMA_V2],
+      sustained.schema,
+    );
+  }
   const readyPlayAnchor = requireObject(
     sustained.readyPlayAnchor,
     "$.sustainedPlay.readyPlayAnchor",
@@ -604,9 +751,17 @@ export function deriveSmbSustainedPlayOracle(report) {
     "$.sustainedPlay.receipts.length",
   );
   const parityAddresses = { top: null, bottom: null };
+  const pairingState = { lastPresentedSerial: null };
   let previous = null;
   for (let index = 0; index < sustained.receipts.length; index += 1) {
-    previous = validateReceipt(sustained.receipts[index], index, previous, parityAddresses);
+    previous = validateReceipt(
+      sustained.receipts[index],
+      index,
+      previous,
+      parityAddresses,
+      pairedReceipts,
+      pairingState,
+    );
   }
   const first = sustained.receipts[0];
   const last = sustained.receipts.at(-1);
@@ -630,11 +785,42 @@ export function deriveSmbSustainedPlayOracle(report) {
   exact(report.rendering?.metrics?.operations?.pending, 0, "$.rendering.metrics.operations.pending");
   exact(report.controller?.queueOverflows, 0, "$.controller.queueOverflows");
 
+  const drained = sustained.receipts.filter(receipt => receipt.drained === true).length;
+  const presented = sustained.receipts.filter(receipt => receipt.presented === true).length;
+  const staged = sustained.receipts.filter(receipt =>
+    receipt.accepted === true && receipt.presented === false
+  ).length;
+  const rejected = sustained.receipts.filter(receipt =>
+    receipt.accepted !== true
+  ).length;
+  const completedPairEpochs = new Set(sustained.receipts
+    .filter(receipt => receipt.presented === true)
+    .map(receipt => receipt.pairEpoch)).size;
+  exact(
+    drained,
+    SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
+    "$.sustainedPlay.oracle.drained",
+  );
+  if (pairedReceipts) {
+    exact(staged, 60, "$.sustainedPlay.oracle.staged");
+    exact(presented, 60, "$.sustainedPlay.oracle.presented");
+    exact(rejected, 0, "$.sustainedPlay.oracle.rejected");
+    exact(completedPairEpochs, 60, "$.sustainedPlay.oracle.completedPairEpochs");
+  } else {
+    exact(
+      presented,
+      SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
+      "$.sustainedPlay.oracle.presented",
+    );
+  }
+
   return {
     capacity: SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
     received: SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
-    drained: SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
-    presented: SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
+    drained,
+    ...(pairedReceipts
+      ? { staged, presented, rejected, completedPairEpochs }
+      : { presented }),
     topFields: 60,
     bottomFields: 60,
     strictAlternation: true,
