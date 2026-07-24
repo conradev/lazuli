@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli varying GX raster WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli varying GX raster WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildVaryingRasterOraclePacket,
+      fnv1a64Hex,
+      varyingRasterOracleCases,
+      varyingRasterOracleXfb,
+    } from "./browser_boot_varying_raster_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length &&
+        actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      renderer.reset_diagnostics();
+      const runs = [];
+      const referenceBytes = new Map();
+      try {
+        for (let runIndex = 0; runIndex < RUN_COUNT; runIndex += 1) {
+          const cases = [];
+          for (
+            let caseIndex = 0;
+            caseIndex < varyingRasterOracleCases.length;
+            caseIndex += 1
+          ) {
+            const entry = varyingRasterOracleCases[caseIndex];
+            const generation =
+              runIndex * varyingRasterOracleCases.length + caseIndex + 1;
+            renderer.reset();
+            const diagnosticsBefore = renderer.diagnostics();
+            renderer.submit_gx_frame(
+              buildVaryingRasterOraclePacket(entry.id, generation),
+            );
+            const presentation = renderer.present_xfb(
+              varyingRasterOracleXfb.destination,
+              generation,
+              0,
+              "progressive",
+              "top",
+              generation,
+              varyingRasterOracleXfb.width,
+              varyingRasterOracleXfb.height,
+              varyingRasterOracleXfb.stride,
+              varyingRasterOracleXfb.height,
+              1,
+              false,
+            );
+            await renderer.drain();
+            const readback = await renderer.read_presented_xfb_rgba();
+            const actualRgba = Array.from(readback.rgba);
+            const prior = referenceBytes.get(entry.id);
+            const byteExact = bytesEqual(actualRgba, entry.expectedRgba);
+            const dimensionsExact =
+              readback.width === varyingRasterOracleXfb.width &&
+              readback.height === varyingRasterOracleXfb.height;
+            const deterministic =
+              prior === undefined || bytesEqual(actualRgba, prior);
+            if (prior === undefined) {
+              referenceBytes.set(entry.id, actualRgba);
+            }
+            renderer.check_health();
+            const diagnosticsAfter = renderer.diagnostics();
+            const managedCoverageDelta = {
+              draws:
+                diagnosticsAfter.managedCoverageDraws -
+                diagnosticsBefore.managedCoverageDraws,
+              triangles:
+                diagnosticsAfter.managedCoverageTriangles -
+                diagnosticsBefore.managedCoverageTriangles,
+            };
+            const managedCoverageExact =
+              managedCoverageDelta.draws ===
+                entry.expectedManagedCoverage.draws &&
+              managedCoverageDelta.triangles ===
+                entry.expectedManagedCoverage.triangles;
+            const actualRgbaFnv1a64 = fnv1a64Hex(actualRgba);
+            const hashExact =
+              actualRgbaFnv1a64 === entry.expectedRgbaFnv1a64;
+            cases.push({
+              id: entry.id,
+              name: entry.name,
+              expectedRgbaFnv1a64: entry.expectedRgbaFnv1a64,
+              actualRgbaFnv1a64,
+              hashExact,
+              expectedRgba: entry.expectedRgba,
+              actualRgba,
+              byteExact,
+              dimensionsExact,
+              deterministic,
+              expectedManagedCoverage: entry.expectedManagedCoverage,
+              managedCoverageDelta,
+              managedCoverageExact,
+              width: readback.width,
+              height: readback.height,
+              presentation,
+              pass:
+                byteExact &&
+                dimensionsExact &&
+                deterministic &&
+                hashExact &&
+                managedCoverageExact,
+            });
+          }
+          runs.push({
+            index: runIndex + 1,
+            pass: cases.every((entry) => entry.pass),
+            cases,
+          });
+        }
+        renderer.check_health();
+        const diagnostics = renderer.diagnostics();
+        const expectedManagedCoverage =
+          RUN_COUNT * varyingRasterOracleCases.length;
+        const managedCoverageCountersExact =
+          diagnostics.managedCoverageDraws === expectedManagedCoverage &&
+          diagnostics.managedCoverageTriangles === expectedManagedCoverage;
+        const result = {
+          pass:
+            runs.every((entry) => entry.pass) &&
+            managedCoverageCountersExact,
+          runCount: RUN_COUNT,
+          strictWebGpu: true,
+          deterministic: runs
+            .flatMap((entry) => entry.cases)
+            .every((entry) => entry.deterministic),
+          expectedManagedCoverage,
+          managedCoverageCountersExact,
+          runs,
+          diagnostics,
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliVaryingRasterOraclePromise = run().catch((error) => {
+      const result = {
+        pass: false,
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>
