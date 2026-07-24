@@ -618,6 +618,48 @@ pub(crate) fn gx_efb_format(pixel_control: u32) -> GxEfbFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GxDestinationAlphaState {
+    pub(crate) target_has_guest_alpha: bool,
+    // Zero is the canonical inactive state. Bit eight distinguishes an active
+    // replacement of zero from inactivity; the low byte is BP 0x42's value.
+    pub(crate) effective_constant: u16,
+}
+
+impl GxDestinationAlphaState {
+    pub(crate) const fn replacement_enabled(self) -> bool {
+        self.effective_constant & 0x100 != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn replacement_value(self) -> u8 {
+        self.effective_constant as u8
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn rgba6_value(self) -> u8 {
+        self.replacement_value() >> 2
+    }
+}
+
+pub(crate) fn gx_destination_alpha_state(
+    blend_mode: u32,
+    constant_alpha: u32,
+    pixel_control: u32,
+) -> GxDestinationAlphaState {
+    let target_has_guest_alpha = gx_efb_format(pixel_control).has_alpha();
+    let replacement_enabled =
+        constant_alpha & (1 << 8) != 0 && blend_mode & (1 << 4) != 0 && target_has_guest_alpha;
+    GxDestinationAlphaState {
+        target_has_guest_alpha,
+        effective_constant: if replacement_enabled {
+            0x100 | (constant_alpha & 0xff) as u16
+        } else {
+            0
+        },
+    }
+}
+
 const fn expand_5_to_8(channel: u8) -> u8 {
     (channel & 0xf8) | (channel >> 5)
 }
@@ -707,6 +749,34 @@ pub(crate) enum GxBlendFactor {
     OneMinusDestination,
     DestinationAlpha,
     OneMinusDestinationAlpha,
+}
+
+pub(crate) const fn gx_blend_factor_for_component(
+    factor: GxBlendFactor,
+    alpha_component: bool,
+    target_has_guest_alpha: bool,
+) -> GxBlendFactor {
+    let factor = if alpha_component {
+        match factor {
+            GxBlendFactor::Source => GxBlendFactor::SourceAlpha,
+            GxBlendFactor::OneMinusSource => GxBlendFactor::OneMinusSourceAlpha,
+            GxBlendFactor::Destination => GxBlendFactor::DestinationAlpha,
+            GxBlendFactor::OneMinusDestination => GxBlendFactor::OneMinusDestinationAlpha,
+            factor => factor,
+        }
+    } else {
+        factor
+    };
+
+    if target_has_guest_alpha {
+        factor
+    } else {
+        match factor {
+            GxBlendFactor::DestinationAlpha => GxBlendFactor::One,
+            GxBlendFactor::OneMinusDestinationAlpha => GxBlendFactor::Zero,
+            factor => factor,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1491,12 +1561,12 @@ mod tests {
         XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
         compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
         decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
-        gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_copy_filter_coefficients,
-        gx_copy_filter_taps, gx_depth24_to_float, gx_efb_format, gx_float_to_depth24,
-        gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height,
-        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
-        requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
-        reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
+        gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
+        gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_to_float,
+        gx_destination_alpha_state, gx_efb_format, gx_float_to_depth24, gx_sampler_identity,
+        gx_xfb_copy_parameters, gx_xfb_output_height, materialize_xfb_rgba8_reference,
+        merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
+        resolve_xfb_copy, reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
         xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_scanout_plan,
         xfb_scanout_source_row, xfb_surface_extent_matches,
     };
@@ -2802,6 +2872,145 @@ mod tests {
         for (raw, expected) in expected.into_iter().enumerate() {
             assert_eq!(gx_efb_format(raw as u32), expected);
             assert_eq!(gx_efb_format(0x00ff_ff00 | raw as u32), expected);
+        }
+    }
+
+    #[test]
+    fn gx_destination_alpha_canonicalizes_every_enable_update_and_format_combination() {
+        for value in [0, 1, 0x80, 0xff] {
+            for replacement_enable in [false, true] {
+                for alpha_update in [false, true] {
+                    for pixel_format in 0..=7 {
+                        let constant_alpha = value | (u32::from(replacement_enable) << 8);
+                        let blend_mode = u32::from(alpha_update) << 4;
+                        let state =
+                            gx_destination_alpha_state(blend_mode, constant_alpha, pixel_format);
+                        let target_has_guest_alpha = pixel_format == 1;
+                        let replacement_enabled =
+                            replacement_enable && alpha_update && target_has_guest_alpha;
+                        let effective_constant = if replacement_enabled {
+                            0x100 | value as u16
+                        } else {
+                            0
+                        };
+
+                        assert_eq!(
+                            state.target_has_guest_alpha, target_has_guest_alpha,
+                            "value {value:#04x}, enable {replacement_enable}, alpha update \
+                             {alpha_update}, pixel format {pixel_format}",
+                        );
+                        assert_eq!(state.replacement_enabled(), replacement_enabled);
+                        assert_eq!(state.effective_constant, effective_constant);
+                        assert_eq!(
+                            state.replacement_value(),
+                            if replacement_enabled { value as u8 } else { 0 },
+                        );
+                        assert_eq!(
+                            state.rgba6_value(),
+                            if replacement_enabled {
+                                value as u8 >> 2
+                            } else {
+                                0
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gx_blend_factors_canonicalize_every_component_and_target_alpha_combination() {
+        use GxBlendFactor as Factor;
+
+        let factors = [
+            Factor::Zero,
+            Factor::One,
+            Factor::Source,
+            Factor::OneMinusSource,
+            Factor::SourceAlpha,
+            Factor::OneMinusSourceAlpha,
+            Factor::Destination,
+            Factor::OneMinusDestination,
+            Factor::DestinationAlpha,
+            Factor::OneMinusDestinationAlpha,
+        ];
+        let expected = [
+            (
+                false,
+                false,
+                [
+                    Factor::Zero,
+                    Factor::One,
+                    Factor::Source,
+                    Factor::OneMinusSource,
+                    Factor::SourceAlpha,
+                    Factor::OneMinusSourceAlpha,
+                    Factor::Destination,
+                    Factor::OneMinusDestination,
+                    Factor::One,
+                    Factor::Zero,
+                ],
+            ),
+            (
+                false,
+                true,
+                [
+                    Factor::Zero,
+                    Factor::One,
+                    Factor::Source,
+                    Factor::OneMinusSource,
+                    Factor::SourceAlpha,
+                    Factor::OneMinusSourceAlpha,
+                    Factor::Destination,
+                    Factor::OneMinusDestination,
+                    Factor::DestinationAlpha,
+                    Factor::OneMinusDestinationAlpha,
+                ],
+            ),
+            (
+                true,
+                false,
+                [
+                    Factor::Zero,
+                    Factor::One,
+                    Factor::SourceAlpha,
+                    Factor::OneMinusSourceAlpha,
+                    Factor::SourceAlpha,
+                    Factor::OneMinusSourceAlpha,
+                    Factor::One,
+                    Factor::Zero,
+                    Factor::One,
+                    Factor::Zero,
+                ],
+            ),
+            (
+                true,
+                true,
+                [
+                    Factor::Zero,
+                    Factor::One,
+                    Factor::SourceAlpha,
+                    Factor::OneMinusSourceAlpha,
+                    Factor::SourceAlpha,
+                    Factor::OneMinusSourceAlpha,
+                    Factor::DestinationAlpha,
+                    Factor::OneMinusDestinationAlpha,
+                    Factor::DestinationAlpha,
+                    Factor::OneMinusDestinationAlpha,
+                ],
+            ),
+        ];
+
+        for (alpha_component, target_has_guest_alpha, expected) in expected {
+            for (factor, expected) in factors.into_iter().zip(expected) {
+                assert_eq!(
+                    gx_blend_factor_for_component(factor, alpha_component, target_has_guest_alpha,),
+                    expected,
+                    "{factor:?}, alpha component {alpha_component}, guest alpha \
+                     {target_has_guest_alpha}",
+                );
+            }
         }
     }
 
