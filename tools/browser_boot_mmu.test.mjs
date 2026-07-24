@@ -135,6 +135,7 @@ function makeContext() {
     physicalMmioBase: 0x0c000000,
     ram: 0x40000,
     ramSize: 0x40000,
+    synchronizeInstructionAddressSpace() {},
     view: new DataView(buffer),
   };
   vm.createContext(context);

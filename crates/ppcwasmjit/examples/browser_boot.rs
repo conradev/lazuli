@@ -3930,6 +3930,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     let firstDsi = null;
     let lastUnmappedAccess = null;
     let dataFastmemTranslationSignature = null;
+    let instructionTranslationSignature = null;
+    let instructionAddressSpaceKey = null;
+    let instructionAddressSpaceGeneration = 0;
     const cpFifoState = {
       control: 0,
       base: 0,
@@ -4190,6 +4193,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       user_0_12: (_ctx, address, gqr, value) => writeQuantized(address, gqr, value),
       user_0_15: () => serviceLockedCacheDma(),
       user_0_16: () => msrChanged(),
+      user_0_17: () => instructionBatChanged(),
       user_0_18: () => dataBatChanged(),
       user_0_19: () => updateTimeBase(),
       user_0_20: () => timeBaseChanged(),
@@ -4397,6 +4401,61 @@ const TEMPLATE: &str = r##"<!doctype html>
       return physicalStart;
     }
 
+    function translateInstructionEffectiveAddress(effectiveAddress, msr, instructionBats) {
+      const effective = effectiveAddress >>> 0;
+      if ((msr & 0x20) === 0) return effective;
+      const userMode = (msr & 0x4000) !== 0;
+      for (const [upper, lower] of instructionBats) {
+        const physical = translateBatAddress(
+          effective,
+          upper,
+          lower,
+          userMode,
+          false
+        );
+        if (physical !== null) return physical;
+      }
+      return null;
+    }
+
+    function translateInstructionEffectiveRange(
+      effectiveAddress,
+      size,
+      msr,
+      instructionBats
+    ) {
+      const effective = effectiveAddress >>> 0;
+      if (!Number.isSafeInteger(size) || size <= 0) return null;
+      if (size > 0x100000000 - effective) return null;
+
+      let physicalStart = null;
+      let offset = 0;
+      while (offset < size) {
+        const currentEffective = (effective + offset) >>> 0;
+        const currentPhysical = translateInstructionEffectiveAddress(
+          currentEffective,
+          msr,
+          instructionBats
+        );
+        if (currentPhysical === null) return null;
+        if (physicalStart === null) {
+          physicalStart = currentPhysical;
+          if (size > 0x100000000 - physicalStart) return null;
+        } else if (currentPhysical !== physicalStart + offset) {
+          return null;
+        }
+        offset += Math.min(size - offset, 0x20000 - (currentEffective & 0x1ffff));
+      }
+      return physicalStart;
+    }
+
+    function readInstructionBats() {
+      return instructionBatOffsets.map(([lowerOffset, upperOffset]) => [
+        view.getUint32(cpu + upperOffset, true),
+        view.getUint32(cpu + lowerOffset, true),
+      ]);
+    }
+
     function readDataBats() {
       return dataBatOffsets.map(([lowerOffset, upperOffset]) => [
         view.getUint32(cpu + upperOffset, true),
@@ -4410,6 +4469,23 @@ const TEMPLATE: &str = r##"<!doctype html>
         view.getUint32(cpu + msrOffset, true),
         readDataBats(),
         write
+      );
+    }
+
+    function translateInstructionAddress(effectiveAddress) {
+      return translateInstructionEffectiveAddress(
+        effectiveAddress,
+        view.getUint32(cpu + msrOffset, true),
+        readInstructionBats()
+      );
+    }
+
+    function translateInstructionRange(effectiveAddress, size) {
+      return translateInstructionEffectiveRange(
+        effectiveAddress,
+        size,
+        view.getUint32(cpu + msrOffset, true),
+        readInstructionBats()
       );
     }
 
@@ -4479,6 +4555,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       const offset = physical - 0xe0000000;
       if (offset < 0 || offset + size > lockedCacheSize) return null;
       return lockedCache + offset;
+    }
+
+    function instructionRamPointer(address, size) {
+      const physical = translateInstructionRange(address, size);
+      if (physical === null) return null;
+      return physicalRamPointer(physical, size)
+        ?? physicalLockedCachePointer(physical, size);
     }
 
     function dataRamOrLockedCachePointer(address, size, write = false) {
@@ -8584,10 +8667,104 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
+    function currentInstructionTranslationSignature() {
+      const signature = [view.getUint32(cpu + msrOffset, true) & 0x4020];
+      for (const [upper, lower] of readInstructionBats()) {
+        signature.push(upper >>> 0, lower >>> 0);
+      }
+      return signature;
+    }
+
+    function instructionTranslationKey(signature) {
+      return signature
+        .map(value => (value >>> 0).toString(16).padStart(8, "0"))
+        .join(":");
+    }
+
+    function instructionBlockKey(effectivePc) {
+      check(instructionAddressSpaceKey !== null, "instruction address space is uninitialized");
+      return instructionAddressSpaceKey
+        + ":"
+        + (effectivePc >>> 0).toString(16).padStart(8, "0");
+    }
+
+    function instructionRegionKey(effectivePc) {
+      return instructionBlockKey(effectivePc);
+    }
+
+    function compiledBlock(effectivePc) {
+      return blocks.get(instructionBlockKey(effectivePc));
+    }
+
+    function hasCompiledBlock(effectivePc) {
+      return blocks.has(instructionBlockKey(effectivePc));
+    }
+
+    function compiledRegion(effectivePc) {
+      return regionsByPc.get(instructionRegionKey(effectivePc));
+    }
+
+    function resetInstructionLinkingState() {
+      recentPcs.length = 0;
+      regionCandidateHits.clear();
+      regionFusionHits.clear();
+      lastPc = null;
+      lastCpuSignature = null;
+      samePcCount = 0;
+    }
+
+    function invalidateAllCompiledCode(reason) {
+      const invalidatedBlocks = blocks.size;
+      const invalidatedRegions = new Set(regionsByPc.values()).size;
+      blocks.clear();
+      regionsByPc.clear();
+      resetInstructionLinkingState();
+      accelerations.set(
+        "instructionAddressSpaceInvalidations",
+        (accelerations.get("instructionAddressSpaceInvalidations") ?? 0) + 1
+      );
+      accelerations.set(
+        "instructionAddressSpaceInvalidatedBlocks",
+        (accelerations.get("instructionAddressSpaceInvalidatedBlocks") ?? 0)
+          + invalidatedBlocks
+      );
+      accelerations.set(
+        "instructionAddressSpaceInvalidatedRegions",
+        (accelerations.get("instructionAddressSpaceInvalidatedRegions") ?? 0)
+          + invalidatedRegions
+      );
+    }
+
+    function synchronizeInstructionAddressSpace(reason, invalidate = false) {
+      const signature = currentInstructionTranslationSignature();
+      if (
+        instructionTranslationSignature !== null
+        && signature.every((value, index) =>
+          instructionTranslationSignature[index] === value
+        )
+      ) {
+        return false;
+      }
+      instructionTranslationSignature = signature;
+      instructionAddressSpaceKey = instructionTranslationKey(signature);
+      instructionAddressSpaceGeneration += 1;
+      if (invalidate) {
+        invalidateAllCompiledCode(reason);
+      } else {
+        resetInstructionLinkingState();
+      }
+      return true;
+    }
+
     function msrChanged() {
       // The compiler terminates this block after publishing its automatic PC.
       // Device interrupt delivery remains in the normal post-block service pass.
       rebuildDataFastmem();
+      synchronizeInstructionAddressSpace("msr");
+    }
+
+    function instructionBatChanged() {
+      synchronizeInstructionAddressSpace("ibat", true);
     }
 
     function dataBatChanged() {
@@ -8631,8 +8808,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function fetchWord(pc) {
-      const pointer = ramPointer(pc, 4);
-      check(pointer !== null, "address is outside mapped main RAM: 0x" + (pc >>> 0).toString(16));
+      const pointer = instructionRamPointer(pc, 4);
+      check(
+        pointer !== null,
+        "instruction address is outside mapped memory: 0x"
+          + (pc >>> 0).toString(16)
+      );
       return view.getUint32(pointer, false);
     }
 
@@ -10296,6 +10477,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const vectorBase = (oldMsr & 0x40) === 0 ? 0 : 0xfff00000;
       view.setUint32(registers + msrOffset, exceptionMsr, true);
       if (((oldMsr ^ exceptionMsr) & 0x4010) !== 0) rebuildDataFastmem();
+      if (((oldMsr ^ exceptionMsr) & 0x4020) !== 0) {
+        synchronizeInstructionAddressSpace("exception");
+      }
       view.setUint32(registers + pcOffset, vectorBase | exception, true);
     }
 
@@ -10514,7 +10698,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function isRecognizedLoopPc(candidatePc) {
-      return isSemanticIdlePattern(blocks.get(candidatePc)?.pattern)
+      return isSemanticIdlePattern(compiledBlock(candidatePc)?.pattern)
         || isCacheLineLoop(candidatePc)
         || decodeMemset32ByteLoop(candidatePc) !== null;
     }
@@ -10569,7 +10753,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     async function linkCompiledRegion(compiler, inputPointer, pcs) {
       const compilerView = new DataView(compiler.memory.buffer);
       for (const [index, regionPc] of pcs.entries()) {
-        const block = blocks.get(regionPc);
+        const block = compiledBlock(regionPc);
         check(block !== undefined, "cannot link an uncompiled region block");
         compilerView.setUint32(inputPointer + index * 8, regionPc, true);
         compilerView.setUint32(inputPointer + index * 8 + 4, block.maximum, true);
@@ -10591,24 +10775,31 @@ const TEMPLATE: &str = r##"<!doctype html>
       const wasm = new Uint8Array(compiler.memory.buffer, pointer, length).slice();
       const blockImports = Object.fromEntries(pcs.map((regionPc, index) => [
         "b" + index,
-        blocks.get(regionPc).instance.exports.run,
+        compiledBlock(regionPc).instance.exports.run,
       ]));
       const { instance } = await WebAssembly.instantiate(wasm, {
         lazuli: { memory },
         lazuli_blocks: blockImports,
       });
-      return { instance, pcs };
+      return {
+        instance,
+        pcs,
+        instructionAddressSpaceKey,
+        instructionAddressSpaceGeneration,
+      };
     }
 
     function maybeLinkHotRegion(compiler, inputPointer, currentPc) {
-      if (regionsByPc.has(currentPc) || isRecognizedLoopPc(currentPc)) return null;
+      if (compiledRegion(currentPc) !== undefined || isRecognizedLoopPc(currentPc)) {
+        return null;
+      }
       const previous = recentPcs.lastIndexOf(currentPc);
       if (previous < 0) return null;
 
       const pcs = [...new Set(recentPcs.slice(previous))];
       if (
         pcs.length === 0 || pcs.length > 16
-        || pcs.some(regionPc => !blocks.has(regionPc) || isRecognizedLoopPc(regionPc))
+        || pcs.some(regionPc => !hasCompiledBlock(regionPc) || isRecognizedLoopPc(regionPc))
       ) return null;
 
       const key = pcs.map(regionPc => regionPc.toString(16)).join(",");
@@ -10618,7 +10809,8 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       return linkCompiledRegion(compiler, inputPointer, pcs).then(region => {
         for (const regionPc of pcs) {
-          if (!regionsByPc.has(regionPc)) regionsByPc.set(regionPc, region);
+          const key = instructionRegionKey(regionPc);
+          if (!regionsByPc.has(key)) regionsByPc.set(key, region);
         }
         accelerations.set(
           "wasmRegionsLinked",
@@ -10630,12 +10822,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     function maybeFuseRegionExit(compiler, inputPointer, sourceRegion, nextPc) {
       if (sourceRegion.pcs.includes(nextPc) || isRecognizedLoopPc(nextPc)) return null;
 
-      const targetRegion = regionsByPc.get(nextPc);
+      const targetRegion = compiledRegion(nextPc);
       const targetPcs = targetRegion?.pcs ?? [nextPc];
       const pcs = [...new Set([...sourceRegion.pcs, ...targetPcs])];
       if (
         pcs.length === sourceRegion.pcs.length
-        || pcs.some(regionPc => !blocks.has(regionPc) || isRecognizedLoopPc(regionPc))
+        || pcs.some(regionPc => !hasCompiledBlock(regionPc) || isRecognizedLoopPc(regionPc))
       ) return null;
 
       const sourceAnchor = sourceRegion.pcs[0];
@@ -10653,7 +10845,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       return linkCompiledRegion(compiler, inputPointer, pcs).then(region => {
-        for (const regionPc of pcs) regionsByPc.set(regionPc, region);
+        for (const regionPc of pcs) {
+          regionsByPc.set(instructionRegionKey(regionPc), region);
+        }
         accelerations.set(
           "wasmRegionFusions",
           (accelerations.get("wasmRegionFusions") ?? 0) + 1
@@ -11247,6 +11441,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       deviceEvents.set("dspInitialize", (deviceEvents.get("dspInitialize") ?? 0) + 1);
       initializeMemoryManagement();
       rebuildDataFastmem();
+      synchronizeInstructionAddressSpace("initialize");
       bytes.fill(0, lockedCache, lockedCache + lockedCacheSize);
       bytes.fill(
         0,
@@ -11342,7 +11537,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           continue;
         }
         stage = "compile";
-        let block = blocks.get(pc);
+        let block = compiledBlock(pc);
         if (block === undefined) {
           try {
             block = compileBlock(compiler, inputPointer, pc);
@@ -11364,8 +11559,10 @@ const TEMPLATE: &str = r##"<!doctype html>
             lazuli_hooks: jitHooks,
           });
           block.instance = instance;
+          block.instructionAddressSpaceKey = instructionAddressSpaceKey;
+          block.instructionAddressSpaceGeneration = instructionAddressSpaceGeneration;
           delete block.wasm;
-          blocks.set(pc, block);
+          blocks.set(instructionBlockKey(pc), block);
         }
 
         stage = "link-region";
@@ -11381,7 +11578,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         let executedBlocks = 0;
         let executedRegion = false;
         let regionRequestedExit = false;
-        const region = regionsByPc.get(pc);
+        const region = compiledRegion(pc);
         const eventCycle = nextRuntimeEventCycle();
         const regionCycleBudget = eventCycle === null
           ? 0x7fffffff

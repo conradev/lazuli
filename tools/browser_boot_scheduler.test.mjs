@@ -32,6 +32,7 @@ function schedulerContext() {
     isCacheLineLoop: () => false,
     decodeMemset32ByteLoop: () => null,
   };
+  context.compiledBlock = pc => context.blocks.get(pc);
   vm.createContext(context);
   vm.runInContext(
     ["isSemanticIdlePattern", "isRecognizedLoopPc"]
