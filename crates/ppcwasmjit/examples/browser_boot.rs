@@ -6222,6 +6222,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       return gxCullF32(gxCullF32(left) * gxCullF32(right));
     }
 
+    function gxCullDiv(left, right) {
+      return gxCullF32(gxCullF32(left) / gxCullF32(right));
+    }
+
     function gxCullAdd(left, right) {
       return gxCullF32(gxCullF32(left) + gxCullF32(right));
     }
@@ -7809,6 +7813,201 @@ const TEMPLATE: &str = r##"<!doctype html>
         ];
       }
       return clip.every(Number.isFinite) ? clip : null;
+    }
+
+    // This is the scalar-f32 software projection oracle used by the clipping
+    // bring-up. Keep it separate from the live f64 vertex path until packets
+    // can carry and the renderer can validate complete clipped geometry.
+    function gxExactClipViewPosition(
+      viewPosition,
+      state = gxCullTransformState()
+    ) {
+      if (
+        !Array.isArray(viewPosition)
+        || viewPosition.length !== 3
+        || viewPosition.some(value => !Number.isFinite(value))
+        || state === null
+        || !Array.isArray(state.projection)
+        || state.projection.length !== 6
+        || state.projection.some(value => !Number.isFinite(value))
+        || (state.projectionType !== 0 && state.projectionType !== 1)
+      ) {
+        return null;
+      }
+      const viewX = gxCullF32(viewPosition[0]);
+      const viewY = gxCullF32(viewPosition[1]);
+      const viewZ = gxCullF32(viewPosition[2]);
+      const projection = state.projection;
+      let clip;
+      if (state.projectionType === 0) {
+        const depth = gxCullAdd(
+          gxCullMul(projection[4], viewZ),
+          projection[5]
+        );
+        clip = [
+          gxCullAdd(gxCullMul(projection[0], viewX), gxCullMul(projection[1], viewZ)),
+          gxCullAdd(gxCullMul(projection[2], viewY), gxCullMul(projection[3], viewZ)),
+          gxCullMul(depth, gxCullSub(1, gxCullF32(1e-7))),
+          gxCullF32(-viewZ),
+        ];
+      } else if (state.projectionType === 1) {
+        clip = [
+          gxCullAdd(gxCullMul(projection[0], viewX), projection[1]),
+          gxCullAdd(gxCullMul(projection[2], viewY), projection[3]),
+          gxCullAdd(gxCullMul(projection[4], viewZ), projection[5]),
+          1,
+        ];
+      } else {
+        return null;
+      }
+      return clip.every(Number.isFinite) ? clip : null;
+    }
+
+    function gxExactClipPosition(
+      position,
+      matrixIndex,
+      state = gxCullTransformState()
+    ) {
+      if (
+        !Array.isArray(position)
+        || position.length !== 3
+        || position.some(value => !Number.isFinite(value))
+        || !Number.isInteger(matrixIndex)
+        || state === null
+        || !Array.isArray(state.positionMatrices)
+      ) {
+        return null;
+      }
+      const viewPosition = gxCullViewPosition(position, matrixIndex, state);
+      return viewPosition === null
+        ? null
+        : gxExactClipViewPosition(viewPosition, state);
+    }
+
+    function gxExactNoWrapScissorAxisOffset(
+      start,
+      end,
+      baseOffset,
+      dimension
+    ) {
+      if (
+        !Number.isInteger(start)
+        || !Number.isInteger(end)
+        || !Number.isInteger(baseOffset)
+        || !Number.isInteger(dimension)
+        || start < 0
+        || end < start
+        || baseOffset < 0
+        || dimension <= 0
+      ) {
+        return null;
+      }
+      let count = 0;
+      for (let extraOffset = -4096; extraOffset <= 4096; extraOffset += 1024) {
+        const offset = baseOffset + extraOffset;
+        const clippedStart = Math.max(0, Math.min(dimension, start - offset));
+        const clippedEnd = Math.max(0, Math.min(dimension, end - offset + 1));
+        if (clippedStart >= clippedEnd) continue;
+        count += 1;
+        if (extraOffset !== 0) return null;
+      }
+      return count === 1 ? baseOffset : null;
+    }
+
+    // The GX scissor can wrap at 1024-pixel intervals and expose more than one
+    // EFB rectangle. The first managed clipping layer deliberately certifies
+    // only the common single, unwrapped rectangle; wrapped draws remain native.
+    function gxExactNoWrapViewportState() {
+      const viewport = Array.from({ length: 6 }, (_unused, index) =>
+        gxXfFloat(0x101a + index)
+      );
+      if (viewport.some(value => !Number.isFinite(value))) return null;
+      const topLeft = gxBpRegisters[0x20] >>> 0;
+      const bottomRight = gxBpRegisters[0x21] >>> 0;
+      const scissorOffset = gxBpRegisters[0x59] >>> 0;
+      // Hardware ignores the top bit of each nominally ten-bit BP59 field.
+      const baseOffsetX = (scissorOffset & 0x1ff) * 2;
+      const baseOffsetY = ((scissorOffset >>> 10) & 0x1ff) * 2;
+      const scissorOffsetX = gxExactNoWrapScissorAxisOffset(
+        (topLeft >>> 12) & 0x7ff,
+        (bottomRight >>> 12) & 0x7ff,
+        baseOffsetX,
+        640
+      );
+      const scissorOffsetY = gxExactNoWrapScissorAxisOffset(
+        topLeft & 0x7ff,
+        bottomRight & 0x7ff,
+        baseOffsetY,
+        528
+      );
+      if (scissorOffsetX === null || scissorOffsetY === null) return null;
+      return {
+        viewport,
+        scissorOffsetX,
+        scissorOffsetY,
+      };
+    }
+
+    function gxExactNoWrapScreenPosition(
+      clipPosition,
+      state = gxExactNoWrapViewportState()
+    ) {
+      if (
+        !Array.isArray(clipPosition)
+        || clipPosition.length !== 4
+        || clipPosition.some(value => !Number.isFinite(value))
+        || state === null
+        || !Array.isArray(state.viewport)
+        || state.viewport.length !== 6
+        || state.viewport.some(value => !Number.isFinite(value))
+        || !Number.isInteger(state.scissorOffsetX)
+        || state.scissorOffsetX < 0
+        || state.scissorOffsetX > 1022
+        || (state.scissorOffsetX & 1) !== 0
+        || !Number.isInteger(state.scissorOffsetY)
+        || state.scissorOffsetY < 0
+        || state.scissorOffsetY > 1022
+        || (state.scissorOffsetY & 1) !== 0
+      ) {
+        return null;
+      }
+      const clip = clipPosition.map(gxCullF32);
+      const viewport = state.viewport.map(gxCullF32);
+      const inverseW = gxCullDiv(1, clip[3]);
+      const screen = [
+        gxCullSub(
+          gxCullAdd(
+            gxCullMul(gxCullMul(clip[0], inverseW), viewport[0]),
+            viewport[3]
+          ),
+          state.scissorOffsetX
+        ),
+        gxCullSub(
+          gxCullAdd(
+            gxCullMul(gxCullMul(clip[1], inverseW), viewport[1]),
+            viewport[4]
+          ),
+          state.scissorOffsetY
+        ),
+        gxCullAdd(
+          gxCullMul(gxCullMul(clip[2], inverseW), viewport[2]),
+          viewport[5]
+        ),
+        clip[3],
+      ];
+      return screen.every(Number.isFinite) ? screen : null;
+    }
+
+    function gxExactNoWrapProjectPosition(
+      position,
+      matrixIndex,
+      transformState = gxCullTransformState(),
+      viewportState = gxExactNoWrapViewportState()
+    ) {
+      const clip = gxExactClipPosition(position, matrixIndex, transformState);
+      return clip === null
+        ? null
+        : gxExactNoWrapScreenPosition(clip, viewportState);
     }
 
     function gxCullClipPositionIsInside(clip) {

@@ -29,6 +29,7 @@ function extractFunction(name) {
 const pureFunctions = [
   "gxCullF32",
   "gxCullMul",
+  "gxCullDiv",
   "gxCullAdd",
   "gxCullSub",
   "gxCullDot4Position",
@@ -526,6 +527,177 @@ test("canonical cull clip transform rounds every scalar operation to f32", () =>
   assert.deepEqual(
     plain(context.gxCullClipPosition([0.5, -0.25, -1], 0)),
     [0.5, -0.25, -1, 1],
+  );
+});
+
+test("exact projection and viewport model pins scalar f32 operation order", () => {
+  const xf = new Float32Array(0x1100);
+  xf.set([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+  ], 0);
+  xf.set([
+    1.0000001192092896,
+    -0.3333333432674408,
+    0.75,
+    0.125,
+    1.25,
+    -0.5,
+  ], 0x1020);
+  xf.set([320, -264, 16777215, 342, 342, 0], 0x101a);
+  const registers = new Uint32Array(xf.buffer);
+  registers[0x1026] = 0;
+  const bp = new Uint32Array(0x100);
+  bp[0x20] = (342 << 12) | 342;
+  bp[0x21] = ((342 + 639) << 12) | (342 + 527);
+  bp[0x59] = 171 | (171 << 10);
+  const context = {
+    Array,
+    Math,
+    Number,
+    gxBpRegisters: bp,
+    gxXfRegisters: registers,
+    gxXfFloat(address) {
+      return xf[address];
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "gxCullF32",
+      "gxCullMul",
+      "gxCullDiv",
+      "gxCullAdd",
+      "gxCullSub",
+      "gxCullDot4Position",
+      "gxCullDot4",
+      "gxCullTransformState",
+      "gxCullPositionMatrix",
+      "gxCullViewPosition",
+      "gxExactClipViewPosition",
+      "gxExactClipPosition",
+      "gxExactNoWrapScissorAxisOffset",
+      "gxExactNoWrapViewportState",
+      "gxExactNoWrapScreenPosition",
+      "gxExactNoWrapProjectPosition",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.gx-exact-projection.js" },
+  );
+
+  const transformState = context.gxCullTransformState();
+  const viewportState = context.gxExactNoWrapViewportState();
+  const position = [0.9999999403953552, -1.25, -3.5];
+  const clip = context.gxExactClipPosition(position, 0, transformState);
+  assert.deepEqual(
+    f32BitPatterns(clip),
+    [0x400aaaab, 0xbfb00000, 0xc09bffff, 0x40600000],
+    "perspective Z includes Dolphin's f32 depth contraction",
+  );
+  assert.deepEqual(
+    f32BitPatterns(
+      context.gxExactNoWrapProjectPosition(
+        position,
+        0,
+        transformState,
+        viewportState,
+      ),
+    ),
+    [0x43461860, 0x42cf6db8, 0xcbb24923, 0x40600000],
+    "divide, viewport multiply/add, and raw BP59 offset each round to f32",
+  );
+  assert.deepEqual(
+    { ...viewportState },
+    {
+      viewport: [320, -264, 16777215, 342, 342, 0],
+      scissorOffsetX: 342,
+      scissorOffsetY: 342,
+    },
+  );
+  assert.equal(
+    context.gxExactNoWrapScreenPosition([0, 0, 0, 0], viewportState),
+    null,
+  );
+  assert.equal(context.gxExactClipPosition(null, 0, transformState), null);
+  assert.equal(
+    context.gxExactClipPosition(position, 0, {
+      projection: transformState.projection,
+      projectionType: 0,
+    }),
+    null,
+  );
+  assert.equal(
+    context.gxExactClipViewPosition(position, {
+      projectionType: 0,
+    }),
+    null,
+  );
+  assert.equal(
+    context.gxExactNoWrapScreenPosition(clip, {
+      viewport: viewportState.viewport,
+      scissorOffsetX: 1024,
+      scissorOffsetY: 342,
+    }),
+    null,
+  );
+
+  const onePlusTwoNeg23 = 1 + 2 ** -23;
+  const oneMinusTwoNeg23 = 1 - 2 ** -23;
+  const cancellation = context.gxExactClipViewPosition(
+    [oneMinusTwoNeg23, 0, 1],
+    {
+      projection: [onePlusTwoNeg23, -1, 1, 0, 1, 0],
+      projectionType: 0,
+    },
+  );
+  assert.deepEqual(
+    f32BitPatterns(cancellation),
+    [0x00000000, 0x00000000, 0x3f7ffffe, 0xbf800000],
+    "each perspective product rounds before the cancellation add",
+  );
+  assert.notEqual(
+    f32Bits(onePlusTwoNeg23 * oneMinusTwoNeg23 - 1),
+    0,
+    "late-f64 projection would retain the cancellation residue",
+  );
+  assert.deepEqual(
+    f32BitPatterns(
+      context.gxExactClipViewPosition(
+        [0.5, -0.25, 0.75],
+        {
+          projection: [2, 0.25, -3, 0.5, 4, -1],
+          projectionType: 1,
+        },
+      ),
+    ),
+    [0x3fa00000, 0x3fa00000, 0x40000000, 0x3f800000],
+    "orthographic projection does not contract Z",
+  );
+
+  bp[0x59] |= (1 << 9) | (1 << 19);
+  assert.deepEqual(
+    { ...context.gxExactNoWrapViewportState() },
+    { ...viewportState },
+    "hardware ignores the top bit of each BP59 offset field",
+  );
+  bp[0x20] = 0;
+  bp[0x21] = (0x7ff << 12) | 0x7ff;
+  assert.equal(
+    context.gxExactNoWrapViewportState(),
+    null,
+    "a wrapped multi-rectangle scissor stays outside the first managed subset",
+  );
+
+  assert.doesNotMatch(
+    extractFunction("gxDecodeVertex"),
+    /\bgxExact/,
+    "live vertex decode must remain unchanged until clipped geometry is transportable",
+  );
+  assert.doesNotMatch(
+    extractFunction("recordGxPrimitive"),
+    /\bgxExact/,
+    "draw capture must not activate the proof model",
   );
 });
 
