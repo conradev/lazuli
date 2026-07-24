@@ -607,9 +607,9 @@ pub(crate) const TEV_VERTEX_WGSL: &str = "enable dual_source_blending;
 
 struct DrawState {
     alpha_test: u32,
-    _padding0: u32,
-    _padding1: u32,
-    _padding2: u32,
+    destination_alpha: u32,
+    fragment_flags: u32,
+    padding: u32,
 };
 
 struct TevVertexInput {
@@ -979,8 +979,17 @@ fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
         discard;
     }
 
+    var selected_alpha = tev_alpha;
+    if (draw_state.destination_alpha & 0x100u) == 0x100u {
+        selected_alpha = draw_state.destination_alpha & 0xffu;
+    }
+    var primary_alpha = source.a;
+    if (draw_state.fragment_flags & 1u) != 0u {
+        primary_alpha = f32(selected_alpha >> 2u) / 63.0;
+    }
+
     var output: TevFragmentOutput;
-    output.primary = source;
+    output.primary = vec4<f32>(source.rgb, primary_alpha);
     output.secondary = source;
     return output;
 }
@@ -1375,11 +1384,55 @@ mod tests {
         assert!(shader.starts_with("enable dual_source_blending;\n"));
         assert_eq!(shader.matches("enable dual_source_blending;").count(), 1);
         assert!(shader.contains(
+            "struct DrawState {\n    alpha_test: u32,\n    destination_alpha: u32,\n    fragment_flags: u32,\n    padding: u32,\n};"
+        ));
+        assert!(shader.contains(
             "struct TevFragmentOutput {\n    @location(0) @blend_src(0) primary: vec4<f32>,\n    @location(0) @blend_src(1) secondary: vec4<f32>,\n};"
         ));
         assert!(shader.contains("fn fs_main(input: TevVertexOutput) -> TevFragmentOutput"));
-        assert!(shader.contains("output.primary = source"));
+        assert!(shader.contains("output.primary = vec4<f32>(source.rgb, primary_alpha)"));
         assert!(shader.contains("output.secondary = source"));
+    }
+
+    #[test]
+    fn wgsl_fragment_alpha_order_and_rgba6_quantization_are_exact() {
+        let shader = shader_source();
+        let evaluate = shader
+            .find("let source = tev_evaluate(raster_colors, tex_coords)")
+            .unwrap();
+        let tev_alpha = shader
+            .find("let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0))")
+            .unwrap();
+        let alpha_test = shader
+            .find("if !alpha_test_passes(tev_alpha, draw_state.alpha_test)")
+            .unwrap();
+        let destination_alpha = shader
+            .find("if (draw_state.destination_alpha & 0x100u) == 0x100u")
+            .unwrap();
+        let rgba6 = shader
+            .find("if (draw_state.fragment_flags & 1u) != 0u")
+            .unwrap();
+        let quantize = shader
+            .find("primary_alpha = f32(selected_alpha >> 2u) / 63.0")
+            .unwrap();
+        let primary = shader
+            .find("output.primary = vec4<f32>(source.rgb, primary_alpha)")
+            .unwrap();
+        let secondary = shader.find("output.secondary = source").unwrap();
+
+        assert!(
+            evaluate < tev_alpha
+                && tev_alpha < alpha_test
+                && alpha_test < destination_alpha
+                && destination_alpha < rgba6
+                && rgba6 < quantize
+                && quantize < primary
+                && primary < secondary
+        );
+        assert!(shader.contains("var selected_alpha = tev_alpha"));
+        assert!(shader.contains("selected_alpha = draw_state.destination_alpha & 0xffu"));
+        assert!(shader.contains("var primary_alpha = source.a"));
+        assert!(!shader.contains("alpha_test_passes(selected_alpha"));
     }
 
     #[test]

@@ -273,13 +273,33 @@ struct TevVertex {
 
 const _: () = assert!(std::mem::size_of::<TevVertex>() == TEV_VERTEX_FLOATS * size_of::<f32>());
 
+const DRAW_FRAGMENT_FLAG_RGBA6: u32 = 1;
 const REQUIRED_WEBGPU_FEATURES: wgpu::Features = wgpu::Features::DUAL_SOURCE_BLENDING;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Pod, Zeroable)]
 struct DrawUniform {
     alpha_test: u32,
-    _padding: [u32; 3],
+    destination_alpha: u32,
+    fragment_flags: u32,
+    _padding: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DrawUniform>() == 16);
+
+impl DrawUniform {
+    fn from_gx(alpha_test: u32, destination_alpha: GxDestinationAlphaState) -> Self {
+        Self {
+            alpha_test: alpha_test & 0x00ff_ffff,
+            destination_alpha: u32::from(destination_alpha.effective_constant),
+            fragment_flags: if destination_alpha.target_has_guest_alpha {
+                DRAW_FRAGMENT_FLAG_RGBA6
+            } else {
+                0
+            },
+            _padding: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -490,12 +510,12 @@ struct TevBindingKey {
     textures: [TextureBindingIdentity; MAX_TEV_TEXTURES],
     samplers: [SamplerIdentity; MAX_TEV_TEXTURES],
     state: Vec<u8>,
-    alpha_test: u32,
+    draw: DrawUniform,
 }
 
 struct CachedTevDrawBinding {
-    _alpha_uniform: wgpu::Buffer,
-    alpha_bind_group: wgpu::BindGroup,
+    _draw_uniform: wgpu::Buffer,
+    draw_bind_group: wgpu::BindGroup,
     _tev_uniform: wgpu::Buffer,
     tev_bind_group: wgpu::BindGroup,
 }
@@ -1708,6 +1728,7 @@ impl WebGpuRenderer {
             blend_mode,
             alpha_test,
             0,
+            0,
             cull_mode,
             scissor_x,
             scissor_y,
@@ -1845,6 +1866,7 @@ impl WebGpuRenderer {
                     draw.record.blend_mode,
                     draw.record.alpha_test,
                     draw.record.fragment_tail.pixel_control,
+                    draw.record.fragment_tail.constant_alpha,
                     draw.record.cull_mode,
                     draw.record.scissor_x,
                     draw.record.scissor_y,
@@ -1911,6 +1933,7 @@ impl WebGpuRenderer {
         blend_mode: u32,
         alpha_test: u32,
         pixel_control: u32,
+        constant_alpha: u32,
         cull_mode: u8,
         scissor_x: u32,
         scissor_y: u32,
@@ -1960,9 +1983,11 @@ impl WebGpuRenderer {
             7 => Primitive::Points,
             _ => Primitive::Triangles,
         };
-        let destination_alpha = gx_destination_alpha_state(blend_mode, 0, pixel_control);
+        let destination_alpha =
+            gx_destination_alpha_state(blend_mode, constant_alpha, pixel_control);
         let pipeline =
             PipelineKey::from_gx(primitive, z_mode, blend_mode, destination_alpha, cull_mode);
+        let draw_uniform = DrawUniform::from_gx(alpha_test, destination_alpha);
         let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
         else {
             return Ok(());
@@ -2058,27 +2083,24 @@ impl WebGpuRenderer {
             textures: texture_identities,
             samplers: sampler_identities,
             state: tev_state.to_vec(),
-            alpha_test: alpha_test & 0x00ff_ffff,
+            draw: draw_uniform,
         };
         let binding = if let Some(binding) = self.tev_draw_binding_indices.get(&binding_key) {
             *binding
         } else {
-            let alpha_uniform = self
+            let draw_uniform = self
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("browser GX TEV alpha-test state"),
-                    contents: bytemuck::bytes_of(&DrawUniform {
-                        alpha_test: binding_key.alpha_test,
-                        _padding: [0; 3],
-                    }),
+                    label: Some("browser GX TEV draw state"),
+                    contents: bytemuck::bytes_of(&binding_key.draw),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-            let alpha_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("browser GX TEV alpha-test bind group"),
+            let draw_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("browser GX TEV draw-state bind group"),
                 layout: &self.tev_draw_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: alpha_uniform.as_entire_binding(),
+                    resource: draw_uniform.as_entire_binding(),
                 }],
             });
             let tev_uniform = self
@@ -2124,8 +2146,8 @@ impl WebGpuRenderer {
             });
             let binding = self.tev_draw_bindings.len();
             self.tev_draw_bindings.push(CachedTevDrawBinding {
-                _alpha_uniform: alpha_uniform,
-                alpha_bind_group,
+                _draw_uniform: draw_uniform,
+                draw_bind_group,
                 _tev_uniform: tev_uniform,
                 tev_bind_group,
             });
@@ -2964,7 +2986,7 @@ impl WebGpuRenderer {
         let required_features = REQUIRED_WEBGPU_FEATURES;
         if !adapter.features().contains(required_features) {
             return Err(
-                "WebGPU dual-source blending is required for exact GX component blending; this adapter exposes no compatible feature and Lazuli has no rendering fallback"
+                "WebGPU dual-source blending is required for exact GX destination alpha; this adapter exposes no compatible feature and Lazuli has no rendering fallback"
                     .to_owned(),
             );
         }
@@ -2980,7 +3002,7 @@ impl WebGpuRenderer {
             .await
             .map_err(|error| {
                 format!(
-                    "failed to create required dual-source-blending WebGPU device; exact GX component blending has no fallback: {error}"
+                    "failed to create required dual-source-blending WebGPU device; exact GX destination alpha has no fallback: {error}"
                 )
             })?;
         let failure_state = RendererFailureState::default();
@@ -3345,7 +3367,7 @@ impl WebGpuRenderer {
                 let binding = &self.tev_draw_bindings[command.state.binding];
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_pipeline(&self.pipelines.tev_geometry[&command.state.pipeline]);
-                pass.set_bind_group(0, &binding.alpha_bind_group, &[]);
+                pass.set_bind_group(0, &binding.draw_bind_group, &[]);
                 pass.set_bind_group(1, &binding.tev_bind_group, &[]);
                 pass.set_scissor_rect(
                     command.state.scissor.x,
@@ -3402,7 +3424,15 @@ impl PipelineKey {
 
         let blend = gx_blend_state(blend_mode);
         let color_blend = color_blend_component(blend, destination_alpha.target_has_guest_alpha);
-        let alpha_blend = alpha_blend_component(blend, destination_alpha.target_has_guest_alpha);
+        let alpha_blend = if destination_alpha.replacement_enabled() {
+            BlendComponentState {
+                source: wgpu::BlendFactor::One,
+                destination: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            }
+        } else {
+            alpha_blend_component(blend, destination_alpha.target_has_guest_alpha)
+        };
         let cull = if primitive == Primitive::Triangles {
             match cull_mode & 3 {
                 1 => CullMode::Back,
@@ -4112,10 +4142,14 @@ fn create_pipelines(
 #[cfg(test)]
 mod tests {
     use super::{
-        PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES, alpha_blend_factor, blend_write_mask,
-        color_blend_factor, expanded_indices,
+        BlendComponentState, DrawUniform, PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES,
+        TevBindingKey, alpha_blend_factor, blend_write_mask, color_blend_factor, expanded_indices,
     };
-    use crate::{GxBlendFactor, gx_destination_alpha_state};
+    use crate::tev::MAX_TEV_TEXTURES;
+    use crate::{
+        GxBlendFactor, SamplerIdentity, TextureAddressMode, TextureBindingIdentity,
+        gx_destination_alpha_state,
+    };
 
     fn encoded_blend_mode(
         source: u32,
@@ -4129,14 +4163,29 @@ mod tests {
             | ((source & 7) << 8)
     }
 
-    fn pipeline_key(blend_mode: u32, pixel_control: u32) -> PipelineKey {
+    fn pipeline_key(blend_mode: u32, constant_alpha: u32, pixel_control: u32) -> PipelineKey {
         PipelineKey::from_gx(
             Primitive::Triangles,
             0,
             blend_mode,
-            gx_destination_alpha_state(blend_mode, 0, pixel_control),
+            gx_destination_alpha_state(blend_mode, constant_alpha, pixel_control),
             0,
         )
+    }
+
+    fn binding_key(draw: DrawUniform) -> TevBindingKey {
+        let sampler = SamplerIdentity {
+            mag_filter: false,
+            min_filter: false,
+            address_u: TextureAddressMode::ClampToEdge,
+            address_v: TextureAddressMode::ClampToEdge,
+        };
+        TevBindingKey {
+            textures: std::array::from_fn(|_| TextureBindingIdentity::White),
+            samplers: [sampler; MAX_TEV_TEXTURES],
+            state: vec![0; 464],
+            draw,
+        }
     }
 
     #[test]
@@ -4212,19 +4261,98 @@ mod tests {
     }
 
     #[test]
+    fn destination_alpha_replacement_changes_only_alpha_blending_behavior() {
+        // Source factor 2 is destination color; destination factor 2 is source
+        // color. Their alpha counterparts must be DstAlpha and Src1Alpha.
+        let blend_mode = encoded_blend_mode(2, 2, true, true);
+        let ordinary = pipeline_key(blend_mode, 0, 1);
+        assert_eq!(ordinary.blend.color.source, wgpu::BlendFactor::Dst);
+        assert_eq!(ordinary.blend.color.destination, wgpu::BlendFactor::Src1);
+        assert_eq!(ordinary.blend.alpha.source, wgpu::BlendFactor::DstAlpha);
+        assert_eq!(
+            ordinary.blend.alpha.destination,
+            wgpu::BlendFactor::Src1Alpha
+        );
+
+        let replaced_zero = pipeline_key(blend_mode, 0x100, 1);
+        let replaced_full = pipeline_key(blend_mode, 0x1ff, 1);
+        assert_eq!(replaced_zero, replaced_full);
+        assert_eq!(replaced_zero.blend.color, ordinary.blend.color);
+        assert_eq!(
+            replaced_zero.blend.alpha,
+            BlendComponentState {
+                source: wgpu::BlendFactor::One,
+                destination: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            }
+        );
+        assert_ne!(replaced_zero, ordinary);
+    }
+
+    #[test]
+    fn destination_alpha_replacement_preserves_subtractive_rgb_blending() {
+        let subtract_mode = 1 | (1 << 3) | (1 << 4) | (1 << 11);
+        let ordinary = pipeline_key(subtract_mode, 0, 1);
+        let replaced = pipeline_key(subtract_mode, 0x180, 1);
+        assert_eq!(
+            ordinary.blend.color.operation,
+            wgpu::BlendOperation::ReverseSubtract
+        );
+        assert_eq!(replaced.blend.color, ordinary.blend.color);
+        assert_eq!(
+            replaced.blend.alpha,
+            BlendComponentState {
+                source: wgpu::BlendFactor::One,
+                destination: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            }
+        );
+    }
+
+    #[test]
     fn write_masks_keep_color_and_guest_alpha_updates_independent() {
-        let neither = pipeline_key(encoded_blend_mode(1, 0, false, false), 1);
-        let color = pipeline_key(encoded_blend_mode(1, 0, true, false), 1);
-        let alpha = pipeline_key(encoded_blend_mode(1, 0, false, true), 1);
-        let both = pipeline_key(encoded_blend_mode(1, 0, true, true), 1);
+        let neither = pipeline_key(encoded_blend_mode(1, 0, false, false), 0, 1);
+        let color = pipeline_key(encoded_blend_mode(1, 0, true, false), 0, 1);
+        let alpha = pipeline_key(encoded_blend_mode(1, 0, false, true), 0, 1);
+        let both = pipeline_key(encoded_blend_mode(1, 0, true, true), 0, 1);
         assert_eq!(blend_write_mask(neither.blend), wgpu::ColorWrites::empty());
         assert_eq!(blend_write_mask(color.blend), wgpu::ColorWrites::COLOR);
         assert_eq!(blend_write_mask(alpha.blend), wgpu::ColorWrites::ALPHA);
         assert_eq!(blend_write_mask(both.blend), wgpu::ColorWrites::ALL);
 
-        let no_alpha = pipeline_key(encoded_blend_mode(1, 0, true, true), 0);
+        let no_alpha = pipeline_key(encoded_blend_mode(1, 0, true, true), 0, 0);
         assert_eq!(blend_write_mask(no_alpha.blend), wgpu::ColorWrites::COLOR);
         assert!(no_alpha.blend.color_write);
         assert!(!no_alpha.blend.alpha_write);
+    }
+
+    #[test]
+    fn draw_binding_cache_keys_canonicalize_inactive_state_without_aliasing_active_values() {
+        let blend_mode = encoded_blend_mode(1, 0, true, true);
+        let active_zero =
+            DrawUniform::from_gx(0x123456, gx_destination_alpha_state(blend_mode, 0x100, 1));
+        let active_full =
+            DrawUniform::from_gx(0x123456, gx_destination_alpha_state(blend_mode, 0x1ff, 1));
+        assert_eq!(active_zero.destination_alpha, 0x100);
+        assert_eq!(active_full.destination_alpha, 0x1ff);
+        assert_eq!(active_zero.fragment_flags, 1);
+        assert_ne!(binding_key(active_zero), binding_key(active_full));
+
+        let alpha_update_disabled = encoded_blend_mode(1, 0, true, false);
+        let inactive_a = DrawUniform::from_gx(
+            0x123456,
+            gx_destination_alpha_state(alpha_update_disabled, 0x100, 1),
+        );
+        let inactive_b = DrawUniform::from_gx(
+            0x123456,
+            gx_destination_alpha_state(alpha_update_disabled, 0x1ff, 1),
+        );
+        assert_eq!(inactive_a.destination_alpha, 0);
+        assert_eq!(binding_key(inactive_a), binding_key(inactive_b));
+
+        let no_alpha =
+            DrawUniform::from_gx(0x123456, gx_destination_alpha_state(blend_mode, 0x1ff, 0));
+        assert_eq!(no_alpha.fragment_flags, 0);
+        assert_ne!(binding_key(inactive_a), binding_key(no_alpha));
     }
 }

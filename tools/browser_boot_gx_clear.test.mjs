@@ -202,7 +202,7 @@ test("GX depth endpoints span the full unsigned 24-bit range in clears and draws
   assert.doesNotMatch(rendererCoreSource, /GX_DEPTH24_SCALE|GX_DEPTH24_MAX_FLOAT/);
 });
 
-test("strict WebGPU rendering requires the canonical component-exact dual-source contract", () => {
+test("strict WebGPU rendering requires the canonical dual-source destination-alpha contract", () => {
   assert.match(
     rendererSource,
     /const REQUIRED_WEBGPU_FEATURES: wgpu::Features = wgpu::Features::DUAL_SOURCE_BLENDING/,
@@ -227,4 +227,45 @@ test("strict WebGPU rendering requires the canonical component-exact dual-source
   assert.match(shader, /@location\(0\) @blend_src\(0\) primary: vec4<f32>/);
   assert.match(shader, /@location\(0\) @blend_src\(1\) secondary: vec4<f32>/);
   assert.match(shader, /output\.secondary = source/);
+});
+
+test("LZGX v3 fragment-tail destination alpha reaches the draw uniform after the TEV alpha test", () => {
+  const submit = rendererSection("pub fn submit_gx_frame", "fn push_tev_draw_inner");
+  assert.match(
+    submit,
+    /draw\.record\.fragment_tail\.pixel_control,\s*draw\.record\.fragment_tail\.constant_alpha,/s,
+  );
+
+  const draw = rendererSection("fn push_tev_draw_inner", "pub fn copy_texture");
+  assert.match(
+    draw,
+    /gx_destination_alpha_state\(blend_mode, constant_alpha, pixel_control\)/,
+  );
+  assert.match(draw, /DrawUniform::from_gx\(alpha_test, destination_alpha\)/);
+  assert.match(draw, /draw: draw_uniform/);
+
+  const gate = sourceSection(
+    rendererCoreSource,
+    "pub(crate) fn gx_destination_alpha_state",
+    "const fn expand_5_to_8",
+  );
+  assert.match(gate, /constant_alpha & \(1 << 8\) != 0/);
+  assert.match(gate, /blend_mode & \(1 << 4\) != 0/);
+  assert.match(gate, /target_has_guest_alpha/);
+
+  const fragment = sourceSection(
+    tevSource,
+    "pub(crate) const TEV_FRAGMENT_WGSL",
+    "pub(crate) fn shader_source",
+  );
+  const testPosition = fragment.indexOf(
+    "alpha_test_passes(tev_alpha, draw_state.alpha_test)",
+  );
+  const replacementPosition = fragment.indexOf(
+    "draw_state.destination_alpha & 0x100u",
+  );
+  assert.notEqual(testPosition, -1);
+  assert.notEqual(replacementPosition, -1);
+  assert.ok(testPosition < replacementPosition);
+  assert.match(fragment, /f32\(selected_alpha >> 2u\) \/ 63\.0/);
 });
