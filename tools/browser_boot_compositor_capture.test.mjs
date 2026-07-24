@@ -26,6 +26,13 @@ function extractFunction(name) {
 
 function temporalCapture(ordinal = 1) {
   const generation = 500 + ordinal;
+  const scanout = {
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0x0a00,
+    sourceRowStep: 2,
+    fieldHeight: 224,
+    rowRepeat: 2,
+  };
   return {
     scenario: "smb-ready-play",
     step: "post-play-presented",
@@ -39,6 +46,7 @@ function temporalCapture(ordinal = 1) {
       copyRow: 0,
       width: 640,
       height: 448,
+      ...scanout,
     },
     presentedSurface: {
       address: "0x01200500",
@@ -47,6 +55,7 @@ function temporalCapture(ordinal = 1) {
       presentationSerial: 900 + ordinal,
       width: 640,
       height: 448,
+      ...scanout,
     },
   };
 }
@@ -127,6 +136,8 @@ function coordinatorHarness() {
     "freezeCompositorGeometry",
     "captureCompositorGeometry",
     "compositorGeometryEqual",
+    "viScanoutProvenance",
+    "viScanoutProvenanceEqual",
     "compositorCaptureProvenance",
     "finishCompositorCapture",
     "failCompositorCapture",
@@ -223,11 +234,16 @@ test("two stable animation frames publish one exact frozen descriptor", async ()
     "row",
     "width",
     "height",
+    "scanoutPolicy",
+    "fieldStrideBytes",
+    "sourceRowStep",
+    "fieldHeight",
+    "rowRepeat",
     "geometry",
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(descriptor)), {
-    protocol: "lazuli-compositor-capture-v1",
-    token: "lazuli-compositor-v1:3:1:701:901:00000000-0000-4000-8000-000000000001",
+    protocol: "lazuli-compositor-capture-v2",
+    token: "lazuli-compositor-v2:3:1:701:901:00000000-0000-4000-8000-000000000001",
     scenario: "smb-ready-play",
     step: "post-play-presented",
     ordinal: 1,
@@ -238,6 +254,11 @@ test("two stable animation frames publish one exact frozen descriptor", async ()
     row: 0,
     width: 640,
     height: 448,
+    scanoutPolicy: "bob",
+    fieldStrideBytes: 0x0a00,
+    sourceRowStep: 2,
+    fieldHeight: 224,
+    rowRepeat: 2,
     geometry: {
       canvas: {
         bufferWidth: 640,
@@ -394,6 +415,15 @@ test("provenance mismatch and concurrent capture requests fail closed", async ()
     const harness = coordinatorHarness();
     const capture = temporalCapture();
     capture.presentedSurface.presentationSerial = 0;
+    assert.throws(
+      () => harness.context.waitForCompositorCapture(capture, harness.currentWorker),
+      /provenance is invalid/,
+    );
+  }
+  {
+    const harness = coordinatorHarness();
+    const capture = temporalCapture();
+    capture.presentedSurface.rowRepeat = 1;
     assert.throws(
       () => harness.context.waitForCompositorCapture(capture, harness.currentWorker),
       /provenance is invalid/,

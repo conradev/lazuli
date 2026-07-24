@@ -9528,6 +9528,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         throw new Error("compositor capture provenance is invalid");
       }
+      let scanout;
+      try {
+        scanout = viScanoutProvenance(surface);
+      } catch (_error) {
+        throw new Error("compositor capture provenance is invalid");
+      }
+      if (!viScanoutProvenanceEqual(scanout, presentation)) {
+        throw new Error("compositor capture provenance is invalid");
+      }
       return {
         scenario: capture.scenario,
         step: capture.step,
@@ -9539,6 +9548,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         row,
         width,
         height,
+        ...scanout,
       };
     }
     function finishCompositorCapture(active, error = null) {
@@ -9578,7 +9588,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function buildCompositorCaptureDescriptor(provenance, geometry) {
       compositorCaptureSequence += 1;
       const token = [
-        "lazuli-compositor-v1",
+        "lazuli-compositor-v2",
         compositorCaptureWorkerEpoch,
         compositorCaptureSequence,
         provenance.rendererSequence,
@@ -9586,7 +9596,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         crypto.randomUUID(),
       ].join(":");
       return Object.freeze({
-        protocol: "lazuli-compositor-capture-v1",
+        protocol: "lazuli-compositor-capture-v2",
         token,
         ...provenance,
         geometry,
@@ -9784,6 +9794,56 @@ const TEMPLATE: &str = r##"<!doctype html>
         unique: colors.size,
       };
     }
+    function viScanoutProvenance(value) {
+      const scanoutPolicy = String(value?.scanoutPolicy);
+      const fieldStrideBytes = Number(value?.fieldStrideBytes);
+      const sourceRowStep = Number(value?.sourceRowStep);
+      const fieldHeight = Number(value?.fieldHeight);
+      const rowRepeat = Number(value?.rowRepeat);
+      const displayHeight = Number(value?.displayHeight ?? value?.height);
+      const selectedRow = Number(value?.row ?? value?.copyRow);
+      const logicalHeight = value?.logicalHeight === undefined
+        ? null
+        : Number(value.logicalHeight);
+      if (
+        (scanoutPolicy !== "bob" && scanoutPolicy !== "direct")
+        || !Number.isSafeInteger(fieldStrideBytes)
+        || fieldStrideBytes <= 0
+        || !Number.isSafeInteger(sourceRowStep)
+        || sourceRowStep <= 0
+        || !Number.isSafeInteger(fieldHeight)
+        || fieldHeight <= 0
+        || (rowRepeat !== 1 && rowRepeat !== 2)
+        || scanoutPolicy !== (rowRepeat === 2 ? "bob" : "direct")
+        || !Number.isSafeInteger(displayHeight)
+        || displayHeight !== fieldHeight * rowRepeat
+        || !Number.isSafeInteger(selectedRow)
+        || selectedRow < 0
+        || (logicalHeight !== null && (
+          !Number.isSafeInteger(logicalHeight)
+          || logicalHeight <= 0
+          || selectedRow + (fieldHeight - 1) * sourceRowStep >= logicalHeight
+        ))
+      ) {
+        throw new Error("WebGPU VI scanout provenance is invalid");
+      }
+      return {
+        scanoutPolicy,
+        fieldStrideBytes,
+        sourceRowStep,
+        fieldHeight,
+        rowRepeat,
+      };
+    }
+    function viScanoutProvenanceEqual(left, right) {
+      return [
+        "scanoutPolicy",
+        "fieldStrideBytes",
+        "sourceRowStep",
+        "fieldHeight",
+        "rowRepeat",
+      ].every(name => left?.[name] === right?.[name]);
+    }
     async function readSelectedXfb() {
       if (!webGpuRenderer.has_presented_xfb()) return null;
       const capture = await webGpuRenderer.read_presented_xfb_rgba();
@@ -9812,6 +9872,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         logicalHeight: Number(capture.logicalHeight),
         displayWidth: Number(capture.displayWidth),
         displayHeight: Number(capture.displayHeight),
+        scanoutPolicy: String(capture.scanoutPolicy),
+        fieldStrideBytes: Number(capture.fieldStrideBytes),
+        sourceRowStep: Number(capture.sourceRowStep),
+        fieldHeight: Number(capture.fieldHeight),
+        rowRepeat: Number(capture.rowRepeat),
         rgbaByteLength: rgba.byteLength,
         rgbaSha256,
         rgbSha256,
@@ -9850,6 +9915,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         layout: String(capture.layout),
         width,
         height,
+        scanoutPolicy: String(capture.scanoutPolicy),
+        fieldStrideBytes: Number(capture.fieldStrideBytes),
+        sourceRowStep: Number(capture.sourceRowStep),
+        fieldHeight: Number(capture.fieldHeight),
+        rowRepeat: Number(capture.rowRepeat),
         rgbaByteLength: rgba.byteLength,
         rgbaSha256,
         rgbSha256,
@@ -9899,12 +9969,38 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         throw new Error("invalid temporal selected-XFB capture request");
       }
+      const pictureConfiguration = Number(frame.pictureConfiguration);
+      const wordsPerLine = Number(frame.wordsPerLine);
+      const standardWordsPerLine = Number(frame.standardWordsPerLine);
+      const activeLines = Number(frame.activeLines);
+      const nonInterlaced = frame.nonInterlaced;
+      if (
+        !Number.isSafeInteger(pictureConfiguration)
+        || pictureConfiguration < 0
+        || pictureConfiguration > 0xffff
+        || wordsPerLine !== ((pictureConfiguration >>> 8) & 0x7f)
+        || standardWordsPerLine !== (pictureConfiguration & 0xff)
+        || activeLines !== Number(frame.fieldHeight)
+        || nonInterlaced !== (Number(frame.rowRepeat) === 1)
+        || width !== wordsPerLine * 16
+        || Number(frame.fieldStrideBytes) !== standardWordsPerLine * 32
+      ) {
+        throw new Error("invalid temporal VI raw scanout geometry");
+      }
+      const scanout = viScanoutProvenance({ ...frame, row: copyRow });
       const [selectedXfb, presentedSurface] = await Promise.all([
         readSelectedXfb(),
         readPresentedSurface(),
       ]);
       if (presentedSurface === null) {
         throw new Error("requested WebGPU presented-surface capture is unavailable");
+      }
+      if (
+        selectedXfb === null
+        || !viScanoutProvenanceEqual(scanout, selectedXfb)
+        || !viScanoutProvenanceEqual(scanout, presentedSurface)
+      ) {
+        throw new Error("captured WebGPU scanout provenance does not match presentation");
       }
       const capture = {
         scenario: request.scenario,
@@ -9919,6 +10015,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           copyRow,
           width,
           height,
+          pictureConfiguration,
+          wordsPerLine,
+          standardWordsPerLine,
+          activeLines,
+          nonInterlaced,
+          ...scanout,
         },
         selectedXfb,
         presentedSurface,
@@ -9935,7 +10037,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           && selected.generation === frame.presentation.copyIndex
           && selected.row === frame.presentation.copyRow
           && selected.displayWidth === frame.presentation.width
-          && selected.displayHeight === frame.presentation.height;
+          && selected.displayHeight === frame.presentation.height
+          && viScanoutProvenanceEqual(selected, frame.presentation);
         return {
           ordinal: frame.ordinal,
           rendererSequence: frame.rendererSequence,
@@ -10012,7 +10115,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           && surface.generation === frame.presentation.copyIndex
           && surface.row === frame.presentation.copyRow
           && surface.width === frame.presentation.width
-          && surface.height === frame.presentation.height;
+          && surface.height === frame.presentation.height
+          && viScanoutProvenanceEqual(surface, frame.presentation);
         return {
           ordinal: frame.ordinal,
           rendererSequence: frame.rendererSequence,
@@ -10122,6 +10226,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         const metrics = snapshotRendererPerformance(hostMetrics);
         const selectedXfb = await readSelectedXfb();
         const temporalSelectedXfb = {
+          scanoutEvidenceVersion: 2,
           capacity: temporalSelectedXfbCapacity,
           frames: temporalFrames.map(frame => ({
             ...frame,
@@ -10851,8 +10956,11 @@ const TEMPLATE: &str = r##"<!doctype html>
             frame.address,
             frame.copyIndex,
             frame.copyRow,
-            Math.max(0, Math.min(1024, frame.width)),
-            Math.max(0, Math.min(1024, frame.height)),
+            frame.width,
+            frame.height,
+            frame.fieldStrideBytes,
+            frame.fieldHeight,
+            frame.rowRepeat,
             frame.temporalXfbCapture !== undefined
           ),
           sourceWorker
@@ -10864,6 +10972,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             "0x" + frame.address.toString(16).padStart(8, "0");
           document.body.dataset.viCopyIndex = String(frame.copyIndex);
           document.body.dataset.viCopyRow = String(frame.copyRow);
+          document.body.dataset.viScanoutPolicy = String(frame.scanoutPolicy);
           document.body.dataset.viFields = String(
             Number(document.body.dataset.viFields ?? 0) + 1
           );

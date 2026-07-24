@@ -21,30 +21,31 @@ use crate::tev::{
     required_texture_maps, shader_source as tev_shader_source, validate_draw_transport,
 };
 use crate::{
-    EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
+    EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
+    GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxEfbFormat, GxXfbCopyParameters,
     RendererFailureState, RendererMetrics, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
     SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, XfbCopyMetadata,
-    XfbReadbackLayout, clipped_copy_extent, compact_surface_readback_rows,
-    compact_xfb_readback_rows, decoded_texture_cache_hit, decoded_texture_is_available,
+    XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent, compact_surface_readback_rows,
+    compact_xfb_scanout_rows, decoded_texture_cache_hit, decoded_texture_is_available,
     gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float,
-    gx_sampler_identity, merge_contiguous_draw_range, requested_surface_readback_layout,
-    require_tev_texture, reusable_xfb_surface_index, rgba8_texture_byte_len, select_texture,
-    xfb_copy_matches_selection, xfb_readback_layout, xfb_source_rect, xfb_surface_extent_matches,
+    gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height, merge_contiguous_draw_range,
+    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
+    rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
+    xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 const PRESENT_SHADER: &str = "
-struct SourceRect {
-    value: vec4<f32>,
+struct XfbPresentUniform {
+    geometry: vec4<u32>,
+    scanout: vec4<u32>,
 };
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
 };
 
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
-@group(0) @binding(1) var source_sampler: sampler;
-@group(0) @binding(2) var<uniform> source_rect: SourceRect;
+@group(0) @binding(1) var<uniform> present: XfbPresentUniform;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
@@ -53,20 +54,146 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
         vec2<f32>(3.0, -1.0),
         vec2<f32>(-1.0, 3.0),
     );
-    let coordinates = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(2.0, 1.0),
-        vec2<f32>(0.0, -1.0),
-    );
     var output: VertexOutput;
     output.position = vec4<f32>(positions[index], 0.0, 1.0);
-    output.uv = source_rect.value.xy + coordinates[index] * source_rect.value.zw;
     return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(source_texture, source_sampler, input.uv).rgb, 1.0);
+    let logical_width = present.geometry.x;
+    let logical_height = present.geometry.y;
+    let display_width = present.geometry.z;
+    let display_height = present.geometry.w;
+    let selected_row = present.scanout.x;
+    let source_row_step = present.scanout.y;
+    let field_height = present.scanout.z;
+    let row_repeat = present.scanout.w;
+    let output_x = min(u32(input.position.x), display_width - 1u);
+    let output_y = min(u32(input.position.y), display_height - 1u);
+    let logical_x = min(output_x * logical_width / display_width, logical_width - 1u);
+    let field_line = min(output_y / row_repeat, field_height - 1u);
+    let logical_y = selected_row + field_line * source_row_step;
+    let source_size = textureDimensions(source_texture);
+    let source_x = min(logical_x * source_size.x / logical_width, source_size.x - 1u);
+    let source_y = min(logical_y * source_size.y / logical_height, source_size.y - 1u);
+    return vec4<f32>(
+        textureLoad(source_texture, vec2<i32>(i32(source_x), i32(source_y)), 0).rgb,
+        1.0,
+    );
+}
+";
+
+const XFB_COPY_SHADER: &str = "
+struct XfbCopyUniform {
+    source_rect: vec4<f32>,
+    filter_coefficients: vec4<u32>,
+    sampling: vec4<f32>,
+    options: vec4<u32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) source_x: f32,
+};
+
+@group(0) @binding(0) var efb_texture: texture_2d<f32>;
+@group(0) @binding(1) var efb_sampler: sampler;
+@group(0) @binding(2) var<uniform> copy: XfbCopyUniform;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let coordinates = array<f32, 3>(
+        0.0,
+        2.0,
+        0.0,
+    );
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[index], 0.0, 1.0);
+    output.source_x = copy.source_rect.x + coordinates[index] * copy.source_rect.z;
+    return output;
+}
+
+fn round_even_unorm8(channel: f32) -> u32 {
+    let scaled = clamp(channel, 0.0, 1.0) * 255.0;
+    let lower = floor(scaled);
+    let fraction = scaled - lower;
+    let lower_int = u32(lower);
+    let increment = fraction > 0.5 || (fraction == 0.5 && (lower_int & 1u) != 0u);
+    return lower_int + select(0u, 1u, increment);
+}
+
+fn native_efb_sample(tex_sample: vec4<f32>) -> vec4<u32> {
+    if copy.options.x == 1u {
+        var value = vec4<u32>(
+            round_even_unorm8(tex_sample.r),
+            round_even_unorm8(tex_sample.g),
+            round_even_unorm8(tex_sample.b),
+            round_even_unorm8(tex_sample.a),
+        );
+        value = (value & vec4<u32>(0xfcu)) | (value >> vec4<u32>(6u));
+        return value;
+    }
+    if copy.options.x == 2u {
+        let value = vec4<u32>(
+            round_even_unorm8(tex_sample.r),
+            round_even_unorm8(tex_sample.g),
+            round_even_unorm8(tex_sample.b),
+            255u,
+        );
+        return vec4<u32>(
+            (value.r & 0xf8u) | (value.r >> 5u),
+            (value.g & 0xfcu) | (value.g >> 6u),
+            (value.b & 0xf8u) | (value.b >> 5u),
+            255u,
+        );
+    }
+    let value = vec4<u32>(tex_sample * 255.0);
+    return vec4<u32>(value.rgb, 255u);
+}
+
+fn sample_efb(source_x: f32, source_y: f32, row_offset: f32) -> vec4<u32> {
+    let y = clamp(
+        source_y + row_offset * copy.source_rect.w,
+        copy.sampling.y,
+        copy.sampling.z,
+    );
+    return native_efb_sample(textureSample(efb_texture, efb_sampler, vec2<f32>(source_x, y)));
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    // The BP y-scale defines source sample spacing directly. output_height is
+    // only the number of fragment rows and must not be folded into this ratio.
+    let source_y = (input.position.y + copy.source_rect.y)
+        * copy.sampling.w * copy.source_rect.w;
+    let previous = sample_efb(input.source_x, source_y, -1.0);
+    let current = sample_efb(input.source_x, source_y, 0.0);
+    let next = sample_efb(input.source_x, source_y, 1.0);
+    var combined = previous.rgb * copy.filter_coefficients.x
+        + current.rgb * copy.filter_coefficients.y
+        + next.rgb * copy.filter_coefficients.z;
+    var filtered = combined >> vec3<u32>(6u);
+    let coefficient_sum = copy.filter_coefficients.x
+        + copy.filter_coefficients.y
+        + copy.filter_coefficients.z;
+    if coefficient_sum >= 128u {
+        filtered = filtered & vec3<u32>(0x1ffu);
+    }
+    filtered = min(filtered, vec3<u32>(255u));
+    // SMB programs identity gamma. Keep the branch uniform so that path does
+    // not execute three pow operations for every XFB pixel.
+    if copy.options.y != 0u {
+        filtered = vec3<u32>(round(
+            pow(vec3<f32>(filtered) / 255.0, vec3<f32>(copy.sampling.x)) * 255.0
+        ));
+    }
+    return vec4<f32>(vec4<u32>(filtered, 255u)) / 255.0;
 }
 ";
 
@@ -138,10 +265,105 @@ impl CopyClearUniform {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct XfbPresentUniform {
+    geometry: [u32; 4],
+    scanout: [u32; 4],
+}
+
+impl XfbPresentUniform {
+    fn new(
+        logical_width: u32,
+        logical_height: u32,
+        display_width: u32,
+        plan: XfbScanoutPlan,
+    ) -> Self {
+        Self {
+            geometry: [
+                logical_width,
+                logical_height,
+                display_width,
+                plan.display_height,
+            ],
+            scanout: [
+                plan.selected_row,
+                plan.source_row_step,
+                plan.field_height,
+                plan.row_repeat,
+            ],
+        }
+    }
+}
+
 struct CopyClearResources {
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipelines: Vec<wgpu::RenderPipeline>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct XfbCopyUniform {
+    source_rect: [f32; 4],
+    filter_coefficients: [u32; 4],
+    sampling: [f32; 4],
+    options: [u32; 4],
+}
+
+impl XfbCopyUniform {
+    fn new(
+        source_x: u32,
+        source_y: u32,
+        source_width: u32,
+        source_height: u32,
+        parameters: GxXfbCopyParameters,
+    ) -> Self {
+        let top = if parameters.clamp_top { source_y } else { 0 };
+        let bottom = if parameters.clamp_bottom {
+            source_y + source_height
+        } else {
+            EFB_HEIGHT
+        } - 1;
+        Self {
+            source_rect: [
+                source_x as f32 / EFB_WIDTH as f32,
+                source_y as f32,
+                source_width as f32 / EFB_WIDTH as f32,
+                1.0 / EFB_HEIGHT as f32,
+            ],
+            filter_coefficients: [
+                parameters.filter_coefficients[0],
+                parameters.filter_coefficients[1],
+                parameters.filter_coefficients[2],
+                0,
+            ],
+            sampling: [
+                parameters.gamma.reciprocal(),
+                (top as f32 + 0.5) / EFB_HEIGHT as f32,
+                (bottom as f32 + 0.5) / EFB_HEIGHT as f32,
+                parameters.y_scale_reciprocal(),
+            ],
+            options: [
+                match parameters.source_format {
+                    GxEfbFormat::Rgb8Z24 => 0,
+                    GxEfbFormat::Rgba6Z24 => 1,
+                    GxEfbFormat::Rgb565Z16 => 2,
+                    GxEfbFormat::Z24 | GxEfbFormat::OtherNoAlpha => u32::MAX,
+                },
+                u32::from(parameters.gamma != crate::GxCopyGamma::Gamma1_0),
+                0,
+                0,
+            ],
+        }
+    }
+}
+
+struct XfbCopyResources {
+    uniform: wgpu::Buffer,
+    nearest_bind_group: wgpu::BindGroup,
+    linear_bind_group: wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -240,8 +462,8 @@ struct CachedTexture {
 struct CachedXfbSurface {
     id: u64,
     texture: wgpu::Texture,
-    _view: wgpu::TextureView,
-    source_rect_buffer: wgpu::Buffer,
+    view: wgpu::TextureView,
+    present_uniform: wgpu::Buffer,
     present_bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
@@ -261,13 +483,12 @@ struct PresentedXfb {
     texture: wgpu::Texture,
     selected_address: u32,
     generation: u32,
-    selected_row: u32,
+    scanout: XfbScanoutPlan,
     source_width: u32,
     source_height: u32,
     logical_width: u32,
     logical_height: u32,
     display_width: u32,
-    display_height: u32,
 }
 
 #[derive(Clone)]
@@ -279,7 +500,7 @@ struct PresentedSurface {
     presentation_serial: u64,
     selected_address: u32,
     generation: u32,
-    selected_row: u32,
+    scanout: XfbScanoutPlan,
 }
 
 struct Pipelines {
@@ -399,6 +620,7 @@ pub struct WebGpuRenderer {
     _efb_depth: wgpu::Texture,
     efb_depth_view: wgpu::TextureView,
     copy_clear: CopyClearResources,
+    xfb_copy: XfbCopyResources,
     tev_draw_layout: wgpu::BindGroupLayout,
     tev_texture_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
@@ -787,7 +1009,7 @@ impl WebGpuRenderer {
                 presented.source_width,
                 presented.source_height,
                 presented.logical_height,
-                presented.selected_row,
+                0,
             )
             .ok_or_else(|| JsValue::from_str("presented WebGPU XFB has no readable pixels"))?;
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -803,11 +1025,7 @@ impl WebGpuRenderer {
                 wgpu::TexelCopyTextureInfo {
                     texture: &presented.texture,
                     mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: layout.source_row,
-                        z: 0,
-                    },
+                    origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {
@@ -830,7 +1048,12 @@ impl WebGpuRenderer {
                 .map_err(|error| JsValue::from_str(&format!("WebGPU XFB map failed: {error}")))?;
             let pixels = {
                 let mapped = buffer.slice(..).get_mapped_range();
-                let pixels = compact_xfb_readback_rows(&mapped, layout);
+                let pixels = compact_xfb_scanout_rows(
+                    &mapped,
+                    layout,
+                    presented.logical_height,
+                    presented.scanout,
+                );
                 drop(mapped);
                 buffer.unmap();
                 pixels.ok_or_else(|| JsValue::from_str("WebGPU XFB map returned truncated rows"))?
@@ -838,6 +1061,13 @@ impl WebGpuRenderer {
             ensure_renderer_healthy(&failure_state)?;
 
             let result = Object::new();
+            let source_row = u32::try_from(
+                u64::from(presented.scanout.selected_row)
+                    .checked_mul(u64::from(presented.source_height))
+                    .ok_or_else(|| JsValue::from_str("presented WebGPU XFB row overflow"))?
+                    / u64::from(presented.logical_height),
+            )
+            .map_err(|_| JsValue::from_str("presented WebGPU XFB row overflow"))?;
             Reflect::set(
                 &result,
                 &JsValue::from_str("format"),
@@ -851,16 +1081,20 @@ impl WebGpuRenderer {
             for (name, value) in [
                 ("address", presented.selected_address),
                 ("generation", presented.generation),
-                ("row", presented.selected_row),
-                ("sourceRow", layout.source_row),
+                ("row", presented.scanout.selected_row),
+                ("sourceRow", source_row),
                 ("width", layout.width),
-                ("height", layout.height),
+                ("height", presented.scanout.display_height),
                 ("textureWidth", presented.source_width),
                 ("textureHeight", presented.source_height),
                 ("logicalWidth", presented.logical_width),
                 ("logicalHeight", presented.logical_height),
                 ("displayWidth", presented.display_width),
-                ("displayHeight", presented.display_height),
+                ("displayHeight", presented.scanout.display_height),
+                ("fieldStrideBytes", presented.scanout.field_stride_bytes),
+                ("sourceRowStep", presented.scanout.source_row_step),
+                ("fieldHeight", presented.scanout.field_height),
+                ("rowRepeat", presented.scanout.row_repeat),
             ] {
                 Reflect::set(
                     &result,
@@ -868,6 +1102,15 @@ impl WebGpuRenderer {
                     &JsValue::from_f64(f64::from(value)),
                 )?;
             }
+            Reflect::set(
+                &result,
+                &JsValue::from_str("scanoutPolicy"),
+                &JsValue::from_str(if presented.scanout.row_repeat == 2 {
+                    "bob"
+                } else {
+                    "direct"
+                }),
+            )?;
             Reflect::set(
                 &result,
                 &JsValue::from_str("rgba"),
@@ -919,9 +1162,13 @@ impl WebGpuRenderer {
             for (name, value) in [
                 ("address", presented.selected_address),
                 ("generation", presented.generation),
-                ("row", presented.selected_row),
+                ("row", presented.scanout.selected_row),
                 ("width", presented.layout.width),
                 ("height", presented.layout.height),
+                ("fieldStrideBytes", presented.scanout.field_stride_bytes),
+                ("sourceRowStep", presented.scanout.source_row_step),
+                ("fieldHeight", presented.scanout.field_height),
+                ("rowRepeat", presented.scanout.row_repeat),
             ] {
                 Reflect::set(
                     &result,
@@ -933,6 +1180,15 @@ impl WebGpuRenderer {
                 &result,
                 &JsValue::from_str("presentationSerial"),
                 &JsValue::from_f64(presented.presentation_serial as f64),
+            )?;
+            Reflect::set(
+                &result,
+                &JsValue::from_str("scanoutPolicy"),
+                &JsValue::from_str(if presented.scanout.row_repeat == 2 {
+                    "bob"
+                } else {
+                    "direct"
+                }),
             )?;
             Reflect::set(
                 &result,
@@ -1157,7 +1413,6 @@ impl WebGpuRenderer {
                 )?;
             }
 
-            let copy_clear = header.clear.then_some(header.copy_state);
             match header.copy_kind {
                 GxCopyKind::Texture => self.copy_texture_inner(
                     header.source_x,
@@ -1166,7 +1421,7 @@ impl WebGpuRenderer {
                     header.source_height,
                     header.destination,
                     header.generation,
-                    copy_clear,
+                    header.clear.then_some(header.copy_state),
                 ),
                 GxCopyKind::Xfb => self.copy_xfb_inner(
                     header.source_x,
@@ -1178,7 +1433,8 @@ impl WebGpuRenderer {
                     header.destination,
                     header.stride,
                     header.generation,
-                    copy_clear,
+                    header.copy_state,
+                    header.clear,
                 ),
             }
         })();
@@ -1638,15 +1894,28 @@ impl WebGpuRenderer {
         clear_depth: u32,
     ) -> Result<(), JsValue> {
         self.record_wasm_bridge_call(0);
-        let copy_clear = public_copy_clear_state(
+        let copy_command = if clear { 0x4800 } else { 0x4000 };
+        let mut copy_state = public_copy_clear_state(
             clear,
             z_mode,
             blend_mode,
             pixel_control,
-            if clear { 0x4800 } else { 0x4000 },
+            copy_command,
             [clear_red, clear_green, clear_blue, clear_alpha],
             clear_depth,
-        )?;
+        )?
+        .unwrap_or(GxCopyState {
+            z_mode,
+            blend_mode,
+            pixel_control,
+            copy_command,
+            clear_rgba: [clear_red, clear_green, clear_blue, clear_alpha],
+            clear_depth,
+            copy_scale: 256,
+            copy_filter: GX_IDENTITY_COPY_FILTER,
+        });
+        copy_state.copy_scale = 256;
+        copy_state.copy_filter = GX_IDENTITY_COPY_FILTER;
         self.copy_xfb_inner(
             source_x,
             source_y,
@@ -1657,7 +1926,8 @@ impl WebGpuRenderer {
             destination,
             stride,
             generation,
-            copy_clear,
+            copy_state,
+            clear,
         )
     }
 
@@ -1673,12 +1943,53 @@ impl WebGpuRenderer {
         destination: u32,
         stride: u32,
         generation: u32,
-        copy_clear: Option<GxCopyState>,
+        copy_state: GxCopyState,
+        clear: bool,
     ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.copy_xfb_calls = metrics.copy_xfb_calls.saturating_add(1);
         });
+        if xfb_width == 0
+            || xfb_height == 0
+            || xfb_width > GX_MAX_COPY_DIMENSION
+            || xfb_height > GX_MAX_COPY_DIMENSION
+        {
+            return Err(JsValue::from_str(&format!(
+                "GX XFB output {xfb_width}x{xfb_height} exceeds the nonempty {GX_MAX_COPY_DIMENSION}x{GX_MAX_COPY_DIMENSION} GX limit"
+            )));
+        }
+        let maximum_texture_dimension = self.device.limits().max_texture_dimension_2d;
+        if xfb_width > maximum_texture_dimension || xfb_height > maximum_texture_dimension {
+            return Err(JsValue::from_str(&format!(
+                "GX XFB output {xfb_width}x{xfb_height} exceeds WebGPU's {maximum_texture_dimension}px texture limit"
+            )));
+        }
+        let expected_height = gx_xfb_output_height(
+            source_height,
+            copy_state.copy_command,
+            copy_state.copy_scale,
+        )
+        .ok_or_else(|| JsValue::from_str("GX XFB copy scale does not produce a valid height"))?;
+        if xfb_height != expected_height {
+            return Err(JsValue::from_str(&format!(
+                "GX XFB copy height {xfb_height} does not match copy-scale materialization {expected_height}"
+            )));
+        }
+        let parameters = gx_xfb_copy_parameters(copy_state);
+        match parameters.source_format {
+            GxEfbFormat::Rgb8Z24 | GxEfbFormat::Rgba6Z24 | GxEfbFormat::Rgb565Z16 => {}
+            GxEfbFormat::Z24 => {
+                return Err(JsValue::from_str(
+                    "GX Z24 EFB-to-XFB copies require the WebGPU depth-copy pipeline",
+                ));
+            }
+            GxEfbFormat::OtherNoAlpha => {
+                return Err(JsValue::from_str(
+                    "GX component/YUV EFB-to-XFB copies require untransported PE CMode1 state",
+                ));
+            }
+        }
         let mut encoder = self.flush_geometry();
         let Some((width, source_height)) =
             clipped_copy_extent(source_x, source_y, width, source_height)
@@ -1705,40 +2016,50 @@ impl WebGpuRenderer {
         let surface = reusable_xfb_surface_index(
             &surface_descriptors,
             protected_surface,
-            width,
-            source_height,
+            xfb_width,
+            xfb_height,
         )
         .map_or_else(
-            || self.create_xfb_surface(width, source_height),
+            || self.create_xfb_surface(xfb_width, xfb_height),
             |index| surfaces.remove(index),
         );
         let spare = surfaces.into_iter().find(|candidate| {
-            xfb_surface_extent_matches(candidate.width, candidate.height, width, source_height)
+            xfb_surface_extent_matches(candidate.width, candidate.height, xfb_width, xfb_height)
         });
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.efb_color,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: source_x,
-                    y: source_y,
-                    z: 0,
+        let linear_filter = parameters.uses_linear_filter();
+        let uniform = XfbCopyUniform::new(source_x, source_y, width, source_height, parameters);
+        self.queue
+            .write_buffer(&self.xfb_copy.uniform, 0, bytemuck::bytes_of(&uniform));
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("browser GX EFB-to-XFB materialization pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.xfb_copy.pipeline);
+            pass.set_bind_group(
+                0,
+                if linear_filter {
+                    &self.xfb_copy.linear_bind_group
+                } else {
+                    &self.xfb_copy.nearest_bind_group
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &surface.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width,
-                height: source_height,
-                depth_or_array_layers: 1,
-            },
-        );
-        if let Some(state) = copy_clear {
+                &[],
+            );
+            pass.draw(0..3, 0..1);
+        }
+        if clear {
             update_renderer_metrics(&self.metrics, |metrics| {
                 metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
             });
@@ -1750,7 +2071,7 @@ impl WebGpuRenderer {
                     width,
                     height: source_height,
                 },
-                state,
+                copy_state,
             );
         }
         self.queue.submit([encoder.finish()]);
@@ -1765,11 +2086,11 @@ impl WebGpuRenderer {
                 metadata: XfbCopyMetadata {
                     destination,
                     stride,
-                    height: xfb_height.max(1),
+                    height: xfb_height,
                     generation,
                 },
-                output_width: xfb_width.max(1),
-                output_height: xfb_height.max(1),
+                output_width: xfb_width,
+                output_height: xfb_height,
             },
         );
         if self.xfb_cache.len() > 16
@@ -1784,6 +2105,7 @@ impl WebGpuRenderer {
         self.ensure_healthy()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn present_xfb(
         &mut self,
         selected_address: u32,
@@ -1791,13 +2113,17 @@ impl WebGpuRenderer {
         selected_row: u32,
         output_width: u32,
         output_height: u32,
+        field_stride_bytes: u32,
+        field_height: u32,
+        row_repeat: u32,
         capture_surface: bool,
     ) -> Result<bool, JsValue> {
         self.record_wasm_bridge_call(0);
-        self.ensure_healthy()?;
-        // A capture proves one exact presentation. Never let a failed or
-        // uncaptured presentation expose evidence from an earlier surface.
+        // Evidence proves one exact presentation. Never let a rejected plan,
+        // renderer failure, or uncaptured presentation expose stale metadata.
+        self.last_presented_xfb = None;
         self.last_presented_surface = None;
+        self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.present_xfb_calls = metrics.present_xfb_calls.saturating_add(1);
         });
@@ -1826,21 +2152,25 @@ impl WebGpuRenderer {
         else {
             return Ok(false);
         };
-        let Some(rect) = xfb_source_rect(selected_row, cached_height) else {
+        if output_width == 0
+            || output_width > GX_MAX_COPY_DIMENSION
+            || output_height == 0
+            || output_height > GX_MAX_COPY_DIMENSION
+            || output_width != cached_width
+        {
+            return Ok(false);
+        }
+        let Some(scanout) = xfb_scanout_plan(
+            metadata,
+            selected_row,
+            field_stride_bytes,
+            field_height,
+            row_repeat,
+            output_height,
+        ) else {
             return Ok(false);
         };
-        let output_width = if output_width == 0 {
-            cached_width
-        } else {
-            output_width
-        }
-        .clamp(1, 1024);
-        let output_height = if output_height == 0 {
-            cached_height
-        } else {
-            output_height
-        }
-        .clamp(1, 1024);
+        let uniform = XfbPresentUniform::new(cached_width, cached_height, output_width, scanout);
         self.resize_surface(output_width, output_height);
         let capture_plan = requested_surface_readback_layout(
             capture_surface,
@@ -1877,7 +2207,7 @@ impl WebGpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.queue
-            .write_buffer(&surface.source_rect_buffer, 0, bytemuck::cast_slice(&rect));
+            .write_buffer(&surface.present_uniform, 0, bytemuck::bytes_of(&uniform));
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1940,7 +2270,7 @@ impl WebGpuRenderer {
                 presentation_serial: next_presentation_serial,
                 selected_address,
                 generation: metadata.generation,
-                selected_row,
+                scanout,
             }
         });
         self.queue.submit([encoder.finish()]);
@@ -1955,15 +2285,18 @@ impl WebGpuRenderer {
             texture: surface.texture,
             selected_address,
             generation: metadata.generation,
-            selected_row,
+            scanout,
             source_width: surface.width,
             source_height: surface.height,
             logical_width: cached_width,
             logical_height: cached_height,
             display_width: output_width,
-            display_height: output_height,
         });
-        self.ensure_healthy()?;
+        if let Err(error) = self.ensure_healthy() {
+            self.last_presented_xfb = None;
+            self.last_presented_surface = None;
+            return Err(error);
+        }
         Ok(true)
     }
 }
@@ -2139,7 +2472,7 @@ impl WebGpuRenderer {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -2148,12 +2481,6 @@ impl WebGpuRenderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -2165,6 +2492,7 @@ impl WebGpuRenderer {
         });
         let samplers = create_samplers(&device);
         let copy_clear = create_copy_clear_resources(&device);
+        let xfb_copy = create_xfb_copy_resources(&device, &efb_color_view, &samplers);
         let pipelines = create_pipelines(
             &device,
             &tev_draw_layout,
@@ -2195,6 +2523,7 @@ impl WebGpuRenderer {
             _efb_depth: efb_depth,
             efb_depth_view,
             copy_clear,
+            xfb_copy,
             tev_draw_layout,
             tev_texture_layout,
             present_layout,
@@ -2260,18 +2589,22 @@ impl WebGpuRenderer {
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let source_rect_buffer =
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("browser XFB source rectangle"),
-                    contents: bytemuck::cast_slice(&[0.0_f32, 0.0, 1.0, 1.0]),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                });
+        let initial_uniform = XfbPresentUniform {
+            geometry: [0; 4],
+            scanout: [0; 4],
+        };
+        let present_uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("browser XFB scanout plan"),
+                contents: bytemuck::bytes_of(&initial_uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
         let present_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("browser XFB presentation bind group"),
             layout: &self.present_layout,
@@ -2282,18 +2615,7 @@ impl WebGpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(
-                        &self.samplers[&SamplerIdentity {
-                            mag_filter: true,
-                            min_filter: true,
-                            address_u: TextureAddressMode::ClampToEdge,
-                            address_v: TextureAddressMode::ClampToEdge,
-                        }],
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: source_rect_buffer.as_entire_binding(),
+                    resource: present_uniform.as_entire_binding(),
                 },
             ],
         });
@@ -2307,8 +2629,8 @@ impl WebGpuRenderer {
         CachedXfbSurface {
             id,
             texture,
-            _view: view,
-            source_rect_buffer,
+            view,
+            present_uniform,
             present_bind_group,
             width,
             height,
@@ -2773,6 +3095,121 @@ fn create_tev_geometry_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn create_xfb_copy_resources(
+    device: &wgpu::Device,
+    efb_color_view: &wgpu::TextureView,
+    samplers: &HashMap<SamplerIdentity, wgpu::Sampler>,
+) -> XfbCopyResources {
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("browser GX EFB-to-XFB copy layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("browser GX EFB-to-XFB copy uniform"),
+        size: size_of::<XfbCopyUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = |label, linear| {
+        let sampler = &samplers[&SamplerIdentity {
+            mag_filter: linear,
+            min_filter: linear,
+            address_u: TextureAddressMode::ClampToEdge,
+            address_v: TextureAddressMode::ClampToEdge,
+        }];
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(efb_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        })
+    };
+    let nearest_bind_group = bind_group("browser GX nearest EFB-to-XFB copy bind group", false);
+    let linear_bind_group = bind_group("browser GX linear EFB-to-XFB copy bind group", true);
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("browser GX EFB-to-XFB copy shader"),
+        source: wgpu::ShaderSource::Wgsl(XFB_COPY_SHADER.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("browser GX EFB-to-XFB copy pipeline layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("browser GX EFB-to-XFB copy pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    XfbCopyResources {
+        uniform,
+        nearest_bind_group,
+        linear_bind_group,
+        pipeline,
+    }
 }
 
 fn create_copy_clear_resources(device: &wgpu::Device) -> CopyClearResources {

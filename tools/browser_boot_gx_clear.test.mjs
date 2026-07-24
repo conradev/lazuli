@@ -44,13 +44,17 @@ test("reset remains an unconditional full-EFB clear", () => {
 });
 
 test("texture and XFB copies encode their clipped clear after the copy and before submit", () => {
-  for (const [start, end] of [
-    ["fn copy_texture_inner", "pub fn copy_xfb"],
-    ["fn copy_xfb_inner", "pub fn present_xfb"],
+  for (const [start, end, copyMarker] of [
+    ["fn copy_texture_inner", "pub fn copy_xfb", "encoder.copy_texture_to_texture"],
+    [
+      "fn copy_xfb_inner",
+      "pub fn present_xfb",
+      "browser GX EFB-to-XFB materialization pass",
+    ],
   ]) {
     const section = rendererSection(start, end);
     const clip = section.indexOf("clipped_copy_extent");
-    const copy = section.indexOf("encoder.copy_texture_to_texture");
+    const copy = section.indexOf(copyMarker);
     const clear = section.indexOf("self.encode_copy_clear");
     const submit = section.indexOf("self.queue.submit", clear);
     assert.notEqual(clip, -1, `${start} must compute a clipped extent`);
@@ -61,6 +65,79 @@ test("texture and XFB copies encode their clipped clear after the copy and befor
     assert.ok(copy < clear, `${start} cleared before copying`);
     assert.ok(clear < submit, `${start} submitted before clearing`);
   }
+});
+
+test("XFB copies materialize transported GX filter scale clamp and gamma state", () => {
+  const submit = rendererSection("pub fn submit_gx_frame", "fn push_tev_draw_inner");
+  assert.match(
+    submit,
+    /GxCopyKind::Xfb => self\.copy_xfb_inner\([\s\S]*header\.copy_state,[\s\S]*header\.clear/,
+  );
+
+  const copy = rendererSection("fn copy_xfb_inner", "pub fn present_xfb");
+  assert.match(copy, /gx_xfb_output_height\(/);
+  assert.match(copy, /xfb_height != expected_height/);
+  assert.match(copy, /gx_xfb_copy_parameters\(copy_state\)/);
+  assert.match(copy, /xfb_width > GX_MAX_COPY_DIMENSION/);
+  assert.match(copy, /xfb_height > GX_MAX_COPY_DIMENSION/);
+  assert.match(copy, /GxEfbFormat::Z24[\s\S]*WebGPU depth-copy pipeline/);
+  assert.match(copy, /GxEfbFormat::OtherNoAlpha[\s\S]*untransported PE CMode1 state/);
+  assert.ok(
+    copy.indexOf("xfb_width > GX_MAX_COPY_DIMENSION")
+      < copy.indexOf("self.create_xfb_surface"),
+    "GX output limits must be checked before allocating an XFB surface",
+  );
+  assert.match(copy, /XfbCopyUniform::new\(/);
+  assert.match(copy, /self\.xfb_copy\.linear_bind_group/);
+  assert.match(copy, /self\.xfb_copy\.nearest_bind_group/);
+  assert.match(copy, /view: &surface\.view/);
+  assert.doesNotMatch(copy, /encoder\.copy_texture_to_texture/);
+
+  const shader = rendererSection("const XFB_COPY_SHADER", "const COPY_CLEAR_SHADER");
+  assert.match(shader, /previous\.rgb \* copy\.filter_coefficients\.x/);
+  assert.match(shader, /current\.rgb \* copy\.filter_coefficients\.y/);
+  assert.match(shader, /next\.rgb \* copy\.filter_coefficients\.z/);
+  assert.match(shader, /combined >> vec3<u32>\(6u\)/);
+  assert.match(shader, /coefficient_sum >= 128u/);
+  assert.match(
+    shader,
+    /if copy\.options\.y != 0u \{[\s\S]*pow\([\s\S]*copy\.sampling\.x/,
+  );
+  assert.match(
+    shader,
+    /let source_y = \(input\.position\.y \+ copy\.source_rect\.y\)[\s\S]*copy\.sampling\.w/,
+  );
+  assert.doesNotMatch(shader, /source_height\s*\/\s*output_height/);
+  assert.match(shader, /fn round_even_unorm8/);
+  assert.match(shader, /copy\.options\.x == 1u[\s\S]*0xfcu/);
+  assert.match(shader, /copy\.options\.x == 2u[\s\S]*0xf8u/);
+  assert.match(shader, /vec4<u32>\(filtered, 255u\)/);
+  assert.match(shader, /clamp\([\s\S]*copy\.sampling\.y,[\s\S]*copy\.sampling\.z/);
+
+  const resources = rendererSection(
+    "fn create_xfb_copy_resources",
+    "fn create_copy_clear_resources",
+  );
+  assert.match(
+    resources,
+    /sample_type: wgpu::TextureSampleType::Float \{ filterable: true \}/,
+  );
+  assert.match(resources, /SamplerBindingType::Filtering/);
+  assert.match(
+    resources,
+    /targets: &\[Some\(wgpu::ColorTargetState \{[\s\S]*format: wgpu::TextureFormat::Rgba8Unorm/,
+  );
+
+  const surface = rendererSection("fn create_xfb_surface", "fn ensure_healthy");
+  assert.match(surface, /format: wgpu::TextureFormat::Rgba8Unorm/);
+  assert.match(surface, /wgpu::TextureUsages::TEXTURE_BINDING/);
+  assert.match(surface, /wgpu::TextureUsages::COPY_SRC/);
+  assert.match(surface, /wgpu::TextureUsages::RENDER_ATTACHMENT/);
+  assert.doesNotMatch(surface, /wgpu::TextureUsages::COPY_DST/);
+
+  const efb = rendererSection("let efb_color =", "let efb_color_view");
+  assert.match(efb, /format: wgpu::TextureFormat::Rgba8Unorm/);
+  assert.match(efb, /wgpu::TextureUsages::TEXTURE_BINDING/);
 });
 
 test("the draw clear loads prior EFB contents and independently masks RGB alpha and depth", () => {

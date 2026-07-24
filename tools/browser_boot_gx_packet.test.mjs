@@ -373,6 +373,21 @@ test("rejects conflicting content for one frame-local texture key", () => {
 
 test("rejects malformed or non-canonical packet inputs", () => {
   const context = packetContext();
+
+  const exactXfbLimit = representativeXfbFrame();
+  exactXfbLimit.width = 1024;
+  exactXfbLimit.height = 1024;
+  assert.doesNotThrow(() => context.packGxFramePacketV2(2, exactXfbLimit));
+
+  for (const field of ["width", "height"]) {
+    const oversizedXfb = representativeXfbFrame();
+    oversizedXfb[field] = 1025;
+    assert.throws(
+      () => context.packGxFramePacketV2(2, oversizedXfb),
+      new RegExp(`frame\\.output${field === "width" ? "Width" : "Height"} must be an integer from 0 through 1024`),
+    );
+  }
+
   assert.throws(
     () => context.packGxFramePacketV2(3, emptyTextureFrame()),
     /copyKind must be 1 or 2|copyKind must be an integer/,
