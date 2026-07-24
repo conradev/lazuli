@@ -17,7 +17,9 @@ use wgpu::util::DeviceExt;
 
 use crate::clip::gx_exact_draw_raster_geometry;
 use crate::packet::{GxCopyKind, GxCopyState, GxFramePacket, GxTriangleAction};
-use crate::raster::GxRasterAttributePlaneF32;
+use crate::raster::{
+    GxRasterAttributePlaneF32, gx_non_aa_raster_color_rgba8, gx_normalized_raster_channel_u8,
+};
 use crate::tev::{
     MAX_TEV_TEXTURES, TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS,
     required_texture_coords, required_texture_maps, shader_source as tev_shader_source,
@@ -294,16 +296,19 @@ const TEV_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_arr
     10 => Float32x3
 ];
 
-// Managed draws reconstruct one live projective coordinate from a six-vec3
-// flat payload in STQ0..STQ5. STQ6/STQ7's final 24 bytes carry three packed
-// exact 28.4 edge points followed by the three raw f32 depth words, without
-// inflating native vertex transport.
+// Managed draws reinterpret raster0/raster1 as two flat Uint32x4 payloads:
+// three packed RGBA8 endpoints for each raster channel plus two spare words.
+// STQ0/STQ1 preserve the raw binary32 source-position words for portable
+// software-f32 raster-plane evaluation. They reconstruct one live projective
+// coordinate from STQ0..STQ5, while STQ6/STQ7 carry three packed exact 28.4
+// edge points and three raw f32 depth words. Native draws retain the unchanged
+// Float32 144-byte layout.
 const MANAGED_COVERAGE_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_array![
     0 => Float32x4,
-    1 => Float32x4,
-    2 => Float32x4,
-    3 => Float32x3,
-    4 => Float32x3,
+    1 => Uint32x4,
+    2 => Uint32x4,
+    3 => Uint32x3,
+    4 => Uint32x3,
     5 => Float32x3,
     6 => Float32x3,
     7 => Float32x3,
@@ -331,14 +336,14 @@ enum ManagedCoverageEvidence {
 /// live submission select the exact path without topology expansion or legacy
 /// scissor reconstruction after the segment has begun.
 struct QualifiedExactDraw {
-    vertices: Vec<f32>,
-    expanded: Vec<usize>,
     scissor: Option<ScissorRect>,
+    managed_vertices: Option<Vec<TevVertex>>,
+    exact_empty: bool,
 }
 
 impl QualifiedExactDraw {
     fn is_empty(&self) -> bool {
-        self.expanded.is_empty()
+        self.exact_empty || self.managed_vertices.as_ref().is_some_and(Vec::is_empty)
     }
 }
 
@@ -351,6 +356,12 @@ struct PreparedExactDraw {
     qualified: Option<QualifiedExactDraw>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactAuthoritativeNoop {
+    RasterEmpty,
+    RequiredRejected,
+}
+
 impl PreparedExactDraw {
     fn qualified(&self) -> Option<&QualifiedExactDraw> {
         self.qualified.as_ref()
@@ -360,15 +371,14 @@ impl PreparedExactDraw {
         self.required
     }
 
-    fn is_required_managed_safe(&self) -> bool {
-        self.required
-            && self.required_managed_safe
-            && self.qualified().is_some_and(|exact| !exact.is_empty())
-    }
-
-    fn is_authoritative_noop(&self) -> bool {
-        (self.required && (!self.required_managed_safe || self.qualified.is_none()))
-            || self.qualified().is_some_and(QualifiedExactDraw::is_empty)
+    fn authoritative_noop(&self) -> Option<ExactAuthoritativeNoop> {
+        if self.qualified().is_some_and(QualifiedExactDraw::is_empty) {
+            Some(ExactAuthoritativeNoop::RasterEmpty)
+        } else if self.required && (!self.required_managed_safe || self.qualified.is_none()) {
+            Some(ExactAuthoritativeNoop::RequiredRejected)
+        } else {
+            None
+        }
     }
 }
 
@@ -1090,6 +1100,11 @@ fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> 
         ("drainCalls", metrics.drain_calls),
         ("earlyDepthOnlyCommands", metrics.early_depth_only_commands),
         ("expandedVertexBytes", metrics.expanded_vertex_bytes),
+        ("exactRasterEmptyDraws", metrics.exact_raster_empty_draws),
+        (
+            "exactRequiredRejectedDraws",
+            metrics.exact_required_rejected_draws,
+        ),
         ("gxFramePacketBytes", metrics.gx_frame_packet_bytes),
         (
             "gxFramePacketPayloadBytes",
@@ -2203,7 +2218,19 @@ impl WebGpuRenderer {
             );
         });
 
-        if prepared_exact.is_some_and(PreparedExactDraw::is_authoritative_noop) {
+        if let Some(authoritative_noop) =
+            prepared_exact.and_then(PreparedExactDraw::authoritative_noop)
+        {
+            update_renderer_metrics(&self.metrics, |metrics| match authoritative_noop {
+                ExactAuthoritativeNoop::RasterEmpty => {
+                    metrics.exact_raster_empty_draws =
+                        metrics.exact_raster_empty_draws.saturating_add(1);
+                }
+                ExactAuthoritativeNoop::RequiredRejected => {
+                    metrics.exact_required_rejected_draws =
+                        metrics.exact_required_rejected_draws.saturating_add(1);
+                }
+            });
             // Exact clipping/culling proves this draw contributes no fragments,
             // or required exact geometry cannot use the certified managed
             // route. Do not allocate or resurrect its native topology.
@@ -2255,8 +2282,6 @@ impl WebGpuRenderer {
                 source_vertices,
                 &expanded,
                 raster_position_correction,
-                ManagedCoverageEvidence::None,
-                None,
                 state,
             );
         }
@@ -2290,30 +2315,7 @@ impl WebGpuRenderer {
         let source_cull = pipeline.cull;
         let native_scissor = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height);
         let raster_center = gx_raster_center_evidence(pixel_control);
-        let exact_managed = qualified_exact.filter(|exact| {
-            if required_exact {
-                return prepared_exact.is_some_and(PreparedExactDraw::is_required_managed_safe);
-            }
-            let Some(scissor) = exact.scissor else {
-                return false;
-            };
-            source_cull != CullMode::All
-                && managed_coverage_draw_is_safe(
-                    ManagedCoverageEvidence::TrustedExactClip,
-                    primitive,
-                    raster_center,
-                    early_depth,
-                    required_maps,
-                    required_coords,
-                    sampler_modes,
-                    sampler_identities,
-                    fog,
-                    z_texture,
-                    &exact.vertices,
-                    &exact.expanded,
-                    scissor,
-                )
-        });
+        let exact_managed = qualified_exact.filter(|exact| exact.managed_vertices.is_some());
         if required_exact && exact_managed.is_none() {
             // A v6 required draw is authoritative even outside the currently
             // certified exact-managed subset. Suppress it rather than falling
@@ -2331,7 +2333,7 @@ impl WebGpuRenderer {
         });
         let resource_preparation_timer = sample_draw_timing
             .then(|| self.host_phase_timer(RendererHostPhase::ResourcePreparation));
-        let managed_expanded = prepared_exact
+        let managed_vertices = prepared_exact
             .is_none()
             .then(|| {
                 let expanded = native_expanded
@@ -2347,7 +2349,7 @@ impl WebGpuRenderer {
                     && z_texture.operation == GxZTextureOperation::Disabled)
                     .then(|| managed_post_cull_indices(expanded, managed_coverage_actions))
                     .flatten()?;
-                managed_coverage_draw_is_safe(
+                prepare_managed_coverage_vertices(
                     ManagedCoverageEvidence::TrustedPostCull,
                     primitive,
                     raster_center,
@@ -2362,12 +2364,17 @@ impl WebGpuRenderer {
                     &post_cull,
                     scissor,
                 )
-                .then_some(post_cull)
             })
             .flatten();
+        if managed_vertices.as_ref().is_some_and(Vec::is_empty) {
+            // Trusted post-cull evidence can prove every legacy triangle is an
+            // exact raster no-op. Return before texture/cache/binding creation
+            // so an empty managed draw cannot mutate renderer resource state.
+            return Ok(());
+        }
         let managed_evidence = if exact_managed.is_some() {
             ManagedCoverageEvidence::TrustedExactClip
-        } else if managed_expanded.is_some() {
+        } else if managed_vertices.is_some() {
             ManagedCoverageEvidence::TrustedPostCull
         } else {
             ManagedCoverageEvidence::None
@@ -2573,26 +2580,24 @@ impl WebGpuRenderer {
             binding,
         };
         drop(resource_preparation_timer);
-        let (draw_vertices, draw_expanded, raster_position_correction) =
-            if let Some(exact) = exact_managed {
-                (exact.vertices.as_slice(), exact.expanded.as_slice(), 0.0)
-            } else if let Some(post_cull) = managed_expanded.as_deref() {
-                (source_vertices, post_cull, 0.0)
-            } else {
-                (
-                    source_vertices,
-                    native_expanded
-                        .as_deref()
-                        .expect("non-exact draw retains native topology"),
-                    raster_position_correction,
-                )
-            };
+        if let Some(exact) = exact_managed {
+            return self.push_prepared_managed_draw(
+                exact
+                    .managed_vertices
+                    .as_deref()
+                    .expect("qualified exact draw has prepared managed vertices"),
+                state,
+            );
+        }
+        if let Some(vertices) = managed_vertices.as_deref() {
+            return self.push_prepared_managed_draw(vertices, state);
+        }
         self.push_expanded_draw(
-            draw_vertices,
-            draw_expanded,
+            source_vertices,
+            native_expanded
+                .as_deref()
+                .expect("non-exact draw retains native topology"),
             raster_position_correction,
-            managed_evidence,
-            managed_coverage_texture_coord(required_coords).flatten(),
             state,
         )
     }
@@ -2602,40 +2607,42 @@ impl WebGpuRenderer {
         source_vertices: &[f32],
         expanded: &[usize],
         raster_position_correction: f32,
-        managed_coverage_evidence: ManagedCoverageEvidence,
-        managed_texture_coord: Option<usize>,
         state: DrawCommandState,
     ) -> Result<(), JsValue> {
         let start = self.tev_vertices.len() as u32;
-        let mut managed_triangles = 0_u64;
-        if managed_coverage_evidence != ManagedCoverageEvidence::None {
-            for triangle in expanded.chunks_exact(3) {
-                let vertices = managed_coverage_triangle_vertices(
-                    source_vertices,
-                    [triangle[0], triangle[1], triangle[2]],
-                    managed_texture_coord,
-                    state.scissor,
-                )
-                .map_err(|error| JsValue::from_str(&error.to_string()))?;
-                if let Some(vertices) = vertices {
-                    self.tev_vertices.extend(vertices);
-                    managed_triangles = managed_triangles.saturating_add(1);
-                }
-            }
-        } else {
-            for index in expanded {
-                self.tev_vertices.push(tev_vertex_from_source(
-                    source_vertices,
-                    *index,
-                    raster_position_correction,
-                ));
-            }
+        for index in expanded {
+            self.tev_vertices.push(tev_vertex_from_source(
+                source_vertices,
+                *index,
+                raster_position_correction,
+            ));
         }
+        self.finish_expanded_draw(start, false, 0, state)
+    }
+
+    fn push_prepared_managed_draw(
+        &mut self,
+        prepared: &[TevVertex],
+        state: DrawCommandState,
+    ) -> Result<(), JsValue> {
+        debug_assert!(prepared.len().is_multiple_of(3));
+        let start = self.tev_vertices.len() as u32;
+        self.tev_vertices.extend_from_slice(prepared);
+        self.finish_expanded_draw(start, true, (prepared.len() / 3) as u64, state)
+    }
+
+    fn finish_expanded_draw(
+        &mut self,
+        start: u32,
+        managed_coverage: bool,
+        managed_triangles: u64,
+        state: DrawCommandState,
+    ) -> Result<(), JsValue> {
         let end = self.tev_vertices.len() as u32;
         if start == end {
             return Ok(());
         }
-        if managed_coverage_evidence != ManagedCoverageEvidence::None {
+        if managed_coverage {
             update_renderer_metrics(&self.metrics, |metrics| {
                 metrics.managed_coverage_draws = metrics.managed_coverage_draws.saturating_add(1);
                 metrics.managed_coverage_triangles = metrics
@@ -4103,6 +4110,7 @@ fn tev_vertex_from_source(
     }
 }
 
+#[cfg(test)]
 fn source_triangle_depth_and_rasters_are_bitwise_flat(
     source_vertices: &[f32],
     indices: [usize; 3],
@@ -4183,6 +4191,7 @@ fn managed_coverage_texel_uv_is_safe(uv: [f32; 2]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn managed_coverage_attribute_payload(
     source_vertices: &[f32],
     indices: [usize; 3],
@@ -4195,13 +4204,13 @@ fn managed_coverage_attribute_payload_for_depth(
     source_vertices: &[f32],
     indices: [usize; 3],
     texture_coord: Option<usize>,
-    varying_depth: bool,
+    varying_screen_attribute: bool,
 ) -> Option<[[f32; 3]; 6]> {
     let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
     if indices.into_iter().any(|index| index >= vertex_count) {
         return None;
     }
-    if texture_coord.is_none() && !varying_depth {
+    if texture_coord.is_none() && !varying_screen_attribute {
         return Some(MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD);
     }
     if texture_coord.is_some_and(|coord| coord >= MAX_TEV_TEXTURES) {
@@ -4246,14 +4255,49 @@ fn managed_coverage_attribute_payload_for_depth(
     Some(payload)
 }
 
+fn managed_coverage_raster_channel_u8(value: f32) -> Option<u8> {
+    let channel = gx_normalized_raster_channel_u8(value);
+    let canonical = f32::from(channel) / 255.0;
+    ((value == 0.0 && canonical == 0.0) || value.to_bits() == canonical.to_bits())
+        .then_some(channel)
+}
+
+fn managed_coverage_raster_endpoints(
+    source_vertices: &[f32],
+    indices: [usize; 3],
+) -> Option<[[u8; 8]; 3]> {
+    let mut endpoints = [[0; 8]; 3];
+    for (endpoint, index) in endpoints.iter_mut().zip(indices) {
+        let offset = index * TEV_VERTEX_FLOATS + 4;
+        for (channel, value) in endpoint
+            .iter_mut()
+            .zip(&source_vertices[offset..offset + 8])
+        {
+            *channel = managed_coverage_raster_channel_u8(*value)?;
+        }
+    }
+    Some(endpoints)
+}
+
+fn managed_coverage_pack_rgba8(channels: [u8; 4]) -> u32 {
+    u32::from(channels[0])
+        | (u32::from(channels[1]) << 8)
+        | (u32::from(channels[2]) << 16)
+        | (u32::from(channels[3]) << 24)
+}
+
 fn managed_coverage_payload_is_safe(
     payload: [[f32; 3]; 6],
     depths: [f32; 3],
+    raster_endpoints: [[u8; 8]; 3],
     points: [GxRasterPoint28_4; 3],
     raster_scissor: GxRasterScissor,
     textured: bool,
 ) -> bool {
     if !managed_coverage_depth_plane_is_safe(payload, depths, points, raster_scissor) {
+        return false;
+    }
+    if !managed_coverage_raster_planes_are_safe(payload, raster_endpoints, points, raster_scissor) {
         return false;
     }
     if !textured {
@@ -4337,6 +4381,49 @@ fn managed_coverage_payload_is_safe(
     true
 }
 
+fn managed_coverage_raster_planes_are_safe(
+    payload: [[f32; 3]; 6],
+    raster_endpoints: [[u8; 8]; 3],
+    points: [GxRasterPoint28_4; 3],
+    raster_scissor: GxRasterScissor,
+) -> bool {
+    let GxRasterSetup::Triangle(triangle) =
+        GxRasterTriangle28_4::setup_post_cull(points, GxRasterWinding::Negative, raster_scissor)
+    else {
+        return true;
+    };
+    let bounds = triangle.bounds();
+    if bounds.left >= bounds.right || bounds.top >= bounds.bottom {
+        return true;
+    }
+    let positions = std::array::from_fn(|vertex| [payload[0][vertex], payload[1][vertex]]);
+    let corners = [
+        [bounds.left, bounds.top],
+        [bounds.right - 1, bounds.top],
+        [bounds.left, bounds.bottom - 1],
+        [bounds.right - 1, bounds.bottom - 1],
+    ];
+    for base in [0_usize, 4] {
+        let plane = |channel| {
+            GxRasterAttributePlaneF32::from_screen_triangle(
+                positions,
+                raster_endpoints.map(|vertex| f32::from(vertex[base + channel])),
+            )
+        };
+        let [Ok(red), Ok(green), Ok(blue), Ok(alpha)] = [plane(0), plane(1), plane(2), plane(3)]
+        else {
+            return false;
+        };
+        let planes = [red, green, blue, alpha];
+        if corners.into_iter().any(|[pixel_x, pixel_y]| {
+            gx_non_aa_raster_color_rgba8(planes, pixel_x, pixel_y).is_err()
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
 fn managed_coverage_depth_plane_is_safe(
     payload: [[f32; 3]; 6],
     depths: [f32; 3],
@@ -4393,6 +4480,121 @@ fn managed_post_cull_indices(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn prepare_managed_coverage_vertices(
+    evidence: ManagedCoverageEvidence,
+    primitive: Primitive,
+    raster_center: GxRasterCenterEvidence,
+    early_depth: GxEarlyDepthPlan,
+    required_maps: [bool; MAX_TEV_TEXTURES],
+    required_coords: [bool; MAX_TEV_TEXTURES],
+    sampler_modes: [u32; MAX_TEV_TEXTURES],
+    sampler_identities: [SamplerIdentity; MAX_TEV_TEXTURES],
+    fog: GxFogState,
+    z_texture: GxZTextureState,
+    source_vertices: &[f32],
+    expanded: &[usize],
+    scissor: ScissorRect,
+) -> Option<Vec<TevVertex>> {
+    let Some(texture_coord) = managed_coverage_texture_coord(required_coords) else {
+        return None;
+    };
+    if evidence == ManagedCoverageEvidence::None
+        || primitive != Primitive::Triangles
+        || raster_center != GxRasterCenterEvidence::KnownNonAntialiased
+        || early_depth != GxEarlyDepthPlan::FixedFunction
+        || !managed_coverage_samplers_are_safe(required_maps, sampler_modes, sampler_identities)
+        || fog != GxFogState::default()
+        || z_texture.operation != GxZTextureOperation::Disabled
+        || !expanded.len().is_multiple_of(3)
+        || !source_vertices.len().is_multiple_of(TEV_VERTEX_FLOATS)
+    {
+        return None;
+    }
+
+    for vertex in source_vertices.chunks_exact(TEV_VERTEX_FLOATS) {
+        if vertex.iter().any(|component| !component.is_finite())
+            || !(0.0..=EFB_WIDTH as f32).contains(&vertex[0])
+            || !(0.0..=EFB_HEIGHT as f32).contains(&vertex[1])
+            || !(0.0..=GX_DEPTH24_MAX as f32).contains(&vertex[2])
+            || vertex[3] <= 0.0
+        {
+            return None;
+        }
+    }
+
+    let Ok(raster_scissor) = GxRasterScissor::new(
+        scissor.x as u16,
+        scissor.y as u16,
+        (scissor.x + scissor.width) as u16,
+        (scissor.y + scissor.height) as u16,
+        0,
+        0,
+    ) else {
+        return None;
+    };
+    let textured = texture_coord.is_some();
+    let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
+    let mut prepared = Vec::with_capacity(expanded.len());
+    for triangle in expanded.chunks_exact(3) {
+        let indices = [triangle[0], triangle[1], triangle[2]];
+        if indices.into_iter().any(|index| index >= vertex_count) {
+            return None;
+        }
+        let depth_is_flat = source_triangle_depth_is_bitwise_flat(source_vertices, indices);
+        let rasters_are_flat = source_triangle_rasters_are_bitwise_flat(source_vertices, indices);
+        if evidence == ManagedCoverageEvidence::TrustedPostCull
+            && (!depth_is_flat || !rasters_are_flat)
+        {
+            return None;
+        }
+        let Some(payload) = managed_coverage_attribute_payload_for_depth(
+            source_vertices,
+            indices,
+            texture_coord,
+            !depth_is_flat || !rasters_are_flat,
+        ) else {
+            return None;
+        };
+        let depths = indices.map(|index| source_vertices[index * TEV_VERTEX_FLOATS + 2]);
+        let Some(raster_endpoints) = managed_coverage_raster_endpoints(source_vertices, indices)
+        else {
+            return None;
+        };
+        let mut points = [GxRasterPoint28_4::from_raw(0, 0); 3];
+        for (point, vertex) in points.iter_mut().zip(indices) {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            let Ok(source_point) = GxRasterPoint28_4::from_efb(
+                source_vertices[offset],
+                source_vertices[offset + 1],
+                0,
+                0,
+            ) else {
+                return None;
+            };
+            *point = source_point;
+        }
+        if !managed_coverage_payload_is_safe(
+            payload,
+            depths,
+            raster_endpoints,
+            points,
+            raster_scissor,
+            textured,
+        ) {
+            return None;
+        }
+        let vertices =
+            managed_coverage_triangle_vertices(source_vertices, indices, texture_coord, scissor)
+                .ok()?;
+        if let Some(vertices) = vertices {
+            prepared.extend(vertices);
+        }
+    }
+    Some(prepared)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn managed_coverage_draw_is_safe(
     evidence: ManagedCoverageEvidence,
     primitive: Primitive,
@@ -4408,80 +4610,22 @@ fn managed_coverage_draw_is_safe(
     expanded: &[usize],
     scissor: ScissorRect,
 ) -> bool {
-    let Some(texture_coord) = managed_coverage_texture_coord(required_coords) else {
-        return false;
-    };
-    if evidence == ManagedCoverageEvidence::None
-        || primitive != Primitive::Triangles
-        || raster_center != GxRasterCenterEvidence::KnownNonAntialiased
-        || early_depth != GxEarlyDepthPlan::FixedFunction
-        || !managed_coverage_samplers_are_safe(required_maps, sampler_modes, sampler_identities)
-        || fog != GxFogState::default()
-        || z_texture.operation != GxZTextureOperation::Disabled
-        || !expanded.len().is_multiple_of(3)
-        || !source_vertices.len().is_multiple_of(TEV_VERTEX_FLOATS)
-    {
-        return false;
-    }
-
-    for vertex in source_vertices.chunks_exact(TEV_VERTEX_FLOATS) {
-        if vertex.iter().any(|component| !component.is_finite())
-            || !(0.0..=EFB_WIDTH as f32).contains(&vertex[0])
-            || !(0.0..=EFB_HEIGHT as f32).contains(&vertex[1])
-            || !(0.0..=GX_DEPTH24_MAX as f32).contains(&vertex[2])
-            || vertex[3] <= 0.0
-        {
-            return false;
-        }
-    }
-
-    let Ok(raster_scissor) = GxRasterScissor::new(
-        scissor.x as u16,
-        scissor.y as u16,
-        (scissor.x + scissor.width) as u16,
-        (scissor.y + scissor.height) as u16,
-        0,
-        0,
-    ) else {
-        return false;
-    };
-    let textured = texture_coord.is_some();
-    let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
-    expanded.chunks_exact(3).all(|triangle| {
-        let indices = [triangle[0], triangle[1], triangle[2]];
-        if indices.into_iter().any(|index| index >= vertex_count) {
-            return false;
-        }
-        let depth_is_flat = source_triangle_depth_is_bitwise_flat(source_vertices, indices);
-        if !source_triangle_rasters_are_bitwise_flat(source_vertices, indices)
-            || (evidence == ManagedCoverageEvidence::TrustedPostCull && !depth_is_flat)
-        {
-            return false;
-        }
-        let Some(payload) = managed_coverage_attribute_payload_for_depth(
-            source_vertices,
-            indices,
-            texture_coord,
-            !depth_is_flat,
-        ) else {
-            return false;
-        };
-        let depths = indices.map(|index| source_vertices[index * TEV_VERTEX_FLOATS + 2]);
-        let mut points = [GxRasterPoint28_4::from_raw(0, 0); 3];
-        for (point, vertex) in points.iter_mut().zip(indices) {
-            let offset = vertex * TEV_VERTEX_FLOATS;
-            let Ok(source_point) = GxRasterPoint28_4::from_efb(
-                source_vertices[offset],
-                source_vertices[offset + 1],
-                0,
-                0,
-            ) else {
-                return false;
-            };
-            *point = source_point;
-        }
-        managed_coverage_payload_is_safe(payload, depths, points, raster_scissor, textured)
-    })
+    prepare_managed_coverage_vertices(
+        evidence,
+        primitive,
+        raster_center,
+        early_depth,
+        required_maps,
+        required_coords,
+        sampler_modes,
+        sampler_identities,
+        fog,
+        z_texture,
+        source_vertices,
+        expanded,
+        scissor,
+    )
+    .is_some()
 }
 
 fn managed_coverage_pack_point(point: GxRasterPoint28_4) -> Option<u32> {
@@ -4538,12 +4682,13 @@ fn managed_coverage_triangle_vertices(
     let varying_depth = depths[1..]
         .iter()
         .any(|depth| depth.to_bits() != depths[0].to_bits());
+    let varying_rasters = !source_triangle_rasters_are_bitwise_flat(source_vertices, indices);
     let mut flat = tev_vertex_from_source(source_vertices, indices[0], 0.0);
     if let Some(payload) = managed_coverage_attribute_payload_for_depth(
         source_vertices,
         indices,
         texture_coord,
-        varying_depth,
+        varying_depth || varying_rasters,
     ) {
         flat.tex_coords[..6].copy_from_slice(&payload);
     } else {
@@ -4556,6 +4701,17 @@ fn managed_coverage_triangle_vertices(
     let [Some(point0), Some(point1), Some(point2)] = packed_points else {
         return Ok(None);
     };
+    let Some(raster_endpoints) = managed_coverage_raster_endpoints(source_vertices, indices) else {
+        return Ok(None);
+    };
+    let raster0 = raster_endpoints.map(|channels| {
+        managed_coverage_pack_rgba8(channels[..4].try_into().expect("raster channel zero"))
+    });
+    let raster1 = raster_endpoints.map(|channels| {
+        managed_coverage_pack_rgba8(channels[4..].try_into().expect("raster channel one"))
+    });
+    flat.raster0 = [raster0[0], raster0[1], raster0[2], 0].map(f32::from_bits);
+    flat.raster1 = [raster1[0], raster1[1], raster1[2], 0].map(f32::from_bits);
     flat.tex_coords[6] = [point0, point1, point2].map(f32::from_bits);
     flat.tex_coords[7] = depths;
     Ok(Some(cover.map(|[x, y]| {
@@ -4701,7 +4857,10 @@ fn draw_requires_texture_preflight(
     draw: crate::packet::GxDraw<'_>,
     prepared_exact: Option<&PreparedExactDraw>,
 ) -> bool {
-    if prepared_exact.is_some_and(PreparedExactDraw::is_authoritative_noop) {
+    if prepared_exact
+        .and_then(PreparedExactDraw::authoritative_noop)
+        .is_some()
+    {
         return false;
     }
     let early_depth = gx_early_depth_plan(
@@ -4718,12 +4877,64 @@ fn draw_requires_texture_preflight(
     early_depth != GxEarlyDepthPlan::DepthOnly
 }
 
-fn required_exact_draw_is_managed_safe(
+fn exact_geometry_is_raster_empty(
+    source_vertices: &[f32],
+    expanded: &[usize],
+    scissor: Option<ScissorRect>,
+) -> Option<bool> {
+    if expanded.is_empty() {
+        return Some(true);
+    }
+    if !expanded.len().is_multiple_of(3) || !source_vertices.len().is_multiple_of(TEV_VERTEX_FLOATS)
+    {
+        return None;
+    }
+    let scissor = scissor?;
+    let raster_scissor = GxRasterScissor::new(
+        scissor.x as u16,
+        scissor.y as u16,
+        (scissor.x + scissor.width) as u16,
+        (scissor.y + scissor.height) as u16,
+        0,
+        0,
+    )
+    .ok()?;
+    let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
+    for triangle in expanded.chunks_exact(3) {
+        let indices = [triangle[0], triangle[1], triangle[2]];
+        if indices.into_iter().any(|index| index >= vertex_count) {
+            return None;
+        }
+        let mut points = [GxRasterPoint28_4::from_raw(0, 0); 3];
+        for (point, index) in points.iter_mut().zip(indices) {
+            let offset = index * TEV_VERTEX_FLOATS;
+            *point = GxRasterPoint28_4::from_efb(
+                source_vertices[offset],
+                source_vertices[offset + 1],
+                0,
+                0,
+            )
+            .ok()?;
+        }
+        if let GxRasterSetup::Triangle(triangle) =
+            GxRasterTriangle28_4::setup_post_cull(points, GxRasterWinding::Negative, raster_scissor)
+        {
+            if triangle.has_covered_sample() {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
+}
+
+fn prepare_exact_managed_vertices(
     draw: crate::packet::GxDraw<'_>,
-    exact: &QualifiedExactDraw,
-) -> bool {
-    if !draw.record.exact_clip_required || exact.is_empty() {
-        return false;
+    exact_vertices: &[f32],
+    expanded: &[usize],
+    scissor: Option<ScissorRect>,
+) -> Option<Vec<TevVertex>> {
+    if expanded.is_empty() {
+        return None;
     }
     let primitive = match draw.record.topology {
         5 | 6 => Primitive::Lines,
@@ -4741,16 +4952,16 @@ fn required_exact_draw_is_managed_safe(
         || early_depth != GxEarlyDepthPlan::FixedFunction
         || raster_center != GxRasterCenterEvidence::KnownNonAntialiased
     {
-        return false;
+        return None;
     }
     if draw_depth_encoding(draw.record.z_mode, draw.record.fragment_tail.pixel_control).is_err() {
-        return false;
+        return None;
     }
     let Ok(required_maps) = required_texture_maps(draw.tev_state) else {
-        return false;
+        return None;
     };
     let Ok(required_coords) = required_texture_coords(draw.tev_state) else {
-        return false;
+        return None;
     };
     let sampler_modes = draw.record.textures.map(|slot| slot.sampler_bits);
     let sampler_identities = sampler_modes.map(gx_sampler_identity);
@@ -4759,7 +4970,7 @@ fn required_exact_draw_is_managed_safe(
         draw.record.fragment_tail.z_texture_mode,
         draw.record.fragment_tail.pixel_control,
     ) else {
-        return false;
+        return None;
     };
     let Ok(fog) = gx_fog_state(
         draw.record.fragment_tail.fog_range_base,
@@ -4767,7 +4978,7 @@ fn required_exact_draw_is_managed_safe(
         draw.record.fragment_tail.fog_words,
         draw.record.fragment_tail.viewport_half_width_bits,
     ) else {
-        return false;
+        return None;
     };
     let destination_alpha = gx_destination_alpha_state(
         draw.record.blend_mode,
@@ -4784,25 +4995,27 @@ fn required_exact_draw_is_managed_safe(
     )
     .color_pipeline_for_early_depth(early_depth)
     .cull;
-    let Some(scissor) = exact.scissor else {
-        return false;
+    let Some(scissor) = scissor else {
+        return None;
     };
-    source_cull != CullMode::All
-        && managed_coverage_draw_is_safe(
-            ManagedCoverageEvidence::TrustedExactClip,
-            primitive,
-            raster_center,
-            early_depth,
-            required_maps,
-            required_coords,
-            sampler_modes,
-            sampler_identities,
-            fog,
-            z_texture,
-            &exact.vertices,
-            &exact.expanded,
-            scissor,
-        )
+    if source_cull == CullMode::All {
+        return None;
+    }
+    prepare_managed_coverage_vertices(
+        ManagedCoverageEvidence::TrustedExactClip,
+        primitive,
+        raster_center,
+        early_depth,
+        required_maps,
+        required_coords,
+        sampler_modes,
+        sampler_identities,
+        fog,
+        z_texture,
+        exact_vertices,
+        expanded,
+        scissor,
+    )
 }
 
 fn prepare_exact_draw(
@@ -4834,14 +5047,21 @@ fn prepare_exact_draw(
             qualified: None,
         });
     }
+    let exact_vertices = geometry.into_vertices();
+    let exact_empty = expanded.is_empty()
+        || exact_geometry_is_raster_empty(&exact_vertices, &expanded, scissor).unwrap_or(false);
+    let managed_vertices = (!exact_empty)
+        .then(|| prepare_exact_managed_vertices(draw, &exact_vertices, &expanded, scissor))
+        .flatten();
     let qualified = QualifiedExactDraw {
-        vertices: geometry.into_vertices(),
-        expanded,
         scissor,
+        managed_vertices,
+        exact_empty,
     };
+    let required_managed_safe = required && qualified.managed_vertices.is_some();
     Some(PreparedExactDraw {
         required,
-        required_managed_safe: required && required_exact_draw_is_managed_safe(draw, &qualified),
+        required_managed_safe,
         qualified: Some(qualified),
     })
 }
@@ -5554,18 +5774,21 @@ fn create_pipelines(
 
 #[cfg(test)]
 mod tests {
+    use bytemuck::Zeroable;
+
     use super::{
         BlendComponentState, CopyClearUniform, CullMode, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
-        DepthCommitPipelineKey, DrawUniform, GX_MANAGED_S17_7_RAW_LIMIT,
+        DepthCommitPipelineKey, DrawUniform, ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT,
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxRasterPoint28_4, GxRasterScissor,
         GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
         MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
         ManagedCoverageEvidence, PipelineKey, PreparedExactDraw, Primitive, QualifiedExactDraw,
         REQUIRED_WEBGPU_FEATURES, ScissorRect, TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex,
         alpha_blend_factor, blend_write_mask, browser_raster_position_correction,
-        color_blend_factor, depth_only_command_state, draw_depth_encoding, expanded_index_count,
-        expanded_indices, expanded_primitive_ranges, managed_coverage_attribute_payload,
+        color_blend_factor, depth_only_command_state, draw_depth_encoding,
+        exact_geometry_is_raster_empty, expanded_index_count, expanded_indices,
+        expanded_primitive_ranges, managed_coverage_attribute_payload,
         managed_coverage_draw_is_safe, managed_coverage_pack_point,
         managed_coverage_samplers_are_safe, managed_coverage_texel_uv_is_safe,
         managed_coverage_texture_coord, managed_coverage_triangle_vertices,
@@ -5627,8 +5850,18 @@ mod tests {
             source[offset + 1] = y;
             source[offset + 2] = 1234.0;
             source[offset + 3] = 1.0;
-            source[offset + 4..offset + 8].copy_from_slice(&[0.25, 0.5, 0.75, 1.0]);
-            source[offset + 8..offset + 12].copy_from_slice(&[1.0, 0.75, 0.5, 0.25]);
+            source[offset + 4..offset + 8].copy_from_slice(&[
+                64.0 / 255.0,
+                128.0 / 255.0,
+                192.0 / 255.0,
+                1.0,
+            ]);
+            source[offset + 8..offset + 12].copy_from_slice(&[
+                1.0,
+                192.0 / 255.0,
+                128.0 / 255.0,
+                64.0 / 255.0,
+            ]);
             for coordinate in 0..MAX_TEV_TEXTURES {
                 let start = offset + 12 + coordinate * 3;
                 source[start..start + 3].copy_from_slice(&[
@@ -5644,14 +5877,14 @@ mod tests {
     #[test]
     fn required_exact_preparation_is_authoritative_when_qualification_fails() {
         let qualified = || QualifiedExactDraw {
-            vertices: vec![0.0; TEV_VERTEX_FLOATS * 3],
-            expanded: vec![0, 1, 2],
             scissor: Some(ScissorRect {
                 x: 0,
                 y: 0,
                 width: 1,
                 height: 1,
             }),
+            managed_vertices: Some(vec![TevVertex::zeroed(); 3]),
+            exact_empty: false,
         };
         let optional_unqualified = PreparedExactDraw {
             required: false,
@@ -5659,8 +5892,9 @@ mod tests {
             qualified: None,
         };
         assert!(!optional_unqualified.is_required());
-        assert!(
-            !optional_unqualified.is_authoritative_noop(),
+        assert_eq!(
+            optional_unqualified.authoritative_noop(),
+            None,
             "v5 optional exact input retains its native fallback",
         );
 
@@ -5670,8 +5904,9 @@ mod tests {
             qualified: None,
         };
         assert!(required_unqualified.is_required());
-        assert!(
-            required_unqualified.is_authoritative_noop(),
+        assert_eq!(
+            required_unqualified.authoritative_noop(),
+            Some(ExactAuthoritativeNoop::RequiredRejected),
             "v6 required input must suppress unsupported raw geometry",
         );
 
@@ -5680,15 +5915,16 @@ mod tests {
             required_managed_safe: true,
             qualified: Some(qualified()),
         };
-        assert!(!required_qualified.is_authoritative_noop());
+        assert_eq!(required_qualified.authoritative_noop(), None);
 
         let required_unsafe = PreparedExactDraw {
             required: true,
             required_managed_safe: false,
             qualified: Some(qualified()),
         };
-        assert!(
-            required_unsafe.is_authoritative_noop(),
+        assert_eq!(
+            required_unsafe.authoritative_noop(),
+            Some(ExactAuthoritativeNoop::RequiredRejected),
             "a qualified required draw outside the managed subset needs no resources",
         );
 
@@ -5697,8 +5933,9 @@ mod tests {
             required_managed_safe: false,
             qualified: Some(qualified()),
         };
-        assert!(
-            !optional_unsafe.is_authoritative_noop(),
+        assert_eq!(
+            optional_unsafe.authoritative_noop(),
+            None,
             "v5 optional exact input retains its unsafe native fallback",
         );
 
@@ -5706,15 +5943,50 @@ mod tests {
             required: false,
             required_managed_safe: false,
             qualified: Some(QualifiedExactDraw {
-                vertices: Vec::new(),
-                expanded: Vec::new(),
                 scissor: None,
+                managed_vertices: None,
+                exact_empty: true,
             }),
         };
-        assert!(
-            optional_empty.is_authoritative_noop(),
+        assert_eq!(
+            optional_empty.authoritative_noop(),
+            Some(ExactAuthoritativeNoop::RasterEmpty),
             "exact clipping that removes every triangle remains authoritative",
         );
+
+        let snapped_source = flat_triangle_source([[0.575, 0.0], [0.590, 1.0], [0.575, 2.0]]);
+        let snapped_scissor = Some(ScissorRect {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 528,
+        });
+        assert_eq!(
+            exact_geometry_is_raster_empty(&snapped_source, &[0, 1, 2], snapped_scissor,),
+            Some(true),
+        );
+        let sample_empty_source = flat_triangle_source([[0.0, 0.0], [0.0, 0.0625], [1.0, 0.9375]]);
+        assert_eq!(
+            exact_geometry_is_raster_empty(&sample_empty_source, &[0, 1, 2], snapped_scissor,),
+            Some(true),
+            "a conservative pixel bound without a covered 7/12 sample is an exact no-op",
+        );
+        for required in [false, true] {
+            let snapped_empty = PreparedExactDraw {
+                required,
+                required_managed_safe: false,
+                qualified: Some(QualifiedExactDraw {
+                    scissor: snapped_scissor,
+                    managed_vertices: None,
+                    exact_empty: true,
+                }),
+            };
+            assert_eq!(
+                snapped_empty.authoritative_noop(),
+                Some(ExactAuthoritativeNoop::RasterEmpty),
+                "geometry-only snapped-empty proof is authoritative for both v5 and v6",
+            );
+        }
     }
 
     fn qualifying_managed_draw_with_textures(
@@ -5785,6 +6057,19 @@ mod tests {
             vertex.tex_coords[7][0].to_bits() as i32,
             vertex.tex_coords[7][1].to_bits() as i32,
             vertex.tex_coords[7][2].to_bits() as i32,
+        ]
+    }
+
+    fn managed_raster_payload(vertex: TevVertex) -> [u32; 8] {
+        [
+            vertex.raster0[0].to_bits(),
+            vertex.raster0[1].to_bits(),
+            vertex.raster0[2].to_bits(),
+            vertex.raster0[3].to_bits(),
+            vertex.raster1[0].to_bits(),
+            vertex.raster1[1].to_bits(),
+            vertex.raster1[2].to_bits(),
+            vertex.raster1[3].to_bits(),
         ]
     }
 
@@ -6128,11 +6413,14 @@ mod tests {
         );
 
         let mut varying_raster = source.clone();
-        varying_raster[TEV_VERTEX_FLOATS + 4] =
-            f32::from_bits(varying_raster[TEV_VERTEX_FLOATS + 4].to_bits() ^ 1);
+        varying_raster[TEV_VERTEX_FLOATS + 4] = 65.0 / 255.0;
         assert!(
-            !qualifying_exact_managed_draw(&varying_raster),
-            "varying raster channels remain outside the exact managed subset",
+            qualifying_exact_managed_draw(&varying_raster),
+            "trusted exact clip admits canonical varying raster endpoints",
+        );
+        assert!(
+            !qualifying_managed_draw(&varying_raster),
+            "legacy post-cull evidence retains its flat-raster requirement",
         );
 
         let mut collinear = flat_triangle_source([[0.0, 0.0], [1.0, 0.03125], [22.0, 0.6875]]);
@@ -6143,6 +6431,48 @@ mod tests {
             !qualifying_exact_managed_draw(&collinear),
             "varying depth needs a finite unsnapped source-space plane",
         );
+    }
+
+    #[test]
+    fn managed_exact_vertices_pack_both_raster_endpoint_channels_in_trusted_order() {
+        let mut source = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
+        let endpoints = [
+            [1_u8, 2, 3, 4, 5, 6, 7, 8],
+            [9, 10, 11, 12, 13, 14, 15, 16],
+            [17, 18, 19, 20, 21, 22, 23, 24],
+        ];
+        for (vertex, endpoint) in endpoints.into_iter().enumerate() {
+            let offset = vertex * TEV_VERTEX_FLOATS + 4;
+            for (destination, byte) in source[offset..offset + 8].iter_mut().zip(endpoint) {
+                *destination = f32::from(byte) / 255.0;
+            }
+        }
+        let vertices = managed_coverage_triangle_vertices(
+            &source,
+            [0, 2, 1],
+            None,
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap()
+        .expect("trusted exact varying-raster triangle survives managed setup");
+        let expected = [
+            0x0403_0201,
+            0x1413_1211,
+            0x0c0b_0a09,
+            0,
+            0x0807_0605,
+            0x1817_1615,
+            0x100f_0e0d,
+            0,
+        ];
+        for vertex in vertices {
+            assert_eq!(managed_raster_payload(vertex), expected);
+        }
     }
 
     #[test]
@@ -6510,7 +6840,19 @@ mod tests {
         for vertex in vertices {
             assert_eq!(vertex.position[2].to_bits(), 1234.0_f32.to_bits());
             assert_eq!(vertex.position[3], 1.0);
-            assert_eq!(vertex.raster0, [0.25, 0.5, 0.75, 1.0]);
+            assert_eq!(
+                managed_raster_payload(vertex),
+                [
+                    0xffc0_8040,
+                    0xffc0_8040,
+                    0xffc0_8040,
+                    0,
+                    0x4080_c0ff,
+                    0x4080_c0ff,
+                    0x4080_c0ff,
+                    0,
+                ],
+            );
             assert_eq!(
                 managed_coverage_payload(vertex),
                 [9, 0x0040_0040, 64, depth, depth, depth],
@@ -6557,13 +6899,43 @@ mod tests {
     }
 
     #[test]
-    fn managed_vertex_layout_reuses_dead_stq_bytes_without_inflating_native_vertices() {
+    fn managed_vertex_layout_reinterprets_rasters_without_inflating_native_vertices() {
         assert_eq!(std::mem::size_of::<TevVertex>(), TEV_VERTEX_FLOATS * 4);
         assert_eq!(std::mem::size_of::<TevVertex>(), 144);
         assert_eq!(TEV_VERTEX_ATTRIBUTES.len(), 11);
+        assert_eq!(
+            TEV_VERTEX_ATTRIBUTES[1].format,
+            wgpu::VertexFormat::Float32x4
+        );
+        assert_eq!(TEV_VERTEX_ATTRIBUTES[1].offset, 16);
+        assert_eq!(
+            TEV_VERTEX_ATTRIBUTES[2].format,
+            wgpu::VertexFormat::Float32x4
+        );
+        assert_eq!(TEV_VERTEX_ATTRIBUTES[2].offset, 32);
         assert_eq!(TEV_VERTEX_ATTRIBUTES[10].shader_location, 10);
         assert_eq!(TEV_VERTEX_ATTRIBUTES[10].offset, 132);
         assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES.len(), 11);
+        assert_eq!(
+            MANAGED_COVERAGE_VERTEX_ATTRIBUTES[1].format,
+            wgpu::VertexFormat::Uint32x4
+        );
+        assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES[1].offset, 16);
+        assert_eq!(
+            MANAGED_COVERAGE_VERTEX_ATTRIBUTES[2].format,
+            wgpu::VertexFormat::Uint32x4
+        );
+        assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES[2].offset, 32);
+        assert_eq!(
+            MANAGED_COVERAGE_VERTEX_ATTRIBUTES[3].format,
+            wgpu::VertexFormat::Uint32x3
+        );
+        assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES[3].offset, 48);
+        assert_eq!(
+            MANAGED_COVERAGE_VERTEX_ATTRIBUTES[4].format,
+            wgpu::VertexFormat::Uint32x3
+        );
+        assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES[4].offset, 60);
         assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES[9].shader_location, 11);
         assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES[9].offset, 120);
         assert_eq!(MANAGED_COVERAGE_VERTEX_ATTRIBUTES[10].shader_location, 12);

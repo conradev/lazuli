@@ -48,6 +48,8 @@ pub(crate) struct RendererMetrics {
     pub(crate) drain_calls: u64,
     pub(crate) early_depth_only_commands: u64,
     pub(crate) expanded_vertex_bytes: u64,
+    pub(crate) exact_raster_empty_draws: u64,
+    pub(crate) exact_required_rejected_draws: u64,
     pub(crate) gx_frame_packet_bytes: u64,
     pub(crate) gx_frame_packet_payload_bytes: u64,
     pub(crate) managed_coverage_draws: u64,

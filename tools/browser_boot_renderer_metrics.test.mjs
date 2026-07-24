@@ -14,6 +14,10 @@ const rendererSource = readFileSync(
   new URL("../crates/browser-renderer/src/web.rs", import.meta.url),
   "utf8",
 );
+const rendererCoreSource = readFileSync(
+  new URL("../crates/browser-renderer/src/lib.rs", import.meta.url),
+  "utf8",
+);
 const headlessSource = readFileSync(
   new URL("./browser_boot_headless.mjs", import.meta.url),
   "utf8",
@@ -430,6 +434,48 @@ test("WebGPU diagnostic readback is excluded from workload counters", () => {
   assert.doesNotMatch(rendererSource.slice(start, end), /update_renderer_metrics/);
 });
 
+test("exact authoritative no-ops have distinct renderer compatibility counters", () => {
+  for (const field of [
+    "exact_raster_empty_draws",
+    "exact_required_rejected_draws",
+  ]) {
+    assert.match(
+      rendererCoreSource,
+      new RegExp(`pub\\(crate\\) ${field}: u64`),
+    );
+  }
+  for (const [publicField, rustField] of [
+    ["exactRasterEmptyDraws", "exact_raster_empty_draws"],
+    ["exactRequiredRejectedDraws", "exact_required_rejected_draws"],
+  ]) {
+    assert.match(
+      rendererSource,
+      new RegExp(`"${publicField}"[\\s\\S]{0,80}metrics\\.${rustField}`),
+    );
+    assert.match(
+      rendererSource,
+      new RegExp(`${rustField}\\s*=\\s*metrics\\.${rustField}\\.saturating_add\\(1\\)`),
+    );
+  }
+  const classifierStart = rendererSource.indexOf(
+    "fn authoritative_noop(&self) -> Option<ExactAuthoritativeNoop>",
+  );
+  const classifierEnd = rendererSource.indexOf("\n    }\n}", classifierStart);
+  assert.notEqual(classifierStart, -1);
+  assert.notEqual(classifierEnd, -1);
+  const classifier = rendererSource.slice(classifierStart, classifierEnd);
+  const rasterEmpty = classifier.indexOf("ExactAuthoritativeNoop::RasterEmpty");
+  const requiredRejected = classifier.indexOf(
+    "ExactAuthoritativeNoop::RequiredRejected",
+  );
+  assert.notEqual(rasterEmpty, -1);
+  assert.notEqual(requiredRejected, -1);
+  assert.ok(
+    rasterEmpty < requiredRejected,
+    "raster-empty precedence keeps required empty draws out of rejection telemetry",
+  );
+});
+
 test("draw transport is counted before empty, clipped, and culled exits", () => {
   const start = rendererSource.indexOf("pub fn push_tev_draw");
   const end = rendererSource.indexOf("pub fn copy_efb_to_texture", start);
@@ -437,7 +483,7 @@ test("draw transport is counted before empty, clipped, and culled exits", () => 
   const record = push.indexOf("metrics.record_draw_transport");
   assert.notEqual(record, -1);
   assert.ok(
-    push.indexOf("PreparedExactDraw::is_authoritative_noop", record)
+    push.indexOf("PreparedExactDraw::authoritative_noop", record)
       < push.indexOf("let expanded = expanded_indices", record),
     "authoritative no-op allocates native topology",
   );
@@ -448,7 +494,7 @@ test("draw transport is counted before empty, clipped, and culled exits", () => 
   );
   for (const exit of [
     "if expanded_vertex_count == 0",
-    "PreparedExactDraw::is_authoritative_noop",
+    "PreparedExactDraw::authoritative_noop",
     "required_exact && early_depth != GxEarlyDepthPlan::FixedFunction",
     "let native_scissor = clipped_scissor",
     "required_exact && exact_managed.is_none()",
