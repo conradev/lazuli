@@ -23,17 +23,18 @@ use crate::tev::{
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
     GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDepthCompareLocation,
-    GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbFormat, GxFogState, GxXfbCopyParameters,
-    GxZTextureFormat, GxZTextureOperation, GxZTextureState, RendererFailureState,
-    RendererHostTimings, RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture,
-    SurfacePixelOrder, SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity,
-    ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame,
-    ViOwnedField, ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan,
-    clipped_copy_extent, compact_surface_readback_rows, compact_xfb_scanout_rows,
-    decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_factor_for_component,
-    gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_depth24_to_float,
-    gx_destination_alpha_state, gx_early_depth_plan, gx_fog_state, gx_sampler_identity,
-    gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
+    GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding, GxEfbFormat, GxFogState,
+    GxXfbCopyParameters, GxZTextureFormat, GxZTextureOperation, GxZTextureState,
+    RendererFailureState, RendererHostTimings, RendererMetrics, RendererPhaseTiming,
+    SamplerIdentity, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
+    TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor, ViFieldPairOutcome,
+    ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField, ViPresentationMode,
+    XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
+    compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
+    decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
+    gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state, gx_early_depth_plan,
+    gx_efb_depth_encoding, gx_fog_state, gx_sampler_identity, gx_xfb_copy_parameters,
+    gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
     requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
     rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
     xfb_scanout_plan, xfb_surface_extent_matches,
@@ -291,6 +292,8 @@ const TEV_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_arr
 
 const DRAW_FRAGMENT_FLAG_RGBA6: u32 = 1;
 const DRAW_FRAGMENT_FLAG_FOG: u32 = 2;
+const DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT: u32 = 2;
+const DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE: u32 = 1 << 5;
 const REQUIRED_WEBGPU_FEATURES: wgpu::Features =
     wgpu::Features::DUAL_SOURCE_BLENDING.union(wgpu::Features::DEPTH_CLIP_CONTROL);
 
@@ -315,6 +318,8 @@ impl DrawUniform {
         alpha_test: u32,
         destination_alpha: GxDestinationAlphaState,
         z_texture: GxZTextureState,
+        depth_encoding: GxEfbDepthEncoding,
+        depth_enabled: bool,
         fog: GxFogState,
     ) -> Self {
         let format = match z_texture.format {
@@ -338,7 +343,16 @@ impl DrawUniform {
                 DRAW_FRAGMENT_FLAG_FOG
             } else {
                 0
-            },
+            } | (depth_encoding.shader_code()
+                << DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT)
+                | if depth_enabled
+                    && z_texture.operation != GxZTextureOperation::Disabled
+                    && z_texture.depth_compare_location == GxDepthCompareLocation::Late
+                {
+                    DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE
+                } else {
+                    0
+                },
             z_texture: (z_texture.bias & GX_DEPTH24_MAX) | (format << 24) | (operation << 26),
             fog_control: [fog.range_base, 0, 0, 0],
             fog_range0: [
@@ -367,10 +381,10 @@ struct CopyClearUniform {
 }
 
 impl CopyClearUniform {
-    fn new(rgba: [u8; 4], depth: u32) -> Self {
+    fn new(rgba: [u8; 4], depth: u32, depth_encoding: GxEfbDepthEncoding) -> Self {
         Self {
             color: rgba.map(|channel| f32::from(channel) / 255.0),
-            depth_and_padding: [gx_depth24_to_float(depth), 0.0, 0.0, 0.0],
+            depth_and_padding: [depth_encoding.depth32_float(depth), 0.0, 0.0, 0.0],
         }
     }
 }
@@ -530,7 +544,8 @@ struct PipelineKey {
     cull: CullMode,
     depth: DepthPipelineState,
     blend: BlendPipelineState,
-    late_fragment_depth: bool,
+    canonical_fragment_depth: bool,
+    unclipped_depth: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -538,6 +553,7 @@ struct DepthCommitPipelineKey {
     primitive: Primitive,
     cull: CullMode,
     compare: wgpu::CompareFunction,
+    depth_encoding: GxEfbDepthEncoding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1480,7 +1496,7 @@ impl WebGpuRenderer {
                     height,
                 },
                 state,
-            );
+            )?;
         }
         self.queue.submit([encoder.finish()]);
         update_renderer_metrics(&self.metrics, |metrics| {
@@ -1494,13 +1510,19 @@ impl WebGpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         rectangle: ScissorRect,
         state: GxCopyState,
-    ) {
+    ) -> Result<(), JsValue> {
         let mask = gx_copy_clear_mask(state.z_mode, state.blend_mode, state.pixel_control);
         if !mask.writes_anything() {
-            return;
+            return Ok(());
         }
         let rgba = gx_copy_clear_rgba(state.pixel_control, state.clear_rgba);
-        let uniform = CopyClearUniform::new(rgba, state.clear_depth);
+        let depth_encoding = if mask.depth {
+            gx_efb_depth_encoding(state.pixel_control)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?
+        } else {
+            GxEfbDepthEncoding::Z24
+        };
+        let uniform = CopyClearUniform::new(rgba, state.clear_depth, depth_encoding);
         self.queue
             .write_buffer(&self.copy_clear.uniform, 0, bytemuck::bytes_of(&uniform));
         encode_copy_clear_pass(
@@ -1512,6 +1534,7 @@ impl WebGpuRenderer {
             rectangle,
             "browser GX post-copy clear pass",
         );
+        Ok(())
     }
 
     pub fn begin_segment(&mut self) -> Result<(), JsValue> {
@@ -2087,6 +2110,8 @@ impl WebGpuRenderer {
             7 => Primitive::Points,
             _ => Primitive::Triangles,
         };
+        let depth_encoding = draw_depth_encoding(z_mode, pixel_control)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
         if early_depth == GxEarlyDepthPlan::DepthOnly {
             let Some(scissor) =
@@ -2097,7 +2122,8 @@ impl WebGpuRenderer {
             if primitive_cull_mode(primitive, cull_mode) == CullMode::All {
                 return Ok(());
             }
-            let Some(state) = depth_only_command_state(primitive, z_mode, cull_mode, scissor)
+            let Some(state) =
+                depth_only_command_state(primitive, z_mode, cull_mode, depth_encoding, scissor)
             else {
                 // A failed fixed-function depth compare has no observable
                 // fragment or depth effect, so do not enqueue a GPU no-op.
@@ -2134,7 +2160,14 @@ impl WebGpuRenderer {
         } else {
             GxFogState::default()
         };
-        let draw_uniform = DrawUniform::from_gx(alpha_test, destination_alpha, z_texture, fog);
+        let draw_uniform = DrawUniform::from_gx(
+            alpha_test,
+            destination_alpha,
+            z_texture,
+            depth_encoding,
+            pipeline.canonical_fragment_depth,
+            fog,
+        );
         let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
         else {
             return Ok(());
@@ -2301,8 +2334,9 @@ impl WebGpuRenderer {
             self.tev_draw_binding_indices.insert(binding_key, binding);
             binding
         };
-        let depth_commit = (early_depth == GxEarlyDepthPlan::PrimitiveOrdered)
-            .then_some(DepthCommitPipelineKey::from(pipeline));
+        let depth_commit = (early_depth == GxEarlyDepthPlan::PrimitiveOrdered).then_some(
+            DepthCommitPipelineKey::from_pipeline(pipeline, depth_encoding),
+        );
         let pipeline = Some(pipeline);
         let binding = Some(binding);
         let state = DrawCommandState {
@@ -2475,7 +2509,7 @@ impl WebGpuRenderer {
                     height,
                 },
                 state,
-            );
+            )?;
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.submit([encoder.finish()]);
@@ -2722,7 +2756,7 @@ impl WebGpuRenderer {
                     height: source_height,
                 },
                 copy_state,
-            );
+            )?;
         }
         self.queue.submit([encoder.finish()]);
         update_renderer_metrics(&self.metrics, |metrics| {
@@ -3670,7 +3704,8 @@ impl PipelineKey {
                 color_write: blend.color_write,
                 alpha_write: blend.alpha_write && destination_alpha.target_has_guest_alpha,
             },
-            late_fragment_depth: depth_enabled
+            canonical_fragment_depth: depth_enabled,
+            unclipped_depth: depth_enabled
                 && z_texture.operation != GxZTextureOperation::Disabled
                 && z_texture.depth_compare_location == GxDepthCompareLocation::Late,
         }
@@ -3685,11 +3720,26 @@ impl PipelineKey {
 }
 
 impl DepthCommitPipelineKey {
-    fn from_gx(primitive: Primitive, z_mode: u32, cull_mode: u8) -> Self {
+    fn from_gx(
+        primitive: Primitive,
+        z_mode: u32,
+        cull_mode: u8,
+        depth_encoding: GxEfbDepthEncoding,
+    ) -> Self {
         Self {
             primitive,
             cull: primitive_cull_mode(primitive, cull_mode),
             compare: depth_pipeline_state(z_mode).compare,
+            depth_encoding,
+        }
+    }
+
+    fn from_pipeline(pipeline: PipelineKey, depth_encoding: GxEfbDepthEncoding) -> Self {
+        Self {
+            primitive: pipeline.primitive,
+            cull: pipeline.cull,
+            compare: pipeline.depth.compare,
+            depth_encoding,
         }
     }
 }
@@ -3698,9 +3748,11 @@ fn depth_only_command_state(
     primitive: Primitive,
     z_mode: u32,
     cull_mode: u8,
+    depth_encoding: GxEfbDepthEncoding,
     scissor: ScissorRect,
 ) -> Option<DrawCommandState> {
-    let depth_commit = DepthCommitPipelineKey::from_gx(primitive, z_mode, cull_mode);
+    let depth_commit =
+        DepthCommitPipelineKey::from_gx(primitive, z_mode, cull_mode, depth_encoding);
     let early_depth = GxEarlyDepthPlan::DepthOnly;
     let binding = None;
     (depth_commit.compare != wgpu::CompareFunction::Never).then_some(DrawCommandState {
@@ -3710,16 +3762,6 @@ fn depth_only_command_state(
         scissor,
         binding,
     })
-}
-
-impl From<PipelineKey> for DepthCommitPipelineKey {
-    fn from(pipeline: PipelineKey) -> Self {
-        Self {
-            primitive: pipeline.primitive,
-            cull: pipeline.cull,
-            compare: pipeline.depth.compare,
-        }
-    }
 }
 
 fn depth_pipeline_state(z_mode: u32) -> DepthPipelineState {
@@ -3732,6 +3774,16 @@ fn depth_pipeline_state(z_mode: u32) -> DepthPipelineState {
         },
         write: enabled && z_mode & (1 << 4) != 0,
     }
+}
+
+fn draw_depth_encoding(
+    z_mode: u32,
+    pixel_control: u32,
+) -> Result<GxEfbDepthEncoding, crate::GxEfbDepthDecodeError> {
+    if z_mode & 1 == 0 {
+        return Ok(GxEfbDepthEncoding::Z24);
+    }
+    gx_efb_depth_encoding(pixel_control)
 }
 
 fn primitive_cull_mode(primitive: Primitive, cull_mode: u8) -> CullMode {
@@ -4091,7 +4143,7 @@ fn create_tev_geometry_pipeline(
             strip_index_format: None,
             front_face: wgpu::FrontFace::Cw,
             cull_mode: webgpu_cull_mode(key.cull),
-            unclipped_depth: key.late_fragment_depth,
+            unclipped_depth: key.unclipped_depth,
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
@@ -4105,7 +4157,7 @@ fn create_tev_geometry_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if key.late_fragment_depth {
+            entry_point: Some(if key.canonical_fragment_depth {
                 "fs_depth_main"
             } else {
                 "fs_main"
@@ -4156,7 +4208,21 @@ fn create_early_depth_commit_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_early_depth_commit"),
+            entry_point: Some(match key.depth_encoding {
+                GxEfbDepthEncoding::Z24 => "fs_early_depth_commit_z24",
+                GxEfbDepthEncoding::Z16(crate::GxDepthCompression::Linear) => {
+                    "fs_early_depth_commit_z16_linear"
+                }
+                GxEfbDepthEncoding::Z16(crate::GxDepthCompression::Near) => {
+                    "fs_early_depth_commit_z16_near"
+                }
+                GxEfbDepthEncoding::Z16(crate::GxDepthCompression::Mid) => {
+                    "fs_early_depth_commit_z16_mid"
+                }
+                GxEfbDepthEncoding::Z16(crate::GxDepthCompression::Far) => {
+                    "fs_early_depth_commit_z16_far"
+                }
+            }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8Unorm,
@@ -4342,7 +4408,11 @@ fn create_copy_clear_resources(device: &wgpu::Device) -> CopyClearResources {
     });
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("browser GX copy-clear uniform"),
-        contents: bytemuck::bytes_of(&CopyClearUniform::new([0; 4], GX_DEPTH24_MAX)),
+        contents: bytemuck::bytes_of(&CopyClearUniform::new(
+            [0; 4],
+            GX_DEPTH24_MAX,
+            GxEfbDepthEncoding::Z24,
+        )),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4526,16 +4596,18 @@ fn create_pipelines(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlendComponentState, DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_RGBA6,
+        BlendComponentState, CopyClearUniform, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
+        DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
         DepthCommitPipelineKey, DrawUniform, PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES,
         ScissorRect, TevBindingKey, alpha_blend_factor, blend_write_mask, color_blend_factor,
-        depth_only_command_state, expanded_indices, expanded_primitive_ranges,
+        depth_only_command_state, draw_depth_encoding, expanded_indices, expanded_primitive_ranges,
         merge_contiguous_draw_range,
     };
     use crate::tev::MAX_TEV_TEXTURES;
     use crate::{
-        GxBlendFactor, GxEarlyDepthPlan, GxFogState, SamplerIdentity, TextureAddressMode,
-        TextureBindingIdentity, gx_destination_alpha_state, gx_z_texture_state,
+        GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState,
+        SamplerIdentity, TextureAddressMode, TextureBindingIdentity, gx_destination_alpha_state,
+        gx_z_texture_state,
     };
 
     fn encoded_blend_mode(
@@ -4610,10 +4682,22 @@ mod tests {
             height: 4,
         };
         let less_update = 1 | (1 << 1) | (1 << 4);
-        let first =
-            depth_only_command_state(Primitive::Triangles, less_update, 1, scissor).unwrap();
-        let second =
-            depth_only_command_state(Primitive::Triangles, less_update, 1, scissor).unwrap();
+        let first = depth_only_command_state(
+            Primitive::Triangles,
+            less_update,
+            1,
+            GxEfbDepthEncoding::Z24,
+            scissor,
+        )
+        .unwrap();
+        let second = depth_only_command_state(
+            Primitive::Triangles,
+            less_update,
+            1,
+            GxEfbDepthEncoding::Z24,
+            scissor,
+        )
+        .unwrap();
         assert!(first.pipeline.is_none());
         assert!(first.binding.is_none());
         assert!(first.depth_commit.is_some());
@@ -4628,8 +4712,14 @@ mod tests {
         assert_eq!(vertices, 0..6);
 
         let greater_update = 1 | (4 << 1) | (1 << 4);
-        let different_compare =
-            depth_only_command_state(Primitive::Triangles, greater_update, 1, scissor).unwrap();
+        let different_compare = depth_only_command_state(
+            Primitive::Triangles,
+            greater_update,
+            1,
+            GxEfbDepthEncoding::Z24,
+            scissor,
+        )
+        .unwrap();
         assert!(!merge_contiguous_draw_range(
             &mut vertices,
             &first,
@@ -4640,6 +4730,7 @@ mod tests {
             Primitive::Triangles,
             less_update,
             1,
+            GxEfbDepthEncoding::Z24,
             ScissorRect {
                 width: 4,
                 ..scissor
@@ -4663,7 +4754,30 @@ mod tests {
             height: 1,
         };
         let never_update = 1 | (1 << 4);
-        assert!(depth_only_command_state(Primitive::Triangles, never_update, 0, scissor).is_none());
+        assert!(
+            depth_only_command_state(
+                Primitive::Triangles,
+                never_update,
+                0,
+                GxEfbDepthEncoding::Z24,
+                scissor,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn depth_disabled_draws_canonicalize_unused_inverse_compression_to_z24() {
+        let inverse_z16 = 2 | (4 << 3);
+        assert_eq!(
+            draw_depth_encoding(0, inverse_z16),
+            Ok(GxEfbDepthEncoding::Z24)
+        );
+        assert!(draw_depth_encoding(1, inverse_z16).is_err());
+        assert_eq!(
+            draw_depth_encoding(1, 2 | (3 << 3)),
+            Ok(GxEfbDepthEncoding::Z16(GxDepthCompression::Far))
+        );
     }
 
     #[test]
@@ -4690,7 +4804,7 @@ mod tests {
                 .depth
                 .write
         );
-        let commit = DepthCommitPipelineKey::from(pipeline);
+        let commit = DepthCommitPipelineKey::from_pipeline(pipeline, GxEfbDepthEncoding::Z24);
         assert_eq!(commit.compare, pipeline.depth.compare);
     }
 
@@ -4700,8 +4814,15 @@ mod tests {
         let second = pipeline_key(encoded_blend_mode(7, 6, false, true), 0x1ff, 1);
         assert_ne!(first, second);
         assert_eq!(
-            DepthCommitPipelineKey::from(first),
-            DepthCommitPipelineKey::from(second),
+            DepthCommitPipelineKey::from_pipeline(first, GxEfbDepthEncoding::Z24),
+            DepthCommitPipelineKey::from_pipeline(second, GxEfbDepthEncoding::Z24),
+        );
+        assert_ne!(
+            DepthCommitPipelineKey::from_pipeline(first, GxEfbDepthEncoding::Z24),
+            DepthCommitPipelineKey::from_pipeline(
+                first,
+                GxEfbDepthEncoding::Z16(GxDepthCompression::Linear),
+            ),
         );
     }
 
@@ -4843,12 +4964,16 @@ mod tests {
             0x123456,
             gx_destination_alpha_state(blend_mode, 0x100, 1),
             z_texture,
+            GxEfbDepthEncoding::Z24,
+            false,
             GxFogState::default(),
         );
         let active_full = DrawUniform::from_gx(
             0x123456,
             gx_destination_alpha_state(blend_mode, 0x1ff, 1),
             z_texture,
+            GxEfbDepthEncoding::Z24,
+            false,
             GxFogState::default(),
         );
         assert_eq!(active_zero.destination_alpha, 0x100);
@@ -4861,12 +4986,16 @@ mod tests {
             0x123456,
             gx_destination_alpha_state(alpha_update_disabled, 0x100, 1),
             z_texture,
+            GxEfbDepthEncoding::Z24,
+            false,
             GxFogState::default(),
         );
         let inactive_b = DrawUniform::from_gx(
             0x123456,
             gx_destination_alpha_state(alpha_update_disabled, 0x1ff, 1),
             z_texture,
+            GxEfbDepthEncoding::Z24,
+            false,
             GxFogState::default(),
         );
         assert_eq!(inactive_a.destination_alpha, 0);
@@ -4876,6 +5005,8 @@ mod tests {
             0x123456,
             gx_destination_alpha_state(blend_mode, 0x1ff, 0),
             gx_z_texture_state(0, 0, 0).unwrap(),
+            GxEfbDepthEncoding::Z24,
+            false,
             GxFogState::default(),
         );
         assert_eq!(no_alpha.fragment_flags, 0);
@@ -4886,10 +5017,24 @@ mod tests {
     fn draw_uniform_marks_active_fog_without_changing_the_rgba6_flag() {
         let destination_alpha = gx_destination_alpha_state(0, 0, 0);
         let z_texture = gx_z_texture_state(0, 0, 0).unwrap();
-        let disabled = DrawUniform::from_gx(0, destination_alpha, z_texture, GxFogState::default());
+        let disabled = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            z_texture,
+            GxEfbDepthEncoding::Z24,
+            false,
+            GxFogState::default(),
+        );
         let mut fog = GxFogState::default();
         fog.parameters[3] = 2 << 21;
-        let enabled = DrawUniform::from_gx(0, destination_alpha, z_texture, fog);
+        let enabled = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            z_texture,
+            GxEfbDepthEncoding::Z24,
+            false,
+            fog,
+        );
         assert_eq!(disabled.fragment_flags & DRAW_FRAGMENT_FLAG_FOG, 0);
         assert_eq!(
             enabled.fragment_flags & DRAW_FRAGMENT_FLAG_FOG,
@@ -4902,7 +5047,38 @@ mod tests {
     }
 
     #[test]
-    fn z_texture_state_selects_only_the_late_depth_pipeline_and_packs_the_draw_uniform() {
+    fn draw_and_copy_clear_uniforms_share_the_model_depth_encoding() {
+        let destination_alpha = gx_destination_alpha_state(0, 0, 2);
+        let z_texture = gx_z_texture_state(0, 0, 2).unwrap();
+        for (encoding, expected_code) in [
+            (GxEfbDepthEncoding::Z24, 0),
+            (GxEfbDepthEncoding::Z16(GxDepthCompression::Linear), 1),
+            (GxEfbDepthEncoding::Z16(GxDepthCompression::Near), 2),
+            (GxEfbDepthEncoding::Z16(GxDepthCompression::Mid), 3),
+            (GxEfbDepthEncoding::Z16(GxDepthCompression::Far), 4),
+        ] {
+            let draw = DrawUniform::from_gx(
+                0,
+                destination_alpha,
+                z_texture,
+                encoding,
+                true,
+                GxFogState::default(),
+            );
+            assert_eq!(
+                (draw.fragment_flags >> DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT) & 7,
+                expected_code
+            );
+            let clear = CopyClearUniform::new([0; 4], 0x12_3456, encoding);
+            assert_eq!(
+                clear.depth_and_padding[0],
+                encoding.depth32_float(0x12_3456)
+            );
+        }
+    }
+
+    #[test]
+    fn every_z_test_uses_canonical_fragment_depth_and_late_ztexture_is_selected_in_uniform() {
         let destination_alpha = gx_destination_alpha_state(0, 0, 0);
         let late = gx_z_texture_state(0x12_3456, 2 | (1 << 2), 0).unwrap();
         let early = gx_z_texture_state(0x12_3456, 2 | (1 << 2), 1 << 6).unwrap();
@@ -4918,17 +5094,67 @@ mod tests {
                 0,
             )
         };
-        assert!(pipeline(1, late).late_fragment_depth);
-        assert!(!pipeline(1, early).late_fragment_depth);
-        assert!(!pipeline(0, late).late_fragment_depth);
-        assert!(!pipeline(1, disabled).late_fragment_depth);
+        assert!(pipeline(1, late).canonical_fragment_depth);
+        assert!(pipeline(1, early).canonical_fragment_depth);
+        assert!(!pipeline(0, late).canonical_fragment_depth);
+        assert!(pipeline(1, disabled).canonical_fragment_depth);
+        assert!(pipeline(1, late).unclipped_depth);
+        assert!(!pipeline(1, early).unclipped_depth);
+        assert!(!pipeline(0, late).unclipped_depth);
+        assert!(!pipeline(1, disabled).unclipped_depth);
 
-        let draw = DrawUniform::from_gx(0, destination_alpha, late, GxFogState::default());
+        let draw = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            late,
+            GxEfbDepthEncoding::Z24,
+            true,
+            GxFogState::default(),
+        );
         assert_eq!(draw.z_texture, 0x0612_3456);
-        let early_draw = DrawUniform::from_gx(0, destination_alpha, early, GxFogState::default());
+        let early_draw = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            early,
+            GxEfbDepthEncoding::Z24,
+            true,
+            GxFogState::default(),
+        );
         assert_eq!(early_draw.z_texture, draw.z_texture);
-        let disabled_draw =
-            DrawUniform::from_gx(0, destination_alpha, disabled, GxFogState::default());
+        assert_ne!(early_draw.fragment_flags, draw.fragment_flags);
+        assert_eq!(
+            draw.fragment_flags & DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE,
+            DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE
+        );
+        assert_eq!(
+            early_draw.fragment_flags & DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE,
+            0
+        );
+        let inactive_late = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            late,
+            GxEfbDepthEncoding::Z24,
+            false,
+            GxFogState::default(),
+        );
+        let inactive_early = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            early,
+            GxEfbDepthEncoding::Z24,
+            false,
+            GxFogState::default(),
+        );
+        assert_eq!(binding_key(inactive_late), binding_key(inactive_early));
+        let disabled_draw = DrawUniform::from_gx(
+            0,
+            destination_alpha,
+            disabled,
+            GxEfbDepthEncoding::Z24,
+            true,
+            GxFogState::default(),
+        );
         assert_eq!(disabled_draw.z_texture, 0);
         assert_ne!(binding_key(draw), binding_key(disabled_draw));
     }

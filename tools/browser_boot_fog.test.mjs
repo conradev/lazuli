@@ -59,7 +59,7 @@ test("LZGX v3 carries complete raw fog state into one canonical WebGPU draw unif
   );
   assert.match(
     draw,
-    /DrawUniform::from_gx\(alpha_test, destination_alpha, z_texture, fog\)/,
+    /DrawUniform::from_gx\(\s*alpha_test,\s*destination_alpha,\s*z_texture,\s*depth_encoding,\s*pipeline\.canonical_fragment_depth,\s*fog,\s*\)/s,
   );
   assert.match(
     draw,
@@ -94,10 +94,10 @@ test("WebGPU fog consumes theoretical post-Z-texture depth before destination al
     "if !alpha_test_passes(tev_alpha, draw_state.alpha_test)",
   );
   const zTexture = fragment.indexOf(
-    "depth = gx_z_texture_depth(reference_depth, evaluation.raw_texture)",
+    "let operation_depth = gx_z_texture_depth(raster_depth, evaluation.raw_texture)",
   );
   const fog = fragment.indexOf(
-    "gx_fog_color(unorm_source, input.position.x, depth)",
+    "gx_fog_color(unorm_source, input.position.x, operation_depth)",
   );
   const destinationAlpha = fragment.indexOf(
     "if (draw_state.destination_alpha & 0x100u) == 0x100u",
@@ -111,10 +111,17 @@ test("WebGPU fog consumes theoretical post-Z-texture depth before destination al
   assert.match(fragment, /if operation == 0u \{\s*return reference_depth;/s);
   assert.match(fragment, /let fog_enabled = \(draw_state\.fragment_flags & 2u\) != 0u/);
   assert.match(fragment, /if needs_fragment_depth \|\| fog_enabled \{/);
+  assert.match(
+    fragment,
+    /buffer_depth = select\(raster_depth, operation_depth, late_z_texture\)/,
+  );
   assert.match(fragment, /let values = tev_fragment_values\(input, false\)/);
   assert.match(fragment, /let values = tev_fragment_values\(input, true\)/);
-  assert.match(fragment, /values\.depth = depth/);
-  assert.match(fragment, /output\.depth = f32\(values\.depth\) \/ 16777215\.0/);
+  assert.match(fragment, /values\.buffer_depth = buffer_depth/);
+  assert.match(
+    fragment,
+    /output\.depth = gx_efb_depth_to_attachment\(values\.buffer_depth, depth_encoding\)/,
+  );
   assert.match(fragment, /return vec4<u32>\(rgb, source\.a\)/);
 });
 

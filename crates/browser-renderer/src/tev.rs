@@ -652,7 +652,71 @@ struct TevVertexOutput {
     @location(10) @interpolate(linear) depth24: f32,
 };
 
+struct CanonicalDepthOutput {
+    @builtin(frag_depth) depth: f32,
+};
+
 @group(0) @binding(2) var<uniform> draw_state: DrawState;
+
+fn gx_raster_depth24(depth24: f32) -> u32 {
+    if !(depth24 > 0.0) {
+        return 0u;
+    }
+    if depth24 >= 16777215.0 {
+        return 0x00ffffffu;
+    }
+    return u32(depth24);
+}
+
+fn gx_depth24_to_attachment(depth: u32) -> f32 {
+    return f32(depth & 0x00ffffffu) / 16777215.0;
+}
+
+fn gx_z16_leading_ones(depth: u32) -> u32 {
+    var leading_ones = 0u;
+    for (var index = 0u; index < 24u; index += 1u) {
+        if (depth & (1u << (23u - index))) == 0u {
+            break;
+        }
+        leading_ones += 1u;
+    }
+    return leading_ones;
+}
+
+fn gx_compress_z16(depth: u32, encoding: u32) -> u32 {
+    let source = depth & 0x00ffffffu;
+    if encoding == 1u {
+        return source >> 8u;
+    }
+
+    var exponent_bits = 2u;
+    var maximum_exponent = 3u;
+    if encoding == 3u {
+        exponent_bits = 3u;
+        maximum_exponent = 7u;
+    } else if encoding == 4u {
+        exponent_bits = 4u;
+        maximum_exponent = 12u;
+    }
+    let source_leading_ones = gx_z16_leading_ones(source);
+    let exponent = min(source_leading_ones, maximum_exponent);
+    let exponent_is_clamped = source_leading_ones >= maximum_exponent;
+    let mantissa_bits = 16u - exponent_bits;
+    var mantissa_top = max(24u - exponent, mantissa_bits);
+    if !exponent_is_clamped {
+        mantissa_top -= 1u;
+    }
+    let bottom = mantissa_top - mantissa_bits;
+    let mask = (1u << mantissa_bits) - 1u;
+    return (exponent << mantissa_bits) | ((source >> bottom) & mask);
+}
+
+fn gx_efb_depth_to_attachment(depth: u32, encoding: u32) -> f32 {
+    if encoding == 0u {
+        return gx_depth24_to_attachment(depth);
+    }
+    return f32(gx_compress_z16(depth, encoding)) / 65535.0;
+}
 
 @vertex
 fn vs_main(input: TevVertexInput) -> TevVertexOutput {
@@ -678,10 +742,42 @@ fn vs_main(input: TevVertexInput) -> TevVertexOutput {
 }
 
 // Browser WebGPU cannot force early fragment tests. Early GX depth commits use
-// this side-effect-free fragment entry in a paired pipeline: fixed-function
-// depth is updated, while an empty color write mask preserves the EFB color.
+// binding-free fragment entries in a paired pipeline. They emit the same
+// canonical attachment depth as the color attempt, while an empty color write
+// mask preserves the EFB color.
+fn gx_early_depth_commit(
+    input: TevVertexOutput,
+    encoding: u32,
+) -> CanonicalDepthOutput {
+    var output: CanonicalDepthOutput;
+    output.depth =
+        gx_efb_depth_to_attachment(gx_raster_depth24(input.depth24), encoding);
+    return output;
+}
+
 @fragment
-fn fs_early_depth_commit() {
+fn fs_early_depth_commit_z24(input: TevVertexOutput) -> CanonicalDepthOutput {
+    return gx_early_depth_commit(input, 0u);
+}
+
+@fragment
+fn fs_early_depth_commit_z16_linear(input: TevVertexOutput) -> CanonicalDepthOutput {
+    return gx_early_depth_commit(input, 1u);
+}
+
+@fragment
+fn fs_early_depth_commit_z16_near(input: TevVertexOutput) -> CanonicalDepthOutput {
+    return gx_early_depth_commit(input, 2u);
+}
+
+@fragment
+fn fs_early_depth_commit_z16_mid(input: TevVertexOutput) -> CanonicalDepthOutput {
+    return gx_early_depth_commit(input, 3u);
+}
+
+@fragment
+fn fs_early_depth_commit_z16_far(input: TevVertexOutput) -> CanonicalDepthOutput {
+    return gx_early_depth_commit(input, 4u);
 }
 
 fn alpha_compare(value: u32, reference: u32, operation: u32) -> bool {
@@ -1002,7 +1098,7 @@ struct TevFragmentDepthOutput {
 struct TevFragmentValues {
     primary: vec4<f32>,
     secondary: vec4<f32>,
-    depth: u32,
+    buffer_depth: u32,
 };
 
 fn gx_z_texture_depth(reference_depth: u32, raw_texture: vec4<u32>) -> u32 {
@@ -1147,18 +1243,21 @@ fn tev_fragment_values(input: TevVertexOutput, needs_fragment_depth: bool) -> Te
     }
 
     let fog_enabled = (draw_state.fragment_flags & 2u) != 0u;
-    var depth = 0u;
+    var buffer_depth = 0u;
     var normalized_source = source;
     if needs_fragment_depth || fog_enabled {
-        let reference_depth =
-            u32(round(clamp(input.depth24, 0.0, 16777215.0)));
-        depth = gx_z_texture_depth(reference_depth, evaluation.raw_texture);
+        let raster_depth = gx_raster_depth24(input.depth24);
+        let operation_depth = gx_z_texture_depth(raster_depth, evaluation.raw_texture);
+        if needs_fragment_depth {
+            let late_z_texture = (draw_state.fragment_flags & (1u << 5u)) != 0u;
+            buffer_depth = select(raster_depth, operation_depth, late_z_texture);
+        }
         if fog_enabled {
             let unorm_source = vec4<u32>(
                 round(clamp(source, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0)
             );
             normalized_source =
-                vec4<f32>(gx_fog_color(unorm_source, input.position.x, depth)) / 255.0;
+                vec4<f32>(gx_fog_color(unorm_source, input.position.x, operation_depth)) / 255.0;
         }
     }
 
@@ -1174,7 +1273,7 @@ fn tev_fragment_values(input: TevVertexOutput, needs_fragment_depth: bool) -> Te
     var values: TevFragmentValues;
     values.primary = vec4<f32>(normalized_source.rgb, primary_alpha);
     values.secondary = normalized_source;
-    values.depth = depth;
+    values.buffer_depth = buffer_depth;
     return values;
 }
 
@@ -1193,7 +1292,8 @@ fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput {
     var output: TevFragmentDepthOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
-    output.depth = f32(values.depth) / 16777215.0;
+    let depth_encoding = (draw_state.fragment_flags >> 2u) & 7u;
+    output.depth = gx_efb_depth_to_attachment(values.buffer_depth, depth_encoding);
     return output;
 }
 ";
@@ -1633,12 +1733,10 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_early_depth_commit_has_no_fragment_side_effects() {
+    fn wgsl_early_depth_commit_is_binding_free_and_writes_only_canonical_depth() {
         let shader = shader_source();
         assert!(shader.contains("@invariant @builtin(position) position: vec4<f32>"));
-        let start = shader
-            .find("@fragment\nfn fs_early_depth_commit()")
-            .unwrap();
+        let start = shader.find("fn gx_early_depth_commit(").unwrap();
         let end = shader[start..].find("fn alpha_compare").unwrap() + start;
         let commit = &shader[start..end];
         assert!(!commit.contains("discard"));
@@ -1646,7 +1744,17 @@ mod tests {
         assert!(!commit.contains("textureSample"));
         assert!(!commit.contains("fog"));
         assert!(!commit.contains("destination_alpha"));
-        assert!(!commit.contains("frag_depth"));
+        assert!(!commit.contains("@group"));
+        assert!(commit.contains("output.depth ="));
+        for entry in [
+            "fs_early_depth_commit_z24",
+            "fs_early_depth_commit_z16_linear",
+            "fs_early_depth_commit_z16_near",
+            "fs_early_depth_commit_z16_mid",
+            "fs_early_depth_commit_z16_far",
+        ] {
+            assert!(commit.contains(entry));
+        }
     }
 
     #[test]
@@ -1666,11 +1774,11 @@ mod tests {
             .find("if needs_fragment_depth || fog_enabled")
             .unwrap();
         let z_texture = shader
-            .find("depth = gx_z_texture_depth(reference_depth, evaluation.raw_texture)")
+            .find("let operation_depth = gx_z_texture_depth(raster_depth, evaluation.raw_texture)")
             .unwrap();
         let unorm_source = shader.find("let unorm_source = vec4<u32>(").unwrap();
         let fog = shader
-            .find("gx_fog_color(unorm_source, input.position.x, depth)")
+            .find("gx_fog_color(unorm_source, input.position.x, operation_depth)")
             .unwrap();
         let destination_alpha = shader
             .find("if (draw_state.destination_alpha & 0x100u) == 0x100u")
@@ -1728,7 +1836,8 @@ mod tests {
         );
         assert!(shader.contains("@location(10) @interpolate(linear) depth24: f32"));
         assert!(shader.contains("output.depth24 = input.position.z"));
-        assert!(shader.contains("u32(round(clamp(input.depth24, 0.0, 16777215.0)))"));
+        assert!(shader.contains("let raster_depth = gx_raster_depth24(input.depth24)"));
+        assert!(shader.contains("return u32(depth24)"));
         assert!(!shader.contains("u32(round(clamp(input.position.z, 0.0, 1.0) * 16777215.0))"));
         assert!(shader.contains("let values = tev_fragment_values(input, false)"));
         assert!(shader.contains("let values = tev_fragment_values(input, true)"));
@@ -1738,7 +1847,12 @@ mod tests {
             )
         );
         assert!(shader.contains("if operation == 0u {\n        return reference_depth;"));
-        assert!(shader.contains("output.depth = f32(values.depth) / 16777215.0"));
+        assert!(shader.contains(
+            "output.depth = gx_efb_depth_to_attachment(values.buffer_depth, depth_encoding)"
+        ));
+        assert!(
+            shader.contains("buffer_depth = select(raster_depth, operation_depth, late_z_texture)")
+        );
         assert!(shader.contains("eye_depth = (a_and_c.x * 16777216.0)"));
     }
 
@@ -1767,10 +1881,10 @@ mod tests {
             .find("if needs_fragment_depth || fog_enabled")
             .unwrap();
         let z_texture = shader
-            .find("depth = gx_z_texture_depth(reference_depth, evaluation.raw_texture)")
+            .find("let operation_depth = gx_z_texture_depth(raster_depth, evaluation.raw_texture)")
             .unwrap();
         let fog = shader
-            .find("gx_fog_color(unorm_source, input.position.x, depth)")
+            .find("gx_fog_color(unorm_source, input.position.x, operation_depth)")
             .unwrap();
         assert!(alpha_test < gate && gate < z_texture && z_texture < fog);
     }

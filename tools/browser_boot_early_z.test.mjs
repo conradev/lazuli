@@ -131,25 +131,37 @@ test("WebGPU depth commits preserve source Z without TEV color or alpha side eff
   assert.match(pipeline, /entry_point: Some\("vs_main"\)/);
   assert.match(pipeline, /depth_write_enabled: Some\(true\)/);
   assert.match(pipeline, /depth_compare: Some\(key\.compare\)/);
-  assert.match(pipeline, /entry_point: Some\("fs_early_depth_commit"\)/);
+  assert.match(pipeline, /entry_point: Some\(match key\.depth_encoding/);
+  for (const entry of [
+    "fs_early_depth_commit_z24",
+    "fs_early_depth_commit_z16_linear",
+    "fs_early_depth_commit_z16_near",
+    "fs_early_depth_commit_z16_mid",
+    "fs_early_depth_commit_z16_far",
+  ]) {
+    assert.match(pipeline, new RegExp(`"${entry}"`));
+  }
   assert.match(pipeline, /write_mask: wgpu::ColorWrites::empty\(\)/);
   assert.match(pipeline, /unclipped_depth: false/);
   assert.doesNotMatch(pipeline, /fs_depth_main/);
 
-  const vertex = sourceSection(
+  const commit = sourceSection(
     tevSource,
-    "@fragment\nfn fs_early_depth_commit",
+    "fn gx_early_depth_commit(",
     "fn alpha_compare",
   );
+  assert.match(commit, /gx_raster_depth24\(input\.depth24\)/);
+  assert.match(commit, /gx_efb_depth_to_attachment/);
+  assert.match(commit, /CanonicalDepthOutput/);
   for (const forbidden of [
     "discard",
     "tev_evaluate",
     "textureSample",
     "fog",
     "destination_alpha",
-    "frag_depth",
+    "draw_state",
   ]) {
-    assert.doesNotMatch(vertex, new RegExp(forbidden));
+    assert.doesNotMatch(commit, new RegExp(forbidden));
   }
 });
 

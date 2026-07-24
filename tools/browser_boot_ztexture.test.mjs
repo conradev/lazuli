@@ -23,7 +23,7 @@ function rendererSection(startText, endText) {
   return sourceSection(rendererSource, startText, endText);
 }
 
-test("LZGX v3 Z-texture tail selects exact late fragment depth without touching ordinary draws", () => {
+test("LZGX v3 Z-texture tail selects late operation depth within canonical GX depth output", () => {
   const submit = rendererSection("pub fn submit_gx_frame", "fn push_tev_draw_inner");
   assert.match(
     submit,
@@ -38,7 +38,8 @@ test("LZGX v3 Z-texture tail selects exact late fragment depth without touching 
   assert.match(draw, /map_err\(\|error\| JsValue::from_str\(&error\.to_string\(\)\)\)/);
 
   const key = rendererSection("impl PipelineKey", "fn color_blend_component");
-  assert.match(key, /late_fragment_depth: depth_enabled/);
+  assert.match(key, /canonical_fragment_depth: depth_enabled/);
+  assert.match(key, /unclipped_depth: depth_enabled/);
   assert.match(key, /z_texture\.operation != GxZTextureOperation::Disabled/);
   assert.match(
     key,
@@ -49,10 +50,10 @@ test("LZGX v3 Z-texture tail selects exact late fragment depth without touching 
     "fn create_tev_geometry_pipeline",
     "fn create_xfb_copy_resources",
   );
-  assert.match(pipeline, /unclipped_depth: key\.late_fragment_depth/);
+  assert.match(pipeline, /unclipped_depth: key\.unclipped_depth/);
   assert.match(
     pipeline,
-    /entry_point: Some\(if key\.late_fragment_depth \{\s*"fs_depth_main"\s*\} else \{\s*"fs_main"/s,
+    /entry_point: Some\(if key\.canonical_fragment_depth \{\s*"fs_depth_main"\s*\} else \{\s*"fs_main"/s,
   );
 
   const fragment = sourceSection(
@@ -62,9 +63,18 @@ test("LZGX v3 Z-texture tail selects exact late fragment depth without touching 
   );
   assert.match(fragment, /@builtin\(frag_depth\) depth: f32/);
   assert.match(fragment, /fn fs_depth_main/);
+  assert.match(fragment, /let raster_depth = gx_raster_depth24\(input\.depth24\)/);
   assert.match(
     fragment,
-    /u32\(round\(clamp\(input\.depth24, 0\.0, 16777215\.0\)\)\)/,
+    /let operation_depth = gx_z_texture_depth\(raster_depth, evaluation\.raw_texture\)/,
+  );
+  assert.match(
+    fragment,
+    /buffer_depth = select\(raster_depth, operation_depth, late_z_texture\)/,
+  );
+  assert.match(
+    fragment,
+    /gx_efb_depth_to_attachment\(values\.buffer_depth, depth_encoding\)/,
   );
   assert.match(tevSource, /@location\(10\) @interpolate\(linear\) depth24: f32/);
   assert.match(tevSource, /output\.depth24 = input\.position\.z/);

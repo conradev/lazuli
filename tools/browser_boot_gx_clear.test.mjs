@@ -166,7 +166,11 @@ test("the exact copy clear consumes the transported EFB color format", () => {
     clear,
     /gx_copy_clear_rgba\(state\.pixel_control, state\.clear_rgba\)/,
   );
-  assert.match(clear, /CopyClearUniform::new\(rgba, state\.clear_depth\)/);
+  assert.match(
+    clear,
+    /CopyClearUniform::new\(rgba, state\.clear_depth, depth_encoding\)/,
+  );
+  assert.match(clear, /gx_efb_depth_encoding\(state\.pixel_control\)/);
 
   const format = sourceSection(
     rendererCoreSource,
@@ -181,25 +185,43 @@ test("the exact copy clear consumes the transported EFB color format", () => {
   assert.doesNotMatch(format, /clear_depth|GX_DEPTH24/);
 });
 
-test("GX depth endpoints span the full unsigned 24-bit range in clears and draws", () => {
+test("GX depth compare, write, and clear paths share canonical fixed-width attachment codes", () => {
   const vertexShader = sourceSection(
     tevSource,
     "pub(crate) const TEV_VERTEX_WGSL",
     "pub(crate) const TEV_WGSL",
   );
-  const readbackConversion = sourceSection(
+  const depthModel = sourceSection(
     rendererCoreSource,
-    "pub(crate) fn gx_float_to_depth24",
-    "pub(crate) enum GxBlendFactor",
+    "pub(crate) enum GxDepthCompression",
+    "pub(crate) enum GxZTextureFormat",
   );
+  const rasterConversion = sourceSection(
+    rendererCoreSource,
+    "pub(crate) fn gx_depth24_from_units",
+    "pub(crate) enum GxZTextureFormat",
+  );
+  assert.match(depthModel, /Self::Z24 => depth & GX_DEPTH24_MAX/);
   assert.match(
-    rendererCoreSource,
-    /\(depth & GX_DEPTH24_MAX\) as f32 \/ GX_DEPTH24_MAX as f32/,
+    depthModel,
+    /self\.quantize_depth24\(depth\) as f32 \/ maximum as f32/,
   );
+  assert.match(depthModel, /GxEfbFormat::Rgb565Z16/);
+  assert.match(depthModel, /match \(pixel_control >> 3\) & 7/);
   assert.match(vertexShader, /input\.position\.z \/ 16777215\.0/);
   assert.doesNotMatch(vertexShader, /input\.position\.z \/ 16777216\.0/);
-  assert.match(readbackConversion, /\* GX_DEPTH24_MAX as f32\)\.round\(\) as u32/);
-  assert.doesNotMatch(rendererCoreSource, /GX_DEPTH24_SCALE|GX_DEPTH24_MAX_FLOAT/);
+  assert.match(vertexShader, /fn gx_raster_depth24\(depth24: f32\) -> u32/);
+  assert.match(vertexShader, /return u32\(depth24\)/);
+  assert.match(
+    vertexShader,
+    /return f32\(depth & 0x00ffffffu\) \/ 16777215\.0/,
+  );
+  assert.match(rasterConversion, /depth\.floor\(\) as u32/);
+  assert.match(
+    rasterConversion,
+    /depth \* \(GX_DEPTH24_MAX as f32 \+ 1\.0\)/,
+  );
+  assert.doesNotMatch(rasterConversion, /\.round\(\)/);
 });
 
 test("strict WebGPU rendering requires dual-source blending and depth clip control", () => {
@@ -247,7 +269,7 @@ test("LZGX v3 fragment-tail destination alpha reaches the draw uniform after the
   );
   assert.match(
     draw,
-    /DrawUniform::from_gx\(alpha_test, destination_alpha, z_texture, fog\)/,
+    /DrawUniform::from_gx\(\s*alpha_test,\s*destination_alpha,\s*z_texture,\s*depth_encoding,\s*pipeline\.canonical_fragment_depth,\s*fog,\s*\)/s,
   );
   assert.match(draw, /draw: draw_uniform/);
 
