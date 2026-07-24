@@ -9015,6 +9015,91 @@ const TEMPLATE: &str = r##"<!doctype html>
       return regionsByPc.get(instructionRegionKey(effectivePc));
     }
 
+    function captureInstructionPageDependencies(effectiveStart, byteCount) {
+      const start = effectiveStart >>> 0;
+      if (
+        !Number.isSafeInteger(byteCount) || byteCount <= 0
+        || byteCount > 0x100000000 || (start & 3) !== 0
+        || (byteCount & 3) !== 0
+      ) {
+        return {
+          dependencies: [],
+          fault: { kind: "invalid-range", effective: start },
+        };
+      }
+
+      const dependencies = [];
+      let effective = start;
+      let remaining = byteCount;
+      while (remaining > 0) {
+        // One real, aligned fetch represents this block's use of the 4 KiB
+        // page. Hashed translations are retained; real-mode and IBAT fetches
+        // are already pinned by the block's instruction namespace.
+        const fetched = resolveInstructionFetch(effective, 4, true);
+        if (fetched.kind !== "mapped") {
+          return { dependencies: [], fault: fetched };
+        }
+        if (fetched.ptePhysical !== undefined) {
+          dependencies.push({
+            effective,
+            physical: fetched.physical >>> 0,
+          });
+        }
+        const pageBytes = Math.min(
+          remaining,
+          0x1000 - (effective & 0xfff),
+          0x100000000 - effective
+        );
+        effective = (effective + pageBytes) >>> 0;
+        remaining -= pageBytes;
+      }
+      return { dependencies, fault: null };
+    }
+
+    function validateInstructionPageDependencies(dependencies) {
+      if (!Array.isArray(dependencies)) return false;
+      for (const dependency of dependencies) {
+        if (
+          dependency === null || !Number.isInteger(dependency.effective)
+          || (dependency.effective & 3) !== 0
+          || !Number.isInteger(dependency.physical)
+        ) return false;
+        // A real fetch both validates and touches a resident ITLB way. On a
+        // miss it walks/refills the page table and sets R before comparison.
+        const fetched = resolveInstructionFetch(dependency.effective, 4, true);
+        if (
+          fetched.kind !== "mapped" || fetched.ptePhysical === undefined
+          || (fetched.physical >>> 0) !== (dependency.physical >>> 0)
+        ) return false;
+      }
+      return true;
+    }
+
+    function blockHasInstructionPageDependencies(block) {
+      return Array.isArray(block?.instructionPageDependencies)
+        && block.instructionPageDependencies.length !== 0;
+    }
+
+    function regionHasInstructionPageDependencies(region) {
+      return region.pcs.some(regionPc =>
+        blockHasInstructionPageDependencies(compiledBlock(regionPc))
+      );
+    }
+
+    function compiledRegionIsExecutable(region) {
+      // A linked Wasm region cannot reproduce the guest's instruction fetch
+      // between member blocks. In particular, validating more than two pages
+      // in one ITLB set can evict an earlier way before the region starts.
+      // Hashed-page regions therefore stay on single-block dispatch until the
+      // linker can insert a validation callback at each block boundary.
+      if (regionHasInstructionPageDependencies(region)) return false;
+      return region.pcs.every(regionPc => {
+        const block = compiledBlock(regionPc);
+        return block !== undefined
+          && validateInstructionPageDependencies(block.instructionPageDependencies);
+      });
+    }
+
     function resetInstructionLinkingState() {
       recentPcs.length = 0;
       regionCandidateHits.clear();
@@ -9022,6 +9107,44 @@ const TEMPLATE: &str = r##"<!doctype html>
       lastPc = null;
       lastCpuSignature = null;
       samePcCount = 0;
+    }
+
+    function invalidateCompiledBlock(block, reason) {
+      const key = block.instructionAddressSpaceKey
+        + ":"
+        + (block.effectiveStart >>> 0).toString(16).padStart(8, "0");
+      if (blocks.get(key) !== block) return false;
+      blocks.delete(key);
+
+      const invalidatedRegions = new Set();
+      for (const region of new Set(regionsByPc.values())) {
+        if (
+          region.instructionAddressSpaceKey === block.instructionAddressSpaceKey
+          && region.pcs.some(regionPc => (regionPc >>> 0) === block.effectiveStart)
+        ) {
+          invalidatedRegions.add(region);
+        }
+      }
+      for (const [regionKey, region] of regionsByPc) {
+        if (invalidatedRegions.has(region)) regionsByPc.delete(regionKey);
+      }
+      resetInstructionLinkingState();
+      accelerations.set(
+        "instructionTranslationDependencyInvalidations",
+        (accelerations.get("instructionTranslationDependencyInvalidations") ?? 0) + 1
+      );
+      accelerations.set(
+        "instructionTranslationDependencyInvalidatedRegions",
+        (accelerations.get("instructionTranslationDependencyInvalidatedRegions") ?? 0)
+          + invalidatedRegions.size
+      );
+      accelerations.set(
+        "instructionTranslationDependencyInvalidationReason:" + reason,
+        (accelerations.get(
+          "instructionTranslationDependencyInvalidationReason:" + reason
+        ) ?? 0) + 1
+      );
+      return true;
     }
 
     function instructionRangesOverlap(startA, sizeA, startB, sizeB) {
@@ -11343,7 +11466,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         throw new RangeError("instruction block size must be between 1 and 64 words");
       }
       for (let index = 0; index < maximumWords; index += 1) {
-        const fetched = fetchInstructionWord((pc + index * 4) >>> 0);
+        // Staging is compiler lookahead, not an architected instruction
+        // fetch. Keep it side-effect-free until the compiler tells us the
+        // exact executable extent; otherwise an early branch can set R and
+        // perturb ITLB LRU state for instructions the guest never fetches.
+        const fetched = fetchInstructionWord(
+          (pc + index * 4) >>> 0,
+          false
+        );
         if (fetched.kind !== "mapped") {
           return { wordCount: index, fault: fetched };
         }
@@ -11356,7 +11486,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       const compilerView = new DataView(compiler.memory.buffer);
       const staged = stageInstructionBlock(compilerView, inputPointer, pc);
       const { wordCount } = staged;
-      if (wordCount === 0) return { fault: staged.fault };
+      if (wordCount === 0) {
+        // The first instruction really is being fetched, including the
+        // MPC750 rule that a matched protection/guarded PTE sets R. Repeat
+        // only this faulting word with architectural side effects enabled.
+        const fetched = fetchInstructionWord(pc, true);
+        return { fault: fetched.kind === "mapped" ? staged.fault : fetched };
+      }
 
       const succeeded = compiler.ppcwasmjit_compile(inputPointer, wordCount);
       if (succeeded !== 1) {
@@ -11371,10 +11507,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       const pointer = compiler.ppcwasmjit_output_pointer();
       const length = compiler.ppcwasmjit_output_length();
       check(length !== 0, "browser JIT returned an empty module");
+      const maximum = compiler.ppcwasmjit_maximum_executed() >>> 0;
+      const effectiveBytes = Math.max(4, (maximum & 0xffff) * 4);
+      const retained = captureInstructionPageDependencies(pc, effectiveBytes);
+      if (retained.fault !== null) return { fault: retained.fault };
       return {
-        maximum: compiler.ppcwasmjit_maximum_executed() >>> 0,
+        maximum,
         pattern: compiler.ppcwasmjit_pattern() >>> 0,
         wasm: new Uint8Array(compiler.memory.buffer, pointer, length).slice(),
+        effectiveStart: pc >>> 0,
+        effectiveBytes,
+        instructionPageDependencies: retained.dependencies,
       };
     }
 
@@ -11427,7 +11570,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       const pcs = [...new Set(recentPcs.slice(previous))];
       if (
         pcs.length === 0 || pcs.length > 16
-        || pcs.some(regionPc => !hasCompiledBlock(regionPc) || isRecognizedLoopPc(regionPc))
+        || pcs.some(regionPc => {
+          const block = compiledBlock(regionPc);
+          return block === undefined
+            || blockHasInstructionPageDependencies(block)
+            || isRecognizedLoopPc(regionPc);
+        })
       ) return null;
 
       const key = pcs.map(regionPc => regionPc.toString(16)).join(",");
@@ -11455,7 +11603,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       const pcs = [...new Set([...sourceRegion.pcs, ...targetPcs])];
       if (
         pcs.length === sourceRegion.pcs.length
-        || pcs.some(regionPc => !hasCompiledBlock(regionPc) || isRecognizedLoopPc(regionPc))
+        || pcs.some(regionPc => {
+          const block = compiledBlock(regionPc);
+          return block === undefined
+            || blockHasInstructionPageDependencies(block)
+            || isRecognizedLoopPc(regionPc);
+        })
       ) return null;
 
       const sourceAnchor = sourceRegion.pcs[0];
@@ -12168,6 +12321,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
         stage = "compile";
         let block = compiledBlock(pc);
+        if (
+          block !== undefined
+          && !validateInstructionPageDependencies(block.instructionPageDependencies)
+        ) {
+          invalidateCompiledBlock(block, "pre-execution-validation");
+          block = undefined;
+        }
         if (block === undefined) {
           try {
             block = compileBlock(compiler, inputPointer, pc);
@@ -12250,7 +12410,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         let executedBlocks = 0;
         let executedRegion = false;
         let regionRequestedExit = false;
-        const region = compiledRegion(pc);
+        const retainedRegion = compiledRegion(pc);
+        const region = retainedRegion !== undefined
+          && compiledRegionIsExecutable(retainedRegion)
+          ? retainedRegion
+          : undefined;
         const eventCycle = nextRuntimeEventCycle();
         const regionCycleBudget = eventCycle === null
           ? 0x7fffffff

@@ -102,10 +102,6 @@ const instructionFunctions = [
   "compiledRegion",
   "resetInstructionLinkingState",
   "invalidateAllCompiledCode",
-  "instructionRangeTouchesTlbSet",
-  "invalidateInstructionTranslationSet",
-  "invalidateTranslationLookasideBuffer",
-  "synchronizeTranslationLookasideBuffer",
   "synchronizeInstructionAddressSpace",
   "initializePageTableRegisters",
   "msrChanged",
@@ -211,68 +207,6 @@ function writeInstructionBat(context, index, upper, lower) {
   context.view.setUint32(context.cpu + upperOffset, upper >>> 0, true);
   context.view.setUint32(context.cpu + lowerOffset, lower >>> 0, true);
 }
-
-test("TLB hooks invalidate the addressed resident set and compiled aliases", () => {
-  assert.match(
-    source,
-    /user_0_25:\s*\(_ctx,\s*address\)\s*=>\s*invalidateTranslationLookasideBuffer\(address\)/,
-  );
-  assert.match(
-    source,
-    /user_0_26:\s*\(\)\s*=>\s*synchronizeTranslationLookasideBuffer\(\)/,
-  );
-
-  const context = makeContext();
-  const effective = 0x80001000;
-  const setIndex = (effective >>> 12) & 0x3f;
-  const retainedSet = (setIndex + 1) & 0x3f;
-  context.blocks.set("stable:80001000", {
-    effectiveStart: effective,
-    effectiveBytes: 4,
-  });
-  context.regionsByPc.set("stable:80001000", {
-    instructionAddressSpaceKey: "stable",
-    pcs: [effective],
-  });
-  context.instructionTlbSets[setIndex] = {
-    entries: [{ id: "instruction-0" }, { id: "instruction-1" }],
-    lru: 1,
-  };
-  context.dataTlbSets[setIndex] = {
-    entries: [{ id: "data-0" }, { id: "data-1" }],
-    lru: 1,
-  };
-  context.instructionTlbSets[retainedSet].entries[0] = {
-    id: "instruction-retained",
-  };
-  context.dataTlbSets[retainedSet].entries[0] = { id: "data-retained" };
-
-  assert.equal(context.invalidateTranslationLookasideBuffer(effective), 1);
-  assert.equal(context.blocks.size, 0);
-  assert.equal(context.regionsByPc.size, 0);
-  assert.equal(context.recentPcs.length, 0);
-  assert.deepEqual(context.instructionTlbSets[setIndex], {
-    entries: [null, null],
-    lru: 0,
-  });
-  assert.deepEqual(context.dataTlbSets[setIndex], {
-    entries: [null, null],
-    lru: 0,
-  });
-  assert.equal(
-    context.instructionTlbSets[retainedSet].entries[0].id,
-    "instruction-retained",
-  );
-  assert.equal(
-    context.dataTlbSets[retainedSet].entries[0].id,
-    "data-retained",
-  );
-  assert.equal(context.accelerations.get("translationTlbInvalidations"), 1);
-  assert.equal(context.accelerations.get("instructionTlbInvalidations"), 1);
-
-  context.synchronizeTranslationLookasideBuffer();
-  assert.equal(context.accelerations.get("translationTlbSynchronizations"), 1);
-});
 
 test("browser memory-management layout derives and initializes SR and SDR1 registers", () => {
   assert.match(
@@ -889,5 +823,10 @@ test("IBAT and MSR hooks synchronize fetch mappings before another block", () =>
     /regionsByPc\.get\(instructionRegionKey\(effectivePc\)\)/,
     "linked regions must include the current instruction namespace",
   );
-  assert.match(source, /const region = compiledRegion\(pc\)/);
+  assert.match(source, /const retainedRegion = compiledRegion\(pc\)/);
+  assert.match(
+    source,
+    /const region = retainedRegion !== undefined\s*&& compiledRegionIsExecutable\(retainedRegion\)/,
+    "a retained region must pass translation-dependency validation before execution",
+  );
 });

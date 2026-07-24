@@ -268,9 +268,9 @@ semanticTest("block staging compiles a valid prefix without probing past its fir
     [0x80001004, 0x4e800020],
   ]);
   const context = {
-    fetchInstructionWord(effective) {
+    fetchInstructionWord(effective, updateReferenced) {
       const address = effective >>> 0;
-      probes.push(address);
+      probes.push([address, updateReferenced]);
       if (words.has(address)) {
         return {
           kind: "mapped",
@@ -297,7 +297,11 @@ semanticTest("block staging compiles a valid prefix without probing past its fir
   assert.equal(staged.wordCount, 2);
   assert.equal(staged.fault.kind, "bat-miss");
   assert.equal(staged.fault.effective >>> 0, 0x80001008);
-  assert.deepEqual(probes, [0x80001000, 0x80001004, 0x80001008]);
+  assert.deepEqual(probes, [
+    [0x80001000, false],
+    [0x80001004, false],
+    [0x80001008, false],
+  ]);
   assert.equal(compilerView.getUint32(0, true), 0x60000000);
   assert.equal(compilerView.getUint32(4, true), 0x4e800020);
   assert.throws(
@@ -309,6 +313,16 @@ semanticTest("block staging compiles a valid prefix without probing past its fir
     extractFunction("compileBlock"),
     /ppcwasmjit_compile\(\s*inputPointer,\s*(?:staged\.)?wordCount\s*\)/,
     "the compiler ABI must receive the mapped prefix length, never a hard-coded 64",
+  );
+  assert.match(
+    extractFunction("compileBlock"),
+    /wordCount === 0[\s\S]*fetchInstructionWord\(pc, true\)/,
+    "a first-word fault must be repeated as the one real architectural fetch",
+  );
+  assert.match(
+    extractFunction("compileBlock"),
+    /captureInstructionPageDependencies\(pc, effectiveBytes\)/,
+    "only the compiler-reported executable extent receives real page fetches",
   );
 });
 
