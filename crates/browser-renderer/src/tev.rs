@@ -85,6 +85,34 @@ pub(crate) fn required_texture_maps(state: &[u8]) -> Result<[bool; MAX_TEV_TEXTU
     Ok(required)
 }
 
+pub(crate) fn required_texture_coords(state: &[u8]) -> Result<[bool; MAX_TEV_TEXTURES], String> {
+    if state.len() != TEV_DRAW_STATE_BYTES {
+        return Err(format!(
+            "TEV draw state must be exactly {TEV_DRAW_STATE_BYTES} bytes, got {}",
+            state.len()
+        ));
+    }
+
+    let stage_count = u32::from_le_bytes(
+        state[448..452]
+            .try_into()
+            .expect("fixed TEV stage-count field"),
+    ) as usize;
+    let mut required = [false; MAX_TEV_TEXTURES];
+    for stage in 0..stage_count.min(MAX_TEV_STAGES) {
+        let refs_offset = stage * 16 + 8;
+        let refs = u32::from_le_bytes(
+            state[refs_offset..refs_offset + 4]
+                .try_into()
+                .expect("fixed TEV stage reference field"),
+        );
+        if refs & (1 << 6) != 0 {
+            required[((refs >> 3) & 7) as usize] = true;
+        }
+    }
+    Ok(required)
+}
+
 /// One TEV stage in the exact layout consumed by [`TEV_WGSL`].
 ///
 /// `refs` uses the low ten bits of a BP TEV-order half: texture map in bits
@@ -668,15 +696,15 @@ struct ManagedCoverageVertexInput {
 
 struct ManagedCoverageVertexOutput {
     @invariant @builtin(position) position: vec4<f32>,
-    @location(0) raster0: vec4<f32>,
-    @location(1) raster1: vec4<f32>,
-    @location(2) stq0: vec3<f32>,
-    @location(3) stq1: vec3<f32>,
-    @location(4) stq2: vec3<f32>,
-    @location(5) stq3: vec3<f32>,
-    @location(6) stq4: vec3<f32>,
-    @location(7) stq5: vec3<f32>,
-    @location(10) @interpolate(linear) depth24: f32,
+    @location(0) @interpolate(flat) raster0: vec4<f32>,
+    @location(1) @interpolate(flat) raster1: vec4<f32>,
+    @location(2) @interpolate(flat) stq0: vec3<f32>,
+    @location(3) @interpolate(flat) stq1: vec3<f32>,
+    @location(4) @interpolate(flat) stq2: vec3<f32>,
+    @location(5) @interpolate(flat) stq3: vec3<f32>,
+    @location(6) @interpolate(flat) stq4: vec3<f32>,
+    @location(7) @interpolate(flat) stq5: vec3<f32>,
+    @location(10) @interpolate(flat) depth24: f32,
     @location(11) @interpolate(flat) coverage_xy01_28_4: vec4<i32>,
     @location(12) @interpolate(flat) coverage_xy2_28_4: vec2<i32>,
 };
@@ -796,20 +824,85 @@ fn vs_managed_coverage(
 }
 
 fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOutput {
+    let sample_x_numerator = floor(input.position.x) * 12.0 + 7.0;
+    let sample_y_numerator = floor(input.position.y) * 12.0 + 7.0;
+    let sample_x = sample_x_numerator / 12.0;
+    let sample_y = sample_y_numerator / 12.0;
+    let source_x = input.stq0;
+    let source_y = input.stq1;
+    let inv_w = gx_managed_attribute_at_sample(
+        source_x, source_y, input.stq2, sample_x, sample_y,
+    );
+    let s_over_w = gx_managed_attribute_at_sample(
+        source_x, source_y, input.stq3, sample_x, sample_y,
+    );
+    let t_over_w = gx_managed_attribute_at_sample(
+        source_x, source_y, input.stq4, sample_x, sample_y,
+    );
+    let q_over_w = gx_managed_attribute_at_sample(
+        source_x, source_y, input.stq5, sample_x, sample_y,
+    );
+    // Match Dolphin's software rasterizer operation-for-operation: recover W,
+    // recover Q with that once-rounded W, divide W by Q, and only then project
+    // S/W and T/W. The algebraically equivalent (S/W)/(Q/W) changes f32 bits.
+    let w = 1.0 / inv_w;
+    let q = q_over_w * w;
+    var projection = w;
+    if q != 0.0 {
+        projection = w / q;
+    }
+    let reconstructed_stq = vec3<f32>(
+        s_over_w * projection,
+        t_over_w * projection,
+        1.0,
+    );
+
     var output: TevVertexOutput;
     output.position = input.position;
     output.raster0 = input.raster0;
     output.raster1 = input.raster1;
-    output.stq0 = input.stq0;
-    output.stq1 = input.stq1;
-    output.stq2 = input.stq2;
-    output.stq3 = input.stq3;
-    output.stq4 = input.stq4;
-    output.stq5 = input.stq5;
-    output.stq6 = vec3<f32>(0.0);
-    output.stq7 = vec3<f32>(0.0);
+    output.stq0 = reconstructed_stq;
+    output.stq1 = reconstructed_stq;
+    output.stq2 = reconstructed_stq;
+    output.stq3 = reconstructed_stq;
+    output.stq4 = reconstructed_stq;
+    output.stq5 = reconstructed_stq;
+    output.stq6 = reconstructed_stq;
+    output.stq7 = reconstructed_stq;
     output.depth24 = input.depth24;
     return output;
+}
+
+fn gx_managed_attribute_at_sample(
+    source_x: vec3<f32>,
+    source_y: vec3<f32>,
+    attributes: vec3<f32>,
+    sample_x: f32,
+    sample_y: f32,
+) -> f32 {
+    let dx10 = source_x.y - source_x.x;
+    let dx20 = source_x.z - source_x.x;
+    let dy10 = source_y.y - source_y.x;
+    let dy20 = source_y.z - source_y.x;
+    let delta20 = attributes.z - attributes.x;
+    let delta10 = attributes.y - attributes.x;
+    let a_left = delta20 * dy10;
+    let a_right = delta10 * dy20;
+    let a = a_left - a_right;
+    let b_left = dx20 * delta10;
+    let b_right = dx10 * delta20;
+    let b = b_left - b_right;
+    let c_left = dx20 * dy10;
+    let c_right = dx10 * dy20;
+    let c = c_left - c_right;
+    let dfdx = a / c;
+    let dfdy = b / c;
+    let sample_dx = sample_x - source_x.x;
+    let sample_dy = sample_y - source_y.x;
+    let x_term = dfdx * sample_dx;
+    let y_term = dfdy * sample_dy;
+    let x_value = attributes.x + x_term;
+    return x_value + y_term;
 }
 
 fn gx_managed_edge_covers(
@@ -1930,8 +2023,29 @@ mod tests {
         assert!(shader.contains("@location(12) @interpolate(flat) coverage_xy2_28_4: vec2<i32>"));
         assert!(shader.contains("input: ManagedCoverageVertexInput,"));
         assert!(shader.contains(") -> ManagedCoverageVertexOutput"));
-        assert!(shader.contains("output.stq6 = vec3<f32>(0.0)"));
-        assert!(shader.contains("output.stq7 = vec3<f32>(0.0)"));
+        for location in 0..=7 {
+            assert!(shader.contains(&format!("@location({location}) @interpolate(flat)")));
+        }
+        assert!(shader.contains("@location(10) @interpolate(flat) depth24: f32"));
+        for coord in 0..MAX_TEV_TEXTURES {
+            assert!(shader.contains(&format!("output.stq{coord} = reconstructed_stq")));
+        }
+        assert!(shader.contains("let sample_x_numerator = floor(input.position.x) * 12.0 + 7.0"));
+        assert!(shader.contains("let sample_y_numerator = floor(input.position.y) * 12.0 + 7.0"));
+        assert!(shader.contains("let sample_x = sample_x_numerator / 12.0"));
+        assert!(shader.contains("let sample_y = sample_y_numerator / 12.0"));
+        assert!(!shader.contains("floor(input.position.x) + 7.0 / 12.0"));
+        assert!(!shader.contains("floor(input.position.y) + 7.0 / 12.0"));
+        assert!(shader.contains("fn gx_managed_attribute_at_sample("));
+        assert!(shader.contains("let x_value = attributes.x + x_term"));
+        assert!(shader.contains("return x_value + y_term"));
+        assert!(shader.contains("let w = 1.0 / inv_w"));
+        assert!(shader.contains("let q = q_over_w * w"));
+        assert!(shader.contains("var projection = w"));
+        assert!(shader.contains("projection = w / q"));
+        assert!(shader.contains("s_over_w * projection"));
+        assert!(shader.contains("t_over_w * projection"));
+        assert!(!shader.contains("vec3<f32>(s_over_w, t_over_w, q_over_w) / inv_w"));
 
         let native_vertex_start = shader
             .find("@vertex\nfn vs_main(input: TevVertexInput)")
@@ -2202,6 +2316,35 @@ mod tests {
             [false, false, false, true, false, false, true, false]
         );
         assert!(required_texture_maps(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn required_texture_coords_follow_enabled_live_stages_and_deduplicate() {
+        let mut bytes = vec![0_u8; TEV_DRAW_STATE_BYTES];
+        bytes[8..12].copy_from_slice(&refs(3, 7, true, 0).to_le_bytes());
+        bytes[24..28].copy_from_slice(&refs(6, 7, true, 0).to_le_bytes());
+        bytes[40..44].copy_from_slice(&refs(1, 2, false, 0).to_le_bytes());
+        bytes[56..60].copy_from_slice(&refs(0, 2, true, 0).to_le_bytes());
+
+        bytes[448..452].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            required_texture_coords(&bytes).unwrap(),
+            [false, false, false, false, false, false, false, true],
+        );
+
+        bytes[448..452].copy_from_slice(&3_u32.to_le_bytes());
+        assert_eq!(
+            required_texture_coords(&bytes).unwrap(),
+            [false, false, false, false, false, false, false, true],
+            "disabled stages do not make their coordinate live",
+        );
+
+        bytes[448..452].copy_from_slice(&4_u32.to_le_bytes());
+        assert_eq!(
+            required_texture_coords(&bytes).unwrap(),
+            [false, false, true, false, false, false, false, true],
+        );
+        assert!(required_texture_coords(&bytes[..bytes.len() - 1]).is_err());
     }
 
     #[test]

@@ -16,9 +16,11 @@ use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
 use crate::packet::{GxCopyKind, GxCopyState, GxFramePacket, GxTriangleAction};
+use crate::raster::GxRasterAttributePlaneF32;
 use crate::tev::{
     MAX_TEV_TEXTURES, TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS,
-    required_texture_maps, shader_source as tev_shader_source, validate_draw_transport,
+    required_texture_coords, required_texture_maps, shader_source as tev_shader_source,
+    validate_draw_transport,
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
@@ -291,9 +293,9 @@ const TEV_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_arr
     10 => Float32x3
 ];
 
-// Certified managed draws cannot sample texture maps, so STQ6/STQ7's final
-// 24 bytes are dead. The managed-only layout reinterprets that storage as the
-// six exact 28.4 edge coordinates without inflating native vertex transport.
+// Managed draws reconstruct one live projective coordinate from a six-vec3
+// flat payload in STQ0..STQ5. STQ6/STQ7's final 24 bytes then carry the six
+// exact 28.4 edge coordinates without inflating native vertex transport.
 const MANAGED_COVERAGE_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_array![
     0 => Float32x4,
     1 => Float32x4,
@@ -2175,12 +2177,15 @@ impl WebGpuRenderer {
                 &expanded,
                 raster_position_correction,
                 ManagedCoverageEvidence::None,
+                None,
                 state,
             );
         }
 
         let required_maps =
             required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
+        let required_coords =
+            required_texture_coords(tev_state).map_err(|error| JsValue::from_str(&error))?;
         let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let fog = gx_fog_state(
@@ -2202,6 +2207,10 @@ impl WebGpuRenderer {
         )
         .color_pipeline_for_early_depth(early_depth);
         let source_cull = pipeline.cull;
+        let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
+        else {
+            return Ok(());
+        };
         let managed_expanded = (source_cull != CullMode::All
             && managed_coverage_actions.is_some()
             && primitive == Primitive::Triangles
@@ -2220,10 +2229,12 @@ impl WebGpuRenderer {
                 gx_raster_center_evidence(pixel_control),
                 early_depth,
                 required_maps,
+                required_coords,
                 fog,
                 z_texture,
                 source_vertices,
                 post_cull,
+                scissor,
             )
         });
         if managed_coverage {
@@ -2242,10 +2253,6 @@ impl WebGpuRenderer {
             pipeline.canonical_fragment_depth,
             fog,
         );
-        let Some(scissor) = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height)
-        else {
-            return Ok(());
-        };
         if pipeline.cull == CullMode::All {
             return Ok(());
         }
@@ -2437,6 +2444,7 @@ impl WebGpuRenderer {
             } else {
                 ManagedCoverageEvidence::None
             },
+            managed_coverage_texture_coord(required_coords).flatten(),
             state,
         )
     }
@@ -2447,6 +2455,7 @@ impl WebGpuRenderer {
         expanded: &[usize],
         raster_position_correction: f32,
         managed_coverage_evidence: ManagedCoverageEvidence,
+        managed_texture_coord: Option<usize>,
         state: DrawCommandState,
     ) -> Result<(), JsValue> {
         let start = self.tev_vertices.len() as u32;
@@ -2456,6 +2465,7 @@ impl WebGpuRenderer {
                 let vertices = managed_coverage_triangle_vertices(
                     source_vertices,
                     [triangle[0], triangle[1], triangle[2]],
+                    managed_texture_coord,
                     state.scissor,
                 )
                 .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -3945,19 +3955,169 @@ fn tev_vertex_from_source(
     }
 }
 
-fn source_triangle_attributes_are_bitwise_flat(
+fn source_triangle_depth_and_rasters_are_bitwise_flat(
     source_vertices: &[f32],
     indices: [usize; 3],
 ) -> bool {
     let reference = indices[0] * TEV_VERTEX_FLOATS;
-    [2].into_iter()
-        .chain(4..TEV_VERTEX_FLOATS)
-        .all(|component| {
-            let expected = source_vertices[reference + component].to_bits();
-            indices[1..].iter().all(|index| {
-                source_vertices[index * TEV_VERTEX_FLOATS + component].to_bits() == expected
-            })
+    [2].into_iter().chain(4..12).all(|component| {
+        let expected = source_vertices[reference + component].to_bits();
+        indices[1..].iter().all(|index| {
+            source_vertices[index * TEV_VERTEX_FLOATS + component].to_bits() == expected
         })
+    })
+}
+
+fn managed_coverage_texture_coord(
+    required_coords: [bool; MAX_TEV_TEXTURES],
+) -> Option<Option<usize>> {
+    let mut live = required_coords
+        .into_iter()
+        .enumerate()
+        .filter_map(|(coord, required)| required.then_some(coord));
+    let selected = live.next();
+    live.next().is_none().then_some(selected)
+}
+
+const MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD: [[f32; 3]; 6] = [
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0],
+    [1.0, 1.0, 1.0],
+];
+
+fn managed_coverage_attribute_payload(
+    source_vertices: &[f32],
+    indices: [usize; 3],
+    texture_coord: Option<usize>,
+) -> Option<[[f32; 3]; 6]> {
+    let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
+    if indices.into_iter().any(|index| index >= vertex_count) {
+        return None;
+    }
+    let Some(texture_coord) = texture_coord else {
+        return Some(MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD);
+    };
+    if texture_coord >= MAX_TEV_TEXTURES {
+        return None;
+    }
+
+    let mut payload = [[0.0; 3]; 6];
+    for (payload_vertex, index) in indices.into_iter().enumerate() {
+        let offset = index * TEV_VERTEX_FLOATS;
+        let w = source_vertices[offset + 3];
+        let inv_w = 1.0 / w;
+        let stq_offset = offset + 12 + texture_coord * 3;
+        // Dolphin's software rasterizer computes one rounded reciprocal and
+        // then multiplies each projective component by that exact f32.
+        let s_over_w = source_vertices[stq_offset] * inv_w;
+        let t_over_w = source_vertices[stq_offset + 1] * inv_w;
+        let q_over_w = source_vertices[stq_offset + 2] * inv_w;
+        let values = [
+            source_vertices[offset],
+            source_vertices[offset + 1],
+            inv_w,
+            s_over_w,
+            t_over_w,
+            q_over_w,
+        ];
+        if values.into_iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        for (field, value) in values.into_iter().enumerate() {
+            payload[field][payload_vertex] = value;
+        }
+    }
+    Some(payload)
+}
+
+fn managed_coverage_payload_is_safe(
+    payload: [[f32; 3]; 6],
+    points: [GxRasterPoint28_4; 3],
+    raster_scissor: GxRasterScissor,
+    textured: bool,
+) -> bool {
+    if !textured {
+        // Do not derive interpolation planes from source positions when no
+        // coordinate is live. Source-space collinearity is irrelevant to
+        // coverage, and the canonical dummy reconstructs finite (0, 0, 1).
+        return payload == MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD;
+    }
+
+    let positions = std::array::from_fn(|vertex| [payload[0][vertex], payload[1][vertex]]);
+    let planes = [
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, payload[2]),
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, payload[3]),
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, payload[4]),
+        GxRasterAttributePlaneF32::from_screen_triangle(positions, payload[5]),
+    ];
+    let [
+        Ok(inv_w_plane),
+        Ok(s_over_w_plane),
+        Ok(t_over_w_plane),
+        Ok(q_over_w_plane),
+    ] = planes
+    else {
+        return false;
+    };
+    let GxRasterSetup::Triangle(triangle) =
+        GxRasterTriangle28_4::setup_post_cull(points, GxRasterWinding::Negative, raster_scissor)
+    else {
+        return true;
+    };
+    let bounds = triangle.bounds();
+    if bounds.left >= bounds.right || bounds.top >= bounds.bottom {
+        return true;
+    }
+
+    let corners = [
+        [bounds.left, bounds.top],
+        [bounds.right - 1, bounds.top],
+        [bounds.left, bounds.bottom - 1],
+        [bounds.right - 1, bounds.bottom - 1],
+    ];
+    let mut q_is_positive = None;
+    for [pixel_x, pixel_y] in corners {
+        let samples = [
+            inv_w_plane.sample_non_aa(pixel_x, pixel_y),
+            s_over_w_plane.sample_non_aa(pixel_x, pixel_y),
+            t_over_w_plane.sample_non_aa(pixel_x, pixel_y),
+            q_over_w_plane.sample_non_aa(pixel_x, pixel_y),
+        ];
+        let [Ok(inv_w), Ok(s_over_w), Ok(t_over_w), Ok(q_over_w)] = samples else {
+            return false;
+        };
+        if inv_w < f32::EPSILON {
+            return false;
+        }
+
+        // Mirror the managed WGSL and Dolphin BuildBlock sequence exactly.
+        // Algebraically collapsing these operations changes rounded f32 bits.
+        let w = 1.0 / inv_w;
+        if !w.is_finite() || w < f32::EPSILON {
+            return false;
+        }
+        let q = q_over_w * w;
+        if !q.is_finite() || q.abs() < f32::EPSILON {
+            return false;
+        }
+        let positive = q.is_sign_positive();
+        if q_is_positive.is_some_and(|expected| expected != positive) {
+            return false;
+        }
+        q_is_positive = Some(positive);
+        let projection = w / q;
+        if !projection.is_finite() || projection.abs() < f32::EPSILON {
+            return false;
+        }
+        let uv = [s_over_w * projection, t_over_w * projection];
+        if uv.into_iter().any(|value| !value.is_finite()) {
+            return false;
+        }
+    }
+    true
 }
 
 fn managed_post_cull_indices(
@@ -3993,11 +4153,16 @@ fn managed_coverage_draw_is_safe(
     raster_center: GxRasterCenterEvidence,
     early_depth: GxEarlyDepthPlan,
     required_maps: [bool; MAX_TEV_TEXTURES],
+    required_coords: [bool; MAX_TEV_TEXTURES],
     fog: GxFogState,
     z_texture: GxZTextureState,
     source_vertices: &[f32],
     expanded: &[usize],
+    scissor: ScissorRect,
 ) -> bool {
+    let Some(texture_coord) = managed_coverage_texture_coord(required_coords) else {
+        return false;
+    };
     if evidence != ManagedCoverageEvidence::TrustedPostCull
         || primitive != Primitive::Triangles
         || raster_center != GxRasterCenterEvidence::KnownNonAntialiased
@@ -4006,6 +4171,7 @@ fn managed_coverage_draw_is_safe(
         || fog != GxFogState::default()
         || z_texture.operation != GxZTextureOperation::Disabled
         || !expanded.len().is_multiple_of(3)
+        || !source_vertices.len().is_multiple_of(TEV_VERTEX_FLOATS)
     {
         return false;
     }
@@ -4021,15 +4187,52 @@ fn managed_coverage_draw_is_safe(
         }
     }
 
+    let Ok(raster_scissor) = GxRasterScissor::new(
+        scissor.x as u16,
+        scissor.y as u16,
+        (scissor.x + scissor.width) as u16,
+        (scissor.y + scissor.height) as u16,
+        0,
+        0,
+    ) else {
+        return false;
+    };
+    let textured = texture_coord.is_some();
+    let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
     expanded.chunks_exact(3).all(|triangle| {
         let indices = [triangle[0], triangle[1], triangle[2]];
-        source_triangle_attributes_are_bitwise_flat(source_vertices, indices)
+        if indices.into_iter().any(|index| index >= vertex_count) {
+            return false;
+        }
+        if !source_triangle_depth_and_rasters_are_bitwise_flat(source_vertices, indices) {
+            return false;
+        }
+        let Some(payload) =
+            managed_coverage_attribute_payload(source_vertices, indices, texture_coord)
+        else {
+            return false;
+        };
+        let mut points = [GxRasterPoint28_4::from_raw(0, 0); 3];
+        for (point, vertex) in points.iter_mut().zip(indices) {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            let Ok(source_point) = GxRasterPoint28_4::from_efb(
+                source_vertices[offset],
+                source_vertices[offset + 1],
+                0,
+                0,
+            ) else {
+                return false;
+            };
+            *point = source_point;
+        }
+        managed_coverage_payload_is_safe(payload, points, raster_scissor, textured)
     })
 }
 
 fn managed_coverage_triangle_vertices(
     source_vertices: &[f32],
     indices: [usize; 3],
+    texture_coord: Option<usize>,
     scissor: ScissorRect,
 ) -> Result<Option<[TevVertex; 3]>, crate::GxRasterError> {
     let raster_scissor = GxRasterScissor::new(
@@ -4071,8 +4274,15 @@ fn managed_coverage_triangle_vertices(
     ];
     let [point0, point1, point2] = points.map(GxRasterPoint28_4::raw);
     let mut flat = tev_vertex_from_source(source_vertices, indices[0], 0.0);
+    if let Some(payload) =
+        managed_coverage_attribute_payload(source_vertices, indices, texture_coord)
+    {
+        flat.tex_coords[..6].copy_from_slice(&payload);
+    } else {
+        return Ok(None);
+    }
     // The managed vertex layout reads these exact bits as Sint32x4/Sint32x2.
-    // STQ6/STQ7 are certified dead because no managed draw requires a map.
+    // The selected source coordinate has already been captured in STQ0..STQ5.
     flat.tex_coords[6] = [
         f32::from_bits(point0[0] as u32),
         f32::from_bits(point0[1] as u32),
@@ -4920,13 +5130,17 @@ mod tests {
         BlendComponentState, CopyClearUniform, CullMode, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
         DepthCommitPipelineKey, DrawUniform, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
+        GxRasterPoint28_4, GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4,
+        GxRasterWinding, MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD,
         MANAGED_COVERAGE_VERTEX_ATTRIBUTES, ManagedCoverageEvidence, PipelineKey, Primitive,
         REQUIRED_WEBGPU_FEATURES, ScissorRect, TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex,
         alpha_blend_factor, blend_write_mask, browser_raster_position_correction,
         color_blend_factor, depth_only_command_state, draw_depth_encoding, expanded_indices,
-        expanded_primitive_ranges, managed_coverage_draw_is_safe,
-        managed_coverage_triangle_vertices, managed_post_cull_indices, merge_contiguous_draw_range,
-        source_triangle_attributes_are_bitwise_flat, tev_vertex_from_source,
+        expanded_primitive_ranges, managed_coverage_attribute_payload,
+        managed_coverage_draw_is_safe, managed_coverage_payload_is_safe,
+        managed_coverage_texture_coord, managed_coverage_triangle_vertices,
+        managed_post_cull_indices, merge_contiguous_draw_range,
+        source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
     };
     use crate::packet::GxTriangleAction;
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS};
@@ -5003,10 +5217,44 @@ mod tests {
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::FixedFunction,
             [false; MAX_TEV_TEXTURES],
+            [false; MAX_TEV_TEXTURES],
             GxFogState::default(),
             gx_z_texture_state(0, 0, 0).unwrap(),
             source,
             &[0, 1, 2],
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 528,
+            },
+        )
+    }
+
+    fn projective_payload_is_safe(source: &[f32], texture_coord: usize) -> bool {
+        let Some(payload) =
+            managed_coverage_attribute_payload(source, [0, 1, 2], Some(texture_coord))
+        else {
+            return false;
+        };
+        let mut points = [GxRasterPoint28_4::from_raw(0, 0); 3];
+        for (point, vertex) in points.iter_mut().zip(0..3) {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            let Ok(source_point) = GxRasterPoint28_4::from_efb(
+                source[offset],
+                source[offset + 1],
+                0,
+                0,
+            ) else {
+                return false;
+            };
+            *point = source_point;
+        }
+        managed_coverage_payload_is_safe(
+            payload,
+            points,
+            GxRasterScissor::new(0, 0, 640, 528, 0, 0).unwrap(),
+            true,
         )
     }
 
@@ -5187,15 +5435,21 @@ mod tests {
     }
 
     #[test]
-    fn managed_coverage_requires_the_whole_draw_to_be_flat_and_certifiably_safe() {
+    fn managed_coverage_requires_flat_z_and_rasters_and_certifiable_draw_state() {
         let source = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
         assert!(qualifying_managed_draw(&source));
-        assert!(source_triangle_attributes_are_bitwise_flat(
+        assert!(source_triangle_depth_and_rasters_are_bitwise_flat(
             &source,
             [0, 1, 2]
         ));
 
         let z_texture = gx_z_texture_state(0, 0, 0).unwrap();
+        let scissor = ScissorRect {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 528,
+        };
         let eligible = |primitive,
                         raster_center,
                         early_depth,
@@ -5209,10 +5463,12 @@ mod tests {
                 raster_center,
                 early_depth,
                 required_maps,
+                [false; MAX_TEV_TEXTURES],
                 fog,
                 z_texture,
                 source,
                 &[0, 1, 2],
+                scissor,
             )
         };
         assert!(!managed_coverage_draw_is_safe(
@@ -5221,10 +5477,12 @@ mod tests {
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::FixedFunction,
             [false; MAX_TEV_TEXTURES],
+            [false; MAX_TEV_TEXTURES],
             GxFogState::default(),
             z_texture,
             &source,
             &[0, 1, 2],
+            scissor,
         ));
         assert!(!eligible(
             Primitive::Lines,
@@ -5300,7 +5558,7 @@ mod tests {
             );
         }
 
-        for component in [2, 4, TEV_VERTEX_FLOATS - 1] {
+        for component in [2, 4, 11] {
             let mut non_flat = source.clone();
             let offset = TEV_VERTEX_FLOATS + component;
             non_flat[offset] = f32::from_bits(non_flat[offset].to_bits() ^ 1);
@@ -5309,10 +5567,239 @@ mod tests {
                 "non-flat component {component} was accepted",
             );
         }
+        for component in [3, 12, TEV_VERTEX_FLOATS - 1] {
+            let mut varying = source.clone();
+            let offset = TEV_VERTEX_FLOATS + component;
+            varying[offset] += 0.125;
+            assert!(
+                qualifying_managed_draw(&varying),
+                "varying W or unused STQ component {component} was rejected",
+            );
+        }
+        let mut extrapolating_w = source.clone();
+        for (vertex, w) in [1_000.0, 1.0, 1_000.0].into_iter().enumerate() {
+            extrapolating_w[vertex * TEV_VERTEX_FLOATS + 3] = w;
+        }
+        assert!(
+            qualifying_managed_draw(&extrapolating_w),
+            "unused projective reconstruction must not reject an untextured variable-W draw",
+        );
         let narrow = flat_triangle_source([[0.0, 0.0], [0.5, 0.0], [0.0, 1.0]]);
         assert!(
             qualifying_managed_draw(&narrow),
             "rounded screen area is not a cull certificate or an activation gate",
+        );
+    }
+
+    #[test]
+    fn managed_untextured_coverage_uses_a_dummy_plane_for_source_collinear_snap_geometry() {
+        let source = flat_triangle_source([[0.0, 0.0], [1.0, 0.03125], [22.0, 0.6875]]);
+        let points = [
+            GxRasterPoint28_4::from_efb(0.0, 0.0, 0, 0).unwrap(),
+            GxRasterPoint28_4::from_efb(1.0, 0.03125, 0, 0).unwrap(),
+            GxRasterPoint28_4::from_efb(22.0, 0.6875, 0, 0).unwrap(),
+        ];
+        assert_eq!(
+            points.map(GxRasterPoint28_4::raw),
+            [[0, 0], [16, 1], [352, 11]]
+        );
+        let snapped_area = i128::from(16) * i128::from(11) - i128::from(1) * i128::from(352);
+        assert_eq!(snapped_area, -176);
+        let raster_scissor = GxRasterScissor::new(0, 0, 32, 8, 0, 0).unwrap();
+        let GxRasterSetup::Triangle(triangle) = GxRasterTriangle28_4::setup_post_cull(
+            points,
+            GxRasterWinding::Negative,
+            raster_scissor,
+        ) else {
+            panic!("the snapped regression vector must remain nondegenerate");
+        };
+        assert!(triangle.covers_pixel(18, 0));
+        assert!(
+            qualifying_managed_draw(&source),
+            "source-space collinearity must not reject snapped nondegenerate coverage",
+        );
+        assert_eq!(
+            managed_coverage_texture_coord([false; MAX_TEV_TEXTURES]),
+            Some(None),
+        );
+        assert_eq!(
+            managed_coverage_attribute_payload(&source, [0, 1, 2], None),
+            Some(MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD),
+        );
+
+        let vertices = managed_coverage_triangle_vertices(
+            &source,
+            [0, 1, 2],
+            None,
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 8,
+            },
+        )
+        .unwrap()
+        .expect("the negative snapped triangle must survive managed setup");
+        for vertex in vertices {
+            assert_eq!(
+                vertex.tex_coords[..6],
+                MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD
+            );
+        }
+    }
+
+    #[test]
+    fn managed_projective_payload_packs_one_selected_coordinate_without_activation() {
+        let mut source = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
+        let widths = [1.0, 2.0, 4.0];
+        let selected_stq = [[0.25, 0.5, 1.0], [2.0, 1.0, 2.0], [8.0, 4.0, 4.0]];
+        for vertex in 0..3 {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            source[offset + 3] = widths[vertex];
+            source[offset + 12 + 7 * 3..offset + 12 + 8 * 3].copy_from_slice(&selected_stq[vertex]);
+            source[offset + 12 + 2 * 3] += vertex as f32 * 17.0;
+        }
+
+        let mut required_coords = [false; MAX_TEV_TEXTURES];
+        required_coords[7] = true;
+        assert_eq!(
+            managed_coverage_texture_coord(required_coords),
+            Some(Some(7))
+        );
+        let vertices = managed_coverage_triangle_vertices(
+            &source,
+            [0, 1, 2],
+            Some(7),
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap()
+        .expect("projective payload setup must survive independently of activation");
+        let expected_payload = [
+            [0.590, 4.0, 4.0],
+            [0.0, 0.0, 4.0],
+            [1.0, 0.5, 0.25],
+            [0.25, 1.0, 2.0],
+            [0.5, 0.5, 1.0],
+            [1.0, 1.0, 1.0],
+        ];
+        for vertex in vertices {
+            assert_eq!(vertex.tex_coords[..6], expected_payload);
+            assert_eq!(managed_coverage_payload(vertex), [9, 0, 64, 0, 64, 64]);
+        }
+
+        let mut awkward = source.clone();
+        let awkward_w = f32::from_bits(0x3f00_26f6);
+        let awkward_s = f32::from_bits(0x3e80_b99b);
+        awkward[3] = awkward_w;
+        awkward[12 + 7 * 3] = awkward_s;
+        let awkward_payload =
+            managed_coverage_attribute_payload(&awkward, [0, 1, 2], Some(7)).unwrap();
+        assert_eq!(awkward_payload[2][0].to_bits(), 0x3fff_b22c);
+        assert_eq!(
+            awkward_payload[3][0].to_bits(),
+            0x3f00_9279,
+            "S/W must multiply by the once-rounded reciprocal like Dolphin",
+        );
+        assert_eq!((awkward_s / awkward_w).to_bits(), 0x3f00_9278);
+
+        required_coords[6] = true;
+        assert_eq!(managed_coverage_texture_coord(required_coords), None);
+    }
+
+    #[test]
+    fn managed_projective_payload_rejects_invalid_planes_and_sampled_coordinates() {
+        let base = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
+
+        let degenerate = flat_triangle_source([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]);
+        assert!(
+            !projective_payload_is_safe(&degenerate, 0),
+            "degenerate source plane was admitted"
+        );
+
+        let mut inverse_w_overflow = base.clone();
+        inverse_w_overflow[3] = f32::from_bits(1);
+        assert!(
+            !projective_payload_is_safe(&inverse_w_overflow, 0),
+            "overflowing reciprocal W was admitted",
+        );
+
+        let mut vanishing_inverse_w = base.clone();
+        for vertex in 0..3 {
+            vanishing_inverse_w[vertex * TEV_VERTEX_FLOATS + 3] = 2.0 / f32::EPSILON;
+        }
+        assert!(
+            !projective_payload_is_safe(&vanishing_inverse_w, 0),
+            "reciprocal W below the conservative denominator margin was admitted",
+        );
+
+        let mut vanishing_recovered_w = base.clone();
+        for vertex in 0..3 {
+            vanishing_recovered_w[vertex * TEV_VERTEX_FLOATS + 3] = f32::EPSILON / 2.0;
+        }
+        assert!(
+            !projective_payload_is_safe(&vanishing_recovered_w, 0),
+            "recovered W below the shader-normal margin was admitted",
+        );
+
+        let mut attribute_overflow = base.clone();
+        attribute_overflow[TEV_VERTEX_FLOATS + 12] = f32::MAX;
+        assert!(
+            !projective_payload_is_safe(&attribute_overflow, 0),
+            "overflowing attribute-plane arithmetic was admitted",
+        );
+
+        let mut zero_q = base.clone();
+        for vertex in 0..3 {
+            zero_q[vertex * TEV_VERTEX_FLOATS + 14] = 0.0;
+        }
+        assert!(
+            !projective_payload_is_safe(&zero_q, 0),
+            "zero projective Q was admitted"
+        );
+
+        let mut vanishing_q = base.clone();
+        for vertex in 0..3 {
+            vanishing_q[vertex * TEV_VERTEX_FLOATS + 14] = f32::EPSILON / 2.0;
+        }
+        assert!(
+            !projective_payload_is_safe(&vanishing_q, 0),
+            "projective Q below the conservative denominator margin was admitted",
+        );
+
+        let mut vanishing_recovered_q = base.clone();
+        for vertex in 0..3 {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            vanishing_recovered_q[offset + 3] = f32::EPSILON;
+            vanishing_recovered_q[offset + 14] = f32::EPSILON * f32::EPSILON;
+        }
+        assert!(
+            !projective_payload_is_safe(&vanishing_recovered_q, 0),
+            "recovered Q below the shader-normal margin was admitted",
+        );
+
+        let mut changing_q_sign = base.clone();
+        changing_q_sign[14] = 1.0;
+        changing_q_sign[TEV_VERTEX_FLOATS + 14] = -1.0;
+        changing_q_sign[TEV_VERTEX_FLOATS * 2 + 14] = 1.0;
+        assert!(
+            !projective_payload_is_safe(&changing_q_sign, 0),
+            "a Q plane crossing zero in the raster bounds was admitted",
+        );
+
+        let mut overflowing_uv = base;
+        for vertex in 0..3 {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            overflowing_uv[offset + 12] = f32::MAX;
+            overflowing_uv[offset + 14] = f32::MIN_POSITIVE;
+        }
+        assert!(
+            !projective_payload_is_safe(&overflowing_uv, 0),
+            "a finite STQ payload with overflowing sampled UV was admitted",
         );
     }
 
@@ -5322,6 +5809,7 @@ mod tests {
         let vertices = managed_coverage_triangle_vertices(
             &source,
             [0, 2, 1],
+            None,
             ScissorRect {
                 x: 0,
                 y: 0,
@@ -5342,6 +5830,7 @@ mod tests {
         let same_bucket_vertices = managed_coverage_triangle_vertices(
             &same_bucket,
             [0, 2, 1],
+            None,
             ScissorRect {
                 x: 0,
                 y: 0,
@@ -5359,6 +5848,7 @@ mod tests {
         let source_order = managed_coverage_triangle_vertices(
             &source,
             [0, 1, 2],
+            None,
             ScissorRect {
                 x: 0,
                 y: 0,
