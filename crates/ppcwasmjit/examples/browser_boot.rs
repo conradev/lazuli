@@ -1687,10 +1687,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       const sourceHeight = gxFramePacketInteger(frame.sourceHeight, "frame.sourceHeight");
       const outputWidth = copyKind === 2
-        ? gxFramePacketInteger(frame.outputWidth ?? frame.width, "frame.outputWidth")
+        ? gxFramePacketInteger(frame.outputWidth ?? frame.width, "frame.outputWidth", 1024)
         : 0;
       const outputHeight = copyKind === 2
-        ? gxFramePacketInteger(frame.outputHeight ?? frame.height, "frame.outputHeight")
+        ? gxFramePacketInteger(frame.outputHeight ?? frame.height, "frame.outputHeight", 1024)
         : 0;
       const destination = gxFramePacketInteger(frame.destination, "frame.destination");
       const stride = copyKind === 2
@@ -5408,9 +5408,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const dimensions = gxBpRegisters[0x4a];
       const yScaleRaw = gxBpRegisters[0x4e];
       const sourceHeight = ((dimensions >>> 10) & 0x3ff) + 1;
-      const yScale = (trigger & 0x400) !== 0
-        ? 256 / Math.max(1, yScaleRaw)
-        : yScaleRaw / 256;
+      const scaledIntervals = (trigger & 0x400) !== 0
+        ? Math.floor((sourceHeight - 1) * 256 / Math.max(1, yScaleRaw))
+        : Math.floor((sourceHeight - 1) * yScaleRaw / 256);
       const copyToXfb = (trigger & 0x4000) !== 0;
       const viTop = viXfbAddress(0x201c);
       const viBottom = viXfbAddress(0x2024);
@@ -5439,7 +5439,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         sourceY: (source >>> 10) & 0x3ff,
         width: (dimensions & 0x3ff) + 1,
         sourceHeight,
-        height: Math.max(1, Math.floor(1 + (sourceHeight - 1) * yScale)),
+        // libogc's __GX_GetNumXfbLines clamps to 1024. Keep that protocol-safety
+        // bound for direct BP writes too (intentionally stricter than Dolphin's
+        // current path) so extreme scales cannot inflate downstream surfaces.
+        height: Math.min(
+          1024,
+          1 + scaledIntervals
+        ),
         destination: (gxBpRegisters[0x4b] << 5) >>> 0,
         viTop,
         viBottom,
@@ -6967,11 +6973,22 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function decodeViOutputDimensions(pictureConfiguration, displayControl, activeLines) {
-      const width = ((pictureConfiguration >>> 8) & 0x7f) * 16;
+      const wordsPerLine = (pictureConfiguration >>> 8) & 0x7f;
+      const standardWordsPerLine = pictureConfiguration & 0xff;
       const nonInterlaced = (displayControl & 4) !== 0;
+      const rowRepeat = nonInterlaced ? 1 : 2;
       return {
-        width,
-        height: activeLines * (nonInterlaced ? 1 : 2),
+        pictureConfiguration,
+        wordsPerLine,
+        standardWordsPerLine,
+        activeLines,
+        nonInterlaced,
+        width: wordsPerLine * 16,
+        fieldStrideBytes: standardWordsPerLine * 32,
+        fieldHeight: activeLines,
+        rowRepeat,
+        height: activeLines * rowRepeat,
+        scanoutPolicy: rowRepeat === 2 ? "bob" : "direct",
       };
     }
 
@@ -7223,6 +7240,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           const address = viXfbAddress(target.registerOffset);
           const dimensions = viOutputDimensions();
           const resolved = gxResolveXfbCopy(address);
+          const sourceRowStep = resolved !== null
+            && resolved.frame.stride > 0
+            && dimensions.fieldStrideBytes % resolved.frame.stride === 0
+            ? dimensions.fieldStrideBytes / resolved.frame.stride
+            : 0;
           const temporalXfbCapture = claimSmbTemporalXfbCapture();
           if (resolved !== null) {
             resolved.frame.displayed = true;
@@ -7237,6 +7259,16 @@ const TEMPLATE: &str = r##"<!doctype html>
             height: dimensions.height,
             copyIndex: resolved?.frame.index ?? 0,
             copyRow: resolved?.row ?? 0,
+            pictureConfiguration: dimensions.pictureConfiguration,
+            wordsPerLine: dimensions.wordsPerLine,
+            standardWordsPerLine: dimensions.standardWordsPerLine,
+            activeLines: dimensions.activeLines,
+            nonInterlaced: dimensions.nonInterlaced,
+            fieldStrideBytes: dimensions.fieldStrideBytes,
+            sourceRowStep,
+            fieldHeight: dimensions.fieldHeight,
+            rowRepeat: dimensions.rowRepeat,
+            scanoutPolicy: dimensions.scanoutPolicy,
             ...(temporalXfbCapture === null ? {} : { temporalXfbCapture }),
           });
           gxFramesPresented += 1;
@@ -8801,6 +8833,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             trace: viTrace,
           },
           viDisplayConfig: "0x" + view.getUint16(mmio + 0x2002, false).toString(16).padStart(4, "0"),
+          viPictureConfiguration: "0x" + view.getUint16(mmio + 0x2048, false).toString(16).padStart(4, "0"),
           viXfbTop: "0x" + viXfbAddress(0x201c).toString(16).padStart(8, "0"),
           viXfbBottom: "0x" + viXfbAddress(0x2024).toString(16).padStart(8, "0"),
           viDisplayInterrupts: [0x2030, 0x2034, 0x2038, 0x203c].map(offset =>

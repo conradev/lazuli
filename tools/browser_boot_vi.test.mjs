@@ -196,13 +196,53 @@ test("VI single-field presentation repeats once per top-field frame", () => {
 test("VI dimensions distinguish interlaced and single-field output", () => {
   const context = evaluateFunctions(["decodeViOutputDimensions"]);
   assert.deepEqual(
-    JSON.parse(JSON.stringify(context.decodeViOutputDimensions(0x2828, 0, 240))),
-    { width: 640, height: 480 },
+    JSON.parse(JSON.stringify(context.decodeViOutputDimensions(0x2850, 0, 240))),
+    {
+      pictureConfiguration: 0x2850,
+      wordsPerLine: 40,
+      standardWordsPerLine: 80,
+      activeLines: 240,
+      nonInterlaced: false,
+      width: 640,
+      fieldStrideBytes: 2560,
+      fieldHeight: 240,
+      rowRepeat: 2,
+      height: 480,
+      scanoutPolicy: "bob",
+    },
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.decodeViOutputDimensions(0x2828, 4, 240))),
-    { width: 640, height: 240 },
+    {
+      pictureConfiguration: 0x2828,
+      wordsPerLine: 40,
+      standardWordsPerLine: 40,
+      activeLines: 240,
+      nonInterlaced: true,
+      width: 640,
+      fieldStrideBytes: 1280,
+      fieldHeight: 240,
+      rowRepeat: 1,
+      height: 240,
+      scanoutPolicy: "direct",
+    },
   );
+});
+
+test("SMB VI geometry produces the exact four-row top and bottom bob oracle", () => {
+  const context = evaluateFunctions(["decodeViOutputDimensions"]);
+  const scanout = context.decodeViOutputDimensions(0x2850, 0, 2);
+  const sourceRowStep = scanout.fieldStrideBytes / 0x500;
+  const rows = selectedRow => Array.from(
+    { length: scanout.height },
+    (_unused, outputRow) => selectedRow
+      + Math.floor(outputRow / scanout.rowRepeat) * sourceRowStep,
+  );
+
+  assert.equal(scanout.scanoutPolicy, "bob");
+  assert.equal(sourceRowStep, 2);
+  assert.deepEqual(rows(0), [0, 0, 2, 2]);
+  assert.deepEqual(rows(1), [1, 1, 3, 3]);
 });
 
 test("VI field service selects a cached XFB independently of comparators", () => {
@@ -246,7 +286,21 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       viLastPresentationCopyRow: 0,
       viLastPresentationCycle: null,
       viLastPresentationField: null,
-      viOutputDimensions() { return { width: 640, height: 480 }; },
+      viOutputDimensions() {
+        return {
+          pictureConfiguration: 0x2850,
+          wordsPerLine: 40,
+          standardWordsPerLine: 80,
+          activeLines: 240,
+          nonInterlaced: false,
+          width: 640,
+          fieldStrideBytes: 2560,
+          fieldHeight: 240,
+          rowRepeat: 2,
+          height: 480,
+          scanoutPolicy: "bob",
+        };
+      },
       viPresentationCount: 0,
       viTiming: {
         equ: 6,
@@ -272,6 +326,16 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       height: 480,
       copyIndex: 12,
       copyRow: 0,
+      pictureConfiguration: 0x2850,
+      wordsPerLine: 40,
+      standardWordsPerLine: 80,
+      activeLines: 240,
+      nonInterlaced: false,
+      fieldStrideBytes: 2560,
+      sourceRowStep: 2,
+      fieldHeight: 240,
+      rowRepeat: 2,
+      scanoutPolicy: "bob",
     },
     rendererSequence: 1,
   }]);
@@ -303,6 +367,16 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       height: 480,
       copyIndex: 12,
       copyRow: 1,
+      pictureConfiguration: 0x2850,
+      wordsPerLine: 40,
+      standardWordsPerLine: 80,
+      activeLines: 240,
+      nonInterlaced: false,
+      fieldStrideBytes: 2560,
+      sourceRowStep: 2,
+      fieldHeight: 240,
+      rowRepeat: 2,
+      scanoutPolicy: "bob",
     },
     rendererSequence: 2,
   });
@@ -390,6 +464,10 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
         height: 480,
         copyIndex: 7,
         copyRow: 1,
+        fieldStrideBytes: 2560,
+        fieldHeight: 240,
+        rowRepeat: 2,
+        scanoutPolicy: "bob",
       },
       rendererSequence: 20,
     },

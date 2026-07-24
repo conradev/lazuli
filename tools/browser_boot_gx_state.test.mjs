@@ -221,8 +221,10 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     gxFrameDraws: [],
     gxFrameDrawVertices: 0,
     gxFrameSkippedPrimitives: 0,
+    gxFramesSkipped: 0,
     gxFlushSkippedCopyClears() {},
     gxSkippedFrameClearColor: null,
+    gxSkippedCopyClears: [],
     gxLoadTlut() { assert.fail("unexpected TLUT load"); },
     gxMarkTextureCopyConsumer() { assert.fail("unexpected texture consumer"); },
     gxPrearmTextureCopyProducer() { assert.fail("unexpected texture producer"); },
@@ -233,6 +235,10 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     gxTextureCopyFramesPresented: 0,
     gxTextureCopies: textureCopies,
     gxTextureCopyIsBound() { return false; },
+    gxUncollectedNonClearingFrames: 0,
+    gxXfbCopies: [],
+    gxXfbCopyCount: 0,
+    gxXfbFramesCaptured: 0,
     mmio: 0,
     peFinishCycle: null,
     peFinishSignal: false,
@@ -274,6 +280,27 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     expected.clearRgba,
   );
   assert.equal(JSON.stringify(textureCopies[0]).includes('"copyState"'), false);
+
+  // A legitimate extreme inverse BP scale saturates at the GX/libogc line
+  // limit before becoming an LZGX output extent.
+  bp[0x4a] = 1023 << 10;
+  bp[0x4e] = 1;
+  copyContext.gxCollectFrameGeometry = true;
+  copyContext.recordGxBpWrite(((0x52 << 24) | 0x004400) >>> 0);
+  assert.equal(capturedFrames.length, 2);
+  assert.equal(capturedFrames[1].copyKind, 2);
+  assert.equal(capturedFrames[1].frame.sourceHeight, 1024);
+  assert.equal(capturedFrames[1].frame.height, 1024);
+
+  // Keep the worker's fixed-point line count identical to the Rust consumer.
+  // Precomputing 256 / 49 as f64 and multiplying rounds just below 768.
+  bp[0x4a] = 147 << 10;
+  bp[0x4e] = 49;
+  copyContext.gxCollectFrameGeometry = true;
+  copyContext.recordGxBpWrite(((0x52 << 24) | 0x004400) >>> 0);
+  assert.equal(capturedFrames.length, 3);
+  assert.equal(capturedFrames[2].frame.sourceHeight, 148);
+  assert.equal(capturedFrames[2].frame.height, 769);
 });
 
 test("distinct skipped regional clears retain their source order", () => {
