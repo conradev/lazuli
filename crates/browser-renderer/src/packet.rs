@@ -21,10 +21,15 @@ pub(crate) const GX_TEXTURE_REFERENCE_ABSENT: u32 = u32::MAX;
 
 const GX_PACKET_VERSION_V2: u16 = 2;
 const GX_PACKET_VERSION_V3: u16 = 3;
+const GX_PACKET_VERSION_V5: u16 = 5;
 const GX_DRAW_RECORD_BYTES_V2: u16 = 128;
 const PACKET_ALIGNMENT: u32 = 16;
 const COPY_FLAG_CLEAR: u32 = 1;
 const DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE: u16 = 1;
+const DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE: u16 = 1 << 1;
+const EXACT_CLIP_INPUT_ENCODING_F32_V1: u32 = 1;
+const EXACT_CLIP_STATE_BYTES: u32 = 48;
+const EXACT_CLIP_VERTEX_BYTES: u32 = 16;
 const TEXTURE_FLAG_PAYLOAD: u32 = 1;
 const SAMPLER_BITS_MASK_V3: u32 = 0xff;
 const SAMPLER_BITS_MASK_V4: u32 = SAMPLER_BITS_MASK_V3 | (3 << 19);
@@ -112,6 +117,28 @@ pub(crate) struct GxFragmentTailState {
     pub(crate) viewport_half_width_bits: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxExactClipState {
+    pub(crate) bp_gen_mode: u32,
+    pub(crate) bp_scissor_top_left: u32,
+    pub(crate) bp_scissor_bottom_right: u32,
+    pub(crate) bp_scissor_offset: u32,
+    pub(crate) xf_clip_disable: u32,
+    pub(crate) viewport_bits: [u32; 6],
+}
+
+impl GxExactClipState {
+    pub(crate) fn viewport(self) -> [f32; 6] {
+        self.viewport_bits.map(f32::from_bits)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GxExactClipRecord {
+    state: GxExactClipState,
+    position_offset: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GxDrawRecord {
     pub(crate) topology: u8,
@@ -129,6 +156,7 @@ pub(crate) struct GxDrawRecord {
     pub(crate) textures: [GxTextureSlot; MAX_TEV_TEXTURES],
     pub(crate) fragment_tail: GxFragmentTailState,
     pub(crate) post_cull_actions: Option<Vec<GxTriangleAction>>,
+    exact_clip: Option<GxExactClipRecord>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,10 +211,31 @@ pub(crate) struct GxTextureRecord {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct GxExactClipInput<'a> {
+    pub(crate) state: GxExactClipState,
+    position_bytes: &'a [u8],
+}
+
+impl GxExactClipInput<'_> {
+    pub(crate) fn positions(&self) -> impl ExactSizeIterator<Item = [f32; 4]> + '_ {
+        self.position_bytes.chunks_exact(16).map(|bytes| {
+            [0, 4, 8, 12].map(|offset| {
+                f32::from_le_bytes(
+                    bytes[offset..offset + 4]
+                        .try_into()
+                        .expect("four-byte exact GX clip component"),
+                )
+            })
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct GxDraw<'a> {
     pub(crate) record: &'a GxDrawRecord,
     pub(crate) tev_state: &'a [u8],
     pub(crate) vertex_bytes: &'a [u8],
+    pub(crate) exact_clip_input: Option<GxExactClipInput<'a>>,
 }
 
 impl GxDraw<'_> {
@@ -229,7 +278,7 @@ impl<'a> GxFramePacket<'a> {
         let version = read_u16(bytes, 0x04);
         let draw_record_bytes = match version {
             GX_PACKET_VERSION_V2 => GX_DRAW_RECORD_BYTES_V2,
-            GX_PACKET_VERSION_V3 | GX_PACKET_VERSION => GX_DRAW_RECORD_BYTES,
+            GX_PACKET_VERSION_V3 | GX_PACKET_VERSION | GX_PACKET_VERSION_V5 => GX_DRAW_RECORD_BYTES,
             _ => return Err(GxPacketError::UnsupportedVersion(version)),
         };
         expect_u16(
@@ -405,7 +454,7 @@ impl<'a> GxFramePacket<'a> {
         ] {
             expect_u32(field, actual, expected)?;
         }
-        if version == GX_PACKET_VERSION {
+        if matches!(version, GX_PACKET_VERSION | GX_PACKET_VERSION_V5) {
             if packet_bytes < packet_base_bytes {
                 return Err(GxPacketError::SectionOutOfBounds("base packet"));
             }
@@ -466,6 +515,9 @@ impl<'a> GxFramePacket<'a> {
         let mut next_vertex_relative_offset = 0u32;
         let mut counted_vertices = 0u32;
         let mut evidence_tail_bytes = 0u32;
+        let mut exact_clip_tail_bytes = 0u32;
+        let mut exact_clip_draw_count = 0u32;
+        let mut exact_clip_draws = Vec::with_capacity(to_usize(draw_count));
         for draw_index in 0..to_usize(draw_count) {
             let record_offset =
                 to_usize(draw_table_offset) + draw_index * usize::from(draw_record_bytes);
@@ -473,15 +525,34 @@ impl<'a> GxFramePacket<'a> {
             let topology = record[0x00];
             let cull_mode = record[0x01];
             let draw_flags = read_u16(record, 0x02);
-            if version == GX_PACKET_VERSION {
-                if draw_flags & !DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE != 0 {
-                    return Err(GxPacketError::InvalidField {
-                        field: "draw flags",
-                        value: u64::from(draw_flags),
-                    });
+            match version {
+                GX_PACKET_VERSION => {
+                    if draw_flags & !DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE != 0 {
+                        return Err(GxPacketError::InvalidField {
+                            field: "draw flags",
+                            value: u64::from(draw_flags),
+                        });
+                    }
                 }
-            } else {
-                expect_u16("draw flags", draw_flags, 0)?;
+                GX_PACKET_VERSION_V5 => {
+                    let permitted = DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE
+                        | DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE;
+                    if draw_flags & !permitted != 0 {
+                        return Err(GxPacketError::InvalidField {
+                            field: "draw flags",
+                            value: u64::from(draw_flags),
+                        });
+                    }
+                    if draw_flags == permitted {
+                        return Err(GxPacketError::NonCanonical(
+                            "one draw cannot carry both post-cull actions and exact clip inputs",
+                        ));
+                    }
+                }
+                GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => {
+                    expect_u16("draw flags", draw_flags, 0)?;
+                }
+                _ => unreachable!("validated LZGX packet version"),
             }
             if topology > 7 {
                 return Err(GxPacketError::InvalidField {
@@ -498,6 +569,7 @@ impl<'a> GxFramePacket<'a> {
             let vertex_count = read_u32(record, 0x04);
             let has_post_cull_actions =
                 draw_flags & DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE != 0;
+            let has_exact_clip_input = draw_flags & DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE != 0;
             if has_post_cull_actions {
                 let triangle_count = source_triangle_count(topology, vertex_count);
                 if triangle_count == 0 {
@@ -511,6 +583,32 @@ impl<'a> GxFramePacket<'a> {
                     "post-cull evidence byte length",
                 )?;
             }
+            if has_exact_clip_input {
+                let triangle_count = source_triangle_count(topology, vertex_count);
+                if triangle_count == 0 {
+                    return Err(GxPacketError::NonCanonical(
+                        "exact clip input must describe at least one triangle",
+                    ));
+                }
+                let exact_position_bytes = checked_mul(
+                    vertex_count,
+                    EXACT_CLIP_VERTEX_BYTES,
+                    "exact clip position byte length",
+                )?;
+                let exact_chunk_bytes = checked_add(
+                    EXACT_CLIP_STATE_BYTES,
+                    exact_position_bytes,
+                    "exact clip chunk byte length",
+                )?;
+                exact_clip_tail_bytes = checked_add(
+                    exact_clip_tail_bytes,
+                    exact_chunk_bytes,
+                    "exact clip tail byte length",
+                )?;
+                exact_clip_draw_count =
+                    checked_add(exact_clip_draw_count, 1, "exact clip draw count")?;
+            }
+            exact_clip_draws.push(has_exact_clip_input);
             let vertex_relative_offset = read_u32(record, 0x08);
             let tev_relative_offset = read_u32(record, 0x0c);
             expect_u32(
@@ -540,11 +638,21 @@ impl<'a> GxFramePacket<'a> {
             let vertex_start =
                 checked_add(vertex_offset, vertex_relative_offset, "draw vertex start")?;
             let vertex_end = checked_add(vertex_start, this_vertex_bytes, "draw vertex end")?;
+            if vertex_end > key_offset {
+                return Err(GxPacketError::SectionOutOfBounds("draw vertices"));
+            }
             for component in bytes[to_usize(vertex_start)..to_usize(vertex_end)].chunks_exact(4) {
                 let bits = u32::from_le_bytes(
                     component.try_into().expect("four-byte GX vertex component"),
                 );
-                if f32::from_bits(bits).is_nan() && bits != 0x7fc0_0000 {
+                let value = f32::from_bits(bits);
+                if has_exact_clip_input && !value.is_finite() {
+                    return Err(GxPacketError::InvalidField {
+                        field: "exact clip source vertex component",
+                        value: u64::from(bits),
+                    });
+                }
+                if value.is_nan() && bits != 0x7fc0_0000 {
                     return Err(GxPacketError::NonCanonical(
                         "vertex NaNs must use the canonical quiet-NaN encoding",
                     ));
@@ -637,7 +745,7 @@ impl<'a> GxFramePacket<'a> {
                 texture: None,
                 sampler_bits: 0,
             }; MAX_TEV_TEXTURES];
-            let sampler_bits_mask = if version == GX_PACKET_VERSION {
+            let sampler_bits_mask = if matches!(version, GX_PACKET_VERSION | GX_PACKET_VERSION_V5) {
                 SAMPLER_BITS_MASK_V4
             } else {
                 SAMPLER_BITS_MASK_V3
@@ -712,6 +820,7 @@ impl<'a> GxFramePacket<'a> {
                 textures: texture_slots,
                 fragment_tail,
                 post_cull_actions: has_post_cull_actions.then(Vec::new),
+                exact_clip: None,
             });
         }
         expect_u32("summed draw vertices", counted_vertices, total_vertex_count)?;
@@ -732,10 +841,28 @@ impl<'a> GxFramePacket<'a> {
             evidence_tail_bytes,
             "post-cull evidence end",
         )?;
-        let expected_packet_bytes = if version == GX_PACKET_VERSION {
-            align_packet(evidence_end, "post-cull evidence padding")?
-        } else {
-            packet_base_bytes
+        let exact_clip_start = match version {
+            GX_PACKET_VERSION => align_packet(evidence_end, "post-cull evidence padding")?,
+            GX_PACKET_VERSION_V5 => align_packet(evidence_end, "exact clip input alignment")?,
+            GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => evidence_end,
+            _ => unreachable!("validated LZGX packet version"),
+        };
+        let expected_packet_bytes = match version {
+            GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => packet_base_bytes,
+            GX_PACKET_VERSION => exact_clip_start,
+            GX_PACKET_VERSION_V5 => {
+                if exact_clip_draw_count == 0 {
+                    return Err(GxPacketError::NonCanonical(
+                        "version 5 requires at least one exact clip input",
+                    ));
+                }
+                checked_add(
+                    exact_clip_start,
+                    exact_clip_tail_bytes,
+                    "exact clip input end",
+                )?
+            }
+            _ => unreachable!("validated LZGX packet version"),
         };
         expect_u32("packet bytes", packet_bytes, expected_packet_bytes)?;
 
@@ -776,7 +903,104 @@ impl<'a> GxFramePacket<'a> {
             evidence_offset = chunk_end;
         }
         debug_assert_eq!(evidence_offset, to_usize(evidence_end));
-        require_zero(bytes, evidence_offset, to_usize(expected_packet_bytes))?;
+        if version == GX_PACKET_VERSION_V5 {
+            require_zero(bytes, evidence_offset, to_usize(exact_clip_start))?;
+
+            let mut exact_clip_offset = exact_clip_start;
+            for (draw, has_exact_clip_input) in draws.iter_mut().zip(exact_clip_draws.into_iter()) {
+                if !has_exact_clip_input {
+                    continue;
+                }
+                let chunk_offset = to_usize(exact_clip_offset);
+                expect_u32(
+                    "exact clip input encoding",
+                    read_u32(bytes, chunk_offset),
+                    EXACT_CLIP_INPUT_ENCODING_F32_V1,
+                )?;
+                let bp_gen_mode =
+                    read_bp_word(bytes, chunk_offset + 0x04, "exact clip BP generation mode")?;
+                let bp_scissor_top_left =
+                    read_bp_word(bytes, chunk_offset + 0x08, "exact clip BP scissor top-left")?;
+                let bp_scissor_bottom_right = read_bp_word(
+                    bytes,
+                    chunk_offset + 0x0c,
+                    "exact clip BP scissor bottom-right",
+                )?;
+                let bp_scissor_offset =
+                    read_bp_word(bytes, chunk_offset + 0x10, "exact clip BP scissor offset")?;
+                let xf_clip_disable = read_u32(bytes, chunk_offset + 0x14);
+                if xf_clip_disable & !7 != 0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "exact clip XF clip-disable",
+                        value: u64::from(xf_clip_disable),
+                    });
+                }
+                if (bp_gen_mode >> 14) & 3 != u32::from(draw.cull_mode) {
+                    return Err(GxPacketError::NonCanonical(
+                        "exact clip BP generation cull mode must match the draw",
+                    ));
+                }
+                let viewport_bits =
+                    std::array::from_fn(|index| read_u32(bytes, chunk_offset + 0x18 + index * 4));
+                for (index, bits) in viewport_bits.into_iter().enumerate() {
+                    let value = f32::from_bits(bits);
+                    if !value.is_finite() || (index < 2 && value == 0.0) {
+                        return Err(GxPacketError::InvalidField {
+                            field: "exact clip viewport component",
+                            value: u64::from(bits),
+                        });
+                    }
+                }
+                expect_u32(
+                    "exact clip viewport X bits",
+                    viewport_bits[0],
+                    draw.fragment_tail.viewport_half_width_bits,
+                )?;
+
+                let position_bytes = checked_mul(
+                    draw.vertex_count,
+                    EXACT_CLIP_VERTEX_BYTES,
+                    "exact clip position byte length",
+                )?;
+                let position_offset = checked_add(
+                    exact_clip_offset,
+                    EXACT_CLIP_STATE_BYTES,
+                    "exact clip position offset",
+                )?;
+                let chunk_end =
+                    checked_add(position_offset, position_bytes, "exact clip chunk end")?;
+                for component in
+                    bytes[to_usize(position_offset)..to_usize(chunk_end)].chunks_exact(4)
+                {
+                    let bits = u32::from_le_bytes(
+                        component
+                            .try_into()
+                            .expect("four-byte exact GX clip component"),
+                    );
+                    if !f32::from_bits(bits).is_finite() {
+                        return Err(GxPacketError::InvalidField {
+                            field: "exact clip position component",
+                            value: u64::from(bits),
+                        });
+                    }
+                }
+                draw.exact_clip = Some(GxExactClipRecord {
+                    state: GxExactClipState {
+                        bp_gen_mode,
+                        bp_scissor_top_left,
+                        bp_scissor_bottom_right,
+                        bp_scissor_offset,
+                        xf_clip_disable,
+                        viewport_bits,
+                    },
+                    position_offset,
+                });
+                exact_clip_offset = chunk_end;
+            }
+            debug_assert_eq!(exact_clip_offset, expected_packet_bytes);
+        } else {
+            require_zero(bytes, evidence_offset, to_usize(expected_packet_bytes))?;
+        }
 
         let mut textures = Vec::with_capacity(texture_count_usize);
         let mut texture_keys = HashSet::with_capacity(texture_count_usize);
@@ -939,10 +1163,24 @@ impl<'a> GxFramePacket<'a> {
         let tev_start = to_usize(self.header.tev_offset + record.tev_relative_offset);
         let vertex_start = to_usize(self.header.vertex_offset + record.vertex_relative_offset);
         let vertex_len = to_usize(record.vertex_count * GX_VERTEX_BYTES);
+        let exact_clip_input = record.exact_clip.map(|exact_clip| {
+            let position_start = to_usize(exact_clip.position_offset);
+            let position_len = to_usize(
+                record
+                    .vertex_count
+                    .checked_mul(EXACT_CLIP_VERTEX_BYTES)
+                    .expect("validated exact GX clip position length"),
+            );
+            GxExactClipInput {
+                state: exact_clip.state,
+                position_bytes: &self.bytes[position_start..position_start + position_len],
+            }
+        });
         Some(GxDraw {
             record,
             tev_state: &self.bytes[tev_start..tev_start + to_usize(GX_TEV_STATE_BYTES)],
             vertex_bytes: &self.bytes[vertex_start..vertex_start + vertex_len],
+            exact_clip_input,
         })
     }
 
@@ -2076,6 +2314,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_draw_vertices_beyond_the_validated_section_before_slicing() {
+        let mut bytes = single_draw_v4_texture_copy(2, 0, 3, None);
+        put_u32(&mut bytes, V3_DRAW_OFFSET + 0x04, 4);
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::SectionOutOfBounds("draw vertices")
+        );
+    }
+
+    #[test]
     fn rejects_nonzero_v4_action_and_final_padding() {
         let action = [GxTriangleAction::Keep012];
         let valid = single_draw_v4_texture_copy(2, 0, 3, Some(&action));
@@ -2256,10 +2504,10 @@ mod tests {
     #[test]
     fn rejects_unknown_packet_version() {
         let mut bytes = textured_xfb_copy();
-        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION + 1);
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V5 + 1);
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
-            GxPacketError::UnsupportedVersion(GX_PACKET_VERSION + 1)
+            GxPacketError::UnsupportedVersion(GX_PACKET_VERSION_V5 + 1)
         );
     }
 
