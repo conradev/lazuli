@@ -918,10 +918,10 @@ test("exact projection and viewport model pins scalar f32 operation order", () =
   );
   assert.match(
     extractFunction("postGxFrame"),
-    /packGxFramePacketV4\(/,
-    "source-state capture stays transport- and render-inert in this layer",
+    /packGxFramePacketV5\(/,
+    "live transport negotiates v5 only for frames carrying exact source inputs",
   );
-  assert.doesNotMatch(extractFunction("postGxFrame"), /packGxFramePacketV5\(/);
+  assert.doesNotMatch(extractFunction("postGxFrame"), /packGxFramePacketV4\(/);
 });
 
 test("exact input capture snapshots raw GX state and homogeneous f32 positions", () => {

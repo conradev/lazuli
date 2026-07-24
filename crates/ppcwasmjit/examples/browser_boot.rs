@@ -1413,7 +1413,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       let packet;
       try {
-        packet = packGxFramePacketV4(copyKind, frame, residentTextureKeys);
+        // The v5 encoder returns the canonical v4 bytes unchanged until at
+        // least one draw carries a complete exact homogeneous input.
+        packet = packGxFramePacketV5(copyKind, frame, residentTextureKeys);
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
