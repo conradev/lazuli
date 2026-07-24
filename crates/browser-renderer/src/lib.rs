@@ -939,6 +939,325 @@ pub(crate) fn xfb_scanout_source_row(plan: XfbScanoutPlan, output_row: u32) -> O
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViPresentationMode {
+    Progressive,
+    SingleField,
+    Interlaced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViFieldParity {
+    Top,
+    Bottom,
+}
+
+impl ViFieldParity {
+    const fn is_opposite(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Top, Self::Bottom) | (Self::Bottom, Self::Top)
+        )
+    }
+}
+
+/// Exact renderer-side evidence for one emulated VI field.
+///
+/// `copy`, `selected_address`, `selected_generation`, and `selected_row` bind
+/// the request to one retained XFB. Interlaced pair members may deliberately
+/// refer to different XFB copies: games can copy a new field between the two VI
+/// presentation boundaries. `pair_epoch` is the producer-owned provenance
+/// that says those independently validated fields belong to one host frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViFieldDescriptor {
+    pub(crate) mode: ViPresentationMode,
+    pub(crate) pair_epoch: u32,
+    pub(crate) parity: ViFieldParity,
+    pub(crate) copy: XfbCopyMetadata,
+    pub(crate) selected_address: u32,
+    pub(crate) selected_generation: u32,
+    pub(crate) selected_row: u32,
+    pub(crate) source_width: u32,
+    pub(crate) source_height: u32,
+    pub(crate) display_width: u32,
+    pub(crate) scanout: XfbScanoutPlan,
+}
+
+impl ViFieldDescriptor {
+    fn validation_error(self) -> Option<ViFieldPairRejection> {
+        if self.selected_generation == 0 || self.copy.generation != self.selected_generation {
+            return Some(ViFieldPairRejection::InvalidGeneration);
+        }
+        if !xfb_copy_matches_selection(
+            self.copy,
+            self.selected_address,
+            self.selected_generation,
+            self.selected_row,
+        ) {
+            return Some(ViFieldPairRejection::InvalidAddress);
+        }
+        if self.source_width == 0
+            || self.source_height == 0
+            || self.display_width == 0
+            || self.source_width != self.display_width
+            || self.source_height != self.copy.height
+            || xfb_scanout_plan(
+                self.copy,
+                self.selected_row,
+                self.scanout.field_stride_bytes,
+                self.scanout.field_height,
+                self.scanout.row_repeat,
+                self.scanout.display_height,
+            ) != Some(self.scanout)
+        {
+            return Some(ViFieldPairRejection::InvalidGeometry);
+        }
+        let expected_row_repeat = match self.mode {
+            ViPresentationMode::Progressive | ViPresentationMode::SingleField => 1,
+            ViPresentationMode::Interlaced => 2,
+        };
+        if self.scanout.row_repeat != expected_row_repeat {
+            return Some(ViFieldPairRejection::InvalidMode);
+        }
+        None
+    }
+
+    fn pair_stride_matches(self, other: Self) -> bool {
+        self.copy.stride == other.copy.stride
+            && self.scanout.field_stride_bytes == other.scanout.field_stride_bytes
+            && self.scanout.source_row_step == other.scanout.source_row_step
+    }
+
+    fn pair_geometry_matches(self, other: Self) -> bool {
+        self.source_width == other.source_width
+            && self.source_height == other.source_height
+            && self.display_width == other.display_width
+            && self.scanout.field_height == other.scanout.field_height
+            && self.scanout.row_repeat == other.scanout.row_repeat
+            && self.scanout.display_height == other.scanout.display_height
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ViOwnedField<T> {
+    pub(crate) descriptor: ViFieldDescriptor,
+    pub(crate) payload: T,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ViHostFrame<T> {
+    Immediate(ViOwnedField<T>),
+    Interlaced {
+        pair_epoch: u32,
+        top: ViOwnedField<T>,
+        bottom: ViOwnedField<T>,
+    },
+}
+
+impl<T> ViHostFrame<T> {
+    pub(crate) fn pair_epoch(&self) -> u32 {
+        match self {
+            Self::Immediate(field) => field.descriptor.pair_epoch,
+            Self::Interlaced { pair_epoch, .. } => *pair_epoch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViFieldPairAwaiting {
+    pub(crate) pair_epoch: u32,
+    pub(crate) parity: ViFieldParity,
+    pub(crate) superseded_epoch: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViFieldPairRejection {
+    InvalidGeneration,
+    InvalidAddress,
+    InvalidGeometry,
+    InvalidMode,
+    StaleEpoch {
+        pair_epoch: u32,
+        newest_epoch: u32,
+    },
+    CompletedEpoch {
+        pair_epoch: u32,
+    },
+    DuplicateParity {
+        pair_epoch: u32,
+        parity: ViFieldParity,
+    },
+    ModeMismatch {
+        pair_epoch: u32,
+    },
+    StrideMismatch {
+        pair_epoch: u32,
+    },
+    GeometryMismatch {
+        pair_epoch: u32,
+    },
+}
+
+impl ViFieldPairRejection {
+    pub(crate) const fn telemetry_code(self) -> &'static str {
+        match self {
+            Self::InvalidGeneration => "vi-field-invalid-generation",
+            Self::InvalidAddress => "vi-field-invalid-address",
+            Self::InvalidGeometry => "vi-field-invalid-geometry",
+            Self::InvalidMode => "vi-field-invalid-mode",
+            Self::StaleEpoch { .. } => "vi-field-stale-epoch",
+            Self::CompletedEpoch { .. } => "vi-field-completed-epoch",
+            Self::DuplicateParity { .. } => "vi-field-duplicate-parity",
+            Self::ModeMismatch { .. } => "vi-field-pair-mode-mismatch",
+            Self::StrideMismatch { .. } => "vi-field-pair-stride-mismatch",
+            Self::GeometryMismatch { .. } => "vi-field-pair-geometry-mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ViFieldPairOutcome<T> {
+    Awaiting(ViFieldPairAwaiting),
+    Ready(ViHostFrame<T>),
+    Rejected(ViFieldPairRejection),
+}
+
+impl<T> ViFieldPairOutcome<T> {
+    pub(crate) fn telemetry_code(&self) -> &'static str {
+        match self {
+            Self::Awaiting(awaiting) if awaiting.superseded_epoch.is_some() => {
+                "vi-field-pair-superseded"
+            }
+            Self::Awaiting(_) => "vi-field-pair-awaiting",
+            Self::Ready(ViHostFrame::Immediate(field)) => match field.descriptor.mode {
+                ViPresentationMode::Progressive => "vi-progressive-frame-ready",
+                ViPresentationMode::SingleField => "vi-single-field-frame-ready",
+                ViPresentationMode::Interlaced => "vi-interlaced-frame-ready",
+            },
+            Self::Ready(ViHostFrame::Interlaced { .. }) => "vi-interlaced-frame-ready",
+            Self::Rejected(rejection) => rejection.telemetry_code(),
+        }
+    }
+}
+
+pub(crate) struct ViFieldPairState<T> {
+    pending: Option<ViOwnedField<T>>,
+    newest_epoch: Option<u32>,
+}
+
+impl<T> Default for ViFieldPairState<T> {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            newest_epoch: None,
+        }
+    }
+}
+
+impl<T> ViFieldPairState<T> {
+    pub(crate) fn pending(&self) -> Option<&ViOwnedField<T>> {
+        self.pending.as_ref()
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.pending = None;
+        self.newest_epoch = None;
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        descriptor: ViFieldDescriptor,
+        payload: T,
+    ) -> ViFieldPairOutcome<T> {
+        if let Some(rejection) = descriptor.validation_error() {
+            return ViFieldPairOutcome::Rejected(rejection);
+        }
+
+        if let Some(newest_epoch) = self.newest_epoch {
+            if descriptor.pair_epoch < newest_epoch {
+                return ViFieldPairOutcome::Rejected(ViFieldPairRejection::StaleEpoch {
+                    pair_epoch: descriptor.pair_epoch,
+                    newest_epoch,
+                });
+            }
+            if descriptor.pair_epoch == newest_epoch {
+                return self.submit_current_epoch(descriptor, payload);
+            }
+        }
+
+        let superseded_epoch = self.pending.take().map(|field| field.descriptor.pair_epoch);
+        self.newest_epoch = Some(descriptor.pair_epoch);
+        let field = ViOwnedField {
+            descriptor,
+            payload,
+        };
+        match descriptor.mode {
+            ViPresentationMode::Progressive | ViPresentationMode::SingleField => {
+                ViFieldPairOutcome::Ready(ViHostFrame::Immediate(field))
+            }
+            ViPresentationMode::Interlaced => {
+                self.pending = Some(field);
+                ViFieldPairOutcome::Awaiting(ViFieldPairAwaiting {
+                    pair_epoch: descriptor.pair_epoch,
+                    parity: descriptor.parity,
+                    superseded_epoch,
+                })
+            }
+        }
+    }
+
+    fn submit_current_epoch(
+        &mut self,
+        descriptor: ViFieldDescriptor,
+        payload: T,
+    ) -> ViFieldPairOutcome<T> {
+        let Some(pending) = self.pending.as_ref() else {
+            return ViFieldPairOutcome::Rejected(ViFieldPairRejection::CompletedEpoch {
+                pair_epoch: descriptor.pair_epoch,
+            });
+        };
+        if descriptor.mode != ViPresentationMode::Interlaced {
+            return ViFieldPairOutcome::Rejected(ViFieldPairRejection::ModeMismatch {
+                pair_epoch: descriptor.pair_epoch,
+            });
+        }
+        if !pending.descriptor.parity.is_opposite(descriptor.parity) {
+            return ViFieldPairOutcome::Rejected(ViFieldPairRejection::DuplicateParity {
+                pair_epoch: descriptor.pair_epoch,
+                parity: descriptor.parity,
+            });
+        }
+        if !pending.descriptor.pair_stride_matches(descriptor) {
+            return ViFieldPairOutcome::Rejected(ViFieldPairRejection::StrideMismatch {
+                pair_epoch: descriptor.pair_epoch,
+            });
+        }
+        if !pending.descriptor.pair_geometry_matches(descriptor) {
+            return ViFieldPairOutcome::Rejected(ViFieldPairRejection::GeometryMismatch {
+                pair_epoch: descriptor.pair_epoch,
+            });
+        }
+
+        let pending = self
+            .pending
+            .take()
+            .expect("validated pending VI field disappeared");
+        let field = ViOwnedField {
+            descriptor,
+            payload,
+        };
+        let (top, bottom) = match pending.descriptor.parity {
+            ViFieldParity::Top => (pending, field),
+            ViFieldParity::Bottom => (field, pending),
+        };
+        ViFieldPairOutcome::Ready(ViHostFrame::Interlaced {
+            pair_epoch: descriptor.pair_epoch,
+            top,
+            bottom,
+        })
+    }
+}
+
 pub(crate) const fn xfb_surface_extent_matches(
     cached_width: u32,
     cached_height: u32,
@@ -950,14 +1269,14 @@ pub(crate) const fn xfb_surface_extent_matches(
 
 pub(crate) fn reusable_xfb_surface_index(
     surfaces: &[(u64, u32, u32)],
-    protected_surface: Option<u64>,
+    protected_surfaces: &[u64],
     width: u32,
     height: u32,
 ) -> Option<usize> {
     surfaces
         .iter()
         .position(|(surface, cached_width, cached_height)| {
-            Some(*surface) != protected_surface
+            !protected_surfaces.contains(surface)
                 && xfb_surface_extent_matches(*cached_width, *cached_height, width, height)
         })
 }
@@ -1167,15 +1486,17 @@ mod tests {
         EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH24_MAX, GxBlendFactor,
         GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxEfbFormat, RendererFailureState,
         RendererMetrics, RendererPhaseTiming, SelectedTexture, SurfacePixelOrder,
-        SurfaceReadbackRequestError, TextureAddressMode, XfbCopyMetadata, alpha_compare,
-        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
-        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
-        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_blend_state,
-        gx_copy_clear_mask, gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
-        gx_depth24_to_float, gx_efb_format, gx_float_to_depth24, gx_sampler_identity,
-        gx_xfb_copy_parameters, gx_xfb_output_height, materialize_xfb_rgba8_reference,
-        merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
-        resolve_xfb_copy, reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
+        SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome,
+        ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode,
+        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
+        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
+        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
+        gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_copy_filter_coefficients,
+        gx_copy_filter_taps, gx_depth24_to_float, gx_efb_format, gx_float_to_depth24,
+        gx_sampler_identity, gx_xfb_copy_parameters, gx_xfb_output_height,
+        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
+        requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
+        reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
         xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_scanout_plan,
         xfb_scanout_source_row, xfb_surface_extent_matches,
     };
@@ -1190,6 +1511,44 @@ mod tests {
             stride: STRIDE,
             height: 480,
             generation,
+        }
+    }
+
+    fn vi_field(
+        mode: ViPresentationMode,
+        pair_epoch: u32,
+        parity: ViFieldParity,
+        copy: XfbCopyMetadata,
+        selected_address: u32,
+        selected_row: u32,
+    ) -> ViFieldDescriptor {
+        let row_repeat = match mode {
+            ViPresentationMode::Progressive | ViPresentationMode::SingleField => 1,
+            ViPresentationMode::Interlaced => 2,
+        };
+        let field_height = copy.height / row_repeat;
+        let field_stride_bytes = copy.stride * row_repeat;
+        let scanout = xfb_scanout_plan(
+            copy,
+            selected_row,
+            field_stride_bytes,
+            field_height,
+            row_repeat,
+            copy.height,
+        )
+        .unwrap();
+        ViFieldDescriptor {
+            mode,
+            pair_epoch,
+            parity,
+            copy,
+            selected_address,
+            selected_generation: copy.generation,
+            selected_row,
+            source_width: 640,
+            source_height: copy.height,
+            display_width: 640,
+            scanout,
         }
     }
 
@@ -1613,6 +1972,388 @@ mod tests {
     }
 
     #[test]
+    fn progressive_and_single_field_inputs_complete_without_pairing() {
+        let copy = XfbCopyMetadata {
+            destination: BASE,
+            stride: STRIDE,
+            height: 4,
+            generation: 12,
+        };
+        let mut state = ViFieldPairState::default();
+
+        let progressive = state.submit(
+            vi_field(
+                ViPresentationMode::Progressive,
+                40,
+                ViFieldParity::Top,
+                copy,
+                BASE,
+                0,
+            ),
+            "progressive",
+        );
+        assert_eq!(progressive.telemetry_code(), "vi-progressive-frame-ready");
+        assert!(matches!(
+            progressive,
+            ViFieldPairOutcome::Ready(ViHostFrame::Immediate(field))
+                if field.payload == "progressive" && field.descriptor.pair_epoch == 40
+        ));
+        assert!(state.pending().is_none());
+
+        let single = state.submit(
+            vi_field(
+                ViPresentationMode::SingleField,
+                41,
+                ViFieldParity::Bottom,
+                copy,
+                BASE,
+                0,
+            ),
+            "single",
+        );
+        assert_eq!(single.telemetry_code(), "vi-single-field-frame-ready");
+        assert!(matches!(
+            single,
+            ViFieldPairOutcome::Ready(ViHostFrame::Immediate(field))
+                if field.payload == "single" && field.descriptor.pair_epoch == 41
+        ));
+        assert!(state.pending().is_none());
+    }
+
+    #[test]
+    fn black_top_and_white_bottom_authorize_exactly_one_mixed_host_frame() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum SyntheticField {
+            Black,
+            White,
+        }
+
+        let copy = XfbCopyMetadata {
+            destination: BASE,
+            stride: STRIDE,
+            height: 4,
+            generation: 12,
+        };
+        let top = vi_field(
+            ViPresentationMode::Interlaced,
+            50,
+            ViFieldParity::Top,
+            copy,
+            BASE,
+            0,
+        );
+        let bottom = vi_field(
+            ViPresentationMode::Interlaced,
+            50,
+            ViFieldParity::Bottom,
+            copy,
+            BASE + STRIDE,
+            1,
+        );
+        let mut state = ViFieldPairState::default();
+
+        let first = state.submit(top, SyntheticField::Black);
+        assert_eq!(first.telemetry_code(), "vi-field-pair-awaiting");
+        assert!(matches!(first, ViFieldPairOutcome::Awaiting(_)));
+        assert_eq!(
+            state.pending().map(|field| field.payload),
+            Some(SyntheticField::Black)
+        );
+
+        let second = state.submit(bottom, SyntheticField::White);
+        assert_eq!(second.telemetry_code(), "vi-interlaced-frame-ready");
+        match second {
+            ViFieldPairOutcome::Ready(frame) => {
+                assert_eq!(frame.pair_epoch(), 50);
+                let ViHostFrame::Interlaced {
+                    pair_epoch,
+                    top,
+                    bottom,
+                } = frame
+                else {
+                    panic!("opposite fields produced an immediate frame");
+                };
+                assert_eq!(pair_epoch, 50);
+                assert_eq!(top.payload, SyntheticField::Black);
+                assert_eq!(top.descriptor.parity, ViFieldParity::Top);
+                assert_eq!(bottom.payload, SyntheticField::White);
+                assert_eq!(bottom.descriptor.parity, ViFieldParity::Bottom);
+            }
+            outcome => panic!("opposite fields did not produce one mixed frame: {outcome:?}"),
+        }
+        assert!(state.pending().is_none());
+
+        let replay = state.submit(top, SyntheticField::Black);
+        assert_eq!(
+            replay,
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::CompletedEpoch { pair_epoch: 50 })
+        );
+        assert_eq!(replay.telemetry_code(), "vi-field-completed-epoch");
+    }
+
+    #[test]
+    fn interlaced_pair_preserves_distinct_per_field_xfb_provenance() {
+        let top_copy = XfbCopyMetadata {
+            destination: BASE,
+            stride: STRIDE,
+            height: 4,
+            generation: 60,
+        };
+        let bottom_copy = XfbCopyMetadata {
+            destination: BASE + 0x0020_0000,
+            stride: STRIDE,
+            height: 4,
+            generation: 61,
+        };
+        let top = vi_field(
+            ViPresentationMode::Interlaced,
+            60,
+            ViFieldParity::Top,
+            top_copy,
+            top_copy.destination,
+            0,
+        );
+        let bottom = vi_field(
+            ViPresentationMode::Interlaced,
+            60,
+            ViFieldParity::Bottom,
+            bottom_copy,
+            bottom_copy.destination,
+            0,
+        );
+        let mut state = ViFieldPairState::default();
+
+        assert!(matches!(
+            state.submit(top, "top surface"),
+            ViFieldPairOutcome::Awaiting(_)
+        ));
+        match state.submit(bottom, "bottom surface") {
+            ViFieldPairOutcome::Ready(ViHostFrame::Interlaced { top, bottom, .. }) => {
+                assert_eq!(top.payload, "top surface");
+                assert_eq!(top.descriptor.selected_address, BASE);
+                assert_eq!(top.descriptor.selected_generation, 60);
+                assert_eq!(bottom.payload, "bottom surface");
+                assert_eq!(bottom.descriptor.selected_address, bottom_copy.destination);
+                assert_eq!(bottom.descriptor.selected_generation, 61);
+            }
+            outcome => panic!("distinct but epoch-paired XFB fields were rejected: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_stale_and_cross_epoch_fields_never_mix() {
+        let copy = XfbCopyMetadata {
+            destination: BASE,
+            stride: STRIDE,
+            height: 4,
+            generation: 70,
+        };
+        let descriptor = |epoch, parity| {
+            let row = u32::from(parity == ViFieldParity::Bottom);
+            vi_field(
+                ViPresentationMode::Interlaced,
+                epoch,
+                parity,
+                copy,
+                BASE + row * STRIDE,
+                row,
+            )
+        };
+        let mut state = ViFieldPairState::default();
+
+        assert!(matches!(
+            state.submit(descriptor(70, ViFieldParity::Top), "epoch 70 top"),
+            ViFieldPairOutcome::Awaiting(_)
+        ));
+        let duplicate = state.submit(descriptor(70, ViFieldParity::Top), "duplicate epoch 70 top");
+        assert_eq!(
+            duplicate,
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::DuplicateParity {
+                pair_epoch: 70,
+                parity: ViFieldParity::Top,
+            })
+        );
+        assert_eq!(
+            state.pending().map(|field| field.payload),
+            Some("epoch 70 top")
+        );
+
+        let stale = state.submit(descriptor(69, ViFieldParity::Bottom), "epoch 69 bottom");
+        assert_eq!(
+            stale,
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::StaleEpoch {
+                pair_epoch: 69,
+                newest_epoch: 70,
+            })
+        );
+
+        let advanced = state.submit(descriptor(71, ViFieldParity::Bottom), "epoch 71 bottom");
+        assert_eq!(advanced.telemetry_code(), "vi-field-pair-superseded");
+        assert!(matches!(
+            advanced,
+            ViFieldPairOutcome::Awaiting(awaiting)
+                if awaiting.pair_epoch == 71
+                    && awaiting.parity == ViFieldParity::Bottom
+                    && awaiting.superseded_epoch == Some(70)
+        ));
+        assert_eq!(
+            state.pending().map(|field| field.payload),
+            Some("epoch 71 bottom")
+        );
+
+        match state.submit(descriptor(71, ViFieldParity::Top), "epoch 71 top") {
+            ViFieldPairOutcome::Ready(ViHostFrame::Interlaced {
+                pair_epoch,
+                top,
+                bottom,
+            }) => {
+                assert_eq!(pair_epoch, 71);
+                assert_eq!(top.payload, "epoch 71 top");
+                assert_eq!(bottom.payload, "epoch 71 bottom");
+            }
+            outcome => panic!("new epoch did not form an isolated pair: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_shape_mismatches_reject_without_discarding_the_first_field() {
+        let copy = XfbCopyMetadata {
+            destination: BASE,
+            stride: STRIDE,
+            height: 4,
+            generation: 80,
+        };
+        let top = vi_field(
+            ViPresentationMode::Interlaced,
+            80,
+            ViFieldParity::Top,
+            copy,
+            BASE,
+            0,
+        );
+        let bottom = vi_field(
+            ViPresentationMode::Interlaced,
+            80,
+            ViFieldParity::Bottom,
+            copy,
+            BASE + STRIDE,
+            1,
+        );
+        let mut state = ViFieldPairState::default();
+        assert!(matches!(
+            state.submit(top, "original top"),
+            ViFieldPairOutcome::Awaiting(_)
+        ));
+
+        let different_stride_copy = XfbCopyMetadata {
+            destination: BASE + 0x0010_0000,
+            stride: STRIDE / 2,
+            height: 4,
+            generation: 81,
+        };
+        let different_stride = vi_field(
+            ViPresentationMode::Interlaced,
+            80,
+            ViFieldParity::Bottom,
+            different_stride_copy,
+            different_stride_copy.destination,
+            0,
+        );
+        assert_eq!(
+            state.submit(different_stride, "wrong stride"),
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::StrideMismatch { pair_epoch: 80 })
+        );
+
+        let mut different_geometry = bottom;
+        different_geometry.source_width = 608;
+        different_geometry.display_width = 608;
+        assert_eq!(
+            state.submit(different_geometry, "wrong geometry"),
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::GeometryMismatch { pair_epoch: 80 })
+        );
+
+        let immediate = vi_field(
+            ViPresentationMode::SingleField,
+            80,
+            ViFieldParity::Bottom,
+            copy,
+            BASE,
+            0,
+        );
+        assert_eq!(
+            state.submit(immediate, "wrong mode"),
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::ModeMismatch { pair_epoch: 80 })
+        );
+        assert_eq!(
+            state.pending().map(|field| field.payload),
+            Some("original top")
+        );
+        assert!(matches!(
+            state.submit(bottom, "matching bottom"),
+            ViFieldPairOutcome::Ready(ViHostFrame::Interlaced { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_field_provenance_does_not_advance_pair_state() {
+        let copy = XfbCopyMetadata {
+            destination: BASE,
+            stride: STRIDE,
+            height: 4,
+            generation: 90,
+        };
+        let valid = vi_field(
+            ViPresentationMode::Interlaced,
+            90,
+            ViFieldParity::Top,
+            copy,
+            BASE,
+            0,
+        );
+        let mut state = ViFieldPairState::default();
+
+        let mut wrong_generation = valid;
+        wrong_generation.selected_generation = 89;
+        assert_eq!(
+            state.submit(wrong_generation, ()),
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::InvalidGeneration)
+        );
+
+        let mut wrong_address = valid;
+        wrong_address.selected_address += 4;
+        assert_eq!(
+            state.submit(wrong_address, ()),
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::InvalidAddress)
+        );
+
+        let mut wrong_geometry = valid;
+        wrong_geometry.source_width = 0;
+        assert_eq!(
+            state.submit(wrong_geometry, ()),
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::InvalidGeometry)
+        );
+
+        let mut wrong_mode = valid;
+        wrong_mode.mode = ViPresentationMode::Progressive;
+        assert_eq!(
+            state.submit(wrong_mode, ()),
+            ViFieldPairOutcome::Rejected(ViFieldPairRejection::InvalidMode)
+        );
+        assert!(state.pending().is_none());
+
+        assert!(matches!(
+            state.submit(valid, ()),
+            ViFieldPairOutcome::Awaiting(_)
+        ));
+        state.reset();
+        assert!(state.pending().is_none());
+        assert!(matches!(
+            state.submit(valid, ()),
+            ViFieldPairOutcome::Awaiting(_)
+        ));
+    }
+
+    #[test]
     fn xfb_surface_reuse_requires_an_exact_copy_extent() {
         assert!(xfb_surface_extent_matches(640, 448, 640, 448));
         assert!(!xfb_surface_extent_matches(640, 448, 608, 448));
@@ -1623,29 +2364,30 @@ mod tests {
     fn xfb_surface_reuse_preserves_the_last_presented_surface() {
         let surfaces = [(41, 640, 448), (42, 640, 448)];
         assert_eq!(
-            reusable_xfb_surface_index(&surfaces, Some(41), 640, 448),
+            reusable_xfb_surface_index(&surfaces, &[41], 640, 448),
             Some(1)
         );
         assert_eq!(
-            reusable_xfb_surface_index(&surfaces, Some(42), 640, 448),
+            reusable_xfb_surface_index(&surfaces, &[42], 640, 448),
             Some(0)
         );
         assert_eq!(
-            reusable_xfb_surface_index(&surfaces, None, 640, 448),
+            reusable_xfb_surface_index(&surfaces, &[], 640, 448),
             Some(0)
         );
-        assert_eq!(
-            reusable_xfb_surface_index(&surfaces, Some(41), 608, 448),
-            None
-        );
+        assert_eq!(reusable_xfb_surface_index(&surfaces, &[41], 608, 448), None);
         let mismatched_spare = [(41, 640, 448), (42, 608, 448)];
         assert_eq!(
-            reusable_xfb_surface_index(&mismatched_spare, Some(41), 640, 448),
+            reusable_xfb_surface_index(&mismatched_spare, &[41], 640, 448),
             None
         );
         assert_eq!(
-            reusable_xfb_surface_index(&mismatched_spare, Some(41), 608, 448),
+            reusable_xfb_surface_index(&mismatched_spare, &[41], 608, 448),
             Some(1)
+        );
+        assert_eq!(
+            reusable_xfb_surface_index(&surfaces, &[41, 42], 640, 448),
+            None
         );
     }
 
