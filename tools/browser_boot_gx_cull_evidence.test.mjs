@@ -34,6 +34,15 @@ const pureFunctions = [
   "gxCullSub",
   "gxCullDot4Position",
   "gxCullDot4",
+  "gxExactClipVertexIsValid",
+  "gxExactClipVertexListIsValid",
+  "gxExactClipMask",
+  "gxExactClipDifferentSigns",
+  "gxExactClipPlaneDistance",
+  "gxExactClipVertex",
+  "gxExactClipPolygon",
+  "gxExactTriangulateClipPolygon",
+  "gxExactPostClipTriangles",
   "gxCullClipPositionIsInside",
   "gxCullNormalZ3",
   "gxCullNormalZ",
@@ -182,6 +191,214 @@ test("positive-W zero-mask certification accepts boundaries and rejects one ULP 
     context.gxCullClipPositionIsInside([0, 0, 2 ** -80, 2 ** -80]),
     false,
     "a tiny positive Z remains outside even when f32(W * Z) underflows to zero",
+  );
+});
+
+test("exact GX clip masks preserve all six Dolphin plane decisions", () => {
+  const context = pureContext();
+  const outside = Math.fround(1 + 2 ** -23);
+  assert.equal(context.gxExactClipMask([1, 0, 0, 1]), 0);
+  assert.equal(context.gxExactClipMask([-1, 0, 0, 1]), 0);
+  assert.equal(context.gxExactClipMask([0, 1, 0, 1]), 0);
+  assert.equal(context.gxExactClipMask([0, -1, 0, 1]), 0);
+  assert.equal(context.gxExactClipMask([0, 0, 0, 1]), 0);
+  assert.equal(context.gxExactClipMask([0, 0, -1, 1]), 0);
+  assert.equal(context.gxExactClipMask([outside, 0, 0, 1]), 0x01);
+  assert.equal(context.gxExactClipMask([-outside, 0, 0, 1]), 0x02);
+  assert.equal(context.gxExactClipMask([0, outside, 0, 1]), 0x04);
+  assert.equal(context.gxExactClipMask([0, -outside, 0, 1]), 0x08);
+  assert.equal(context.gxExactClipMask([0, 0, 2 ** -149, 1]), 0x10);
+  assert.equal(context.gxExactClipMask([0, 0, -outside, 1]), 0x20);
+  assert.equal(context.gxExactClipMask([0, 0, 0, -1]), 0x2f);
+  assert.equal(context.gxExactClipMask([0, 0, 0, 0]), 0);
+  assert.equal(
+    context.gxExactClipMask([0, 0, 2 ** -80, 2 ** -80]),
+    0,
+    "the exact W*Z mask retains f32 underflow instead of the conservative certificate",
+  );
+  assert.equal(context.gxExactClipMask([Number.NaN, 0, 0, 1]), null);
+  assert.equal(context.gxExactClipMask([1e39, 0, 0, 1]), null);
+  assert.equal(context.gxExactClipMask(new Array(4)), null);
+  const sparsePayload = [0, 0, 0, 1];
+  sparsePayload.length = 5;
+  assert.equal(context.gxExactClipMask(sparsePayload), null);
+});
+
+test("ordered f32 clipping interpolates payloads and fans one outside vertex", () => {
+  const context = pureContext();
+  const triangle = [
+    [0, 0, -0.5, 1, 0],
+    [2, 0, -0.5, 1, 2],
+    [0, 1, -0.5, 1, 4],
+  ];
+  const polygon = context.gxExactClipPolygon(triangle, 0x01);
+  assert.deepEqual(plain(polygon), [
+    [0, 0, -0.5, 1, 0],
+    [1, 0, -0.5, 1, 1],
+    [1, 0.5, -0.5, 1, 3],
+    [0, 1, -0.5, 1, 4],
+  ]);
+  assert.deepEqual(
+    plain(context.gxExactTriangulateClipPolygon(polygon)),
+    [
+      [polygon[0], polygon[1], polygon[2]],
+      [polygon[0], polygon[2], polygon[3]],
+    ].map(plain),
+  );
+
+  const interpolated = context.gxExactClipVertex(
+    0.17358385026454926,
+    [0, 0, 0, 1, 18364432],
+    [0, 0, 0, 1, -8323480.5],
+  );
+  assert.equal(
+    f32Bits(interpolated[4]),
+    0x4b518802,
+    "OUT + f32((IN - OUT) * T) must not collapse into one late-f64 expression",
+  );
+  assert.equal(
+    f32Bits(
+      Math.fround(
+        18364432
+        + (-8323480.5 - 18364432) * Math.fround(0.17358385026454926),
+      ),
+    ),
+    0x4b518801,
+  );
+});
+
+test("ordered polygon walk clips every plane and preserves boundary transitions", () => {
+  const context = pureContext();
+  const insideA = [0, 0, -0.5, 1];
+  const insideB = [0, 0.5, -0.5, 1];
+  const cases = [
+    [0x01, [2, 0, -0.5, 1], [-1, 0, 0, 1]],
+    [0x02, [-2, 0, -0.5, 1], [1, 0, 0, 1]],
+    [0x04, [0, 2, -0.5, 1], [0, -1, 0, 1]],
+    [0x08, [0, -2, -0.5, 1], [0, 1, 0, 1]],
+    [0x10, [0, 0, -0.5, -1], [0, 0, 0, 1]],
+    [0x20, [0, 0, -2, 1], [0, 0, 1, 1]],
+  ];
+  for (const [bit, outside, plane] of cases) {
+    const polygon = context.gxExactClipPolygon(
+      [insideA, outside, insideB],
+      bit,
+    );
+    assert.equal(polygon.length, 4, `plane bit ${bit.toString(16)}`);
+    const distances = polygon.map(vertex =>
+      context.gxExactClipPlaneDistance(vertex, plane)
+    );
+    assert.equal(
+      distances.filter(distance => Object.is(distance, 0)).length,
+      2,
+      `plane bit ${bit.toString(16)} emits both boundary intersections`,
+    );
+    assert.ok(distances.every(distance => distance >= 0));
+  }
+
+  assert.equal(
+    context.gxExactClipPolygon(
+      [
+        [0, 0, -0.5, 1],
+        [2, 0, -0.5, 1],
+        [2, 1, -0.5, 1],
+      ],
+      0x01,
+    ).length,
+    3,
+    "two outside vertices reduce to one triangle",
+  );
+
+  const multiPlane = context.gxExactClipPolygon(
+    [
+      [0, 0, -0.5, 1],
+      [2, 2, -0.5, 1],
+      [0, 0.5, -0.5, 1],
+    ],
+    0x01 | 0x04,
+  );
+  assert.deepEqual(plain(multiPlane), [
+    [0, 0, -0.5, 1],
+    [1, 1, -0.5, 1],
+    [1, 1, -0.5, 1],
+    [0.6666666269302368, 1, -0.5, 1],
+    [0, 0.5, -0.5, 1],
+  ]);
+  assert.equal(f32Bits(multiPlane[3][0]), 0x3f2aaaaa);
+  assert.equal(
+    context.gxExactTriangulateClipPolygon(multiPlane).length,
+    3,
+    "the literal GX transition rule retains its on-plane duplicate fan vertex",
+  );
+});
+
+test("exact triangle processing rejects, culls, reorders, and clips in GX order", () => {
+  const context = pureContext();
+  const front = [
+    [0, 0, -0.5, 1, 0],
+    [2, 0, -0.5, 1, 2],
+    [0, 1, -0.5, 1, 4],
+  ];
+  const back = [front[0], front[2], front[1]];
+  const frontTriangles = context.gxExactPostClipTriangles(front, 0, -264);
+  assert.equal(frontTriangles.length, 2);
+  assert.deepEqual(
+    plain(context.gxExactPostClipTriangles(back, 0, -264)),
+    plain(frontTriangles),
+    "backfaces reorder 021 before the ordered plane walk",
+  );
+  assert.equal(
+    context.gxExactPostClipTriangles(front, 1, -264).length,
+    0,
+    "GX back-cull mode rejects the front-facing source triangle",
+  );
+  assert.equal(
+    context.gxExactPostClipTriangles(
+      [
+        [2, 0, -0.5, 1],
+        [2, 1, -0.5, 1],
+        [2, -1, -0.5, 1],
+      ],
+      0,
+      -264,
+    ).length,
+    0,
+    "the per-vertex mask AND trivially rejects before culling",
+  );
+
+  const mixedPositiveZ = [
+    [0, 0, -0.5, 1],
+    [1, 0, 0.25, 1],
+    [0, 1, -0.5, 1],
+  ];
+  assert.deepEqual(
+    plain(context.gxExactPostClipTriangles(mixedPositiveZ, 0, -264)),
+    [mixedPositiveZ],
+    "Dolphin's +Z mask deliberately walks the W >= 0 polygon plane",
+  );
+  assert.equal(
+    context.gxExactPostClipTriangles(
+      mixedPositiveZ.map(vertex => [vertex[0], vertex[1], 0.25, 1]),
+      0,
+      -264,
+    ).length,
+    0,
+    "three positive-Z masks still trigger the earlier trivial reject",
+  );
+  assert.equal(context.gxExactPostClipTriangles(null, 0, -264), null);
+  assert.equal(context.gxExactClipPolygon(front, 0x40), null);
+  assert.equal(
+    context.gxExactPostClipTriangles([front[0], , front[2]], 0, -264),
+    null,
+  );
+  assert.equal(
+    context.gxExactClipPolygon([front[0], , front[2]], 0),
+    null,
+  );
+  assert.equal(
+    context.gxExactPostClipTriangles(front, 0, 1e-300),
+    null,
+    "viewport height is certified after conversion to f32",
   );
 });
 

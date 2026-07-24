@@ -8010,6 +8010,227 @@ const TEMPLATE: &str = r##"<!doctype html>
         : gxExactNoWrapScreenPosition(clip, viewportState);
     }
 
+    function gxExactClipVertexIsValid(vertex, componentCount = null) {
+      if (
+        !Array.isArray(vertex)
+        || vertex.length < 4
+        || (componentCount !== null && vertex.length !== componentCount)
+      ) {
+        return false;
+      }
+      for (let component = 0; component < vertex.length; component += 1) {
+        if (
+          !Object.prototype.hasOwnProperty.call(vertex, component)
+          || !Number.isFinite(vertex[component])
+          || !Number.isFinite(gxCullF32(vertex[component]))
+        ) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function gxExactClipVertexListIsValid(
+      vertices,
+      minimumCount,
+      maximumCount = null
+    ) {
+      if (
+        !Array.isArray(vertices)
+        || !Number.isInteger(minimumCount)
+        || minimumCount < 0
+        || vertices.length < minimumCount
+        || (
+          maximumCount !== null
+          && (
+            !Number.isInteger(maximumCount)
+            || maximumCount < minimumCount
+            || vertices.length > maximumCount
+          )
+        )
+      ) {
+        return false;
+      }
+      const componentCount = (
+        Object.prototype.hasOwnProperty.call(vertices, 0)
+        && Array.isArray(vertices[0])
+      )
+        ? vertices[0].length
+        : 0;
+      if (componentCount < 4) return false;
+      for (let vertex = 0; vertex < vertices.length; vertex += 1) {
+        if (
+          !Object.prototype.hasOwnProperty.call(vertices, vertex)
+          || !gxExactClipVertexIsValid(vertices[vertex], componentCount)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function gxExactClipMask(vertex) {
+      if (!gxExactClipVertexIsValid(vertex)) return null;
+      const x = gxCullF32(vertex[0]);
+      const y = gxCullF32(vertex[1]);
+      const z = gxCullF32(vertex[2]);
+      const w = gxCullF32(vertex[3]);
+      let mask = 0;
+      if (gxCullSub(w, x) < 0) mask |= 0x01;
+      if (gxCullAdd(x, w) < 0) mask |= 0x02;
+      if (gxCullSub(w, y) < 0) mask |= 0x04;
+      if (gxCullAdd(y, w) < 0) mask |= 0x08;
+      if (gxCullMul(w, z) > 0) mask |= 0x10;
+      if (gxCullAdd(z, w) < 0) mask |= 0x20;
+      return mask;
+    }
+
+    function gxExactClipDifferentSigns(left, right) {
+      return (
+        (left <= 0 && right > 0)
+        || (left > 0 && right <= 0)
+      );
+    }
+
+    function gxExactClipPlaneDistance(vertex, plane) {
+      if (
+        !gxExactClipVertexIsValid(vertex)
+        || !Array.isArray(plane)
+        || plane.length !== 4
+        || plane.some(
+          value => !Number.isFinite(value) || !Number.isFinite(gxCullF32(value))
+        )
+      ) {
+        return null;
+      }
+      const distance = gxCullDot4(plane, vertex);
+      return Number.isFinite(distance) ? distance : null;
+    }
+
+    function gxExactClipVertex(t, outVertex, inVertex) {
+      if (
+        !gxExactClipVertexIsValid(outVertex)
+        || !gxExactClipVertexIsValid(inVertex, outVertex.length)
+        || !Number.isFinite(t)
+      ) {
+        return null;
+      }
+      t = gxCullF32(t);
+      if (!Number.isFinite(t) || t < 0 || t > 1) return null;
+      const vertex = outVertex.map((outComponent, component) =>
+        gxCullAdd(
+          outComponent,
+          gxCullMul(gxCullSub(inVertex[component], outComponent), t)
+        )
+      );
+      return vertex.every(Number.isFinite) ? vertex : null;
+    }
+
+    function gxExactClipPolygon(vertices, mask) {
+      if (
+        !gxExactClipVertexListIsValid(vertices, 3)
+        || !Number.isInteger(mask)
+        || mask < 0
+        || mask > 0x3f
+      ) {
+        return null;
+      }
+      let input = vertices.map(vertex => vertex.map(gxCullF32));
+      const planes = [
+        [0x01, [-1, 0, 0, 1]],
+        [0x02, [1, 0, 0, 1]],
+        [0x04, [0, -1, 0, 1]],
+        [0x08, [0, 1, 0, 1]],
+        // Dolphin's triangle clipper intentionally walks W >= 0 for +Z.
+        [0x10, [0, 0, 0, 1]],
+        [0x20, [0, 0, 1, 1]],
+      ];
+      for (const [planeBit, plane] of planes) {
+        if ((mask & planeBit) === 0) continue;
+        const output = [];
+        let previous = input[0];
+        let previousDistance = gxExactClipPlaneDistance(previous, plane);
+        if (previousDistance === null) return null;
+        for (let index = 1; index <= input.length; index += 1) {
+          const current = input[index % input.length];
+          const distance = gxExactClipPlaneDistance(current, plane);
+          if (distance === null) return null;
+          if (previousDistance >= 0) output.push(previous);
+          if (gxExactClipDifferentSigns(distance, previousDistance)) {
+            let t;
+            let outVertex;
+            let inVertex;
+            if (distance < 0) {
+              t = gxCullDiv(distance, gxCullSub(distance, previousDistance));
+              outVertex = current;
+              inVertex = previous;
+            } else {
+              t = gxCullDiv(
+                previousDistance,
+                gxCullSub(previousDistance, distance)
+              );
+              outVertex = previous;
+              inVertex = current;
+            }
+            const intersection = gxExactClipVertex(t, outVertex, inVertex);
+            if (intersection === null) return null;
+            output.push(intersection);
+          }
+          previous = current;
+          previousDistance = distance;
+        }
+        if (output.length < 3) return [];
+        input = output;
+      }
+      return input;
+    }
+
+    function gxExactTriangulateClipPolygon(polygon) {
+      if (
+        !gxExactClipVertexListIsValid(polygon, 3)
+      ) {
+        return null;
+      }
+      const triangles = [[polygon[0], polygon[1], polygon[2]]];
+      for (let vertex = 3; vertex < polygon.length; vertex += 1) {
+        triangles.push([polygon[0], polygon[vertex - 1], polygon[vertex]]);
+      }
+      return triangles;
+    }
+
+    function gxExactPostClipTriangles(triangle, cullMode, viewportHeight) {
+      if (
+        !gxExactClipVertexListIsValid(triangle, 3, 3)
+        || !Number.isInteger(cullMode)
+        || cullMode < 0
+        || cullMode > 3
+        || !Number.isFinite(viewportHeight)
+      ) {
+        return null;
+      }
+      viewportHeight = gxCullF32(viewportHeight);
+      if (!Number.isFinite(viewportHeight) || viewportHeight === 0) return null;
+      const masks = triangle.map(gxExactClipMask);
+      if (masks.some(mask => mask === null)) return null;
+      if ((masks[0] & masks[1] & masks[2]) !== 0) return [];
+      const action = gxPostCullActionFromNormal(
+        gxCullNormalZ3(triangle[0], triangle[1], triangle[2]),
+        cullMode,
+        viewportHeight
+      );
+      if (action === null) return null;
+      if ((action & 2) === 0) return [];
+      const ordered = (action & 1) === 0
+        ? triangle
+        : [triangle[0], triangle[2], triangle[1]];
+      const polygon = gxExactClipPolygon(
+        ordered,
+        masks[0] | masks[1] | masks[2]
+      );
+      if (polygon === null || polygon.length === 0) return polygon;
+      return gxExactTriangulateClipPolygon(polygon);
+    }
+
     function gxCullClipPositionIsInside(clip) {
       if (
         !Array.isArray(clip)
