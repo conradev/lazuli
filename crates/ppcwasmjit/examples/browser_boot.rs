@@ -7790,6 +7790,116 @@ const TEMPLATE: &str = r##"<!doctype html>
       return Math.min(theoreticalLevels, requestedLevels);
     }
 
+    // Future V7 activation must call this with the raw BP words before
+    // gxTextureSamplerState canonicalizes legacy V6 sampling state.
+    function gxStrictV7TexturePreflight(rawMode0, rawMode1, format, width, height) {
+      const reject = reason => ({ accepted: false, reason });
+      const isUint32 = value =>
+        Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+      if (!isUint32(rawMode0)) return reject("invalid-mode0");
+      if (!isUint32(rawMode1)) return reject("invalid-mode1");
+      if ((rawMode0 & (~0x0039ffff >>> 0)) !== 0) {
+        return reject("noncanonical-mode0-bits");
+      }
+      if ((rawMode1 & (~0x0000ffff >>> 0)) !== 0) {
+        return reject("noncanonical-mode1-bits");
+      }
+
+      const mode0 = rawMode0 >>> 0;
+      const mode1 = rawMode1 >>> 0;
+      const minFilter = (mode0 >>> 5) & 7;
+      const mipMode = minFilter & 3;
+      if (mipMode === 3) return reject("reserved-min-filter");
+      if ((mode0 & (1 << 21)) !== 0) {
+        return reject("unsupported-lod-bias-clamp");
+      }
+      const anisotropyRaw = (mode0 >>> 19) & 3;
+      if (anisotropyRaw === 3) return reject("reserved-anisotropy");
+      if (anisotropyRaw !== 0) return reject("unsupported-anisotropy");
+
+      const supportedFormat =
+        Number.isInteger(format)
+        && (
+          (format >= 0 && format <= 6)
+          || format === 8
+          || format === 9
+          || format === 10
+          || format === 14
+        );
+      if (!supportedFormat) return reject("unsupported-texture-format");
+      if (
+        !Number.isInteger(width)
+        || !Number.isInteger(height)
+        || width < 1
+        || height < 1
+        || width > 1024
+        || height > 1024
+      ) {
+        return reject("invalid-texture-dimensions");
+      }
+
+      const usesMipFilter = mipMode !== 0;
+      const powerOfTwo = value => (value & (value - 1)) === 0;
+      const wrapS = mode0 & 3;
+      const wrapT = (mode0 >>> 2) & 3;
+      if ((wrapS === 1 || wrapS === 2) && !powerOfTwo(width)) {
+        return reject("wrap-s-requires-power-of-two-width");
+      }
+      if ((wrapT === 1 || wrapT === 2) && !powerOfTwo(height)) {
+        return reject("wrap-t-requires-power-of-two-height");
+      }
+      if (usesMipFilter && (!powerOfTwo(width) || !powerOfTwo(height))) {
+        return reject("mipped-texture-must-be-power-of-two");
+      }
+      if ((format === 8 || format === 9 || format === 10) && mipMode === 2) {
+        return reject("ci-texture-cannot-use-mip-linear");
+      }
+
+      const levelCount = gxTextureMipCount(width, height, mode0, mode1);
+      if (!Number.isInteger(levelCount) || levelCount < 1) {
+        return reject("invalid-mip-state");
+      }
+
+      const lodMinRaw = mode1 & 0xff;
+      const lodMaxRaw = (mode1 >>> 8) & 0xff;
+      const residentMax = Math.min(0xff, (levelCount - 1) * 16);
+      const effectiveLodMaxRaw = usesMipFilter
+        ? Math.min(lodMaxRaw, residentMax)
+        : 0;
+      const effectiveLodMinRaw = usesMipFilter
+        ? Math.min(lodMinRaw, effectiveLodMaxRaw)
+        : 0;
+      const lodBiasRaw = (mode0 >>> 9) & 0xff;
+      const signedLodBiasRaw = lodBiasRaw < 0x80
+        ? lodBiasRaw
+        : lodBiasRaw - 0x100;
+      return {
+        accepted: true,
+        classification: usesMipFilter && levelCount > 1
+          ? "genuine-mip"
+          : "base-only-companion",
+        mode0,
+        mode1,
+        format,
+        width,
+        height,
+        levelCount,
+        minFilter,
+        mipMode,
+        magLinear: (mode0 & (1 << 4)) !== 0,
+        minLinear: (mode0 & (1 << 7)) !== 0,
+        diagonalLod: (mode0 & (1 << 8)) !== 0,
+        lodBiasRaw,
+        lodBiasSixteenths: usesMipFilter ? signedLodBiasRaw >> 1 : 0,
+        lodMinRaw,
+        lodMaxRaw,
+        effectiveLodMinRaw,
+        effectiveLodMaxRaw,
+        wrapS,
+        wrapT,
+      };
+    }
+
     function gxTextureMipChainLayout(width, height, layout, mode0, mode1) {
       const levelCount = gxTextureMipCount(width, height, mode0, mode1);
       if (levelCount === null) return null;
