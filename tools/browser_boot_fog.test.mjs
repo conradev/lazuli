@@ -119,11 +119,11 @@ test("WebGPU fog consumes theoretical post-Z-texture depth before destination al
   );
   assert.match(
     fragment,
-    /let values = tev_fragment_values\(input, false, false\)/,
+    /fn fs_main\(input: TevVertexOutput\)[\s\S]*?let values = tev_fragment_values\([\s\S]*?\n        false,\n        false,\n    \);/,
   );
   assert.match(
     fragment,
-    /let values = tev_fragment_values\(input, true, false\)/,
+    /fn fs_depth_main\(input: TevVertexOutput\)[\s\S]*?let values = tev_fragment_values\([\s\S]*?\n        true,\n        false,\n    \);/,
   );
   assert.match(fragment, /values\.buffer_depth = buffer_depth/);
   assert.match(

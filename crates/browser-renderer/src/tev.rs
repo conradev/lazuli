@@ -634,8 +634,8 @@ const _: () = {
 /// - bind this block at group 1;
 /// - upload one [`TevDrawState`] at binding 0;
 /// - bind texture maps 0..7 at bindings 1..8 and their samplers at 9..16;
-/// - call `tev_evaluate(raster_colors, tex_coords, managed_exact_sampler)` from a
-///   fragment entry point;
+/// - call `tev_evaluate(raster_colors, managed_raster_bytes, tex_coords,
+///   managed_exact_sampler)` from a fragment entry point;
 /// - provide GX-scaled, texel-space STQ coordinates; sampling performs `st / q`
 ///   in the fragment stage so interpolation remains projective, then only the
 ///   native hardware-sampler path normalizes by the selected map dimensions.
@@ -686,10 +686,10 @@ struct TevVertexOutput {
 
 struct ManagedCoverageVertexInput {
     @location(0) position: vec4<f32>,
-    @location(1) raster0: vec4<f32>,
-    @location(2) raster1: vec4<f32>,
-    @location(3) stq0: vec3<f32>,
-    @location(4) stq1: vec3<f32>,
+    @location(1) raster0_endpoints: vec4<u32>,
+    @location(2) raster1_endpoints: vec4<u32>,
+    @location(3) source_x_bits: vec3<u32>,
+    @location(4) source_y_bits: vec3<u32>,
     @location(5) stq2: vec3<f32>,
     @location(6) stq3: vec3<f32>,
     @location(7) stq4: vec3<f32>,
@@ -700,10 +700,10 @@ struct ManagedCoverageVertexInput {
 
 struct ManagedCoverageVertexOutput {
     @invariant @builtin(position) position: vec4<f32>,
-    @location(0) @interpolate(flat) raster0: vec4<f32>,
-    @location(1) @interpolate(flat) raster1: vec4<f32>,
-    @location(2) @interpolate(flat) stq0: vec3<f32>,
-    @location(3) @interpolate(flat) stq1: vec3<f32>,
+    @location(0) @interpolate(flat) raster0_endpoints: vec3<u32>,
+    @location(1) @interpolate(flat) raster1_endpoints: vec3<u32>,
+    @location(2) @interpolate(flat) source_x_bits: vec3<u32>,
+    @location(3) @interpolate(flat) source_y_bits: vec3<u32>,
     @location(4) @interpolate(flat) stq2: vec3<f32>,
     @location(5) @interpolate(flat) stq3: vec3<f32>,
     @location(6) @interpolate(flat) stq4: vec3<f32>,
@@ -812,10 +812,10 @@ fn vs_managed_coverage(
         (input.position.z / 16777215.0) * input.position.w,
         input.position.w,
     );
-    output.raster0 = input.raster0;
-    output.raster1 = input.raster1;
-    output.stq0 = input.stq0;
-    output.stq1 = input.stq1;
+    output.raster0_endpoints = input.raster0_endpoints.xyz;
+    output.raster1_endpoints = input.raster1_endpoints.xyz;
+    output.source_x_bits = input.source_x_bits;
+    output.source_y_bits = input.source_y_bits;
     output.stq2 = input.stq2;
     output.stq3 = input.stq3;
     output.stq4 = input.stq4;
@@ -829,13 +829,424 @@ fn vs_managed_coverage(
     return output;
 }
 
+const SF32_SIGN_MASK = 0x80000000u;
+const SF32_EXPONENT_MASK = 0x7f800000u;
+const SF32_FRACTION_MASK = 0x007fffffu;
+const SF32_INFINITY = 0x7f800000u;
+const SF32_CANONICAL_NAN = 0x7fc00000u;
+
+struct Sf32Parts {
+    sign: u32,
+    exponent: i32,
+    significand: u32,
+};
+
+struct Sf32U64 {
+    high: u32,
+    low: u32,
+};
+
+fn sf32_is_nan(bits: u32) -> bool {
+    return (bits & SF32_EXPONENT_MASK) == SF32_EXPONENT_MASK
+        && (bits & SF32_FRACTION_MASK) != 0u;
+}
+
+fn sf32_is_infinite(bits: u32) -> bool {
+    return (bits & 0x7fffffffu) == SF32_INFINITY;
+}
+
+fn sf32_is_zero(bits: u32) -> bool {
+    return (bits & 0x7fffffffu) == 0u;
+}
+
+fn sf32_decode_finite_nonzero(bits: u32) -> Sf32Parts {
+    let exponent_field = (bits >> 23u) & 0xffu;
+    var exponent = i32(exponent_field) - 127;
+    var significand = bits & SF32_FRACTION_MASK;
+    if exponent_field == 0u {
+        let shift = countLeadingZeros(significand) - 8u;
+        significand <<= shift;
+        exponent = -126 - i32(shift);
+    } else {
+        significand |= 0x00800000u;
+    }
+    var parts: Sf32Parts;
+    parts.sign = bits & SF32_SIGN_MASK;
+    parts.exponent = exponent;
+    parts.significand = significand;
+    return parts;
+}
+
+fn sf32_shift_right_jam(value: u32, distance: u32) -> u32 {
+    if distance == 0u {
+        return value;
+    }
+    if distance < 32u {
+        let shifted = value >> distance;
+        let discarded = (value << (32u - distance)) != 0u;
+        return shifted | select(0u, 1u, discarded);
+    }
+    return select(0u, 1u, value != 0u);
+}
+
+fn sf32_round_pack(sign: u32, initial_exponent: i32, initial_significand: u32) -> u32 {
+    var exponent = initial_exponent;
+    var significand = initial_significand;
+    if significand == 0u {
+        return sign;
+    }
+    if significand >= 0x08000000u {
+        significand = sf32_shift_right_jam(significand, 1u);
+        exponent += 1;
+    }
+    loop {
+        if significand >= 0x04000000u {
+            break;
+        }
+        significand <<= 1u;
+        exponent -= 1;
+    }
+    if exponent < -126 {
+        significand = sf32_shift_right_jam(significand, u32(-126 - exponent));
+        exponent = -126;
+    }
+    let round_bits = significand & 7u;
+    var rounded = significand >> 3u;
+    if round_bits > 4u || (round_bits == 4u && (rounded & 1u) != 0u) {
+        rounded += 1u;
+    }
+    if rounded >= 0x01000000u {
+        rounded >>= 1u;
+        exponent += 1;
+    }
+    if exponent > 127 {
+        return sign | SF32_INFINITY;
+    }
+    if rounded == 0u {
+        return sign;
+    }
+    var exponent_field = 0u;
+    if exponent != -126 || rounded >= 0x00800000u {
+        exponent_field = u32(exponent + 127);
+    }
+    return sign | (exponent_field << 23u) | (rounded & SF32_FRACTION_MASK);
+}
+
+fn sf32_add(left_bits: u32, right_bits: u32) -> u32 {
+    if sf32_is_nan(left_bits) || sf32_is_nan(right_bits) {
+        return SF32_CANONICAL_NAN;
+    }
+    let left_infinite = sf32_is_infinite(left_bits);
+    let right_infinite = sf32_is_infinite(right_bits);
+    if left_infinite || right_infinite {
+        if left_infinite && right_infinite
+            && ((left_bits ^ right_bits) & SF32_SIGN_MASK) != 0u {
+            return SF32_CANONICAL_NAN;
+        }
+        return select(right_bits, left_bits, left_infinite);
+    }
+    let left_zero = sf32_is_zero(left_bits);
+    let right_zero = sf32_is_zero(right_bits);
+    if left_zero && right_zero {
+        return (left_bits & right_bits) & SF32_SIGN_MASK;
+    }
+    if left_zero {
+        return right_bits;
+    }
+    if right_zero {
+        return left_bits;
+    }
+
+    var large_bits = left_bits;
+    var small_bits = right_bits;
+    if (large_bits & 0x7fffffffu) < (small_bits & 0x7fffffffu) {
+        let swap = large_bits;
+        large_bits = small_bits;
+        small_bits = swap;
+    }
+    if (large_bits & 0x7fffffffu) == (small_bits & 0x7fffffffu)
+        && ((large_bits ^ small_bits) & SF32_SIGN_MASK) != 0u {
+        return 0u;
+    }
+
+    let large = sf32_decode_finite_nonzero(large_bits);
+    let small = sf32_decode_finite_nonzero(small_bits);
+    let exponent_distance = u32(large.exponent - small.exponent);
+    let large_significand = large.significand << 3u;
+    let small_significand =
+        sf32_shift_right_jam(small.significand << 3u, exponent_distance);
+    var result_significand: u32;
+    if ((large_bits ^ small_bits) & SF32_SIGN_MASK) == 0u {
+        result_significand = large_significand + small_significand;
+    } else {
+        result_significand = large_significand - small_significand;
+    }
+    return sf32_round_pack(large.sign, large.exponent, result_significand);
+}
+
+fn sf32_sub(left_bits: u32, right_bits: u32) -> u32 {
+    return sf32_add(left_bits, right_bits ^ SF32_SIGN_MASK);
+}
+
+fn sf32_mul_u24(left: u32, right: u32) -> Sf32U64 {
+    let left_low = left & 0xffffu;
+    let left_high = left >> 16u;
+    let right_low = right & 0xffffu;
+    let right_high = right >> 16u;
+    let low_product = left_low * right_low;
+    let cross0 = left_low * right_high;
+    let cross1 = left_high * right_low;
+    var low = low_product;
+    var high = left_high * right_high;
+    var added = low + (cross0 << 16u);
+    high += (cross0 >> 16u) + select(0u, 1u, added < low);
+    low = added;
+    added = low + (cross1 << 16u);
+    high += (cross1 >> 16u) + select(0u, 1u, added < low);
+    low = added;
+    var product: Sf32U64;
+    product.high = high;
+    product.low = low;
+    return product;
+}
+
+fn sf32_u64_shift_right_jam(value: Sf32U64, distance: u32) -> u32 {
+    // The 24x24 product path calls this with 20 or 21. Keeping the bounded
+    // range explicit avoids backend-dependent shifts by the word width.
+    let shifted = (value.low >> distance) | (value.high << (32u - distance));
+    let discarded = (value.low << (32u - distance)) != 0u;
+    return shifted | select(0u, 1u, discarded);
+}
+
+fn sf32_mul(left_bits: u32, right_bits: u32) -> u32 {
+    if sf32_is_nan(left_bits) || sf32_is_nan(right_bits) {
+        return SF32_CANONICAL_NAN;
+    }
+    let sign = (left_bits ^ right_bits) & SF32_SIGN_MASK;
+    let left_infinite = sf32_is_infinite(left_bits);
+    let right_infinite = sf32_is_infinite(right_bits);
+    let left_zero = sf32_is_zero(left_bits);
+    let right_zero = sf32_is_zero(right_bits);
+    if (left_infinite && right_zero) || (right_infinite && left_zero) {
+        return SF32_CANONICAL_NAN;
+    }
+    if left_infinite || right_infinite {
+        return sign | SF32_INFINITY;
+    }
+    if left_zero || right_zero {
+        return sign;
+    }
+    let left = sf32_decode_finite_nonzero(left_bits);
+    let right = sf32_decode_finite_nonzero(right_bits);
+    let product = sf32_mul_u24(left.significand, right.significand);
+    let leading_bit_47 = (product.high & 0x00008000u) != 0u;
+    let distance = select(20u, 21u, leading_bit_47);
+    let exponent = left.exponent + right.exponent + select(0, 1, leading_bit_47);
+    let significand = sf32_u64_shift_right_jam(product, distance);
+    return sf32_round_pack(sign, exponent, significand);
+}
+
+fn sf32_div(numerator_bits: u32, denominator_bits: u32) -> u32 {
+    if sf32_is_nan(numerator_bits) || sf32_is_nan(denominator_bits) {
+        return SF32_CANONICAL_NAN;
+    }
+    let sign = (numerator_bits ^ denominator_bits) & SF32_SIGN_MASK;
+    let numerator_infinite = sf32_is_infinite(numerator_bits);
+    let denominator_infinite = sf32_is_infinite(denominator_bits);
+    let numerator_zero = sf32_is_zero(numerator_bits);
+    let denominator_zero = sf32_is_zero(denominator_bits);
+    if (numerator_infinite && denominator_infinite) || (numerator_zero && denominator_zero) {
+        return SF32_CANONICAL_NAN;
+    }
+    if numerator_infinite || denominator_zero {
+        return sign | SF32_INFINITY;
+    }
+    if numerator_zero || denominator_infinite {
+        return sign;
+    }
+    let numerator = sf32_decode_finite_nonzero(numerator_bits);
+    let denominator = sf32_decode_finite_nonzero(denominator_bits);
+    var exponent = numerator.exponent - denominator.exponent;
+    var remainder = numerator.significand;
+    if remainder < denominator.significand {
+        remainder <<= 1u;
+        exponent -= 1;
+    }
+    remainder -= denominator.significand;
+    var quotient = 1u;
+    for (var bit = 0u; bit < 26u; bit += 1u) {
+        remainder <<= 1u;
+        quotient <<= 1u;
+        if remainder >= denominator.significand {
+            remainder -= denominator.significand;
+            quotient |= 1u;
+        }
+    }
+    if remainder != 0u {
+        quotient |= 1u;
+    }
+    return sf32_round_pack(sign, exponent, quotient);
+}
+
+fn sf32_from_u32(value: u32) -> u32 {
+    if value == 0u {
+        return 0u;
+    }
+    var highest_bit = 31u - countLeadingZeros(value);
+    var significand: u32;
+    if highest_bit <= 23u {
+        significand = value << (23u - highest_bit);
+    } else {
+        let distance = highest_bit - 23u;
+        significand = value >> distance;
+        let discarded_mask = (1u << distance) - 1u;
+        let discarded = value & discarded_mask;
+        let halfway = 1u << (distance - 1u);
+        if discarded > halfway || (discarded == halfway && (significand & 1u) != 0u) {
+            significand += 1u;
+        }
+        if significand == 0x01000000u {
+            significand >>= 1u;
+            highest_bit += 1u;
+        }
+    }
+    return ((highest_bit + 127u) << 23u) | (significand & SF32_FRACTION_MASK);
+}
+
+fn sf32_to_gx_u8(bits: u32) -> u32 {
+    if (bits & SF32_SIGN_MASK) != 0u || sf32_is_nan(bits) || sf32_is_zero(bits) {
+        return 0u;
+    }
+    if sf32_is_infinite(bits) || bits >= 0x437f0000u {
+        return 255u;
+    }
+    let exponent_field = (bits >> 23u) & 0xffu;
+    if exponent_field < 127u {
+        return 0u;
+    }
+    let exponent = exponent_field - 127u;
+    let significand = (bits & SF32_FRACTION_MASK) | 0x00800000u;
+    return significand >> (23u - exponent);
+}
+
+fn gx_managed_unpack_rgba8(packed: u32) -> vec4<u32> {
+    return vec4<u32>(
+        packed & 0xffu,
+        (packed >> 8u) & 0xffu,
+        (packed >> 16u) & 0xffu,
+        packed >> 24u,
+    );
+}
+
+fn gx_managed_soft_attribute_at_sample(
+    source_x_bits: vec3<u32>,
+    source_y_bits: vec3<u32>,
+    attribute_bits: vec3<u32>,
+    sample_x_bits: u32,
+    sample_y_bits: u32,
+) -> u32 {
+    let dx10 = sf32_sub(source_x_bits.y, source_x_bits.x);
+    let dx20 = sf32_sub(source_x_bits.z, source_x_bits.x);
+    let dy10 = sf32_sub(source_y_bits.y, source_y_bits.x);
+    let dy20 = sf32_sub(source_y_bits.z, source_y_bits.x);
+    let delta20 = sf32_sub(attribute_bits.z, attribute_bits.x);
+    let delta10 = sf32_sub(attribute_bits.y, attribute_bits.x);
+    let a_left = sf32_mul(delta20, dy10);
+    let a_right = sf32_mul(delta10, dy20);
+    let a = sf32_sub(a_left, a_right);
+    let b_left = sf32_mul(dx20, delta10);
+    let b_right = sf32_mul(dx10, delta20);
+    let b = sf32_sub(b_left, b_right);
+    let c_left = sf32_mul(dx20, dy10);
+    let c_right = sf32_mul(dx10, dy20);
+    let c = sf32_sub(c_left, c_right);
+    let dfdx = sf32_div(a, c);
+    let dfdy = sf32_div(b, c);
+    let sample_dx = sf32_sub(sample_x_bits, source_x_bits.x);
+    let sample_dy = sf32_sub(sample_y_bits, source_y_bits.x);
+    let x_term = sf32_mul(dfdx, sample_dx);
+    let y_term = sf32_mul(dfdy, sample_dy);
+    let x_value = sf32_add(attribute_bits.x, x_term);
+    return sf32_add(x_value, y_term);
+}
+
+fn gx_managed_raster_color_bytes_at_sample(
+    source_x_bits: vec3<u32>,
+    source_y_bits: vec3<u32>,
+    packed_endpoints: vec3<u32>,
+    sample_x_bits: u32,
+    sample_y_bits: u32,
+) -> vec4<i32> {
+    let endpoint0 = gx_managed_unpack_rgba8(packed_endpoints.x);
+    let endpoint1 = gx_managed_unpack_rgba8(packed_endpoints.y);
+    let endpoint2 = gx_managed_unpack_rgba8(packed_endpoints.z);
+    let bytes = vec4<i32>(
+        i32(sf32_to_gx_u8(gx_managed_soft_attribute_at_sample(
+            source_x_bits, source_y_bits,
+            vec3<u32>(
+                sf32_from_u32(endpoint0.r),
+                sf32_from_u32(endpoint1.r),
+                sf32_from_u32(endpoint2.r),
+            ),
+            sample_x_bits, sample_y_bits,
+        ))),
+        i32(sf32_to_gx_u8(gx_managed_soft_attribute_at_sample(
+            source_x_bits, source_y_bits,
+            vec3<u32>(
+                sf32_from_u32(endpoint0.g),
+                sf32_from_u32(endpoint1.g),
+                sf32_from_u32(endpoint2.g),
+            ),
+            sample_x_bits, sample_y_bits,
+        ))),
+        i32(sf32_to_gx_u8(gx_managed_soft_attribute_at_sample(
+            source_x_bits, source_y_bits,
+            vec3<u32>(
+                sf32_from_u32(endpoint0.b),
+                sf32_from_u32(endpoint1.b),
+                sf32_from_u32(endpoint2.b),
+            ),
+            sample_x_bits, sample_y_bits,
+        ))),
+        i32(sf32_to_gx_u8(gx_managed_soft_attribute_at_sample(
+            source_x_bits, source_y_bits,
+            vec3<u32>(
+                sf32_from_u32(endpoint0.a),
+                sf32_from_u32(endpoint1.a),
+                sf32_from_u32(endpoint2.a),
+            ),
+            sample_x_bits, sample_y_bits,
+        ))),
+    );
+    return bytes;
+}
+
+fn gx_managed_raster_colors(input: ManagedCoverageVertexOutput) -> array<vec4<i32>, 8> {
+    let pixel_x = u32(floor(input.position.x));
+    let pixel_y = u32(floor(input.position.y));
+    let sample_x_bits = sf32_div(sf32_from_u32(pixel_x * 12u + 7u), 0x41400000u);
+    let sample_y_bits = sf32_div(sf32_from_u32(pixel_y * 12u + 7u), 0x41400000u);
+    return array<vec4<i32>, 8>(
+        gx_managed_raster_color_bytes_at_sample(
+            input.source_x_bits, input.source_y_bits, input.raster0_endpoints,
+            sample_x_bits, sample_y_bits,
+        ),
+        gx_managed_raster_color_bytes_at_sample(
+            input.source_x_bits, input.source_y_bits, input.raster1_endpoints,
+            sample_x_bits, sample_y_bits,
+        ),
+        vec4<i32>(0), vec4<i32>(0), vec4<i32>(0),
+        vec4<i32>(0), vec4<i32>(0), vec4<i32>(0),
+    );
+}
+
 fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOutput {
     let sample_x_numerator = floor(input.position.x) * 12.0 + 7.0;
     let sample_y_numerator = floor(input.position.y) * 12.0 + 7.0;
     let sample_x = sample_x_numerator / 12.0;
     let sample_y = sample_y_numerator / 12.0;
-    let source_x = input.stq0;
-    let source_y = input.stq1;
+    let source_x = bitcast<vec3<f32>>(input.source_x_bits);
+    let source_y = bitcast<vec3<f32>>(input.source_y_bits);
     let inv_w = gx_managed_attribute_at_sample(
         source_x, source_y, input.stq2, sample_x, sample_y,
     );
@@ -865,8 +1276,10 @@ fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOu
 
     var output: TevVertexOutput;
     output.position = input.position;
-    output.raster0 = input.raster0;
-    output.raster1 = input.raster1;
+    // Managed raster colors bypass normalized-f32 TEV conversion. Their exact
+    // software-f32 byte vectors are passed separately to tev_fragment_values.
+    output.raster0 = vec4<f32>(0.0);
+    output.raster1 = vec4<f32>(0.0);
     output.stq0 = reconstructed_stq;
     output.stq1 = reconstructed_stq;
     output.stq2 = reconstructed_stq;
@@ -1382,6 +1795,7 @@ struct TevEvaluation {
 
 fn tev_evaluate(
     raster_colors: array<vec4<f32>, 8>,
+    managed_raster_bytes: array<vec4<i32>, 8>,
     tex_coords: array<vec3<f32>, 8>,
     managed_exact_sampler: bool,
 ) -> TevEvaluation {
@@ -1410,7 +1824,13 @@ fn tev_evaluate(
         let texture = tev_swizzle(texture_base, (stage.alpha_combiner >> 2u) & 3u);
         let raster_channel = (stage.refs >> 7u) & 7u;
         var raster_base = vec4<i32>(0);
-        if raster_channel != 7u { raster_base = tev_to_bytes(raster_colors[raster_channel]); }
+        if raster_channel != 7u {
+            if managed_exact_sampler {
+                raster_base = managed_raster_bytes[raster_channel];
+            } else {
+                raster_base = tev_to_bytes(raster_colors[raster_channel]);
+            }
+        }
         let raster = tev_swizzle(raster_base, stage.alpha_combiner & 3u);
         let color_konst = tev_konst_color(stage.konst_selectors & 31u);
         let alpha_konst = tev_konst_alpha((stage.konst_selectors >> 5u) & 31u);
@@ -1588,6 +2008,7 @@ fn gx_fog_color(source: vec4<u32>, position_x: f32, depth: u32) -> vec4<u32> {
 
 fn tev_fragment_values(
     input: TevVertexOutput,
+    managed_raster_bytes: array<vec4<i32>, 8>,
     needs_fragment_depth: bool,
     managed_exact_sampler: bool,
 ) -> TevFragmentValues {
@@ -1600,7 +2021,8 @@ fn tev_fragment_values(
         input.stq0, input.stq1, input.stq2, input.stq3,
         input.stq4, input.stq5, input.stq6, input.stq7,
     );
-    let evaluation = tev_evaluate(raster_colors, tex_coords, managed_exact_sampler);
+    let evaluation =
+        tev_evaluate(raster_colors, managed_raster_bytes, tex_coords, managed_exact_sampler);
     let source = evaluation.source;
     let tev_alpha = u32(round(clamp(source.a, 0.0, 1.0) * 255.0));
     if !alpha_test_passes(tev_alpha, draw_state.alpha_test) {
@@ -1644,7 +2066,15 @@ fn tev_fragment_values(
 
 @fragment
 fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
-    let values = tev_fragment_values(input, false, false);
+    let values = tev_fragment_values(
+        input,
+        array<vec4<i32>, 8>(
+            vec4<i32>(0), vec4<i32>(0), vec4<i32>(0), vec4<i32>(0),
+            vec4<i32>(0), vec4<i32>(0), vec4<i32>(0), vec4<i32>(0),
+        ),
+        false,
+        false,
+    );
     var output: TevFragmentOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1653,7 +2083,15 @@ fn fs_main(input: TevVertexOutput) -> TevFragmentOutput {
 
 @fragment
 fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput {
-    let values = tev_fragment_values(input, true, false);
+    let values = tev_fragment_values(
+        input,
+        array<vec4<i32>, 8>(
+            vec4<i32>(0), vec4<i32>(0), vec4<i32>(0), vec4<i32>(0),
+            vec4<i32>(0), vec4<i32>(0), vec4<i32>(0), vec4<i32>(0),
+        ),
+        true,
+        false,
+    );
     var output: TevFragmentDepthOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1667,7 +2105,12 @@ fn fs_managed_coverage_main(input: ManagedCoverageVertexOutput) -> TevFragmentOu
     if !gx_managed_coverage_passes(input) {
         discard;
     }
-    let values = tev_fragment_values(managed_coverage_tev_input(input), false, true);
+    let values = tev_fragment_values(
+        managed_coverage_tev_input(input),
+        gx_managed_raster_colors(input),
+        false,
+        true,
+    );
     var output: TevFragmentOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1681,7 +2124,12 @@ fn fs_managed_coverage_depth_main(
     if !gx_managed_coverage_passes(input) {
         discard;
     }
-    let values = tev_fragment_values(managed_coverage_tev_input(input), true, true);
+    let values = tev_fragment_values(
+        managed_coverage_tev_input(input),
+        gx_managed_raster_colors(input),
+        true,
+        true,
+    );
     var output: TevFragmentDepthOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -1698,6 +2146,10 @@ pub(crate) fn shader_source() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raster::{
+        GxRasterAttributePlaneF32, GxRasterPoint28_4, GxRasterScissor, GxRasterSetup,
+        GxRasterTriangle28_4, GxRasterWinding, gx_raster_channel_u8,
+    };
 
     fn refs(texture: u32, coord: u32, enabled: bool, raster: u32) -> u32 {
         texture | coord << 3 | u32::from(enabled) << 6 | raster << 7
@@ -2190,6 +2642,15 @@ mod tests {
         let managed_interfaces_start = shader.find("struct ManagedCoverageVertexInput").unwrap();
         let native_interfaces = &shader[native_interfaces_start..managed_interfaces_start];
         assert!(!native_interfaces.contains("packed_xy28_4"));
+        assert!(!native_interfaces.contains("raster0_endpoints"));
+        assert!(shader.contains("@location(1) raster0_endpoints: vec4<u32>"));
+        assert!(shader.contains("@location(2) raster1_endpoints: vec4<u32>"));
+        assert!(shader.contains("@location(0) @interpolate(flat) raster0_endpoints: vec3<u32>"));
+        assert!(shader.contains("@location(1) @interpolate(flat) raster1_endpoints: vec3<u32>"));
+        assert!(shader.contains("@location(3) source_x_bits: vec3<u32>"));
+        assert!(shader.contains("@location(4) source_y_bits: vec3<u32>"));
+        assert!(shader.contains("@location(2) @interpolate(flat) source_x_bits: vec3<u32>"));
+        assert!(shader.contains("@location(3) @interpolate(flat) source_y_bits: vec3<u32>"));
         assert!(shader.contains("@location(11) packed_xy28_4_depth0: vec4<i32>"));
         assert!(shader.contains("@location(12) depth12: vec2<i32>"));
         assert!(shader.contains("@location(10) @interpolate(flat) source_depth24: vec3<f32>"));
@@ -2230,9 +2691,48 @@ mod tests {
             .find("@vertex\nfn vs_managed_coverage(")
             .unwrap()
             + native_vertex_start;
+        let native_vertex = &shader[native_vertex_start..managed_vertex_start];
         assert!(
-            !shader[native_vertex_start..managed_vertex_start].contains("packed_xy28_4"),
+            !native_vertex.contains("packed_xy28_4")
+                && !native_vertex.contains("raster0_endpoints")
+                && !native_vertex.contains("source_x_bits"),
             "the native vertex entry must retain its original interface",
+        );
+        assert!(native_vertex.contains("output.raster0 = input.raster0"));
+        assert!(native_vertex.contains("output.raster1 = input.raster1"));
+        assert!(native_vertex.contains("output.stq0 = input.stq0"));
+        assert!(native_vertex.contains("output.stq1 = input.stq1"));
+        let managed_vertex_end = shader[managed_vertex_start..]
+            .find("const SF32_SIGN_MASK")
+            .unwrap()
+            + managed_vertex_start;
+        let managed_vertex = &shader[managed_vertex_start..managed_vertex_end];
+        assert!(managed_vertex.contains("output.source_x_bits = input.source_x_bits"));
+        assert!(managed_vertex.contains("output.source_y_bits = input.source_y_bits"));
+        assert!(!managed_vertex.contains("output.stq0 = input.stq0"));
+
+        let managed_attribute_start = shader.find("const SF32_SIGN_MASK").unwrap();
+        let managed_attribute_end = shader
+            .find("fn gx_managed_edge_covers(")
+            .expect("managed raster helpers precede coverage");
+        let managed_attributes = &shader[managed_attribute_start..managed_attribute_end];
+        assert!(managed_attributes.contains("input.raster0_endpoints"));
+        assert!(managed_attributes.contains("input.raster1_endpoints"));
+        assert!(managed_attributes.contains("fn sf32_add("));
+        assert!(managed_attributes.contains("fn sf32_sub("));
+        assert!(managed_attributes.contains("fn sf32_mul("));
+        assert!(managed_attributes.contains("fn sf32_div("));
+        assert!(managed_attributes.contains("fn sf32_from_u32("));
+        assert!(managed_attributes.contains("fn sf32_to_gx_u8("));
+        assert!(managed_attributes.contains("fn gx_managed_soft_attribute_at_sample("));
+        assert!(managed_attributes.contains("let x_value = sf32_add(attribute_bits.x, x_term)"));
+        assert!(managed_attributes.contains("return sf32_add(x_value, y_term)"));
+        assert!(managed_attributes.contains("input.source_x_bits"));
+        assert!(managed_attributes.contains("input.source_y_bits"));
+        assert!(managed_attributes.contains("0x41400000u"));
+        assert!(managed_attributes.contains("-> array<vec4<i32>, 8>"));
+        assert!(
+            !managed_attributes.contains("gx_managed_attribute_at_sample(\n            source_x")
         );
 
         let edge_start = shader.find("fn gx_managed_edge_covers(").unwrap();
@@ -2264,16 +2764,71 @@ mod tests {
         let coverage_test = managed
             .find("if !gx_managed_coverage_passes(input)")
             .unwrap();
-        let tev = managed
-            .find(
-                "let values = tev_fragment_values(managed_coverage_tev_input(input), false, true)",
-            )
-            .unwrap();
+        let tev = managed.find("gx_managed_raster_colors(input)").unwrap();
         assert!(coverage_test < tev);
         assert!(managed.contains("fn fs_managed_coverage_depth_main"));
-        assert!(managed.contains(
-            "let values = tev_fragment_values(managed_coverage_tev_input(input), true, true)"
-        ));
+        assert_eq!(
+            managed.matches("gx_managed_raster_colors(input)").count(),
+            2
+        );
+        assert!(shader.contains("raster_base = managed_raster_bytes[raster_channel]"));
+        assert!(shader.contains("raster_base = tev_to_bytes(raster_colors[raster_channel])"));
+    }
+
+    #[test]
+    fn managed_softfloat_pins_a_fused_and_reassociated_byte_counterexample() {
+        let positions = [
+            [f32::from_bits(0x4388_70cb), f32::from_bits(0x4225_ed00)],
+            [f32::from_bits(0x4387_6b4d), f32::from_bits(0x421f_fc34)],
+            [f32::from_bits(0x4386_9331), f32::from_bits(0x422a_6c9b)],
+        ];
+        let plane =
+            GxRasterAttributePlaneF32::from_screen_triangle(positions, [242.0, 190.0, 65.0])
+                .unwrap();
+        let sample = plane.sample_non_aa(270, 40).unwrap();
+        assert_eq!(sample.to_bits(), 0x4326_ffff);
+        assert_eq!(gx_raster_channel_u8(sample), 166);
+        let points = [
+            GxRasterPoint28_4::from_raw(4366, 664),
+            GxRasterPoint28_4::from_raw(4333, 640),
+            GxRasterPoint28_4::from_raw(4306, 682),
+        ];
+        let GxRasterSetup::Triangle(triangle) = GxRasterTriangle28_4::setup_post_cull(
+            points,
+            GxRasterWinding::Negative,
+            GxRasterScissor::full_efb(),
+        ) else {
+            panic!("counterexample must remain a live exact triangle");
+        };
+        assert!(triangle.covers_pixel(270, 40));
+
+        // A backend-fused setup produces 0x4327_0001 and Y-first accumulation
+        // produces 0x4327_0000 for this covered sample: both truncate to 167.
+        // Pin the shader to raw input words and the same separately rounded,
+        // X-then-Y operation graph as raster.rs.
+        let managed = shader_source();
+        let start = managed
+            .find("fn gx_managed_soft_attribute_at_sample(")
+            .unwrap();
+        let end = managed[start..]
+            .find("fn gx_managed_raster_color_bytes_at_sample(")
+            .unwrap()
+            + start;
+        let plane_shader = &managed[start..end];
+        for operation in [
+            "let a_left = sf32_mul(delta20, dy10)",
+            "let a_right = sf32_mul(delta10, dy20)",
+            "let a = sf32_sub(a_left, a_right)",
+            "let dfdx = sf32_div(a, c)",
+            "let x_term = sf32_mul(dfdx, sample_dx)",
+            "let y_term = sf32_mul(dfdy, sample_dy)",
+            "let x_value = sf32_add(attribute_bits.x, x_term)",
+            "return sf32_add(x_value, y_term)",
+        ] {
+            assert!(plane_shader.contains(operation), "missing {operation}");
+        }
+        assert!(!plane_shader.contains("fma("));
+        assert!(!plane_shader.contains("bitcast<f32>"));
     }
 
     #[test]
@@ -2305,7 +2860,7 @@ mod tests {
     fn wgsl_fragment_alpha_order_and_rgba6_quantization_are_exact() {
         let shader = shader_source();
         let evaluate = shader
-            .find("let evaluation = tev_evaluate(raster_colors, tex_coords, managed_exact_sampler)")
+            .find("tev_evaluate(raster_colors, managed_raster_bytes, tex_coords, managed_exact_sampler)")
             .unwrap();
         let source = shader.find("let source = evaluation.source").unwrap();
         let tev_alpha = shader
@@ -2387,8 +2942,8 @@ mod tests {
         assert!(shader.contains("let raster_depth = gx_raster_depth24(input.depth24)"));
         assert!(shader.contains("return u32(depth24)"));
         assert!(!shader.contains("u32(round(clamp(input.position.z, 0.0, 1.0) * 16777215.0))"));
-        assert!(shader.contains("let values = tev_fragment_values(input, false, false)"));
-        assert!(shader.contains("let values = tev_fragment_values(input, true, false)"));
+        assert!(shader.contains("fn fs_main(input: TevVertexOutput)"));
+        assert!(shader.contains("fn fs_depth_main(input: TevVertexOutput)"));
         assert!(shader.contains("textureSample("));
         assert!(!shader.contains("textureSampleLevel("));
         assert!(
@@ -2547,7 +3102,7 @@ mod tests {
         }
         assert!(shader.contains("let uv = stq.xy / stq.z"));
         assert!(shader.contains(
-            "let evaluation = tev_evaluate(raster_colors, tex_coords, managed_exact_sampler)"
+            "tev_evaluate(raster_colors, managed_raster_bytes, tex_coords, managed_exact_sampler)"
         ));
         assert!(shader.contains("let source = evaluation.source"));
         assert!(shader.contains("let unorm_source = vec4<u32>("));

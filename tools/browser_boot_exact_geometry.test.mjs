@@ -57,10 +57,10 @@ test("exact geometry and empty-draw proof are prepared before WebGPU mutation", 
   const preflight = sourceSection(
     rendererSource,
     "fn draw_requires_texture_preflight",
-    "fn required_exact_draw_is_managed_safe",
+    "fn prepare_exact_managed_vertices",
   );
   assertOrdered(preflight, [
-    "PreparedExactDraw::is_authoritative_noop",
+    "PreparedExactDraw::authoritative_noop",
     "gx_early_depth_plan",
     "PreparedExactDraw::is_required",
     "GxEarlyDepthPlan::FixedFunction",
@@ -68,7 +68,7 @@ test("exact geometry and empty-draw proof are prepared before WebGPU mutation", 
   ]);
   assert.match(
     preflight,
-    /PreparedExactDraw::is_authoritative_noop\) \{\s*return false;[\s\S]*early_depth != GxEarlyDepthPlan::FixedFunction[\s\S]*return false;[\s\S]*early_depth != GxEarlyDepthPlan::DepthOnly/,
+    /PreparedExactDraw::authoritative_noop\)[\s\S]*\.is_some\(\)\s*\{\s*return false;[\s\S]*early_depth != GxEarlyDepthPlan::FixedFunction[\s\S]*return false;[\s\S]*early_depth != GxEarlyDepthPlan::DepthOnly/,
   );
   assert.match(
     submit,
@@ -84,16 +84,25 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   );
   assert.match(
     preparationTypes,
+    /struct QualifiedExactDraw \{\s*scissor: Option<ScissorRect>,\s*managed_vertices: Option<Vec<TevVertex>>,\s*exact_empty: bool,\s*\}/,
+  );
+  assert.doesNotMatch(preparationTypes, /vertices: Vec<f32>|expanded: Vec<usize>/);
+  assert.match(
+    preparationTypes,
     /struct PreparedExactDraw \{\s*required: bool,\s*required_managed_safe: bool,\s*qualified: Option<QualifiedExactDraw>,\s*\}/,
   );
   assert.match(
     preparationTypes,
-    /fn is_authoritative_noop\(&self\)[\s\S]*self\.required && \(!self\.required_managed_safe \|\| self\.qualified\.is_none\(\)\)[\s\S]*self\.qualified\(\)\.is_some_and\(QualifiedExactDraw::is_empty\)/,
+    /fn is_empty\(&self\)[\s\S]*self\.exact_empty[\s\S]*managed_vertices[\s\S]*is_some_and\(Vec::is_empty\)/,
+  );
+  assert.match(
+    preparationTypes,
+    /enum ExactAuthoritativeNoop \{\s*RasterEmpty,\s*RequiredRejected,\s*\}[\s\S]*fn authoritative_noop\(&self\)[\s\S]*self\.qualified\(\)\.is_some_and\(QualifiedExactDraw::is_empty\)[\s\S]*Some\(ExactAuthoritativeNoop::RasterEmpty\)[\s\S]*self\.required && \(!self\.required_managed_safe \|\| self\.qualified\.is_none\(\)\)[\s\S]*Some\(ExactAuthoritativeNoop::RequiredRejected\)/,
   );
 
   const requiredRoute = sourceSection(
     rendererSource,
-    "fn required_exact_draw_is_managed_safe",
+    "fn prepare_exact_managed_vertices",
     "fn prepare_exact_draw",
   );
   for (const requirement of [
@@ -102,18 +111,29 @@ test("absent, optional, and required exact inputs remain distinct", () => {
     "required_texture_coords",
     "gx_z_texture_state",
     "gx_fog_state",
-    "managed_coverage_draw_is_safe",
+    "prepare_managed_coverage_vertices",
   ]) {
     assert.match(requiredRoute, new RegExp(requirement));
   }
   assert.match(
     requiredRoute,
-    /let Ok\(z_texture\)[\s\S]*else \{\s*return false;[\s\S]*let Ok\(fog\)[\s\S]*else \{\s*return false;/,
+    /let Ok\(z_texture\)[\s\S]*else \{\s*return None;[\s\S]*let Ok\(fog\)[\s\S]*else \{\s*return None;/,
   );
   assert.match(
     requiredRoute,
-    /early_depth != GxEarlyDepthPlan::FixedFunction[\s\S]*return false;[\s\S]*draw_depth_encoding/,
+    /early_depth != GxEarlyDepthPlan::FixedFunction[\s\S]*return None;[\s\S]*draw_depth_encoding/,
   );
+  assert.match(requiredRoute, /-> Option<Vec<TevVertex>>/);
+
+  const rasterEmpty = sourceSection(
+    rendererSource,
+    "fn exact_geometry_is_raster_empty",
+    "fn prepare_exact_managed_vertices",
+  );
+  assert.match(rasterEmpty, /GxRasterTriangle28_4::setup_post_cull/);
+  assert.match(rasterEmpty, /GxRasterWinding::Negative/);
+  assert.match(rasterEmpty, /triangle\.has_covered_sample\(\)/);
+  assert.doesNotMatch(rasterEmpty, /bounds\.left < bounds\.right/);
 
   const prepare = sourceSection(
     rendererSource,
@@ -138,7 +158,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.doesNotMatch(prepare, /right - left \+ 1|bottom - top \+ 1/);
   assert.match(
     prepare,
-    /let qualified = QualifiedExactDraw \{[\s\S]*vertices: geometry\.into_vertices\(\),[\s\S]*expanded,[\s\S]*scissor,[\s\S]*Some\(PreparedExactDraw \{\s*required,\s*required_managed_safe: required\s*&& required_exact_draw_is_managed_safe\(draw, &qualified\),\s*qualified: Some\(qualified\),\s*\}\)/,
+    /let exact_vertices = geometry\.into_vertices\(\);[\s\S]*let exact_empty = expanded\.is_empty\(\)[\s\S]*exact_geometry_is_raster_empty\(&exact_vertices, &expanded, scissor\)[\s\S]*let managed_vertices = \(!exact_empty\)[\s\S]*prepare_exact_managed_vertices\(draw, &exact_vertices, &expanded, scissor\)[\s\S]*let qualified = QualifiedExactDraw \{\s*scissor,\s*managed_vertices,\s*exact_empty,\s*\};[\s\S]*let required_managed_safe = required && qualified\.managed_vertices\.is_some\(\);/,
   );
 });
 
@@ -150,7 +170,7 @@ test("authoritative no-op and depth routing precede all TEV gates", () => {
   );
   assertOrdered(draw, [
     "metrics.record_draw_transport",
-    "PreparedExactDraw::is_authoritative_noop",
+    "PreparedExactDraw::authoritative_noop",
     "let qualified_exact",
     "let required_exact",
     "gx_early_depth_plan",
@@ -160,7 +180,7 @@ test("authoritative no-op and depth routing precede all TEV gates", () => {
   ]);
   assert.match(
     draw,
-    /PreparedExactDraw::is_authoritative_noop\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*let qualified_exact/,
+    /PreparedExactDraw::authoritative_noop\)[\s\S]*ExactAuthoritativeNoop::RasterEmpty[\s\S]*ExactAuthoritativeNoop::RequiredRejected[\s\S]*return Ok\(\(\)\);[\s\S]*let qualified_exact/,
   );
   assert.match(
     draw,
@@ -168,7 +188,7 @@ test("authoritative no-op and depth routing precede all TEV gates", () => {
   );
   assert.match(
     draw,
-    /if early_depth == GxEarlyDepthPlan::DepthOnly \{[\s\S]*source_vertices,[\s\S]*&expanded,[\s\S]*ManagedCoverageEvidence::None/,
+    /if early_depth == GxEarlyDepthPlan::DepthOnly \{[\s\S]*return self\.push_expanded_draw\([\s\S]*source_vertices,[\s\S]*&expanded,[\s\S]*raster_position_correction,[\s\S]*state/,
   );
 });
 
@@ -181,22 +201,21 @@ test("exact managed geometry wins while only optional unsafe input falls back", 
   assertOrdered(draw, [
     "let exact_managed",
     "if required_exact && exact_managed.is_none()",
-    "let managed_expanded",
+    "let native_expanded",
+    "let managed_vertices",
     "let managed_evidence",
     "let scissor = if let Some(exact)",
     "pipeline = pipeline.with_managed_coverage()",
+    "let mut selected",
+    "return self.push_prepared_managed_draw",
   ]);
   assert.match(
     draw,
-    /let exact_managed = qualified_exact\.filter\([\s\S]*ManagedCoverageEvidence::TrustedExactClip[\s\S]*exact\.vertices[\s\S]*&exact\.expanded[\s\S]*scissor/,
+    /let exact_managed =\s*qualified_exact\.filter\(\|exact\| exact\.managed_vertices\.is_some\(\)\);/,
   );
   assert.match(
     draw,
-    /if required_exact \{\s*return prepared_exact\s*\.is_some_and\(PreparedExactDraw::is_required_managed_safe\);\s*\}/,
-  );
-  assert.match(
-    draw,
-    /if required_exact && exact_managed\.is_none\(\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*let managed_expanded/,
+    /if required_exact && exact_managed\.is_none\(\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*let native_expanded/,
   );
   assert.match(
     draw,
@@ -204,7 +223,11 @@ test("exact managed geometry wins while only optional unsafe input falls back", 
   );
   assert.match(
     draw,
-    /let managed_expanded = prepared_exact\s*\.is_none\(\)/,
+    /let managed_vertices = prepared_exact\s*\.is_none\(\)[\s\S]*prepare_managed_coverage_vertices\([\s\S]*ManagedCoverageEvidence::TrustedPostCull/,
+  );
+  assert.match(
+    draw,
+    /if managed_vertices\.as_ref\(\)\.is_some_and\(Vec::is_empty\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*\}[\s\S]*let managed_evidence =/,
   );
   assert.match(
     draw,
@@ -212,23 +235,24 @@ test("exact managed geometry wins while only optional unsafe input falls back", 
   );
   assert.match(
     draw,
-    /if let Some\(exact\) = exact_managed \{\s*\(exact\.vertices\.as_slice\(\), exact\.expanded\.as_slice\(\), 0\.0\)/,
+    /if let Some\(exact\) = exact_managed \{[\s\S]*push_prepared_managed_draw\([\s\S]*exact[\s\S]*\.managed_vertices/,
   );
   assert.match(
     draw,
-    /else \{\s*\(\s*source_vertices,\s*native_expanded[\s\S]*\.expect\("non-exact draw retains native topology"\),\s*raster_position_correction,/,
+    /if let Some\(vertices\) = managed_vertices\.as_deref\(\) \{[\s\S]*push_prepared_managed_draw\(vertices, state\)/,
   );
   assert.doesNotMatch(
     draw,
     /expanded_indices\([^)]*exact|source_indices\(\)/,
   );
+  assert.doesNotMatch(draw, /managed_coverage_triangle_vertices\(/);
 });
 
 test("exact activation retains every managed shader-safety gate", () => {
   const qualification = sourceSection(
     rendererSource,
+    "fn prepare_managed_coverage_vertices",
     "fn managed_coverage_draw_is_safe",
-    "fn managed_coverage_triangle_vertices",
   );
   for (const requirement of [
     "ManagedCoverageEvidence::TrustedPostCull",
@@ -241,7 +265,10 @@ test("exact activation retains every managed shader-safety gate", () => {
     "source_triangle_depth_is_bitwise_flat",
     "source_triangle_rasters_are_bitwise_flat",
     "managed_coverage_attribute_payload_for_depth",
+    "managed_coverage_raster_endpoints",
     "managed_coverage_payload_is_safe",
+    "let mut prepared",
+    "prepared.extend",
   ]) {
     assert.match(qualification, new RegExp(requirement.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
@@ -252,10 +279,13 @@ test("exact activation retains every managed shader-safety gate", () => {
   assert.match(qualification, /vertex\[3\] <= 0\.0/);
   assert.match(qualification, /GX_DEPTH24_MAX/);
   assert.match(rendererSource, /fn managed_coverage_depth_plane_is_safe/);
+  assert.match(rendererSource, /fn managed_coverage_raster_planes_are_safe/);
+  assert.match(rendererSource, /fn managed_coverage_raster_channel_u8/);
   assert.match(
     qualification,
-    /evidence == ManagedCoverageEvidence::TrustedPostCull && !depth_is_flat/,
+    /evidence == ManagedCoverageEvidence::TrustedPostCull\s*&& \(!depth_is_flat \|\| !rasters_are_flat\)/,
   );
+  assert.match(qualification, /Some\(prepared\)\s*\}/);
 });
 
 test("the activated path remains wgpu WebGPU-only and disables GPU reculling", () => {
