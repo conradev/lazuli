@@ -7269,6 +7269,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const bank = textureMap >= 4 ? 0x20 : 0;
       return {
         mode0: 0x80 + bank + slot,
+        mode1: 0x84 + bank + slot,
         image0: 0x88 + bank + slot,
         image1: 0x8c + bank + slot,
         image2: 0x90 + bank + slot,
@@ -7380,6 +7381,53 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 14: return { name: "CMPR", blockWidth: 8, blockHeight: 8, blockBytes: 32 };
         default: return null;
       }
+    }
+
+    function gxTextureMipCount(width, height, mode0, mode1) {
+      const mipMode = (mode0 >>> 5) & 3;
+      if (mipMode === 0) return 1;
+      if (mipMode === 3) return null;
+      const theoreticalLevels = Math.floor(Math.log2(Math.max(width, height))) + 1;
+      const maxLodRaw = (mode1 >>> 8) & 0xff;
+      const requestedLevels = Math.ceil(maxLodRaw / 16) + 1;
+      return Math.min(theoreticalLevels, requestedLevels);
+    }
+
+    function gxTextureMipChainLayout(width, height, layout, mode0, mode1) {
+      const levelCount = gxTextureMipCount(width, height, mode0, mode1);
+      if (levelCount === null) return null;
+      const levels = [];
+      let levelWidth = width;
+      let levelHeight = height;
+      let encodedOffset = 0;
+      let decodedOffset = 0;
+      for (let level = 0; level < levelCount; level += 1) {
+        const blocksWide = Math.ceil(levelWidth / layout.blockWidth);
+        const blocksHigh = Math.ceil(levelHeight / layout.blockHeight);
+        const encodedBytes = blocksWide * blocksHigh * layout.blockBytes;
+        const decodedBytes = levelWidth * levelHeight * 4;
+        levels.push({
+          level,
+          width: levelWidth,
+          height: levelHeight,
+          blocksWide,
+          blocksHigh,
+          encodedOffset,
+          encodedBytes,
+          decodedOffset,
+          decodedBytes,
+        });
+        encodedOffset += encodedBytes;
+        decodedOffset += decodedBytes;
+        levelWidth = Math.max(1, Math.floor(levelWidth / 2));
+        levelHeight = Math.max(1, Math.floor(levelHeight / 2));
+      }
+      return {
+        levelCount,
+        levels,
+        encodedBytes: encodedOffset,
+        decodedBytes: decodedOffset,
+      };
     }
 
     function gxTextureImageSource(image1, image2, image3) {
@@ -7601,12 +7649,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       const registers = gxTextureRegisters(textureMap);
       const image0 = gxBpRegisters[registers.image0];
       const mode0 = gxBpRegisters[registers.mode0];
+      const mode1 = gxBpRegisters[registers.mode1];
       const sampler = gxTextureSamplerState(mode0);
       const width = (image0 & 0x3ff) + 1;
       const height = ((image0 >>> 10) & 0x3ff) + 1;
       const format = (image0 >>> 20) & 0xf;
       const layout = gxTextureLayout(format);
       if (layout === null || width > 1024 || height > 1024 || width * height > 1_048_576) {
+        gxTextureDecodeErrors += 1;
+        return null;
+      }
+      const mipChain = gxTextureMipChainLayout(width, height, layout, mode0, mode1);
+      if (mipChain === null) {
+        // MODE0 mip mode 3 is reserved. Do not silently reinterpret it as a
+        // base-only or MODE1-selected source chain.
         gxTextureDecodeErrors += 1;
         return null;
       }
@@ -7624,9 +7680,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       const address = imageSource.address;
       gxMarkTextureCopyConsumer(address);
-      const blocksWide = Math.ceil(width / layout.blockWidth);
-      const blocksHigh = Math.ceil(height / layout.blockHeight);
-      const encodedBytes = blocksWide * blocksHigh * layout.blockBytes;
+      // LZGX v6 carries only the base image. Model the complete source chain
+      // here, but keep the existing decoded texture and packet shape until a
+      // mip-aware transport version is negotiated end to end.
+      const baseLevel = mipChain.levels[0];
+      const blocksWide = baseLevel.blocksWide;
+      const blocksHigh = baseLevel.blocksHigh;
+      const encodedBytes = baseLevel.encodedBytes;
       const pointer = ramPointer(address, encodedBytes);
       if (pointer === null) {
         gxTextureDecodeErrors += 1;
