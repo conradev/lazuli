@@ -638,6 +638,167 @@ test("VI scanout registers are guest-visible immediately and latch at field boun
   assert.equal(top.topBase.latchSerial + 1, top.picture.latchSerial);
 });
 
+test("VI BFBL retains its sampled shared POFF across queued buffer generations", () => {
+  const memory = memoryFixture();
+  const oldTop = 0x00f8_2580;
+  const currentTopRaw = 0x1008_03ad;
+  const currentBottomRaw = 0x0008_03d3;
+  const currentTop = 0x0100_75a0;
+  const currentBottom = 0x0100_7a60;
+  const stride = 0x04c0;
+  const picture = {
+    value: 0x2850,
+    writeCycle: 80,
+    writeSerial: 1,
+    field: "top",
+    latchedAtCycle: 100,
+    latchSerial: 2,
+    displayControl: 1,
+    activeLines: 240,
+  };
+  const oldTopEntry = {
+    value: oldTop,
+    writeCycle: 70,
+    writeSerial: 1,
+    field: "top",
+    latchedAtCycle: 100,
+    latchSerial: 1,
+  };
+  memory.view.setUint32(0x201c, currentTopRaw, false);
+  memory.view.setUint32(0x2024, currentBottomRaw, false);
+
+  const lowFrame = {
+    index: 223,
+    captured: true,
+    destination: oldTop,
+    stride,
+    width: 640,
+    height: 480,
+  };
+  const highFrame = {
+    index: 224,
+    captured: true,
+    destination: currentTop,
+    stride,
+    width: 640,
+    height: 480,
+  };
+  const context = evaluateFunctions(
+    [
+      "programmedViScanoutEntry",
+      "cloneViScanoutEntry",
+      "viScanoutStateSnapshot",
+      "latchViScanoutBoundary",
+      "viXfbAddressFromRaw",
+      "viActiveXfbAddress",
+      "gxXfbCopyRowOffset",
+      "gxResolveXfbCopy",
+      "allocateViPairEpoch",
+      "claimViFieldPair",
+    ],
+    {
+      ...memory,
+      check(condition, message) {
+        if (!condition) throw new Error(message);
+      },
+      gxXfbCopies: [lowFrame, highFrame],
+      hex32(value) {
+        return "0x" + (value >>> 0).toString(16).padStart(8, "0");
+      },
+      traceVi() {},
+      viActiveAcv: 240,
+      viActiveOddVBlank: 0,
+      viNextPairEpoch: 1,
+      viPendingFieldPair: null,
+      viScanoutActive: {
+        topBase: oldTopEntry,
+        bottomBase: null,
+        picture,
+      },
+      viScanoutBoundarySnapshots: [],
+      viScanoutLatchSerial: 2,
+      viScanoutPending: {
+        topBase: null,
+        bottomBase: null,
+        picture: null,
+      },
+    },
+  );
+
+  context.viScanoutBoundarySnapshots.push({
+    scheduledCycle: 200,
+    field: "bottom",
+    snapshot: context.latchViScanoutBoundary("bottom", 200),
+  });
+  const queuedBottom = context.viScanoutBoundarySnapshots[0].snapshot;
+  assert.equal(queuedBottom.topBase.value, oldTop);
+  assert.equal(queuedBottom.bottomBase.value, currentBottomRaw);
+  assert.equal(queuedBottom.bottomBase.pageOffsetRaw, currentTopRaw);
+  assert.equal(
+    context.viActiveXfbAddress("bottom", queuedBottom),
+    currentBottom,
+    "BFBL must decode with the live shared POFF sampled at its own boundary",
+  );
+
+  const resolvedBottom = context.gxResolveXfbCopy(currentBottom);
+  assert.equal(highFrame.destination, currentTop);
+  assert.equal(currentBottom - highFrame.destination, stride);
+  assert.equal(resolvedBottom.frame.index, 224);
+  assert.notEqual(resolvedBottom.frame.index, 0);
+  assert.equal(resolvedBottom.row, 1);
+
+  memory.view.setUint32(0x201c, 0x00f9_0000, false);
+  memory.view.setUint32(0x2024, 0x00f9_04c0, false);
+  context.latchViScanoutBoundary("bottom", 300);
+  assert.equal(queuedBottom.bottomBase.value, currentBottomRaw);
+  assert.equal(queuedBottom.bottomBase.pageOffsetRaw, currentTopRaw);
+  assert.equal(context.viActiveXfbAddress("bottom", queuedBottom), currentBottom);
+
+  const dimensions = {
+    width: 640,
+    height: 480,
+    fieldStrideBytes: stride * 2,
+    fieldHeight: 240,
+    rowRepeat: 2,
+    scanoutPolicy: "bob",
+  };
+  const topState = {
+    topBase: oldTopEntry,
+    bottomBase: null,
+    picture,
+  };
+  const top = context.claimViFieldPair(
+    "top",
+    dimensions,
+    context.gxResolveXfbCopy(oldTop),
+    2,
+    oldTop,
+    topState,
+  );
+  assert.equal(top.pairCompleting, false);
+  assert.equal(top.fields.top.copyIndex, 223);
+
+  const bottom = context.claimViFieldPair(
+    "bottom",
+    dimensions,
+    resolvedBottom,
+    2,
+    currentBottom,
+    queuedBottom,
+  );
+  assert.equal(bottom.pairCompleting, true);
+  assert.equal(bottom.pairEpoch, top.pairEpoch);
+  assert.equal(bottom.fields.top.address, oldTop);
+  assert.equal(bottom.fields.top.copyIndex, 223);
+  assert.equal(bottom.fields.bottom.address, currentBottom);
+  assert.equal(bottom.fields.bottom.copyIndex, 224);
+  assert.equal(bottom.fields.bottom.copyRow, 1);
+  assert.equal(
+    bottom.fields.bottom.scanoutProvenance.base.pageOffsetRaw,
+    currentTopRaw,
+  );
+});
+
 test("VI drains a due field boundary before applying a same-cycle MMIO write", () => {
   function makeBoundaryFixture() {
     const memory = memoryFixture();
