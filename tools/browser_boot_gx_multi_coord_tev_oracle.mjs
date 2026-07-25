@@ -1,6 +1,16 @@
 import {
   fnv1a64Hex,
 } from "./browser_boot_managed_textured_coverage_vectors.mjs";
+import {
+  buildGxMipColorOraclePacket,
+  gxMipColorOracle,
+  gxMipColorOracleCases,
+  gxMipColorOraclePacketLayout,
+} from "./browser_boot_gx_mip_color_oracle.mjs";
+import {
+  modelGxMipDerivativeLod,
+} from "./browser_boot_gx_mip_derivative_oracle.mjs";
+
 const PACKET_VERSION = 4;
 const HEADER_BYTES = 160;
 const DRAW_BYTES = 176;
@@ -28,6 +38,8 @@ const TEXTURE_MAP_B = 6;
 const TEXTURE_COORD_A = 2;
 const TEXTURE_COORD_B = 7;
 const SAMPLER_NEAREST_NO_MIP = 0;
+const SAMPLER_NEAREST_MIP_NEAREST = 1 << 5;
+const MIP_MODE1_ZERO_TO_TWO = 2 * 16 << 8;
 const DEAD_STQ = Object.freeze([0, 0, 1]);
 
 const POSITIONS = Object.freeze([
@@ -107,6 +119,73 @@ const CASE_DEFINITIONS = Object.freeze([
   }),
 ]);
 
+function derivativeCoordinatePlane(
+  q,
+  dxRaw,
+  baseSRaw,
+  baseTRaw,
+) {
+  return Object.freeze(
+    POSITIONS.map(([x]) =>
+      Object.freeze([
+        ((baseSRaw + dxRaw * x) / 128) * q,
+        (baseTRaw / 128) * q,
+        q,
+      ]),
+    ),
+  );
+}
+
+const DERIVATIVE_COORDINATE_A = derivativeCoordinatePlane(
+  0.5,
+  128,
+  4096,
+  6144,
+);
+const DERIVATIVE_COORDINATE_B = derivativeCoordinatePlane(
+  2,
+  512,
+  8192,
+  2048,
+);
+const DERIVATIVE_STAGE_A = Object.freeze({
+  texture: "mip-chain",
+  map: 0,
+  coordinate: TEXTURE_COORD_A,
+  dxRaw: 128,
+  selectedLevel: 0,
+});
+const DERIVATIVE_STAGE_B = Object.freeze({
+  texture: "mip-chain",
+  map: 0,
+  coordinate: TEXTURE_COORD_B,
+  dxRaw: 512,
+  selectedLevel: 2,
+});
+const DERIVATIVE_CASE_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    id: "same-map-coord2-lod0-then-coord7-lod2",
+    name:
+      "same map coordinate 2 LOD 0 then coordinate 7 LOD 2",
+    stages: Object.freeze([
+      DERIVATIVE_STAGE_A,
+      DERIVATIVE_STAGE_B,
+    ]),
+    discriminator: "per-coordinate-derivative-forward",
+  }),
+  Object.freeze({
+    id: "same-map-coord7-lod2-then-coord2-lod0",
+    name:
+      "same map coordinate 7 LOD 2 then coordinate 2 LOD 0",
+    stages: Object.freeze([
+      DERIVATIVE_STAGE_B,
+      DERIVATIVE_STAGE_A,
+    ]),
+    discriminator:
+      "per-coordinate-derivative-reversed-stage-control",
+  }),
+]);
+
 function align16(value) {
   return (value + 15) & ~15;
 }
@@ -137,6 +216,18 @@ function definitionFor(id) {
   if (definition === undefined) {
     throw new RangeError(
       `unknown GX multi-coordinate TEV vector ${id}`,
+    );
+  }
+  return definition;
+}
+
+function derivativeDefinitionFor(id) {
+  const definition = DERIVATIVE_CASE_DEFINITIONS.find(
+    entry => entry.id === id,
+  );
+  if (definition === undefined) {
+    throw new RangeError(
+      `unknown GX multi-coordinate derivative TEV vector ${id}`,
     );
   }
   return definition;
@@ -445,6 +536,89 @@ function modelGxMultiCoordTevDefinitionSurface(
   return Object.freeze(rgba);
 }
 
+function derivativeLodForCoordinate(coordinate) {
+  const dxRaw =
+    coordinate === TEXTURE_COORD_A
+      ? DERIVATIVE_STAGE_A.dxRaw
+      : coordinate === TEXTURE_COORD_B
+        ? DERIVATIVE_STAGE_B.dxRaw
+        : null;
+  if (dxRaw === null) {
+    throw new RangeError(
+      "GX multi-coordinate derivative source must be coordinate 2 or 7",
+    );
+  }
+  return modelGxMipDerivativeLod({
+    dx: [dxRaw, 0],
+    dy: [0, 0],
+    mipMode: 1,
+    minLodSixteenths: 0,
+    maxLodSixteenths: 32,
+  });
+}
+
+function derivativeTextureColor(coordinate) {
+  const lod = derivativeLodForCoordinate(coordinate);
+  return Object.freeze({
+    lod,
+    color: gxMipColorOracleCases[lod.selectedLevel].color,
+  });
+}
+
+export function modelGxMultiCoordDerivativeTevSurface(
+  id,
+  { reuseCoordinate = null } = {},
+) {
+  const definition = derivativeDefinitionFor(id);
+  if (
+    reuseCoordinate !== null &&
+    reuseCoordinate !== TEXTURE_COORD_A &&
+    reuseCoordinate !== TEXTURE_COORD_B
+  ) {
+    throw new RangeError(
+      "GX multi-coordinate derivative reuse source must be coordinate 2 or 7",
+    );
+  }
+  const sampled = definition.stages.map(stage =>
+    derivativeTextureColor(reuseCoordinate ?? stage.coordinate),
+  );
+  const rgba = Object.freeze([
+    ...Array.from(
+      { length: 3 },
+      (_, channel) =>
+        Math.max(
+          0,
+          Math.min(
+            255,
+            sampled[0].color[channel] +
+              128 -
+              sampled[1].color[channel],
+          ),
+        ),
+    ),
+    255,
+  ]);
+  return Object.freeze({
+    rgba,
+    surface: Object.freeze(
+      Array.from({ length: XFB_WIDTH * XFB_HEIGHT }, () => rgba)
+        .flat(),
+    ),
+    stages: Object.freeze(
+      sampled.map((entry, index) =>
+        Object.freeze({
+          coordinate:
+            reuseCoordinate ?? definition.stages[index].coordinate,
+          rhoRaw: entry.lod.rhoRaw,
+          lodSixteenths: entry.lod.clampedLodSixteenths,
+          selectedLevel: entry.lod.selectedLevel,
+          color: entry.color,
+        }),
+      ),
+    ),
+  });
+}
+
 function rgbaMask(rgba) {
   let mask = 0;
   for (let pixel = 0; pixel < rgba.length / 4; pixel += 1) {
@@ -586,6 +760,40 @@ function writeVertex(view, offset, vertexIndex) {
   if (values.length !== VERTEX_FLOATS) {
     throw new Error(
       `GX multi-coordinate TEV vertex has ${values.length} floats`,
+    );
+  }
+  for (let component = 0; component < values.length; component += 1) {
+    view.setFloat32(offset + component * 4, values[component], true);
+  }
+}
+
+function writeDerivativeVertex(view, offset, vertexIndex) {
+  const values = [
+    POSITIONS[vertexIndex][0],
+    POSITIONS[vertexIndex][1],
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+  ];
+  for (let coordinate = 0; coordinate < 8; coordinate += 1) {
+    values.push(
+      ...(coordinate === TEXTURE_COORD_A
+        ? DERIVATIVE_COORDINATE_A[vertexIndex]
+        : coordinate === TEXTURE_COORD_B
+          ? DERIVATIVE_COORDINATE_B[vertexIndex]
+          : DEAD_STQ),
+    );
+  }
+  if (values.length !== VERTEX_FLOATS) {
+    throw new Error(
+      `GX multi-coordinate derivative TEV vertex has ${values.length} floats`,
     );
   }
   for (let component = 0; component < values.length; component += 1) {
@@ -790,6 +998,42 @@ export function buildGxMultiCoordTevOraclePacket(
   return packet;
 }
 
+export function buildGxMultiCoordDerivativeTevOraclePacket(
+  id,
+  generation = 1,
+) {
+  const definition = derivativeDefinitionFor(id);
+  generation = generationU32(generation);
+  const packet = buildGxMipColorOraclePacket(0, generation);
+  const layout = gxMipColorOraclePacketLayout();
+  const view = new DataView(
+    packet.buffer,
+    packet.byteOffset,
+    packet.byteLength,
+  );
+  packet.fill(0, layout.tevOffset, layout.tevOffset + TEV_BYTES);
+  writeTevState(view, layout.tevOffset, definition);
+  putU32(view, 0x64, XFB_DESTINATION);
+  putU32(
+    view,
+    layout.drawOffset + 0x34,
+    SAMPLER_NEAREST_MIP_NEAREST,
+  );
+  putU32(view, layout.mode1Offset, MIP_MODE1_ZERO_TO_TWO);
+  for (
+    let vertexIndex = 0;
+    vertexIndex < VERTEX_COUNT;
+    vertexIndex += 1
+  ) {
+    writeDerivativeVertex(
+      view,
+      layout.vertexOffset + vertexIndex * VERTEX_BYTES,
+      vertexIndex,
+    );
+  }
+  return packet;
+}
+
 export const gxMultiCoordTevOracleCases = Object.freeze(
   CASE_DEFINITIONS.map((definition, index) => {
     const expectedRgba = modelGxMultiCoordTevSurface(definition.id);
@@ -840,8 +1084,58 @@ export const gxMultiCoordTevOracleCases = Object.freeze(
   }),
 );
 
+export const gxMultiCoordDerivativeTevOracleCases = Object.freeze(
+  DERIVATIVE_CASE_DEFINITIONS.map((definition, index) => {
+    const model = modelGxMultiCoordDerivativeTevSurface(
+      definition.id,
+    );
+    const reusedCoord2 =
+      modelGxMultiCoordDerivativeTevSurface(
+        definition.id,
+        { reuseCoordinate: TEXTURE_COORD_A },
+      );
+    const reusedCoord7 =
+      modelGxMultiCoordDerivativeTevSurface(
+        definition.id,
+        { reuseCoordinate: TEXTURE_COORD_B },
+      );
+    return Object.freeze({
+      id: definition.id,
+      name: definition.name,
+      discriminator: definition.discriminator,
+      packetVersion: gxMipColorOracle.packetVersion,
+      stages: definition.stages,
+      liveTextureMaps: Object.freeze(
+        definition.stages.map(stage => stage.map),
+      ),
+      liveTextureCoordinates: Object.freeze(
+        definition.stages.map(stage => stage.coordinate),
+      ),
+      expectedPath: "managed",
+      expectedManagedTriangles: 2,
+      expectedRgba: model.surface,
+      expectedRgbaFnv1a64: fnv1a64Hex(model.surface),
+      expectedMask: rgbaMask(model.surface),
+      expectedStageLods: model.stages,
+      reusedCoord2Rgba: reusedCoord2.surface,
+      reusedCoord2RgbaFnv1a64:
+        fnv1a64Hex(reusedCoord2.surface),
+      reusedCoord7Rgba: reusedCoord7.surface,
+      reusedCoord7RgbaFnv1a64:
+        fnv1a64Hex(reusedCoord7.surface),
+      packetFnv1a64: fnv1a64Hex(
+        buildGxMultiCoordDerivativeTevOraclePacket(
+          definition.id,
+          index + 1,
+        ),
+      ),
+    });
+  }),
+);
+
 export const gxMultiCoordTevCertificationCases = Object.freeze([
   ...gxMultiCoordTevOracleCases,
+  ...gxMultiCoordDerivativeTevOracleCases,
 ]);
 
 export const gxMultiCoordTevCoverageProof = Object.freeze({
@@ -856,7 +1150,10 @@ export const gxMultiCoordTevCoverageProof = Object.freeze({
 
 export const gxMultiCoordTevOracle = Object.freeze({
   packetVersion: PACKET_VERSION,
-  packetVersions: Object.freeze([PACKET_VERSION]),
+  packetVersions: Object.freeze([
+    PACKET_VERSION,
+    gxMipColorOracle.packetVersion,
+  ]),
   stageCount: 2,
   textureMaps: Object.freeze([TEXTURE_MAP_A, TEXTURE_MAP_B]),
   textureCoordinates: Object.freeze([
@@ -895,6 +1192,20 @@ export const gxMultiCoordTevOracle = Object.freeze({
       managedCoverageTriangles:
         gxMultiCoordTevCertificationCases.length * 4,
     }),
+  }),
+  derivative: Object.freeze({
+    packetVersion: gxMipColorOracle.packetVersion,
+    textureMap: 0,
+    textureCoordinates: Object.freeze([
+      TEXTURE_COORD_A,
+      TEXTURE_COORD_B,
+    ]),
+    coordinateA: DERIVATIVE_COORDINATE_A,
+    coordinateB: DERIVATIVE_COORDINATE_B,
+    mode0: SAMPLER_NEAREST_MIP_NEAREST,
+    mode1: MIP_MODE1_ZERO_TO_TWO,
+    expectedLevels: Object.freeze([0, 2]),
+    mipLevelCount: gxMipColorOracle.mipLevelCount,
   }),
   xfb: Object.freeze({
     destination: XFB_DESTINATION,

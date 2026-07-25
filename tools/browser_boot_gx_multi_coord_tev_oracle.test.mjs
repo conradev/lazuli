@@ -2,16 +2,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildGxMultiCoordDerivativeTevOraclePacket,
   buildGxMultiCoordTevOraclePacket,
   fnv1a64Hex,
+  gxMultiCoordDerivativeTevOracleCases,
   gxMultiCoordTevCoverageProof,
   gxMultiCoordTevCertificationCases,
   gxMultiCoordTevMask,
   gxMultiCoordTevOracle,
   gxMultiCoordTevOracleCases,
   gxMultiCoordTevOraclePacketLayout,
+  modelGxMultiCoordDerivativeTevSurface,
   modelGxMultiCoordTevSurface,
 } from "./browser_boot_gx_multi_coord_tev_oracle.mjs";
+import {
+  gxMipColorOraclePacketLayout,
+} from "./browser_boot_gx_mip_color_oracle.mjs";
+
 function view(bytes) {
   return new DataView(
     bytes.buffer,
@@ -357,6 +364,172 @@ test("reference model gates stage order, map-coordinate pairing, and Q timing", 
   ]);
 });
 
+test("same-map V7 packets keep coordinates 2 and 7 as distinct LOD inputs", () => {
+  const layout = gxMipColorOraclePacketLayout();
+  for (const entry of gxMultiCoordDerivativeTevOracleCases) {
+    const packet =
+      buildGxMultiCoordDerivativeTevOraclePacket(entry.id);
+    assert.equal(u16(packet, 0x04), 7);
+    assert.equal(u32(packet, 0x08), layout.packetBytes);
+    assert.equal(u32(packet, 0x18), 1);
+    assert.equal(
+      u32(packet, 0x64),
+      gxMultiCoordTevOracle.xfb.destination,
+    );
+    assert.equal(
+      u32(packet, layout.textureOffset + 0x0c),
+      84,
+    );
+    assert.equal(
+      u32(packet, layout.textureOffset + 0x24),
+      3,
+    );
+    assert.equal(u32(packet, layout.drawOffset + 0x30), 0);
+    assert.equal(
+      u32(packet, layout.drawOffset + 0x34),
+      gxMultiCoordTevOracle.derivative.mode0,
+    );
+    for (let map = 1; map < 8; map += 1) {
+      assert.equal(
+        u32(packet, layout.drawOffset + 0x30 + map * 8),
+        0xffffffff,
+      );
+    }
+    assert.equal(
+      u32(packet, layout.mode1Offset),
+      gxMultiCoordTevOracle.derivative.mode1,
+    );
+    assert.equal(u32(packet, layout.tevOffset + 448), 2);
+    assert.deepEqual(
+      Array.from({ length: 2 }, (_, stage) => {
+        const references = u32(
+          packet,
+          layout.tevOffset + stage * 16 + 8,
+        );
+        return {
+          map: references & 7,
+          coordinate: (references >>> 3) & 7,
+          enabled: (references & (1 << 6)) !== 0,
+        };
+      }),
+      entry.stages.map(stage => ({
+        map: 0,
+        coordinate: stage.coordinate,
+        enabled: true,
+      })),
+    );
+    assert.equal(packet[layout.evidenceOffset], 0x0f);
+  }
+});
+
+test("same-map coordinate planes select robust LOD 0 and LOD 2", () => {
+  const layout = gxMipColorOraclePacketLayout();
+  const packet = buildGxMultiCoordDerivativeTevOraclePacket(
+    gxMultiCoordDerivativeTevOracleCases[0].id,
+  );
+  const expected = [
+    { coordinate: 2, q: 0.5, dx: 1, rhoRaw: 128, level: 0 },
+    { coordinate: 7, q: 2, dx: 4, rhoRaw: 512, level: 2 },
+  ];
+  for (const vector of expected) {
+    const uv = [0, 1].map(vertex => {
+      const offset =
+        layout.vertexOffset +
+        vertex * 36 * 4 +
+        (12 + vector.coordinate * 3) * 4;
+      const s = f32(packet, offset);
+      const t = f32(packet, offset + 4);
+      const q = f32(packet, offset + 8);
+      assert.equal(q, vector.q);
+      assert.notEqual(q, 1);
+      return { s: s / q, t: t / q };
+    });
+    const deltaX =
+      gxMultiCoordTevOracle.positions[1][0] -
+      gxMultiCoordTevOracle.positions[0][0];
+    assert.ok(
+      Math.abs((uv[1].s - uv[0].s) / deltaX - vector.dx) <
+        0.00001,
+    );
+    assert.ok(Math.abs(uv[1].t - uv[0].t) < 0.00001);
+    const stage =
+      gxMultiCoordDerivativeTevOracleCases[0]
+        .expectedStageLods.find(
+          candidate => candidate.coordinate === vector.coordinate,
+        );
+    assert.equal(stage.rhoRaw, vector.rhoRaw);
+    assert.equal(stage.selectedLevel, vector.level);
+  }
+  assert.deepEqual(
+    gxMultiCoordTevOracle.derivative.expectedLevels,
+    [0, 2],
+  );
+});
+
+test("same-map derivative model rejects coordinate broadcast and stage reversal", () => {
+  const expectedHashes = {
+    "same-map-coord2-lod0-then-coord7-lod2":
+      "0x4d0731a8af13c765",
+    "same-map-coord7-lod2-then-coord2-lod0":
+      "0x08c67243bad22c25",
+  };
+  const packetHashes = {
+    "same-map-coord2-lod0-then-coord7-lod2":
+      "0x3288b6d7a79cea61",
+    "same-map-coord7-lod2-then-coord2-lod0":
+      "0xc8330155920d723a",
+  };
+  for (const entry of gxMultiCoordDerivativeTevOracleCases) {
+    assert.equal(entry.expectedRgbaFnv1a64, expectedHashes[entry.id]);
+    assert.equal(entry.packetFnv1a64, packetHashes[entry.id]);
+    assert.equal(
+      entry.reusedCoord2RgbaFnv1a64,
+      "0x10c6ca2f7d37fba5",
+    );
+    assert.equal(
+      entry.reusedCoord7RgbaFnv1a64,
+      "0x10c6ca2f7d37fba5",
+    );
+    assert.notEqual(
+      entry.expectedRgbaFnv1a64,
+      entry.reusedCoord2RgbaFnv1a64,
+      "reusing coordinate 2 derivatives for both stages must fail",
+    );
+    assert.notEqual(
+      entry.expectedRgbaFnv1a64,
+      entry.reusedCoord7RgbaFnv1a64,
+      "reusing coordinate 7 derivatives for both stages must fail",
+    );
+    assert.equal(entry.expectedMask, 0xffff);
+  }
+  const [forward, reversed] =
+    gxMultiCoordDerivativeTevOracleCases;
+  assert.deepEqual(pixel(forward.expectedRgba, 0, 0), [
+    255, 50, 0, 255,
+  ]);
+  assert.deepEqual(pixel(reversed.expectedRgba, 0, 0), [
+    0, 206, 255, 255,
+  ]);
+  assert.notEqual(
+    forward.expectedRgbaFnv1a64,
+    reversed.expectedRgbaFnv1a64,
+  );
+  assert.deepEqual(
+    modelGxMultiCoordDerivativeTevSurface(
+      forward.id,
+      { reuseCoordinate: 2 },
+    ).rgba,
+    [128, 128, 128, 255],
+  );
+  assert.throws(
+    () => modelGxMultiCoordDerivativeTevSurface(
+      forward.id,
+      { reuseCoordinate: 3 },
+    ),
+    /reuse source must be coordinate 2 or 7/,
+  );
+});
+
 test("Keep021 proves one exact owner per pixel across the shared seam", () => {
   assert.equal(gxMultiCoordTevCoverageProof.evidence, 0x0f);
   assert.deepEqual(gxMultiCoordTevCoverageProof.triangles, [
@@ -428,17 +601,17 @@ test("model and packet builders reject malformed selectors", () => {
       managedCoverageTriangles: 8,
     },
   });
-  assert.equal(gxMultiCoordTevCertificationCases.length, 2);
+  assert.equal(gxMultiCoordTevCertificationCases.length, 4);
   assert.deepEqual(
     gxMultiCoordTevOracle.certificationExpectedMetrics,
     {
       perRun: {
-        managedCoverageDraws: 2,
-        managedCoverageTriangles: 4,
-      },
-      twoRuns: {
         managedCoverageDraws: 4,
         managedCoverageTriangles: 8,
+      },
+      twoRuns: {
+        managedCoverageDraws: 8,
+        managedCoverageTriangles: 16,
       },
     },
   );
