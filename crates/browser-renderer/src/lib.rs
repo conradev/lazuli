@@ -22,6 +22,7 @@ pub(crate) const GX_MAX_COPY_DIMENSION: u32 = 1024;
 pub(crate) const WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 pub(crate) const GX_DEPTH16_MAX: u32 = 0x0000_ffff;
 pub(crate) const GX_DEPTH24_MAX: u32 = 0x00ff_ffff;
+pub(crate) const EXACT_REQUIRED_REJECTION_REASON_COUNT: usize = 14;
 /// Flipper's canonical single-sample raster point, in EFB pixel coordinates.
 #[cfg(test)]
 pub(crate) const GX_NON_AA_RASTER_CENTER_EFB: f32 = 7.0 / 12.0;
@@ -33,6 +34,124 @@ pub(crate) const WEBGPU_RASTER_CENTER_EFB: f32 = 1.0 / 2.0;
 /// Keep the exact rational expression instead of subtracting the two rounded
 /// `f32` center constants: those operations produce different low bits.
 pub(crate) const GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB: f32 = -1.0 / 12.0;
+
+/// Stable, bounded compatibility reasons for authoritative required-exact no-ops.
+///
+/// These codes are telemetry API: append new reasons rather than reordering or
+/// renaming existing entries.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactRequiredRejectionReason {
+    ExactPreparation,
+    Scissor,
+    Primitive,
+    EarlyDepth,
+    RasterCenter,
+    DepthEncoding,
+    TevState,
+    TextureCoordinates,
+    Sampler,
+    ZTexture,
+    Fog,
+    FullyCulled,
+    ManagedPayload,
+    Unclassified,
+}
+
+impl ExactRequiredRejectionReason {
+    pub(crate) const ALL: [Self; EXACT_REQUIRED_REJECTION_REASON_COUNT] = [
+        Self::ExactPreparation,
+        Self::Scissor,
+        Self::Primitive,
+        Self::EarlyDepth,
+        Self::RasterCenter,
+        Self::DepthEncoding,
+        Self::TevState,
+        Self::TextureCoordinates,
+        Self::Sampler,
+        Self::ZTexture,
+        Self::Fog,
+        Self::FullyCulled,
+        Self::ManagedPayload,
+        Self::Unclassified,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn telemetry_code(self) -> &'static str {
+        match self {
+            Self::ExactPreparation => "exactPreparation",
+            Self::Scissor => "scissor",
+            Self::Primitive => "primitive",
+            Self::EarlyDepth => "earlyDepth",
+            Self::RasterCenter => "rasterCenter",
+            Self::DepthEncoding => "depthEncoding",
+            Self::TevState => "tevState",
+            Self::TextureCoordinates => "textureCoordinates",
+            Self::Sampler => "sampler",
+            Self::ZTexture => "zTexture",
+            Self::Fog => "fog",
+            Self::FullyCulled => "fullyCulled",
+            Self::ManagedPayload => "managedPayload",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// Side-effect-free facts used only to classify a draw already rejected by the
+/// exact-managed admission path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExactRequiredRejectionInputs {
+    pub(crate) exact_preparation_succeeded: bool,
+    pub(crate) scissor_available: bool,
+    pub(crate) triangle_primitive: bool,
+    pub(crate) fixed_function_early_depth: bool,
+    pub(crate) known_non_aa_raster_center: bool,
+    pub(crate) depth_encoding_supported: bool,
+    pub(crate) tev_state_supported: bool,
+    pub(crate) texture_coordinates_supported: bool,
+    pub(crate) samplers_supported: bool,
+    pub(crate) z_texture_supported: bool,
+    pub(crate) fog_supported: bool,
+    pub(crate) survives_cull: bool,
+    pub(crate) managed_payload_supported: bool,
+}
+
+impl ExactRequiredRejectionInputs {
+    pub(crate) const fn classify(self) -> ExactRequiredRejectionReason {
+        if !self.exact_preparation_succeeded {
+            ExactRequiredRejectionReason::ExactPreparation
+        } else if !self.scissor_available {
+            ExactRequiredRejectionReason::Scissor
+        } else if !self.triangle_primitive {
+            ExactRequiredRejectionReason::Primitive
+        } else if !self.fixed_function_early_depth {
+            ExactRequiredRejectionReason::EarlyDepth
+        } else if !self.known_non_aa_raster_center {
+            ExactRequiredRejectionReason::RasterCenter
+        } else if !self.depth_encoding_supported {
+            ExactRequiredRejectionReason::DepthEncoding
+        } else if !self.tev_state_supported {
+            ExactRequiredRejectionReason::TevState
+        } else if !self.texture_coordinates_supported {
+            ExactRequiredRejectionReason::TextureCoordinates
+        } else if !self.samplers_supported {
+            ExactRequiredRejectionReason::Sampler
+        } else if !self.z_texture_supported {
+            ExactRequiredRejectionReason::ZTexture
+        } else if !self.fog_supported {
+            ExactRequiredRejectionReason::Fog
+        } else if !self.survives_cull {
+            ExactRequiredRejectionReason::FullyCulled
+        } else if !self.managed_payload_supported {
+            ExactRequiredRejectionReason::ManagedPayload
+        } else {
+            ExactRequiredRejectionReason::Unclassified
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RendererMetrics {
@@ -50,6 +169,7 @@ pub(crate) struct RendererMetrics {
     pub(crate) expanded_vertex_bytes: u64,
     pub(crate) exact_raster_empty_draws: u64,
     pub(crate) exact_required_rejected_draws: u64,
+    exact_required_rejection_reasons: [u64; EXACT_REQUIRED_REJECTION_REASON_COUNT],
     pub(crate) gx_frame_packet_bytes: u64,
     pub(crate) gx_frame_packet_payload_bytes: u64,
     pub(crate) managed_coverage_draws: u64,
@@ -73,6 +193,21 @@ pub(crate) struct RendererMetrics {
 }
 
 impl RendererMetrics {
+    pub(crate) fn record_exact_required_rejection_reason(
+        &mut self,
+        reason: ExactRequiredRejectionReason,
+    ) {
+        let counter = &mut self.exact_required_rejection_reasons[reason.index()];
+        *counter = counter.saturating_add(1);
+    }
+
+    pub(crate) const fn exact_required_rejection_reason_draws(
+        &self,
+        reason: ExactRequiredRejectionReason,
+    ) -> u64 {
+        self.exact_required_rejection_reasons[reason.index()]
+    }
+
     pub(crate) fn record_wasm_bridge_call(&mut self, typed_array_bytes: usize) {
         self.wasm_bridge_calls = self.wasm_bridge_calls.saturating_add(1);
         self.wasm_bridge_typed_array_bytes = self
@@ -2257,25 +2392,25 @@ pub use web::WebGpuRenderer;
 #[cfg(test)]
 mod tests {
     use super::{
-        EFB_HEIGHT, EFB_WIDTH, GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX,
-        GX_NON_AA_RASTER_CENTER_EFB, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
-        GxAlphaTestOutcome, GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxCopyGamma,
-        GxDepthCompareLocation, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthDecodeError,
-        GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
-        GxRasterCenterEvidence, GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation,
-        RendererFailureState, RendererMetrics, RendererPhaseTiming, SelectedTexture,
-        SurfacePixelOrder, SurfaceReadbackRequestError, TextureAddressMode, ViFieldDescriptor,
-        ViFieldPairOutcome, ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame,
-        ViPresentationMode, WEBGPU_RASTER_CENTER_EFB, XfbCopyMetadata, alpha_compare,
-        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
-        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
-        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_alpha_test_outcome,
-        gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
-        gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_from_units,
-        gx_depth24_to_float, gx_destination_alpha_state, gx_early_depth_plan,
-        gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24, gx_fog_reference, gx_fog_state,
-        gx_raster_center_evidence, gx_sampler_identity, gx_xfb_copy_parameters,
-        gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
+        EFB_HEIGHT, EFB_WIDTH, ExactRequiredRejectionInputs, ExactRequiredRejectionReason,
+        GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX, GX_NON_AA_RASTER_CENTER_EFB,
+        GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxAlphaTestOutcome, GxBlendFactor,
+        GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxDepthCompression,
+        GxEarlyDepthPlan, GxEfbDepthDecodeError, GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError,
+        GxFogProjection, GxFogState, GxFogType, GxRasterCenterEvidence, GxZTextureDecodeError,
+        GxZTextureFormat, GxZTextureOperation, RendererFailureState, RendererMetrics,
+        RendererPhaseTiming, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
+        TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
+        ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode, WEBGPU_RASTER_CENTER_EFB,
+        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
+        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
+        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
+        gx_alpha_test_outcome, gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask,
+        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
+        gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
+        gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
+        gx_fog_reference, gx_fog_state, gx_raster_center_evidence, gx_sampler_identity,
+        gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
         materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
@@ -2677,6 +2812,87 @@ mod tests {
         assert_eq!(metrics.texture_metadata_bytes, 320);
         assert_eq!(metrics.texture_pixel_bytes, 4096);
         assert_eq!(metrics.expanded_vertex_bytes, 1296);
+    }
+
+    #[test]
+    fn exact_required_rejection_classifier_has_stable_bounded_reasons() {
+        let supported = ExactRequiredRejectionInputs {
+            exact_preparation_succeeded: true,
+            scissor_available: true,
+            triangle_primitive: true,
+            fixed_function_early_depth: true,
+            known_non_aa_raster_center: true,
+            depth_encoding_supported: true,
+            tev_state_supported: true,
+            texture_coordinates_supported: true,
+            samplers_supported: true,
+            z_texture_supported: true,
+            fog_supported: true,
+            survives_cull: true,
+            managed_payload_supported: true,
+        };
+        macro_rules! rejects {
+            ($field:ident, $reason:ident) => {{
+                let mut inputs = supported;
+                inputs.$field = false;
+                assert_eq!(inputs.classify(), ExactRequiredRejectionReason::$reason);
+            }};
+        }
+        rejects!(exact_preparation_succeeded, ExactPreparation);
+        rejects!(scissor_available, Scissor);
+        rejects!(triangle_primitive, Primitive);
+        rejects!(fixed_function_early_depth, EarlyDepth);
+        rejects!(known_non_aa_raster_center, RasterCenter);
+        rejects!(depth_encoding_supported, DepthEncoding);
+        rejects!(tev_state_supported, TevState);
+        rejects!(texture_coordinates_supported, TextureCoordinates);
+        rejects!(samplers_supported, Sampler);
+        rejects!(z_texture_supported, ZTexture);
+        rejects!(fog_supported, Fog);
+        rejects!(survives_cull, FullyCulled);
+        rejects!(managed_payload_supported, ManagedPayload);
+        assert_eq!(
+            supported.classify(),
+            ExactRequiredRejectionReason::Unclassified,
+        );
+        assert_eq!(
+            ExactRequiredRejectionReason::ALL.map(|reason| reason.telemetry_code()),
+            [
+                "exactPreparation",
+                "scissor",
+                "primitive",
+                "earlyDepth",
+                "rasterCenter",
+                "depthEncoding",
+                "tevState",
+                "textureCoordinates",
+                "sampler",
+                "zTexture",
+                "fog",
+                "fullyCulled",
+                "managedPayload",
+                "unclassified",
+            ],
+        );
+    }
+
+    #[test]
+    fn renderer_metrics_saturate_each_exact_rejection_reason_independently() {
+        let mut metrics = RendererMetrics::default();
+        for reason in ExactRequiredRejectionReason::ALL {
+            metrics.record_exact_required_rejection_reason(reason);
+        }
+        for reason in ExactRequiredRejectionReason::ALL {
+            assert_eq!(metrics.exact_required_rejection_reason_draws(reason), 1);
+        }
+
+        metrics.exact_required_rejection_reasons[ExactRequiredRejectionReason::Sampler.index()] =
+            u64::MAX;
+        metrics.record_exact_required_rejection_reason(ExactRequiredRejectionReason::Sampler);
+        assert_eq!(
+            metrics.exact_required_rejection_reason_draws(ExactRequiredRejectionReason::Sampler),
+            u64::MAX,
+        );
     }
 
     #[test]

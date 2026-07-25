@@ -26,7 +26,8 @@ use crate::tev::{
     validate_draw_transport,
 };
 use crate::{
-    EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
+    EFB_HEIGHT, EFB_WIDTH, ExactRequiredRejectionInputs, ExactRequiredRejectionReason,
+    GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
     GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
     GxDepthCompareLocation, GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding,
     GxEfbFormat, GxFogState, GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor,
@@ -1006,6 +1007,17 @@ fn update_renderer_metrics(
     metrics.set(current);
 }
 
+fn record_exact_required_rejection(
+    metrics: &Cell<RendererMetrics>,
+    reason: ExactRequiredRejectionReason,
+) {
+    update_renderer_metrics(metrics, |metrics| {
+        metrics.exact_required_rejected_draws =
+            metrics.exact_required_rejected_draws.saturating_add(1);
+        metrics.record_exact_required_rejection_reason(reason);
+    });
+}
+
 fn renderer_phase_timing_object(timing: RendererPhaseTiming) -> Result<Object, JsValue> {
     let result = Object::new();
     for (name, value) in [
@@ -1147,6 +1159,19 @@ fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> 
             &JsValue::from_f64(value as f64),
         )?;
     }
+    let rejection_reasons = Object::new();
+    for reason in ExactRequiredRejectionReason::ALL {
+        Reflect::set(
+            &rejection_reasons,
+            &JsValue::from_str(reason.telemetry_code()),
+            &JsValue::from_f64(metrics.exact_required_rejection_reason_draws(reason) as f64),
+        )?;
+    }
+    Reflect::set(
+        &result,
+        &JsValue::from_str("exactRequiredRejectionReasons"),
+        &rejection_reasons,
+    )?;
     Ok(result)
 }
 
@@ -2221,16 +2246,35 @@ impl WebGpuRenderer {
         if let Some(authoritative_noop) =
             prepared_exact.and_then(PreparedExactDraw::authoritative_noop)
         {
-            update_renderer_metrics(&self.metrics, |metrics| match authoritative_noop {
+            match authoritative_noop {
                 ExactAuthoritativeNoop::RasterEmpty => {
-                    metrics.exact_raster_empty_draws =
-                        metrics.exact_raster_empty_draws.saturating_add(1);
+                    update_renderer_metrics(&self.metrics, |metrics| {
+                        metrics.exact_raster_empty_draws =
+                            metrics.exact_raster_empty_draws.saturating_add(1);
+                    });
                 }
                 ExactAuthoritativeNoop::RequiredRejected => {
-                    metrics.exact_required_rejected_draws =
-                        metrics.exact_required_rejected_draws.saturating_add(1);
+                    let reason = classify_exact_required_rejection(
+                        prepared_exact.expect("required rejection has prepared exact input"),
+                        topology,
+                        tev_state,
+                        textures,
+                        z_mode,
+                        blend_mode,
+                        alpha_test,
+                        pixel_control,
+                        constant_alpha,
+                        z_texture_bias,
+                        z_texture_mode,
+                        fog_range_base,
+                        fog_range_coefficients,
+                        fog_parameters,
+                        viewport_half_width_bits,
+                        cull_mode,
+                    );
+                    record_exact_required_rejection(&self.metrics, reason);
                 }
-            });
+            }
             // Exact clipping/culling proves this draw contributes no fragments,
             // or required exact geometry cannot use the certified managed
             // route. Do not allocate or resurrect its native topology.
@@ -2252,6 +2296,10 @@ impl WebGpuRenderer {
             // Required exact input may only use the managed path. In
             // particular, never route it through the raw depth-only shortcut
             // or the native primitive-ordered path.
+            record_exact_required_rejection(
+                &self.metrics,
+                ExactRequiredRejectionReason::EarlyDepth,
+            );
             return Ok(());
         }
         let depth_encoding = draw_depth_encoding(z_mode, pixel_control)
@@ -2320,6 +2368,25 @@ impl WebGpuRenderer {
             // A v6 required draw is authoritative even outside the currently
             // certified exact-managed subset. Suppress it rather than falling
             // through to native geometry or legacy post-cull evidence.
+            let reason = classify_exact_required_rejection(
+                prepared_exact.expect("required draw has prepared exact input"),
+                topology,
+                tev_state,
+                textures,
+                z_mode,
+                blend_mode,
+                alpha_test,
+                pixel_control,
+                constant_alpha,
+                z_texture_bias,
+                z_texture_mode,
+                fog_range_base,
+                fog_range_coefficients,
+                fog_parameters,
+                viewport_half_width_bits,
+                cull_mode,
+            );
+            record_exact_required_rejection(&self.metrics, reason);
             return Ok(());
         }
         let native_expanded = exact_managed.is_none().then(|| {
@@ -4851,6 +4918,84 @@ fn clipped_scissor(x: u32, y: u32, width: u32, height: u32) -> Option<ScissorRec
         width,
         height,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_exact_required_rejection(
+    prepared: &PreparedExactDraw,
+    topology: u8,
+    tev_state: &[u8],
+    textures: &[TevTextureInput<'_>; MAX_TEV_TEXTURES],
+    z_mode: u32,
+    blend_mode: u32,
+    alpha_test: u32,
+    pixel_control: u32,
+    constant_alpha: u32,
+    z_texture_bias: u32,
+    z_texture_mode: u32,
+    fog_range_base: u32,
+    fog_range_coefficients: [u32; 5],
+    fog_parameters: [u32; 5],
+    viewport_half_width_bits: u32,
+    cull_mode: u8,
+) -> ExactRequiredRejectionReason {
+    let qualified = prepared.qualified();
+    let primitive = match topology {
+        5 | 6 => Primitive::Lines,
+        7 => Primitive::Points,
+        _ => Primitive::Triangles,
+    };
+    let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
+    let required_maps = required_texture_maps(tev_state).ok();
+    let required_coords = required_texture_coords(tev_state).ok();
+    let sampler_modes = std::array::from_fn(|map| textures[map].sampler);
+    let sampler_identities = sampler_modes.map(gx_sampler_identity);
+    let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control).ok();
+    let fog = gx_fog_state(
+        fog_range_base,
+        fog_range_coefficients,
+        fog_parameters,
+        viewport_half_width_bits,
+    )
+    .ok();
+    let destination_alpha = gx_destination_alpha_state(blend_mode, constant_alpha, pixel_control);
+    let survives_cull = z_texture.is_none_or(|z_texture| {
+        PipelineKey::from_gx(
+            primitive,
+            z_mode,
+            blend_mode,
+            destination_alpha,
+            z_texture,
+            cull_mode,
+        )
+        .color_pipeline_for_early_depth(early_depth)
+        .cull
+            != CullMode::All
+    });
+
+    ExactRequiredRejectionInputs {
+        exact_preparation_succeeded: qualified.is_some(),
+        scissor_available: qualified.and_then(|exact| exact.scissor).is_some(),
+        triangle_primitive: primitive == Primitive::Triangles,
+        fixed_function_early_depth: early_depth == GxEarlyDepthPlan::FixedFunction,
+        known_non_aa_raster_center: gx_raster_center_evidence(pixel_control)
+            == GxRasterCenterEvidence::KnownNonAntialiased,
+        depth_encoding_supported: draw_depth_encoding(z_mode, pixel_control).is_ok(),
+        tev_state_supported: required_maps.is_some() && required_coords.is_some(),
+        texture_coordinates_supported: required_coords
+            .is_some_and(|coords| managed_coverage_texture_coord(coords).is_some()),
+        samplers_supported: required_maps.is_some_and(|maps| {
+            managed_coverage_samplers_are_safe(maps, sampler_modes, sampler_identities)
+        }),
+        z_texture_supported: z_texture
+            .is_some_and(|state| state.operation == GxZTextureOperation::Disabled),
+        fog_supported: fog.is_some_and(|state| state == GxFogState::default()),
+        survives_cull,
+        managed_payload_supported: qualified
+            .and_then(|exact| exact.managed_vertices.as_ref())
+            .is_some(),
+    }
+    .classify()
 }
 
 fn draw_requires_texture_preflight(
