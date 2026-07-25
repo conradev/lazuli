@@ -90,6 +90,9 @@ test("only Ready frames acquire the canvas while staged fields preserve complete
   const parseMode = method.indexOf("vi_presentation_mode(");
   const parseParity = method.indexOf("vi_field_parity(");
   const lookupXfb = method.indexOf(".xfb_cache");
+  const unavailableRetirements = [
+    ...method.matchAll(/reject_unavailable_member\(mode, pair_epoch, parity\)/g),
+  ];
 
   assert.ok(rejectZeroEpoch >= 0 && rejectZeroEpoch < parseMode);
   assert.ok(rejectZeroEpoch < parseParity && rejectZeroEpoch < lookupXfb);
@@ -99,6 +102,11 @@ test("only Ready frames acquire the canvas while staged fields preserve complete
   );
   assert.ok(validate >= 0 && validate < stage);
   assert.ok(stage >= 0 && stage < ready && ready < present);
+  assert.equal(
+    unavailableRetirements.length,
+    2,
+    "both missing and stale XFB provenance must retire an exact pending mate",
+  );
   assert.doesNotMatch(method, /get_current_texture/);
   assert.doesNotMatch(method, /last_presented_(?:xfb|surface) = None/);
   assert.doesNotMatch(method, /\.clamp\(/);

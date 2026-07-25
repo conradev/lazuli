@@ -2068,6 +2068,23 @@ impl<T> ViFieldPairState<T> {
         self.pending.as_ref()
     }
 
+    pub(crate) fn reject_unavailable_member(
+        &mut self,
+        mode: ViPresentationMode,
+        pair_epoch: u32,
+        parity: ViFieldParity,
+    ) -> bool {
+        let rejects_pending = mode == ViPresentationMode::Interlaced
+            && self.pending.as_ref().is_some_and(|pending| {
+                pending.descriptor.pair_epoch == pair_epoch
+                    && pending.descriptor.parity.is_opposite(parity)
+            });
+        if rejects_pending {
+            self.pending = None;
+        }
+        rejects_pending
+    }
+
     pub(crate) fn reset(&mut self) {
         self.pending = None;
         self.newest_epoch = None;
@@ -3295,6 +3312,70 @@ mod tests {
             state.submit(bottom, "matching bottom"),
             ViFieldPairOutcome::Ready(ViHostFrame::Interlaced { .. })
         ));
+    }
+
+    #[test]
+    fn unavailable_opposite_member_retires_only_its_exact_pending_pair() {
+        let copy = XfbCopyMetadata {
+            destination: BASE,
+            stride: STRIDE,
+            height: 4,
+            generation: 85,
+        };
+        let descriptor = |epoch, parity| {
+            let row = u32::from(parity == ViFieldParity::Bottom);
+            vi_field(
+                ViPresentationMode::Interlaced,
+                epoch,
+                parity,
+                copy,
+                BASE + row * STRIDE,
+                row,
+            )
+        };
+        let mut state = ViFieldPairState::default();
+
+        assert!(matches!(
+            state.submit(descriptor(85, ViFieldParity::Top), "epoch 85 top"),
+            ViFieldPairOutcome::Awaiting(_)
+        ));
+        assert!(!state.reject_unavailable_member(
+            ViPresentationMode::Interlaced,
+            84,
+            ViFieldParity::Bottom
+        ));
+        assert!(!state.reject_unavailable_member(
+            ViPresentationMode::Interlaced,
+            85,
+            ViFieldParity::Top
+        ));
+        assert!(!state.reject_unavailable_member(
+            ViPresentationMode::SingleField,
+            85,
+            ViFieldParity::Bottom
+        ));
+        assert_eq!(
+            state.pending().map(|field| field.payload),
+            Some("epoch 85 top")
+        );
+
+        assert!(state.reject_unavailable_member(
+            ViPresentationMode::Interlaced,
+            85,
+            ViFieldParity::Bottom
+        ));
+        assert!(state.pending().is_none());
+
+        let next = state.submit(descriptor(86, ViFieldParity::Top), "epoch 86 top");
+        assert_eq!(next.telemetry_code(), "vi-field-pair-awaiting");
+        match next {
+            ViFieldPairOutcome::Awaiting(awaiting) => {
+                assert_eq!(awaiting.pair_epoch, 86);
+                assert_eq!(awaiting.parity, ViFieldParity::Top);
+                assert_eq!(awaiting.superseded_epoch, None);
+            }
+            outcome => panic!("new first field was not staged cleanly: {outcome:?}"),
+        }
     }
 
     #[test]

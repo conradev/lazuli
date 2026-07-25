@@ -3177,6 +3177,8 @@ impl WebGpuRenderer {
             );
         };
         if selected_address == 0 || expected_generation == 0 {
+            self.vi_field_pairs
+                .reject_unavailable_member(mode, pair_epoch, parity);
             return xfb_presentation_result(
                 false,
                 false,
@@ -3205,6 +3207,8 @@ impl WebGpuRenderer {
                 )
             })
         else {
+            self.vi_field_pairs
+                .reject_unavailable_member(mode, pair_epoch, parity);
             return xfb_presentation_result(
                 false,
                 false,
