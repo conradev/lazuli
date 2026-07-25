@@ -21,9 +21,11 @@ use crate::raster::{
     GxRasterAttributePlaneF32, gx_non_aa_raster_color_rgba8, gx_normalized_raster_channel_u8,
 };
 use crate::tev::{
-    MAX_TEV_TEXTURES, TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS,
-    required_texture_coords, required_texture_maps, shader_source as tev_shader_source,
-    validate_draw_transport,
+    MANAGED_TEX_COORD_SIDECAR_WORDS, MAX_TEV_TEXTURES, ManagedSidecarCapacityOutcome,
+    TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS, TevPipelineLayoutKind,
+    managed_sidecar_capacity_outcome, managed_tex_coord_sidecar_record,
+    managed_tex_coord_sidecar_record_base, required_texture_coords, required_texture_maps,
+    shader_source as tev_shader_source, tev_pipeline_layout_kind, validate_draw_transport,
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, ExactRequiredRejectionInputs, ExactRequiredRejectionReason,
@@ -339,7 +341,13 @@ enum ManagedCoverageEvidence {
 struct QualifiedExactDraw {
     scissor: Option<ScissorRect>,
     managed_vertices: Option<Vec<TevVertex>>,
+    managed_tex_coord_sidecar: Option<Vec<u32>>,
     exact_empty: bool,
+}
+
+struct PreparedManagedCoverageVertices {
+    vertices: Vec<TevVertex>,
+    tex_coord_sidecar: Option<Vec<u32>>,
 }
 
 impl QualifiedExactDraw {
@@ -656,6 +664,7 @@ struct PipelineKey {
     primitive: Primitive,
     cull: CullMode,
     managed_coverage: bool,
+    managed_tex_coord_sidecar: bool,
     depth: DepthPipelineState,
     blend: BlendPipelineState,
     canonical_fragment_depth: bool,
@@ -734,6 +743,11 @@ struct CachedTevDrawBinding {
     draw_bind_group: wgpu::BindGroup,
     _tev_uniform: wgpu::Buffer,
     tev_bind_group: wgpu::BindGroup,
+}
+
+struct CachedManagedTexCoordSidecar {
+    _buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 struct CachedTexture {
@@ -843,7 +857,8 @@ struct PresentedSurface {
 
 struct Pipelines {
     tev_shader: wgpu::ShaderModule,
-    tev_layout: wgpu::PipelineLayout,
+    tev_legacy_layout: wgpu::PipelineLayout,
+    tev_sidecar_layout: wgpu::PipelineLayout,
     early_depth_layout: wgpu::PipelineLayout,
     tev_geometry: HashMap<PipelineKey, wgpu::RenderPipeline>,
     early_depth_commit: HashMap<DepthCommitPipelineKey, wgpu::RenderPipeline>,
@@ -966,6 +981,7 @@ pub struct WebGpuRenderer {
     xfb_present: XfbPresentResources,
     tev_draw_layout: wgpu::BindGroupLayout,
     tev_texture_layout: wgpu::BindGroupLayout,
+    managed_tex_coord_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
     samplers: HashMap<SamplerIdentity, wgpu::Sampler>,
     white_texture: CachedTexture,
@@ -979,6 +995,7 @@ pub struct WebGpuRenderer {
     next_xfb_surface_id: u64,
     pipelines: Pipelines,
     tev_vertices: Vec<TevVertex>,
+    managed_tex_coord_sidecar: Vec<u32>,
     commands: Vec<DrawCommand>,
     tev_draw_binding_indices: HashMap<TevBindingKey, usize>,
     tev_draw_bindings: Vec<CachedTevDrawBinding>,
@@ -2438,29 +2455,49 @@ impl WebGpuRenderer {
         let source_cull = pipeline.cull;
         let native_scissor = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height);
         let raster_center = gx_raster_center_evidence(pixel_control);
-        let exact_managed = qualified_exact.filter(|exact| exact.managed_vertices.is_some());
+        let max_storage_bytes = self.device.limits().max_storage_buffer_binding_size as usize;
+        let exact_sidecar_capacity = qualified_exact
+            .filter(|exact| exact.managed_vertices.is_some())
+            .map(|exact| {
+                managed_sidecar_capacity_outcome(
+                    required_exact,
+                    self.managed_tex_coord_sidecar.len(),
+                    exact.managed_tex_coord_sidecar.as_deref(),
+                    max_storage_bytes,
+                )
+            });
+        let exact_managed = qualified_exact.filter(|exact| {
+            exact.managed_vertices.is_some()
+                && exact_sidecar_capacity == Some(ManagedSidecarCapacityOutcome::Managed)
+        });
         if required_exact && exact_managed.is_none() {
             // A v6 required draw is authoritative even outside the currently
             // certified exact-managed subset. Suppress it rather than falling
             // through to native geometry or legacy post-cull evidence.
-            let reason = classify_exact_required_rejection(
-                prepared_exact.expect("required draw has prepared exact input"),
-                topology,
-                tev_state,
-                textures,
-                z_mode,
-                blend_mode,
-                alpha_test,
-                pixel_control,
-                constant_alpha,
-                z_texture_bias,
-                z_texture_mode,
-                fog_range_base,
-                fog_range_coefficients,
-                fog_parameters,
-                viewport_half_width_bits,
-                cull_mode,
-            );
+            let reason = if exact_sidecar_capacity
+                == Some(ManagedSidecarCapacityOutcome::RejectManagedPayload)
+            {
+                ExactRequiredRejectionReason::ManagedPayload
+            } else {
+                classify_exact_required_rejection(
+                    prepared_exact.expect("required draw has prepared exact input"),
+                    topology,
+                    tev_state,
+                    textures,
+                    z_mode,
+                    blend_mode,
+                    alpha_test,
+                    pixel_control,
+                    constant_alpha,
+                    z_texture_bias,
+                    z_texture_mode,
+                    fog_range_base,
+                    fog_range_coefficients,
+                    fog_parameters,
+                    viewport_half_width_bits,
+                    cull_mode,
+                )
+            };
             record_exact_required_rejection(&self.metrics, reason);
             return Ok(());
         }
@@ -2506,8 +2543,19 @@ impl WebGpuRenderer {
                     scissor,
                 )
             })
-            .flatten();
-        if managed_vertices.as_ref().is_some_and(Vec::is_empty) {
+            .flatten()
+            .filter(|prepared| {
+                managed_sidecar_capacity_outcome(
+                    false,
+                    self.managed_tex_coord_sidecar.len(),
+                    prepared.tex_coord_sidecar.as_deref(),
+                    max_storage_bytes,
+                ) == ManagedSidecarCapacityOutcome::Managed
+            });
+        if managed_vertices
+            .as_ref()
+            .is_some_and(|prepared| prepared.vertices.is_empty())
+        {
             // Trusted post-cull evidence can prove every legacy triangle is an
             // exact raster no-op. Return before texture/cache/binding creation
             // so an empty managed draw cannot mutate renderer resource state.
@@ -2532,7 +2580,15 @@ impl WebGpuRenderer {
             scissor
         };
         if managed_coverage {
-            pipeline = pipeline.with_managed_coverage();
+            pipeline = pipeline.with_managed_coverage(
+                exact_managed
+                    .and_then(|exact| exact.managed_tex_coord_sidecar.as_ref())
+                    .is_some()
+                    || managed_vertices
+                        .as_ref()
+                        .and_then(|prepared| prepared.tex_coord_sidecar.as_ref())
+                        .is_some(),
+            );
         }
         let fog = if pipeline.blend.color_write {
             fog
@@ -2741,11 +2797,16 @@ impl WebGpuRenderer {
                     .managed_vertices
                     .as_deref()
                     .expect("qualified exact draw has prepared managed vertices"),
+                exact.managed_tex_coord_sidecar.as_deref(),
                 state,
             );
         }
-        if let Some(vertices) = managed_vertices.as_deref() {
-            return self.push_prepared_managed_draw(vertices, state);
+        if let Some(prepared) = managed_vertices.as_ref() {
+            return self.push_prepared_managed_draw(
+                &prepared.vertices,
+                prepared.tex_coord_sidecar.as_deref(),
+                state,
+            );
         }
         self.push_expanded_draw(
             source_vertices,
@@ -2778,11 +2839,40 @@ impl WebGpuRenderer {
     fn push_prepared_managed_draw(
         &mut self,
         prepared: &[TevVertex],
+        tex_coord_sidecar: Option<&[u32]>,
         state: DrawCommandState,
     ) -> Result<(), JsValue> {
         debug_assert!(prepared.len().is_multiple_of(3));
         let start = self.tev_vertices.len() as u32;
-        self.tev_vertices.extend_from_slice(prepared);
+        if let Some(sidecar) = tex_coord_sidecar {
+            let triangle_count = prepared.len() / 3;
+            let expected_words = triangle_count
+                .checked_mul(MANAGED_TEX_COORD_SIDECAR_WORDS)
+                .ok_or_else(|| JsValue::from_str("managed texture-coordinate sidecar overflow"))?;
+            if sidecar.len() != expected_words {
+                return Err(JsValue::from_str(
+                    "managed texture-coordinate sidecar length does not match triangle count",
+                ));
+            }
+            let old_words = self.managed_tex_coord_sidecar.len();
+            let new_words = old_words
+                .checked_add(sidecar.len())
+                .ok_or_else(|| JsValue::from_str("managed texture-coordinate sidecar overflow"))?;
+            let sidecar_bytes = new_words
+                .checked_mul(size_of::<u32>())
+                .ok_or_else(|| JsValue::from_str("managed texture-coordinate sidecar overflow"))?;
+            if sidecar_bytes > self.device.limits().max_storage_buffer_binding_size as usize {
+                return Err(JsValue::from_str(
+                    "managed texture-coordinate sidecar exceeds WebGPU storage binding limit",
+                ));
+            }
+            let prepared = managed_vertices_with_sidecar_record_base(prepared, old_words)
+                .ok_or_else(|| JsValue::from_str("managed texture-coordinate record overflow"))?;
+            self.managed_tex_coord_sidecar.extend_from_slice(sidecar);
+            self.tev_vertices.extend(prepared);
+        } else {
+            self.tev_vertices.extend_from_slice(prepared);
+        }
         self.finish_expanded_draw(start, true, (prepared.len() / 3) as u64, state)
     }
 
@@ -3767,6 +3857,20 @@ impl WebGpuRenderer {
                 label: Some("browser GX per-fragment TEV layout"),
                 entries: &tev_texture_layout_entries,
             });
+        let managed_tex_coord_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("browser GX managed texture-coordinate sidecar layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
         let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("browser XFB presentation layout"),
             entries: &[
@@ -3809,6 +3913,7 @@ impl WebGpuRenderer {
             &device,
             &tev_draw_layout,
             &tev_texture_layout,
+            &managed_tex_coord_layout,
             &present_layout,
             surface_format,
         );
@@ -3842,6 +3947,7 @@ impl WebGpuRenderer {
             xfb_present,
             tev_draw_layout,
             tev_texture_layout,
+            managed_tex_coord_layout,
             present_layout,
             samplers: HashMap::new(),
             white_texture,
@@ -3855,6 +3961,7 @@ impl WebGpuRenderer {
             next_xfb_surface_id: 1,
             pipelines,
             tev_vertices: Vec::new(),
+            managed_tex_coord_sidecar: Vec::new(),
             commands: Vec::new(),
             tev_draw_binding_indices: HashMap::new(),
             tev_draw_bindings: Vec::new(),
@@ -3954,6 +4061,31 @@ impl WebGpuRenderer {
                     usage: wgpu::BufferUsages::VERTEX,
                 })
         });
+        let managed_tex_coord_sidecar = (!self.managed_tex_coord_sidecar.is_empty()).then(|| {
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.buffers_created = metrics.buffers_created.saturating_add(1);
+                metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
+            });
+            let buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("browser GX managed texture-coordinate sidecar"),
+                    contents: bytemuck::cast_slice(&self.managed_tex_coord_sidecar),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("browser GX managed texture-coordinate sidecar bind group"),
+                layout: &self.managed_tex_coord_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            CachedManagedTexCoordSidecar {
+                _buffer: buffer,
+                bind_group,
+            }
+        });
         let tev_pipeline_keys = self
             .commands
             .iter()
@@ -4027,6 +4159,15 @@ impl WebGpuRenderer {
                         pass.set_pipeline(&self.pipelines.tev_geometry[&pipeline]);
                         pass.set_bind_group(0, &binding.draw_bind_group, &[]);
                         pass.set_bind_group(1, &binding.tev_bind_group, &[]);
+                        if pipeline
+                            .tev_layout_kind()
+                            .requires_managed_tex_coord_sidecar()
+                        {
+                            let sidecar = managed_tex_coord_sidecar
+                                .as_ref()
+                                .expect("managed multi-coordinate draw has a sidecar");
+                            pass.set_bind_group(2, &sidecar.bind_group, &[]);
+                        }
                         pass.draw(command.vertices.clone(), 0..1);
                     }
                     GxEarlyDepthPlan::DepthOnly => {
@@ -4049,6 +4190,15 @@ impl WebGpuRenderer {
                         let commit = &self.pipelines.early_depth_commit[&commit_key];
                         pass.set_bind_group(0, &binding.draw_bind_group, &[]);
                         pass.set_bind_group(1, &binding.tev_bind_group, &[]);
+                        if color_key
+                            .tev_layout_kind()
+                            .requires_managed_tex_coord_sidecar()
+                        {
+                            let sidecar = managed_tex_coord_sidecar
+                                .as_ref()
+                                .expect("managed multi-coordinate draw has a sidecar");
+                            pass.set_bind_group(2, &sidecar.bind_group, &[]);
+                        }
                         managed_early_depth_commands =
                             managed_early_depth_commands.saturating_add(1);
                         for vertices in
@@ -4081,6 +4231,7 @@ impl WebGpuRenderer {
                 .saturating_add(depth_commit_draws);
         });
         self.tev_vertices.clear();
+        self.managed_tex_coord_sidecar.clear();
         self.commands.clear();
         self.tev_draw_binding_indices.clear();
         self.tev_draw_bindings.clear();
@@ -4089,6 +4240,7 @@ impl WebGpuRenderer {
 
     fn clear_segment(&mut self) {
         self.tev_vertices.clear();
+        self.managed_tex_coord_sidecar.clear();
         self.commands.clear();
         self.tev_draw_binding_indices.clear();
         self.tev_draw_bindings.clear();
@@ -4133,6 +4285,7 @@ impl PipelineKey {
             primitive,
             cull: primitive_cull_mode(primitive, cull_mode),
             managed_coverage: false,
+            managed_tex_coord_sidecar: false,
             depth,
             blend: BlendPipelineState {
                 enabled: blend.enabled,
@@ -4155,11 +4308,16 @@ impl PipelineKey {
         self
     }
 
-    fn with_managed_coverage(mut self) -> Self {
+    fn with_managed_coverage(mut self, tex_coord_sidecar: bool) -> Self {
         debug_assert_eq!(self.primitive, Primitive::Triangles);
         self.managed_coverage = true;
+        self.managed_tex_coord_sidecar = tex_coord_sidecar;
         self.cull = CullMode::None;
         self
+    }
+
+    const fn tev_layout_kind(self) -> TevPipelineLayoutKind {
+        tev_pipeline_layout_kind(self.managed_tex_coord_sidecar)
     }
 }
 
@@ -4308,12 +4466,18 @@ fn source_triangle_components_are_bitwise_flat(
 fn managed_coverage_texture_coord(
     required_coords: [bool; MAX_TEV_TEXTURES],
 ) -> Option<Option<usize>> {
-    let mut live = required_coords
+    // Every valid GX coordinate index is representable. Zero or one live
+    // coordinate retains the original in-vertex payload; multiple live
+    // coordinates use the per-primitive storage sidecar.
+    Some(required_coords.into_iter().position(|required| required))
+}
+
+fn managed_coverage_uses_tex_coord_sidecar(required_coords: [bool; MAX_TEV_TEXTURES]) -> bool {
+    required_coords
         .into_iter()
-        .enumerate()
-        .filter_map(|(coord, required)| required.then_some(coord));
-    let selected = live.next();
-    live.next().is_none().then_some(selected)
+        .filter(|required| *required)
+        .count()
+        > 1
 }
 
 fn managed_coverage_samplers_are_safe(
@@ -4414,6 +4578,28 @@ fn managed_coverage_attribute_payload_for_depth(
     Some(payload)
 }
 
+fn managed_vertices_with_sidecar_record_base(
+    prepared: &[TevVertex],
+    resident_words: usize,
+) -> Option<Vec<TevVertex>> {
+    if !prepared.len().is_multiple_of(3) {
+        return None;
+    }
+    let triangle_count = prepared.len() / 3;
+    let base_record = managed_tex_coord_sidecar_record_base(resident_words, triangle_count)?;
+    Some(
+        prepared
+            .iter()
+            .enumerate()
+            .map(|(vertex_index, vertex)| {
+                let mut vertex = *vertex;
+                vertex.raster0[3] = f32::from_bits(base_record + (vertex_index / 3) as u32);
+                vertex
+            })
+            .collect(),
+    )
+}
+
 fn managed_coverage_raster_channel_u8(value: f32) -> Option<u8> {
     let channel = gx_normalized_raster_channel_u8(value);
     let canonical = f32::from(channel) / 255.0;
@@ -4492,11 +4678,18 @@ fn managed_coverage_payload_is_safe(
         return true;
     }
 
+    // Coarse derivatives may evaluate one helper lane beyond any covered edge.
+    // Certify the complete one-pixel halo for every required coordinate so a
+    // stage never obtains dpdx/dpdy from an unchecked projective value.
+    let helper_left = bounds.left.saturating_sub(1);
+    let helper_top = bounds.top.saturating_sub(1);
+    let helper_right = bounds.right;
+    let helper_bottom = bounds.bottom;
     let corners = [
-        [bounds.left, bounds.top],
-        [bounds.right - 1, bounds.top],
-        [bounds.left, bounds.bottom - 1],
-        [bounds.right - 1, bounds.bottom - 1],
+        [helper_left, helper_top],
+        [helper_right, helper_top],
+        [helper_left, helper_bottom],
+        [helper_right, helper_bottom],
     ];
     let mut q_is_positive = None;
     for [pixel_x, pixel_y] in corners {
@@ -4652,7 +4845,7 @@ fn prepare_managed_coverage_vertices(
     source_vertices: &[f32],
     expanded: &[usize],
     scissor: ScissorRect,
-) -> Option<Vec<TevVertex>> {
+) -> Option<PreparedManagedCoverageVertices> {
     let Some(texture_coord) = managed_coverage_texture_coord(required_coords) else {
         return None;
     };
@@ -4691,8 +4884,17 @@ fn prepare_managed_coverage_vertices(
         return None;
     };
     let textured = texture_coord.is_some();
+    let uses_tex_coord_sidecar = managed_coverage_uses_tex_coord_sidecar(required_coords);
     let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
     let mut prepared = Vec::with_capacity(expanded.len());
+    let mut tex_coord_sidecar = if uses_tex_coord_sidecar {
+        let capacity = (expanded.len() / 3).checked_mul(MANAGED_TEX_COORD_SIDECAR_WORDS)?;
+        let mut sidecar = Vec::new();
+        sidecar.try_reserve_exact(capacity).ok()?;
+        Some(sidecar)
+    } else {
+        None
+    };
     for triangle in expanded.chunks_exact(3) {
         let indices = [triangle[0], triangle[1], triangle[2]];
         if indices.into_iter().any(|index| index >= vertex_count) {
@@ -4731,13 +4933,35 @@ fn prepare_managed_coverage_vertices(
             };
             *point = source_point;
         }
-        if !managed_coverage_payload_is_safe(
+        if textured {
+            for (coord, required) in required_coords.into_iter().enumerate() {
+                if !required {
+                    continue;
+                }
+                let coord_payload = managed_coverage_attribute_payload_for_depth(
+                    source_vertices,
+                    indices,
+                    Some(coord),
+                    !depth_is_flat || !rasters_are_flat,
+                )?;
+                if !managed_coverage_payload_is_safe(
+                    coord_payload,
+                    depths,
+                    raster_endpoints,
+                    points,
+                    raster_scissor,
+                    true,
+                ) {
+                    return None;
+                }
+            }
+        } else if !managed_coverage_payload_is_safe(
             payload,
             depths,
             raster_endpoints,
             points,
             raster_scissor,
-            textured,
+            false,
         ) {
             return None;
         }
@@ -4745,10 +4969,20 @@ fn prepare_managed_coverage_vertices(
             managed_coverage_triangle_vertices(source_vertices, indices, texture_coord, scissor)
                 .ok()?;
         if let Some(vertices) = vertices {
+            if let Some(sidecar) = tex_coord_sidecar.as_mut() {
+                sidecar.extend_from_slice(&managed_tex_coord_sidecar_record(
+                    source_vertices,
+                    indices,
+                    required_coords,
+                )?);
+            }
             prepared.extend(vertices);
         }
     }
-    Some(prepared)
+    Some(PreparedManagedCoverageVertices {
+        vertices: prepared,
+        tex_coord_sidecar,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5166,7 +5400,7 @@ fn prepare_exact_managed_vertices(
     expanded: &[usize],
     scissor: Option<ScissorRect>,
     sampler_states: [GxSamplerState; MAX_TEV_TEXTURES],
-) -> Option<Vec<TevVertex>> {
+) -> Option<PreparedManagedCoverageVertices> {
     if expanded.is_empty() {
         return None;
     }
@@ -5282,7 +5516,7 @@ fn prepare_exact_draw(
     let exact_vertices = geometry.into_vertices();
     let exact_empty = expanded.is_empty()
         || exact_geometry_is_raster_empty(&exact_vertices, &expanded, scissor).unwrap_or(false);
-    let managed_vertices = (!exact_empty)
+    let managed = (!exact_empty)
         .then(|| {
             prepare_exact_managed_vertices(
                 draw,
@@ -5295,7 +5529,8 @@ fn prepare_exact_draw(
         .flatten();
     let qualified = QualifiedExactDraw {
         scissor,
-        managed_vertices,
+        managed_vertices: managed.as_ref().map(|prepared| prepared.vertices.clone()),
+        managed_tex_coord_sidecar: managed.and_then(|prepared| prepared.tex_coord_sidecar),
         exact_empty,
     };
     let required_managed_safe = required && qualified.managed_vertices.is_some();
@@ -5523,8 +5758,11 @@ impl Pipelines {
         if self.tev_geometry.contains_key(&key) {
             return false;
         }
-        let pipeline =
-            create_tev_geometry_pipeline(device, &self.tev_shader, &self.tev_layout, key);
+        let layout = match key.tev_layout_kind() {
+            TevPipelineLayoutKind::Legacy => &self.tev_legacy_layout,
+            TevPipelineLayoutKind::ManagedTexCoordSidecar => &self.tev_sidecar_layout,
+        };
+        let pipeline = create_tev_geometry_pipeline(device, &self.tev_shader, layout, key);
         self.tev_geometry.insert(key, pipeline);
         true
     }
@@ -5603,12 +5841,23 @@ fn create_tev_geometry_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(match (key.managed_coverage, key.canonical_fragment_depth) {
-                (true, true) => "fs_managed_coverage_depth_main",
-                (true, false) => "fs_managed_coverage_main",
-                (false, true) => "fs_depth_main",
-                (false, false) => "fs_main",
-            }),
+            entry_point: Some(
+                match (
+                    key.managed_coverage,
+                    key.managed_tex_coord_sidecar,
+                    key.canonical_fragment_depth,
+                ) {
+                    (true, true, true) => "fs_managed_multi_coord_depth_main",
+                    (true, true, false) => "fs_managed_multi_coord_main",
+                    (true, false, true) => "fs_managed_coverage_depth_main",
+                    (true, false, false) => "fs_managed_coverage_main",
+                    (false, false, true) => "fs_depth_main",
+                    (false, false, false) => "fs_main",
+                    (false, true, _) => {
+                        unreachable!("native pipeline cannot require managed sidecar")
+                    }
+                },
+            ),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8Unorm,
@@ -5992,6 +6241,7 @@ fn create_pipelines(
     device: &wgpu::Device,
     tev_draw_layout: &wgpu::BindGroupLayout,
     tev_texture_layout: &wgpu::BindGroupLayout,
+    managed_tex_coord_layout: &wgpu::BindGroupLayout,
     present_layout: &wgpu::BindGroupLayout,
     surface_format: wgpu::TextureFormat,
 ) -> Pipelines {
@@ -5999,9 +6249,18 @@ fn create_pipelines(
         label: Some("browser GX per-fragment TEV shader"),
         source: wgpu::ShaderSource::Wgsl(tev_shader_source().into()),
     });
-    let tev_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("browser GX per-fragment TEV pipeline layout"),
+    let tev_legacy_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("browser GX per-fragment legacy TEV pipeline layout"),
         bind_group_layouts: &[Some(tev_draw_layout), Some(tev_texture_layout)],
+        immediate_size: 0,
+    });
+    let tev_sidecar_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("browser GX per-fragment sidecar TEV pipeline layout"),
+        bind_group_layouts: &[
+            Some(tev_draw_layout),
+            Some(tev_texture_layout),
+            Some(managed_tex_coord_layout),
+        ],
         immediate_size: 0,
     });
     let early_depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -6049,7 +6308,8 @@ fn create_pipelines(
     });
     Pipelines {
         tev_shader,
-        tev_layout,
+        tev_legacy_layout,
+        tev_sidecar_layout,
         early_depth_layout,
         tev_geometry: HashMap::new(),
         early_depth_commit: HashMap::new(),
@@ -6068,20 +6328,23 @@ mod tests {
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxRasterPoint28_4, GxRasterScissor,
         GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
         MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
-        ManagedCoverageEvidence, PipelineKey, PreparedExactDraw, Primitive, QualifiedExactDraw,
-        REQUIRED_WEBGPU_FEATURES, ScissorRect, TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex,
-        alpha_blend_factor, blend_write_mask, browser_raster_position_correction,
-        color_blend_factor, depth_only_command_state, draw_depth_encoding,
-        exact_geometry_is_raster_empty, expanded_index_count, expanded_indices,
-        expanded_primitive_ranges, managed_coverage_attribute_payload,
-        managed_coverage_draw_is_safe, managed_coverage_pack_point,
-        managed_coverage_samplers_are_safe, managed_coverage_texel_uv_is_safe,
-        managed_coverage_texture_coord, managed_coverage_triangle_vertices,
-        managed_post_cull_indices, merge_contiguous_draw_range, rgba8_mip_uploads,
+        MANAGED_TEX_COORD_SIDECAR_WORDS, ManagedCoverageEvidence, ManagedSidecarCapacityOutcome,
+        PipelineKey, PreparedExactDraw, Primitive, QualifiedExactDraw, REQUIRED_WEBGPU_FEATURES,
+        ScissorRect, TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex, alpha_blend_factor,
+        blend_write_mask, browser_raster_position_correction, color_blend_factor,
+        depth_only_command_state, draw_depth_encoding, exact_geometry_is_raster_empty,
+        expanded_index_count, expanded_indices, expanded_primitive_ranges,
+        managed_coverage_attribute_payload, managed_coverage_draw_is_safe,
+        managed_coverage_pack_point, managed_coverage_samplers_are_safe,
+        managed_coverage_texel_uv_is_safe, managed_coverage_texture_coord,
+        managed_coverage_triangle_vertices, managed_post_cull_indices,
+        managed_sidecar_capacity_outcome, managed_tex_coord_sidecar_record,
+        managed_vertices_with_sidecar_record_base, merge_contiguous_draw_range,
+        prepare_managed_coverage_vertices, rgba8_mip_uploads,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
     };
     use crate::packet::GxTriangleAction;
-    use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS};
+    use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS, managed_tex_coord_sidecar_fits};
     use crate::{
         GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState,
         GxRasterCenterEvidence, GxSamplerState, GxZTextureOperation, SamplerIdentity,
@@ -6210,6 +6473,7 @@ mod tests {
                 height: 1,
             }),
             managed_vertices: Some(vec![TevVertex::zeroed(); 3]),
+            managed_tex_coord_sidecar: None,
             exact_empty: false,
         };
         let optional_unqualified = PreparedExactDraw {
@@ -6271,6 +6535,7 @@ mod tests {
             qualified: Some(QualifiedExactDraw {
                 scissor: None,
                 managed_vertices: None,
+                managed_tex_coord_sidecar: None,
                 exact_empty: true,
             }),
         };
@@ -6304,6 +6569,7 @@ mod tests {
                 qualified: Some(QualifiedExactDraw {
                     scissor: snapped_scissor,
                     managed_vertices: None,
+                    managed_tex_coord_sidecar: None,
                     exact_empty: true,
                 }),
             };
@@ -6984,16 +7250,271 @@ mod tests {
         assert_eq!((awkward_s / awkward_w).to_bits(), 0x3f00_9278);
 
         required_coords[6] = true;
-        assert_eq!(managed_coverage_texture_coord(required_coords), None);
+        assert_eq!(
+            managed_coverage_texture_coord(required_coords),
+            Some(Some(6))
+        );
         assert!(
-            !qualifying_managed_draw_with_textures(
+            qualifying_managed_draw_with_textures(
                 &source,
                 required_maps,
                 required_coords,
                 sampler_modes,
             ),
-            "two live texture coordinates must stay on the native path",
+            "two live texture coordinates use the exact managed sidecar",
         );
+        let prepared = prepare_managed_coverage_vertices(
+            ManagedCoverageEvidence::TrustedPostCull,
+            Primitive::Triangles,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxEarlyDepthPlan::FixedFunction,
+            required_maps,
+            required_coords,
+            legacy_sampler_states(sampler_modes),
+            GxFogState::default(),
+            gx_z_texture_state(0, 0, 0).unwrap(),
+            &source,
+            &[0, 1, 2],
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+        )
+        .expect("two-coordinate draw prepares an exact managed sidecar");
+        assert_eq!(prepared.vertices.len(), 3);
+        assert_eq!(
+            prepared.tex_coord_sidecar.as_deref(),
+            Some(
+                managed_tex_coord_sidecar_record(&source, [0, 1, 2], required_coords)
+                    .unwrap()
+                    .as_slice()
+            ),
+        );
+        assert_eq!(
+            prepared.tex_coord_sidecar.as_ref().unwrap().len(),
+            MANAGED_TEX_COORD_SIDECAR_WORDS,
+        );
+
+        required_coords.fill(true);
+        assert!(
+            qualifying_managed_draw_with_textures(
+                &source,
+                required_maps,
+                required_coords,
+                sampler_modes,
+            ),
+            "all eight GX coordinate indices remain representable",
+        );
+    }
+
+    #[test]
+    fn managed_multi_coord_sidecar_preserves_empty_noops_and_fails_closed_at_limits() {
+        let source = flat_triangle_source([[0.0, 0.0], [0.01, 0.0], [0.0, 0.01]]);
+        let mut required_maps = [false; MAX_TEV_TEXTURES];
+        required_maps[0] = true;
+        let mut required_coords = [false; MAX_TEV_TEXTURES];
+        required_coords[2] = true;
+        required_coords[7] = true;
+        let prepared = prepare_managed_coverage_vertices(
+            ManagedCoverageEvidence::TrustedPostCull,
+            Primitive::Triangles,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxEarlyDepthPlan::FixedFunction,
+            required_maps,
+            required_coords,
+            legacy_sampler_states([0; MAX_TEV_TEXTURES]),
+            GxFogState::default(),
+            gx_z_texture_state(0, 0, 0).unwrap(),
+            &source,
+            &[0, 1, 2],
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+        )
+        .expect("snapped-empty multi-coordinate evidence is still authoritative");
+        assert!(prepared.vertices.is_empty());
+        assert_eq!(prepared.tex_coord_sidecar, Some(Vec::new()));
+        assert!(managed_tex_coord_sidecar_fits(0, Some(&[]), 0));
+
+        let record = [0_u32; MANAGED_TEX_COORD_SIDECAR_WORDS];
+        let bytes = MANAGED_TEX_COORD_SIDECAR_WORDS * std::mem::size_of::<u32>();
+        assert!(managed_tex_coord_sidecar_fits(0, Some(&record), bytes));
+        assert!(!managed_tex_coord_sidecar_fits(0, Some(&record), bytes - 1));
+        assert!(!managed_tex_coord_sidecar_fits(
+            usize::MAX - 1,
+            Some(&record),
+            usize::MAX
+        ));
+        assert!(!managed_tex_coord_sidecar_fits(
+            0,
+            Some(&record[..record.len() - 1]),
+            usize::MAX
+        ));
+        assert_eq!(
+            managed_sidecar_capacity_outcome(false, 0, Some(&record), bytes - 1),
+            ManagedSidecarCapacityOutcome::NativeFallback,
+        );
+        assert_eq!(
+            managed_sidecar_capacity_outcome(true, 0, Some(&record), bytes - 1),
+            ManagedSidecarCapacityOutcome::RejectManagedPayload,
+        );
+        assert_eq!(
+            managed_sidecar_capacity_outcome(true, 0, Some(&record), bytes),
+            ManagedSidecarCapacityOutcome::Managed,
+        );
+    }
+
+    #[test]
+    fn managed_sidecar_carries_distinct_exact_endpoints_for_all_eight_coords() {
+        let mut source = flat_triangle_source([[1.0, 1.0], [5.0, 1.0], [1.0, 5.0]]);
+        let widths = [1.0_f32, 2.0, 4.0];
+        for (vertex, width) in widths.into_iter().enumerate() {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            source[offset + 3] = width;
+            for coord in 0..MAX_TEV_TEXTURES {
+                let stq = offset + 12 + coord * 3;
+                source[stq] = coord as f32 + vertex as f32 * 0.125 + 0.25;
+                source[stq + 1] = coord as f32 * 0.5 + vertex as f32 * 0.25 + 0.5;
+                source[stq + 2] = 1.0 + coord as f32 * 0.0625;
+            }
+        }
+        let required_coords = [true; MAX_TEV_TEXTURES];
+        let record = managed_tex_coord_sidecar_record(&source, [0, 1, 2], required_coords).unwrap();
+        assert_eq!(record[..3], widths.map(|width| (1.0_f32 / width).to_bits()),);
+        for coord in 0..MAX_TEV_TEXTURES {
+            let base = 3 + coord * 9;
+            for component in 0..3 {
+                for vertex in 0..3 {
+                    let offset = vertex * TEV_VERTEX_FLOATS;
+                    let value =
+                        source[offset + 12 + coord * 3 + component] * (1.0 / source[offset + 3]);
+                    assert_eq!(
+                        record[base + component * 3 + vertex],
+                        value.to_bits(),
+                        "coord {coord} component {component} vertex {vertex}",
+                    );
+                }
+            }
+        }
+        assert_eq!(record[MANAGED_TEX_COORD_SIDECAR_WORDS - 1], 0);
+    }
+
+    #[test]
+    fn managed_sidecar_global_ids_and_keep021_endpoint_order_are_stable() {
+        let prepared = vec![TevVertex::zeroed(); 6];
+        let first = managed_vertices_with_sidecar_record_base(&prepared, 0).unwrap();
+        for (record, triangle) in first.chunks_exact(3).enumerate() {
+            assert!(
+                triangle
+                    .iter()
+                    .all(|vertex| vertex.raster0[3].to_bits() == record as u32),
+            );
+        }
+        let second = managed_vertices_with_sidecar_record_base(
+            &prepared,
+            2 * MANAGED_TEX_COORD_SIDECAR_WORDS,
+        )
+        .unwrap();
+        for (record, triangle) in second.chunks_exact(3).enumerate() {
+            assert!(
+                triangle
+                    .iter()
+                    .all(|vertex| vertex.raster0[3].to_bits() == record as u32 + 2),
+            );
+        }
+        let after_segment_reset =
+            managed_vertices_with_sidecar_record_base(&prepared[..3], 0).unwrap();
+        assert!(
+            after_segment_reset
+                .iter()
+                .all(|vertex| vertex.raster0[3].to_bits() == 0),
+        );
+
+        let mut source = flat_triangle_source([[1.0, 1.0], [5.0, 1.0], [1.0, 5.0]]);
+        for vertex in 0..3 {
+            let offset = vertex * TEV_VERTEX_FLOATS + 12 + 2 * 3;
+            source[offset] = 10.0 + vertex as f32;
+            source[offset + 1] = 20.0 + vertex as f32;
+            source[offset + 2] = 1.0;
+        }
+        let mut required_coords = [false; MAX_TEV_TEXTURES];
+        required_coords[2] = true;
+        required_coords[7] = true;
+        let actions = [GxTriangleAction::Keep021];
+        let reordered = managed_post_cull_indices(&[0, 1, 2], Some(&actions)).unwrap();
+        assert_eq!(reordered, [0, 2, 1]);
+        let record = managed_tex_coord_sidecar_record(
+            &source,
+            reordered.try_into().unwrap(),
+            required_coords,
+        )
+        .unwrap();
+        assert_eq!(
+            record[3 + 2 * 9..3 + 2 * 9 + 3],
+            [10.0_f32.to_bits(), 12.0_f32.to_bits(), 11.0_f32.to_bits()],
+        );
+    }
+
+    #[test]
+    fn managed_single_and_untextured_paths_keep_the_original_vertex_bytes() {
+        let source = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
+        for selected_coord in [None, Some(7)] {
+            let mut required_maps = [false; MAX_TEV_TEXTURES];
+            let mut required_coords = [false; MAX_TEV_TEXTURES];
+            if let Some(coord) = selected_coord {
+                required_maps[0] = true;
+                required_coords[coord] = true;
+            }
+            let prepared = prepare_managed_coverage_vertices(
+                ManagedCoverageEvidence::TrustedPostCull,
+                Primitive::Triangles,
+                GxRasterCenterEvidence::KnownNonAntialiased,
+                GxEarlyDepthPlan::FixedFunction,
+                required_maps,
+                required_coords,
+                legacy_sampler_states([0; MAX_TEV_TEXTURES]),
+                GxFogState::default(),
+                gx_z_texture_state(0, 0, 0).unwrap(),
+                &source,
+                &[0, 1, 2],
+                ScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap();
+            assert_eq!(prepared.tex_coord_sidecar, None);
+            let expected = managed_coverage_triangle_vertices(
+                &source,
+                [0, 1, 2],
+                selected_coord,
+                ScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                bytemuck::cast_slice::<TevVertex, u8>(&prepared.vertices),
+                bytemuck::cast_slice::<TevVertex, u8>(&expected),
+            );
+            assert!(
+                prepared
+                    .vertices
+                    .iter()
+                    .all(|vertex| vertex.raster0[3].to_bits() == 0),
+            );
+        }
     }
 
     #[test]
@@ -7284,10 +7805,14 @@ mod tests {
             1,
         );
         assert_eq!(back_culled_native.cull, CullMode::Back);
-        let managed = back_culled_native.with_managed_coverage();
+        let managed = back_culled_native.with_managed_coverage(false);
         assert!(managed.managed_coverage);
+        assert!(!managed.managed_tex_coord_sidecar);
         assert_eq!(managed.cull, CullMode::None);
         assert_ne!(managed, back_culled_native);
+        let multi_coord = back_culled_native.with_managed_coverage(true);
+        assert!(multi_coord.managed_tex_coord_sidecar);
+        assert_ne!(multi_coord, managed);
     }
 
     #[test]

@@ -917,10 +917,20 @@ test("producer gates exact cull work to the receiver's current managed subset", 
       0,
       4,
       pipeline,
-      [stage(0, 0), stage(1, 0)],
+      [stage(2, 0), stage(7, 0)],
     ),
-    false,
-    "two live texcoords exceed the producer subset",
+    true,
+    "two nonconsecutive live texcoords enter the exact managed subset",
+  );
+  assert.equal(
+    candidate(
+      0,
+      4,
+      pipeline,
+      Array.from({ length: 8 }, (_unused, coord) => stage(coord, 0)),
+    ),
+    true,
+    "all eight live texcoords remain eligible for the receiver sidecar",
   );
   assert.equal(
     candidate(5, 3, pipeline, []),

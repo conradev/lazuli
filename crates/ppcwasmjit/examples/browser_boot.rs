@@ -9859,7 +9859,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         return false;
       }
-      let liveTexCoordMask = 0;
       let requiredTextureMapMask = 0;
       let allLegacySamplersEligible = true;
       for (const stage of texturedStages) {
@@ -9875,10 +9874,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         ) {
           return false;
         }
-        liveTexCoordMask |= 1 << stage.texCoordIndex;
         requiredTextureMapMask |= 1 << stage.textureMap;
       }
-      if ((liveTexCoordMask & (liveTexCoordMask - 1)) !== 0) return false;
       for (let textureMap = 0; textureMap < 8; textureMap += 1) {
         if ((requiredTextureMapMask & (1 << textureMap)) === 0) continue;
         const texture = Array.isArray(textures) ? textures[textureMap] : null;

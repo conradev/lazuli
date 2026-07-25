@@ -84,7 +84,11 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   );
   assert.match(
     preparationTypes,
-    /struct QualifiedExactDraw \{\s*scissor: Option<ScissorRect>,\s*managed_vertices: Option<Vec<TevVertex>>,\s*exact_empty: bool,\s*\}/,
+    /struct QualifiedExactDraw \{\s*scissor: Option<ScissorRect>,\s*managed_vertices: Option<Vec<TevVertex>>,\s*managed_tex_coord_sidecar: Option<Vec<u32>>,\s*exact_empty: bool,\s*\}/,
+  );
+  assert.match(
+    preparationTypes,
+    /struct PreparedManagedCoverageVertices \{\s*vertices: Vec<TevVertex>,\s*tex_coord_sidecar: Option<Vec<u32>>,\s*\}/,
   );
   assert.doesNotMatch(preparationTypes, /vertices: Vec<f32>|expanded: Vec<usize>/);
   assert.match(
@@ -123,7 +127,10 @@ test("absent, optional, and required exact inputs remain distinct", () => {
     requiredRoute,
     /early_depth != GxEarlyDepthPlan::FixedFunction[\s\S]*return None;[\s\S]*draw_depth_encoding/,
   );
-  assert.match(requiredRoute, /-> Option<Vec<TevVertex>>/);
+  assert.match(
+    requiredRoute,
+    /-> Option<PreparedManagedCoverageVertices>/,
+  );
 
   const rasterEmpty = sourceSection(
     rendererSource,
@@ -158,7 +165,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.doesNotMatch(prepare, /right - left \+ 1|bottom - top \+ 1/);
   assert.match(
     prepare,
-    /let exact_vertices = geometry\.into_vertices\(\);[\s\S]*let exact_empty = expanded\.is_empty\(\)[\s\S]*exact_geometry_is_raster_empty\(&exact_vertices, &expanded, scissor\)[\s\S]*let managed_vertices = \(!exact_empty\)[\s\S]*prepare_exact_managed_vertices\(\s*draw,\s*&exact_vertices,\s*&expanded,\s*scissor,\s*sampler_states,\s*\)[\s\S]*let qualified = QualifiedExactDraw \{\s*scissor,\s*managed_vertices,\s*exact_empty,\s*\};[\s\S]*let required_managed_safe = required && qualified\.managed_vertices\.is_some\(\);/,
+    /let exact_vertices = geometry\.into_vertices\(\);[\s\S]*let exact_empty = expanded\.is_empty\(\)[\s\S]*exact_geometry_is_raster_empty\(&exact_vertices, &expanded, scissor\)[\s\S]*let managed = \(!exact_empty\)[\s\S]*prepare_exact_managed_vertices\(\s*draw,\s*&exact_vertices,\s*&expanded,\s*scissor,\s*sampler_states,\s*\)[\s\S]*let qualified = QualifiedExactDraw \{\s*scissor,\s*managed_vertices: managed\.as_ref\(\)\.map\(\|prepared\| prepared\.vertices\.clone\(\)\),\s*managed_tex_coord_sidecar: managed\.and_then\(\|prepared\| prepared\.tex_coord_sidecar\),\s*exact_empty,\s*\};[\s\S]*let required_managed_safe = required && qualified\.managed_vertices\.is_some\(\);/,
   );
 });
 
@@ -205,13 +212,13 @@ test("exact managed geometry wins while only optional unsafe input falls back", 
     "let managed_vertices",
     "let managed_evidence",
     "let scissor = if let Some(exact)",
-    "pipeline = pipeline.with_managed_coverage()",
+    "pipeline = pipeline.with_managed_coverage(",
     "let mut selected",
     "return self.push_prepared_managed_draw",
   ]);
   assert.match(
     draw,
-    /let exact_managed =\s*qualified_exact\.filter\(\|exact\| exact\.managed_vertices\.is_some\(\)\);/,
+    /let exact_sidecar_capacity = qualified_exact[\s\S]*managed_sidecar_capacity_outcome\([\s\S]*exact\.managed_tex_coord_sidecar\.as_deref\(\),[\s\S]*let exact_managed = qualified_exact\.filter\(\|exact\| \{\s*exact\.managed_vertices\.is_some\(\)\s*&& exact_sidecar_capacity == Some\(ManagedSidecarCapacityOutcome::Managed\)\s*\}\);/,
   );
   assert.match(
     draw,
@@ -227,7 +234,7 @@ test("exact managed geometry wins while only optional unsafe input falls back", 
   );
   assert.match(
     draw,
-    /if managed_vertices\.as_ref\(\)\.is_some_and\(Vec::is_empty\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*\}[\s\S]*let managed_evidence =/,
+    /if managed_vertices\s*\.as_ref\(\)\s*\.is_some_and\(\|prepared\| prepared\.vertices\.is_empty\(\)\)\s*\{[\s\S]*return Ok\(\(\)\);[\s\S]*\}[\s\S]*let managed_evidence =/,
   );
   assert.match(
     draw,
@@ -235,11 +242,11 @@ test("exact managed geometry wins while only optional unsafe input falls back", 
   );
   assert.match(
     draw,
-    /if let Some\(exact\) = exact_managed \{[\s\S]*push_prepared_managed_draw\([\s\S]*exact[\s\S]*\.managed_vertices/,
+    /if let Some\(exact\) = exact_managed \{[\s\S]*push_prepared_managed_draw\([\s\S]*exact[\s\S]*\.managed_vertices[\s\S]*exact\.managed_tex_coord_sidecar\.as_deref\(\),/,
   );
   assert.match(
     draw,
-    /if let Some\(vertices\) = managed_vertices\.as_deref\(\) \{[\s\S]*push_prepared_managed_draw\(vertices, state\)/,
+    /if let Some\(prepared\) = managed_vertices\.as_ref\(\) \{[\s\S]*push_prepared_managed_draw\(\s*&prepared\.vertices,\s*prepared\.tex_coord_sidecar\.as_deref\(\),\s*state,\s*\)/,
   );
   assert.doesNotMatch(
     draw,
@@ -267,6 +274,8 @@ test("exact activation retains every managed shader-safety gate", () => {
     "managed_coverage_attribute_payload_for_depth",
     "managed_coverage_raster_endpoints",
     "managed_coverage_payload_is_safe",
+    "managed_coverage_uses_tex_coord_sidecar",
+    "managed_tex_coord_sidecar_record",
     "let mut prepared",
     "prepared.extend",
   ]) {
@@ -285,7 +294,10 @@ test("exact activation retains every managed shader-safety gate", () => {
     qualification,
     /evidence == ManagedCoverageEvidence::TrustedPostCull\s*&& \(!depth_is_flat \|\| !rasters_are_flat\)/,
   );
-  assert.match(qualification, /Some\(prepared\)\s*\}/);
+  assert.match(
+    qualification,
+    /Some\(PreparedManagedCoverageVertices \{\s*vertices: prepared,\s*tex_coord_sidecar,\s*\}\)/,
+  );
 });
 
 test("the activated path remains wgpu WebGPU-only and disables GPU reculling", () => {
