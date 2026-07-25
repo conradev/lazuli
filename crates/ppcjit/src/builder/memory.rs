@@ -1806,20 +1806,20 @@ impl BlockBuilder<'_> {
         LOAD_INFO
     }
 
-    pub fn psq_lx(&mut self, ins: Ins) -> InstructionInfo {
+    fn psq_load_indexed(&mut self, ins: Ins, update: bool) -> InstructionInfo {
         self.check_floats();
 
         let rb = self.get(ins.gpr_b());
-        let addr = if ins.field_ra() == 0 {
+        let addr = if !update && ins.field_ra() == 0 {
             rb
         } else {
             let ra = self.get(ins.gpr_a());
             self.bd.ins().iadd(ra, rb)
         };
 
-        let gqr = self.get(SPR::GQR[ins.field_ps_i() as usize]);
+        let gqr = self.get(SPR::GQR[ins.field_ps_ix() as usize]);
         let (ps0, size) = self.mem_load_quant(addr, gqr);
-        let ps1 = if ins.field_ps_w() == 0 {
+        let ps1 = if ins.field_ps_wx() == 0 {
             let addr = self.bd.ins().iadd(addr, size);
             self.mem_load_quant(addr, gqr).0
         } else {
@@ -1829,8 +1829,19 @@ impl BlockBuilder<'_> {
         let value = self.bd.ins().scalar_to_vector(ir::types::F64X2, ps0);
         let value = self.bd.ins().insertlane(value, ps1, 1);
         self.set(ins.fpr_d(), value);
+        if update {
+            self.set(ins.gpr_a(), addr);
+        }
 
         LOAD_INFO
+    }
+
+    pub fn psq_lx(&mut self, ins: Ins) -> InstructionInfo {
+        self.psq_load_indexed(ins, false)
+    }
+
+    pub fn psq_lux(&mut self, ins: Ins) -> InstructionInfo {
+        self.psq_load_indexed(ins, true)
     }
 
     pub fn psq_st(&mut self, ins: Ins) -> InstructionInfo {
@@ -1883,11 +1894,11 @@ impl BlockBuilder<'_> {
         STORE_INFO
     }
 
-    pub fn psq_stx(&mut self, ins: Ins) -> InstructionInfo {
+    fn psq_store_indexed(&mut self, ins: Ins, update: bool) -> InstructionInfo {
         self.check_floats();
 
         let rb = self.get(ins.gpr_b());
-        let addr = if ins.field_ra() == 0 {
+        let addr = if !update && ins.field_ra() == 0 {
             rb
         } else {
             let ra = self.get(ins.gpr_a());
@@ -1896,15 +1907,26 @@ impl BlockBuilder<'_> {
 
         let fpr_s = self.get(ins.fpr_s());
         let ps0 = self.bd.ins().extractlane(fpr_s, 0);
-        let gqr = self.get(SPR::GQR[ins.field_ps_i() as usize]);
+        let gqr = self.get(SPR::GQR[ins.field_ps_ix() as usize]);
 
         let size = self.mem_store_quant(addr, gqr, ps0);
-        if ins.field_ps_w() == 0 {
+        if ins.field_ps_wx() == 0 {
             let ps1 = self.bd.ins().extractlane(fpr_s, 1);
             let addr = self.bd.ins().iadd(addr, size);
             self.mem_store_quant(addr, gqr, ps1);
         }
+        if update {
+            self.set(ins.gpr_a(), addr);
+        }
 
         STORE_INFO
+    }
+
+    pub fn psq_stx(&mut self, ins: Ins) -> InstructionInfo {
+        self.psq_store_indexed(ins, false)
+    }
+
+    pub fn psq_stux(&mut self, ins: Ins) -> InstructionInfo {
+        self.psq_store_indexed(ins, true)
     }
 }
