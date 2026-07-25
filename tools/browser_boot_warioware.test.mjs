@@ -74,6 +74,634 @@ function makeContext(identifier = "GZWE01") {
   return context;
 }
 
+const wariowareNextMicrogameSetterPc = 0x80046050;
+const wariowareNextMicrogameActivationPc = 0x80046174;
+const wariowareFilteredNextMicrogameSelectorPc = 0x80046c44;
+const wariowareNextMicrogameSelectorPc = 0x80046d20;
+const wariowareNextMicrogameSetterSignature = [
+  0x9421ffe0,
+  0x7c0802a6,
+  0x2c04270f,
+  0x90010024,
+  0x93e1001c,
+  0x93c10018,
+];
+const wariowareNextMicrogameSelectorSignature = [
+  0x9421fff0,
+  0x7c0802a6,
+  0x3c608027,
+  0x90010014,
+  0x8403861c,
+  0x2c000000,
+];
+const overrideFunctionNames = [
+  "exactWarioWareRevisionZero",
+  "createWarioWareNextMicrogameOverride",
+  "warioWareNextMicrogameOverridePending",
+  "warioWareNextMicrogameOverrideRegionSafe",
+  "warioWareNextMicrogameSetterSignatureMatches",
+  "warioWareNextMicrogameSelectorSignatureMatches",
+  "isUint32",
+  "relativeBranchTarget",
+  "observeWarioWareNextMicrogameSelection",
+  "warioWareNextMicrogameCallerMatches",
+  "applyWarioWareNextMicrogameOverride",
+  "snapshotWarioWareNextMicrogameOverride",
+  "hex32",
+];
+
+function overrideContext(boot = {
+  identifier: "GZWE01",
+  discId: 0,
+  version: 0,
+}) {
+  const registers = new Uint32Array(32);
+  const instructions = new Map(
+    [
+      ...wariowareNextMicrogameSetterSignature.map((word, index) => [
+        wariowareNextMicrogameSetterPc + index * 4,
+        word,
+      ]),
+      ...wariowareNextMicrogameSelectorSignature.map((word, index) => [
+        wariowareNextMicrogameSelectorPc + index * 4,
+        word,
+      ]),
+    ],
+  );
+  const selectorLr = 0x8101d75c;
+  const setterLr = selectorLr + 0x10;
+  const relativeBranch = (from, to) =>
+    (0x48000001 | ((to - from) & 0x03fffffc)) >>> 0;
+  instructions.set(selectorLr - 4, relativeBranch(
+    selectorLr - 4,
+    wariowareNextMicrogameSelectorPc,
+  ));
+  instructions.set(selectorLr, 0x907b278c);
+  instructions.set(selectorLr + 4, 0x809b278c);
+  instructions.set(selectorLr + 8, 0x38600000);
+  instructions.set(setterLr - 4, relativeBranch(
+    setterLr - 4,
+    wariowareNextMicrogameSetterPc,
+  ));
+  const context = {
+    Map,
+    Number,
+    URLSearchParams,
+    boot,
+    cycles: 123_456,
+    linkRegister: selectorLr,
+    registers,
+    instructions,
+    wariowareNextMicrogameQueryName: "wariowareNextMicrogame",
+    wariowareNextMicrogameQueryValue: "0x63",
+    wariowareNextMicrogameSetterPc,
+    wariowareNextMicrogameActivationPc,
+    wariowareFilteredNextMicrogameSelectorPc,
+    wariowareNextMicrogameSelectorPc,
+    wariowareRepellionMicrogameId: 0x63,
+    wariowareMaximumRetailMicrogameId: 0x117,
+    wariowareNextMicrogameSetterSignature,
+    wariowareNextMicrogameSelectorSignature,
+    readGpr(index) {
+      return registers[index];
+    },
+    writeGpr(index, value) {
+      registers[index] = value >>> 0;
+    },
+    readLr() {
+      return context.linkRegister;
+    },
+    probeInstructionWord(address) {
+      return instructions.get(address) ?? null;
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    overrideFunctionNames.map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.warioware-override.js" },
+  );
+  context.selectorLr = selectorLr;
+  context.setterLr = setterLr;
+  return context;
+}
+
+test("WarioWare next-microgame request accepts only the exact debug opt-in", () => {
+  const context = overrideContext();
+  const selected = JSON.parse(JSON.stringify(
+    context.createWarioWareNextMicrogameOverride(
+      new URLSearchParams("?wariowareNextMicrogame=0x63&cycles=10"),
+    ),
+  ));
+  assert.deepEqual(selected, {
+    requested: true,
+    eligible: true,
+    applied: false,
+    cycle: null,
+    pc: null,
+    original: null,
+    forced: 0x63,
+    player: null,
+    caller: null,
+    lr: null,
+    selectorCycle: null,
+    selectorPc: null,
+    selectorLr: null,
+  });
+
+  for (const query of [
+    "",
+    "?wariowareNextMicrogame=99",
+    "?wariowareNextMicrogame=0X63",
+    "?wariowareNextMicrogame=0x63&wariowareNextMicrogame=0x63",
+  ]) {
+    const rejected = context.createWarioWareNextMicrogameOverride(
+      new URLSearchParams(query),
+    );
+    assert.equal(rejected.requested, false, query);
+    assert.equal(rejected.eligible, false, query);
+    assert.equal(rejected.forced, null, query);
+  }
+});
+
+test("WarioWare next-microgame override is exact-disc, exact-revision, and one-shot", () => {
+  const context = overrideContext();
+  const request = () => context.createWarioWareNextMicrogameOverride(
+    new URLSearchParams("?wariowareNextMicrogame=0x63"),
+  );
+  const override = request();
+  context.registers[3] = 0;
+  context.registers[4] = 0x4b;
+
+  context.linkRegister = context.setterLr;
+  assert.equal(
+    context.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+    ),
+    false,
+    "a setter call without the preceding selector observation must be untouched",
+  );
+  assert.equal(context.registers[4], 0x4b);
+
+  context.linkRegister = context.selectorLr;
+  assert.equal(
+    context.observeWarioWareNextMicrogameSelection(
+      wariowareNextMicrogameSelectorPc,
+      override,
+    ),
+    true,
+  );
+  assert.equal(
+    context.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc - 4,
+      override,
+    ),
+    false,
+  );
+  assert.equal(context.registers[4], 0x4b);
+  context.linkRegister = context.setterLr;
+  assert.equal(
+    context.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+    ),
+    true,
+  );
+  assert.equal(context.registers[3], 0, "the player register must be preserved");
+  assert.equal(context.registers[4], 0x63);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      context.snapshotWarioWareNextMicrogameOverride(override),
+    )),
+    {
+      requested: true,
+      eligible: true,
+      applied: true,
+      cycle: 123_456,
+      pc: "0x80046050",
+      original: 0x4b,
+      forced: 0x63,
+      player: 0,
+      caller: "0x8101d768",
+      lr: "0x8101d76c",
+      selectorCycle: 123_456,
+      selectorPc: "0x80046d20",
+      selectorLr: "0x8101d75c",
+    },
+  );
+
+  context.registers[4] = 0x52;
+  assert.equal(
+    context.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+    ),
+    false,
+  );
+  assert.equal(context.registers[4], 0x52, "a later selector call must be untouched");
+});
+
+test("WarioWare next-microgame override fails closed on variants and signature drift", () => {
+  {
+    const context = overrideContext();
+    const override = context.createWarioWareNextMicrogameOverride(
+      new URLSearchParams(""),
+    );
+    context.registers[3] = 0;
+    context.registers[4] = 0x4b;
+    context.linkRegister = context.selectorLr;
+    assert.equal(
+      context.observeWarioWareNextMicrogameSelection(
+        wariowareNextMicrogameSelectorPc,
+        override,
+      ),
+      false,
+    );
+    context.linkRegister = context.setterLr;
+    assert.equal(
+      context.applyWarioWareNextMicrogameOverride(
+        wariowareNextMicrogameSetterPc,
+        override,
+      ),
+      false,
+    );
+    assert.equal(context.registers[4], 0x4b);
+  }
+
+  for (const boot of [
+    { identifier: "GZWE01", discId: 0, version: 1 },
+    { identifier: "GZWE01", discId: 1, version: 0 },
+    { identifier: "GMBE8P", discId: 0, version: 0 },
+  ]) {
+    const context = overrideContext(boot);
+    const override = context.createWarioWareNextMicrogameOverride(
+      new URLSearchParams("?wariowareNextMicrogame=0x63"),
+    );
+    context.registers[3] = 0;
+    context.registers[4] = 0x4b;
+    assert.equal(override.requested, true);
+    assert.equal(override.eligible, false);
+    assert.equal(
+      context.applyWarioWareNextMicrogameOverride(
+        wariowareNextMicrogameSetterPc,
+        override,
+      ),
+      false,
+    );
+    assert.equal(context.registers[4], 0x4b);
+  }
+
+  const drifted = overrideContext();
+  const override = drifted.createWarioWareNextMicrogameOverride(
+    new URLSearchParams("?wariowareNextMicrogame=0x63"),
+  );
+  drifted.registers[3] = 0;
+  drifted.registers[4] = 0x4b;
+  drifted.linkRegister = drifted.selectorLr;
+  assert.equal(
+    drifted.observeWarioWareNextMicrogameSelection(
+      wariowareNextMicrogameSelectorPc,
+      override,
+    ),
+    true,
+  );
+  drifted.linkRegister = drifted.setterLr;
+  drifted.instructions.set(wariowareNextMicrogameSetterPc + 8, 0x60000000);
+  assert.equal(
+    drifted.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+    ),
+    false,
+  );
+  assert.equal(drifted.registers[4], 0x4b);
+  assert.equal(override.applied, false);
+
+  drifted.instructions.set(
+    wariowareNextMicrogameSetterPc + 8,
+    wariowareNextMicrogameSetterSignature[2],
+  );
+  drifted.registers[3] = 1;
+  assert.equal(
+    drifted.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+    ),
+    false,
+  );
+  assert.equal(override.applied, false);
+
+  drifted.registers[3] = 0;
+  for (const invalidId of [0x118, 0x2706, 0x270f]) {
+    drifted.registers[4] = invalidId;
+    assert.equal(
+      drifted.applyWarioWareNextMicrogameOverride(
+        wariowareNextMicrogameSetterPc,
+        override,
+      ),
+      false,
+      `non-retail or sentinel ID ${invalidId.toString(16)} must be untouched`,
+    );
+    assert.equal(drifted.registers[4], invalidId);
+    assert.equal(override.applied, false);
+  }
+
+  drifted.registers[4] = 0x4b;
+  drifted.linkRegister += 4;
+  assert.equal(
+    drifted.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+    ),
+    false,
+    "the selector and setter LRs must form the exact relocated caller chain",
+  );
+  assert.equal(drifted.registers[4], 0x4b);
+});
+
+test("WarioWare next-microgame override rejects malformed runtime observations", () => {
+  const context = overrideContext();
+  const override = context.createWarioWareNextMicrogameOverride(
+    new URLSearchParams("?wariowareNextMicrogame=0x63"),
+  );
+  context.linkRegister = null;
+  assert.equal(
+    context.observeWarioWareNextMicrogameSelection(
+      wariowareNextMicrogameSelectorPc,
+      override,
+    ),
+    false,
+  );
+  assert.equal(override.selectorLr, null);
+
+  context.linkRegister = context.selectorLr;
+  const callerStore = context.instructions.get(context.selectorLr);
+  context.instructions.set(context.selectorLr, 0x60000000);
+  assert.equal(
+    context.observeWarioWareNextMicrogameSelection(
+      wariowareNextMicrogameSelectorPc,
+      override,
+    ),
+    false,
+    "an unrelated selector caller must not arm region suppression",
+  );
+  assert.equal(override.selectorLr, null);
+  context.instructions.set(context.selectorLr, callerStore);
+  assert.equal(
+    context.observeWarioWareNextMicrogameSelection(
+      wariowareNextMicrogameSelectorPc,
+      override,
+    ),
+    true,
+  );
+  context.linkRegister = context.setterLr;
+  assert.equal(
+    context.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+      () => null,
+    ),
+    false,
+  );
+  assert.equal(override.applied, false);
+});
+
+test("WarioWare next-microgame override fences regions for its entire pending window", () => {
+  const context = overrideContext();
+  const override = context.createWarioWareNextMicrogameOverride(
+    new URLSearchParams("?wariowareNextMicrogame=0x63"),
+  );
+
+  assert.equal(context.warioWareNextMicrogameOverridePending(override), true);
+  context.linkRegister = context.selectorLr;
+  assert.equal(
+    context.observeWarioWareNextMicrogameSelection(
+      wariowareNextMicrogameSelectorPc,
+      override,
+    ),
+    true,
+  );
+  assert.equal(context.warioWareNextMicrogameOverridePending(override), true);
+
+  context.registers[3] = 0;
+  context.registers[4] = 0x4b;
+  context.linkRegister = context.setterLr;
+  assert.equal(
+    context.applyWarioWareNextMicrogameOverride(
+      wariowareNextMicrogameSetterPc,
+      override,
+    ),
+    true,
+  );
+  assert.equal(context.warioWareNextMicrogameOverridePending(override), false);
+});
+
+test("WarioWare next-microgame override fences active retail microgames and selector-bearing regions", () => {
+  const context = overrideContext();
+  const override = context.createWarioWareNextMicrogameOverride(
+    new URLSearchParams("?wariowareNextMicrogame=0x63"),
+  );
+  const benignRegion = { pcs: [0x80001000, 0x80002000] };
+
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [0x80001000, wariowareNextMicrogameSelectorPc] },
+      override,
+    ),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [0x80001000, wariowareFilteredNextMicrogameSelectorPc] },
+      override,
+    ),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [wariowareNextMicrogameSetterPc, 0x80002000] },
+      override,
+    ),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [0x80001000, wariowareNextMicrogameActivationPc] },
+      override,
+    ),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      benignRegion,
+      override,
+    ),
+    true,
+  );
+  for (const activeMicrogameId of [1, 0x63, 0x117]) {
+    assert.equal(
+      context.warioWareNextMicrogameOverrideRegionSafe(
+        benignRegion,
+        override,
+        activeMicrogameId,
+      ),
+      false,
+      `retail microgame ${activeMicrogameId} must fence linked regions`,
+    );
+  }
+  for (
+    const inactiveMicrogameId
+    of [null, 0, 0x118, 0x2706, 0x270f, -1, 1.5, NaN, "1"]
+  ) {
+    assert.equal(
+      context.warioWareNextMicrogameOverrideRegionSafe(
+        benignRegion,
+        override,
+        inactiveMicrogameId,
+      ),
+      true,
+      `non-retail microgame ${String(inactiveMicrogameId)} must preserve benign regions`,
+    );
+  }
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe({}, override),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe({ pcs: [] }, override),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [0x80001000, undefined] },
+      override,
+    ),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [0x80001000, , 0x80002000] },
+      override,
+    ),
+    false,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [0x80001000, 0x80001000] },
+      override,
+    ),
+    false,
+  );
+
+  override.applied = true;
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [wariowareNextMicrogameSelectorPc] },
+      override,
+      0x63,
+    ),
+    true,
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe({}, override),
+    true,
+  );
+
+  const ineligible = context.createWarioWareNextMicrogameOverride(
+    new URLSearchParams("?wariowareNextMicrogame=0x63"),
+    { identifier: "GZWE01", discId: 0, version: 1 },
+  );
+  assert.equal(
+    context.warioWareNextMicrogameOverrideRegionSafe(
+      { pcs: [wariowareNextMicrogameSelectorPc] },
+      ineligible,
+      0x63,
+    ),
+    true,
+  );
+});
+
+test("WarioWare next-microgame request remains debug-runner-only", () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(extractFunction("runnerSearchForSurface"), context);
+  const request = "?wariowareNextMicrogame=0x63";
+
+  assert.equal(context.runnerSearchForSurface(true, request), request);
+  assert.equal(context.runnerSearchForSurface(false, request), "");
+  assert.equal(
+    context.runnerSearchForSurface(
+      false,
+      request,
+      "?scenario=smb-ready-play",
+    ),
+    "?scenario=smb-ready-play",
+  );
+  assert.match(
+    source,
+    /runnerSearchForSurface\(\s*debugSurface,\s*location\.search,\s*selectedCompatibilityRunnerSearch\s*\)/,
+  );
+  assert.match(
+    source,
+    /controllerScenarioInputExclusive = controllerScenario !== null/,
+  );
+  for (const name of [
+    "createWarioWareNextMicrogameOverride",
+    "observeWarioWareNextMicrogameSelection",
+    "applyWarioWareNextMicrogameOverride",
+  ]) {
+    assert.doesNotMatch(extractFunction(name), /controllerScenario/);
+  }
+});
+
+test("WarioWare next-microgame source guards preserve the hook boundary", () => {
+  const apply = extractFunction("applyWarioWareNextMicrogameOverride");
+  const regionSafe = extractFunction(
+    "warioWareNextMicrogameOverrideRegionSafe",
+  );
+  assert.match(
+    source,
+    /observeWarioWareNextMicrogameSelection\(pc\);\s+applyWarioWareNextMicrogameOverride\(pc\);\s+stage = "compile";/,
+  );
+  assert.match(
+    source,
+    /const wariowareActiveMicrogameId =\s+warioWareNextMicrogameOverridePending\(\)\s+\? guestU32\(0x80295ed0\)\s+: null/,
+  );
+  assert.match(
+    source,
+    /const region = retainedRegion !== undefined\s+&& warioWareNextMicrogameOverrideRegionSafe\(\s*retainedRegion,\s*wariowareNextMicrogameOverride,\s*wariowareActiveMicrogameId\s*\)/,
+  );
+  assert.match(
+    regionSafe,
+    /isUint32\(activeMicrogameId\)\s+&& activeMicrogameId >= 1\s+&& activeMicrogameId <= wariowareMaximumRetailMicrogameId/,
+  );
+  assert.match(
+    apply,
+    /const argumentRegister = activationSetter \? 3 : 4/,
+  );
+  assert.match(
+    apply,
+    /writeRegister\(argumentRegister, wariowareRepellionMicrogameId\)/,
+  );
+  assert.equal(
+    [...apply.matchAll(/writeRegister\(/g)].length,
+    1,
+  );
+  assert.match(
+    extractFunction("exactWarioWareRevisionZero"),
+    /disc\?\.identifier === "GZWE01"\s+&& disc\.discId === 0\s+&& disc\.version === 0/,
+  );
+  assert.match(
+    extractFunction("createWarioWareNextMicrogameOverride"),
+    /eligible: requested && exactWarioWareRevisionZero\(disc\)/,
+  );
+  assert.match(
+    extractFunction("warioWareNextMicrogameOverridePending"),
+    /return override\.eligible === true && override\.applied !== true/,
+  );
+});
+
 test("WarioWare snapshots expose the exact live Repellion state", () => {
   const context = makeContext();
   const { view } = context;
