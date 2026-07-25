@@ -5,6 +5,10 @@ import { test } from "node:test";
 
 import {
   ACTIVE_RECORD_PATH,
+  BOOTSTRAP_ASSETS,
+  BOOTSTRAP_CACHE,
+  LEGAL_PAGE_PATH,
+  LEGACY_LEGAL_PAGE_PATH,
   META_CACHE,
   WORKER_STATUS_PATH,
   activeReleaseResponse,
@@ -26,6 +30,35 @@ import {
 } from "./release.mjs";
 
 const ORIGIN = "https://gekko.free";
+
+test("keeps the legal page and bundled font notice available offline", async () => {
+  const legalAssets = new Map([
+    [LEGAL_PAGE_PATH, "<h1>Gekko source</h1>"],
+    ["/THIRD-PARTY-NOTICES.txt", "Apache-2.0 font attribution"],
+  ]);
+  const storage = new MemoryCacheStorage();
+  const cache = await storage.open(BOOTSTRAP_CACHE);
+  for (const [path, body] of legalAssets) {
+    assert.ok(BOOTSTRAP_ASSETS.includes(path));
+    await cache.put(`${ORIGIN}${path}`, new Response(body));
+  }
+  await withWorkerGlobals(
+    storage,
+    async () => {
+      throw new Error("offline");
+    },
+    async () => {
+      for (const [path, body] of legalAssets) {
+        const response = await handleFetch(new Request(`${ORIGIN}${path}`));
+        assert.equal(await response.text(), body);
+      }
+      const legacyLegalPage = await handleFetch(
+        new Request(`${ORIGIN}${LEGACY_LEGAL_PAGE_PATH}`),
+      );
+      assert.equal(await legacyLegalPage.text(), legalAssets.get(LEGAL_PAGE_PATH));
+    },
+  );
+});
 
 test("worker status identifies the release schema during upgrades", async () => {
   assert.equal(WORKER_STATUS_PATH, "/.gekko/worker-status");
@@ -418,11 +451,18 @@ test("does not intercept unknown navigation routes", async () => {
       return new Response("not found", { status: 404 });
     },
     async () => {
-      for (const path of ["/unknown", "/nested/unknown"]) {
+      const paths = [
+        "/unknown",
+        "/nested/unknown",
+        "/warioware",
+        "/smb",
+        "/games/foo",
+      ];
+      for (const path of paths) {
         const response = await handleFetch(new Request(`${ORIGIN}${path}`));
         assert.equal(response.status, 404);
       }
-      assert.deepEqual(networkRequests, [`${ORIGIN}/unknown`, `${ORIGIN}/nested/unknown`]);
+      assert.deepEqual(networkRequests, paths.map(path => `${ORIGIN}${path}`));
     },
   );
 });

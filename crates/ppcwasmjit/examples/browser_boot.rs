@@ -27,6 +27,11 @@ const FASTMEM_LUT_COUNT: usize = 1 << 15;
 const DISC_BI2_OFFSET: u64 = 0x440;
 const DISC_BI2_SIZE: usize = 0x2000;
 const DISC_SOURCE_RUNTIME: &str = include_str!("browser_disc_source.mjs");
+const IPL_IMAGE_SIZE: usize = 2 * 1024 * 1024;
+const IPL_FONT_JAPANESE_OFFSET: usize = 0x1a_ff00;
+const IPL_FONT_JAPANESE: &[u8] = include_bytes!("../../../resources/ipl/font_japanese.bin");
+const IPL_FONT_WESTERN_OFFSET: usize = 0x1f_cf00;
+const IPL_FONT_WESTERN: &[u8] = include_bytes!("../../../resources/ipl/font_western.bin");
 
 trait ReadSeek: Read + Seek {}
 
@@ -240,6 +245,14 @@ fn main() {
         GX_FIFO_STAGING_DATA_PTR as u32,
         GX_FIFO_STAGING_CAPACITY as u32,
     );
+    assert!(
+        IPL_FONT_JAPANESE_OFFSET + IPL_FONT_JAPANESE.len() <= IPL_FONT_WESTERN_OFFSET,
+        "bundled Japanese IPL font overlaps the western font"
+    );
+    assert!(
+        IPL_FONT_WESTERN_OFFSET + IPL_FONT_WESTERN.len() <= IPL_IMAGE_SIZE,
+        "bundled western IPL font exceeds the virtual IPL image"
+    );
 
     let output_directory = output
         .parent()
@@ -267,6 +280,16 @@ fn main() {
         .replace("__HAS_DISC__", if has_disc { "true" } else { "false" })
         .replace("__BI2__", &hex(&disc.bi2))
         .replace("__FST__", &hex(&disc.filesystem))
+        .replace("__IPL_FONT_JAPANESE__", &hex(IPL_FONT_JAPANESE))
+        .replace(
+            "__IPL_FONT_JAPANESE_OFFSET__",
+            &IPL_FONT_JAPANESE_OFFSET.to_string(),
+        )
+        .replace("__IPL_FONT_WESTERN__", &hex(IPL_FONT_WESTERN))
+        .replace(
+            "__IPL_FONT_WESTERN_OFFSET__",
+            &IPL_FONT_WESTERN_OFFSET.to_string(),
+        )
         .replace("__FST_MAX_SIZE__", &disc.filesystem_max_size.to_string())
         .replace("__GPR_OFFSETS__", &gpr_offsets)
         .replace("__SR_OFFSETS__", &segment_register_offsets)
@@ -4992,6 +5015,48 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
 
+    // These redistributable replacement fonts occupy the same decoded IPL
+    // windows as the console fonts. Keeping the sparse virtual image inside
+    // the existing frontend asset avoids a font fetch or public asset route.
+    function createBundledExiIplImage() {
+      const image = new Uint8Array(exiIplImageBytes);
+      image.set(
+        decode("__IPL_FONT_JAPANESE__"),
+        __IPL_FONT_JAPANESE_OFFSET__
+      );
+      image.set(
+        decode("__IPL_FONT_WESTERN__"),
+        __IPL_FONT_WESTERN_OFFSET__
+      );
+      return image;
+    }
+
+    function validateExiIplImage(image, label) {
+      if (Object.prototype.toString.call(image) !== "[object Uint8Array]") {
+        throw new TypeError(`${label} must be a Uint8Array`);
+      }
+      if (image.byteLength !== exiIplImageBytes) {
+        throw new RangeError(
+          `${label} must be exactly ${exiIplImageBytes} bytes`
+        );
+      }
+      return image;
+    }
+
+    async function configuredExiIplImage(config) {
+      config ??= globalThis.iplSourceConfig ?? { kind: "bundled-default" };
+      if (config.kind !== "bundled-default") {
+        throw new Error("unsupported IPL source configuration");
+      }
+      const image = await createBundledExiIplImage();
+      return {
+        image: image === null
+          ? null
+          : validateExiIplImage(image, "bundled IPL-compatible image"),
+        source: { kind: "bundled-default" },
+      };
+    }
+
     function createWeightedLruCache(maximumEntries, maximumWeight, weightOf) {
       const entries = new Map();
       let totalWeight = 0;
@@ -5055,7 +5120,17 @@ const TEMPLATE: &str = r##"<!doctype html>
     const compilerWasmPromise = fetchBinary(
       globalThis.compilerWasmUrl, "browser JIT compiler"
     );
-    const discSourceConfig = await configuredDiscSource();
+    const discSourceConfigPromise = configuredDiscSource();
+    const configuredExiIplImagePromise = configuredExiIplImage();
+    let [
+      compilerWasm,
+      discSourceConfig,
+      configuredExiIpl,
+    ] = await Promise.all([
+      compilerWasmPromise,
+      discSourceConfigPromise,
+      configuredExiIplImagePromise,
+    ]);
     let discSource = null;
     let boot;
     if (discSourceConfig.kind === "boot-assets") {
@@ -5082,7 +5157,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       discSource = await openDiscSource(discSourceConfig);
       boot = await readDiscBoot(discSource);
     }
-    let compilerWasm = await compilerWasmPromise;
     let { bi2, dol, fst } = boot;
     const { bi2Address, fstAddress, fstMaxSize } = boot;
     const bi2Bytes = bi2.length;
@@ -5205,10 +5279,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     });
     const hookCalls = new Map();
     const deviceEvents = new Map();
-    // The device model accepts an exact decoded 2 MiB IPL-compatible image.
-    // Source providers are layered separately from the EXI transport.
-    let exiIplImage = null;
-    const exiIplSource = { kind: "unconfigured" };
+    // The transport consumes a decoded 2 MiB IPL-compatible image supplied
+    // by the bundled replacement-font image.
+    // No proprietary IPL bytes belong in this generated harness.
+    let exiIplImage = configuredExiIpl.image;
+    const exiIplSource = configuredExiIpl.source;
     const exiTransferTraceLimit = 64;
     const exiTransferTrace = [];
     const exiTransferOutcomes = new Map();

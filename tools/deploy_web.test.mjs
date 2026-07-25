@@ -9,6 +9,7 @@ test("deployment serves static assets without a request handler", async () => {
   assert.doesNotMatch(wrangler, /^main\s*=/m);
   assert.match(wrangler, /^\[assets\]$/m);
   assert.match(wrangler, /^html_handling\s*=\s*"auto-trailing-slash"$/m);
+  assert.match(wrangler, /^not_found_handling\s*=\s*"none"$/m);
 });
 
 test("deployment pins the verified Wrangler release", async () => {

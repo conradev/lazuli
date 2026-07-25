@@ -14,12 +14,16 @@ export const RELEASE_CACHE_PREFIX = "gekko-release-";
 export const ACTIVE_RECORD_PATH = "/.gekko/active-release";
 export const STAGE_RELEASE_PATH = "/.gekko/stage-release";
 export const WORKER_STATUS_PATH = "/.gekko/worker-status";
+export const LEGAL_PAGE_PATH = "/source/";
+export const LEGACY_LEGAL_PAGE_PATH = "/source.html";
 
-const BOOTSTRAP_ASSETS = [
+export const BOOTSTRAP_ASSETS = [
   "/index.html",
   "/app.webmanifest",
   "/icon.svg",
   "/LICENSE.txt",
+  LEGAL_PAGE_PATH,
+  "/THIRD-PARTY-NOTICES.txt",
   "/release.mjs",
 ];
 
@@ -216,6 +220,14 @@ async function networkFirstBootstrap(request) {
   }
 }
 
+function canonicalLegalPageRequest(request) {
+  const requested = new URL(request.url);
+  requested.pathname = LEGAL_PAGE_PATH;
+  requested.search = "";
+  requested.hash = "";
+  return new Request(requested, request);
+}
+
 async function networkFirstRelease(request) {
   try {
     const response = await fetch(new Request(request, { cache: "no-store" }));
@@ -329,6 +341,9 @@ export async function handleFetch(request) {
     return activeReleaseResponse();
   }
   if (request.method !== "GET") return fetch(request);
+  if (url.pathname === LEGACY_LEGAL_PAGE_PATH) {
+    return networkFirstBootstrap(canonicalLegalPageRequest(request));
+  }
   if (
     url.pathname === "/"
     || url.pathname === "/index.html"
