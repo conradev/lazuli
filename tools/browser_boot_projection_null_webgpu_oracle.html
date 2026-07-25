@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli projection-null GX WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli projection-null GX WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildProjectionNullOraclePacket,
+      fnv1a64Hex,
+      projectionNullMask,
+      projectionNullOracleCase,
+      projectionNullOracleXfb,
+    } from "./browser_boot_projection_null_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length &&
+        actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      renderer.reset_diagnostics();
+      const runs = [];
+      let referenceRgba;
+      try {
+        for (let runIndex = 0; runIndex < RUN_COUNT; runIndex += 1) {
+          const generation = runIndex + 1;
+          renderer.reset();
+          const diagnosticsBefore = renderer.diagnostics();
+          renderer.submit_gx_frame(
+            buildProjectionNullOraclePacket(generation),
+          );
+          const presentation = renderer.present_xfb(
+            projectionNullOracleXfb.destination,
+            generation,
+            0,
+            "progressive",
+            "top",
+            generation,
+            projectionNullOracleXfb.width,
+            projectionNullOracleXfb.height,
+            projectionNullOracleXfb.stride,
+            projectionNullOracleXfb.height,
+            1,
+            false,
+          );
+          await renderer.drain();
+          const readback = await renderer.read_presented_xfb_rgba();
+          const actualRgba = Array.from(readback.rgba);
+          const byteExact = bytesEqual(
+            actualRgba,
+            projectionNullOracleCase.expectedRgba,
+          );
+          const dimensionsExact =
+            readback.width === projectionNullOracleXfb.width &&
+            readback.height === projectionNullOracleXfb.height;
+          const deterministic =
+            referenceRgba === undefined ||
+            bytesEqual(actualRgba, referenceRgba);
+          if (referenceRgba === undefined) {
+            referenceRgba = actualRgba;
+          }
+          renderer.check_health();
+          const diagnosticsAfter = renderer.diagnostics();
+          const managedCoverageDelta = {
+            draws:
+              diagnosticsAfter.managedCoverageDraws -
+              diagnosticsBefore.managedCoverageDraws,
+            triangles:
+              diagnosticsAfter.managedCoverageTriangles -
+              diagnosticsBefore.managedCoverageTriangles,
+          };
+          const managedCoverageExact =
+            managedCoverageDelta.draws ===
+              projectionNullOracleCase.expectedManagedCoverage.draws &&
+            managedCoverageDelta.triangles ===
+              projectionNullOracleCase.expectedManagedCoverage.triangles;
+          const actualMask = projectionNullMask(actualRgba);
+          const actualRgbaFnv1a64 = fnv1a64Hex(actualRgba);
+          const maskExact =
+            actualMask === projectionNullOracleCase.expectedMask;
+          const hashExact =
+            actualRgbaFnv1a64 ===
+            projectionNullOracleCase.expectedRgbaFnv1a64;
+          runs.push({
+            index: runIndex + 1,
+            expectedMask: projectionNullOracleCase.expectedMask,
+            actualMask,
+            maskExact,
+            expectedRgbaFnv1a64:
+              projectionNullOracleCase.expectedRgbaFnv1a64,
+            actualRgbaFnv1a64,
+            hashExact,
+            expectedManagedCoverage:
+              projectionNullOracleCase.expectedManagedCoverage,
+            managedCoverageDelta,
+            managedCoverageExact,
+            byteExact,
+            dimensionsExact,
+            deterministic,
+            width: readback.width,
+            height: readback.height,
+            presentation,
+            pass:
+              byteExact &&
+              dimensionsExact &&
+              deterministic &&
+              maskExact &&
+              hashExact &&
+              managedCoverageExact,
+          });
+        }
+        renderer.check_health();
+        const diagnostics = renderer.diagnostics();
+        const managedCoverageCountersExact =
+          diagnostics.managedCoverageDraws === 2 &&
+          diagnostics.managedCoverageTriangles === 4;
+        const result = {
+          pass:
+            runs.every((entry) => entry.pass) &&
+            managedCoverageCountersExact,
+          runCount: RUN_COUNT,
+          strictWebGpu: true,
+          deterministic: runs.every((entry) => entry.deterministic),
+          managedCoverageCountersExact,
+          runs,
+          diagnostics,
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliProjectionNullOraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>
