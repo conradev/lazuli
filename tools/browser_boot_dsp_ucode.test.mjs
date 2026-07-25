@@ -46,6 +46,7 @@ const dspFunctionNames = [
   "ramPointer",
   "hex32",
   "emptyDspUcodeUpload",
+  "emptyDspZeldaCommandState",
   "dspUcodeHashEctor",
   "classifyDspUcode",
   "traceDsp",
@@ -56,6 +57,8 @@ const dspFunctionNames = [
   "captureDspRomParameter",
   "rejectDspUcodeBoot",
   "bootDspUcode",
+  "rejectDspZeldaCommand",
+  "handleDspZeldaMail",
   "handleDspCpuMail",
   "writeDspMailboxHigh",
   "writeDspMailboxLow",
@@ -88,6 +91,7 @@ function dspContext(payload = axHashFixture) {
     dspTrace: [],
     dspUcodeBooted: false,
     dspUcodeHash: null,
+    dspZeldaCommandState: null,
     mmio: 0x20000,
     pc: 0x80001000,
     ram: 0,
@@ -101,6 +105,7 @@ function dspContext(payload = axHashFixture) {
     { filename: "browser_boot.dsp-ucode.js" },
   );
   context.dspUcodeUpload = context.emptyDspUcodeUpload();
+  context.dspZeldaCommandState = context.emptyDspZeldaCommandState();
   context.bytes.set(payload, 0x1000);
   return context;
 }

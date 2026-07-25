@@ -4920,6 +4920,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let dspMode = "rom";
     let dspUcodeBooted = false;
     let dspAxCommandListPending = false;
+    let dspZeldaCommandState = emptyDspZeldaCommandState();
     let dspScheduledMail = null;
     const dspAudioDmaEnableInterruptLatencyCycles = 200;
     let dspAudioDmaRemainingBlocks = 0;
@@ -10450,6 +10451,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function emptyDspZeldaCommandState() {
+      return {
+        phase: "waiting",
+        expectedWords: 0,
+        words: [],
+        rejected: false,
+        reason: null,
+        lastCommand: null,
+        lastSync: null,
+      };
+    }
+
     function dspUcodeHashEctor(source) {
       let hash = 0;
       for (const value of source) {
@@ -10526,6 +10539,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMode = "rom";
       dspUcodeBooted = false;
       dspAxCommandListPending = false;
+      dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       traceDsp("ucode-boot-rejected", { reason, ...details });
       deviceEvents.set(
@@ -10578,6 +10592,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       dspMode = mode;
       dspUcodeBooted = true;
+      dspZeldaCommandState = emptyDspZeldaCommandState();
       traceDsp("ucode-boot", {
         hash: hex32(hash),
         mode,
@@ -10596,6 +10611,89 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
+    function rejectDspZeldaCommand(reason, details = {}) {
+      dspZeldaCommandState.phase = "halted";
+      dspZeldaCommandState.expectedWords = 0;
+      dspZeldaCommandState.words.length = 0;
+      dspZeldaCommandState.rejected = true;
+      dspZeldaCommandState.reason = reason;
+      traceDsp("zelda-command-rejected", { reason, ...details });
+      deviceEvents.set(
+        "dspZeldaCommandRejected",
+        (deviceEvents.get("dspZeldaCommandRejected") ?? 0) + 1
+      );
+      return false;
+    }
+
+    function handleDspZeldaMail(mail) {
+      const payload = mail >>> 0;
+      if (dspZeldaCommandState.phase === "halted") return false;
+
+      if (dspZeldaCommandState.phase === "waiting") {
+        // The standard Zelda/JAudio protocol starts each command with the
+        // raw number of following 32-bit words. Only the five-word setup
+        // command is modeled until its state semantics are implemented.
+        if (payload !== 5) {
+          return rejectDspZeldaCommand("unsupported-count", {
+            count: hex32(payload),
+          });
+        }
+        dspZeldaCommandState.phase = "writing";
+        dspZeldaCommandState.expectedWords = 5;
+        dspZeldaCommandState.words.length = 0;
+        dspZeldaCommandState.rejected = false;
+        dspZeldaCommandState.reason = null;
+        return true;
+      }
+
+      if (dspZeldaCommandState.phase !== "writing") {
+        return rejectDspZeldaCommand("invalid-state", {
+          phase: dspZeldaCommandState.phase,
+        });
+      }
+
+      dspZeldaCommandState.words.push(payload);
+      dspZeldaCommandState.expectedWords -= 1;
+      if (dspZeldaCommandState.expectedWords !== 0) return true;
+
+      const words = dspZeldaCommandState.words.slice();
+      const commandMail = words[0] >>> 0;
+      if ((commandMail & 0x80000000) === 0) {
+        return rejectDspZeldaCommand("malformed-command", {
+          command: hex32(commandMail),
+        });
+      }
+      const command = (commandMail >>> 24) & 0x7f;
+      if (command !== 0x01) {
+        return rejectDspZeldaCommand("unsupported-command", {
+          command,
+          commandMail: hex32(commandMail),
+        });
+      }
+
+      const sync = (commandMail >>> 16) & 0xffff;
+      dspZeldaCommandState.phase = "waiting";
+      dspZeldaCommandState.expectedWords = 0;
+      dspZeldaCommandState.words.length = 0;
+      dspZeldaCommandState.lastCommand = commandMail;
+      dspZeldaCommandState.lastSync = sync;
+      traceDsp("zelda-command", {
+        command,
+        commandMail: hex32(commandMail),
+        sync: "0x" + sync.toString(16).padStart(4, "0"),
+      });
+      deviceEvents.set(
+        "dspZeldaCommand",
+        (deviceEvents.get("dspZeldaCommand") ?? 0) + 1
+      );
+
+      // Dolphin's standard Zelda protocol acknowledges commands in this
+      // exact order: interrupting DSP_SYNC, then the non-interrupt F355 token.
+      pushDspMail(0xdcd10004, true, "zelda-command-sync");
+      pushDspMail((0xf3550000 | sync) >>> 0, false, "zelda-command-ack");
+      return true;
+    }
+
     function resetDspMailbox() {
       dspMailQueue.length = 0;
       dspCurrentMail = null;
@@ -10606,6 +10704,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMode = "rom";
       dspUcodeBooted = false;
       dspAxCommandListPending = false;
+      dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       view.setUint16(mmio + 0x5000, 0, false);
       view.setUint16(mmio + 0x5002, 0, false);
@@ -10624,6 +10723,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMode = "init";
       dspUcodeBooted = false;
       dspAxCommandListPending = false;
+      dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       view.setUint16(mmio + 0x5004, 0, false);
       view.setUint16(mmio + 0x5006, 0, false);
@@ -10665,6 +10765,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else if (((mail & 0xffff0000) >>> 0) === 0xbabe0000) {
           dspAxCommandListPending = true;
         }
+      } else if (dspMode === "zelda") {
+        handleDspZeldaMail(mail);
       }
     }
 
@@ -15984,6 +16086,22 @@ const TEMPLATE: &str = r##"<!doctype html>
           dspScheduledMail,
           dspMode,
           dspUcodeHash: dspUcodeHash === null ? null : hex32(dspUcodeHash),
+          dspZeldaCommand: {
+            phase: dspZeldaCommandState.phase,
+            expectedWords: dspZeldaCommandState.expectedWords,
+            bufferedWords: dspZeldaCommandState.words.length,
+            rejected: dspZeldaCommandState.rejected,
+            reason: dspZeldaCommandState.reason,
+            lastCommand:
+              dspZeldaCommandState.lastCommand === null
+                ? null
+                : hex32(dspZeldaCommandState.lastCommand),
+            lastSync:
+              dspZeldaCommandState.lastSync === null
+                ? null
+                : "0x" +
+                  dspZeldaCommandState.lastSync.toString(16).padStart(4, "0"),
+          },
           dspTrace,
           dspAudioDma: {
             enabled: (view.getUint16(mmio + 0x5036, false) & 0x8000) !== 0,
