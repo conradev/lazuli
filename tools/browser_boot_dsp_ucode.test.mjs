@@ -46,6 +46,7 @@ const dspFunctionNames = [
   "ramPointer",
   "hex32",
   "emptyDspUcodeUpload",
+  "emptyDspZeldaRenderState",
   "emptyDspZeldaCommandState",
   "dspUcodeHashEctor",
   "classifyDspUcode",
