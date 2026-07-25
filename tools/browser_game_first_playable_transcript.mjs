@@ -19,6 +19,9 @@ import {
   verifyGameFirstPlayableTranscriptCore,
 } from "./browser_game_first_playable_transcript_core.mjs";
 import {
+  projectLuigisMansionGuestConsumption,
+} from "./browser_game_first_playable_luigi.mjs";
+import {
   projectWarioWareGuestConsumption,
 } from "./browser_game_first_playable_warioware.mjs";
 
@@ -28,17 +31,22 @@ export {
   GameFirstPlayableTranscriptError,
 };
 
+function projectSupportedGuestConsumption(options) {
+  return projectLuigisMansionGuestConsumption(options)
+    ?? projectWarioWareGuestConsumption(options);
+}
+
 export function deriveGameFirstPlayableTranscript(options) {
   return deriveGameFirstPlayableTranscriptCore({
     ...options,
-    guestProjector: projectWarioWareGuestConsumption,
+    guestProjector: projectSupportedGuestConsumption,
   });
 }
 
 export function verifyGameFirstPlayableTranscript(options) {
   return verifyGameFirstPlayableTranscriptCore({
     ...options,
-    guestProjector: projectWarioWareGuestConsumption,
+    guestProjector: projectSupportedGuestConsumption,
   });
 }
 
