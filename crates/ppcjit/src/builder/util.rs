@@ -168,6 +168,62 @@ impl BlockBuilder<'_> {
         }
     }
 
+    /// Rounds one multiplier lane to Gekko's internal 25-bit mantissa precision.
+    pub fn force_25_bit_lane(&mut self, value: ir::Value) -> ir::Value {
+        const FRACTION_MASK: i64 = 0x000f_ffff_ffff_ffff;
+        const KEEP_MASK: i64 = 0xffff_ffff_f800_0000_u64 as i64;
+        const ROUND_BIT: i64 = 0x0800_0000;
+
+        let bits = self
+            .bd
+            .ins()
+            .bitcast(ir::types::I64, ir::MemFlags::new(), value);
+        let fraction_mask = self.ir_value(FRACTION_MASK);
+        let high_shift = self.ir_value(32i64);
+        let high = self.bd.ins().ushr(bits, high_shift);
+        let high = self.bd.ins().ireduce(ir::types::I32, high);
+        let low = self.bd.ins().ireduce(ir::types::I32, bits);
+        let exponent = self.bd.ins().band_imm(high, 0x7ff0_0000);
+        let fraction_high = self.bd.ins().band_imm(high, 0x000f_ffff);
+        let fraction_words = self.bd.ins().bor(fraction_high, low);
+        let exponent_is_zero = self.bd.ins().icmp_imm(IntCC::Equal, exponent, 0);
+        let fraction_is_nonzero = self.bd.ins().icmp_imm(IntCC::NotEqual, fraction_words, 0);
+        let is_subnormal = self.bd.ins().band(exponent_is_zero, fraction_is_nonzero);
+        let fraction = self.bd.ins().band(bits, fraction_mask);
+
+        let keep_mask = self.ir_value(KEEP_MASK);
+        let round_bit = self.ir_value(ROUND_BIT);
+        let normal_kept = self.bd.ins().band(bits, keep_mask);
+        let normal_round = self.bd.ins().band(bits, round_bit);
+        let normal = self.bd.ins().iadd(normal_kept, normal_round);
+
+        // Gekko normalizes a subnormal multiplier before rounding its mantissa. Shift the normal
+        // masks to follow the highest set fraction bit, matching Dolphin's hardware-tested model.
+        let leading_zeros = self.bd.ins().clz(fraction);
+        let negative_eleven = self.ir_value(-11i64);
+        let shift = self.bd.ins().iadd(leading_zeros, negative_eleven);
+        let subnormal_keep_mask = self.bd.ins().sshr(keep_mask, shift);
+        let subnormal_round_bit = self.bd.ins().ushr(round_bit, shift);
+        let subnormal_kept = self.bd.ins().band(bits, subnormal_keep_mask);
+        let subnormal_round = self.bd.ins().band(bits, subnormal_round_bit);
+        let subnormal = self.bd.ins().iadd(subnormal_kept, subnormal_round);
+
+        let rounded = self.bd.ins().select(is_subnormal, subnormal, normal);
+        self.bd
+            .ins()
+            .bitcast(ir::types::F64, ir::MemFlags::new(), rounded)
+    }
+
+    /// Rounds both multiplier lanes to Gekko's internal 25-bit mantissa precision.
+    pub fn force_paired_25_bit(&mut self, value: ir::Value) -> ir::Value {
+        let ps0 = self.bd.ins().extractlane(value, 0);
+        let ps1 = self.bd.ins().extractlane(value, 1);
+        let ps0 = self.force_25_bit_lane(ps0);
+        let ps1 = self.force_25_bit_lane(ps1);
+        let paired = self.bd.ins().scalar_to_vector(ir::types::F64X2, ps0);
+        self.bd.ins().insertlane(paired, ps1, 1)
+    }
+
     /// Given a F64X2, copies lane 0 to lane 1.
     pub fn copy_ps0_to_ps1(&mut self, value: ir::Value) -> ir::Value {
         let bytes = self.bd.ins().bitcast(
@@ -187,36 +243,6 @@ impl BlockBuilder<'_> {
             .dfg
             .constants
             .insert(ir::ConstantData::from(SHUFFLE_CONST.as_bytes()));
-
-        let mask = self.bd.ins().vconst(ir::types::I8X16, shuffle_const);
-        let value = self.bd.ins().swizzle(bytes, mask);
-
-        self.bd.ins().bitcast(
-            ir::types::F64X2,
-            ir::MemFlags::new().with_endianness(ir::Endianness::Little),
-            value,
-        )
-    }
-
-    /// Given a F64X2, copies lane 1 to lane 0.
-    pub fn copy_ps1_to_ps0(&mut self, value: ir::Value) -> ir::Value {
-        let bytes = self.bd.ins().bitcast(
-            ir::types::I8X16,
-            ir::MemFlags::new().with_endianness(ir::Endianness::Little),
-            value,
-        );
-
-        const SHUFFLE_CONST: [u8; 16] = [
-            8, 9, 10, 11, 12, 13, 14, 15, // ps0
-            8, 9, 10, 11, 12, 13, 14, 15, // ps1
-        ];
-
-        let shuffle_const = self
-            .bd
-            .func
-            .dfg
-            .constants
-            .insert(ir::ConstantData::from(SHUFFLE_CONST.as_slice()));
 
         let mask = self.bd.ins().vconst(ir::types::I8X16, shuffle_const);
         let value = self.bd.ins().swizzle(bytes, mask);
