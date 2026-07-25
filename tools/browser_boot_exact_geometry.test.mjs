@@ -40,7 +40,8 @@ test("exact geometry and empty-draw proof are prepared before WebGPU mutation", 
   );
   assertOrdered(submit, [
     "let prepared_exact_draws",
-    "// Resolve every required texture",
+    "// Resolve every texture consumed",
+    "let mut packet_texture_keys",
     "drop(packet_parse_timer)",
     "self.begin_segment_inner()?",
   ]);
@@ -50,7 +51,24 @@ test("exact geometry and empty-draw proof are prepared before WebGPU mutation", 
   );
   assert.match(
     submit,
-    /is_some_and\(PreparedExactDraw::is_authoritative_empty\)[\s\S]*continue;[\s\S]*gx_early_depth_plan/,
+    /let mut packet_texture_keys = HashSet::new\(\);[\s\S]*if !draw_requires_texture_preflight\(draw, prepared_exact\.as_ref\(\)\) \{\s*continue;[\s\S]*packet_texture_keys\.insert\(texture\.key\);/,
+  );
+
+  const preflight = sourceSection(
+    rendererSource,
+    "fn draw_requires_texture_preflight",
+    "fn required_exact_draw_is_managed_safe",
+  );
+  assertOrdered(preflight, [
+    "PreparedExactDraw::is_authoritative_noop",
+    "gx_early_depth_plan",
+    "PreparedExactDraw::is_required",
+    "GxEarlyDepthPlan::FixedFunction",
+    "GxEarlyDepthPlan::DepthOnly",
+  ]);
+  assert.match(
+    preflight,
+    /PreparedExactDraw::is_authoritative_noop\) \{\s*return false;[\s\S]*early_depth != GxEarlyDepthPlan::FixedFunction[\s\S]*return false;[\s\S]*early_depth != GxEarlyDepthPlan::DepthOnly/,
   );
   assert.match(
     submit,
@@ -58,7 +76,7 @@ test("exact geometry and empty-draw proof are prepared before WebGPU mutation", 
   );
 });
 
-test("absent, unqualified, and authoritative exact inputs remain distinct", () => {
+test("absent, optional, and required exact inputs remain distinct", () => {
   const preparationTypes = sourceSection(
     rendererSource,
     "struct QualifiedExactDraw",
@@ -66,22 +84,47 @@ test("absent, unqualified, and authoritative exact inputs remain distinct", () =
   );
   assert.match(
     preparationTypes,
-    /enum PreparedExactDraw \{\s*Unqualified,\s*Qualified\(QualifiedExactDraw\),\s*\}/,
+    /struct PreparedExactDraw \{\s*required: bool,\s*required_managed_safe: bool,\s*qualified: Option<QualifiedExactDraw>,\s*\}/,
   );
   assert.match(
     preparationTypes,
-    /fn is_authoritative_empty\(&self\)[\s\S]*self\.qualified\(\)\.is_some_and\(QualifiedExactDraw::is_empty\)/,
+    /fn is_authoritative_noop\(&self\)[\s\S]*self\.required && \(!self\.required_managed_safe \|\| self\.qualified\.is_none\(\)\)[\s\S]*self\.qualified\(\)\.is_some_and\(QualifiedExactDraw::is_empty\)/,
+  );
+
+  const requiredRoute = sourceSection(
+    rendererSource,
+    "fn required_exact_draw_is_managed_safe",
+    "fn prepare_exact_draw",
+  );
+  for (const requirement of [
+    "draw_depth_encoding",
+    "required_texture_maps",
+    "required_texture_coords",
+    "gx_z_texture_state",
+    "gx_fog_state",
+    "managed_coverage_draw_is_safe",
+  ]) {
+    assert.match(requiredRoute, new RegExp(requirement));
+  }
+  assert.match(
+    requiredRoute,
+    /let Ok\(z_texture\)[\s\S]*else \{\s*return false;[\s\S]*let Ok\(fog\)[\s\S]*else \{\s*return false;/,
+  );
+  assert.match(
+    requiredRoute,
+    /early_depth != GxEarlyDepthPlan::FixedFunction[\s\S]*return false;[\s\S]*draw_depth_encoding/,
   );
 
   const prepare = sourceSection(
     rendererSource,
     "fn prepare_exact_draw",
-    "fn expanded_indices",
+    "fn expanded_index_count",
   );
   assert.match(prepare, /draw\.exact_clip_input\?;/);
+  assert.match(prepare, /let required = draw\.record\.exact_clip_required;/);
   assert.match(
     prepare,
-    /let Ok\(geometry\) = gx_exact_draw_raster_geometry\(draw, source_vertices\) else \{\s*return Some\(PreparedExactDraw::Unqualified\);/,
+    /let Ok\(geometry\) = gx_exact_draw_raster_geometry\(draw, source_vertices\) else \{\s*return Some\(PreparedExactDraw \{\s*required,\s*required_managed_safe: false,\s*qualified: None,\s*\}\);/,
   );
   assert.match(
     prepare,
@@ -95,11 +138,11 @@ test("absent, unqualified, and authoritative exact inputs remain distinct", () =
   assert.doesNotMatch(prepare, /right - left \+ 1|bottom - top \+ 1/);
   assert.match(
     prepare,
-    /PreparedExactDraw::Qualified\(QualifiedExactDraw \{[\s\S]*vertices: geometry\.into_vertices\(\),[\s\S]*expanded,[\s\S]*scissor,/,
+    /let qualified = QualifiedExactDraw \{[\s\S]*vertices: geometry\.into_vertices\(\),[\s\S]*expanded,[\s\S]*scissor,[\s\S]*Some\(PreparedExactDraw \{\s*required,\s*required_managed_safe: required\s*&& required_exact_draw_is_managed_safe\(draw, &qualified\),\s*qualified: Some\(qualified\),\s*\}\)/,
   );
 });
 
-test("authoritative empty and depth-only routing precede all TEV gates", () => {
+test("authoritative no-op and depth routing precede all TEV gates", () => {
   const draw = sourceSection(
     rendererSource,
     "fn push_tev_draw_inner",
@@ -107,15 +150,21 @@ test("authoritative empty and depth-only routing precede all TEV gates", () => {
   );
   assertOrdered(draw, [
     "metrics.record_draw_transport",
+    "PreparedExactDraw::is_authoritative_noop",
     "let qualified_exact",
-    "QualifiedExactDraw::is_empty",
+    "let required_exact",
     "gx_early_depth_plan",
+    "required_exact && early_depth != GxEarlyDepthPlan::FixedFunction",
     "GxEarlyDepthPlan::DepthOnly",
     "required_texture_maps",
   ]);
   assert.match(
     draw,
-    /QualifiedExactDraw::is_empty\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*let early_depth/,
+    /PreparedExactDraw::is_authoritative_noop\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*let qualified_exact/,
+  );
+  assert.match(
+    draw,
+    /if required_exact && early_depth != GxEarlyDepthPlan::FixedFunction \{[\s\S]*return Ok\(\(\)\);[\s\S]*let depth_encoding/,
   );
   assert.match(
     draw,
@@ -123,7 +172,7 @@ test("authoritative empty and depth-only routing precede all TEV gates", () => {
   );
 });
 
-test("exact managed geometry wins and unsafe exact input falls back natively", () => {
+test("exact managed geometry wins while only optional unsafe input falls back", () => {
   const draw = sourceSection(
     rendererSource,
     "fn push_tev_draw_inner",
@@ -131,6 +180,7 @@ test("exact managed geometry wins and unsafe exact input falls back natively", (
   );
   assertOrdered(draw, [
     "let exact_managed",
+    "if required_exact && exact_managed.is_none()",
     "let managed_expanded",
     "let managed_evidence",
     "let scissor = if let Some(exact)",
@@ -139,6 +189,18 @@ test("exact managed geometry wins and unsafe exact input falls back natively", (
   assert.match(
     draw,
     /let exact_managed = qualified_exact\.filter\([\s\S]*ManagedCoverageEvidence::TrustedExactClip[\s\S]*exact\.vertices[\s\S]*&exact\.expanded[\s\S]*scissor/,
+  );
+  assert.match(
+    draw,
+    /if required_exact \{\s*return prepared_exact\s*\.is_some_and\(PreparedExactDraw::is_required_managed_safe\);\s*\}/,
+  );
+  assert.match(
+    draw,
+    /if required_exact && exact_managed\.is_none\(\) \{[\s\S]*return Ok\(\(\)\);[\s\S]*let managed_expanded/,
+  );
+  assert.match(
+    draw,
+    /let native_expanded = exact_managed\.is_none\(\)\.then\(\|\| \{[\s\S]*expanded_indices\(topology, vertex_count\)/,
   );
   assert.match(
     draw,
@@ -154,7 +216,7 @@ test("exact managed geometry wins and unsafe exact input falls back natively", (
   );
   assert.match(
     draw,
-    /else \{\s*\(\s*source_vertices,\s*expanded\.as_slice\(\),\s*raster_position_correction,/,
+    /else \{\s*\(\s*source_vertices,\s*native_expanded[\s\S]*\.expect\("non-exact draw retains native topology"\),\s*raster_position_correction,/,
   );
   assert.doesNotMatch(
     draw,

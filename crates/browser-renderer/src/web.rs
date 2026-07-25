@@ -342,24 +342,33 @@ impl QualifiedExactDraw {
     }
 }
 
-/// The three exact-input states must remain distinct. An exact draw that is
-/// not yet supported falls back to its original native geometry, but must not
-/// accidentally borrow legacy managed evidence intended for an absent input.
-enum PreparedExactDraw {
-    Unqualified,
-    Qualified(QualifiedExactDraw),
+/// Absent, optional, and required exact inputs remain distinct through
+/// submission. Optional unsupported input retains the v5 native fallback;
+/// required unsupported input is an authoritative no-op.
+struct PreparedExactDraw {
+    required: bool,
+    required_managed_safe: bool,
+    qualified: Option<QualifiedExactDraw>,
 }
 
 impl PreparedExactDraw {
     fn qualified(&self) -> Option<&QualifiedExactDraw> {
-        match self {
-            Self::Unqualified => None,
-            Self::Qualified(exact) => Some(exact),
-        }
+        self.qualified.as_ref()
     }
 
-    fn is_authoritative_empty(&self) -> bool {
-        self.qualified().is_some_and(QualifiedExactDraw::is_empty)
+    fn is_required(&self) -> bool {
+        self.required
+    }
+
+    fn is_required_managed_safe(&self) -> bool {
+        self.required
+            && self.required_managed_safe
+            && self.qualified().is_some_and(|exact| !exact.is_empty())
+    }
+
+    fn is_authoritative_noop(&self) -> bool {
+        (self.required && (!self.required_managed_safe || self.qualified.is_none()))
+            || self.qualified().is_some_and(QualifiedExactDraw::is_empty)
     }
 }
 
@@ -1952,10 +1961,6 @@ impl WebGpuRenderer {
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let header = *packet.header();
         let payload_bytes: usize = packet.textures().map(|texture| texture.pixels.len()).sum();
-        let packet_texture_keys = packet
-            .textures()
-            .map(|texture| texture.key)
-            .collect::<HashSet<_>>();
 
         self.ensure_healthy()?;
         let mut source_vertices =
@@ -1974,23 +1979,12 @@ impl WebGpuRenderer {
                 )
             })
             .collect::<Vec<_>>();
-        // Resolve every required texture before beginning the segment. Packet
-        // syntax is already validated above; this preflight also makes a
-        // missing resident payload fail without leaving earlier draws queued.
+        // Resolve every texture consumed by a prepared route before beginning
+        // the segment. Authoritative no-ops and depth-only routes neither
+        // validate nor protect irrelevant packet resources.
+        let mut packet_texture_keys = HashSet::new();
         for (draw, prepared_exact) in packet.draws().zip(&prepared_exact_draws) {
-            if prepared_exact
-                .as_ref()
-                .is_some_and(PreparedExactDraw::is_authoritative_empty)
-            {
-                continue;
-            }
-            if gx_early_depth_plan(
-                draw.record.z_mode,
-                draw.record.blend_mode,
-                draw.record.alpha_test,
-                draw.record.fragment_tail.pixel_control,
-            ) == GxEarlyDepthPlan::DepthOnly
-            {
+            if !draw_requires_texture_preflight(draw, prepared_exact.as_ref()) {
                 continue;
             }
             for (map, slot) in draw.record.textures.iter().enumerate() {
@@ -2028,6 +2022,7 @@ impl WebGpuRenderer {
                     ),
                 )
                 .map_err(|error| JsValue::from_str(&error))?;
+                packet_texture_keys.insert(texture.key);
             }
         }
         drop(packet_parse_timer);
@@ -2184,8 +2179,6 @@ impl WebGpuRenderer {
         // Super Monkey Ball emits millions of draws. Sample one deterministic
         // draw ordinal per stride so host clock imports cannot dominate GX.
         let sample_draw_timing = self.sample_draw_host_timing();
-        let topology_expansion_timer =
-            sample_draw_timing.then(|| self.host_phase_timer(RendererHostPhase::TopologyExpansion));
         let vertex_count = validate_draw_transport(
             source_vertices.len(),
             tev_state.len(),
@@ -2194,12 +2187,10 @@ impl WebGpuRenderer {
             MAX_TEV_TEXTURES,
         )
         .map_err(|error| JsValue::from_str(&error))?;
-        let expanded = expanded_indices(topology, vertex_count)
+        let expanded_vertex_count = expanded_index_count(topology, vertex_count)
             .ok_or_else(|| JsValue::from_str("unsupported GX primitive topology"))?;
-        let expanded_vertex_bytes = expanded
-            .len()
-            .saturating_mul(std::mem::size_of::<TevVertex>());
-        drop(topology_expansion_timer);
+        let expanded_vertex_bytes =
+            expanded_vertex_count.saturating_mul(std::mem::size_of::<TevVertex>());
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.record_draw_transport(
                 source_vertices
@@ -2212,9 +2203,13 @@ impl WebGpuRenderer {
             );
         });
 
-        let resource_preparation_timer = sample_draw_timing
-            .then(|| self.host_phase_timer(RendererHostPhase::ResourcePreparation));
-        if expanded.is_empty() {
+        if prepared_exact.is_some_and(PreparedExactDraw::is_authoritative_noop) {
+            // Exact clipping/culling proves this draw contributes no fragments,
+            // or required exact geometry cannot use the certified managed
+            // route. Do not allocate or resurrect its native topology.
+            return Ok(());
+        }
+        if expanded_vertex_count == 0 {
             return Ok(());
         }
         let primitive = match topology {
@@ -2224,13 +2219,14 @@ impl WebGpuRenderer {
         };
         let raster_position_correction = browser_raster_position_correction(pixel_control);
         let qualified_exact = prepared_exact.and_then(PreparedExactDraw::qualified);
-        if qualified_exact.is_some_and(QualifiedExactDraw::is_empty) {
-            // Exact clipping/culling and raw scissor qualification prove that
-            // this draw contributes no fragments. Do not let legacy projected
-            // geometry or scissor state resurrect it.
+        let required_exact = prepared_exact.is_some_and(PreparedExactDraw::is_required);
+        let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
+        if required_exact && early_depth != GxEarlyDepthPlan::FixedFunction {
+            // Required exact input may only use the managed path. In
+            // particular, never route it through the raw depth-only shortcut
+            // or the native primitive-ordered path.
             return Ok(());
         }
-        let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
         let depth_encoding = draw_depth_encoding(z_mode, pixel_control)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         if early_depth == GxEarlyDepthPlan::DepthOnly {
@@ -2249,7 +2245,12 @@ impl WebGpuRenderer {
                 // fragment or depth effect, so do not enqueue a GPU no-op.
                 return Ok(());
             };
-            drop(resource_preparation_timer);
+            let topology_expansion_timer = sample_draw_timing
+                .then(|| self.host_phase_timer(RendererHostPhase::TopologyExpansion));
+            let expanded = expanded_indices(topology, vertex_count)
+                .expect("supported depth-only GX topology has a canonical expansion");
+            debug_assert_eq!(expanded.len(), expanded_vertex_count);
+            drop(topology_expansion_timer);
             return self.push_expanded_draw(
                 source_vertices,
                 &expanded,
@@ -2290,6 +2291,9 @@ impl WebGpuRenderer {
         let native_scissor = clipped_scissor(scissor_x, scissor_y, scissor_width, scissor_height);
         let raster_center = gx_raster_center_evidence(pixel_control);
         let exact_managed = qualified_exact.filter(|exact| {
+            if required_exact {
+                return prepared_exact.is_some_and(PreparedExactDraw::is_required_managed_safe);
+            }
             let Some(scissor) = exact.scissor else {
                 return false;
             };
@@ -2310,9 +2314,29 @@ impl WebGpuRenderer {
                     scissor,
                 )
         });
+        if required_exact && exact_managed.is_none() {
+            // A v6 required draw is authoritative even outside the currently
+            // certified exact-managed subset. Suppress it rather than falling
+            // through to native geometry or legacy post-cull evidence.
+            return Ok(());
+        }
+        let native_expanded = exact_managed.is_none().then(|| {
+            let topology_expansion_timer = sample_draw_timing
+                .then(|| self.host_phase_timer(RendererHostPhase::TopologyExpansion));
+            let expanded = expanded_indices(topology, vertex_count)
+                .expect("supported native GX topology has a canonical expansion");
+            debug_assert_eq!(expanded.len(), expanded_vertex_count);
+            drop(topology_expansion_timer);
+            expanded
+        });
+        let resource_preparation_timer = sample_draw_timing
+            .then(|| self.host_phase_timer(RendererHostPhase::ResourcePreparation));
         let managed_expanded = prepared_exact
             .is_none()
             .then(|| {
+                let expanded = native_expanded
+                    .as_deref()
+                    .expect("non-exact draw retains native topology");
                 let scissor = native_scissor?;
                 let post_cull = (source_cull != CullMode::All
                     && managed_coverage_actions.is_some()
@@ -2321,7 +2345,7 @@ impl WebGpuRenderer {
                     && early_depth == GxEarlyDepthPlan::FixedFunction
                     && fog == GxFogState::default()
                     && z_texture.operation == GxZTextureOperation::Disabled)
-                    .then(|| managed_post_cull_indices(&expanded, managed_coverage_actions))
+                    .then(|| managed_post_cull_indices(expanded, managed_coverage_actions))
                     .flatten()?;
                 managed_coverage_draw_is_safe(
                     ManagedCoverageEvidence::TrustedPostCull,
@@ -2557,7 +2581,9 @@ impl WebGpuRenderer {
             } else {
                 (
                     source_vertices,
-                    expanded.as_slice(),
+                    native_expanded
+                        .as_deref()
+                        .expect("non-exact draw retains native topology"),
                     raster_position_correction,
                 )
             };
@@ -4671,13 +4697,126 @@ fn clipped_scissor(x: u32, y: u32, width: u32, height: u32) -> Option<ScissorRec
     })
 }
 
+fn draw_requires_texture_preflight(
+    draw: crate::packet::GxDraw<'_>,
+    prepared_exact: Option<&PreparedExactDraw>,
+) -> bool {
+    if prepared_exact.is_some_and(PreparedExactDraw::is_authoritative_noop) {
+        return false;
+    }
+    let early_depth = gx_early_depth_plan(
+        draw.record.z_mode,
+        draw.record.blend_mode,
+        draw.record.alpha_test,
+        draw.record.fragment_tail.pixel_control,
+    );
+    if prepared_exact.is_some_and(PreparedExactDraw::is_required)
+        && early_depth != GxEarlyDepthPlan::FixedFunction
+    {
+        return false;
+    }
+    early_depth != GxEarlyDepthPlan::DepthOnly
+}
+
+fn required_exact_draw_is_managed_safe(
+    draw: crate::packet::GxDraw<'_>,
+    exact: &QualifiedExactDraw,
+) -> bool {
+    if !draw.record.exact_clip_required || exact.is_empty() {
+        return false;
+    }
+    let primitive = match draw.record.topology {
+        5 | 6 => Primitive::Lines,
+        7 => Primitive::Points,
+        _ => Primitive::Triangles,
+    };
+    let early_depth = gx_early_depth_plan(
+        draw.record.z_mode,
+        draw.record.blend_mode,
+        draw.record.alpha_test,
+        draw.record.fragment_tail.pixel_control,
+    );
+    let raster_center = gx_raster_center_evidence(draw.record.fragment_tail.pixel_control);
+    if primitive != Primitive::Triangles
+        || early_depth != GxEarlyDepthPlan::FixedFunction
+        || raster_center != GxRasterCenterEvidence::KnownNonAntialiased
+    {
+        return false;
+    }
+    if draw_depth_encoding(draw.record.z_mode, draw.record.fragment_tail.pixel_control).is_err() {
+        return false;
+    }
+    let Ok(required_maps) = required_texture_maps(draw.tev_state) else {
+        return false;
+    };
+    let Ok(required_coords) = required_texture_coords(draw.tev_state) else {
+        return false;
+    };
+    let sampler_modes = draw.record.textures.map(|slot| slot.sampler_bits);
+    let sampler_identities = sampler_modes.map(gx_sampler_identity);
+    let Ok(z_texture) = gx_z_texture_state(
+        draw.record.fragment_tail.z_texture_bias,
+        draw.record.fragment_tail.z_texture_mode,
+        draw.record.fragment_tail.pixel_control,
+    ) else {
+        return false;
+    };
+    let Ok(fog) = gx_fog_state(
+        draw.record.fragment_tail.fog_range_base,
+        draw.record.fragment_tail.fog_range_k,
+        draw.record.fragment_tail.fog_words,
+        draw.record.fragment_tail.viewport_half_width_bits,
+    ) else {
+        return false;
+    };
+    let destination_alpha = gx_destination_alpha_state(
+        draw.record.blend_mode,
+        draw.record.fragment_tail.constant_alpha,
+        draw.record.fragment_tail.pixel_control,
+    );
+    let source_cull = PipelineKey::from_gx(
+        primitive,
+        draw.record.z_mode,
+        draw.record.blend_mode,
+        destination_alpha,
+        z_texture,
+        draw.record.cull_mode,
+    )
+    .color_pipeline_for_early_depth(early_depth)
+    .cull;
+    let Some(scissor) = exact.scissor else {
+        return false;
+    };
+    source_cull != CullMode::All
+        && managed_coverage_draw_is_safe(
+            ManagedCoverageEvidence::TrustedExactClip,
+            primitive,
+            raster_center,
+            early_depth,
+            required_maps,
+            required_coords,
+            sampler_modes,
+            sampler_identities,
+            fog,
+            z_texture,
+            &exact.vertices,
+            &exact.expanded,
+            scissor,
+        )
+}
+
 fn prepare_exact_draw(
     draw: crate::packet::GxDraw<'_>,
     source_vertices: &[f32],
 ) -> Option<PreparedExactDraw> {
     draw.exact_clip_input?;
+    let required = draw.record.exact_clip_required;
     let Ok(geometry) = gx_exact_draw_raster_geometry(draw, source_vertices) else {
-        return Some(PreparedExactDraw::Unqualified);
+        return Some(PreparedExactDraw {
+            required,
+            required_managed_safe: false,
+            qualified: None,
+        });
     };
     debug_assert_eq!(geometry.triangle_count(), geometry.source_indices().len());
     let expanded = (0..geometry.triangle_count() * 3).collect::<Vec<_>>();
@@ -4689,17 +4828,40 @@ fn prepare_exact_draw(
         height: bottom - top,
     });
     if !expanded.is_empty() && scissor.is_none() {
-        return Some(PreparedExactDraw::Unqualified);
+        return Some(PreparedExactDraw {
+            required,
+            required_managed_safe: false,
+            qualified: None,
+        });
     }
-    Some(PreparedExactDraw::Qualified(QualifiedExactDraw {
+    let qualified = QualifiedExactDraw {
         vertices: geometry.into_vertices(),
         expanded,
         scissor,
-    }))
+    };
+    Some(PreparedExactDraw {
+        required,
+        required_managed_safe: required && required_exact_draw_is_managed_safe(draw, &qualified),
+        qualified: Some(qualified),
+    })
+}
+
+fn expanded_index_count(topology: u8, count: usize) -> Option<usize> {
+    match topology {
+        0 | 1 => (count / 4)
+            .checked_mul(6)?
+            .checked_add(if count % 4 == 3 { 3 } else { 0 }),
+        2 => Some(count - count % 3),
+        3 | 4 => count.saturating_sub(2).checked_mul(3),
+        5 => Some(count - count % 2),
+        6 => count.saturating_sub(1).checked_mul(2),
+        7 => Some(count),
+        _ => None,
+    }
 }
 
 fn expanded_indices(topology: u8, count: usize) -> Option<Vec<usize>> {
-    let mut indices = Vec::new();
+    let mut indices = Vec::with_capacity(expanded_index_count(topology, count)?);
     match topology {
         0 | 1 => {
             for base in (0..count.saturating_sub(3)).step_by(4) {
@@ -5399,14 +5561,15 @@ mod tests {
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxRasterPoint28_4, GxRasterScissor,
         GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
         MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
-        ManagedCoverageEvidence, PipelineKey, Primitive, REQUIRED_WEBGPU_FEATURES, ScissorRect,
-        TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex, alpha_blend_factor, blend_write_mask,
-        browser_raster_position_correction, color_blend_factor, depth_only_command_state,
-        draw_depth_encoding, expanded_indices, expanded_primitive_ranges,
-        managed_coverage_attribute_payload, managed_coverage_draw_is_safe,
-        managed_coverage_pack_point, managed_coverage_samplers_are_safe,
-        managed_coverage_texel_uv_is_safe, managed_coverage_texture_coord,
-        managed_coverage_triangle_vertices, managed_post_cull_indices, merge_contiguous_draw_range,
+        ManagedCoverageEvidence, PipelineKey, PreparedExactDraw, Primitive, QualifiedExactDraw,
+        REQUIRED_WEBGPU_FEATURES, ScissorRect, TEV_VERTEX_ATTRIBUTES, TevBindingKey, TevVertex,
+        alpha_blend_factor, blend_write_mask, browser_raster_position_correction,
+        color_blend_factor, depth_only_command_state, draw_depth_encoding, expanded_index_count,
+        expanded_indices, expanded_primitive_ranges, managed_coverage_attribute_payload,
+        managed_coverage_draw_is_safe, managed_coverage_pack_point,
+        managed_coverage_samplers_are_safe, managed_coverage_texel_uv_is_safe,
+        managed_coverage_texture_coord, managed_coverage_triangle_vertices,
+        managed_post_cull_indices, merge_contiguous_draw_range,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
     };
     use crate::packet::GxTriangleAction;
@@ -5476,6 +5639,82 @@ mod tests {
             }
         }
         source
+    }
+
+    #[test]
+    fn required_exact_preparation_is_authoritative_when_qualification_fails() {
+        let qualified = || QualifiedExactDraw {
+            vertices: vec![0.0; TEV_VERTEX_FLOATS * 3],
+            expanded: vec![0, 1, 2],
+            scissor: Some(ScissorRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }),
+        };
+        let optional_unqualified = PreparedExactDraw {
+            required: false,
+            required_managed_safe: false,
+            qualified: None,
+        };
+        assert!(!optional_unqualified.is_required());
+        assert!(
+            !optional_unqualified.is_authoritative_noop(),
+            "v5 optional exact input retains its native fallback",
+        );
+
+        let required_unqualified = PreparedExactDraw {
+            required: true,
+            required_managed_safe: false,
+            qualified: None,
+        };
+        assert!(required_unqualified.is_required());
+        assert!(
+            required_unqualified.is_authoritative_noop(),
+            "v6 required input must suppress unsupported raw geometry",
+        );
+
+        let required_qualified = PreparedExactDraw {
+            required: true,
+            required_managed_safe: true,
+            qualified: Some(qualified()),
+        };
+        assert!(!required_qualified.is_authoritative_noop());
+
+        let required_unsafe = PreparedExactDraw {
+            required: true,
+            required_managed_safe: false,
+            qualified: Some(qualified()),
+        };
+        assert!(
+            required_unsafe.is_authoritative_noop(),
+            "a qualified required draw outside the managed subset needs no resources",
+        );
+
+        let optional_unsafe = PreparedExactDraw {
+            required: false,
+            required_managed_safe: false,
+            qualified: Some(qualified()),
+        };
+        assert!(
+            !optional_unsafe.is_authoritative_noop(),
+            "v5 optional exact input retains its unsafe native fallback",
+        );
+
+        let optional_empty = PreparedExactDraw {
+            required: false,
+            required_managed_safe: false,
+            qualified: Some(QualifiedExactDraw {
+                vertices: Vec::new(),
+                expanded: Vec::new(),
+                scissor: None,
+            }),
+        };
+        assert!(
+            optional_empty.is_authoritative_noop(),
+            "exact clipping that removes every triangle remains authoritative",
+        );
     }
 
     fn qualifying_managed_draw_with_textures(
@@ -5551,11 +5790,18 @@ mod tests {
 
     #[test]
     fn expands_gamecube_topologies_for_webgpu() {
+        for topology in 0..=7 {
+            for count in 0..=16 {
+                let expanded = expanded_indices(topology, count).unwrap();
+                assert_eq!(expanded_index_count(topology, count), Some(expanded.len()));
+            }
+        }
         assert_eq!(expanded_indices(0, 4).unwrap(), [0, 1, 2, 0, 2, 3]);
         assert_eq!(expanded_indices(2, 3).unwrap(), [0, 1, 2]);
         assert_eq!(expanded_indices(3, 4).unwrap(), [0, 1, 2, 1, 3, 2]);
         assert_eq!(expanded_indices(4, 4).unwrap(), [0, 1, 2, 0, 2, 3]);
         assert_eq!(expanded_indices(6, 3).unwrap(), [0, 1, 1, 2]);
+        assert_eq!(expanded_index_count(8, 3), None);
     }
 
     #[test]
