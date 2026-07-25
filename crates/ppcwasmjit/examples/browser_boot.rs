@@ -1413,9 +1413,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       let packet;
       try {
-        // The v5 encoder returns the canonical v4 bytes unchanged until at
-        // least one draw carries a complete exact homogeneous input.
-        packet = packGxFramePacketV5(copyKind, frame, residentTextureKeys);
+        // The v6 encoder preserves canonical v4/v5 bytes until at least one
+        // draw declares exact homogeneous geometry authoritative.
+        packet = packGxFramePacketV6(copyKind, frame, residentTextureKeys);
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
@@ -4758,6 +4758,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxDecodedVertices = 0;
     let gxProjectedVertices = 0;
     let gxDroppedVertices = 0;
+    let gxLegacyProjectionNullVertices = 0;
+    let gxExactRequiredDraws = 0;
+    let gxExactRequiredVertices = 0;
+    let gxExactRequiredCaptureMisses = 0;
     let gxDisplayListErrors = 0;
     let gxVertexDecodeErrors = 0;
     let gxUnknownOpcodes = 0;
@@ -8072,7 +8076,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       } else {
         return null;
       }
-      if (![clipX, clipY, clipZ, clipW].every(Number.isFinite) || Math.abs(clipW) < 1e-12) {
+      if (![clipX, clipY, clipZ, clipW].every(Number.isFinite) || clipW === 0) {
         return null;
       }
       const viewport = Array.from({ length: 6 }, (_unused, index) =>
@@ -8084,12 +8088,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       const scissorOffset = gxBpRegisters[0x59];
       const scissorX = scissorOffset & 0x3ff;
       const scissorY = (scissorOffset >>> 10) & 0x3ff;
-      return [
+      const projected = [
         clipX / clipW * viewport[0] + viewport[3] - scissorX * 2,
         clipY / clipW * viewport[1] + viewport[4] - scissorY * 2,
         clipZ / clipW * viewport[2] + viewport[5],
         clipW,
       ];
+      const projectedF32 = projected.map(value => Math.fround(value));
+      return (
+        projectedF32.every(Number.isFinite)
+        && projectedF32[3] !== 0
+      )
+        ? projected
+        : null;
     }
 
     function gxCullClipPosition(
@@ -9155,28 +9166,38 @@ const TEMPLATE: &str = r##"<!doctype html>
       const rawTextureCoordSets = Array.from({ length: 8 }, () => []);
       const rasterColorSets = Array.from({ length: 2 }, () => []);
       const normalSet = [];
-      const cullPositions = collectCullSources ? [] : null;
-      const cullMatrixIndices = collectCullSources ? [] : null;
+      const sourcePositions = [];
+      const positionMatrixIndices = [];
       let textureMatrices = null;
-      let complete = true;
+      let decodeComplete = true;
+      let exactGeometryRequired = false;
+      let legacyProjectionNullVertices = 0;
       for (let vertex = 0; vertex < vertexCount; vertex += 1) {
         const start = payloadOffset + vertex * vertexSize;
         const decoded = gxDecodeVertex(source, start, opcode & 7);
         if (decoded.cursor !== start + vertexSize) gxVertexDecodeErrors += 1;
-        if (decoded.skipped || decoded.projected === null) {
+        if (decoded.skipped) {
           gxDroppedVertices += 1;
-          complete = false;
+          decodeComplete = false;
           continue;
         }
         gxDecodedVertices += 1;
-        gxProjectedVertices += 1;
+        sourcePositions.push(decoded.position);
+        positionMatrixIndices.push(decoded.positionMatrix);
+        const projected = decoded.projected ?? [0, 0, 0, 1];
+        if (decoded.projected === null) {
+          gxLegacyProjectionNullVertices += 1;
+          legacyProjectionNullVertices += 1;
+          exactGeometryRequired = true;
+        } else {
+          gxProjectedVertices += 1;
+        }
         const raster0 = decoded.rasterColors?.[0]
           ?? decoded.colors[0].map(value => value / 255);
         const raster1 = decoded.rasterColors?.[1]
           ?? decoded.colors[1].map(value => value / 255);
         vertices.push(
-          decoded.projected[0], decoded.projected[1], decoded.projected[2],
-          decoded.projected[3],
+          projected[0], projected[1], projected[2], projected[3],
           ...raster0,
           ...raster1
         );
@@ -9189,13 +9210,30 @@ const TEMPLATE: &str = r##"<!doctype html>
         rasterColorSets[0].push(raster0);
         rasterColorSets[1].push(raster1);
         normalSet.push(decoded.normal);
-        if (collectCullSources) {
-          cullPositions.push(decoded.position);
-          cullMatrixIndices.push(decoded.positionMatrix);
-        }
         textureMatrices = decoded.textureMatrices;
       }
-      if (!complete || vertices.length === 0) return;
+      if (!decodeComplete || vertices.length === 0) {
+        gxDroppedVertices += legacyProjectionNullVertices;
+        return;
+      }
+      const sourceVertices = new Float32Array(vertices);
+      let exactClipInput = null;
+      if (exactGeometryRequired) {
+        exactClipInput = gxManagedCoverageExactClipInput(
+          topology,
+          pipeline.cullMode,
+          sourcePositions,
+          positionMatrixIndices
+        );
+        if (
+          exactClipInput === null
+          || !sourceVertices.every(Number.isFinite)
+        ) {
+          gxExactRequiredCaptureMisses += 1;
+          gxDroppedVertices += legacyProjectionNullVertices;
+          return;
+        }
+      }
       gxFrameDrawVertices += vertexCount;
       for (const stage of stages) {
         if (!stage.textureEnabled) continue;
@@ -9216,28 +9254,30 @@ const TEMPLATE: &str = r##"<!doctype html>
       const texCoordIndex = texturedStages[0]?.texCoordIndex ?? 0;
       const selectedTexCoords = texCoordSets[texCoordIndex];
       const postCullEvidence = (
-        collectCullSources
+        !exactGeometryRequired
+        && collectCullSources
         && gxManagedCoverageVerticesCandidate(topology, vertices)
       )
         ? gxManagedCoveragePostCullEvidence(
           topology,
           pipeline.cullMode,
-          cullPositions,
-          cullMatrixIndices,
+          sourcePositions,
+          positionMatrixIndices,
           gxXfFloat(0x101b)
         )
         : null;
-      const exactClipInput = (
-        collectCullSources
+      if (
+        !exactGeometryRequired
+        && collectCullSources
         && postCullEvidence === null
-      )
-        ? gxManagedCoverageExactClipInput(
+      ) {
+        exactClipInput = gxManagedCoverageExactClipInput(
           topology,
           pipeline.cullMode,
-          cullPositions,
-          cullMatrixIndices
-        )
-        : null;
+          sourcePositions,
+          positionMatrixIndices
+        );
+      }
       const draw = {
         topology,
         vat: opcode & 7,
@@ -9245,14 +9285,19 @@ const TEMPLATE: &str = r##"<!doctype html>
         // Renderer frames cross a Worker boundary. Keep the GPU-bound payload
         // in its final f32 representation so structured cloning does not walk
         // and duplicate one boxed JavaScript number per vertex component.
-        vertices: new Float32Array(vertices),
+        vertices: sourceVertices,
         textures,
         tevState: gxPackTevState(stages),
         pipeline,
         ...(postCullEvidence === null ? {} : { postCullEvidence }),
         ...(exactClipInput === null ? {} : { exactClipInput }),
+        ...(exactGeometryRequired ? { exactGeometryRequired: true } : {}),
       };
       gxFrameDraws.push(draw);
+      if (exactGeometryRequired) {
+        gxExactRequiredDraws += 1;
+        gxExactRequiredVertices += vertexCount;
+      }
       const vatIndex = opcode & 7;
       const primitiveSample = {
         cycle: cycles,
@@ -15246,6 +15291,10 @@ const TEMPLATE: &str = r##"<!doctype html>
             decodedVertices: gxDecodedVertices,
             projectedVertices: gxProjectedVertices,
             droppedVertices: gxDroppedVertices,
+            legacyProjectionNullVertices: gxLegacyProjectionNullVertices,
+            exactRequiredDraws: gxExactRequiredDraws,
+            exactRequiredVertices: gxExactRequiredVertices,
+            exactRequiredCaptureMisses: gxExactRequiredCaptureMisses,
             vertexDecodeErrors: gxVertexDecodeErrors,
             texgenTransforms: gxTexgenTransforms,
             texgenFallbacks: gxTexgenFallbacks,

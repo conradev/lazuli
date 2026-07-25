@@ -426,6 +426,34 @@ test("preserves homogeneous W for WebGPU clipping and interpolation", () => {
   );
 });
 
+test("classifies legacy projection by its exact W and transported f32 image", () => {
+  gxBpRegisters.fill(0);
+  gxXfRegisters.fill(0);
+  gxXfValues[0x1020] = 1;
+  gxXfValues[0x1022] = 1;
+  gxXfValues[0x101a] = 1;
+  gxXfValues[0x101b] = 1;
+
+  assert.equal(context.gxProjectViewPosition([0, 0, 0]), null);
+  assert.equal(context.gxProjectViewPosition([0, 0, -0]), null);
+
+  const tinyRepresentableW = context.gxProjectViewPosition([0, 0, -1e-20]);
+  assert.notEqual(tinyRepresentableW, null);
+  assert.ok(Math.abs(tinyRepresentableW[3]) < 1e-12);
+  assert.notEqual(Math.fround(tinyRepresentableW[3]), 0);
+
+  assert.equal(
+    context.gxProjectViewPosition([0, 0, -1e-50]),
+    null,
+    "a nonzero f64 W that becomes zero in the packet cannot use native geometry",
+  );
+  assert.equal(
+    context.gxProjectViewPosition([1e20, 0, -1e-20]),
+    null,
+    "finite JS projection that overflows its transported f32 is exact-required",
+  );
+});
+
 test("does not truncate late GX draws with a debug-era frame vertex cap", () => {
   const recordPrimitive = extractFunction("recordGxPrimitive");
 

@@ -397,12 +397,14 @@ test("packs the exact 464-byte WebGPU TEV uniform layout", () => {
 test("worker draw capture routes XF attributes through the TEV transport", () => {
   const capture = extractFunction("recordGxPrimitive");
   assert.match(capture, /gxPackTevState\s*\(/);
-  assert.match(capture, /vertices:\s*new Float32Array\(vertices\)/);
+  assert.match(capture, /const sourceVertices = new Float32Array\(vertices\)/);
+  assert.match(capture, /vertices:\s*sourceVertices/);
   assert.match(capture, /decoded\.colors\s*\[\s*0\s*\]/);
   assert.match(capture, /decoded\.colors\s*\[\s*1\s*\]/);
   assert.match(capture, /gxManagedCoverageStateCandidate\s*\(/);
-  assert.match(capture, /cullPositions\.push\(decoded\.position\)/);
-  assert.match(capture, /cullMatrixIndices\.push\(decoded\.positionMatrix\)/);
+  assert.match(capture, /sourcePositions\.push\(decoded\.position\)/);
+  assert.match(capture, /positionMatrixIndices\.push\(decoded\.positionMatrix\)/);
+  assert.match(capture, /exactGeometryRequired/);
   assert.match(capture, /gxManagedCoveragePostCullEvidence\s*\(/);
   assert.match(capture, /\{\s*postCullEvidence\s*\}/);
   assert.doesNotMatch(capture, /cullClipPositions/);
