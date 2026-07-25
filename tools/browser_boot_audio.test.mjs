@@ -191,9 +191,14 @@ test("DSP audio DMA is a runtime scheduler candidate and is included in reports"
     viTiming: null,
   };
   vm.createContext(context);
-  vm.runInContext(extractFunction("nextRuntimeEventCycle"), context, {
-    filename: "browser_boot.audio-scheduler.js",
-  });
+  vm.runInContext(
+    [
+      "runtimeEventCycleCandidates",
+      "nextRuntimeEventCycle",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.audio-scheduler.js" },
+  );
 
   assert.equal(context.nextRuntimeEventCycle(), 110);
   assert.match(source, /dspAudioDma: \{/);

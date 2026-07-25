@@ -196,6 +196,51 @@ test("region hooks combine block prefixes with instruction offsets and request e
   assert.equal(context.cycles, 1_000);
 });
 
+test("MSR hooks honor continuation classification and FIFO-drain exits", () => {
+  const context = makeContext();
+  context.regionRunning = true;
+  let hookResult = 1;
+  const hooks = context.createJitHookProxy({
+    user_0_16() {
+      context.events.push(["msr", context.cycles, hookResult]);
+      return hookResult;
+    },
+  });
+
+  publish(context, { prefix: 20, offset: 3 });
+  assert.equal(hooks.user_0_16(), 1);
+  assert.deepEqual(context.events, [
+    ["drain", 1_023],
+    ["msr", 1_023, 1],
+  ]);
+  assert.equal(context.regionContinuableHookCalls, 1);
+  assert.equal(context.view.getUint32(context.regionControl + 4, true), 0);
+
+  context.events.length = 0;
+  hookResult = 0;
+  publish(context, { prefix: 20, offset: 4 });
+  assert.equal(hooks.user_0_16(), 0);
+  assert.deepEqual(context.events, [
+    ["drain", 1_024],
+    ["msr", 1_024, 0],
+  ]);
+  assert.equal(context.regionContinuableHookCalls, 1);
+  assert.equal(context.view.getUint32(context.regionControl + 4, true), 1);
+
+  context.events.length = 0;
+  hookResult = 1;
+  publish(context, { prefix: 20, offset: 5 });
+  context.view.setUint32(context.gxFifoStagingMeta, 32, true);
+  assert.equal(hooks.user_0_16(), 1);
+  assert.deepEqual(context.events, [
+    ["drain", 1_025],
+    ["msr", 1_025, 1],
+  ]);
+  assert.equal(context.regionContinuableHookCalls, 2);
+  assert.equal(context.view.getUint32(context.regionControl + 4, true), 1);
+  assert.equal(context.cycles, 1_000);
+});
+
 test("exception hooks retain their two-argument ABI while using published cycles", () => {
   const context = makeContext();
   context.cycles = 200;

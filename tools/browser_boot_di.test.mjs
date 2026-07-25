@@ -154,6 +154,7 @@ function makeContext() {
       "serviceDiskAudio",
       "beginDiskCommand",
       "serviceDisk",
+      "runtimeEventCycleCandidates",
       "nextRuntimeEventCycle",
     ].map(extractFunction).join("\n\n"),
     context,

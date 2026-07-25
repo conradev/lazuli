@@ -65,6 +65,99 @@ test("structural loop recognition remains available before compilation", () => {
   assert.equal(context.isRecognizedLoopPc(0x6000), false);
 });
 
+test("WarioWare queue-full waits wake only for a pending runtime event", () => {
+  const context = {
+    pendingEventCycle: null,
+    nextRuntimeEventCycle(includeCycleLimit) {
+      assert.equal(includeCycleLimit, false);
+      return context.pendingEventCycle;
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(extractFunction("nextStableWaitEventCycle"), context, {
+    filename: "browser_boot.scheduler.js",
+  });
+
+  context.pendingEventCycle = 182_519_381;
+  assert.equal(
+    context.nextStableWaitEventCycle(false, 127),
+    null,
+    "the interrupt-guarded multi-block wait retains its conservative threshold",
+  );
+  assert.equal(
+    context.nextStableWaitEventCycle(false, 128),
+    182_519_381,
+    "a stable restore boundary may advance to the pending ARAM event",
+  );
+
+  context.pendingEventCycle = null;
+  assert.equal(
+    context.nextStableWaitEventCycle(false, 128),
+    null,
+    "a repeated boundary without a device event must keep executing the guest",
+  );
+});
+
+test("runtime deadlines distinguish future work from work due at the published cycle", () => {
+  const context = {
+    aramTransfer: null,
+    cycleLimit: Number.POSITIVE_INFINITY,
+    cycles: 100,
+    diskTransfer: null,
+    dspScheduledMail: null,
+    ensureViSchedule() {},
+    nextAudioSampleCycle: () => null,
+    nextDecrementerCycle: null,
+    nextDiskAudioCycle: null,
+    nextDspAudioDmaCycle: null,
+    nextDspAudioDmaInterruptCycle: null,
+    nextSerialPollCycle: null,
+    nextViBoundaryCycle: null,
+    nextViCycle: null,
+    nextViPresentCycle: null,
+    nextViTimingBoundaryCycle: null,
+    peFinishCycle: null,
+    serialTransfer: null,
+    viTiming: null,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "runtimeEventCycleCandidates",
+      "runtimeEventDueAtOrBefore",
+      "nextRuntimeEventCycle",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.scheduler-deadline.js" },
+  );
+
+  context.aramTransfer = { completionCycle: 101 };
+  assert.equal(context.runtimeEventDueAtOrBefore(100), false);
+  assert.equal(context.nextRuntimeEventCycle(false), 101);
+
+  context.aramTransfer.completionCycle = 100;
+  assert.equal(
+    context.runtimeEventDueAtOrBefore(100),
+    true,
+    "a deadline equal to the hook cycle is already due",
+  );
+  assert.equal(
+    context.nextRuntimeEventCycle(false),
+    null,
+    "future-event selection must continue to exclude an already-due deadline",
+  );
+
+  context.aramTransfer.completionCycle = 99;
+  assert.equal(context.runtimeEventDueAtOrBefore(100), true);
+  context.aramTransfer = null;
+  context.cycleLimit = 90;
+  assert.equal(
+    context.runtimeEventDueAtOrBefore(100),
+    false,
+    "the runner's debug cycle limit is not a device-delivery boundary",
+  );
+});
+
 test("runner budgets are unbounded unless the debug URL supplies them", () => {
   const context = {};
   vm.createContext(context);

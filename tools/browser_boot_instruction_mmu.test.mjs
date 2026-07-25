@@ -104,6 +104,7 @@ const instructionFunctions = [
   "invalidateAllCompiledCode",
   "synchronizeInstructionAddressSpace",
   "initializePageTableRegisters",
+  "interruptDeliveryPendingAtCycle",
   "msrChanged",
   "instructionBatChanged",
   "segmentRegisterChanged",
@@ -161,6 +162,7 @@ function makeContext() {
     lrOffset: 0x8c,
     lockedCache: 0xc0000,
     lockedCacheSize: 0x4000,
+    mmio: 0x80000,
     mmioSize: 0x20000,
     msrOffset: 0x20,
     pcOffset: 0x24,
@@ -186,6 +188,8 @@ function makeContext() {
     srr1Offset: 0x84,
     view: new DataView(buffer),
   };
+  context.decrementerPending = false;
+  context.runtimeEventDueAtOrBefore = () => false;
   context.rebuildDataFastmem = () => {
     context.dataFastmemRebuilds += 1;
   };
@@ -594,6 +598,130 @@ test("exception entry switches namespaces before vector lookup and reuses the pr
   assert.equal(context.compiledBlock(oldPc), resumeBlock);
 });
 
+test("MSR changes continue only across translation-stable interrupt boundaries", () => {
+  const context = makeContext();
+  context.rebuildDataFastmem = () => false;
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00008032, true);
+  context.synchronizeInstructionAddressSpace("seed");
+
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00000032, true);
+  assert.equal(
+    context.msrChanged(),
+    1,
+    "disabling EE without changing IR/DR may remain inside the linked region",
+  );
+
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00008032, true);
+  assert.equal(
+    context.msrChanged(),
+    1,
+    "enabling EE without an asserted interrupt or due event may remain linked",
+  );
+
+  context.view.setUint32(context.mmio + 0x3000, 0x00000040, false);
+  context.view.setUint32(context.mmio + 0x3004, 0x00000040, false);
+  assert.equal(
+    context.msrChanged(),
+    0,
+    "a deliverable PI interrupt must exit at the EE-enable boundary",
+  );
+
+  context.view.setUint32(context.mmio + 0x3004, 0x00000004, false);
+  assert.equal(
+    context.msrChanged(),
+    1,
+    "an asserted but masked PI cause must not become deliverable",
+  );
+
+  context.decrementerPending = true;
+  assert.equal(
+    context.msrChanged(),
+    0,
+    "a pending decrementer must exit at the EE-enable boundary",
+  );
+  context.decrementerPending = false;
+
+  context.runtimeEventDueAtOrBefore = observedCycles => observedCycles === 1_000;
+  assert.equal(
+    context.msrChanged(),
+    0,
+    "a device event due at the current cycle must reach the post-block pass",
+  );
+  context.runtimeEventDueAtOrBefore = () => false;
+
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00000032, true);
+  context.rebuildDataFastmem = () => true;
+  assert.equal(
+    context.msrChanged(),
+    0,
+    "a data translation change must leave the linked region",
+  );
+
+  context.rebuildDataFastmem = () => false;
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00000012, true);
+  assert.equal(
+    context.msrChanged(),
+    0,
+    "an instruction translation change must leave the linked region",
+  );
+});
+
+test("EE-enable hooks decide continuation at the linked region's exact published cycle", () => {
+  const context = makeContext();
+  context.rebuildDataFastmem = () => false;
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00008032, true);
+  context.synchronizeInstructionAddressSpace("seed");
+  context.regionRunning = true;
+  context.view.setUint32(
+    context.regionControl + context.regionCyclePrefixOffset,
+    40,
+    true,
+  );
+  context.view.setUint32(
+    context.regionControl + context.hookCycleOffset,
+    7,
+    true,
+  );
+
+  const observedCycles = [];
+  let eventDue = false;
+  context.runtimeEventDueAtOrBefore = cycle => {
+    observedCycles.push(cycle);
+    return eventDue;
+  };
+  const target = { user_0_16: () => context.msrChanged() };
+
+  assert.equal(context.invokeJitHook(target, "user_0_16", []), 1);
+  assert.deepEqual(observedCycles, [1_047]);
+  assert.equal(
+    context.view.getUint32(
+      context.regionControl + context.regionExitRequestOffset,
+      true,
+    ),
+    0,
+    "a future event must not break the linked region",
+  );
+  assert.equal(context.cycles, 1_000, "the outer scheduler cycle must be restored");
+
+  eventDue = true;
+  context.view.setUint32(
+    context.regionControl + context.regionExitRequestOffset,
+    0,
+    true,
+  );
+  assert.equal(context.invokeJitHook(target, "user_0_16", []), 0);
+  assert.deepEqual(observedCycles, [1_047, 1_047]);
+  assert.equal(
+    context.view.getUint32(
+      context.regionControl + context.regionExitRequestOffset,
+      true,
+    ),
+    1,
+    "a due event must exit at the exact EE-enable hook cycle",
+  );
+  assert.equal(context.cycles, 1_000);
+});
+
 test("MSR and IBAT hooks synchronously request linked-region exits before the next namespace lookup", () => {
   assert.match(source, /user_0_16:\s*\(\) => msrChanged\(\)/);
   assert.match(source, /user_0_17:\s*\(\) => instructionBatChanged\(\)/);
@@ -628,7 +756,7 @@ test("MSR and IBAT hooks synchronously request linked-region exits before the ne
   let msrHookKey = null;
   msrContext.invokeJitHook({
     user_0_16() {
-      msrContext.msrChanged();
+      const result = msrContext.msrChanged();
       msrHookKey = msrContext.instructionAddressSpaceKey;
       assert.equal(
         msrContext.view.getUint32(
@@ -638,6 +766,7 @@ test("MSR and IBAT hooks synchronously request linked-region exits before the ne
         0,
         "the hook target runs synchronously before its exit request is published",
       );
+      return result;
     },
   }, "user_0_16", []);
   assert.equal(msrHookKey, physicalKey);

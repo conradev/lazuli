@@ -4985,6 +4985,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     function regionHookCanContinue(name, arguments_, result) {
       let size;
       switch (name) {
+        case "user_0_16":
+          return Number(result) === 1;
         case "user_0_3": case "user_0_7": size = 1; break;
         case "user_0_4": case "user_0_8": size = 2; break;
         case "user_0_5": case "user_0_9": size = 4; break;
@@ -13458,11 +13460,38 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
+    function interruptDeliveryPendingAtCycle(observedCycles) {
+      const interruptCause = view.getUint32(mmio + 0x3000, false);
+      const interruptMask = view.getUint32(mmio + 0x3004, false);
+      return (
+        (interruptCause & interruptMask) !== 0
+        || decrementerPending
+        || runtimeEventDueAtOrBefore(observedCycles)
+      );
+    }
+
     function msrChanged() {
       // The compiler terminates this block after publishing its automatic PC.
       // Device interrupt delivery remains in the normal post-block service pass.
-      rebuildDataFastmem();
-      synchronizeInstructionAddressSpace("msr");
+      const dataTranslationChanged = rebuildDataFastmem();
+      const instructionTranslationChanged = synchronizeInstructionAddressSpace("msr");
+      if (
+        dataTranslationChanged !== false
+        || instructionTranslationChanged !== false
+      ) return 0;
+
+      const interruptsEnabled = (
+        view.getUint32(cpu + msrOffset, true) & 0x00008000
+      ) !== 0;
+      // An interrupt-disable with unchanged translations cannot make a device
+      // exception newly deliverable. An interrupt-enable may also remain linked
+      // when the exact published hook cycle has no asserted interrupt or due
+      // device deadline. Otherwise the post-block pass must observe this enable
+      // boundary before the following guest instruction executes.
+      return (
+        !interruptsEnabled
+        || !interruptDeliveryPendingAtCycle(cycles)
+      ) ? 1 : 0;
     }
 
     function instructionBatChanged() {
@@ -16191,9 +16220,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         || decodeMemset32ByteLoop(candidatePc) !== null;
     }
 
-    function nextRuntimeEventCycle(includeCycleLimit = true) {
-      ensureViSchedule(cycles);
-      const candidates = [
+    function runtimeEventCycleCandidates(observedCycles, includeCycleLimit = true) {
+      ensureViSchedule(observedCycles);
+      return [
         viTiming?.displayEnabled ? nextViCycle : null,
         viTiming?.displayEnabled ? nextViPresentCycle : null,
         viTiming?.displayEnabled ? nextViBoundaryCycle : null,
@@ -16210,8 +16239,25 @@ const TEMPLATE: &str = r##"<!doctype html>
         aramTransfer?.completionCycle ?? null,
         nextAudioSampleCycle(),
         includeCycleLimit && Number.isFinite(cycleLimit) ? cycleLimit : null,
-      ].filter(value => value !== null && value > cycles);
+      ];
+    }
+
+    function runtimeEventDueAtOrBefore(observedCycles) {
+      return runtimeEventCycleCandidates(observedCycles, false)
+        .some(value => value !== null && value <= observedCycles);
+    }
+
+    function nextRuntimeEventCycle(includeCycleLimit = true) {
+      const candidates = runtimeEventCycleCandidates(cycles, includeCycleLimit)
+        .filter(value => value !== null && value > cycles);
       return candidates.length === 0 ? null : Math.min(...candidates);
+    }
+
+    function nextStableWaitEventCycle(semanticIdle, repeatedBoundaryCount) {
+      const stableWait = semanticIdle
+        ? repeatedBoundaryCount >= 2
+        : repeatedBoundaryCount >= 128;
+      return stableWait ? nextRuntimeEventCycle(false) : null;
     }
 
     function stageInstructionBlock(compilerView, inputPointer, pc, maximumWords = 64) {
@@ -17436,32 +17482,32 @@ const TEMPLATE: &str = r##"<!doctype html>
           && executedBlocks === 1
           && pc === executedPc
           && isSemanticIdlePattern(block.pattern);
-        const stableWait = semanticIdle ? samePcCount >= 2 : samePcCount >= 128;
-        if (stableWait) {
-          const deviceEventCycle = nextRuntimeEventCycle(false);
-          if (deviceEventCycle !== null) {
-            const wakeCycle = Number.isFinite(cycleLimit)
-              ? Math.min(deviceEventCycle, cycleLimit)
-              : deviceEventCycle;
-            const skipped = wakeCycle - cycles;
-            cycles = wakeCycle;
-            accelerations.set(
-              "idleToInterruptCycles",
-              (accelerations.get("idleToInterruptCycles") ?? 0) + skipped
-            );
-            accelerations.set(
-              "idleToInterruptJumps",
-              (accelerations.get("idleToInterruptJumps") ?? 0) + 1
-            );
-            const diskWait = dueDiskTransferPromise(cycles);
-            if (diskWait !== null) await diskWait;
-            serviceMmio(cycles);
-            pc = view.getUint32(cpu + pcOffset, true);
-            lastPc = null;
-            lastCpuSignature = null;
-            samePcCount = 0;
-            await finishTerminalControllerScenario();
-          }
+        const deviceEventCycle = nextStableWaitEventCycle(
+          semanticIdle,
+          samePcCount
+        );
+        if (deviceEventCycle !== null) {
+          const wakeCycle = Number.isFinite(cycleLimit)
+            ? Math.min(deviceEventCycle, cycleLimit)
+            : deviceEventCycle;
+          const skipped = wakeCycle - cycles;
+          cycles = wakeCycle;
+          accelerations.set(
+            "idleToInterruptCycles",
+            (accelerations.get("idleToInterruptCycles") ?? 0) + skipped
+          );
+          accelerations.set(
+            "idleToInterruptJumps",
+            (accelerations.get("idleToInterruptJumps") ?? 0) + 1
+          );
+          const diskWait = dueDiskTransferPromise(cycles);
+          if (diskWait !== null) await diskWait;
+          serviceMmio(cycles);
+          pc = view.getUint32(cpu + pcOffset, true);
+          lastPc = null;
+          lastCpuSignature = null;
+          samePcCount = 0;
+          await finishTerminalControllerScenario();
         }
 
         if (pc === 0) {
