@@ -43,7 +43,7 @@ use crate::{
     gx_efb_depth_encoding, gx_fog_state, gx_raster_center_evidence, gx_sampler_identity,
     gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
     requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
-    rgba8_texture_byte_len, select_texture, xfb_copy_matches_selection, xfb_readback_layout,
+    rgba8_mip_chain_byte_len, select_mip_texture, xfb_copy_matches_selection, xfb_readback_layout,
     xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
@@ -689,6 +689,7 @@ struct TevTextureInput<'a> {
     generation: u32,
     width: u32,
     height: u32,
+    mip_level_count: u32,
     sampler: u32,
 }
 
@@ -713,6 +714,7 @@ struct CachedTexture {
     generation: u32,
     width: u32,
     height: u32,
+    mip_level_count: u32,
 }
 
 #[derive(Clone)]
@@ -1706,9 +1708,10 @@ impl WebGpuRenderer {
         decoded_texture_cache_hit(
             width,
             height,
+            1,
             self.texture_cache
                 .get(key)
-                .map(|texture| (texture.width, texture.height)),
+                .map(|texture| (texture.width, texture.height, texture.mip_level_count)),
         )
     }
 
@@ -1946,6 +1949,7 @@ impl WebGpuRenderer {
                 generation: texture_metadata[metadata + 1],
                 width: texture_metadata[metadata + 2],
                 height: texture_metadata[metadata + 3],
+                mip_level_count: 1,
                 sampler: texture_metadata[metadata + 4],
             }
         });
@@ -1999,14 +2003,6 @@ impl WebGpuRenderer {
         self.record_wasm_bridge_call(packet_bytes.len());
         let packet = GxFramePacket::parse(&packet_bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        if packet
-            .textures()
-            .any(|texture| texture.record.mip_level_count > 1)
-        {
-            return Err(JsValue::from_str(
-                "LZGX mip transport requires WebGPU mip upload support",
-            ));
-        }
         let header = *packet.header();
         let payload_bytes: usize = packet.textures().map(|texture| texture.pixels.len()).sum();
 
@@ -2042,15 +2038,16 @@ impl WebGpuRenderer {
                 let texture = packet
                     .texture(index as usize)
                     .expect("validated GX texture reference");
-                let cached_dimensions = self
+                let cached_layout = self
                     .texture_cache
                     .get(texture.key)
-                    .map(|cached| (cached.width, cached.height));
+                    .map(|cached| (cached.width, cached.height, cached.mip_level_count));
                 let decoded_is_valid = decoded_texture_is_available(
                     texture.record.width,
                     texture.record.height,
+                    texture.record.mip_level_count,
                     texture.pixels.len(),
-                    cached_dimensions,
+                    cached_layout,
                 )
                 .map_err(|error| {
                     JsValue::from_str(&format!(
@@ -2061,12 +2058,13 @@ impl WebGpuRenderer {
                 require_tev_texture(
                     map,
                     true,
-                    select_texture(
+                    select_mip_texture(
                         texture.record.generation,
                         self.efb_copy_cache
                             .get(&texture.record.address)
                             .map(|cached| cached.generation),
                         decoded_is_valid,
+                        texture.record.mip_level_count,
                     ),
                 )
                 .map_err(|error| JsValue::from_str(&error))?;
@@ -2109,6 +2107,7 @@ impl WebGpuRenderer {
                                 generation: texture.record.generation,
                                 width: texture.record.width,
                                 height: texture.record.height,
+                                mip_level_count: texture.record.mip_level_count,
                                 sampler: slot.sampler_bits,
                             }
                         }
@@ -2119,6 +2118,7 @@ impl WebGpuRenderer {
                             generation: 0,
                             width: 0,
                             height: 0,
+                            mip_level_count: 1,
                             sampler: 0,
                         },
                     }
@@ -2492,15 +2492,16 @@ impl WebGpuRenderer {
                 continue;
             }
             let input = &textures[map];
-            let cached_dimensions = self
+            let cached_layout = self
                 .texture_cache
                 .get(input.key)
-                .map(|texture| (texture.width, texture.height));
+                .map(|texture| (texture.width, texture.height, texture.mip_level_count));
             let decoded_is_valid = decoded_texture_is_available(
                 input.width,
                 input.height,
+                input.mip_level_count,
                 input.pixels.len(),
-                cached_dimensions,
+                cached_layout,
             )
             .map_err(|error| {
                 JsValue::from_str(&format!("TEV texture map {map} key {}: {error}", input.key))
@@ -2508,12 +2509,13 @@ impl WebGpuRenderer {
             selected[map] = require_tev_texture(
                 map,
                 true,
-                select_texture(
+                select_mip_texture(
                     input.generation,
                     self.efb_copy_cache
                         .get(&input.address)
                         .map(|texture| texture.generation),
                     decoded_is_valid,
+                    input.mip_level_count,
                 ),
             )
             .map_err(|error| JsValue::from_str(&error))?;
@@ -2536,6 +2538,7 @@ impl WebGpuRenderer {
                 &format!("GX TEV texture {}", input.key),
                 input.width,
                 input.height,
+                input.mip_level_count,
                 input.pixels,
                 0,
             )?;
@@ -2563,7 +2566,12 @@ impl WebGpuRenderer {
                     address: input.address,
                     generation: input.generation,
                 },
-                SelectedTexture::Decoded => TextureBindingIdentity::Decoded(input.key.to_owned()),
+                SelectedTexture::Decoded => TextureBindingIdentity::Decoded {
+                    key: input.key.to_owned(),
+                    width: input.width,
+                    height: input.height,
+                    mip_level_count: input.mip_level_count,
+                },
                 SelectedTexture::White => TextureBindingIdentity::White,
             }
         });
@@ -2871,6 +2879,7 @@ impl WebGpuRenderer {
                 generation,
                 width,
                 height,
+                mip_level_count: 1,
             },
         );
         while self.efb_copy_cache.len() > 64 {
@@ -3739,6 +3748,7 @@ impl WebGpuRenderer {
             "browser solid white texture",
             1,
             1,
+            1,
             &[255, 255, 255, 255],
             0,
         )?;
@@ -3789,6 +3799,7 @@ impl WebGpuRenderer {
         label: &str,
         width: u32,
         height: u32,
+        mip_level_count: u32,
         pixels: &[u8],
         generation: u32,
     ) -> Result<CachedTexture, JsValue> {
@@ -3798,13 +3809,16 @@ impl WebGpuRenderer {
             label,
             width,
             height,
+            mip_level_count,
             pixels,
             generation,
         )
         .map_err(|error| JsValue::from_str(&error))?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.textures_created = metrics.textures_created.saturating_add(1);
-            metrics.texture_writes = metrics.texture_writes.saturating_add(1);
+            metrics.texture_writes = metrics
+                .texture_writes
+                .saturating_add(u64::from(mip_level_count));
             metrics.texture_upload_bytes = metrics
                 .texture_upload_bytes
                 .saturating_add(pixels.len() as u64);
@@ -5299,6 +5313,8 @@ fn sampler(device: &wgpu::Device, identity: SamplerIdentity) -> wgpu::Sampler {
         mag_filter: filter_mode(identity.mag_filter),
         min_filter: filter_mode(identity.min_filter),
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        lod_min_clamp: 0.0,
+        lod_max_clamp: 0.0,
         ..Default::default()
     })
 }
@@ -5336,26 +5352,78 @@ fn create_samplers(device: &wgpu::Device) -> HashMap<SamplerIdentity, wgpu::Samp
     samplers
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rgba8MipUpload {
+    mip_level: u32,
+    offset: usize,
+    byte_len: usize,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+}
+
+fn rgba8_mip_uploads(
+    width: u32,
+    height: u32,
+    mip_level_count: u32,
+    pixel_bytes: usize,
+) -> Result<Vec<Rgba8MipUpload>, String> {
+    let expected = rgba8_mip_chain_byte_len(width, height, mip_level_count);
+    if expected != Some(pixel_bytes) {
+        let expected = expected.map_or_else(
+            || "an unrepresentable number of".to_owned(),
+            |len| len.to_string(),
+        );
+        return Err(format!(
+            "invalid RGBA8 texture {width}x{height} with {mip_level_count} mip levels: expected {expected} bytes, got {pixel_bytes}"
+        ));
+    }
+
+    let mut uploads = Vec::with_capacity(mip_level_count as usize);
+    let mut level_width = width;
+    let mut level_height = height;
+    let mut offset = 0usize;
+    for mip_level in 0..mip_level_count {
+        let bytes_per_row = level_width
+            .checked_mul(4)
+            .ok_or_else(|| "RGBA8 mip row byte length overflows u32".to_owned())?;
+        let byte_len = usize::try_from(bytes_per_row)
+            .ok()
+            .and_then(|row| row.checked_mul(level_height as usize))
+            .ok_or_else(|| "RGBA8 mip byte length overflows usize".to_owned())?;
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or_else(|| "RGBA8 mip-chain offset overflows usize".to_owned())?;
+        if end > pixel_bytes {
+            return Err("RGBA8 mip upload exceeds the validated payload".to_owned());
+        }
+        uploads.push(Rgba8MipUpload {
+            mip_level,
+            offset,
+            byte_len,
+            width: level_width,
+            height: level_height,
+            bytes_per_row,
+        });
+        offset = end;
+        level_width = (level_width / 2).max(1);
+        level_height = (level_height / 2).max(1);
+    }
+    debug_assert_eq!(offset, pixel_bytes);
+    Ok(uploads)
+}
+
 fn upload_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     label: &str,
     width: u32,
     height: u32,
+    mip_level_count: u32,
     pixels: &[u8],
     generation: u32,
 ) -> Result<CachedTexture, String> {
-    let expected = rgba8_texture_byte_len(width, height);
-    if width == 0 || height == 0 || expected != Some(pixels.len()) {
-        let expected = expected.map_or_else(
-            || "an unrepresentable number of".to_owned(),
-            |len| len.to_string(),
-        );
-        return Err(format!(
-            "invalid RGBA8 texture {width}x{height}: expected {expected} bytes, got {}",
-            pixels.len()
-        ));
-    }
+    let uploads = rgba8_mip_uploads(width, height, mip_level_count, pixels.len())?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -5363,32 +5431,34 @@ fn upload_texture(
             height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+    for upload in uploads {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: upload.mip_level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels[upload.offset..upload.offset + upload.byte_len],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(upload.bytes_per_row),
+                rows_per_image: Some(upload.height),
+            },
+            wgpu::Extent3d {
+                width: upload.width,
+                height: upload.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     Ok(CachedTexture {
         _texture: texture,
@@ -5396,6 +5466,7 @@ fn upload_texture(
         generation,
         width,
         height,
+        mip_level_count,
     })
 }
 
@@ -5949,7 +6020,7 @@ mod tests {
         managed_coverage_draw_is_safe, managed_coverage_pack_point,
         managed_coverage_samplers_are_safe, managed_coverage_texel_uv_is_safe,
         managed_coverage_texture_coord, managed_coverage_triangle_vertices,
-        managed_post_cull_indices, merge_contiguous_draw_range,
+        managed_post_cull_indices, merge_contiguous_draw_range, rgba8_mip_uploads,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
     };
     use crate::packet::GxTriangleAction;
@@ -5997,6 +6068,49 @@ mod tests {
             state: vec![0; 464],
             draw,
         }
+    }
+
+    #[test]
+    fn npot_rgba8_mip_uploads_split_one_flattened_payload_without_padding() {
+        let uploads = rgba8_mip_uploads(3, 5, 3, 72).unwrap();
+        assert_eq!(
+            uploads
+                .iter()
+                .map(|upload| (
+                    upload.mip_level,
+                    upload.offset,
+                    upload.byte_len,
+                    upload.width,
+                    upload.height,
+                    upload.bytes_per_row,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, 60, 3, 5, 12),
+                (1, 60, 8, 1, 2, 4),
+                (2, 68, 4, 1, 1, 4),
+            ]
+        );
+        assert!(
+            rgba8_mip_uploads(3, 5, 3, 71)
+                .unwrap_err()
+                .contains("expected 72 bytes, got 71")
+        );
+        assert!(
+            rgba8_mip_uploads(3, 5, 3, 73)
+                .unwrap_err()
+                .contains("expected 72 bytes, got 73")
+        );
+        assert!(
+            rgba8_mip_uploads(3, 5, 0, 0)
+                .unwrap_err()
+                .contains("expected an unrepresentable number of bytes")
+        );
+        assert!(
+            rgba8_mip_uploads(3, 5, 4, 76)
+                .unwrap_err()
+                .contains("expected an unrepresentable number of bytes")
+        );
     }
 
     fn flat_triangle_source(points: [[f32; 2]; 3]) -> Vec<f32> {

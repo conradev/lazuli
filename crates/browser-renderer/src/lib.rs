@@ -293,8 +293,16 @@ impl RendererFailureState {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TextureBindingIdentity {
     White,
-    Decoded(String),
-    EfbCopy { address: u32, generation: u32 },
+    Decoded {
+        key: String,
+        width: u32,
+        height: u32,
+        mip_level_count: u32,
+    },
+    EfbCopy {
+        address: u32,
+        generation: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -348,6 +356,22 @@ pub(crate) fn select_texture(
     }
 }
 
+pub(crate) fn select_mip_texture(
+    requested_generation: u32,
+    cached_generation: Option<u32>,
+    decoded_is_valid: bool,
+    mip_level_count: u32,
+) -> SelectedTexture {
+    let compatible_efb_generation = (mip_level_count == 1)
+        .then_some(cached_generation)
+        .flatten();
+    select_texture(
+        requested_generation,
+        compatible_efb_generation,
+        decoded_is_valid,
+    )
+}
+
 pub(crate) fn require_tev_texture(
     map: usize,
     required: bool,
@@ -355,7 +379,7 @@ pub(crate) fn require_tev_texture(
 ) -> Result<SelectedTexture, String> {
     if required && selected == SelectedTexture::White {
         Err(format!(
-            "TEV texture map {map} is enabled but has neither valid decoded pixels nor a matching EFB generation"
+            "TEV texture map {map} is enabled but has neither valid decoded pixels nor a matching EFB generation compatible with the texture layout"
         ))
     } else {
         Ok(selected)
@@ -374,41 +398,80 @@ pub(crate) fn valid_rgba8_texture(width: u32, height: u32, byte_len: usize) -> b
         && rgba8_texture_byte_len(width, height).is_some_and(|expected| expected == byte_len)
 }
 
+pub(crate) fn rgba8_mip_chain_byte_len(
+    width: u32,
+    height: u32,
+    mip_level_count: u32,
+) -> Option<usize> {
+    if width == 0 || height == 0 || mip_level_count == 0 {
+        return None;
+    }
+    let theoretical_level_count = u32::BITS - width.max(height).leading_zeros();
+    if mip_level_count > theoretical_level_count {
+        return None;
+    }
+    let mut level_width = width;
+    let mut level_height = height;
+    let mut total = 0usize;
+    for _ in 0..mip_level_count {
+        total = total.checked_add(rgba8_texture_byte_len(level_width, level_height)?)?;
+        level_width = (level_width / 2).max(1);
+        level_height = (level_height / 2).max(1);
+    }
+    Some(total)
+}
+
+pub(crate) fn valid_rgba8_mip_chain(
+    width: u32,
+    height: u32,
+    mip_level_count: u32,
+    byte_len: usize,
+) -> bool {
+    if mip_level_count == 1 {
+        return valid_rgba8_texture(width, height, byte_len);
+    }
+    rgba8_mip_chain_byte_len(width, height, mip_level_count)
+        .is_some_and(|expected| expected == byte_len)
+}
+
 pub(crate) fn decoded_texture_cache_hit(
     width: u32,
     height: u32,
-    cached_dimensions: Option<(u32, u32)>,
+    mip_level_count: u32,
+    cached_layout: Option<(u32, u32, u32)>,
 ) -> bool {
-    cached_dimensions == Some((width, height))
+    cached_layout == Some((width, height, mip_level_count))
 }
 
 pub(crate) fn decoded_texture_is_available(
     width: u32,
     height: u32,
+    mip_level_count: u32,
     byte_len: usize,
-    cached_dimensions: Option<(u32, u32)>,
+    cached_layout: Option<(u32, u32, u32)>,
 ) -> Result<bool, String> {
-    if let Some((cached_width, cached_height)) = cached_dimensions {
-        if (cached_width, cached_height) != (width, height) {
+    if let Some((cached_width, cached_height, cached_mip_level_count)) = cached_layout {
+        if (cached_width, cached_height, cached_mip_level_count) != (width, height, mip_level_count)
+        {
             return Err(format!(
-                "cached RGBA8 texture is {cached_width}x{cached_height}, but the draw requests {width}x{height}"
+                "cached RGBA8 texture is {cached_width}x{cached_height} with {cached_mip_level_count} mip levels, but the draw requests {width}x{height} with {mip_level_count} mip levels"
             ));
         }
-        if byte_len == 0 || valid_rgba8_texture(width, height, byte_len) {
+        if byte_len == 0 || valid_rgba8_mip_chain(width, height, mip_level_count, byte_len) {
             return Ok(true);
         }
     } else if byte_len == 0 {
         return Ok(false);
-    } else if valid_rgba8_texture(width, height, byte_len) {
+    } else if valid_rgba8_mip_chain(width, height, mip_level_count, byte_len) {
         return Ok(true);
     }
 
-    let expected = rgba8_texture_byte_len(width, height).map_or_else(
+    let expected = rgba8_mip_chain_byte_len(width, height, mip_level_count).map_or_else(
         || "an unrepresentable number of".to_owned(),
         |bytes| bytes.to_string(),
     );
     Err(format!(
-        "invalid RGBA8 texture {width}x{height}: expected {expected} bytes, got {byte_len}"
+        "invalid RGBA8 texture {width}x{height} with {mip_level_count} mip levels: expected {expected} bytes, got {byte_len}"
     ))
 }
 
@@ -2430,9 +2493,10 @@ mod tests {
         gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
         materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
-        reusable_xfb_surface_index, select_texture, valid_rgba8_texture,
-        xfb_copy_matches_selection, xfb_readback_layout, xfb_row_offset, xfb_scanout_plan,
-        xfb_scanout_source_row, xfb_surface_extent_matches,
+        reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture, select_texture,
+        valid_rgba8_mip_chain, valid_rgba8_texture, xfb_copy_matches_selection,
+        xfb_readback_layout, xfb_row_offset, xfb_scanout_plan, xfb_scanout_source_row,
+        xfb_surface_extent_matches,
     };
     use crate::packet::GxCopyState;
 
@@ -3878,6 +3942,22 @@ mod tests {
     }
 
     #[test]
+    fn mipmapped_decoded_textures_never_bind_a_single_level_efb_copy() {
+        assert_eq!(
+            select_mip_texture(8, Some(8), true, 1),
+            SelectedTexture::EfbCopy
+        );
+        assert_eq!(
+            select_mip_texture(8, Some(8), true, 2),
+            SelectedTexture::Decoded
+        );
+        assert_eq!(
+            select_mip_texture(8, Some(8), false, 2),
+            SelectedTexture::White
+        );
+    }
+
+    #[test]
     fn decoded_rgba8_pixels_must_exactly_cover_a_nonempty_texture() {
         assert!(valid_rgba8_texture(4, 3, 48));
         assert!(!valid_rgba8_texture(4, 3, 47));
@@ -3887,27 +3967,44 @@ mod tests {
     }
 
     #[test]
+    fn decoded_rgba8_mip_chains_floor_halve_npot_extents_without_level_padding() {
+        assert_eq!(rgba8_mip_chain_byte_len(3, 5, 1), Some(60));
+        assert_eq!(rgba8_mip_chain_byte_len(3, 5, 2), Some(68));
+        assert_eq!(rgba8_mip_chain_byte_len(3, 5, 3), Some(72));
+        assert_eq!(rgba8_mip_chain_byte_len(3, 5, 0), None);
+        assert_eq!(rgba8_mip_chain_byte_len(3, 5, 4), None);
+        assert!(valid_rgba8_mip_chain(3, 5, 3, 72));
+        assert!(!valid_rgba8_mip_chain(3, 5, 3, 71));
+        assert!(!valid_rgba8_mip_chain(3, 5, 3, 73));
+    }
+
+    #[test]
     fn decoded_texture_cache_hits_can_omit_the_rgba8_payload() {
         assert_eq!(
-            decoded_texture_is_available(4, 3, 0, Some((4, 3))),
+            decoded_texture_is_available(4, 3, 1, 0, Some((4, 3, 1))),
             Ok(true)
         );
-        assert_eq!(decoded_texture_is_available(4, 3, 0, None), Ok(false));
-        assert_eq!(decoded_texture_is_available(4, 3, 48, None), Ok(true));
+        assert_eq!(decoded_texture_is_available(4, 3, 1, 0, None), Ok(false));
+        assert_eq!(decoded_texture_is_available(4, 3, 1, 48, None), Ok(true));
     }
 
     #[test]
     fn decoded_texture_cache_queries_match_both_dimensions() {
-        assert!(decoded_texture_cache_hit(4, 3, Some((4, 3))));
-        assert!(!decoded_texture_cache_hit(4, 3, Some((3, 4))));
-        assert!(!decoded_texture_cache_hit(4, 3, None));
+        assert!(decoded_texture_cache_hit(4, 3, 1, Some((4, 3, 1))));
+        assert!(!decoded_texture_cache_hit(4, 3, 1, Some((3, 4, 1))));
+        assert!(!decoded_texture_cache_hit(4, 3, 1, Some((4, 3, 2))));
+        assert!(!decoded_texture_cache_hit(4, 3, 1, None));
     }
 
     #[test]
     fn decoded_texture_cache_keys_have_immutable_dimensions() {
-        let failure = decoded_texture_is_available(4, 3, 0, Some((3, 4))).unwrap_err();
+        let failure = decoded_texture_is_available(4, 3, 1, 0, Some((3, 4, 1))).unwrap_err();
         assert!(failure.contains("cached RGBA8 texture is 3x4"));
         assert!(failure.contains("draw requests 4x3"));
+
+        let failure = decoded_texture_is_available(4, 3, 2, 0, Some((4, 3, 1))).unwrap_err();
+        assert!(failure.contains("cached RGBA8 texture is 4x3 with 1 mip levels"));
+        assert!(failure.contains("draw requests 4x3 with 2 mip levels"));
     }
 
     #[test]
@@ -3927,7 +4024,7 @@ mod tests {
 
     #[test]
     fn malformed_redundant_texture_payloads_are_rejected() {
-        let failure = decoded_texture_is_available(4, 3, 47, Some((4, 3))).unwrap_err();
+        let failure = decoded_texture_is_available(4, 3, 1, 47, Some((4, 3, 1))).unwrap_err();
         assert!(failure.contains("expected 48 bytes, got 47"));
     }
 

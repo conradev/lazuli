@@ -487,7 +487,7 @@ test("keeps live GX emission explicitly on v6", () => {
   assert.doesNotMatch(postSource, /packGxFramePacketV7/);
 });
 
-test("fails closed before WebGPU execution until mip upload support lands", () => {
+test("carries canonical v7 mip resources into strict WebGPU uploads", () => {
   const submitStart = rendererSource.indexOf("pub fn submit_gx_frame(");
   const submitEnd = rendererSource.indexOf(
     "pub fn copy_texture(",
@@ -497,15 +497,60 @@ test("fails closed before WebGPU execution until mip upload support lands", () =
   assert.notEqual(submitEnd, -1);
   const submitSource = rendererSource.slice(submitStart, submitEnd);
   const parseOffset = submitSource.indexOf("GxFramePacket::parse(");
-  const mipGateOffset = submitSource.indexOf(
-    "texture.record.mip_level_count > 1",
-  );
   const rendererMutationOffset = submitSource.indexOf("self.begin_segment_inner()");
   assert.ok(parseOffset >= 0);
-  assert.ok(mipGateOffset > parseOffset);
-  assert.ok(rendererMutationOffset > mipGateOffset);
-  assert.match(
+  assert.ok(rendererMutationOffset > parseOffset);
+  assert.doesNotMatch(
     submitSource,
     /LZGX mip transport requires WebGPU mip upload support/,
+  );
+  assert.match(
+    submitSource,
+    /mip_level_count: texture\.record\.mip_level_count/,
+  );
+  assert.match(
+    submitSource,
+    /cached\.width, cached\.height, cached\.mip_level_count/,
+  );
+  assert.match(
+    submitSource,
+    /selected\[map\] != SelectedTexture::Decoded[\s\S]*self\.texture_cache\.contains_key\(textures\[map\]\.key\)[\s\S]*continue;/,
+  );
+  assert.match(
+    submitSource,
+    /resident\.push\(&JsValue::from_str\(key\)\)/,
+  );
+
+  const uploadStart = rendererSource.lastIndexOf("\nfn upload_texture(");
+  const uploadEnd = rendererSource.indexOf("\nimpl Pipelines", uploadStart);
+  assert.ok(uploadStart >= 0);
+  assert.ok(uploadEnd > uploadStart);
+  const uploadSource = rendererSource.slice(uploadStart, uploadEnd);
+  assert.match(
+    uploadSource,
+    /let uploads = rgba8_mip_uploads\(width, height, mip_level_count, pixels\.len\(\)\)\?/,
+  );
+  assert.match(uploadSource, /mip_level_count,/);
+  assert.match(uploadSource, /for upload in uploads/);
+  assert.match(uploadSource, /mip_level: upload\.mip_level/);
+  assert.match(
+    uploadSource,
+    /&pixels\[upload\.offset\.\.upload\.offset \+ upload\.byte_len\]/,
+  );
+  assert.match(
+    uploadSource,
+    /width: upload\.width,[\s\S]*height: upload\.height/,
+  );
+  assert.match(
+    rendererSource,
+    /mipmap_filter: wgpu::MipmapFilterMode::Nearest,[\s\S]*lod_min_clamp: 0\.0,[\s\S]*lod_max_clamp: 0\.0/,
+  );
+  assert.match(
+    rendererSource,
+    /metrics\.texture_writes = metrics[\s\S]*saturating_add\(u64::from\(mip_level_count\)\)/,
+  );
+  assert.match(
+    rendererSource,
+    /metrics\.texture_upload_bytes = metrics[\s\S]*saturating_add\(pixels\.len\(\) as u64\)/,
   );
 });
