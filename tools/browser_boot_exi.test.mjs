@@ -85,6 +85,9 @@ const exiFunctions = [
   "exiIplImageStatus",
   "updateExiSramChecksums",
   "createDefaultExiSram",
+  "readExiRtcSeconds",
+  "exiRtcSecondsAtCycle",
+  "refreshExiRtc",
   "exiIplReadRegion",
   "recordExi0Transfer",
   "transferExi0IplImmediate",
@@ -97,7 +100,13 @@ function syntheticIpl() {
   return new Uint8Array(2 * 1024 * 1024);
 }
 
-function makeContext(exiIplImage = syntheticIpl()) {
+function makeContext(
+  exiIplImage = syntheticIpl(),
+  {
+    rtcStartSeconds = 0,
+    rtcCyclesPerSecond = 486_000_000,
+  } = {},
+) {
   const memory = new ArrayBuffer(0x24000);
   const raisedExceptions = [];
   const context = {
@@ -133,6 +142,8 @@ function makeContext(exiIplImage = syntheticIpl()) {
     exiSramBase: 0x00800000,
     exiSramBytes: 0x44,
     exiSramSettingsBase: 0x00800004,
+    exiRtcStartSeconds: rtcStartSeconds >>> 0,
+    exiRtcCyclesPerSecond: rtcCyclesPerSecond,
     deviceEvents: new Map(),
     exiIplImageBytes: 2 * 1024 * 1024,
     exiIplImage,
@@ -157,6 +168,9 @@ function makeContext(exiIplImage = syntheticIpl()) {
     exi0IplCursor: 0,
     exi0IplAddressSequence: null,
     exi0IplDmaBytes: 0,
+    exi0RtcRefreshCount: 0,
+    exi0RtcLastRefreshCycle: null,
+    exi0RtcImmediateReadBytes: 0,
     exi0SramImmediateReadBytes: 0,
     exi0SramDmaReads: 0,
     exi0SramDmaBytes: 0,
@@ -1237,6 +1251,233 @@ test("EXI SRAM uses a deterministic checksum-valid settings template", () => {
   );
 });
 
+test("EXI0 RTC follows libogc immediate reads and freezes at command latch", () => {
+  const cyclesPerSecond = 486_000_000;
+  const startSeconds = 0x01020304;
+  const context = makeContext(null, { rtcStartSeconds: startSeconds });
+  const settingsBefore = Array.from(context.exiSram.subarray(4));
+
+  writeIplCommand(context, 0x20000000, cyclesPerSecond);
+  const firstAddress = context.exiTransferTrace.at(-1);
+  assert.equal(context.exi0IplCommandAddress, 0x00800000);
+  assert.equal(context.exi0IplCursor, 0x00800000);
+  assert.equal(context.exi0IplAddressSequence, firstAddress.sequence);
+  assert.equal(firstAddress.operation, "rtc-address");
+  assert.equal(firstAddress.outcome, "accepted");
+  assert.equal(firstAddress.commandRegion, "rtc");
+  assert.equal(firstAddress.sourceKind, "rtc");
+  assert.equal(firstAddress.sourceConfigured, true);
+  assert.equal(firstAddress.rtcRefreshed, true);
+  assert.equal(firstAddress.rtcSeconds, 0x01020305);
+
+  // The data transfer can happen several emulated seconds later; Dolphin
+  // exposes the RTC snapshot taken when the fourth command byte latched.
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0xdeadbeef,
+      length: 4,
+      mode: 0,
+      cycle: cyclesPerSecond * 3,
+    }),
+    0x01020305,
+  );
+  assert.equal(context.exi0IplCursor, 0x00800004);
+  assert.equal(context.exi0RtcImmediateReadBytes, 4);
+  const firstRead = context.exiTransferTrace.at(-1);
+  assert.equal(firstRead.operation, "rtc-read");
+  assert.equal(firstRead.outcome, "complete");
+  assert.equal(firstRead.commandRegion, "rtc");
+  assert.equal(firstRead.sourceKind, "rtc");
+  assert.equal(firstRead.sourceConfigured, true);
+  assert.equal(firstRead.rtcRefreshed, false);
+  assert.equal(firstRead.rtcSeconds, null);
+
+  // Two commands latched within one emulated second return the same value.
+  writeIplCommand(context, 0x20000000, cyclesPerSecond + 123);
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0,
+      length: 4,
+      mode: 0,
+      cycle: cyclesPerSecond * 4,
+    }),
+    0x01020305,
+  );
+
+  assert.deepEqual(Array.from(context.exiSram.subarray(4)), settingsBefore);
+  const snapshot = plain(context.snapshotExternalInterface());
+  assert.deepEqual(
+    {
+      rtcModeled: snapshot.sram.rtcModeled,
+      rtcStartSeconds: snapshot.sram.rtcStartSeconds,
+      rtcCurrentSeconds: snapshot.sram.rtcCurrentSeconds,
+      rtcCyclesPerSecond: snapshot.sram.rtcCyclesPerSecond,
+      rtcRefreshCount: snapshot.sram.rtcRefreshCount,
+      rtcLastRefreshCycle: snapshot.sram.rtcLastRefreshCycle,
+      rtcImmediateReadBytes: snapshot.sram.rtcImmediateReadBytes,
+    },
+    {
+      rtcModeled: true,
+      rtcStartSeconds: 0x01020304,
+      rtcCurrentSeconds: 0x01020305,
+      rtcCyclesPerSecond: cyclesPerSecond,
+      rtcRefreshCount: 2,
+      rtcLastRefreshCycle: cyclesPerSecond + 123,
+      rtcImmediateReadBytes: 8,
+    },
+  );
+});
+
+test("EXI0 RTC uses exact emulated-second boundaries and wraps u32", () => {
+  const cyclesPerSecond = 486_000_000;
+  const context = makeContext(null, { rtcStartSeconds: 0x01020304 });
+
+  writeIplCommand(context, 0x20000000, cyclesPerSecond - 1);
+  assert.equal(context.readExiRtcSeconds(), 0x01020304);
+  writeIplCommand(context, 0x20000000, cyclesPerSecond);
+  assert.equal(context.readExiRtcSeconds(), 0x01020305);
+  writeIplCommand(context, 0x20000000, cyclesPerSecond * 2 + 123);
+  assert.equal(context.readExiRtcSeconds(), 0x01020306);
+  assert.deepEqual(Array.from(context.exiSram.subarray(0, 4)), [1, 2, 3, 6]);
+
+  const wrapped = makeContext(null, { rtcStartSeconds: 0xffffffff });
+  writeIplCommand(wrapped, 0x20000000, cyclesPerSecond);
+  assert.equal(wrapped.readExiRtcSeconds(), 0);
+
+  const split = makeContext(null, { rtcStartSeconds: 0x01020304 });
+  beginIplTransaction(split);
+  immediateTransfer(split, {
+    data: 0x20000000,
+    length: 3,
+    mode: 1,
+    cycle: cyclesPerSecond - 1,
+  });
+  assert.equal(split.exi0RtcRefreshCount, 0);
+  immediateTransfer(split, {
+    data: 0,
+    length: 1,
+    mode: 1,
+    cycle: cyclesPerSecond,
+  });
+  assert.equal(split.readExiRtcSeconds(), 0x01020305);
+  assert.equal(split.exi0RtcRefreshCount, 1);
+  assert.equal(split.exi0RtcLastRefreshCycle, cyclesPerSecond);
+
+  assert.throws(
+    () => split.exiRtcSecondsAtCycle(-1),
+    /non-negative safe integer/,
+  );
+  assert.throws(
+    () => split.exiRtcSecondsAtCycle(1.5),
+    /non-negative safe integer/,
+  );
+});
+
+test("EXI0 refreshes RTC for every complete command but never for partial framing", () => {
+  const context = makeContext();
+  const settingsBefore = Array.from(context.exiSram.subarray(4));
+
+  writeIplAddress(context, 0x100, 1);
+  writeIplCommand(context, 0x20000100, 2);
+  writeIplCommand(context, 0xa0010000, 3);
+  assert.equal(context.exi0RtcRefreshCount, 3);
+  assert.equal(context.exi0RtcLastRefreshCycle, 3);
+  assert.deepEqual(
+    context.exiTransferTrace.map(entry => entry.rtcRefreshed),
+    [true, true, true],
+  );
+  assert.deepEqual(
+    context.exiTransferTrace.map(entry => entry.rtcSeconds),
+    [0, 0, 0],
+  );
+  assert.deepEqual(Array.from(context.exiSram.subarray(4)), settingsBefore);
+
+  beginIplTransaction(context);
+  immediateTransfer(context, {
+    data: 0x20000000,
+    length: 3,
+    mode: 1,
+    cycle: 4,
+  });
+  assert.equal(context.exi0RtcRefreshCount, 3);
+  assert.equal(context.exiTransferTrace.at(-1).rtcRefreshed, false);
+  const rtcBeforeReset = context.readExiRtcSeconds();
+
+  // A new CS assertion discards the partial command but leaves RTC state.
+  beginIplTransaction(context);
+  assert.equal(context.exi0IplCommandBytes, 0);
+  assert.equal(context.exi0RtcRefreshCount, 3);
+  assert.equal(context.readExiRtcSeconds(), rtcBeforeReset);
+});
+
+test("EXI0 RTC bounds and immediate-only DMA policy are atomic", () => {
+  const startSeconds = 0x010203a7;
+  const lastByte = makeContext(null, { rtcStartSeconds: startSeconds });
+  writeIplCommand(lastByte, 0x200000c0, 0);
+  assert.equal(lastByte.exi0IplCommandAddress, 0x00800003);
+  assert.equal(
+    immediateTransfer(lastByte, {
+      data: 0,
+      length: 1,
+      mode: 0,
+      cycle: 1,
+    }),
+    0xa7000000,
+  );
+  assert.equal(lastByte.exi0IplCursor, 0x00800004);
+  assert.equal(lastByte.exi0RtcImmediateReadBytes, 1);
+
+  const immediateOverflow = makeContext(
+    null,
+    { rtcStartSeconds: startSeconds },
+  );
+  writeIplCommand(immediateOverflow, 0x200000c0, 0);
+  assert.equal(
+    immediateTransfer(immediateOverflow, {
+      data: 0x12345678,
+      length: 2,
+      mode: 0,
+      cycle: 1,
+    }),
+    0x12345678,
+  );
+  assert.equal(immediateOverflow.exi0IplCursor, 0x00800003);
+  assert.equal(immediateOverflow.exi0RtcImmediateReadBytes, 0);
+  assert.equal(
+    immediateOverflow.exiTransferTrace.at(-1).reason,
+    "rtc-source-out-of-bounds",
+  );
+
+  const dma = makeContext(null, { rtcStartSeconds: startSeconds });
+  const dmaBase = 0x2400;
+  dma.bytes.fill(0x5a, dma.ram + dmaBase, dma.ram + dmaBase + 32);
+  writeIplCommand(dma, 0x20000000, 0);
+  const dmaCursor = dma.exi0IplCursor;
+  readIplDma(dma, dmaBase, 32, 1);
+  assert.equal(dma.exiTransferTrace.at(-1).operation, "rtc-dma-read");
+  assert.equal(dma.exiTransferTrace.at(-1).outcome, "rejected");
+  assert.equal(dma.exiTransferTrace.at(-1).reason, "rtc-immediate-only");
+  assert.equal(dma.exiTransferTrace.at(-1).sourceKind, "rtc");
+  assert.equal(dma.exiTransferTrace.at(-1).sourceConfigured, true);
+  assert.equal(dma.exi0IplCursor, dmaCursor);
+  assert.deepEqual(
+    Array.from(dma.bytes.subarray(dma.ram + dmaBase, dma.ram + dmaBase + 32)),
+    Array(32).fill(0x5a),
+  );
+  assert.deepEqual(dma.reservationInvalidations, []);
+
+  const zero = makeContext(null, { rtcStartSeconds: startSeconds });
+  writeIplCommand(zero, 0x20000000, 0);
+  const zeroCursor = zero.exi0IplCursor;
+  readIplDma(zero, 0xffffffff, 31, 1);
+  assert.equal(zero.exiTransferTrace.at(-1).operation, "rtc-dma-read");
+  assert.equal(zero.exiTransferTrace.at(-1).outcome, "complete");
+  assert.equal(zero.exiTransferTrace.at(-1).reason, null);
+  assert.equal(zero.exiTransferTrace.at(-1).dmaLength, 0);
+  assert.equal(zero.exi0IplCursor, zeroCursor);
+  assert.deepEqual(zero.reservationInvalidations, []);
+});
+
 test("EXI0 SRAM settings command completes WarioWare's exact DMA read", () => {
   const context = makeContext(null);
   const dmaBase = 0x2400;
@@ -1293,7 +1534,13 @@ test("EXI0 SRAM settings command completes WarioWare's exact DMA read", () => {
   assert.deepEqual(snapshot.sram, {
     base: "0x00800000",
     byteLength: 68,
-    rtcModeled: false,
+    rtcModeled: true,
+    rtcStartSeconds: 0,
+    rtcCurrentSeconds: 0,
+    rtcCyclesPerSecond: 486_000_000,
+    rtcRefreshCount: 1,
+    rtcLastRefreshCycle: 100,
+    rtcImmediateReadBytes: 0,
     settingsBase: "0x00800004",
     settingsByteLength: 64,
     checksum: 0x002c,
@@ -1308,7 +1555,7 @@ test("EXI0 SRAM settings command completes WarioWare's exact DMA read", () => {
   assert.equal(snapshot.transfers.dma.last.operation, "sram-dma-read");
 });
 
-test("EXI0 SRAM reads keep RTC separate and reject overflow atomically", () => {
+test("EXI0 SRAM and RTC reads keep separate bounded regions", () => {
   const immediate = makeContext();
   writeIplCommand(immediate, 0x20000100, 1);
   assert.equal(
@@ -1359,9 +1606,20 @@ test("EXI0 SRAM reads keep RTC separate and reject overflow atomically", () => {
   const rtc = makeContext();
   writeIplCommand(rtc, 0x20000000, 1);
   assert.equal(rtc.exi0IplCommandAddress, 0x00800000);
-  assert.equal(rtc.exi0IplAddressSequence, null);
-  assert.equal(rtc.exiTransferTrace.at(-1).operation, "unhandled");
-  assert.equal(rtc.exiTransferTrace.at(-1).reason, "non-ipl-command");
+  assert.equal(rtc.exi0IplAddressSequence, 1);
+  assert.equal(rtc.exiTransferTrace.at(-1).operation, "rtc-address");
+  assert.equal(rtc.exiTransferTrace.at(-1).outcome, "accepted");
+  assert.equal(rtc.exiTransferTrace.at(-1).reason, null);
+  assert.equal(
+    immediateTransfer(rtc, {
+      data: 0xffffffff,
+      length: 4,
+      mode: 0,
+      cycle: 2,
+    }),
+    0,
+  );
+  assert.equal(rtc.exi0RtcImmediateReadBytes, 4);
 
   const exactEnd = makeContext();
   writeIplCommand(exactEnd, 0x20001100, 1);
@@ -1826,20 +2084,20 @@ test("EXI0 IPL DMA rejects wrong modes and source or RAM range overflow", () => 
     "exi-dma-without-readable-address-command",
   );
 
-  const staleAddressAfterRtc = makeContext();
-  writeIplAddress(staleAddressAfterRtc, 0x3000);
-  beginIplTransaction(staleAddressAfterRtc);
-  immediateTransfer(staleAddressAfterRtc, {
+  const rtcDma = makeContext();
+  writeIplAddress(rtcDma, 0x3000);
+  beginIplTransaction(rtcDma);
+  immediateTransfer(rtcDma, {
     data: 0x20000000,
     length: 4,
     mode: 1,
     cycle: 2,
   });
-  assert.equal(staleAddressAfterRtc.exi0IplAddressSequence, null);
-  readIplDma(staleAddressAfterRtc, 0x2000, 32, 3);
+  assert.equal(rtcDma.exi0IplAddressSequence, 2);
+  readIplDma(rtcDma, 0x2000, 32, 3);
   assert.equal(
-    staleAddressAfterRtc.exiTransferTrace.at(-1).reason,
-    "exi-dma-without-readable-address-command",
+    rtcDma.exiTransferTrace.at(-1).reason,
+    "rtc-immediate-only",
   );
 
   for (const context of [
@@ -1848,7 +2106,7 @@ test("EXI0 IPL DMA rejects wrong modes and source or RAM range overflow", () => 
     wrongMode,
     wrongImageSize,
     missingAddressCommand,
-    staleAddressAfterRtc,
+    rtcDma,
   ]) {
     assert.equal(context.exiTransferTrace.at(-1).outcome, "rejected");
     assert.equal(context.reservationInvalidations.length, 0);

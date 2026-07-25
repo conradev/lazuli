@@ -995,6 +995,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     const exiSramBase = 0x00800000;
     const exiSramBytes = 0x44;
     const exiSramSettingsBase = exiSramBase + 4;
+    const exiRtcStartSeconds = 0;
+    const exiRtcCyclesPerSecond = 486_000_000;
     const workerExecutionTimingSampleStride = 1024;
     let workerExecutionTimingEligibleCalls = 0;
     function newWorkerPhaseTiming(sampleStride) {
@@ -5354,6 +5356,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     let exi0IplCursor = 0;
     let exi0IplAddressSequence = null;
     let exi0IplDmaBytes = 0;
+    let exi0RtcRefreshCount = 0;
+    let exi0RtcLastRefreshCycle = null;
+    let exi0RtcImmediateReadBytes = 0;
     let exi0SramImmediateReadBytes = 0;
     let exi0SramDmaReads = 0;
     let exi0SramDmaBytes = 0;
@@ -16716,9 +16721,53 @@ const TEMPLATE: &str = r##"<!doctype html>
       return sram;
     }
 
+    function readExiRtcSeconds() {
+      return (
+        (exiSram[0] << 24)
+        | (exiSram[1] << 16)
+        | (exiSram[2] << 8)
+        | exiSram[3]
+      ) >>> 0;
+    }
+
+    function exiRtcSecondsAtCycle(observedCycles) {
+      if (!Number.isSafeInteger(observedCycles) || observedCycles < 0) {
+        throw new RangeError(
+          "EXI RTC cycle must be a non-negative safe integer"
+        );
+      }
+      return (
+        exiRtcStartSeconds
+        + Math.floor(observedCycles / exiRtcCyclesPerSecond)
+      ) >>> 0;
+    }
+
+    function refreshExiRtc(observedCycles) {
+      // Dolphin CEXIIPL (EXI_DeviceIPL.cpp at 707d3c7a,
+      // GPL-2.0-or-later) snapshots the big-endian RTC whenever the fourth
+      // command byte latches. Its deterministic path advances a fixed start
+      // time by emulated core ticks; keeping the start at the GameCube epoch
+      // makes browser runs independent of host wall time, timezone, and
+      // guest-written TB state.
+      const seconds = exiRtcSecondsAtCycle(observedCycles);
+      exiSram[0] = seconds >>> 24;
+      exiSram[1] = seconds >>> 16;
+      exiSram[2] = seconds >>> 8;
+      exiSram[3] = seconds;
+      exi0RtcRefreshCount += 1;
+      exi0RtcLastRefreshCycle = observedCycles;
+      return seconds;
+    }
+
     function exiIplReadRegion(address) {
       if (!Number.isInteger(address) || address < 0) return null;
       if (address < exiIplImageBytes) return "rom";
+      if (
+        address >= exiSramBase
+        && address < exiSramSettingsBase
+      ) {
+        return "rtc";
+      }
       if (
         address >= exiSramSettingsBase
         && address < exiSramBase + exiSramBytes
@@ -16728,7 +16777,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       return null;
     }
 
-    function transferExi0IplImmediate(control, immediate) {
+    function transferExi0IplImmediate(
+      control,
+      immediate,
+      observedCycles
+    ) {
       const transferMode = (control >>> 2) & 3;
       const immediateLength = ((control >>> 4) & 3) + 1;
       const immediateBefore = immediate >>> 0;
@@ -16736,8 +16789,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       const commandBytesBefore = exi0IplCommandBytes;
       let immediateAfter = immediateBefore;
       let commandCompleted = false;
+      let rtcRefreshedSeconds = null;
       let imageStatus = null;
       const dataRegionBefore = exiIplReadRegion(exi0IplCommandAddress);
+      const rtcImmediateOutOfBounds = (
+        transferMode === 0
+        && commandBytesBefore >= 4
+        && exi0IplCommandWrite === false
+        && dataRegionBefore === "rtc"
+        && (
+          exi0IplCursor < exiSramBase
+          || exi0IplCursor > exiSramSettingsBase
+          || immediateLength > exiSramSettingsBase - exi0IplCursor
+        )
+      );
       const sramImmediateOutOfBounds = (
         transferMode === 0
         && commandBytesBefore >= 4
@@ -16766,6 +16831,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             exi0IplCursor = exi0IplCommandAddress;
             exi0IplAddressSequence = null;
             commandCompleted = true;
+            rtcRefreshedSeconds = refreshExiRtc(observedCycles);
           }
           // IPL drives all ones while the four command bytes are clocked.
           return 0xff;
@@ -16781,6 +16847,18 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
           return output;
         }
+        if (exi0IplCommandWrite === false && readRegion === "rtc") {
+          if (
+            exi0IplCursor >= exiSramBase
+            && exi0IplCursor < exiSramSettingsBase
+          ) {
+            const output = exiSram[exi0IplCursor - exiSramBase];
+            exi0IplCursor = (exi0IplCursor + 1) >>> 0;
+            exi0RtcImmediateReadBytes += 1;
+            return output;
+          }
+          return inputByte;
+        }
         if (exi0IplCommandWrite === false && readRegion === "sram") {
           if (exi0IplCursor < exiSramBase + exiSramBytes) {
             const output = exiSram[exi0IplCursor - exiSramBase];
@@ -16791,13 +16869,17 @@ const TEMPLATE: &str = r##"<!doctype html>
           return inputByte;
         }
 
-        // RTC, UART, and writes are separate device-model layers.
+        // UART and writes are separate device-model layers.
         // Leaving the byte untouched matches Dolphin's IPL TransferByte
         // behavior for an unhandled address while failing closed on state.
         return inputByte;
       };
 
-      if (transferMode === 0 && !sramImmediateOutOfBounds) {
+      if (
+        transferMode === 0
+        && !rtcImmediateOutOfBounds
+        && !sramImmediateOutOfBounds
+      ) {
         immediateAfter = 0;
         for (let index = 0; index < immediateLength; index += 1) {
           immediateAfter |= transferByte(0) << (24 - index * 8);
@@ -16816,7 +16898,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       let outcome;
       let reason = null;
       const commandRegion = exiIplReadRegion(exi0IplCommandAddress);
-      if (sramImmediateOutOfBounds) {
+      if (rtcImmediateOutOfBounds) {
+        operation = "rtc-read";
+        outcome = "rejected";
+        reason = "rtc-source-out-of-bounds";
+      } else if (sramImmediateOutOfBounds) {
         operation = "sram-read";
         outcome = "rejected";
         reason = "sram-source-out-of-bounds";
@@ -16835,7 +16921,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         ) {
           operation = commandRegion === "rom"
             ? "ipl-address"
-            : "sram-address";
+            : commandRegion === "rtc"
+              ? "rtc-address"
+              : "sram-address";
           outcome = "accepted";
         } else {
           operation = "unhandled";
@@ -16863,6 +16951,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       } else if (
         exi0IplCommandWrite === false
+        && commandRegion === "rtc"
+      ) {
+        operation = "rtc-read";
+        outcome = "complete";
+      } else if (
+        exi0IplCommandWrite === false
         && commandRegion === "sram"
       ) {
         operation = "sram-read";
@@ -16887,6 +16981,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         commandBytesBefore,
         commandBytesAfter: exi0IplCommandBytes,
         commandRegion,
+        rtcRefreshed: rtcRefreshedSeconds !== null,
+        rtcSeconds: rtcRefreshedSeconds,
         imageStatus,
       };
     }
@@ -16982,7 +17078,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       } else if (!dma) {
         immediateFraming = transferExi0IplImmediate(
           controlBefore,
-          immediate
+          immediate,
+          observedCycles
         );
         immediateAfter = immediateFraming.immediateAfter;
         view.setUint32(mmio + 0x6810, immediateAfter, false);
@@ -16994,7 +17091,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         const commandRegion = exiIplReadRegion(exi0IplCommandAddress);
         operation = commandRegion === "sram"
           ? "sram-dma-read"
-          : "ipl-dma-read";
+          : commandRegion === "rtc"
+            ? "rtc-dma-read"
+            : "ipl-dma-read";
         if (commandRegion === "rom") {
           imageStatus = exiIplImageStatus();
         }
@@ -17025,6 +17124,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           // Generic EXI devices clock zero bytes and still signal transfer
           // completion. The RAM address is not consulted in that case.
           outcome = "complete";
+        } else if (commandRegion === "rtc") {
+          outcome = "rejected";
+          reason = "rtc-immediate-only";
         } else if (
           commandRegion === "rom"
           && (
@@ -17060,7 +17162,7 @@ const TEMPLATE: &str = r##"<!doctype html>
                 dmaTarget
               );
               exi0IplDmaBytes += dmaLength;
-            } else {
+            } else if (commandRegion === "sram") {
               const source = exi0IplCursor - exiSramBase;
               bytes.set(
                 exiSram.subarray(source, source + dmaLength),
@@ -17101,6 +17203,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         commandBytesBefore,
         commandBytesAfter: exi0IplCommandBytes,
         commandRegion,
+        rtcRefreshed: immediateFraming?.rtcRefreshed ?? false,
+        rtcSeconds: immediateFraming?.rtcSeconds ?? null,
         sourceKind,
         commandAddress: hex32(exi0IplCommandAddress),
         dmaBase: hex32(dmaBase),
@@ -17113,7 +17217,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         iplCursorBefore: hex32(iplCursorBefore),
         iplCursorAfter: hex32(exi0IplCursor),
         addressSequence: addressSequenceBefore,
-        sourceConfigured: sourceKind === "sram"
+        sourceConfigured: (
+          sourceKind === "sram"
+          || sourceKind === "rtc"
+        )
           ? true
           : sourceKind === "rom"
             ? imageStatus?.configured ?? exiIplImage !== null
@@ -17212,7 +17319,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         sram: {
           base: hex32(exiSramBase),
           byteLength: exiSram.byteLength,
-          rtcModeled: false,
+          rtcModeled: true,
+          rtcStartSeconds: exiRtcStartSeconds,
+          rtcCurrentSeconds: readExiRtcSeconds(),
+          rtcCyclesPerSecond: exiRtcCyclesPerSecond,
+          rtcRefreshCount: exi0RtcRefreshCount,
+          rtcLastRefreshCycle: exi0RtcLastRefreshCycle,
+          rtcImmediateReadBytes: exi0RtcImmediateReadBytes,
           settingsBase: hex32(exiSramSettingsBase),
           settingsByteLength: exiSramBytes - 4,
           checksum: (exiSram[0x04] << 8) | exiSram[0x05],
