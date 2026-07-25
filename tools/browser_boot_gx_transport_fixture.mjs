@@ -247,6 +247,7 @@ export function makeContext({
         true,
       );
     },
+    refreshExternalInterfaceInterruptLevel() { return false; },
     ramPointer(address, size) {
       return context.physicalRamPointer(address, size);
     },

@@ -115,6 +115,7 @@ function makeContext() {
     piFifoWrap: 0x20000000,
     resetGxCommandProcessorDecoder() {},
     resetGxWriteGatherPipe() {},
+    refreshExternalInterfaceInterruptLevel() { return false; },
     serviceCommandProcessorFifo() {
       context.refreshCommandProcessorInterruptLevel("register-harness");
       return 0;

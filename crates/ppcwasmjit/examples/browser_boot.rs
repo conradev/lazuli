@@ -1113,7 +1113,18 @@ const TEMPLATE: &str = r##"<!doctype html>
     const diErrorNoAudioBuffer = 0x00052001;
     const diErrorInvalidAudioCommand = 0x00052401;
     const piDiskInterruptCause = 0x00000004;
+    const piExternalInterfaceInterruptCause = 0x00000010;
     const piCommandProcessorInterruptCause = 0x00000800;
+    const exiDeviceInterruptMask = 0x00000001;
+    const exiDeviceInterrupt = 0x00000002;
+    const exiTransferInterruptMask = 0x00000004;
+    const exiTransferInterrupt = 0x00000008;
+    const exiClockMask = 0x00000070;
+    const exiDeviceSelectMask = 0x00000380;
+    const exiAttachInterruptMask = 0x00000400;
+    const exiAttachInterrupt = 0x00000800;
+    const exiDeviceConnected = 0x00001000;
+    const exiRomDisable = 0x00002000;
     const siTransferStart = 0x00000001;
     const siReadStatusInterruptMask = 0x08000000;
     const siReadStatusInterrupt = 0x10000000;
@@ -5327,6 +5338,14 @@ const TEMPLATE: &str = r##"<!doctype html>
     let exi0IplCursor = 0;
     let exi0IplAddressSequence = null;
     let exi0IplDmaBytes = 0;
+    let exiTransferCompletions = 0;
+    let exiTransferInterruptAcknowledgements = 0;
+    let exiInterruptLevelActive = false;
+    let exiInterruptLevelChanges = 0;
+    let exiInterruptLevelReason = null;
+    let exiPiAssertions = 0;
+    let exiPiDeassertions = 0;
+    let exiExternalInterruptDeliveries = 0;
     const dspTrace = [];
     const accelerations = new Map();
     const exceptionCounts = new Map();
@@ -12848,9 +12867,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     function writeProcessorInterfaceInterruptCause(value) {
       const current = view.getUint32(mmio + 0x3000, false);
       view.setUint32(mmio + 0x3000, current & ~(value >>> 0), false);
-      // PI cause is W1C, but CP is a level source. Hardware therefore
-      // reasserts bit 11 immediately while the CP request remains active.
+      // PI cause is W1C, but CP and EXI are level sources. Hardware therefore
+      // reasserts either cause immediately while its request remains active.
       refreshCommandProcessorInterruptLevel("pi-cause-w1c");
+      refreshExternalInterfaceInterruptLevel("pi-cause-w1c");
     }
 
     function serviceCommandProcessorInterrupt(observedCycles) {
@@ -13726,6 +13746,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         if (writeProcessorInterfaceFifoRegister(physical, value, size)) return 1;
         return reject("device", "processor-interface-fifo-register-rejected");
+      }
+      for (let channel = 0; channel < 3; channel += 1) {
+        const parameter = 0x0c006800 + channel * 0x14;
+        if (physical >= parameter + 4 || physical + size <= parameter) continue;
+        if (physical === parameter && size === 4) {
+          writeExternalInterfaceParameter(channel, value);
+          return 1;
+        }
+        return reject(
+          "device",
+          "external-interface-parameter-register-rejected"
+        );
       }
       if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (size) {
@@ -16315,6 +16347,152 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function writeExternalInterfaceParameter(channel, value) {
+      if (!Number.isInteger(channel) || channel < 0 || channel >= 3) {
+        throw new RangeError("EXI channel must be 0, 1, or 2");
+      }
+      const parameterOffset = 0x6800 + channel * 0x14;
+      const current = view.getUint32(mmio + parameterOffset, false);
+      const written = value >>> 0;
+      const statusMask = (
+        exiDeviceInterrupt
+        | exiTransferInterrupt
+        | (channel < 2 ? exiAttachInterrupt : 0)
+      ) >>> 0;
+      const writableMask = (
+        exiDeviceInterruptMask
+        | exiTransferInterruptMask
+        | exiClockMask
+        | exiDeviceSelectMask
+        | (channel < 2 ? exiAttachInterruptMask : 0)
+        | (channel === 0 ? exiRomDisable : 0)
+      ) >>> 0;
+      const statuses = (current & statusMask) & ~(written & statusMask);
+      const readOnly = channel < 2 ? current & exiDeviceConnected : 0;
+      const next = (
+        (written & writableMask)
+        | statuses
+        | readOnly
+      ) >>> 0;
+      if (
+        (current & exiTransferInterrupt) !== 0
+        && (written & exiTransferInterrupt) !== 0
+      ) {
+        exiTransferInterruptAcknowledgements += 1;
+      }
+      view.setUint32(mmio + parameterOffset, next, false);
+      // Chip-select edge effects belong to the next transaction-framing
+      // layer. This register slice only preserves the architected CSR bits.
+      refreshExternalInterfaceInterruptLevel("csr-write-channel-" + channel);
+      return next;
+    }
+
+    function completeExternalInterfaceTransfer(channel) {
+      if (!Number.isInteger(channel) || channel < 0 || channel >= 3) {
+        throw new RangeError("EXI channel must be 0, 1, or 2");
+      }
+      const parameterOffset = 0x6800 + channel * 0x14;
+      const controlOffset = parameterOffset + 0x0c;
+      const control = view.getUint32(mmio + controlOffset, false);
+      if ((control & 1) === 0) return false;
+      view.setUint32(mmio + controlOffset, (control & ~1) >>> 0, false);
+      view.setUint32(
+        mmio + parameterOffset,
+        (
+          view.getUint32(mmio + parameterOffset, false)
+          | exiTransferInterrupt
+        ) >>> 0,
+        false
+      );
+      exiTransferCompletions += 1;
+      refreshExternalInterfaceInterruptLevel(
+        "transfer-complete-channel-" + channel
+      );
+      return true;
+    }
+
+    function refreshExternalInterfaceInterruptLevel(reason) {
+      let active = false;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const parameter = view.getUint32(
+          mmio + 0x6800 + channel * 0x14,
+          false
+        );
+        active ||= (
+          (parameter & (
+            exiDeviceInterruptMask | exiDeviceInterrupt
+          )) === (
+            exiDeviceInterruptMask | exiDeviceInterrupt
+          )
+          || (parameter & (
+            exiTransferInterruptMask | exiTransferInterrupt
+          )) === (
+            exiTransferInterruptMask | exiTransferInterrupt
+          )
+          || (
+            channel < 2
+            && (parameter & (
+              exiAttachInterruptMask | exiAttachInterrupt
+            )) === (
+              exiAttachInterruptMask | exiAttachInterrupt
+            )
+          )
+        );
+      }
+
+      const beforeCause = view.getUint32(mmio + 0x3000, false);
+      const cause = (
+        active
+          ? beforeCause | piExternalInterfaceInterruptCause
+          : beforeCause & ~piExternalInterfaceInterruptCause
+      ) >>> 0;
+      if (
+        (beforeCause & piExternalInterfaceInterruptCause) === 0
+        && (cause & piExternalInterfaceInterruptCause) !== 0
+      ) {
+        exiPiAssertions += 1;
+      } else if (
+        (beforeCause & piExternalInterfaceInterruptCause) !== 0
+        && (cause & piExternalInterfaceInterruptCause) === 0
+      ) {
+        exiPiDeassertions += 1;
+      }
+      if (active !== exiInterruptLevelActive) {
+        exiInterruptLevelChanges += 1;
+      }
+      exiInterruptLevelActive = active;
+      exiInterruptLevelReason = reason;
+      view.setUint32(mmio + 0x3000, cause, false);
+      return active;
+    }
+
+    function serviceExternalInterfaceInterrupt(observedCycles) {
+      refreshExternalInterfaceInterruptLevel(
+        "mmio-service@" + observedCycles
+      );
+      const cause = view.getUint32(mmio + 0x3000, false);
+      const mask = view.getUint32(mmio + 0x3004, false);
+      if (
+        (cause & mask & piExternalInterfaceInterruptCause) === 0
+      ) {
+        return false;
+      }
+      const msr = view.getUint32(cpu + msrOffset, true);
+      if ((msr & 0x00008000) === 0) return false;
+
+      exiExternalInterruptDeliveries += 1;
+      deviceEvents.set(
+        "exiExternalInterrupt",
+        (deviceEvents.get("exiExternalInterrupt") ?? 0) + 1
+      );
+      deviceEvents.set(
+        "externalInterrupt",
+        (deviceEvents.get("externalInterrupt") ?? 0) + 1
+      );
+      raiseException(cpu, 0x0500);
+      return true;
+    }
+
     function exiTransferModeName(mode) {
       switch (mode) {
         case 0: return "read";
@@ -16365,7 +16543,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       if ((controlBefore & 1) === 0) return false;
 
       const controlAfter = (controlBefore & ~1) >>> 0;
-      view.setUint32(mmio + 0x680c, controlAfter, false);
       deviceEvents.set(
         "exiChannel0",
         (deviceEvents.get("exiChannel0") ?? 0) + 1
@@ -16472,23 +16649,28 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (operation === "ipl-address" && outcome === "accepted") {
         exi0IplAddressSequence = recorded.sequence;
       }
+      completeExternalInterfaceTransfer(0);
       return true;
     }
 
     function serviceExternalInterface(observedCycles) {
       serviceExi0(observedCycles);
-      for (const [channel, offset] of [[1, 0x6820], [2, 0x6834]]) {
-        const control = view.getUint32(mmio + offset, false);
-        if ((control & 1) === 0) continue;
-        view.setUint32(mmio + offset, control & ~1, false);
+      for (const channel of [1, 2]) {
+        if (!completeExternalInterfaceTransfer(channel)) continue;
         const event = "exiChannel" + channel;
         deviceEvents.set(event, (deviceEvents.get(event) ?? 0) + 1);
       }
+      serviceExternalInterfaceInterrupt(observedCycles);
     }
 
     function snapshotExternalInterface() {
       const image = exiIplImageStatus();
       const parameter = view.getUint32(mmio + 0x6800, false);
+      const channelParameters = Array.from(
+        { length: 3 },
+        (_unused, channel) =>
+          view.getUint32(mmio + 0x6800 + channel * 0x14, false)
+      );
       return {
         channel0: {
           parameter: hex32(parameter),
@@ -16497,6 +16679,45 @@ const TEMPLATE: &str = r##"<!doctype html>
           dmaLength: view.getUint32(mmio + 0x6808, false),
           control: hex32(view.getUint32(mmio + 0x680c, false)),
           immediate: hex32(view.getUint32(mmio + 0x6810, false)),
+        },
+        interrupt: {
+          levelActive: exiInterruptLevelActive,
+          levelChanges: exiInterruptLevelChanges,
+          levelReason: exiInterruptLevelReason,
+          piCause: (
+            view.getUint32(mmio + 0x3000, false)
+            & piExternalInterfaceInterruptCause
+          ) !== 0,
+          piMask: (
+            view.getUint32(mmio + 0x3004, false)
+            & piExternalInterfaceInterruptCause
+          ) !== 0,
+          completions: exiTransferCompletions,
+          transferAcknowledgements:
+            exiTransferInterruptAcknowledgements,
+          piAssertions: exiPiAssertions,
+          piDeassertions: exiPiDeassertions,
+          externalDeliveries: exiExternalInterruptDeliveries,
+          channels: channelParameters.map((value, channel) => ({
+            channel,
+            parameter: hex32(value),
+            exi: (value & exiDeviceInterrupt) !== 0,
+            exiMasked: (
+              value & (exiDeviceInterruptMask | exiDeviceInterrupt)
+            ) === (exiDeviceInterruptMask | exiDeviceInterrupt),
+            transfer: (value & exiTransferInterrupt) !== 0,
+            transferMasked: (
+              value & (exiTransferInterruptMask | exiTransferInterrupt)
+            ) === (exiTransferInterruptMask | exiTransferInterrupt),
+            attach: channel < 2
+              ? (value & exiAttachInterrupt) !== 0
+              : false,
+            attachMasked: channel < 2
+              ? (
+                  value & (exiAttachInterruptMask | exiAttachInterrupt)
+                ) === (exiAttachInterruptMask | exiAttachInterrupt)
+              : false,
+          })),
         },
         ipl: {
           ...image,
