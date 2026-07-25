@@ -31,6 +31,17 @@ test("deployment retains the public WarioWare release gate", async () => {
   );
 });
 
+test("deployment retains the private seven-game compatibility gates", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/deploy-web.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /^\s+tools\/browser_game_compatibility_\*\.test\.mjs$/m,
+  );
+});
+
 test("deployment retains the passive public SMB observer gates", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/deploy-web.yml", import.meta.url),

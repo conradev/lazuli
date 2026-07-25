@@ -62,6 +62,7 @@ jobs:
           node --test
           tools/browser_boot_*.test.mjs
           tools/browser_disc_source.test.mjs
+          tools/browser_game_compatibility_*.test.mjs
           tools/browser_public_cdp.test.mjs
           tools/browser_public_smb_screencast.test.mjs
           tools/browser_public_smb_screencast_oracle.test.mjs
