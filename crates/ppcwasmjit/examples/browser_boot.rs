@@ -13870,7 +13870,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           ) >>> 0,
         });
       } else {
-        latch("bottomBase");
+        // TFBL owns the VI's shared POFF bit, but BFBL samples that line at
+        // the bottom-field boundary independently of the active top field.
+        // Keep the sampled raw TFBL value with BFBL so a queued presentation
+        // cannot later inherit POFF from either a stale top latch or a newer
+        // guest register write.
+        latch("bottomBase", {
+          pageOffsetRaw: view.getUint32(mmio + 0x201c, false),
+        });
       }
 
       const snapshot = viScanoutStateSnapshot();
@@ -13878,6 +13885,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         field,
         topBaseLatch: snapshot.topBase?.latchSerial ?? null,
         bottomBaseLatch: snapshot.bottomBase?.latchSerial ?? null,
+        bottomPageOffsetRaw: snapshot.bottomBase?.pageOffsetRaw ?? null,
         pictureLatch: snapshot.picture?.latchSerial ?? null,
       });
       return snapshot;
@@ -13931,13 +13939,25 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function viActiveXfbAddress(field, scanoutState = viScanoutActive) {
+      check(field === "top" || field === "bottom", "invalid VI scanout field");
       const topRaw = scanoutState.topBase?.value
         ?? view.getUint32(mmio + 0x201c, false);
-      const raw = field === "top"
-        ? topRaw
-        : scanoutState.bottomBase?.value
-          ?? view.getUint32(mmio + 0x2024, false);
-      return viXfbAddressFromRaw(raw, topRaw);
+      if (field === "top") return viXfbAddressFromRaw(topRaw, topRaw);
+
+      const bottomBase = scanoutState.bottomBase;
+      if (
+        bottomBase === null
+        || bottomBase === undefined
+        || !Number.isSafeInteger(bottomBase.value)
+        || bottomBase.value < 0
+        || bottomBase.value > 0xffff_ffff
+        || !Number.isSafeInteger(bottomBase.pageOffsetRaw)
+        || bottomBase.pageOffsetRaw < 0
+        || bottomBase.pageOffsetRaw > 0xffff_ffff
+      ) {
+        return null;
+      }
+      return viXfbAddressFromRaw(bottomBase.value, bottomBase.pageOffsetRaw);
     }
 
     function viCurrentHalfLine(observedCycles) {
