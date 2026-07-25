@@ -57,6 +57,9 @@ function makeContext(identifier = "GZWE01") {
     inspectSuperMonkeyBallGameState() {
       return identifier === "GMBE8P" ? { game: "smb" } : null;
     },
+    inspectLuigisMansionGameState() {
+      return null;
+    },
   };
   vm.createContext(context);
   vm.runInContext([
@@ -1337,7 +1340,7 @@ test("WarioWare guest input latch requires live Repellion and a matching host A"
   assert.equal(context.wariowareLastActiveGameplayInput, null);
   assert.match(
     source,
-    /if \(scanoutDue\) \{\s+sampleWarioWareGameplayInput\(scheduledCycle\);/,
+    /function sampleGuestGameplayInput\(sampleCycle\) \{[\s\S]*sampleWarioWareGameplayInput\(sampleCycle\);/,
   );
 });
 
