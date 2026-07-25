@@ -75,12 +75,14 @@ const exiFunctions = [
   "physicalRamPointer",
   "writeProcessorInterfaceInterruptCause",
   "writeExternalInterfaceParameter",
+  "transitionExternalInterfaceChipSelect",
   "completeExternalInterfaceTransfer",
   "refreshExternalInterfaceInterruptLevel",
   "serviceExternalInterfaceInterrupt",
   "exiTransferModeName",
   "exiIplImageStatus",
   "recordExi0Transfer",
+  "transferExi0IplImmediate",
   "serviceExi0",
   "serviceExternalInterface",
   "snapshotExternalInterface",
@@ -130,6 +132,10 @@ function makeContext(exiIplImage = syntheticIpl()) {
     exiTransferOutcomes: new Map(),
     exiTransferSequence: 0,
     exiTransferTraceDropped: 0,
+    exi0IplChipSelectActive: false,
+    exi0IplCommandWord: 0,
+    exi0IplCommandBytes: 0,
+    exi0IplCommandWrite: null,
     exi0IplCommandAddress: null,
     exi0IplCursor: 0,
     exi0IplAddressSequence: null,
@@ -170,20 +176,67 @@ function makeContext(exiIplImage = syntheticIpl()) {
 const exiParameterOffsets = [0x6800, 0x6814, 0x6828];
 const exiControlOffsets = [0x680c, 0x6820, 0x6834];
 
+function selectExi0Device(context, deviceSelect) {
+  const parameterOffset = context.mmio + exiParameterOffsets[0];
+  const parameter = context.view.getUint32(parameterOffset, false);
+  const configurationMask = (
+    context.exiDeviceInterruptMask
+    | context.exiTransferInterruptMask
+    | context.exiClockMask
+    | context.exiDeviceSelectMask
+    | context.exiAttachInterruptMask
+    | context.exiRomDisable
+  ) >>> 0;
+  return context.writeExternalInterfaceParameter(
+    0,
+    (
+      (parameter & configurationMask & ~context.exiDeviceSelectMask)
+      | ((deviceSelect & 7) << 7)
+    ) >>> 0,
+  );
+}
+
 function selectIplDevice(context) {
-  context.writeExternalInterfaceParameter(0, 2 << 7);
+  return selectExi0Device(context, 2);
+}
+
+function beginIplTransaction(context) {
+  selectExi0Device(context, 0);
+  selectIplDevice(context);
+}
+
+function immediateTransfer(
+  context,
+  {
+    data,
+    length,
+    mode,
+    cycle,
+  },
+) {
+  assert.ok(length >= 1 && length <= 4);
+  context.view.setUint32(context.mmio + 0x6810, data >>> 0, false);
+  context.view.setUint32(
+    context.mmio + 0x680c,
+    (
+      1
+      | ((mode & 3) << 2)
+      | ((length - 1) << 4)
+    ) >>> 0,
+    false,
+  );
+  assert.equal(context.serviceExi0(cycle), true);
+  return context.view.getUint32(context.mmio + 0x6810, false);
 }
 
 function writeIplAddress(context, sourceOffset, cycle = 1) {
-  selectIplDevice(context);
-  context.view.setUint32(
-    context.mmio + 0x6810,
-    (sourceOffset * 64) >>> 0,
-    false,
-  );
-  // TSTART, immediate transfer, write mode, four-byte immediate.
-  context.view.setUint32(context.mmio + 0x680c, 0x35, false);
-  assert.equal(context.serviceExi0(cycle), true);
+  beginIplTransaction(context);
+  immediateTransfer(context, {
+    data: (sourceOffset * 64) >>> 0,
+    length: 4,
+    mode: 1,
+    cycle,
+  });
 }
 
 function readIplDma(context, dmaBase, dmaLength, cycle = 2, mode = 0) {
@@ -358,6 +411,321 @@ test("EXI CSR writes preserve read-only EXT and apply masks, config, and status 
     () => context.writeExternalInterfaceParameter(-1, 0),
     /EXI channel must be 0, 1, or 2/,
   );
+});
+
+test("EXI0 immediate writes consume every TLEN MSB-first and bounded-complete", () => {
+  const immediate = 0x11223344;
+  for (let length = 1; length <= 4; length += 1) {
+    const context = makeContext();
+    beginIplTransaction(context);
+
+    assert.equal(
+      immediateTransfer(context, {
+        data: immediate,
+        length,
+        mode: 1,
+        cycle: 10 + length,
+      }),
+      immediate,
+    );
+
+    const expectedCommandWord = length === 4
+      ? immediate
+      : immediate >>> ((4 - length) * 8);
+    assert.equal(context.exi0IplCommandWord, expectedCommandWord);
+    assert.equal(context.exi0IplCommandBytes, length);
+    assert.equal(
+      context.view.getUint32(context.mmio + 0x680c, false) & 1,
+      0,
+    );
+    assert.equal(
+      context.view.getUint32(context.mmio + 0x6800, false)
+        & context.exiTransferInterrupt,
+      context.exiTransferInterrupt,
+    );
+    assert.equal(context.exiTransferCompletions, 1);
+
+    const transfer = context.exiTransferTrace.at(-1);
+    assert.equal(transfer.immediateLength, length);
+    assert.equal(transfer.immediate, "0x11223344");
+    assert.equal(transfer.immediateAfter, "0x11223344");
+    assert.equal(transfer.commandBytesBefore, 0);
+    assert.equal(transfer.commandBytesAfter, length);
+    assert.equal(
+      transfer.commandWordAfter,
+      "0x" + expectedCommandWord.toString(16).padStart(8, "0"),
+    );
+    if (length < 4) {
+      assert.equal(transfer.operation, "ipl-command-frame");
+      assert.equal(transfer.outcome, "pending");
+      assert.equal(transfer.reason, "ipl-command-incomplete");
+    }
+  }
+});
+
+test("EXI0 immediate reads fill high bytes, zero low bytes, and advance IPL cursor", () => {
+  const image = syntheticIpl();
+  const sourceOffset = 0x240;
+  const payload = Uint8Array.from(
+    { length: 16 },
+    (_unused, index) => 0x40 + index,
+  );
+  image.set(payload, sourceOffset);
+  const context = makeContext(image);
+  writeIplAddress(context, sourceOffset, 1);
+
+  let payloadOffset = 0;
+  for (let length = 1; length <= 4; length += 1) {
+    let expected = 0;
+    for (let index = 0; index < length; index += 1) {
+      expected |= payload[payloadOffset + index] << (24 - index * 8);
+    }
+    expected >>>= 0;
+
+    assert.equal(
+      immediateTransfer(context, {
+        data: 0xdeadbeef,
+        length,
+        mode: 0,
+        cycle: 20 + length,
+      }),
+      expected,
+    );
+    const transfer = context.exiTransferTrace.at(-1);
+    assert.equal(transfer.transferMode, "read");
+    assert.equal(transfer.immediateLength, length);
+    assert.equal(
+      transfer.immediateAfter,
+      "0x" + expected.toString(16).padStart(8, "0"),
+    );
+    assert.equal(transfer.operation, "ipl-rom-read");
+    assert.equal(transfer.outcome, "complete");
+    assert.equal(transfer.reason, null);
+    payloadOffset += length;
+  }
+
+  assert.equal(payloadOffset, 10);
+  assert.equal(context.exi0IplCommandBytes, 4);
+  assert.equal(context.exi0IplCommandAddress, sourceOffset);
+  assert.equal(context.exi0IplCursor, sourceOffset + payloadOffset);
+  assert.equal(context.exiTransferCompletions, 5);
+});
+
+test("EXI0 reads clock zero command bytes and return all ones during command framing", () => {
+  const image = syntheticIpl();
+  image[0] = 0x5a;
+  const context = makeContext(image);
+  beginIplTransaction(context);
+
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0xa5a5a5a5,
+      length: 1,
+      mode: 0,
+      cycle: 1,
+    }),
+    0xff000000,
+  );
+  assert.equal(context.exi0IplCommandWord, 0);
+  assert.equal(context.exi0IplCommandBytes, 1);
+  assert.equal(context.exiTransferTrace.at(-1).reason, "ipl-command-incomplete");
+
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0x5a5a5a5a,
+      length: 3,
+      mode: 0,
+      cycle: 2,
+    }),
+    0xffffff00,
+  );
+  assert.equal(context.exi0IplCommandWord, 0);
+  assert.equal(context.exi0IplCommandBytes, 4);
+  assert.equal(context.exi0IplCommandWrite, false);
+  assert.equal(context.exi0IplCommandAddress, 0);
+  assert.equal(context.exi0IplCursor, 0);
+  assert.equal(context.exiTransferTrace.at(-1).operation, "ipl-address");
+
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0xffffffff,
+      length: 1,
+      mode: 0,
+      cycle: 3,
+    }),
+    0x5a000000,
+  );
+  assert.equal(context.exi0IplCursor, 1);
+});
+
+test("EXI0 read-write is Dolphin's no-op and reserved mode preserves framing", () => {
+  const context = makeContext();
+  beginIplTransaction(context);
+  immediateTransfer(context, {
+    data: 0x12340000,
+    length: 2,
+    mode: 1,
+    cycle: 1,
+  });
+  const framing = {
+    commandWord: context.exi0IplCommandWord,
+    commandBytes: context.exi0IplCommandBytes,
+    commandAddress: context.exi0IplCommandAddress,
+    cursor: context.exi0IplCursor,
+  };
+
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0xaabbccdd,
+      length: 3,
+      mode: 2,
+      cycle: 2,
+    }),
+    0xaabbccdd,
+  );
+  assert.deepEqual(
+    {
+      commandWord: context.exi0IplCommandWord,
+      commandBytes: context.exi0IplCommandBytes,
+      commandAddress: context.exi0IplCommandAddress,
+      cursor: context.exi0IplCursor,
+    },
+    framing,
+  );
+  assert.equal(context.exiTransferTrace.at(-1).operation, "ipl-immediate-read-write");
+  assert.equal(context.exiTransferTrace.at(-1).outcome, "ignored");
+  assert.equal(context.exiTransferTrace.at(-1).reason, "ipl-read-write-no-op");
+
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0x55667788,
+      length: 4,
+      mode: 3,
+      cycle: 3,
+    }),
+    0x55667788,
+  );
+  assert.deepEqual(
+    {
+      commandWord: context.exi0IplCommandWord,
+      commandBytes: context.exi0IplCommandBytes,
+      commandAddress: context.exi0IplCommandAddress,
+      cursor: context.exi0IplCursor,
+    },
+    framing,
+  );
+  assert.equal(context.exiTransferTrace.at(-1).operation, "ipl-immediate-reserved");
+  assert.equal(context.exiTransferTrace.at(-1).outcome, "rejected");
+  assert.equal(context.exiTransferTrace.at(-1).reason, "reserved-transfer-mode");
+  assert.equal(context.exiTransferCompletions, 3);
+});
+
+test("EXI0 chip-select edges reproduce Dolphin callback framing boundaries", () => {
+  const context = makeContext();
+  beginIplTransaction(context);
+  immediateTransfer(context, {
+    data: 0x12340000,
+    length: 2,
+    mode: 1,
+    cycle: 1,
+  });
+  assert.equal(context.exi0IplChipSelectActive, true);
+  assert.equal(context.exi0IplCommandWord, 0x1234);
+  assert.equal(context.exi0IplCommandBytes, 2);
+
+  // Same-CS writes have no edge and direct 2<->1 switches change two select
+  // bits. Dolphin therefore sends neither transition to IPL's SetCS callback,
+  // preserving the partial command even while dispatch becomes unsupported.
+  selectIplDevice(context);
+  assert.equal(context.exi0IplCommandWord, 0x1234);
+  assert.equal(context.exi0IplCommandBytes, 2);
+  selectExi0Device(context, 1);
+  assert.equal(context.exi0IplChipSelectActive, false);
+  assert.equal(context.exi0IplCommandWord, 0x1234);
+  assert.equal(context.exi0IplCommandBytes, 2);
+  selectIplDevice(context);
+  assert.equal(context.exi0IplChipSelectActive, true);
+  assert.equal(context.exi0IplCommandWord, 0x1234);
+  assert.equal(context.exi0IplCommandBytes, 2);
+
+  // A normal 2->0 deassert reaches IPL but does not reset its framing. The
+  // following 0->2 assert invokes SetCS(2), which resets command and cursor.
+  selectExi0Device(context, 0);
+  assert.equal(context.exi0IplChipSelectActive, false);
+  assert.equal(context.exi0IplCommandWord, 0x1234);
+  assert.equal(context.exi0IplCommandBytes, 2);
+  selectIplDevice(context);
+  assert.equal(context.exi0IplChipSelectActive, true);
+  assert.equal(context.exi0IplCommandWord, 0);
+  assert.equal(context.exi0IplCommandBytes, 0);
+  assert.equal(context.exi0IplCommandWrite, null);
+  assert.equal(context.exi0IplCommandAddress, null);
+  assert.equal(context.exi0IplCursor, 0);
+  assert.equal(context.exi0IplAddressSequence, null);
+
+  // The callback is selected by changed bits, not by either complete selector.
+  // Thus 2->3 preserves IPL framing (changed=1), while 3->1 resets it through
+  // IPL SetCS(1) (changed=2), even though neither endpoint selects IPL alone.
+  const changedBits = makeContext();
+  beginIplTransaction(changedBits);
+  immediateTransfer(changedBits, {
+    data: 0xab000000,
+    length: 1,
+    mode: 1,
+    cycle: 2,
+  });
+  selectExi0Device(changedBits, 3);
+  assert.equal(changedBits.exi0IplCommandWord, 0xab);
+  assert.equal(changedBits.exi0IplCommandBytes, 1);
+  selectExi0Device(changedBits, 1);
+  assert.equal(changedBits.exi0IplChipSelectActive, false);
+  assert.equal(changedBits.exi0IplCommandWord, 0);
+  assert.equal(changedBits.exi0IplCommandBytes, 0);
+});
+
+test("EXI0 invalid or unsupported selections fail closed but still complete", () => {
+  const selections = [
+    { select: 0, reason: "no-device-selected" },
+    { select: 1, reason: "unsupported-device-select" },
+    { select: 4, reason: "unsupported-device-select" },
+    { select: 3, reason: "multiple-device-select" },
+    { select: 5, reason: "multiple-device-select" },
+    { select: 6, reason: "multiple-device-select" },
+    { select: 7, reason: "multiple-device-select" },
+  ];
+  for (const { select, reason } of selections) {
+    const context = makeContext();
+    selectExi0Device(context, select);
+    assert.equal(
+      immediateTransfer(context, {
+        data: 0x89abcdef,
+        length: 4,
+        mode: 1,
+        cycle: 100 + select,
+      }),
+      0x89abcdef,
+    );
+
+    const transfer = context.exiTransferTrace.at(-1);
+    assert.equal(transfer.deviceSelect, select);
+    assert.equal(transfer.operation, "unhandled");
+    assert.equal(transfer.outcome, "rejected");
+    assert.equal(transfer.reason, reason);
+    assert.equal(transfer.commandBytesBefore, 0);
+    assert.equal(transfer.commandBytesAfter, 0);
+    assert.equal(context.exi0IplCommandWord, 0);
+    assert.equal(context.exi0IplCommandBytes, 0);
+    assert.equal(
+      context.view.getUint32(context.mmio + 0x680c, false) & 1,
+      0,
+    );
+    assert.equal(
+      context.view.getUint32(context.mmio + 0x6800, false)
+        & context.exiTransferInterrupt,
+      context.exiTransferInterrupt,
+    );
+    assert.equal(context.exiTransferCompletions, 1);
+  }
 });
 
 test("EXI interrupt aggregation covers all channels and preserves unrelated PI causes", () => {
@@ -632,9 +1000,21 @@ test("EXI CSR writes and service order cannot bypass completion or level refresh
   );
 
   const writeParameter = extractFunction("writeExternalInterfaceParameter");
+  const storeParameter = writeParameter.indexOf(
+    "view.setUint32(mmio + parameterOffset, next, false);",
+  );
+  const transitionChipSelect = writeParameter.indexOf(
+    "transitionExternalInterfaceChipSelect(",
+    storeParameter,
+  );
+  const refreshAfterWrite = writeParameter.indexOf(
+    "refreshExternalInterfaceInterruptLevel(",
+    transitionChipSelect,
+  );
   assert.ok(
-    writeParameter.indexOf("view.setUint32(mmio + parameterOffset, next, false);")
-      < writeParameter.indexOf("refreshExternalInterfaceInterruptLevel("),
+    storeParameter !== -1
+      && storeParameter < transitionChipSelect
+      && transitionChipSelect < refreshAfterWrite,
   );
 
   const completion = extractFunction("completeExternalInterfaceTransfer");
@@ -672,9 +1052,24 @@ test("EXI CSR writes and service order cannot bypass completion or level refresh
   );
 
   const exi0 = extractFunction("serviceExi0");
+  const frameImmediate = exi0.indexOf("transferExi0IplImmediate(");
+  const publishImmediate = exi0.indexOf(
+    "view.setUint32(mmio + 0x6810, immediateAfter, false);",
+    frameImmediate,
+  );
+  const recordTransfer = exi0.indexOf(
+    "recordExi0Transfer(",
+    publishImmediate,
+  );
+  const completeTransfer = exi0.indexOf(
+    "completeExternalInterfaceTransfer(0);",
+    recordTransfer,
+  );
   assert.ok(
-    exi0.indexOf("recordExi0Transfer(")
-      < exi0.indexOf("completeExternalInterfaceTransfer(0);"),
+    frameImmediate !== -1
+      && frameImmediate < publishImmediate
+      && publishImmediate < recordTransfer
+      && recordTransfer < completeTransfer,
   );
 
   const service = extractFunction("serviceExternalInterface");
@@ -763,6 +1158,10 @@ test("EXI0 IPL address command orders and completes a bounded DMA read", () => {
     byteLength: 2 * 1024 * 1024,
     expectedBytes: 2 * 1024 * 1024,
     source: { kind: "synthetic-test" },
+    chipSelectActive: true,
+    commandWord: "0x07f3c000",
+    commandBytes: 4,
+    commandDirection: "read",
     commandAddress: "0x001fcf00",
     cursor: "0x001fcf40",
     addressSequence: 1,
@@ -887,17 +1286,13 @@ test("EXI0 IPL DMA rejects wrong modes and source or RAM range overflow", () => 
 
   const staleAddressAfterRtc = makeContext();
   writeIplAddress(staleAddressAfterRtc, 0x3000);
-  staleAddressAfterRtc.view.setUint32(
-    staleAddressAfterRtc.mmio + 0x6810,
-    0x20000000,
-    false,
-  );
-  staleAddressAfterRtc.view.setUint32(
-    staleAddressAfterRtc.mmio + 0x680c,
-    0x35,
-    false,
-  );
-  staleAddressAfterRtc.serviceExi0(2);
+  beginIplTransaction(staleAddressAfterRtc);
+  immediateTransfer(staleAddressAfterRtc, {
+    data: 0x20000000,
+    length: 4,
+    mode: 1,
+    cycle: 2,
+  });
   assert.equal(staleAddressAfterRtc.exi0IplAddressSequence, null);
   readIplDma(staleAddressAfterRtc, 0x2000, 32, 3);
   assert.equal(

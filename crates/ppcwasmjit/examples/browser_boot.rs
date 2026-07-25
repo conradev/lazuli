@@ -5334,6 +5334,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     const exiTransferOutcomes = new Map();
     let exiTransferSequence = 0;
     let exiTransferTraceDropped = 0;
+    let exi0IplChipSelectActive = false;
+    let exi0IplCommandWord = 0;
+    let exi0IplCommandBytes = 0;
+    let exi0IplCommandWrite = null;
     let exi0IplCommandAddress = null;
     let exi0IplCursor = 0;
     let exi0IplAddressSequence = null;
@@ -16347,6 +16351,50 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function transitionExternalInterfaceChipSelect(
+      channel,
+      previousSelect,
+      nextSelect
+    ) {
+      if (!Number.isInteger(channel) || channel < 0 || channel >= 3) {
+        throw new RangeError("EXI channel must be 0, 1, or 2");
+      }
+      if (
+        !Number.isInteger(previousSelect)
+        || previousSelect < 0
+        || previousSelect > 7
+        || !Number.isInteger(nextSelect)
+        || nextSelect < 0
+        || nextSelect > 7
+      ) {
+        throw new RangeError("EXI chip select must fit three bits");
+      }
+      if (previousSelect === nextSelect) return false;
+
+      // Dolphin routes a CSR edge to the device selected by old-CS XOR
+      // new-CS, then passes the complete new selector to SetCS. IPL resets
+      // its command byte count and cursor only when that value is nonzero.
+      // Transfer dispatch remains one-hot below, so a multi-select callback
+      // can reset framing but cannot activate the modeled IPL transaction.
+      const changedSelect = previousSelect ^ nextSelect;
+      if (channel === 0) {
+        exi0IplChipSelectActive = nextSelect === 2;
+      }
+      if (
+        channel === 0
+        && changedSelect === 2
+        && nextSelect !== 0
+      ) {
+        exi0IplCommandWord = 0;
+        exi0IplCommandBytes = 0;
+        exi0IplCommandWrite = null;
+        exi0IplCommandAddress = null;
+        exi0IplCursor = 0;
+        exi0IplAddressSequence = null;
+      }
+      return true;
+    }
+
     function writeExternalInterfaceParameter(channel, value) {
       if (!Number.isInteger(channel) || channel < 0 || channel >= 3) {
         throw new RangeError("EXI channel must be 0, 1, or 2");
@@ -16381,8 +16429,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         exiTransferInterruptAcknowledgements += 1;
       }
       view.setUint32(mmio + parameterOffset, next, false);
-      // Chip-select edge effects belong to the next transaction-framing
-      // layer. This register slice only preserves the architected CSR bits.
+      transitionExternalInterfaceChipSelect(
+        channel,
+        (current >>> 7) & 7,
+        (next >>> 7) & 7
+      );
       refreshExternalInterfaceInterruptLevel("csr-write-channel-" + channel);
       return next;
     }
@@ -16516,6 +16567,135 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function transferExi0IplImmediate(control, immediate) {
+      const transferMode = (control >>> 2) & 3;
+      const immediateLength = ((control >>> 4) & 3) + 1;
+      const immediateBefore = immediate >>> 0;
+      const commandWordBefore = exi0IplCommandWord;
+      const commandBytesBefore = exi0IplCommandBytes;
+      let immediateAfter = immediateBefore;
+      let commandCompleted = false;
+      let imageStatus = null;
+
+      const transferByte = input => {
+        const inputByte = input & 0xff;
+        if (exi0IplCommandBytes < 4) {
+          exi0IplCommandWord = (
+            (exi0IplCommandWord << 8) | inputByte
+          ) >>> 0;
+          exi0IplCommandBytes += 1;
+          if (exi0IplCommandBytes === 4) {
+            exi0IplCommandWrite =
+              (exi0IplCommandWord & 0x80000000) !== 0;
+            exi0IplCommandAddress =
+              (exi0IplCommandWord >>> 6) & 0x01ffffff;
+            exi0IplCursor = exi0IplCommandAddress;
+            exi0IplAddressSequence = null;
+            commandCompleted = true;
+          }
+          // IPL drives all ones while the four command bytes are clocked.
+          return 0xff;
+        }
+
+        if (
+          exi0IplCommandWrite === false
+          && exi0IplCommandAddress < exiIplImageBytes
+        ) {
+          imageStatus ??= exiIplImageStatus();
+          const source = exi0IplCursor % exiIplImageBytes;
+          const output = imageStatus.valid ? exiIplImage[source] : 0;
+          if (imageStatus.valid) {
+            exi0IplCursor = (exi0IplCursor + 1) >>> 0;
+          }
+          return output;
+        }
+
+        // RTC, SRAM, UART, and writes are separate device-model layers.
+        // Leaving the byte untouched matches Dolphin's IPL TransferByte
+        // behavior for an unhandled address while failing closed on state.
+        return inputByte;
+      };
+
+      if (transferMode === 0) {
+        immediateAfter = 0;
+        for (let index = 0; index < immediateLength; index += 1) {
+          immediateAfter |= transferByte(0) << (24 - index * 8);
+        }
+        immediateAfter >>>= 0;
+      } else if (transferMode === 1) {
+        for (let index = 0; index < immediateLength; index += 1) {
+          transferByte(immediateBefore >>> (24 - index * 8));
+        }
+      }
+      // Dolphin's IPL device does not override ImmReadWrite, so mode 2 is a
+      // no-op. Mode 3 is reserved. Both still reach Lazuli's bounded transfer
+      // completion path so the prior TSTART/TCINT invariant is preserved.
+
+      let operation;
+      let outcome;
+      let reason = null;
+      if (transferMode === 2) {
+        operation = "ipl-immediate-read-write";
+        outcome = "ignored";
+        reason = "ipl-read-write-no-op";
+      } else if (transferMode === 3) {
+        operation = "ipl-immediate-reserved";
+        outcome = "rejected";
+        reason = "reserved-transfer-mode";
+      } else if (commandCompleted) {
+        if (
+          exi0IplCommandWrite === false
+          && exi0IplCommandAddress < exiIplImageBytes
+        ) {
+          operation = "ipl-address";
+          outcome = "accepted";
+        } else {
+          operation = "unhandled";
+          outcome = "ignored";
+          reason = "non-ipl-command";
+        }
+      } else if (commandBytesBefore < 4) {
+        operation = "ipl-command-frame";
+        outcome = "pending";
+        reason = "ipl-command-incomplete";
+      } else if (
+        exi0IplCommandWrite === false
+        && exi0IplCommandAddress < exiIplImageBytes
+      ) {
+        operation = "ipl-rom-read";
+        imageStatus ??= exiIplImageStatus();
+        if (!imageStatus.configured) {
+          outcome = "unavailable";
+          reason = "ipl-image-not-configured";
+        } else if (!imageStatus.valid) {
+          outcome = "rejected";
+          reason = "invalid-ipl-image";
+        } else {
+          outcome = "complete";
+        }
+      } else {
+        operation = "unhandled";
+        outcome = "ignored";
+        reason = "non-ipl-command";
+      }
+
+      return {
+        transferMode,
+        immediateLength,
+        immediateBefore,
+        immediateAfter,
+        operation,
+        outcome,
+        reason,
+        commandCompleted,
+        commandWordBefore,
+        commandWordAfter: exi0IplCommandWord,
+        commandBytesBefore,
+        commandBytesAfter: exi0IplCommandBytes,
+        imageStatus,
+      };
+    }
+
     function recordExi0Transfer(transfer) {
       const recorded = {
         sequence: ++exiTransferSequence,
@@ -16551,33 +16731,41 @@ const TEMPLATE: &str = r##"<!doctype html>
       const deviceSelect = (parameter >>> 7) & 7;
       const dma = (controlBefore & 2) !== 0;
       const transferMode = (controlBefore >>> 2) & 3;
-      const commandWrite = (immediate & 0x80000000) !== 0;
-      const commandAddress = (immediate >>> 6) & 0x01ffffff;
+      const commandWordBefore = exi0IplCommandWord;
+      const commandBytesBefore = exi0IplCommandBytes;
       const iplCommandAddressBefore = exi0IplCommandAddress;
       const iplCursorBefore = exi0IplCursor;
+      const addressSequenceBefore = exi0IplAddressSequence;
       let operation = "unhandled";
       let outcome = "ignored";
       let reason;
       let dmaTarget = null;
       let imageStatus = null;
+      let immediateAfter = immediate;
+      let immediateFraming = null;
 
-      if (deviceSelect !== 2) {
-        reason = "device-not-ipl-rtc-sram";
+      if (deviceSelect === 0) {
+        outcome = "rejected";
+        reason = "no-device-selected";
+      } else if (
+        (deviceSelect & (deviceSelect - 1)) !== 0
+      ) {
+        outcome = "rejected";
+        reason = "multiple-device-select";
+      } else if (deviceSelect !== 2) {
+        outcome = "rejected";
+        reason = "unsupported-device-select";
       } else if (!dma) {
-        exi0IplAddressSequence = null;
-        exi0IplCommandAddress = null;
-        operation = "ipl-address";
-        if (transferMode !== 1) {
-          outcome = "rejected";
-          reason = "ipl-address-requires-write";
-        } else if (commandWrite || commandAddress >= exiIplImageBytes) {
-          operation = "unhandled";
-          reason = "non-ipl-command";
-        } else {
-          exi0IplCommandAddress = commandAddress;
-          exi0IplCursor = commandAddress;
-          outcome = "accepted";
-        }
+        immediateFraming = transferExi0IplImmediate(
+          controlBefore,
+          immediate
+        );
+        immediateAfter = immediateFraming.immediateAfter;
+        view.setUint32(mmio + 0x6810, immediateAfter, false);
+        operation = immediateFraming.operation;
+        outcome = immediateFraming.outcome;
+        reason = immediateFraming.reason;
+        imageStatus = immediateFraming.imageStatus;
       } else {
         operation = "ipl-dma-read";
         imageStatus = exiIplImageStatus();
@@ -16585,8 +16773,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           outcome = "rejected";
           reason = "ipl-dma-requires-read";
         } else if (
-          commandWrite
-          || commandAddress !== exi0IplCommandAddress
+          exi0IplCommandBytes !== 4
+          || exi0IplCommandWrite !== false
           || exi0IplAddressSequence === null
         ) {
           outcome = "rejected";
@@ -16632,8 +16820,15 @@ const TEMPLATE: &str = r##"<!doctype html>
         controlBefore: hex32(controlBefore),
         controlAfter: hex32(controlAfter),
         immediate: hex32(immediate),
-        commandDirection: commandWrite ? "write" : "read",
-        commandAddress: hex32(commandAddress),
+        immediateAfter: hex32(immediateAfter),
+        commandDirection: exi0IplCommandWrite === null
+          ? "pending"
+          : exi0IplCommandWrite ? "write" : "read",
+        commandWordBefore: hex32(commandWordBefore),
+        commandWordAfter: hex32(exi0IplCommandWord),
+        commandBytesBefore,
+        commandBytesAfter: exi0IplCommandBytes,
+        commandAddress: hex32(exi0IplCommandAddress),
         dmaBase: hex32(dmaBase),
         dmaLength,
         operation,
@@ -16643,10 +16838,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         iplCommandAddressAfter: hex32(exi0IplCommandAddress),
         iplCursorBefore: hex32(iplCursorBefore),
         iplCursorAfter: hex32(exi0IplCursor),
-        addressSequence: exi0IplAddressSequence,
+        addressSequence: addressSequenceBefore,
         sourceConfigured: imageStatus?.configured ?? exiIplImage !== null,
       });
-      if (operation === "ipl-address" && outcome === "accepted") {
+      if (
+        immediateFraming?.commandCompleted === true
+        && operation === "ipl-address"
+        && outcome === "accepted"
+      ) {
         exi0IplAddressSequence = recorded.sequence;
       }
       completeExternalInterfaceTransfer(0);
@@ -16721,6 +16920,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
         ipl: {
           ...image,
+          chipSelectActive: exi0IplChipSelectActive,
+          commandWord: hex32(exi0IplCommandWord),
+          commandBytes: exi0IplCommandBytes,
+          commandDirection: exi0IplCommandWrite === null
+            ? "pending"
+            : exi0IplCommandWrite ? "write" : "read",
           commandAddress: hex32(exi0IplCommandAddress),
           cursor: hex32(exi0IplCursor),
           addressSequence: exi0IplAddressSequence,
