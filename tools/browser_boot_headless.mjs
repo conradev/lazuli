@@ -171,6 +171,9 @@ function parseArguments(argv) {
   if (options.scenario !== null && options.pulses.length !== 0) {
     throw new Error("--scenario cannot be combined with --pulse");
   }
+  if (!options.reuse && options.pulses.length !== 0) {
+    throw new Error("--pulse requires --reuse");
+  }
   if (
     options.scenario !== null
     && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(options.scenario)
@@ -465,7 +468,25 @@ async function waitForRunner(session, deadline, pollMs) {
   throw new Error(`existing page has no cycle runner: ${JSON.stringify(state)}`);
 }
 
+async function cancelHeadlessControllerPulses(session) {
+  await session.evaluate(`(() => {
+    const previous = globalThis.lazuliHeadlessPulseAction;
+    if (
+      previous !== null
+      && typeof previous === "object"
+      && Array.isArray(previous.timers)
+    ) {
+      for (const timer of previous.timers) clearTimeout(timer);
+      previous.timers.length = 0;
+    }
+    globalThis.lazuliHeadlessPulseAction = null;
+  })()`);
+}
+
 async function extendExistingRun(session, options, deadline) {
+  // Cancel an earlier invocation before reading this action's baseline. This
+  // keeps a delayed pulse from landing inside a later pre/post evidence window.
+  await cancelHeadlessControllerPulses(session);
   const state = await waitForRunner(session, deadline, options.pollMs);
   const previous = parseReport(state.result);
   const action = {
@@ -486,15 +507,28 @@ async function extendExistingRun(session, options, deadline) {
       start: "pulseStart",
       up: "pulseUp",
     };
+    const pulseAction = { timers: [] };
+    globalThis.lazuliHeadlessPulseAction = pulseAction;
     const output = document.querySelector("#result");
     if (output !== null) output.textContent = "";
     if (action.renderEvery !== null) {
       globalThis.lazuliCycleRunner.setRenderEvery(action.renderEvery);
     }
     for (const pulse of action.pulses) {
-      setTimeout(() => {
+      const publish = () => {
         globalThis.lazuliController[method[pulse.name]](action.pulseMs);
-      }, pulse.delayMs);
+      };
+      if (pulse.delayMs === 0) {
+        publish();
+      } else {
+        const timer = setTimeout(() => {
+          const index = pulseAction.timers.indexOf(timer);
+          if (index !== -1) pulseAction.timers.splice(index, 1);
+          if (globalThis.lazuliHeadlessPulseAction !== pulseAction) return;
+          publish();
+        }, pulse.delayMs);
+        pulseAction.timers.push(timer);
+      }
     }
     globalThis.lazuliCycleRunner.extendCycles(
       action.extendCycles,
@@ -940,6 +974,9 @@ async function main() {
     );
   } finally {
     try {
+      if (options.reuse) {
+        await cancelHeadlessControllerPulses(session);
+      }
       if (compositorViewportConfigured) {
         await clearCompositorViewport(session);
       }
