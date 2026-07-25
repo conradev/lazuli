@@ -46,6 +46,7 @@ const packetFunctions = [
   "packGxFramePacketV4",
   "gxFramePacketExactClipInput",
   "packGxFramePacketV5",
+  "packGxFramePacketV6",
 ];
 
 function packetContext() {
@@ -564,6 +565,127 @@ test("rejects conflicting or malformed LZGX v5 exact clip inputs", () => {
   reject(
     (draw) => { draw.vertices[0] = Number.NaN; },
     /requires finite source vertices/,
+  );
+});
+
+test("negotiates LZGX v6 without changing canonical v4 or v5 bytes", () => {
+  const context = packetContext();
+  const legacyFrame = evidencedXfbFrame();
+  legacyFrame.geometry.draws[0].exactGeometryRequired = false;
+  const legacyV4 = context.packGxFramePacketV4(2, legacyFrame);
+  const legacyV6 = context.packGxFramePacketV6(2, legacyFrame);
+  assert.equal(new DataView(legacyV6).getUint16(0x04, true), 4);
+  assert.deepEqual(packetBytes(legacyV6), packetBytes(legacyV4));
+
+  const optionalFrame = exactClipXfbFrame();
+  optionalFrame.geometry.draws[0].exactGeometryRequired = false;
+  const optionalV5 = context.packGxFramePacketV5(2, optionalFrame);
+  const optionalV6 = context.packGxFramePacketV6(2, optionalFrame);
+  assert.equal(new DataView(optionalV6).getUint16(0x04, true), 5);
+  assert.deepEqual(packetBytes(optionalV6), packetBytes(optionalV5));
+});
+
+test("marks required exact GX geometry in canonical LZGX v6", () => {
+  const context = packetContext();
+  const frame = exactClipXfbFrame();
+  frame.geometry.draws[0].exactGeometryRequired = true;
+  const optional = context.packGxFramePacketV5(2, frame);
+  const packet = context.packGxFramePacketV6(2, frame);
+  const bytes = new Uint8Array(packet);
+  const optionalBytes = new Uint8Array(optional);
+  const view = new DataView(packet);
+  const exactOffset = 1232;
+
+  assert.equal(packet.byteLength, 1328);
+  assert.equal(view.getUint16(0x04, true), 6);
+  assert.equal(view.getUint16(160 + 0x02, true), 6);
+  assert.deepEqual(
+    bytes.subarray(exactOffset),
+    optionalBytes.subarray(exactOffset),
+  );
+  optionalBytes[0x04] = 6;
+  optionalBytes[160 + 0x02] = 6;
+  assert.deepEqual(bytes, optionalBytes);
+  assert.equal(
+    digest(packet),
+    "639af8e9821bbc074e908375522947529831df955665d057c82e28ecb4e1d3e1",
+  );
+
+  const inheritedFrame = exactClipXfbFrame();
+  inheritedFrame.geometry.draws[0].exactGeometryRequired = true;
+  inheritedFrame.geometry.draws[0] = Object.create(
+    inheritedFrame.geometry.draws[0],
+  );
+  const inherited = context.packGxFramePacketV6(2, inheritedFrame);
+  assert.equal(new DataView(inherited).getUint16(0x04, true), 6);
+  assert.equal(new DataView(inherited).getUint16(160 + 0x02, true), 6);
+});
+
+test("preserves 0, 1, 2, and 6 draw flags and exact-tail order in LZGX v6", () => {
+  const context = packetContext();
+  const rawFrame = evidencedXfbFrame();
+  delete rawFrame.geometry.draws[0].postCullEvidence;
+  const actionFrame = evidencedXfbFrame();
+  const optionalFrame = exactClipXfbFrame();
+  const requiredFrame = exactClipXfbFrame();
+  requiredFrame.geometry.draws[0].exactGeometryRequired = true;
+  requiredFrame.geometry.draws[0].exactClipInput.clipPositions[0] = 7;
+  const frame = {
+    ...requiredFrame,
+    geometry: {
+      drawCalls: 4,
+      vertices: 12,
+      draws: [
+        rawFrame.geometry.draws[0],
+        actionFrame.geometry.draws[0],
+        optionalFrame.geometry.draws[0],
+        requiredFrame.geometry.draws[0],
+      ],
+    },
+  };
+  const v4 = context.packGxFramePacketV4(2, frame);
+  const packet = context.packGxFramePacketV6(2, frame);
+  const view = new DataView(packet);
+  const drawTableOffset = view.getUint32(0x1c, true);
+  const drawRecordBytes = view.getUint16(0x78, true);
+  const flags = Array.from(
+    { length: 4 },
+    (_unused, index) => view.getUint16(
+      drawTableOffset + index * drawRecordBytes + 0x02,
+      true,
+    ),
+  );
+
+  assert.equal(view.getUint16(0x04, true), 6);
+  assert.deepEqual(flags, [0, 1, 2, 6]);
+  assert.equal(view.getFloat32(v4.byteLength + 0x30, true), 0);
+  assert.equal(view.getFloat32(v4.byteLength + 96 + 0x30, true), 7);
+});
+
+test("rejects malformed or conflicting exact-required GX metadata", () => {
+  const context = packetContext();
+  const rejectExact = (required, pattern) => {
+    const frame = exactClipXfbFrame();
+    frame.geometry.draws[0].exactGeometryRequired = required;
+    assert.throws(() => context.packGxFramePacketV6(2, frame), pattern);
+  };
+
+  rejectExact(null, /exactGeometryRequired must be a boolean/);
+  rejectExact("required", /exactGeometryRequired must be a boolean/);
+
+  const actionFrame = evidencedXfbFrame();
+  actionFrame.geometry.draws[0].exactGeometryRequired = true;
+  assert.throws(
+    () => context.packGxFramePacketV6(2, actionFrame),
+    /required exact geometry cannot carry post-cull evidence/,
+  );
+
+  const rawFrame = evidencedXfbFrame();
+  delete rawFrame.geometry.draws[0].postCullEvidence;
+  rawFrame.geometry.draws[0].exactGeometryRequired = true;
+  assert.throws(
+    () => context.packGxFramePacketV6(2, rawFrame),
+    /exactGeometryRequired requires exactClipInput/,
   );
 });
 
