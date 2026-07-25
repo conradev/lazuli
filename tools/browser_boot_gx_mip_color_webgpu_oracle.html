@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli GX mip color WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli GX mip color WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildGxMipColorOraclePacket,
+      gxMipColorOracle,
+      gxMipColorOracleCases,
+    } from "./browser_boot_gx_mip_color_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length &&
+        actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    function probePixel(rgba, width, probe) {
+      const offset = (probe.y * width + probe.x) * 4;
+      return rgba.slice(offset, offset + 4);
+    }
+
+    function resourceMetrics(diagnostics) {
+      return {
+        gxFramePacketPayloadBytes:
+          diagnostics.gxFramePacketPayloadBytes,
+        texturePixelBytes: diagnostics.texturePixelBytes,
+        textureUploadBytes: diagnostics.textureUploadBytes,
+        textureWrites: diagnostics.textureWrites,
+      };
+    }
+
+    function subtractMetrics(after, before) {
+      return {
+        gxFramePacketPayloadBytes:
+          after.gxFramePacketPayloadBytes -
+          before.gxFramePacketPayloadBytes,
+        texturePixelBytes:
+          after.texturePixelBytes - before.texturePixelBytes,
+        textureUploadBytes:
+          after.textureUploadBytes - before.textureUploadBytes,
+        textureWrites:
+          after.textureWrites - before.textureWrites,
+      };
+    }
+
+    function exactUploadMetrics(actual, expected) {
+      return (
+        actual.gxFramePacketPayloadBytes ===
+          expected.packetPayloadBytes &&
+        actual.texturePixelBytes === expected.packetPayloadBytes &&
+        actual.textureUploadBytes === expected.textureUploadBytes &&
+        actual.textureWrites === expected.textureWrites
+      );
+    }
+
+    function traceCanvasContextRequests(canvas) {
+      const requests = [];
+      const original = canvas.getContext;
+      canvas.getContext = function getContext(type, ...options) {
+        requests.push(String(type));
+        return Reflect.apply(original, this, [type, ...options]);
+      };
+      return Object.freeze({
+        requests,
+        restore() {
+          delete canvas.getContext;
+        },
+      });
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const contextTrace = traceCanvasContextRequests(canvas);
+      let renderer;
+      try {
+        renderer = await WebGpuRenderer.create(canvas);
+      } finally {
+        contextTrace.restore();
+      }
+      renderer.reset_diagnostics();
+      const runs = [];
+      const referenceProbePixels = new Map();
+      try {
+        for (let runIndex = 0; runIndex < RUN_COUNT; runIndex += 1) {
+          const cases = [];
+          for (
+            let caseIndex = 0;
+            caseIndex < gxMipColorOracleCases.length;
+            caseIndex += 1
+          ) {
+            const entry = gxMipColorOracleCases[caseIndex];
+            const generation =
+              runIndex * gxMipColorOracleCases.length + caseIndex + 1;
+            renderer.reset();
+            const diagnosticsBefore = resourceMetrics(
+              renderer.diagnostics(),
+            );
+            const acknowledgedKeys = Array.from(
+              renderer.submit_gx_frame(
+                buildGxMipColorOraclePacket(
+                  entry.level,
+                  generation,
+                ),
+              ),
+            );
+            const presentation = renderer.present_xfb(
+              gxMipColorOracle.xfb.destination,
+              generation,
+              0,
+              "progressive",
+              "top",
+              generation,
+              gxMipColorOracle.xfb.width,
+              gxMipColorOracle.xfb.height,
+              gxMipColorOracle.xfb.stride,
+              gxMipColorOracle.xfb.height,
+              1,
+              false,
+            );
+            await renderer.drain();
+            const readback = await renderer.read_presented_xfb_rgba();
+            renderer.check_health();
+            const diagnosticsAfter = resourceMetrics(
+              renderer.diagnostics(),
+            );
+            const uploadMetricDelta = subtractMetrics(
+              diagnosticsAfter,
+              diagnosticsBefore,
+            );
+            const uploadMetricsExact = exactUploadMetrics(
+              uploadMetricDelta,
+              gxMipColorOracle.expectedUpload,
+            );
+            const actualProbeRgba = probePixel(
+              Array.from(readback.rgba),
+              readback.width,
+              gxMipColorOracle.probe,
+            );
+            const prior = referenceProbePixels.get(entry.id);
+            const byteExact = bytesEqual(
+              actualProbeRgba,
+              entry.expectedProbeRgba,
+            );
+            const deterministic =
+              prior === undefined ||
+              bytesEqual(actualProbeRgba, prior);
+            if (prior === undefined) {
+              referenceProbePixels.set(entry.id, actualProbeRgba);
+            }
+            const dimensionsExact =
+              readback.width === gxMipColorOracle.xfb.width &&
+              readback.height === gxMipColorOracle.xfb.height;
+            const acknowledgementExact =
+              acknowledgedKeys.length === 1 &&
+              acknowledgedKeys[0] === gxMipColorOracle.key;
+            cases.push({
+              id: entry.id,
+              level: entry.level,
+              mode0: entry.mode0,
+              mode1: entry.mode1,
+              expectedProbeRgba: entry.expectedProbeRgba,
+              actualProbeRgba,
+              byteExact,
+              deterministic,
+              dimensionsExact,
+              acknowledgedKeys,
+              acknowledgementExact,
+              expectedUploadMetrics:
+                gxMipColorOracle.expectedUpload,
+              uploadMetricDelta,
+              uploadMetricsExact,
+              width: readback.width,
+              height: readback.height,
+              presentation,
+              pass:
+                byteExact &&
+                deterministic &&
+                dimensionsExact &&
+                acknowledgementExact &&
+                uploadMetricsExact,
+            });
+          }
+          const distinctProbeColors =
+            new Set(cases.map(entry => entry.actualProbeRgba.join(",")));
+          const distinctLevelsExact =
+            distinctProbeColors.size === gxMipColorOracle.mipLevelCount;
+          runs.push({
+            index: runIndex + 1,
+            cases,
+            distinctLevelsExact,
+            pass:
+              distinctLevelsExact &&
+              cases.every(entry => entry.pass),
+          });
+        }
+
+        const unexpectedCanvasContexts =
+          contextTrace.requests.filter(type => type !== "webgpu");
+        const backendDiagnostics = {
+          renderer: "WebGpuRenderer",
+          navigatorGpuAvailable:
+            typeof navigator.gpu?.requestAdapter === "function",
+          canvasContextRequests: [...contextTrace.requests],
+          unexpectedCanvasContexts,
+          strictWebGpuOnly:
+            contextTrace.requests.length > 0 &&
+            unexpectedCanvasContexts.length === 0 &&
+            contextTrace.requests.every(type => type === "webgpu"),
+        };
+        renderer.check_health();
+        const result = {
+          pass:
+            backendDiagnostics.navigatorGpuAvailable &&
+            backendDiagnostics.strictWebGpuOnly &&
+            runs.every(entry => entry.pass),
+          runCount: RUN_COUNT,
+          deterministic: runs
+            .flatMap(entry => entry.cases)
+            .every(entry => entry.deterministic),
+          explicitMipLevels: gxMipColorOracleCases.map(
+            entry => entry.level,
+          ),
+          probe: gxMipColorOracle.probe,
+          runs,
+          backendDiagnostics,
+          diagnostics: renderer.diagnostics(),
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliGxMipColorOraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>
