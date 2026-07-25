@@ -335,3 +335,39 @@ test("AX command-list mail schedules the existing DSP completion reply", () => {
   );
   assert.equal(context.deviceEvents.get("dspAxCommandList"), 1);
 });
+
+test("CPU mailbox commits raw payload only after the low-half write", () => {
+  const delivered = [];
+  const memory = new ArrayBuffer(0x6000);
+  const context = {
+    dspCpuMailbox: 0,
+    handleDspCpuMail(mail) {
+      delivered.push(mail >>> 0);
+    },
+    mmio: 0,
+    view: new DataView(memory),
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      extractFunction("writeDspMailboxHigh"),
+      extractFunction("writeDspMailboxLow"),
+    ].join("\n\n"),
+    context,
+    { filename: "browser_boot.audio-cpu-mailbox.js" },
+  );
+
+  context.writeDspMailboxHigh(0);
+  assert.equal(context.view.getUint16(0x5000, false), 0);
+  assert.deepEqual(delivered, []);
+  context.writeDspMailboxLow(5);
+  assert.deepEqual(delivered, [5]);
+  assert.equal(context.view.getUint16(0x5000, false), 0);
+
+  context.writeDspMailboxHigh(0x80f3);
+  assert.equal(context.view.getUint16(0x5000, false), 0x00f3);
+  assert.deepEqual(delivered, [5]);
+  context.writeDspMailboxLow(0xa001);
+  assert.deepEqual(delivered, [5, 0x80f3a001]);
+  assert.equal(context.view.getUint16(0x5000, false), 0x00f3);
+});
