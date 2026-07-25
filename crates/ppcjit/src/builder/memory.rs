@@ -513,6 +513,11 @@ impl BlockBuilder<'_> {
         factor: ir::Value,
     ) -> ir::Value {
         let value = self.bd.ins().load(P::IR_TYPE, MEMFLAGS, pointer, 0);
+        let value = if P::IR_TYPE == ir::types::I8 {
+            value
+        } else {
+            self.bd.ins().bswap(value)
+        };
         let value = if signed {
             self.bd.ins().sextend(ir::types::I32, value)
         } else {
