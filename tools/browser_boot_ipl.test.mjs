@@ -5,16 +5,23 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import vm from "node:vm";
 
 const sourcePath = new URL(
   "../crates/ppcwasmjit/examples/browser_boot.rs",
   import.meta.url,
 );
 const source = readFileSync(sourcePath, "utf8");
+const imageBytes = 2 * 1024 * 1024;
+const palHeader =
+  "(C) 1999-2001 Nintendo.  All rights reserved."
+  + "(C) 1999 ArtX Inc.  All rights reserved."
+  + "PAL  Revision 1.0  ";
 
 function extractFunction(name) {
-  const start = source.indexOf(`function ${name}(`);
+  let start = source.indexOf(`function ${name}(`);
   assert.notEqual(start, -1, `missing ${name} in browser_boot.rs`);
+  if (source.slice(start - 6, start) === "async ") start -= 6;
   const bodyStart = source.indexOf("{", start);
   assert.notEqual(bodyStart, -1, `missing body for ${name}`);
 
@@ -68,6 +75,100 @@ function extractFunction(name) {
   }
   assert.fail(`unterminated body for ${name}`);
 }
+
+function makeDecoderContext() {
+  const context = {
+    Blob,
+    Object,
+    RangeError,
+    TypeError,
+    Uint8Array,
+    localIplImageBytes: imageBytes,
+    palIplHeader: palHeader,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "hasPalIplHeader",
+      "descrambleRetailIplRange",
+      "decodeRetailIplImage",
+      "readLocalIplFile",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.ipl-root.js" },
+  );
+  return context;
+}
+
+test("retail IPL decoding matches the Lazuli descrambler vector", () => {
+  const context = makeDecoderContext();
+  const input = new Uint8Array(imageBytes);
+  const decoded = context.decodeRetailIplImage(input);
+
+  assert.equal(decoded.region, "NTSC");
+  assert.equal(decoded.decodedBytes, 0x15ee40 - 0x100);
+  assert.deepEqual(
+    Array.from(decoded.image.subarray(0x100, 0x120)),
+    [
+      0x89, 0x7e, 0x47, 0x7f, 0xf4, 0x42, 0x3f, 0xe2,
+      0xa1, 0x44, 0x32, 0xa6, 0x30, 0x13, 0xbc, 0xd1,
+      0xdc, 0x12, 0xe0, 0xcc, 0xa5, 0x65, 0x36, 0x8c,
+      0xdf, 0x2a, 0xba, 0x9a, 0xef, 0x28, 0x83, 0xad,
+    ],
+  );
+  assert.equal(input[0x100], 0, "decoder mutated the selected File bytes");
+  assert.equal(decoded.image[0xff], 0);
+  assert.equal(decoded.image[0x15ee40], 0);
+
+  const roundtrip = context.decodeRetailIplImage(decoded.image);
+  assert.deepEqual(
+    Array.from(roundtrip.image.subarray(0x100, 0x120)),
+    Array(32).fill(0),
+  );
+});
+
+test("retail IPL decoding selects the PAL range from the exact C string", () => {
+  const context = makeDecoderContext();
+  const input = new Uint8Array(imageBytes);
+  for (let index = 0; index < palHeader.length; index += 1) {
+    input[index] = palHeader.charCodeAt(index);
+  }
+  input[palHeader.length] = 0;
+
+  const decoded = context.decodeRetailIplImage(input);
+
+  assert.equal(decoded.region, "PAL");
+  assert.equal(decoded.decodedBytes, 0x1aeee8 - 0x100);
+  assert.equal(decoded.image[0x1aeee8], 0);
+});
+
+test("retail IPL decoding rejects a header without a NUL terminator", () => {
+  const context = makeDecoderContext();
+  const input = new Uint8Array(imageBytes);
+  input.fill(0xff);
+  assert.throws(
+    () => context.decodeRetailIplImage(input),
+    /IPL header is not NUL-terminated/,
+  );
+});
+
+test("local IPL reader rejects size before reading file bytes", async () => {
+  const context = makeDecoderContext();
+  let read = false;
+  class ObservedBlob extends Blob {
+    async arrayBuffer() {
+      read = true;
+      return super.arrayBuffer();
+    }
+  }
+  const invalid = new ObservedBlob([new Uint8Array(imageBytes - 1)]);
+
+  await assert.rejects(
+    context.readLocalIplFile(invalid),
+    /IPL file must be exactly 2 MiB/,
+  );
+  assert.equal(read, false);
+});
 
 test("bundled IPL font image is pinned, sparse, and route-free", () => {
   const japanese = readFileSync(

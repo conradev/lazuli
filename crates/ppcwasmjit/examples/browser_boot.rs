@@ -20304,6 +20304,95 @@ const TEMPLATE: &str = r##"<!doctype html>
         return { metrics, selectedXfb, temporalSelectedXfb };
       });
     }
+    const localIplImageBytes = 2 * 1024 * 1024;
+    const palIplHeader =
+      "(C) 1999-2001 Nintendo.  All rights reserved."
+      + "(C) 1999 ArtX Inc.  All rights reserved."
+      + "PAL  Revision 1.0  ";
+
+    function hasPalIplHeader(image) {
+      if (image[palIplHeader.length] !== 0) return false;
+      for (let index = 0; index < palIplHeader.length; index += 1) {
+        if (image[index] !== palIplHeader.charCodeAt(index)) return false;
+      }
+      return true;
+    }
+
+    function descrambleRetailIplRange(image, start, end) {
+      let accumulator = 0;
+      let accumulatorBits = 0;
+      let t = 0x2953;
+      let u = 0xd9c2;
+      let v = 0x3ff1;
+      let x = 1;
+      let index = start;
+      while (index < end) {
+        const t0 = t & 1;
+        const t1 = (t >>> 1) & 1;
+        const u0 = u & 1;
+        const u1 = (u >>> 1) & 1;
+        const v0 = v & 1;
+
+        x ^= t1 ^ v0;
+        x ^= u0 | u1;
+        x ^= (t0 ^ u1 ^ v0) & (t0 ^ u0);
+
+        if (t0 === u0) {
+          v >>>= 1;
+          if (v0 !== 0) v ^= 0xb3d0;
+        }
+        if (t0 === 0) {
+          u >>>= 1;
+          if (u0 !== 0) u ^= 0xfb10;
+        }
+        t >>>= 1;
+        if (t0 !== 0) t ^= 0xa740;
+
+        accumulatorBits += 1;
+        accumulator = (accumulator * 2 + x) & 0xff;
+        if (accumulatorBits === 8) {
+          image[index] ^= accumulator;
+          index += 1;
+          accumulatorBits = 0;
+        }
+      }
+    }
+
+    function decodeRetailIplImage(input) {
+      if (
+        Object.prototype.toString.call(input) !== "[object Uint8Array]"
+      ) {
+        throw new TypeError("IPL image must be a Uint8Array");
+      }
+      if (input.byteLength !== localIplImageBytes) {
+        throw new RangeError(
+          `IPL image must be exactly ${localIplImageBytes} bytes`
+        );
+      }
+      const image = input.slice();
+      if (image.indexOf(0) === -1) {
+        throw new Error("IPL header is not NUL-terminated");
+      }
+      const region = hasPalIplHeader(image) ? "PAL" : "NTSC";
+      const decodedEnd = region === "PAL" ? 0x001aeee8 : 0x0015ee40;
+      descrambleRetailIplRange(image, 0x100, decodedEnd);
+      return {
+        image,
+        region,
+        decodedBytes: decodedEnd - 0x100,
+      };
+    }
+
+    async function readLocalIplFile(file) {
+      if (!(file instanceof Blob)) {
+        throw new TypeError("IPL picker did not provide a file");
+      }
+      if (file.size !== localIplImageBytes) {
+        throw new RangeError("IPL file must be exactly 2 MiB");
+      }
+      return decodeRetailIplImage(new Uint8Array(await file.arrayBuffer()));
+    }
+
     globalThis.lazuliRendererDiagnostics = Object.freeze({
       capturePerformance: captureRendererPerformance,
       captureSelectedXfb,
