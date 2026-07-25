@@ -7270,6 +7270,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       return {
         mode0: 0x80 + bank + slot,
         image0: 0x88 + bank + slot,
+        image1: 0x8c + bank + slot,
+        image2: 0x90 + bank + slot,
         image3: 0x94 + bank + slot,
         tlut: 0x98 + bank + slot,
       };
@@ -7353,7 +7355,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     function gxTextureCopyIsBound(address) {
       for (let textureMap = 0; textureMap < 8; textureMap += 1) {
         const registers = gxTextureRegisters(textureMap);
-        if ((gxBpRegisters[registers.image3] << 5) >>> 0 === address) return true;
+        const source = gxTextureImageSource(
+          gxBpRegisters[registers.image1],
+          gxBpRegisters[registers.image2],
+          gxBpRegisters[registers.image3]
+        );
+        if (source.kind === "main-memory" && source.address === address) return true;
       }
       return false;
     }
@@ -7373,6 +7380,20 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 14: return { name: "CMPR", blockWidth: 8, blockHeight: 8, blockBytes: 32 };
         default: return null;
       }
+    }
+
+    function gxTextureImageSource(image1, image2, image3) {
+      if ((image1 & 0x00200000) !== 0) {
+        return {
+          kind: "preloaded-tmem",
+          evenTmemRegister: image1 >>> 0,
+          oddTmemRegister: image2 >>> 0,
+        };
+      }
+      return {
+        kind: "main-memory",
+        address: (image3 << 5) >>> 0,
+      };
     }
 
     function gxCopyTextureLayout(copyCommand, pixelControl) {
@@ -7589,7 +7610,19 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxTextureDecodeErrors += 1;
         return null;
       }
-      const address = (gxBpRegisters[registers.image3] << 5) >>> 0;
+      const imageSource = gxTextureImageSource(
+        gxBpRegisters[registers.image1],
+        gxBpRegisters[registers.image2],
+        gxBpRegisters[registers.image3]
+      );
+      if (imageSource.kind === "preloaded-tmem") {
+        // IMAGE3 is not a main-memory address when IMAGE1 selects manually
+        // managed/preloaded TMEM. Reject that path until its even/odd TMEM
+        // banks are modeled instead of decoding unrelated DRAM.
+        gxTextureDecodeErrors += 1;
+        return null;
+      }
+      const address = imageSource.address;
       gxMarkTextureCopyConsumer(address);
       const blocksWide = Math.ceil(width / layout.blockWidth);
       const blocksHigh = Math.ceil(height / layout.blockHeight);
@@ -9640,11 +9673,26 @@ const TEMPLATE: &str = r##"<!doctype html>
           target[1] = signed11((registerValue >>> 12) & 0x7ff);
         }
       }
-      if (
-        (address >= 0x94 && address <= 0x97)
-        || (address >= 0xb4 && address <= 0xb7)
-      ) {
-        gxMarkTextureCopyConsumer((gxBpRegisters[address] << 5) >>> 0);
+      // IMAGE1 selects preloaded TMEM versus the IMAGE3 DRAM source, so either
+      // register can make a prospective EFB-copy consumer newly visible.
+      let textureSourceMap = null;
+      if (address >= 0x8c && address <= 0x8f) {
+        textureSourceMap = address - 0x8c;
+      } else if (address >= 0x94 && address <= 0x97) {
+        textureSourceMap = address - 0x94;
+      } else if (address >= 0xac && address <= 0xaf) {
+        textureSourceMap = address - 0xac + 4;
+      } else if (address >= 0xb4 && address <= 0xb7) {
+        textureSourceMap = address - 0xb4 + 4;
+      }
+      if (textureSourceMap !== null) {
+        const registers = gxTextureRegisters(textureSourceMap);
+        const source = gxTextureImageSource(
+          gxBpRegisters[registers.image1],
+          gxBpRegisters[registers.image2],
+          gxBpRegisters[registers.image3]
+        );
+        if (source.kind === "main-memory") gxMarkTextureCopyConsumer(source.address);
       }
       if (address === 0x4b) {
         gxPrearmTextureCopyProducer((gxBpRegisters[address] << 5) >>> 0);
