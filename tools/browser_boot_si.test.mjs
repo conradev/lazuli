@@ -118,6 +118,8 @@ function makeContext(functionNames, overrides = {}) {
     statusDataset: {},
     serialLastPolledButtons: 0,
     serialLastPolledSequence: 0,
+    serialLastPolledOrigin: "host",
+    serialLastActiveHostPublication: null,
     serialLastPollSignature: null,
     serialLastRespondedChannels: 0,
     serialLastPublishedChannels: 0,
@@ -466,6 +468,17 @@ test("periodic polling ignores EN and backpressures an unread RDST mailbox", () 
     buttons: 0x0100,
     sequence: 1,
   }]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.serialLastActiveHostPublication)),
+    {
+      source: "periodic",
+      pollIndex: 1,
+      scheduledCycle: 100,
+      observedCycle: 100,
+      buttons: 0x0100,
+      sequence: 1,
+    },
+  );
   for (const offset of [0x6410, 0x641c, 0x6428]) {
     assert.equal(
       (view.getUint32(offset, false) & 0xc0000000) >>> 0,
@@ -478,6 +491,7 @@ test("periodic polling ignores EN and backpressures an unread RDST mailbox", () 
   assert.deepEqual(Array.from(bytes.slice(0x6404, 0x640c)), firstPacket);
   assert.equal(context.deviceEvents.get("serialPollBackpressured"), 1);
   assert.equal(pollMessages.length, 1);
+  assert.equal(context.serialLastActiveHostPublication.sequence, 1);
 
   view.setUint32(0x6438, view.getUint32(0x6438, false) & ~0x20000000, false);
   context.performSerialPoll(300, 300);
@@ -485,6 +499,7 @@ test("periodic polling ignores EN and backpressures an unread RDST mailbox", () 
   assert.equal(context.controllerAppliedSequence, 2);
   assert.equal(context.serialLastPublishedChannels, 1);
   assert.equal(pollMessages.length, 1);
+  assert.equal(context.serialLastActiveHostPublication.sequence, 1);
 });
 
 test("scenario SI publications retain source cycles and exclude backpressure", () => {
@@ -556,6 +571,7 @@ test("scenario SI publications retain source cycles and exclude backpressure", (
       sequence: 1,
     },
   ]);
+  assert.equal(context.serialLastActiveHostPublication, null);
 });
 
 test("direct 0x40 reads acknowledge the controller state they publish", () => {
@@ -570,7 +586,7 @@ test("direct 0x40 reads acknowledge the controller state they publish", () => {
   context.view.setUint8(0x6480, 0x40);
 
   assert.equal(
-    context.processSerialCommand(0),
+    context.processSerialCommand(0, 700, 725),
     context.serialTransferOutcome.success,
   );
   assert.equal(context.controllerAppliedSequence, 7);
@@ -582,6 +598,24 @@ test("direct 0x40 reads acknowledge the controller state they publish", () => {
     buttons: 0x0100,
     sequence: 7,
   }]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.serialLastActiveHostPublication)),
+    {
+      source: "direct",
+      pollIndex: 1,
+      scheduledCycle: 700,
+      observedCycle: 725,
+      buttons: 0x0100,
+      sequence: 7,
+    },
+  );
+});
+
+test("terminal controller reports retain the last active host publication", () => {
+  assert.match(
+    source,
+    /lastActiveHostPublication: serialLastActiveHostPublication/,
+  );
 });
 
 test("direct and periodic SI paths publish ordered non-neutral main axes", () => {

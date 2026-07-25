@@ -1081,6 +1081,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     let controllerPollIndex = 0;
     let serialLastPolledButtons = 0;
     let serialLastPolledSequence = 0;
+    let serialLastPolledOrigin = "host";
+    let serialLastActiveHostPublication = null;
     let serialLastRespondedChannels = 0;
     let serialLastPublishedChannels = 0;
     let serialLastUpdatedChannels = 0;
@@ -3632,6 +3634,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         source
       );
       const scenarioOwnsInput = scenarioButtons !== null;
+      serialLastPolledOrigin = scenarioOwnsInput ? "scenario" : "host";
       const rawButtons = (
         scenarioOwnsInput ? scenarioButtons : controllerState.buttons
       ) & 0xffff;
@@ -3693,13 +3696,28 @@ const TEMPLATE: &str = r##"<!doctype html>
       ];
     }
 
-    function postControllerPollAcknowledgement(packet) {
+    function postControllerPollAcknowledgement(
+      packet,
+      source = "periodic",
+      scheduledCycle = cycles,
+      observedCycle = scheduledCycle
+    ) {
       const buttons = ((packet[0] << 8) | packet[1]) & ~padUseOrigin;
       if (buttons !== 0) {
+        if (serialLastPolledOrigin === "host") {
+          serialLastActiveHostPublication = {
+            source,
+            pollIndex: controllerPollIndex,
+            scheduledCycle,
+            observedCycle,
+            buttons,
+            sequence: serialLastPolledSequence,
+          };
+        }
         globalThis.postMessage?.({
           type: "controller-poll",
           buttons,
-          sequence: controllerAppliedSequence,
+          sequence: serialLastPolledSequence,
         });
       }
       return buttons;
@@ -17403,7 +17421,12 @@ const TEMPLATE: &str = r##"<!doctype html>
             "direct"
           );
           bytes.set(packet, mmio + 0x6480);
-          postControllerPollAcknowledgement(packet);
+          postControllerPollAcknowledgement(
+            packet,
+            "direct",
+            scheduledCycle,
+            observedCycle
+          );
           return serialTransferOutcome.success;
         }
         case 0x41:
@@ -17488,7 +17511,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           "serialPollPublished",
           (deviceEvents.get("serialPollPublished") ?? 0) + 1
         );
-        const buttons = postControllerPollAcknowledgement(packet);
+        const buttons = postControllerPollAcknowledgement(
+          packet,
+          "periodic",
+          scheduledCycle,
+          observedCycles
+        );
         const signature = packet.join(",");
         if (signature !== serialLastPollSignature) {
           serialLastPollSignature = signature;
@@ -18862,6 +18890,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           })),
           lastPolledButtons: serialLastPolledButtons,
           lastPolledSequence: serialLastPolledSequence,
+          lastActiveHostPublication: serialLastActiveHostPublication,
           lastRespondedChannels: serialLastRespondedChannels,
           lastPublishedChannels: serialLastPublishedChannels,
           lastUpdatedChannels: serialLastUpdatedChannels,
