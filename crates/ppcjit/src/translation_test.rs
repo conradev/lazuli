@@ -4,8 +4,8 @@ use clifwasm::ModuleConfig;
 use cranelift_codegen::ir::{self, Endianness, ExternalName, InstructionData, Opcode};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::{settings, verify_function};
-use gekko::disasm::{Extensions, Ins};
-use gekko::{Exception, GPR, Reg, SPR};
+use gekko::disasm::{Extensions, Ins, Opcode as GuestOpcode};
+use gekko::{Exception, FPR, GPR, Reg, SPR};
 
 use crate::builder::BuilderError;
 use crate::hooks::HookKind;
@@ -127,6 +127,16 @@ fn psq(opcode: u32, fr: u8, ra: u8, displacement: i16, w: bool, gqr: u8) -> Ins 
         | u32::from(w) << 15
         | u32::from(gqr & 7) << 12
         | u32::from(displacement as u16 & 0x0fff);
+    instruction(word)
+}
+
+fn psqx(opcode: u32, fr: u8, ra: u8, rb: u8, w: bool, gqr: u8) -> Ins {
+    let word = opcode
+        | u32::from(fr) << 21
+        | u32::from(ra) << 16
+        | u32::from(rb) << 11
+        | u32::from(w) << 10
+        | u32::from(gqr & 7) << 7;
     instruction(word)
 }
 
@@ -275,6 +285,219 @@ fn portable_fastmem_uses_configured_pointer_width() {
     let clif = translated.function.display().to_string();
     assert!(!clif.contains(" call "));
     assert!(!clif.contains("brif"));
+}
+
+#[test]
+fn portable_indexed_quantized_forms_use_x_fields_and_update_the_base() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    // Indexed PSQ encodes W in bit 10 and I in bits 7..9. Choose rB values whose bits make the
+    // D-form W/I accessors disagree, so this is also a regression proof for the field selection.
+    let load = psqx(0x1000_000c, 2, 3, 5, true, 6);
+    assert_eq!(load.op, GuestOpcode::PsqLx);
+    assert_eq!((load.field_ps_w(), load.field_ps_i()), (0, 2));
+    assert_eq!((load.field_ps_wx(), load.field_ps_ix()), (1, 6));
+
+    let load_update = psqx(0x1000_004c, 3, 3, 17, false, 7);
+    assert_eq!(load_update.op, GuestOpcode::PsqLux);
+    assert_eq!((load_update.field_ps_w(), load_update.field_ps_i()), (1, 0));
+    assert_eq!(
+        (load_update.field_ps_wx(), load_update.field_ps_ix()),
+        (0, 7)
+    );
+
+    let store = psqx(0x1000_000e, 4, 4, 5, true, 6);
+    assert_eq!(store.op, GuestOpcode::PsqStx);
+    assert_eq!((store.field_ps_w(), store.field_ps_i()), (0, 2));
+    assert_eq!((store.field_ps_wx(), store.field_ps_ix()), (1, 6));
+
+    let store_update = psqx(0x1000_004e, 5, 4, 17, false, 7);
+    assert_eq!(store_update.op, GuestOpcode::PsqStux);
+    assert_eq!(
+        (store_update.field_ps_w(), store_update.field_ps_i()),
+        (1, 0)
+    );
+    assert_eq!(
+        (store_update.field_ps_wx(), store_update.field_ps_ix()),
+        (0, 7)
+    );
+
+    let lower = |ins| {
+        let mut config = TranslationConfig::new(
+            CodegenSettings::default(),
+            ir::types::I32,
+            CallConv::Fast,
+            ExitMode::ReturnExecutedWithSlowMemory,
+        );
+        config.settings.force_fpu = true;
+        let translated = Translator::new(config)
+            .translate([ins].into_iter())
+            .unwrap();
+        assert_eq!(translated.sequence.len(), 1);
+        assert_eq!(translated.cycles, 2);
+        assert_eq!(translated.exit, TranslationExit::Fallthrough);
+        lower_portable(&translated.function)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+
+    let load = lower(load);
+    let load_update = lower(load_update);
+    let store = lower(store);
+    let store_update = lower(store_update);
+    let script = r#"
+const [
+  loadHex,
+  loadUpdateHex,
+  storeHex,
+  storeUpdateHex,
+  pcOffset,
+  r3Offset,
+  r4Offset,
+  r5Offset,
+  r17Offset,
+  f2Offset,
+  f3Offset,
+  f4Offset,
+  f5Offset,
+  gqr6Offset,
+  gqr7Offset,
+] = process.argv.slice(1).map((value, index) => index < 4 ? value : Number(value));
+
+const cpu = 64;
+const fastmem = 0x10000;
+const page = 0x40000;
+const initialPc = 0x80001000;
+const initialBase = 0x80001000;
+const mappedGuestPage = 0x80000000;
+
+async function execute(hex, setup, verify) {
+  const memory = new WebAssembly.Memory({ initial: 8 });
+  const view = new DataView(memory.buffer);
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(fastmem + (mappedGuestPage >>> 17) * 4, page, true);
+  // GQR6 is unsigned-halfword load/store; GQR7 is signed-halfword load/store.
+  view.setUint32(cpu + gqr6Offset, (5 << 16) | 5, true);
+  view.setUint32(cpu + gqr7Offset, (7 << 16) | 7, true);
+  setup(view);
+
+  const hooks = new Proxy({}, {
+    get(_target, name) {
+      return () => { throw new Error("unexpected runtime hook: " + String(name)); };
+    },
+  });
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(0, cpu, fastmem) >>> 0;
+  if (executed !== 0x00020001) {
+    throw new Error(`indexed PSQ returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 4) {
+    throw new Error("indexed PSQ did not advance PC exactly once");
+  }
+  verify(view);
+}
+
+await execute(loadHex, (view) => {
+  view.setUint32(cpu + r3Offset, initialBase, true);
+  view.setUint32(cpu + r5Offset, 0x1000, true);
+  new Uint8Array(view.buffer, page + 0x2000, 4).set([0x12, 0x34, 0xab, 0xcd]);
+}, (view) => {
+  const actual = [
+    view.getFloat64(cpu + f2Offset, true),
+    view.getFloat64(cpu + f2Offset + 8, true),
+  ];
+  if (actual[0] !== 0x1234 || actual[1] !== 1) {
+    throw new Error("psq_lx used the wrong W/I fields or guest byte order: " + actual.join(","));
+  }
+  if (view.getUint32(cpu + r3Offset, true) !== initialBase) {
+    throw new Error("psq_lx updated rA");
+  }
+});
+
+await execute(loadUpdateHex, (view) => {
+  view.setUint32(cpu + r3Offset, initialBase, true);
+  view.setUint32(cpu + r17Offset, 0x1000, true);
+  new Uint8Array(view.buffer, page + 0x2000, 4).set([0xff, 0xfe, 0x00, 0x03]);
+}, (view) => {
+  const actual = [
+    view.getFloat64(cpu + f3Offset, true),
+    view.getFloat64(cpu + f3Offset + 8, true),
+  ];
+  if (actual[0] !== -2 || actual[1] !== 3) {
+    throw new Error("psq_lux used the wrong W/I fields or guest byte order: " + actual.join(","));
+  }
+  if (view.getUint32(cpu + r3Offset, true) !== 0x80002000) {
+    throw new Error("psq_lux did not commit rA = rA + rB");
+  }
+});
+
+await execute(storeHex, (view) => {
+  view.setUint32(cpu + r4Offset, initialBase, true);
+  view.setUint32(cpu + r5Offset, 0x1010, true);
+  view.setFloat64(cpu + f4Offset, 0x1234, true);
+  view.setFloat64(cpu + f4Offset + 8, 0x5678, true);
+  new Uint8Array(view.buffer, page + 0x2010, 4).set([0xcc, 0xcc, 0xdd, 0xdd]);
+}, (view) => {
+  const actual = Array.from(new Uint8Array(view.buffer, page + 0x2010, 4));
+  if (actual.join(",") !== "18,52,221,221") {
+    throw new Error("psq_stx used the wrong W/I fields or guest byte order: " + actual.join(","));
+  }
+  if (view.getUint32(cpu + r4Offset, true) !== initialBase) {
+    throw new Error("psq_stx updated rA");
+  }
+});
+
+await execute(storeUpdateHex, (view) => {
+  view.setUint32(cpu + r4Offset, initialBase, true);
+  view.setUint32(cpu + r17Offset, 0x1014, true);
+  view.setFloat64(cpu + f5Offset, -2, true);
+  view.setFloat64(cpu + f5Offset + 8, 3, true);
+}, (view) => {
+  const actual = Array.from(new Uint8Array(view.buffer, page + 0x2014, 4));
+  if (actual.join(",") !== "255,254,0,3") {
+    throw new Error("psq_stux used the wrong W/I fields or guest byte order: " + actual.join(","));
+  }
+  if (view.getUint32(cpu + r4Offset, true) !== 0x80002014) {
+    throw new Error("psq_stux did not commit rA = rA + rB");
+  }
+});
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &load,
+            &load_update,
+            &store,
+            &store_update,
+            &Reg::PC.offset().to_string(),
+            &GPR::R3.offset().to_string(),
+            &GPR::R4.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &GPR::R17.offset().to_string(),
+            &FPR::R2.offset().to_string(),
+            &FPR::R3.offset().to_string(),
+            &FPR::R4.offset().to_string(),
+            &FPR::R5.offset().to_string(),
+            &SPR::GQR[6].offset().to_string(),
+            &SPR::GQR[7].offset().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]
