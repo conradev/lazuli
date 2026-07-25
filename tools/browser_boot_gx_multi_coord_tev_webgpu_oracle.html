@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli GX multi-coordinate TEV WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli GX multi-coordinate TEV WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildGxMultiCoordDerivativeTevOraclePacket,
+      buildGxMultiCoordTevPipelineLayoutOraclePacket,
+      buildGxMultiCoordTevOraclePacket,
+      fnv1a64Hex,
+      gxMultiCoordTevMask,
+      gxMultiCoordTevCertificationCases,
+      gxMultiCoordTevOracle,
+      gxMultiCoordTevPipelineLayoutCases,
+    } from "./browser_boot_gx_multi_coord_tev_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length &&
+        actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    function managedMetrics(diagnostics) {
+      return {
+        managedCoverageDraws: diagnostics.managedCoverageDraws,
+        managedCoverageTriangles:
+          diagnostics.managedCoverageTriangles,
+      };
+    }
+
+    function subtractMetrics(after, before) {
+      return {
+        managedCoverageDraws:
+          after.managedCoverageDraws -
+          before.managedCoverageDraws,
+        managedCoverageTriangles:
+          after.managedCoverageTriangles -
+          before.managedCoverageTriangles,
+      };
+    }
+
+    function exactZeroRejectionDiagnostics(diagnostics) {
+      return (
+        diagnostics.exactRequiredRejectedDraws === 0 &&
+        Object.values(
+          diagnostics.exactRequiredRejectionReasons,
+        ).every(value => value === 0)
+      );
+    }
+
+    function buildCertificationPacket(entry, generation) {
+      if (entry.packetVersion === 4) {
+        return buildGxMultiCoordTevOraclePacket(
+          entry.id,
+          generation,
+        );
+      }
+      if (entry.packetVersion === 7) {
+        return buildGxMultiCoordDerivativeTevOraclePacket(
+          entry.id,
+          generation,
+        );
+      }
+      throw new Error(
+        `unsupported multi-coordinate packet version ${entry.packetVersion}`,
+      );
+    }
+
+    function traceCanvasContextRequests(canvas) {
+      const requests = [];
+      const original = canvas.getContext;
+      canvas.getContext = function getContext(type, ...options) {
+        requests.push(String(type));
+        return Reflect.apply(original, this, [type, ...options]);
+      };
+      return Object.freeze({
+        requests,
+        restore() {
+          delete canvas.getContext;
+        },
+      });
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const contextTrace = traceCanvasContextRequests(canvas);
+      let renderer;
+      try {
+        renderer = await WebGpuRenderer.create(canvas);
+      } finally {
+        contextTrace.restore();
+      }
+      renderer.reset_diagnostics();
+      const runs = [];
+      const referenceBytes = new Map();
+      const pipelineLayoutCases = [];
+      try {
+        for (
+          let caseIndex = 0;
+          caseIndex < gxMultiCoordTevPipelineLayoutCases.length;
+          caseIndex += 1
+        ) {
+          const entry =
+            gxMultiCoordTevPipelineLayoutCases[caseIndex];
+          const generation = 0x4d120000 + caseIndex;
+          renderer.reset();
+          const beforeMetrics = managedMetrics(
+            renderer.diagnostics(),
+          );
+          const packet =
+            buildGxMultiCoordTevPipelineLayoutOraclePacket(
+              entry.id,
+              generation,
+            );
+          const packetDrawCount = new DataView(
+            packet.buffer,
+            packet.byteOffset,
+            packet.byteLength,
+          ).getUint32(0x14, true);
+          const acknowledgedKeys = Array.from(
+            renderer.submit_gx_frame(packet),
+          );
+          const presentation = renderer.present_xfb(
+            gxMultiCoordTevOracle.xfb.destination,
+            generation,
+            0,
+            "progressive",
+            "top",
+            generation,
+            gxMultiCoordTevOracle.xfb.width,
+            gxMultiCoordTevOracle.xfb.height,
+            gxMultiCoordTevOracle.xfb.stride,
+            gxMultiCoordTevOracle.xfb.height,
+            1,
+            false,
+          );
+          await renderer.drain();
+          renderer.check_health();
+          const readback =
+            await renderer.read_presented_xfb_rgba();
+          const afterMetrics = managedMetrics(
+            renderer.diagnostics(),
+          );
+          const metricDelta = subtractMetrics(
+            afterMetrics,
+            beforeMetrics,
+          );
+          const expectedMetricDelta = {
+            managedCoverageDraws:
+              entry.expectedManagedDraws,
+            managedCoverageTriangles:
+              entry.expectedManagedTriangles,
+          };
+          const metricsExact =
+            metricDelta.managedCoverageDraws ===
+              expectedMetricDelta.managedCoverageDraws &&
+            metricDelta.managedCoverageTriangles ===
+              expectedMetricDelta.managedCoverageTriangles;
+          const actualRgba = Array.from(readback.rgba);
+          const byteExact = bytesEqual(
+            actualRgba,
+            entry.expectedRgba,
+          );
+          const dimensionsExact =
+            readback.width ===
+              gxMultiCoordTevOracle.xfb.width &&
+            readback.height ===
+              gxMultiCoordTevOracle.xfb.height;
+          pipelineLayoutCases.push({
+            id: entry.id,
+            name: entry.name,
+            expectedPipelineLayouts:
+              entry.pipelineLayouts,
+            packetDrawCount,
+            oneSubmit: true,
+            oneUnflushedGeometrySegment:
+              entry.id !== "legacy-sidecar-legacy" ||
+              packetDrawCount === 3,
+            acknowledgedKeys,
+            expectedMetricDelta,
+            metricDelta,
+            metricsExact,
+            expectedRgbaFnv1a64:
+              entry.expectedRgbaFnv1a64,
+            actualRgbaFnv1a64: fnv1a64Hex(actualRgba),
+            byteExact,
+            dimensionsExact,
+            pass:
+              packetDrawCount === entry.drawCount &&
+              byteExact &&
+              dimensionsExact &&
+              metricsExact,
+            presentation,
+          });
+        }
+        renderer.reset_diagnostics();
+        for (
+          let runIndex = 0;
+          runIndex < RUN_COUNT;
+          runIndex += 1
+        ) {
+          const cases = [];
+          for (
+            let caseIndex = 0;
+            caseIndex < gxMultiCoordTevCertificationCases.length;
+            caseIndex += 1
+          ) {
+            const entry =
+              gxMultiCoordTevCertificationCases[caseIndex];
+            const generation =
+              runIndex * gxMultiCoordTevCertificationCases.length +
+              caseIndex +
+              1;
+            renderer.reset();
+            const beforeMetrics = managedMetrics(
+              renderer.diagnostics(),
+            );
+            const packet = buildCertificationPacket(
+              entry,
+              generation,
+            );
+            const acknowledgedKeys = Array.from(
+              renderer.submit_gx_frame(packet),
+            );
+            const presentation = renderer.present_xfb(
+              gxMultiCoordTevOracle.xfb.destination,
+              generation,
+              0,
+              "progressive",
+              "top",
+              generation,
+              gxMultiCoordTevOracle.xfb.width,
+              gxMultiCoordTevOracle.xfb.height,
+              gxMultiCoordTevOracle.xfb.stride,
+              gxMultiCoordTevOracle.xfb.height,
+              1,
+              false,
+            );
+            await renderer.drain();
+            renderer.check_health();
+            const readback =
+              await renderer.read_presented_xfb_rgba();
+            const afterMetrics = managedMetrics(
+              renderer.diagnostics(),
+            );
+            const metricDelta = subtractMetrics(
+              afterMetrics,
+              beforeMetrics,
+            );
+            const expectedMetricDelta = {
+              managedCoverageDraws: 1,
+              managedCoverageTriangles:
+                entry.expectedManagedTriangles,
+            };
+            const metricsExact =
+              metricDelta.managedCoverageDraws ===
+                expectedMetricDelta.managedCoverageDraws &&
+              metricDelta.managedCoverageTriangles ===
+                expectedMetricDelta.managedCoverageTriangles;
+            const actualRgba = Array.from(readback.rgba);
+            const prior = referenceBytes.get(entry.id);
+            const byteExact = bytesEqual(
+              actualRgba,
+              entry.expectedRgba,
+            );
+            const dimensionsExact =
+              readback.width ===
+                gxMultiCoordTevOracle.xfb.width &&
+              readback.height ===
+                gxMultiCoordTevOracle.xfb.height;
+            const deterministic =
+              prior === undefined || bytesEqual(actualRgba, prior);
+            if (prior === undefined) {
+              referenceBytes.set(entry.id, actualRgba);
+            }
+            cases.push({
+              id: entry.id,
+              name: entry.name,
+              discriminator: entry.discriminator,
+              liveTextureMaps: entry.liveTextureMaps,
+              liveTextureCoordinates:
+                entry.liveTextureCoordinates,
+              packetVersion: new DataView(
+                packet.buffer,
+                packet.byteOffset,
+                packet.byteLength,
+              ).getUint16(0x04, true),
+              packetBytes: packet.byteLength,
+              acknowledgedKeys,
+              expectedMetricDelta,
+              metricDelta,
+              metricsExact,
+              expectedMask: entry.expectedMask,
+              actualMask: gxMultiCoordTevMask(actualRgba),
+              expectedRgbaFnv1a64:
+                entry.expectedRgbaFnv1a64,
+              actualRgbaFnv1a64: fnv1a64Hex(actualRgba),
+              predividedRgbaFnv1a64:
+                entry.predividedRgbaFnv1a64,
+              swappedCoordinateRgbaFnv1a64:
+                entry.swappedCoordinateRgbaFnv1a64,
+              reusedCoord2RgbaFnv1a64:
+                entry.reusedCoord2RgbaFnv1a64,
+              reusedCoord7RgbaFnv1a64:
+                entry.reusedCoord7RgbaFnv1a64,
+              byteExact,
+              dimensionsExact,
+              deterministic,
+              pass:
+                byteExact &&
+                dimensionsExact &&
+                deterministic &&
+                metricsExact,
+              width: readback.width,
+              height: readback.height,
+              presentation,
+            });
+          }
+          const stageOrderDistinct =
+            cases.length === 4 &&
+            cases[0].actualRgbaFnv1a64 !==
+              cases[1].actualRgbaFnv1a64 &&
+            cases[2].actualRgbaFnv1a64 !==
+              cases[3].actualRgbaFnv1a64;
+          const derivativeCoordinatesDistinct = cases
+            .filter(entry => entry.packetVersion === 7)
+            .every(entry =>
+              entry.actualRgbaFnv1a64 !==
+                entry.reusedCoord2RgbaFnv1a64 &&
+              entry.actualRgbaFnv1a64 !==
+                entry.reusedCoord7RgbaFnv1a64,
+            );
+          runs.push({
+            index: runIndex + 1,
+            stageOrderDistinct,
+            derivativeCoordinatesDistinct,
+            pass:
+              cases.every(entry => entry.pass) &&
+              stageOrderDistinct &&
+              derivativeCoordinatesDistinct,
+            cases,
+          });
+        }
+
+        renderer.check_health();
+        const diagnostics = renderer.diagnostics();
+        const expectedMetrics =
+          gxMultiCoordTevOracle
+            .certificationExpectedMetrics.twoRuns;
+        const managedCoverageCountersExact =
+          diagnostics.managedCoverageDraws ===
+            expectedMetrics.managedCoverageDraws &&
+          diagnostics.managedCoverageTriangles ===
+            expectedMetrics.managedCoverageTriangles;
+        const diagnosticsClean =
+          exactZeroRejectionDiagnostics(diagnostics);
+        const pipelineLayoutsExact =
+          pipelineLayoutCases.length ===
+            gxMultiCoordTevPipelineLayoutCases.length &&
+          pipelineLayoutCases.every(entry =>
+            entry.pass &&
+            entry.oneSubmit &&
+            entry.oneUnflushedGeometrySegment
+          );
+        const unexpectedCanvasContexts =
+          contextTrace.requests.filter(type => type !== "webgpu");
+        const backendDiagnostics = {
+          renderer: "WebGpuRenderer",
+          navigatorGpuAvailable:
+            typeof navigator.gpu?.requestAdapter === "function",
+          canvasContextRequests: [...contextTrace.requests],
+          unexpectedCanvasContexts,
+          strictWebGpuOnly:
+            contextTrace.requests.length > 0 &&
+            unexpectedCanvasContexts.length === 0 &&
+            contextTrace.requests.every(type => type === "webgpu"),
+        };
+        const packetContractExact = runs
+          .flatMap(entry => entry.cases)
+          .every(entry => {
+            const maps = entry.liveTextureMaps.join(",");
+            const coordinates =
+              entry.liveTextureCoordinates.join(",");
+            const expectedMaps = entry.packetVersion === 4
+              ? ["1,6", "6,1"]
+              : ["0,0"];
+            return (
+              gxMultiCoordTevOracle.packetVersions.includes(
+                entry.packetVersion,
+              ) &&
+              expectedMaps.includes(maps) &&
+              ["2,7", "7,2"].includes(coordinates)
+            );
+          });
+        const result = {
+          pass:
+            backendDiagnostics.navigatorGpuAvailable &&
+            backendDiagnostics.strictWebGpuOnly &&
+            packetContractExact &&
+            pipelineLayoutsExact &&
+            runs.every(entry => entry.pass) &&
+            managedCoverageCountersExact &&
+            diagnosticsClean,
+          runCount: RUN_COUNT,
+          strictWebGpu: true,
+          deterministic: runs
+            .flatMap(entry => entry.cases)
+            .every(entry => entry.deterministic),
+          packetContractExact,
+          pipelineLayoutsExact,
+          pipelineLayoutCases,
+          expectedMetrics,
+          managedCoverageCountersExact,
+          diagnosticsClean,
+          backendDiagnostics,
+          runs,
+          diagnostics,
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliGxMultiCoordTevOraclePromise =
+      run().catch(error => {
+        const result = {
+          pass: false,
+          error: error instanceof Error ? error.stack : String(error),
+        };
+        document.body.dataset.status = "error";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      });
+  </script>
+</body>
+</html>
