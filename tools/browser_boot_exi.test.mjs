@@ -83,6 +83,9 @@ const exiFunctions = [
   "serviceExternalInterfaceInterrupt",
   "exiTransferModeName",
   "exiIplImageStatus",
+  "updateExiSramChecksums",
+  "createDefaultExiSram",
+  "exiIplReadRegion",
   "recordExi0Transfer",
   "transferExi0IplImmediate",
   "serviceExi0",
@@ -127,10 +130,14 @@ function makeContext(exiIplImage = syntheticIpl()) {
     exiRomDisable: 0x00002000,
     exiDmaRegisterMask: 0x03ffffe0,
     exiTransferControlMask: 0x0000003f,
+    exiSramBase: 0x00800000,
+    exiSramBytes: 0x44,
+    exiSramSettingsBase: 0x00800004,
     deviceEvents: new Map(),
     exiIplImageBytes: 2 * 1024 * 1024,
     exiIplImage,
     exiIplSource: { kind: "synthetic-test" },
+    exiSram: null,
     exiTransferTraceLimit: 64,
     exiTransferTrace: [],
     exiTransferOutcomes: new Map(),
@@ -150,6 +157,9 @@ function makeContext(exiIplImage = syntheticIpl()) {
     exi0IplCursor: 0,
     exi0IplAddressSequence: null,
     exi0IplDmaBytes: 0,
+    exi0SramImmediateReadBytes: 0,
+    exi0SramDmaReads: 0,
+    exi0SramDmaBytes: 0,
     exiTransferCompletions: 0,
     exiTransferInterruptAcknowledgements: 0,
     exiInterruptLevelActive: false,
@@ -179,6 +189,7 @@ function makeContext(exiIplImage = syntheticIpl()) {
     context,
     { filename: "browser_boot.exi.js" },
   );
+  context.exiSram = context.createDefaultExiSram();
   context.raisedExceptions = raisedExceptions;
   return context;
 }
@@ -239,14 +250,18 @@ function immediateTransfer(
   return context.view.getUint32(context.mmio + 0x6810, false);
 }
 
-function writeIplAddress(context, sourceOffset, cycle = 1) {
+function writeIplCommand(context, commandWord, cycle = 1) {
   beginIplTransaction(context);
   immediateTransfer(context, {
-    data: (sourceOffset * 64) >>> 0,
+    data: commandWord >>> 0,
     length: 4,
     mode: 1,
     cycle,
   });
+}
+
+function writeIplAddress(context, sourceOffset, cycle = 1) {
+  writeIplCommand(context, sourceOffset * 64, cycle);
 }
 
 function readIplDma(context, dmaBase, dmaLength, cycle = 2, mode = 0) {
@@ -1183,6 +1198,288 @@ test("EXI0 IPL address command orders and completes a bounded DMA read", () => {
   });
 });
 
+test("EXI SRAM uses a deterministic checksum-valid settings template", () => {
+  const context = makeContext();
+
+  assert.equal(context.exiSram.byteLength, 0x44);
+  assert.equal(
+    Array.from(context.exiSram)
+      .map(value => value.toString(16).padStart(2, "0"))
+      .join(" "),
+    "00 00 00 00 00 2c ff d0 00 00 00 00 00 00 00 00 "
+      + "00 00 00 00 00 00 00 2c 44 4f 4c 50 48 49 4e 53 "
+      + "4c 4f 54 41 44 4f 4c 50 48 49 4e 53 4c 4f 54 42 "
+      + "00 00 00 00 00 00 00 00 00 00 00 00 00 00 6e 6d "
+      + "00 00 00 00",
+  );
+  assert.equal(context.exiSram[0x17], 0x2c);
+  assert.equal(
+    String.fromCharCode(...context.exiSram.subarray(0x18, 0x24)),
+    "DOLPHINSLOTA",
+  );
+  assert.equal(
+    String.fromCharCode(...context.exiSram.subarray(0x24, 0x30)),
+    "DOLPHINSLOTB",
+  );
+  assert.deepEqual(
+    Array.from(context.exiSram.subarray(0x3e, 0x40)),
+    [0x6e, 0x6d],
+  );
+
+  context.exiSram[0x17] = 0x6c;
+  assert.deepEqual(
+    plain(context.updateExiSramChecksums(context.exiSram)),
+    { checksum: 0x006c, checksumInverse: 0xff90 },
+  );
+  assert.deepEqual(
+    Array.from(context.exiSram.subarray(4, 8)),
+    [0, 0x6c, 0xff, 0x90],
+  );
+});
+
+test("EXI0 SRAM settings command completes WarioWare's exact DMA read", () => {
+  const context = makeContext(null);
+  const dmaBase = 0x2400;
+  context.bytes.fill(
+    0xa5,
+    context.ram + dmaBase - 1,
+    context.ram + dmaBase + 65,
+  );
+
+  writeIplCommand(context, 0x20000100, 100);
+  assert.equal(context.exi0IplCommandAddress, 0x00800004);
+  assert.equal(context.exi0IplCursor, 0x00800004);
+  assert.equal(context.exi0IplAddressSequence, 1);
+
+  readIplDma(context, dmaBase, 64, 120);
+
+  assert.equal(context.bytes[context.ram + dmaBase - 1], 0xa5);
+  assert.equal(context.bytes[context.ram + dmaBase + 64], 0xa5);
+  assert.deepEqual(
+    Array.from(
+      context.bytes.subarray(
+        context.ram + dmaBase,
+        context.ram + dmaBase + 64,
+      ),
+    ),
+    Array.from(context.exiSram.subarray(4)),
+  );
+  assert.deepEqual(
+    context.reservationInvalidations,
+    [{ address: dmaBase, length: 64 }],
+  );
+  assert.equal(context.exi0IplCursor, 0x00800044);
+  assert.equal(context.exi0SramDmaReads, 1);
+  assert.equal(context.exi0SramDmaBytes, 64);
+  assert.equal(context.exi0IplDmaBytes, 0);
+
+  const [address, dma] = context.exiTransferTrace;
+  assert.equal(address.operation, "sram-address");
+  assert.equal(address.outcome, "accepted");
+  assert.equal(address.commandRegion, "sram");
+  assert.equal(address.sourceKind, "sram");
+  assert.equal(address.sourceConfigured, true);
+  assert.equal(address.commandAddress, "0x00800004");
+  assert.equal(dma.operation, "sram-dma-read");
+  assert.equal(dma.outcome, "complete");
+  assert.equal(dma.commandRegion, "sram");
+  assert.equal(dma.sourceKind, "sram");
+  assert.equal(dma.sourceConfigured, true);
+  assert.equal(dma.addressSequence, address.sequence);
+  assert.equal(dma.iplCursorBefore, "0x00800004");
+  assert.equal(dma.iplCursorAfter, "0x00800044");
+
+  const snapshot = plain(context.snapshotExternalInterface());
+  assert.deepEqual(snapshot.sram, {
+    base: "0x00800000",
+    byteLength: 68,
+    rtcModeled: false,
+    settingsBase: "0x00800004",
+    settingsByteLength: 64,
+    checksum: 0x002c,
+    checksumInverse: 0xffd0,
+    flags: 0x2c,
+    immediateReadBytes: 0,
+    dmaReads: 1,
+    dmaBytes: 64,
+  });
+  assert.equal(snapshot.transfers.dma.attempts, 1);
+  assert.equal(snapshot.transfers.dma.completions, 1);
+  assert.equal(snapshot.transfers.dma.last.operation, "sram-dma-read");
+});
+
+test("EXI0 SRAM reads keep RTC separate and reject overflow atomically", () => {
+  const immediate = makeContext();
+  writeIplCommand(immediate, 0x20000100, 1);
+  assert.equal(
+    immediateTransfer(immediate, {
+      data: 0,
+      length: 4,
+      mode: 0,
+      cycle: 2,
+    }),
+    0x002cffd0,
+  );
+  assert.equal(immediate.exi0SramImmediateReadBytes, 4);
+  assert.equal(immediate.exiTransferTrace.at(-1).operation, "sram-read");
+
+  const lastByte = makeContext();
+  lastByte.exiSram[0x43] = 0xa7;
+  writeIplCommand(lastByte, 0x200010c0, 1);
+  assert.equal(
+    immediateTransfer(lastByte, {
+      data: 0,
+      length: 1,
+      mode: 0,
+      cycle: 2,
+    }),
+    0xa7000000,
+  );
+  assert.equal(lastByte.exi0IplCursor, 0x00800044);
+
+  const immediateOverflow = makeContext();
+  immediateOverflow.exiSram[0x43] = 0xa7;
+  writeIplCommand(immediateOverflow, 0x200010c0, 1);
+  assert.equal(
+    immediateTransfer(immediateOverflow, {
+      data: 0x12345678,
+      length: 2,
+      mode: 0,
+      cycle: 2,
+    }),
+    0x12345678,
+  );
+  assert.equal(immediateOverflow.exi0IplCursor, 0x00800043);
+  assert.equal(immediateOverflow.exi0SramImmediateReadBytes, 0);
+  assert.equal(
+    immediateOverflow.exiTransferTrace.at(-1).reason,
+    "sram-source-out-of-bounds",
+  );
+
+  const rtc = makeContext();
+  writeIplCommand(rtc, 0x20000000, 1);
+  assert.equal(rtc.exi0IplCommandAddress, 0x00800000);
+  assert.equal(rtc.exi0IplAddressSequence, null);
+  assert.equal(rtc.exiTransferTrace.at(-1).operation, "unhandled");
+  assert.equal(rtc.exiTransferTrace.at(-1).reason, "non-ipl-command");
+
+  const exactEnd = makeContext();
+  writeIplCommand(exactEnd, 0x20001100, 1);
+  assert.equal(exactEnd.exi0IplCommandAddress, 0x00800044);
+  assert.equal(exactEnd.exi0IplAddressSequence, null);
+  assert.equal(exactEnd.exiTransferTrace.at(-1).operation, "unhandled");
+  readIplDma(exactEnd, 0x2800, 32, 2);
+  assert.equal(
+    exactEnd.exiTransferTrace.at(-1).reason,
+    "exi-dma-without-readable-address-command",
+  );
+
+  const offset32 = makeContext(null);
+  writeIplCommand(offset32, 0x20000900, 1);
+  readIplDma(offset32, 0x2c00, 32, 2);
+  assert.deepEqual(
+    Array.from(
+      offset32.bytes.subarray(
+        offset32.ram + 0x2c00,
+        offset32.ram + 0x2c20,
+      ),
+    ),
+    Array.from(offset32.exiSram.subarray(0x24)),
+  );
+  assert.equal(offset32.exi0IplCursor, 0x00800044);
+
+  const overflow = makeContext();
+  const dmaBase = 0x3000;
+  overflow.bytes.fill(
+    0x5a,
+    overflow.ram + dmaBase,
+    overflow.ram + dmaBase + 64,
+  );
+  // Address 0x800005 leaves only 63 modeled settings bytes.
+  writeIplCommand(overflow, 0x20000140, 1);
+  readIplDma(overflow, dmaBase, 64, 2);
+  assert.equal(
+    overflow.exiTransferTrace.at(-1).reason,
+    "sram-source-out-of-bounds",
+  );
+  assert.deepEqual(
+    Array.from(
+      overflow.bytes.subarray(
+        overflow.ram + dmaBase,
+        overflow.ram + dmaBase + 64,
+      ),
+    ),
+    Array(64).fill(0x5a),
+  );
+  assert.deepEqual(overflow.reservationInvalidations, []);
+  assert.equal(overflow.exi0IplCursor, 0x00800005);
+  assert.equal(overflow.exi0IplAddressSequence, 1);
+  assert.equal(overflow.exi0SramDmaReads, 0);
+  assert.equal(overflow.exi0SramDmaBytes, 0);
+});
+
+test("EXI0 SRAM immediate and DMA reads share one bounded cursor", () => {
+  const context = makeContext(null);
+  writeIplCommand(context, 0x20000100, 10);
+
+  assert.equal(
+    immediateTransfer(context, {
+      data: 0,
+      length: 4,
+      mode: 0,
+      cycle: 20,
+    }),
+    0x002cffd0,
+  );
+  readIplDma(context, 0x3400, 32, 30);
+
+  assert.deepEqual(
+    Array.from(
+      context.bytes.subarray(
+        context.ram + 0x3400,
+        context.ram + 0x3420,
+      ),
+    ),
+    Array.from(context.exiSram.subarray(8, 40)),
+  );
+  assert.equal(context.exi0IplCursor, 0x00800028);
+  assert.equal(context.exi0SramImmediateReadBytes, 4);
+  assert.equal(context.exi0SramDmaReads, 1);
+  assert.equal(context.exi0SramDmaBytes, 32);
+});
+
+test("EXI0 SRAM zero DMA and writes preserve source state", () => {
+  const zero = makeContext(null);
+  writeIplCommand(zero, 0x20000100, 10);
+  const cursor = zero.exi0IplCursor;
+  readIplDma(zero, 0xffffffff, 31, 20);
+  assert.equal(zero.exiTransferTrace.at(-1).outcome, "complete");
+  assert.equal(zero.exiTransferTrace.at(-1).dmaLength, 0);
+  assert.equal(zero.exi0IplCursor, cursor);
+  assert.equal(zero.exi0SramDmaReads, 0);
+  assert.equal(zero.exi0SramDmaBytes, 0);
+  assert.deepEqual(zero.reservationInvalidations, []);
+  assert.equal(
+    plain(zero.snapshotExternalInterface()).transfers.dma
+      .zeroLengthCompletions,
+    1,
+  );
+
+  const write = makeContext(null);
+  const before = Array.from(write.exiSram);
+  writeIplCommand(write, 0xa0000100, 10);
+  immediateTransfer(write, {
+    data: 0x12345678,
+    length: 4,
+    mode: 1,
+    cycle: 20,
+  });
+  assert.equal(write.exiTransferTrace[0].operation, "unhandled");
+  assert.equal(write.exiTransferTrace[1].operation, "unhandled");
+  assert.equal(write.exi0IplAddressSequence, null);
+  assert.deepEqual(Array.from(write.exiSram), before);
+});
+
 test("EXI transfer registers expose only hardware bits on every channel", () => {
   const context = makeContext();
 
@@ -1511,7 +1808,7 @@ test("EXI0 IPL DMA rejects wrong modes and source or RAM range overflow", () => 
   readIplDma(wrongMode, 0x2000, 32, 2, 1);
   assert.equal(
     wrongMode.exiTransferTrace.at(-1).reason,
-    "ipl-dma-requires-read",
+    "exi-dma-requires-read",
   );
 
   const wrongImageSize = makeContext(new Uint8Array(128));
@@ -1526,7 +1823,7 @@ test("EXI0 IPL DMA rejects wrong modes and source or RAM range overflow", () => 
   readIplDma(missingAddressCommand, 0x2000, 32);
   assert.equal(
     missingAddressCommand.exiTransferTrace.at(-1).reason,
-    "ipl-dma-without-address-command",
+    "exi-dma-without-readable-address-command",
   );
 
   const staleAddressAfterRtc = makeContext();
@@ -1542,7 +1839,7 @@ test("EXI0 IPL DMA rejects wrong modes and source or RAM range overflow", () => 
   readIplDma(staleAddressAfterRtc, 0x2000, 32, 3);
   assert.equal(
     staleAddressAfterRtc.exiTransferTrace.at(-1).reason,
-    "ipl-dma-without-address-command",
+    "exi-dma-without-readable-address-command",
   );
 
   for (const context of [

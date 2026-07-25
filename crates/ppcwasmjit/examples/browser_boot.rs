@@ -992,6 +992,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererFailure = null;
     let rendererResidentTextureKeys = new Set();
     const exiIplImageBytes = 2 * 1024 * 1024;
+    const exiSramBase = 0x00800000;
+    const exiSramBytes = 0x44;
+    const exiSramSettingsBase = exiSramBase + 4;
     const workerExecutionTimingSampleStride = 1024;
     let workerExecutionTimingEligibleCalls = 0;
     function newWorkerPhaseTiming(sampleStride) {
@@ -5331,6 +5334,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     // No proprietary IPL bytes belong in this generated harness.
     let exiIplImage = configuredExiIpl.image;
     const exiIplSource = configuredExiIpl.source;
+    const exiSram = createDefaultExiSram();
     const exiTransferTraceLimit = 64;
     const exiTransferTrace = [];
     const exiTransferOutcomes = new Map();
@@ -5350,6 +5354,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     let exi0IplCursor = 0;
     let exi0IplAddressSequence = null;
     let exi0IplDmaBytes = 0;
+    let exi0SramImmediateReadBytes = 0;
+    let exi0SramDmaReads = 0;
+    let exi0SramDmaBytes = 0;
     let exiTransferCompletions = 0;
     let exiTransferInterruptAcknowledgements = 0;
     let exiInterruptLevelActive = false;
@@ -16664,6 +16671,63 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function updateExiSramChecksums(sram) {
+      if (
+        Object.prototype.toString.call(sram) !== "[object Uint8Array]"
+        || sram.byteLength !== exiSramBytes
+      ) {
+        throw new RangeError(
+          `EXI SRAM must be a ${exiSramBytes}-byte Uint8Array`
+        );
+      }
+      let checksum = 0;
+      let checksumInverse = 0;
+      // The settings checksums cover rtc_bias through flags: four
+      // big-endian words at offsets 0x10..0x17 in the aggregate image.
+      for (let offset = 0x10; offset < 0x18; offset += 2) {
+        const word = (sram[offset] << 8) | sram[offset + 1];
+        checksum = (checksum + word) & 0xffff;
+        checksumInverse = (checksumInverse + (word ^ 0xffff)) & 0xffff;
+      }
+      sram[0x04] = checksum >>> 8;
+      sram[0x05] = checksum & 0xff;
+      sram[0x06] = checksumInverse >>> 8;
+      sram[0x07] = checksumInverse & 0xff;
+      return { checksum, checksumInverse };
+    }
+
+    function createDefaultExiSram() {
+      const sram = new Uint8Array(exiSramBytes);
+      // Match Dolphin's public deterministic SRAM template (Sram.cpp at
+      // 707d3c7a, GPL-2.0-or-later): English, stereo, initial setup
+      // complete, and stable placeholder card IDs.
+      sram[0x17] = 0x2c;
+      for (const [offset, value] of [
+        [0x18, "DOLPHINSLOTA"],
+        [0x24, "DOLPHINSLOTB"],
+      ]) {
+        for (let index = 0; index < value.length; index += 1) {
+          sram[offset + index] = value.charCodeAt(index);
+        }
+      }
+      sram[0x3e] = 0x6e;
+      sram[0x3f] = 0x6d;
+      updateExiSramChecksums(sram);
+      return sram;
+    }
+
+    function exiIplReadRegion(address) {
+      if (!Number.isInteger(address) || address < 0) return null;
+      if (address < exiIplImageBytes) return "rom";
+      if (
+        address >= exiSramSettingsBase
+        && address < exiSramBase + exiSramBytes
+      ) {
+        return "sram";
+      }
+      return null;
+    }
+
     function transferExi0IplImmediate(control, immediate) {
       const transferMode = (control >>> 2) & 3;
       const immediateLength = ((control >>> 4) & 3) + 1;
@@ -16673,6 +16737,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       let immediateAfter = immediateBefore;
       let commandCompleted = false;
       let imageStatus = null;
+      const dataRegionBefore = exiIplReadRegion(exi0IplCommandAddress);
+      const sramImmediateOutOfBounds = (
+        transferMode === 0
+        && commandBytesBefore >= 4
+        && exi0IplCommandWrite === false
+        && dataRegionBefore === "sram"
+        && (
+          exi0IplCursor < exiSramSettingsBase
+          || exi0IplCursor > exiSramBase + exiSramBytes
+          || immediateLength
+            > exiSramBase + exiSramBytes - exi0IplCursor
+        )
+      );
 
       const transferByte = input => {
         const inputByte = input & 0xff;
@@ -16694,10 +16771,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           return 0xff;
         }
 
-        if (
-          exi0IplCommandWrite === false
-          && exi0IplCommandAddress < exiIplImageBytes
-        ) {
+        const readRegion = exiIplReadRegion(exi0IplCommandAddress);
+        if (exi0IplCommandWrite === false && readRegion === "rom") {
           imageStatus ??= exiIplImageStatus();
           const source = exi0IplCursor % exiIplImageBytes;
           const output = imageStatus.valid ? exiIplImage[source] : 0;
@@ -16706,14 +16781,23 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
           return output;
         }
+        if (exi0IplCommandWrite === false && readRegion === "sram") {
+          if (exi0IplCursor < exiSramBase + exiSramBytes) {
+            const output = exiSram[exi0IplCursor - exiSramBase];
+            exi0IplCursor = (exi0IplCursor + 1) >>> 0;
+            exi0SramImmediateReadBytes += 1;
+            return output;
+          }
+          return inputByte;
+        }
 
-        // RTC, SRAM, UART, and writes are separate device-model layers.
+        // RTC, UART, and writes are separate device-model layers.
         // Leaving the byte untouched matches Dolphin's IPL TransferByte
         // behavior for an unhandled address while failing closed on state.
         return inputByte;
       };
 
-      if (transferMode === 0) {
+      if (transferMode === 0 && !sramImmediateOutOfBounds) {
         immediateAfter = 0;
         for (let index = 0; index < immediateLength; index += 1) {
           immediateAfter |= transferByte(0) << (24 - index * 8);
@@ -16731,7 +16815,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       let operation;
       let outcome;
       let reason = null;
-      if (transferMode === 2) {
+      const commandRegion = exiIplReadRegion(exi0IplCommandAddress);
+      if (sramImmediateOutOfBounds) {
+        operation = "sram-read";
+        outcome = "rejected";
+        reason = "sram-source-out-of-bounds";
+      } else if (transferMode === 2) {
         operation = "ipl-immediate-read-write";
         outcome = "ignored";
         reason = "ipl-read-write-no-op";
@@ -16742,9 +16831,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       } else if (commandCompleted) {
         if (
           exi0IplCommandWrite === false
-          && exi0IplCommandAddress < exiIplImageBytes
+          && commandRegion !== null
         ) {
-          operation = "ipl-address";
+          operation = commandRegion === "rom"
+            ? "ipl-address"
+            : "sram-address";
           outcome = "accepted";
         } else {
           operation = "unhandled";
@@ -16757,7 +16848,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         reason = "ipl-command-incomplete";
       } else if (
         exi0IplCommandWrite === false
-        && exi0IplCommandAddress < exiIplImageBytes
+        && commandRegion === "rom"
       ) {
         operation = "ipl-rom-read";
         imageStatus ??= exiIplImageStatus();
@@ -16770,6 +16861,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else {
           outcome = "complete";
         }
+      } else if (
+        exi0IplCommandWrite === false
+        && commandRegion === "sram"
+      ) {
+        operation = "sram-read";
+        outcome = "complete";
       } else {
         operation = "unhandled";
         outcome = "ignored";
@@ -16789,6 +16886,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         commandWordAfter: exi0IplCommandWord,
         commandBytesBefore,
         commandBytesAfter: exi0IplCommandBytes,
+        commandRegion,
         imageStatus,
       };
     }
@@ -16893,22 +16991,34 @@ const TEMPLATE: &str = r##"<!doctype html>
         reason = immediateFraming.reason;
         imageStatus = immediateFraming.imageStatus;
       } else {
-        operation = "ipl-dma-read";
-        imageStatus = exiIplImageStatus();
+        const commandRegion = exiIplReadRegion(exi0IplCommandAddress);
+        operation = commandRegion === "sram"
+          ? "sram-dma-read"
+          : "ipl-dma-read";
+        if (commandRegion === "rom") {
+          imageStatus = exiIplImageStatus();
+        }
         if (transferMode !== 0) {
           outcome = "rejected";
-          reason = "ipl-dma-requires-read";
+          reason = "exi-dma-requires-read";
         } else if (
           exi0IplCommandBytes !== 4
           || exi0IplCommandWrite !== false
           || exi0IplAddressSequence === null
+          || commandRegion === null
         ) {
           outcome = "rejected";
-          reason = "ipl-dma-without-address-command";
-        } else if (!imageStatus.configured) {
+          reason = "exi-dma-without-readable-address-command";
+        } else if (
+          commandRegion === "rom"
+          && !imageStatus.configured
+        ) {
           outcome = "unavailable";
           reason = "ipl-image-not-configured";
-        } else if (!imageStatus.valid) {
+        } else if (
+          commandRegion === "rom"
+          && !imageStatus.valid
+        ) {
           outcome = "rejected";
           reason = "invalid-ipl-image";
         } else if (dmaLength === 0) {
@@ -16916,11 +17026,24 @@ const TEMPLATE: &str = r##"<!doctype html>
           // completion. The RAM address is not consulted in that case.
           outcome = "complete";
         } else if (
-          exi0IplCursor > imageStatus.byteLength
-          || dmaLength > imageStatus.byteLength - exi0IplCursor
+          commandRegion === "rom"
+          && (
+            exi0IplCursor > imageStatus.byteLength
+            || dmaLength > imageStatus.byteLength - exi0IplCursor
+          )
         ) {
           outcome = "rejected";
           reason = "ipl-source-out-of-bounds";
+        } else if (
+          commandRegion === "sram"
+          && (
+            exi0IplCursor < exiSramSettingsBase
+            || exi0IplCursor > exiSramBase + exiSramBytes
+            || dmaLength > exiSramBase + exiSramBytes - exi0IplCursor
+          )
+        ) {
+          outcome = "rejected";
+          reason = "sram-source-out-of-bounds";
         } else {
           dmaTarget = physicalRamPointer(dmaBase, dmaLength);
           if (dmaTarget === null) {
@@ -16928,17 +17051,36 @@ const TEMPLATE: &str = r##"<!doctype html>
             reason = "ram-target-out-of-bounds";
           } else {
             invalidateDataReservationForExternalWrite(dmaBase, dmaLength);
-            bytes.set(
-              exiIplImage.subarray(exi0IplCursor, exi0IplCursor + dmaLength),
-              dmaTarget
-            );
-            exi0IplCursor += dmaLength;
-            exi0IplDmaBytes += dmaLength;
+            if (commandRegion === "rom") {
+              bytes.set(
+                exiIplImage.subarray(
+                  exi0IplCursor,
+                  exi0IplCursor + dmaLength
+                ),
+                dmaTarget
+              );
+              exi0IplDmaBytes += dmaLength;
+            } else {
+              const source = exi0IplCursor - exiSramBase;
+              bytes.set(
+                exiSram.subarray(source, source + dmaLength),
+                dmaTarget
+              );
+              exi0SramDmaReads += 1;
+              exi0SramDmaBytes += dmaLength;
+            }
+            exi0IplCursor = (exi0IplCursor + dmaLength) >>> 0;
             outcome = "complete";
           }
         }
       }
 
+      const commandRegion = immediateFraming?.commandRegion
+        ?? exiIplReadRegion(exi0IplCommandAddress);
+      const sourceKind = (
+        deviceSelect === 2
+        && exi0IplCommandWrite === false
+      ) ? commandRegion : null;
       const recorded = recordExi0Transfer({
         cycle: observedCycles,
         parameter: hex32(parameter),
@@ -16958,6 +17100,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         commandWordAfter: hex32(exi0IplCommandWord),
         commandBytesBefore,
         commandBytesAfter: exi0IplCommandBytes,
+        commandRegion,
+        sourceKind,
         commandAddress: hex32(exi0IplCommandAddress),
         dmaBase: hex32(dmaBase),
         dmaLength,
@@ -16969,11 +17113,15 @@ const TEMPLATE: &str = r##"<!doctype html>
         iplCursorBefore: hex32(iplCursorBefore),
         iplCursorAfter: hex32(exi0IplCursor),
         addressSequence: addressSequenceBefore,
-        sourceConfigured: imageStatus?.configured ?? exiIplImage !== null,
+        sourceConfigured: sourceKind === "sram"
+          ? true
+          : sourceKind === "rom"
+            ? imageStatus?.configured ?? exiIplImage !== null
+            : null,
       });
       if (
         immediateFraming?.commandCompleted === true
-        && operation === "ipl-address"
+        && immediateFraming.commandRegion !== null
         && outcome === "accepted"
       ) {
         exi0IplAddressSequence = recorded.sequence;
@@ -17060,6 +17208,19 @@ const TEMPLATE: &str = r##"<!doctype html>
           cursor: hex32(exi0IplCursor),
           addressSequence: exi0IplAddressSequence,
           dmaBytes: exi0IplDmaBytes,
+        },
+        sram: {
+          base: hex32(exiSramBase),
+          byteLength: exiSram.byteLength,
+          rtcModeled: false,
+          settingsBase: hex32(exiSramSettingsBase),
+          settingsByteLength: exiSramBytes - 4,
+          checksum: (exiSram[0x04] << 8) | exiSram[0x05],
+          checksumInverse: (exiSram[0x06] << 8) | exiSram[0x07],
+          flags: exiSram[0x17],
+          immediateReadBytes: exi0SramImmediateReadBytes,
+          dmaReads: exi0SramDmaReads,
+          dmaBytes: exi0SramDmaBytes,
         },
         transfers: {
           total: exiTransferSequence,
