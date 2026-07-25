@@ -12,6 +12,7 @@ import {
   PUBLIC_VIEWPORT,
   assignPublicDisc,
   clearPublicViewport,
+  configurePublicCompatibilityDebug,
   configurePublicViewport,
   expectedPublicFrameUrl,
   validateObservedPublicActiveRelease,
@@ -60,6 +61,7 @@ async function activeRelease() {
 
 function readyState(frameUrl, publicUrl) {
   return {
+    compatibilityDebugAvailable: true,
     compositorCaptureAvailable: false,
     dataset: { renderer: "wgpu-webgpu", status: "waiting" },
     discStatus: "open a disc",
@@ -73,18 +75,17 @@ function readyState(frameUrl, publicUrl) {
     surface: "release",
     topReadyState: "complete",
     topUrl: publicUrl,
-    viewportCaptureMode: "enabled",
+    viewportCaptureMode: null,
   };
 }
 
 test("public release pins the outer path and immutable iframe identity", async () => {
   const release = await activeRelease();
-  const publicUrl = "https://gekko.free/?scenario=smb-ready-play&viewportCapture=1&headlessRun=run-1";
+  const publicUrl = "https://gekko.free/";
   const frameUrl = expectedPublicFrameUrl(publicUrl, release);
   assert.equal(
     frameUrl,
-    `${new URL(release.frontend.url, publicUrl).origin}${release.frontend.url}`
-      + "?scenario=smb-ready-play&viewportCapture=1&headlessRun=run-1",
+    `${new URL(release.frontend.url, publicUrl).origin}${release.frontend.url}`,
   );
 
   const options = {
@@ -126,8 +127,8 @@ test("public release pins the outer path and immutable iframe identity", async (
 });
 
 test("public readiness requires the exact top-level and immutable frame URLs", async () => {
-  const publicUrl = "https://gekko.free/?scenario=smb-ready-play";
-  const frameUrl = "https://gekko.free/assets/frontend-immutable.html?scenario=smb-ready-play";
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = "https://gekko.free/assets/frontend-immutable.html";
   const state = readyState(frameUrl, publicUrl);
   const session = { async evaluate() { return state; } };
   assert.strictEqual(await waitForPublicRelease(session, {
@@ -140,8 +141,8 @@ test("public readiness requires the exact top-level and immutable frame URLs", a
 
 test("shared public disc assignment and runner observation stay iframe-owned", async () => {
   const calls = [];
-  const publicUrl = "https://gekko.free/?scenario=smb-ready-play";
-  const frameUrl = "https://gekko.free/assets/frontend.html?scenario=smb-ready-play";
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = "https://gekko.free/assets/frontend.html";
   const state = {
     ...readyState(frameUrl, publicUrl),
     dataset: { renderer: "wgpu-webgpu", status: "running" },
@@ -172,6 +173,31 @@ test("shared public disc assignment and runner observation stay iframe-owned", a
   }), state);
   assert.ok(calls.some(call => call.method === "DOM.setFileInputFiles"));
   assert.ok(calls.some(call => call.method === "Runtime.releaseObject"));
+});
+
+test("compatibility scenarios use the explicit iframe debug control before disc activation", async () => {
+  const expressions = [];
+  const session = {
+    async evaluate(expression) {
+      expressions.push(expression);
+      return { scenario: "smb-ready-play", viewportCaptureMode: "enabled" };
+    },
+  };
+  assert.deepEqual(
+    await configurePublicCompatibilityDebug(session, {
+      scenario: "smb-ready-play",
+      viewportCapture: true,
+    }),
+    { scenario: "smb-ready-play", viewportCaptureMode: "enabled" },
+  );
+  assert.equal(expressions.length, 1);
+  assert.match(expressions[0], /lazuliCompatibilityDebug/);
+  assert.match(expressions[0], /selectScenario\(request\.scenario\)/);
+  assert.doesNotMatch(expressions[0], /location\.searchParams|history\.|location\.replace/);
+  await assert.rejects(
+    configurePublicCompatibilityDebug(session, { scenario: "other" }),
+    /scenario is unsupported/,
+  );
 });
 
 test("public viewport commands are fixed, reversible, and independent of renderer pacing", async () => {

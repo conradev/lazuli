@@ -18,6 +18,7 @@ import {
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   assignPublicDisc,
+  configurePublicCompatibilityDebug,
   expectedPublicFrameUrl,
   observePublicActiveRelease,
   parsePublicReport,
@@ -145,7 +146,6 @@ export function configuredPublicSmbSustainedUrl(value) {
   if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
     evidenceFailure("--url", "expected the exact production root without query or fragment");
   }
-  url.searchParams.set("scenario", PUBLIC_SMB_SUSTAINED_SCENARIO);
   return url.href;
 }
 
@@ -165,11 +165,10 @@ export function validatePublicSmbSustainedEnvelope(evidence) {
   const publicUrl = productionUrl(evidence.publicUrl, "$.publicUrl");
   if (
     publicUrl.pathname !== "/"
+    || publicUrl.search !== ""
     || publicUrl.hash !== ""
-    || publicUrl.searchParams.size !== 1
-    || publicUrl.searchParams.get("scenario") !== PUBLIC_SMB_SUSTAINED_SCENARIO
   ) {
-    evidenceFailure("$.publicUrl", `expected exact ${PUBLIC_SMB_SUSTAINED_SCENARIO} route`);
+    evidenceFailure("$.publicUrl", "expected the exact queryless production root");
   }
   const release = validateReleaseIdentity(evidence.release, expected, "$.release");
   const terminalRelease = validateReleaseIdentity(
@@ -439,6 +438,9 @@ export async function runPublicSmbSustained(options) {
       options.publicUrl,
       frameUrl,
     );
+    await configurePublicCompatibilityDebug(session, {
+      scenario: PUBLIC_SMB_SUSTAINED_SCENARIO,
+    });
     await assignPublicDisc(session, options.disc, {
       deadline,
       label: "Super Monkey Ball CISO",

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import process from "node:process";
@@ -19,6 +19,7 @@ import {
   PUBLIC_VIEWPORT,
   assignPublicDisc,
   clearPublicViewport,
+  configurePublicCompatibilityDebug,
   configurePublicViewport,
   expectedPublicFrameUrl,
   observePublicActiveRelease,
@@ -667,7 +668,7 @@ async function observePinnedNavigation(
   };
 }
 
-export function configuredPublicSmbCaptureUrl(urlValue, headlessRun) {
+export function configuredPublicSmbCaptureUrl(urlValue) {
   const url = new URL(urlValue);
   if (
     url.origin !== "https://gekko.free"
@@ -679,12 +680,6 @@ export function configuredPublicSmbCaptureUrl(urlValue, headlessRun) {
   if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
     throw new Error("--url must be the exact public root without query or fragment");
   }
-  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(headlessRun)) {
-    throw new Error("passive capture headlessRun is invalid");
-  }
-  url.searchParams.set("scenario", PUBLIC_SCENARIO);
-  url.searchParams.set("viewportCapture", "1");
-  url.searchParams.set("headlessRun", headlessRun);
   return url.href;
 }
 
@@ -733,8 +728,7 @@ export function parsePublicSmbScreencastArguments(argv) {
     throw new Error("--timeout-ms must be an integer >= --poll-ms");
   }
   options.disc = resolve(options.disc);
-  options.headlessRun = `passive-${randomUUID()}`;
-  options.publicUrl = configuredPublicSmbCaptureUrl(options.url, options.headlessRun);
+  options.publicUrl = configuredPublicSmbCaptureUrl(options.url);
   return options;
 }
 
@@ -762,8 +756,20 @@ async function collectPublicSmbScreencast(
     pollMs: options.pollMs,
     publicUrl: options.publicUrl,
   });
-  if (initialState.viewportCaptureMode !== "enabled") {
-    throw captureFailure("public shell did not enable viewport capture mode");
+  if (initialState.viewportCaptureMode !== null) {
+    throw captureFailure("public root unexpectedly enabled viewport capture mode");
+  }
+  await configurePublicCompatibilityDebug(session, {
+    scenario: PUBLIC_SCENARIO,
+    viewportCapture: true,
+  });
+  const configuredState = await waitForPublicRelease(session, {
+    deadline,
+    pollMs: options.pollMs,
+    publicUrl: options.publicUrl,
+  });
+  if (configuredState.viewportCaptureMode !== "enabled") {
+    throw captureFailure("compatibility debug control did not enable viewport capture mode");
   }
   const release = await observePublicActiveRelease(session, options);
   const frameUrl = expectedPublicFrameUrl(options.publicUrl, release);

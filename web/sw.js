@@ -14,7 +14,6 @@ export const RELEASE_CACHE_PREFIX = "gekko-release-";
 export const ACTIVE_RECORD_PATH = "/.gekko/active-release";
 export const STAGE_RELEASE_PATH = "/.gekko/stage-release";
 export const WORKER_STATUS_PATH = "/.gekko/worker-status";
-export const APP_PATH = "/app.html";
 
 const BOOTSTRAP_ASSETS = [
   "/index.html",
@@ -338,11 +337,6 @@ export async function handleFetch(request) {
     return networkFirstBootstrap(request);
   }
   if (url.pathname === "/release.json") return networkFirstRelease(request);
-  if (url.pathname === APP_PATH) {
-    const root = new URL("/", url);
-    root.search = url.search;
-    return Response.redirect(root.href, 302);
-  }
   if (url.pathname === "/ppcwasmjit.wasm") {
     const active = await readActiveRelease(caches, self.location.origin);
     if (active !== null) {

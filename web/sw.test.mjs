@@ -5,7 +5,6 @@ import { test } from "node:test";
 
 import {
   ACTIVE_RECORD_PATH,
-  APP_PATH,
   META_CACHE,
   WORKER_STATUS_PATH,
   activeReleaseResponse,
@@ -282,11 +281,6 @@ test("keeps a verified schema-1 release readable until schema 2 commits", async 
       return new Response("unexpected network response");
     },
     async () => {
-      const legacyApp = await handleFetch(new Request(
-        `${ORIGIN}${APP_PATH}?scenario=smb-ready-play`,
-      ));
-      assert.equal(legacyApp.status, 302);
-      assert.equal(legacyApp.headers.get("Location"), `${ORIGIN}/?scenario=smb-ready-play`);
       const blockedPaths = [
         legacy.backend.url,
         legacy.frontend.url,
@@ -414,34 +408,21 @@ test("reuses unchanged content-addressed backend chunks across releases", async 
   assert.ok(storage.caches.has(secondRecord.cacheName));
 });
 
-test("redirects controlled legacy app navigation without serving the active frontend", async () => {
-  assert.equal(APP_PATH, "/app.html");
+test("does not intercept unknown navigation routes", async () => {
   const storage = new MemoryCacheStorage();
-  const candidate = await makeRelease(7);
-  await stageRelease(candidate.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(candidate.responses),
-    origin: ORIGIN,
-    cacheSuffix: "legacy-route",
-  });
   const networkRequests = [];
   await withWorkerGlobals(
     storage,
     async request => {
       networkRequests.push(request.url);
-      return new Response("unexpected network response");
+      return new Response("not found", { status: 404 });
     },
     async () => {
-      const response = await handleFetch(new Request(
-        `${ORIGIN}${APP_PATH}?scenario=smb-ready-play&source=legacy`,
-      ));
-      assert.equal(response.status, 302);
-      assert.equal(
-        response.headers.get("Location"),
-        `${ORIGIN}/?scenario=smb-ready-play&source=legacy`,
-      );
-      assert.equal(await response.text(), "");
-      assert.deepEqual(networkRequests, []);
+      for (const path of ["/unknown", "/nested/unknown"]) {
+        const response = await handleFetch(new Request(`${ORIGIN}${path}`));
+        assert.equal(response.status, 404);
+      }
+      assert.deepEqual(networkRequests, [`${ORIGIN}/unknown`, `${ORIGIN}/nested/unknown`]);
     },
   );
 });

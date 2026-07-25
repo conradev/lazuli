@@ -341,17 +341,17 @@ test("stopScreencast failure still closes the collector and drains acknowledgeme
   ]);
 });
 
-test("public SMB run URL is the exact passive trio on the outer root", () => {
+test("public SMB run URL remains the exact queryless outer root", () => {
   assert.equal(
-    configuredPublicSmbCaptureUrl("https://gekko.free/", "run-1"),
-    "https://gekko.free/?scenario=smb-ready-play&viewportCapture=1&headlessRun=run-1",
+    configuredPublicSmbCaptureUrl("https://gekko.free/"),
+    "https://gekko.free/",
   );
   assert.throws(
-    () => configuredPublicSmbCaptureUrl("https://gekko.free/app.html", "run-1"),
+    () => configuredPublicSmbCaptureUrl("https://gekko.free/not-root"),
     /exact public root/,
   );
   assert.throws(
-    () => configuredPublicSmbCaptureUrl("https://gekko.free/?renderEvery=1", "run-1"),
+    () => configuredPublicSmbCaptureUrl("https://gekko.free/?renderEvery=1"),
     /exact public root/,
   );
   for (const publicRoot of [
@@ -361,7 +361,7 @@ test("public SMB run URL is the exact passive trio on the outer root", () => {
     "https://gekko.free:8443/",
   ]) {
     assert.throws(
-      () => configuredPublicSmbCaptureUrl(publicRoot, "run-1"),
+      () => configuredPublicSmbCaptureUrl(publicRoot),
       /exact production origin https:\/\/gekko\.free/,
       publicRoot,
     );
@@ -397,8 +397,7 @@ test("passive CLI requires exact release pins and has no renderer cadence option
     "--expect-release-id", "2".repeat(64),
   ];
   const options = parsePublicSmbScreencastArguments(base);
-  assert.equal(options.publicUrl.includes("viewportCapture=1"), true);
-  assert.equal(options.publicUrl.includes("renderEvery"), false);
+  assert.equal(options.publicUrl, "https://gekko.free/");
   assert.equal("renderEvery" in options, false);
   assert.throws(
     () => parsePublicSmbScreencastArguments([...base, "--render-every", "1"]),
@@ -424,6 +423,15 @@ test("passive runner uses Page.startScreencast without renderer rendezvous", asy
   assert.match(source, /canvas\.bufferHeight === 448/);
   assert.match(source, /canvas\.objectFit === "contain"/);
   assert.match(source, /SMB became \$\{capture\.status\} before the public viewport was capturable/);
+  assert.match(
+    source,
+    /configurePublicCompatibilityDebug\(session, \{\s*scenario: PUBLIC_SCENARIO,\s*viewportCapture: true,\s*\}\)/,
+  );
+  assert.ok(
+    source.indexOf("await configurePublicCompatibilityDebug(")
+      < source.indexOf("await assignPublicDisc("),
+    "compatibility scenario selection must precede local disc activation",
+  );
   assert.match(source, /await stopPublicSmbScreencast\(session, collector, started\)/);
   assert.doesNotMatch(source, /lazuliCompositorCapture|capturePendingCompositorFrame/);
   assert.doesNotMatch(source, /setRenderEvery|renderEvery=/);

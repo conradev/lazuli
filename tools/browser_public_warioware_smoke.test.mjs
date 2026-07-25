@@ -35,8 +35,8 @@ function validEvidence() {
       sha256: "a".repeat(64),
     },
     discStatus: "local: WarioWare, Inc. - Mega Party Game$! (USA).ciso",
-    frameUrl: `https://gekko.free/assets/frontend-${"b".repeat(64)}.html?scenario=smb-ready-play`,
-    publicUrl: "https://gekko.free/?scenario=smb-ready-play",
+    frameUrl: `https://gekko.free/assets/frontend-${"b".repeat(64)}.html`,
+    publicUrl: "https://gekko.free/",
     release,
     report: {
       status: "running",
@@ -154,7 +154,7 @@ function setNoHostPresentation(report) {
   report.rendering.selectedXfb = null;
 }
 
-test("public WarioWare smoke accepts a healthy release snapshot with stale SMB query", () => {
+test("public WarioWare smoke accepts a healthy queryless release snapshot", () => {
   const evidence = validEvidence();
   assert.strictEqual(validatePublicWarioWareSmokeEvidence(evidence), evidence);
 });
@@ -187,7 +187,7 @@ test("public WarioWare smoke rejects partial explicit host presentation identity
 test("public WarioWare runtime accepts only the exact production root", () => {
   assert.equal(
     configuredPublicWarioWareUrl("https://gekko.free/"),
-    "https://gekko.free/?scenario=smb-ready-play",
+    "https://gekko.free/",
   );
   for (const publicRoot of [
     "http://gekko.free/",
@@ -203,9 +203,9 @@ test("public WarioWare runtime accepts only the exact production root", () => {
   }
 });
 
-test("public WarioWare smoke rejects the mutable app path with the exact scenario query", () => {
+test("public WarioWare smoke rejects a mutable frontend path", () => {
   const evidence = validEvidence();
-  evidence.frameUrl = "https://gekko.free/app.html?scenario=smb-ready-play";
+  evidence.frameUrl = "https://gekko.free/frontend.html";
   assert.throws(
     () => validatePublicWarioWareSmokeEvidence(evidence),
     /\$\.frameUrl: expected a content-addressed immutable frontend path/,
@@ -215,7 +215,7 @@ test("public WarioWare smoke rejects the mutable app path with the exact scenari
 test("public WarioWare smoke binds its same-origin iframe to the active release", () => {
   const crossOrigin = validEvidence();
   crossOrigin.frameUrl =
-    `https://example.com/assets/frontend-${"b".repeat(64)}.html?scenario=smb-ready-play`;
+    `https://example.com/assets/frontend-${"b".repeat(64)}.html`;
   assert.throws(
     () => validatePublicWarioWareSmokeEvidence(crossOrigin),
     /\$\.frameUrl: expected exact production origin https:\/\/gekko\.free/,
@@ -223,7 +223,7 @@ test("public WarioWare smoke binds its same-origin iframe to the active release"
 
   const wrongAsset = validEvidence();
   wrongAsset.frameUrl =
-    `https://gekko.free/assets/frontend-${"c".repeat(64)}.html?scenario=smb-ready-play`;
+    `https://gekko.free/assets/frontend-${"c".repeat(64)}.html`;
   assert.throws(
     () => validatePublicWarioWareSmokeEvidence(wrongAsset),
     /\$\.frameUrl: does not match the active release frontend identity/,
@@ -237,10 +237,18 @@ test("public WarioWare smoke binds its same-origin iframe to the active release"
   );
 });
 
-test("public WarioWare smoke rejects scenario leakage and unhealthy evidence", () => {
+test("public WarioWare smoke rejects URL state leakage and unhealthy evidence", () => {
   const cases = [
-    ["top query", value => { value.publicUrl = "https://gekko.free/"; }, /\$\.publicUrl/],
-    ["frame query", value => { value.frameUrl = "https://gekko.free/app.html"; }, /\$\.frameUrl/],
+    [
+      "top query",
+      value => { value.publicUrl = "https://gekko.free/?scenario=smb-ready-play"; },
+      /\$\.publicUrl/,
+    ],
+    [
+      "frame query",
+      value => { value.frameUrl += "?scenario=smb-ready-play"; },
+      /\$\.frameUrl/,
+    ],
     ["surface", value => { value.surface = "debug"; }, /\$\.surface/],
     ["dataset status", value => { value.dataset.status = "stopped"; }, /\$\.dataset\.status/],
     ["dataset renderer", value => { value.dataset.renderer = "fallback"; }, /\$\.dataset\.renderer/],
@@ -473,7 +481,7 @@ test("public WarioWare snapshot wait preserves a production-shaped retry on inne
   const state = {
     dataset: { renderer: "wgpu-webgpu", status: "running" },
     discStatus: "local: WarioWare, Inc. - Mega Party Game$! (USA).ciso",
-    frameUrl: `https://gekko.free/assets/frontend-${"b".repeat(64)}.html?scenario=smb-ready-play`,
+    frameUrl: `https://gekko.free/assets/frontend-${"b".repeat(64)}.html`,
     result: JSON.stringify(report),
     surface: "release",
   };

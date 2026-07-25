@@ -29,6 +29,7 @@ const PUBLIC_RELEASE_STATE = `(() => {
   const frameWindow = frame?.contentWindow ?? null;
   if (frameDocument === null || frameWindow === null) {
     return {
+      compatibilityDebugAvailable: false,
       compositorCaptureAvailable: false,
       dataset: {},
       discStatus: null,
@@ -46,7 +47,10 @@ const PUBLIC_RELEASE_STATE = `(() => {
     };
   }
   const compositor = frameWindow.lazuliCompositorCapture;
+  const compatibilityDebug = frameWindow.lazuliCompatibilityDebug;
   return {
+    compatibilityDebugAvailable:
+      typeof compatibilityDebug?.selectScenario === "function",
     compositorCaptureAvailable: compositor !== null
       && typeof compositor === "object"
       && typeof compositor.pending === "function"
@@ -91,6 +95,25 @@ const ACTIVATE_PUBLIC_DISC = `(() => {
   if (dispatched) input.dispatchEvent(new frameWindow.Event("change", { bubbles: true }));
   return { dispatched, fileCount };
 })()`;
+
+const CONFIGURE_PUBLIC_COMPATIBILITY_DEBUG = `(request => {
+  const frame = document.querySelector("#app");
+  const frameWindow = frame?.contentWindow ?? null;
+  const control = frameWindow?.lazuliCompatibilityDebug ?? null;
+  if (typeof control?.selectScenario !== "function") {
+    throw new Error("public release has no compatibility debug control");
+  }
+  const selection = control.selectScenario(request.scenario);
+  if (request.viewportCapture) {
+    document.body.dataset.viewportCapture = "enabled";
+  } else {
+    delete document.body.dataset.viewportCapture;
+  }
+  return {
+    scenario: selection?.scenario ?? null,
+    viewportCaptureMode: document.body.dataset.viewportCapture ?? null,
+  };
+})`;
 
 const REQUEST_PUBLIC_SNAPSHOT = `(() => {
   const frame = document.querySelector("#app");
@@ -172,7 +195,7 @@ export async function publicPageTarget(endpoint) {
 export function expectedPublicFrameUrl(publicUrl, release) {
   const top = new URL(publicUrl);
   const frame = new URL(release.frontend.url, top);
-  frame.search = top.search;
+  frame.search = "";
   frame.hash = "";
   return frame.href;
 }
@@ -191,6 +214,7 @@ export async function waitForPublicRelease(
     if (
       state.topUrl === publicUrl
       && state.topReadyState === "complete"
+      && state.compatibilityDebugAvailable
       && state.frameReadyState === "complete"
       && state.frameHidden === false
       && state.statusHidden === true
@@ -202,6 +226,32 @@ export async function waitForPublicRelease(
     await publicDelay(pollMs);
   }
   throw new Error(`public release did not become ready: ${JSON.stringify(state)}`);
+}
+
+export async function configurePublicCompatibilityDebug(
+  session,
+  { scenario, viewportCapture = false },
+) {
+  if (
+    scenario !== "smb-ready-play"
+    && scenario !== "smb-sustained-play"
+  ) {
+    throw new Error("public compatibility debug scenario is unsupported");
+  }
+  if (typeof viewportCapture !== "boolean") {
+    throw new Error("public compatibility viewport capture flag must be boolean");
+  }
+  const request = { scenario, viewportCapture };
+  const configured = await session.evaluate(
+    `${CONFIGURE_PUBLIC_COMPATIBILITY_DEBUG}(${JSON.stringify(request)})`,
+  );
+  if (
+    configured?.scenario !== scenario
+    || configured?.viewportCaptureMode !== (viewportCapture ? "enabled" : null)
+  ) {
+    throw new Error(`public compatibility debug control failed: ${JSON.stringify(configured)}`);
+  }
+  return configured;
 }
 
 function isStaleDomReferenceError(error) {

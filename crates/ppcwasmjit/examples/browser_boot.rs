@@ -19671,12 +19671,18 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     const source = document.querySelector("#runner-source").textContent;
     const debugSurface = document.querySelector(".shell").dataset.surface === "debug";
-    function runnerSearchForSurface(isDebugSurface, search) {
-      if (isDebugSurface) return search;
-      const scenario = new URLSearchParams(search).get("scenario");
-      return scenario === "smb-ready-play" || scenario === "smb-sustained-play"
-        ? `?scenario=${scenario}`
-        : "";
+    const compatibilityScenarioIds = new Set([
+      "smb-ready-play",
+      "smb-sustained-play",
+    ]);
+    function compatibilityScenarioSearch(scenario) {
+      if (!compatibilityScenarioIds.has(scenario)) {
+        throw new Error("unsupported compatibility scenario");
+      }
+      return `?scenario=${scenario}`;
+    }
+    function runnerSearchForSurface(isDebugSurface, search, compatibilitySearch = "") {
+      return isDebugSurface ? search : compatibilitySearch;
     }
     const defaultDiscSourceConfig = __HAS_DISC__
       ? {
@@ -19691,6 +19697,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let workerUrl = null;
     let terminalPublicationSequence = 0;
     let controllerScenarioState = null;
+    let selectedCompatibilityRunnerSearch = "";
 
     function resetPresentation() {
       output.textContent = "STARTING";
@@ -19720,7 +19727,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       runnerStatus.textContent = "loading";
       const bootstrap = [
         `globalThis.runnerSearch = ${JSON.stringify(
-          runnerSearchForSurface(debugSurface, location.search)
+          runnerSearchForSurface(
+            debugSurface,
+            location.search,
+            selectedCompatibilityRunnerSearch
+          )
         )};`,
         `globalThis.runnerScenarioOptional = ${JSON.stringify(!debugSurface)};`,
         `globalThis.discSourceConfig = ${JSON.stringify(workerDiscConfig)};`,
@@ -19741,6 +19752,28 @@ const TEMPLATE: &str = r##"<!doctype html>
       queueMicrotask(() => { lastControllerPacket = ""; });
       return worker;
     }
+
+    function selectCompatibilityScenario(scenario) {
+      if (debugSurface) {
+        throw new Error("compatibility debug control requires the release surface");
+      }
+      if (location.search !== "" || location.hash !== "") {
+        throw new Error("compatibility debug control requires a queryless frontend");
+      }
+      if (worker !== null) {
+        throw new Error("compatibility scenario must be selected before disc activation");
+      }
+      selectedCompatibilityRunnerSearch = compatibilityScenarioSearch(scenario);
+      return Object.freeze({ scenario });
+    }
+    Object.defineProperty(globalThis, "lazuliCompatibilityDebug", {
+      configurable: false,
+      enumerable: true,
+      value: Object.freeze({
+        selectScenario: selectCompatibilityScenario,
+      }),
+      writable: false,
+    });
 
     if (defaultDiscSourceConfig !== null) {
       startWorker(defaultDiscSourceConfig, "ready");

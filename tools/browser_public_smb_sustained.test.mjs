@@ -23,7 +23,7 @@ const RELEASE_ID = "2".repeat(64);
 const FRONTEND_HASH = "3".repeat(64);
 const TOP_LOADER = "top-loader";
 const FRAME_URL =
-  `https://gekko.free/assets/frontend-${FRONTEND_HASH}.html?scenario=smb-sustained-play`;
+  `https://gekko.free/assets/frontend-${FRONTEND_HASH}.html`;
 
 function releaseIdentity() {
   return {
@@ -48,7 +48,7 @@ function navigationIdentity() {
     top: {
       frameId: "top-frame",
       loaderId: TOP_LOADER,
-      url: "https://gekko.free/?scenario=smb-sustained-play",
+      url: "https://gekko.free/",
     },
     iframe: {
       frameId: "release-frame",
@@ -64,7 +64,7 @@ function validEnvelope() {
   return {
     schema: PUBLIC_SMB_SUSTAINED_SCHEMA,
     expected: { commit: COMMIT, releaseId: RELEASE_ID },
-    publicUrl: "https://gekko.free/?scenario=smb-sustained-play",
+    publicUrl: "https://gekko.free/",
     release,
     terminalRelease: structuredClone(release),
     navigation: {
@@ -87,14 +87,14 @@ function validEnvelope() {
 test("public sustained route accepts only the exact production root", () => {
   assert.equal(
     configuredPublicSmbSustainedUrl("https://gekko.free/"),
-    "https://gekko.free/?scenario=smb-sustained-play",
+    "https://gekko.free/",
   );
   for (const value of [
     "http://gekko.free/",
     "https://localhost/",
     "https://user@gekko.free/",
     "https://gekko.free:8443/",
-    "https://gekko.free/app.html",
+    "https://gekko.free/not-root",
     "https://gekko.free/?scenario=smb-ready-play",
   ]) {
     assert.throws(
@@ -116,7 +116,7 @@ test("public sustained CLI requires exact commit and release pins", () => {
   assert.equal(options.expectCommit, COMMIT);
   assert.equal(options.expectReleaseId, RELEASE_ID);
   assert.equal(options.pollMs, 25);
-  assert.equal(options.publicUrl, "https://gekko.free/?scenario=smb-sustained-play");
+  assert.equal(options.publicUrl, "https://gekko.free/");
 
   assert.throws(
     () => parsePublicSmbSustainedArguments([
@@ -153,12 +153,12 @@ test("public sustained envelope rejects release and navigation drift", () => {
     ],
     [
       "iframe URL",
-      value => { value.navigation.after.iframe.url = "https://gekko.free/app.html"; },
+      value => { value.navigation.after.iframe.url = "https://gekko.free/frontend.html"; },
       /\$\.navigation\.after\.iframe/,
     ],
     [
       "active frontend",
-      value => { value.frameUrl = "https://gekko.free/app.html"; },
+      value => { value.frameUrl = "https://gekko.free/frontend.html"; },
       /\$\.frameUrl/,
     ],
   ];
@@ -239,5 +239,9 @@ test("public sustained harness derives the transcript and does not mutate cadenc
   assert.match(source, /verifySmbSustainedPlay\(report\)/);
   assert.match(source, /observePinnedNavigation/);
   assert.match(source, /observePublicActiveRelease\(session, options, release\)/);
+  assert.match(
+    source,
+    /configurePublicCompatibilityDebug\(session, \{\s*scenario: PUBLIC_SMB_SUSTAINED_SCENARIO,\s*\}\)/,
+  );
   assert.doesNotMatch(source, /renderEvery|viewportCapture|startScreencast/);
 });

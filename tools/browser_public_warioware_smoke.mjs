@@ -9,7 +9,6 @@ import { pathToFileURL } from "node:url";
 import { identifyLocalDiscImage } from "./browser_boot_disc_identity.mjs";
 import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
 import {
-  PUBLIC_SCENARIO,
   assignPublicDisc,
   expectedPublicFrameUrl,
   observePublicActiveRelease,
@@ -144,7 +143,6 @@ export function configuredPublicWarioWareUrl(value) {
   if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
     evidenceFailure("--url", "expected the exact production root without query or fragment");
   }
-  url.searchParams.set("scenario", PUBLIC_SCENARIO);
   return url.href;
 }
 
@@ -330,18 +328,17 @@ export function validatePublicWarioWareSmokeEvidence(evidence) {
   );
   if (
     publicUrl.pathname !== "/"
+    || publicUrl.search !== ""
     || publicUrl.hash !== ""
-    || publicUrl.searchParams.size !== 1
-    || publicUrl.searchParams.get("scenario") !== PUBLIC_SCENARIO
   ) {
-    evidenceFailure("$.publicUrl", `expected stale ${PUBLIC_SCENARIO} scenario`);
+    evidenceFailure("$.publicUrl", "expected the exact queryless production root");
   }
   const frameUrl = requireProductionOrigin(
     evidenceUrl(evidence.frameUrl, "$.frameUrl"),
     "$.frameUrl",
   );
-  if (frameUrl.search !== publicUrl.search || frameUrl.hash !== "") {
-    evidenceFailure("$.frameUrl", `expected forwarded ${PUBLIC_SCENARIO} scenario`);
+  if (frameUrl.search !== "" || frameUrl.hash !== "") {
+    evidenceFailure("$.frameUrl", "expected a queryless immutable frontend");
   }
   if (!IMMUTABLE_FRONTEND_PATH.test(frameUrl.pathname)) {
     evidenceFailure("$.frameUrl", "expected a content-addressed immutable frontend path");
@@ -391,7 +388,7 @@ export function validatePublicWarioWareSmokeEvidence(evidence) {
     evidenceFailure("$.report.error", "expected no terminal error");
   }
   if (report.scenario !== null) {
-    evidenceFailure("$.report.scenario", "expected the stale SMB scenario to be discarded");
+    evidenceFailure("$.report.scenario", "expected no compatibility scenario");
   }
   const disc = requiredObject(report.disc, "$.report.disc");
   if (disc.identifier !== WARIOWARE_DISC_IDENTIFIER) {

@@ -21,7 +21,6 @@ const RENDERER_WASM_NAME = "browser_renderer_bg.wasm";
 const RENDERER_IMPORT_URL = `/${RENDERER_JAVASCRIPT_NAME}`;
 const STATIC_FILES = [
   "index.html",
-  "app.html",
   "app.webmanifest",
   "icon.svg",
   "release.mjs",
@@ -158,12 +157,6 @@ function cloudflareHeaders() {
   Cache-Control: public, max-age=31536000, immutable
 
 /index.html
-  Cache-Control: no-store
-
-/app
-  Cache-Control: no-store
-
-/app.html
   Cache-Control: no-store
 
 /release.json

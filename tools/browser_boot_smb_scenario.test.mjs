@@ -1022,8 +1022,8 @@ test("host turns a drained VI present into metadata without selected-XFB readbac
   );
 });
 
-test("only the SMB scenario crosses the public runner-search boundary", () => {
-  const context = { URLSearchParams };
+test("release scenarios cross only the compatibility debug control boundary", () => {
+  const context = {};
   vm.createContext(context);
   vm.runInContext(extractFunction("runnerSearchForSurface"), context);
 
@@ -1034,17 +1034,27 @@ test("only the SMB scenario crosses the public runner-search boundary", () => {
   assert.equal(context.runnerSearchForSurface(false, "?cycles=10"), "");
   assert.equal(context.runnerSearchForSurface(false, "?scenario=anything"), "");
   assert.equal(
-    context.runnerSearchForSurface(false, "?scenario=smb-main-stick-roundtrip"),
-    "",
-  );
-  assert.equal(
-    context.runnerSearchForSurface(false, "?cycles=10&scenario=smb-ready-play&restMs=99"),
+    context.runnerSearchForSurface(
+      false,
+      "?cycles=10&scenario=smb-ready-play&restMs=99",
+      "?scenario=smb-ready-play",
+    ),
     "?scenario=smb-ready-play",
   );
   assert.equal(
-    context.runnerSearchForSurface(false, "?cycles=10&scenario=smb-sustained-play&restMs=99"),
+    context.runnerSearchForSurface(
+      false,
+      "?cycles=10&scenario=smb-sustained-play&restMs=99",
+      "?scenario=smb-sustained-play",
+    ),
     "?scenario=smb-sustained-play",
   );
+  assert.match(source, /const compatibilityScenarioIds = new Set\(/);
+  assert.match(source, /function compatibilityScenarioSearch\(scenario\)/);
+  assert.match(source, /globalThis, "lazuliCompatibilityDebug"/);
+  assert.match(source, /selectScenario: selectCompatibilityScenario/);
+  assert.match(source, /compatibility debug control requires a queryless frontend/);
+  assert.match(source, /compatibility scenario must be selected before disc activation/);
   assert.match(source, /capturedAtCycle: cycles/);
   assert.match(
     source,
@@ -1052,7 +1062,7 @@ test("only the SMB scenario crosses the public runner-search boundary", () => {
   );
   assert.match(
     source,
-    /globalThis\.runnerSearch = \$\{JSON\.stringify\([\s\S]*?runnerSearchForSurface\(debugSurface, location\.search\)/,
+    /globalThis\.runnerSearch = \$\{JSON\.stringify\([\s\S]*?runnerSearchForSurface\(\s*debugSurface,\s*location\.search,\s*selectedCompatibilityRunnerSearch\s*\)/,
   );
   assert.match(
     source,

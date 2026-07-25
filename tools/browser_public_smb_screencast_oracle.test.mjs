@@ -87,7 +87,7 @@ function geometry() {
 
 function captureState(publicUrl, active, status) {
   const frameUrl = new URL(active.frontend.url, publicUrl);
-  frameUrl.search = new URL(publicUrl).search;
+  frameUrl.search = "";
   return {
     topUrl: publicUrl,
     topReadyState: "complete",
@@ -219,10 +219,10 @@ function retimeTail(report, spanMs) {
 }
 
 function validReport() {
-  const publicUrl = "https://gekko.free/?scenario=smb-ready-play&viewportCapture=1&headlessRun=passive-run-1";
+  const publicUrl = "https://gekko.free/";
   const active = release();
   const frameUrl = new URL(active.frontend.url, publicUrl);
-  frameUrl.search = new URL(publicUrl).search;
+  frameUrl.search = "";
   const frames = Array.from({ length: 64 }, (_, index) => summarizedFrame(index));
   return {
     schema: "lazuli-public-smb-screencast-v1",
@@ -388,10 +388,11 @@ test("passive oracle derives and rejects adjacent black/white extreme transition
 
 test("passive oracle pins evidence to the exact production origin", () => {
   const invalidPublicUrls = [
-    "http://gekko.free/?scenario=smb-ready-play&viewportCapture=1&headlessRun=run",
-    "https://localhost/?scenario=smb-ready-play&viewportCapture=1&headlessRun=run",
-    "https://user@gekko.free/?scenario=smb-ready-play&viewportCapture=1&headlessRun=run",
-    "https://gekko.free:8443/?scenario=smb-ready-play&viewportCapture=1&headlessRun=run",
+    "http://gekko.free/",
+    "https://localhost/",
+    "https://user@gekko.free/",
+    "https://gekko.free:8443/",
+    "https://gekko.free/?scenario=smb-ready-play",
   ];
   for (const publicUrl of invalidPublicUrls) {
     const report = validReport();
@@ -424,7 +425,7 @@ test("passive oracle rejects renderer coupling, raw pixels, and serial provenanc
 
 test("passive oracle requires immutable public frame and active release stability", () => {
   const frameChanged = validReport();
-  frameChanged.after.frameUrl = "https://gekko.free/app.html?scenario=smb-ready-play";
+  frameChanged.after.frameUrl = "https://gekko.free/frontend.html";
   assert.throws(
     () => verifyPublicSmbScreencastReport(frameChanged),
     /after\.frameUrl/,

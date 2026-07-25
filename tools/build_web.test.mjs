@@ -121,8 +121,11 @@ new URL("/ppcwasmjit.wasm", location.href)</script></main></body>`,
   const secondRelease = await buildWeb({ appPath, wasmPath, outputPath, commit });
   assert.equal(secondRelease.releaseId, release.releaseId);
   assert.equal(await readFile(join(outputPath, "release.json"), "utf8"), firstManifest);
-  assert.match(await readFile(join(outputPath, "_headers"), "utf8"), /\/release\.json\n  Cache-Control: no-store/);
+  const headers = await readFile(join(outputPath, "_headers"), "utf8");
+  assert.match(headers, /\/release\.json\n  Cache-Control: no-store/);
+  assert.doesNotMatch(headers, /^\/app(?:\.html)?$/m);
   const rootFiles = await readdir(outputPath);
+  assert.ok(!rootFiles.includes("app.html"), "legacy app alias must not be deployed");
   assert.ok(!rootFiles.includes("ppcwasmjit.wasm"), "backend must remain chunk-only");
   assert.ok(!rootFiles.includes("browser_renderer.js"), "renderer JavaScript must be content-addressed");
   assert.ok(!rootFiles.includes("browser_renderer_bg.wasm"), "renderer wasm must be content-addressed");
@@ -188,17 +191,16 @@ test("local harness retains controls removed from the public frontend", async ()
   assert.equal(harness.match(/<!-- LAZULI DEBUG UI END -->/g)?.length, 2);
 });
 
-test("public shell forwards ready and sustained SMB scenarios outside passive capture", async () => {
+test("public shell never forwards query state to the immutable frontend", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+  assert.doesNotMatch(shell, /publicFrontendSearch|scenarioValues|viewportCapture|headlessRun/);
+  assert.match(shell, /url\.search = "";\s*url\.hash = "";/);
   assert.doesNotMatch(shell, /url\.search\s*=\s*location\.search/);
-  assert.match(shell, /scenarioValues\[0\] === "smb-ready-play"/);
-  assert.match(shell, /scenarioValues\[0\] === "smb-sustained-play"/);
-  assert.doesNotMatch(shell, /searchParams\.set\("(?:cycles|dispatches|rest|renderEvery|harness)"/);
 });
 
-test("public shell forwards one supported scenario and discards all other query state", async () => {
+test("public shell accepts only an exact root location", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
-  const start = shell.indexOf("function publicFrontendSearch(");
+  const start = shell.indexOf("function hasExactRootLocation(");
   assert.notEqual(start, -1);
   const bodyStart = shell.indexOf("{", start);
   let depth = 0;
@@ -213,50 +215,28 @@ test("public shell forwards one supported scenario and discards all other query 
     }
   }
   assert.notEqual(end, -1);
-  const publicFrontendSearch = Function(
+  const hasExactRootLocation = Function(
     `"use strict"; return (${shell.slice(start, end)});`,
   )();
-  assert.equal(
-    publicFrontendSearch("?scenario=smb-ready-play&cycles=99"),
-    "?scenario=smb-ready-play",
-  );
-  assert.equal(
-    publicFrontendSearch("?scenario=smb-sustained-play&renderEvery=9"),
-    "?scenario=smb-sustained-play",
-  );
-  assert.equal(publicFrontendSearch("?scenario=other"), "");
-  assert.equal(
-    publicFrontendSearch("?scenario=smb-sustained-play&scenario=smb-sustained-play"),
-    "",
-  );
-  assert.throws(
-    () => publicFrontendSearch(
-      "?scenario=smb-sustained-play&viewportCapture=1&headlessRun=run-1",
-    ),
-    /invalid passive viewport capture request/,
-  );
+  assert.equal(hasExactRootLocation(new URL("https://gekko.free/")), true);
+  for (const value of [
+    "https://gekko.free/index.html",
+    "https://gekko.free/?scenario=smb-ready-play",
+    "https://gekko.free/#compatibility",
+  ]) {
+    assert.equal(hasExactRootLocation(new URL(value)), false, value);
+  }
+  assert.match(shell, /location\.replace\(new URL\("\/", location\.origin\)\.href\)/);
 });
 
 test("public shell binds the iframe to the staged immutable frontend", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
-  const fallback = await readFile(new URL("../web/app.html", import.meta.url), "utf8");
   assert.match(shell, /new URL\(release\.frontend\.url, location\.href\)/);
-  assert.doesNotMatch(shell, /new URL\("\/app\.html", location\.href\)/);
-  const redirect = fallback.match(/<script>(?<source>.*?)<\/script>/s);
-  assert.ok(redirect?.groups?.source);
-  for (const [search, expected] of [
-    ["", "/"],
-    ["?scenario=smb-ready-play&source=legacy", "/?scenario=smb-ready-play&source=legacy"],
-  ]) {
-    const navigations = [];
-    Function("location", redirect.groups.source)({
-      search,
-      replace(url) {
-        navigations.push(url);
-      },
-    });
-    assert.deepEqual(navigations, [expected]);
-  }
+  assert.doesNotMatch(shell, /app\.html/);
+  await assert.rejects(
+    readFile(new URL("../web/app.html", import.meta.url), "utf8"),
+    error => error?.code === "ENOENT",
+  );
 });
 
 test("public shell never launches an older saved release after an online stage failure", async () => {
@@ -304,17 +284,12 @@ test("public shell never launches an older saved release after an online stage f
   );
 });
 
-test("public shell forwards only an exact passive capture trio", async () => {
+test("public shell exposes no compatibility route parameters", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
-  assert.match(shell, /function publicFrontendSearch\(search\)/);
-  assert.match(shell, /captureValues\[0\] === "1"/);
-  assert.match(shell, /new Set\(keys\)\.size === 3/);
-  assert.match(shell, /\^\[A-Za-z0-9\._:-\]\{1,128\}\$/);
-  assert.match(shell, /output\.set\("scenario", "smb-ready-play"\)/);
-  assert.match(shell, /output\.set\("viewportCapture", "1"\)/);
-  assert.match(shell, /output\.set\("headlessRun", headlessRunValues\[0\]\)/);
-  assert.doesNotMatch(shell, /output\.set\("(?:compositorCapture|renderEvery|cycles|dispatches)"/);
-  assert.match(shell, /document\.body\.dataset\.viewportCapture = "enabled"/);
+  assert.doesNotMatch(
+    shell,
+    /smb-ready-play|smb-sustained-play|scenario|viewportCapture|headlessRun/,
+  );
 });
 
 test("public shell requires a schema-2 worker and never launches a legacy release", async () => {

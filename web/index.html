@@ -117,38 +117,8 @@
       };
     }
 
-    function publicFrontendSearch(search) {
-      const input = new URLSearchParams(search);
-      const scenarioValues = input.getAll("scenario");
-      const captureValues = input.getAll("viewportCapture");
-      if (captureValues.length === 0) {
-        return scenarioValues.length === 1
-          && (
-            scenarioValues[0] === "smb-ready-play"
-            || scenarioValues[0] === "smb-sustained-play"
-          )
-          ? `?scenario=${scenarioValues[0]}`
-          : "";
-      }
-
-      const headlessRunValues = input.getAll("headlessRun");
-      const keys = [...input.keys()];
-      const exactCapture = keys.length === 3
-        && new Set(keys).size === 3
-        && scenarioValues.length === 1
-        && scenarioValues[0] === "smb-ready-play"
-        && captureValues.length === 1
-        && captureValues[0] === "1"
-        && headlessRunValues.length === 1
-        && /^[A-Za-z0-9._:-]{1,128}$/.test(headlessRunValues[0]);
-      if (!exactCapture) {
-        throw new Error("invalid passive viewport capture request");
-      }
-      const output = new URLSearchParams();
-      output.set("scenario", "smb-ready-play");
-      output.set("viewportCapture", "1");
-      output.set("headlessRun", headlessRunValues[0]);
-      return `?${output}`;
+    function hasExactRootLocation(value) {
+      return value.pathname === "/" && value.search === "" && value.hash === "";
     }
 
     async function launch() {
@@ -161,12 +131,9 @@
       const release = selected.release;
       const saved = selected.saved;
 
-      const frontendSearch = publicFrontendSearch(location.search);
       const url = new URL(release.frontend.url, location.href);
-      url.search = frontendSearch;
-      if (new URLSearchParams(frontendSearch).get("viewportCapture") === "1") {
-        document.body.dataset.viewportCapture = "enabled";
-      }
+      url.search = "";
+      url.hash = "";
       app.addEventListener("load", () => {
         status.hidden = true;
         app.hidden = false;
@@ -175,9 +142,13 @@
       app.src = url.href;
     }
 
-    launch().catch(error => {
-      detail.textContent = `Unable to open Gekko: ${error.message}`;
-    });
+    if (!hasExactRootLocation(location)) {
+      location.replace(new URL("/", location.origin).href);
+    } else {
+      launch().catch(error => {
+        detail.textContent = `Unable to open Gekko: ${error.message}`;
+      });
+    }
   </script>
 </body>
 </html>

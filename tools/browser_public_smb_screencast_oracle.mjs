@@ -114,24 +114,10 @@ function parsePublicUrl(value, path) {
     || url.username !== ""
     || url.password !== ""
     || url.pathname !== "/"
+    || url.search !== ""
     || url.hash !== ""
   ) {
     fail(path, "expected the exact https://gekko.free production root URL");
-  }
-  const keys = [...url.searchParams.keys()];
-  if (keys.length !== 3 || new Set(keys).size !== 3) {
-    fail(path, "expected exactly scenario, viewportCapture, and headlessRun");
-  }
-  exact(url.searchParams.get("scenario"), "smb-ready-play", `${path}.scenario`);
-  exact(url.searchParams.get("viewportCapture"), "1", `${path}.viewportCapture`);
-  const run = url.searchParams.get("headlessRun");
-  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(run ?? "")) {
-    fail(`${path}.headlessRun`, "expected a bounded passive capture identifier");
-  }
-  for (const required of ["scenario", "viewportCapture", "headlessRun"]) {
-    if (url.searchParams.getAll(required).length !== 1) {
-      fail(path, `${required} must occur exactly once`);
-    }
   }
   return url;
 }
@@ -271,7 +257,7 @@ function geometry(value, path) {
 
 function expectedFrameUrl(publicUrl, release) {
   const frame = new URL(release.frontend.url, publicUrl);
-  frame.search = publicUrl.search;
+  frame.search = "";
   return frame.href;
 }
 
