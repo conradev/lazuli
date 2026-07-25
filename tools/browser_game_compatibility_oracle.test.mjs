@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   GAME_COMPATIBILITY_RUNTIME_SCHEMA,
   verifyGameCompatibilitySnapshot,
+  verifyGameCompatibilityWindow,
 } from "./browser_game_compatibility_oracle.mjs";
 
 function game() {
@@ -318,4 +319,75 @@ test("bounded incomplete GX command tails remain valid", () => {
     () => verifyGameCompatibilitySnapshot({ ...value, game: game() }),
     /bounded incomplete command tail/,
   );
+});
+
+test("window requires 120 fields and every gameplay progress dimension", () => {
+  const verified = verifyGameCompatibilityWindow({
+    game: game(),
+    snapshots: [sample(0), sample(1)],
+  });
+  assert.deepEqual(verified, {
+    delta: {
+      controllerAppliedSequence: 2,
+      cycles: 1_000_000_000,
+      diskReads: 1,
+      dispatches: 1_000_000,
+      gxCommands: 1_000,
+      hostPresentations: 70,
+      instructions: 20_000_000,
+      primitives: 300,
+      rendererPresents: 140,
+      siPolls: 140,
+      viFields: 140,
+      xfbCopies: 1,
+    },
+    game: "example-game",
+    image: "a".repeat(64),
+    samples: 2,
+    schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
+    surface: "local-debug",
+  });
+});
+
+test("window rejects stalls, regressions, resets, and static selected XFBs", () => {
+  const cases = [
+    [
+      value => { value[1].report.deviceEvents.viField = 130; },
+      /expected at least 120 new VI fields/,
+    ],
+    [
+      value => { value[1].report.gxFifo.decoder.primitives = 2; },
+      /expected primitives to advance/,
+    ],
+    [
+      value => { value[1].report.deviceEvents.serialPoll = 20; },
+      /siPolls regressed/,
+    ],
+    [
+      value => { value[1].report.cycles = value[0].report.cycles; },
+      /strict forward progress/,
+    ],
+    [
+      value => {
+        value[1].report.rendering.selectedXfb.rgbSha256 =
+          value[0].report.rendering.selectedXfb.rgbSha256;
+      },
+      /two distinct selected-XFB RGB hashes/,
+    ],
+    [
+      value => {
+        value[1].environment.surface = "public-root";
+        value[1].report.disc.source = { kind: "local-file" };
+      },
+      /surface changed/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const snapshots = [sample(0), sample(1)];
+    mutate(snapshots);
+    assert.throws(
+      () => verifyGameCompatibilityWindow({ game: game(), snapshots }),
+      pattern,
+    );
+  }
 });

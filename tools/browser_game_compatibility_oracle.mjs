@@ -34,6 +34,20 @@ const DECODER_FAILURE_COUNTERS = [
   "unknownOpcodes",
   "vertexDecodeErrors",
 ];
+const PROGRESS_COUNTERS = [
+  "cycles",
+  "dispatches",
+  "instructions",
+  "viFields",
+  "hostPresentations",
+  "rendererPresents",
+  "gxCommands",
+  "primitives",
+  "xfbCopies",
+  "siPolls",
+  "diskReads",
+  "controllerAppliedSequence",
+];
 function oracleFailure(path, message) {
   throw new Error(`invalid game compatibility evidence at ${path}: ${message}`);
 }
@@ -563,6 +577,91 @@ export function verifyGameCompatibilitySnapshot({ environment, game, report }) {
     game: game.key,
     image: game.image.sha256,
     progress: progressProjection(report, selected, presentationCount),
+    schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
+    surface,
+  });
+}
+
+function progressDelta(first, last) {
+  return Object.freeze(Object.fromEntries(
+    PROGRESS_COUNTERS.map(name => [name, last[name] - first[name]]),
+  ));
+}
+
+export function verifyGameCompatibilityWindow({
+  game,
+  snapshots,
+  sustainedViFields = 120,
+}) {
+  requireGame(game);
+  if (!Number.isSafeInteger(sustainedViFields) || sustainedViFields < 120) {
+    oracleFailure("$.sustainedViFields", "expected at least 120");
+  }
+  if (!Array.isArray(snapshots) || snapshots.length < 2) {
+    oracleFailure("$.snapshots", "expected at least two ordered snapshots");
+  }
+  const verified = snapshots.map(snapshot =>
+    verifyGameCompatibilitySnapshot({ ...snapshot, game })
+  );
+  const surface = verified[0].surface;
+  for (let index = 1; index < verified.length; index += 1) {
+    if (verified[index].surface !== surface) {
+      oracleFailure(
+        `$.snapshots[${index}].environment.surface`,
+        "surface changed during the compatibility window",
+      );
+    }
+    const previous = verified[index - 1].progress;
+    const current = verified[index].progress;
+    for (const name of PROGRESS_COUNTERS) {
+      if (current[name] < previous[name]) {
+        oracleFailure(
+          `$.snapshots[${index}].report`,
+          `${name} regressed from ${previous[name]} to ${current[name]}`,
+        );
+      }
+    }
+    for (const name of ["cycles", "dispatches", "instructions"]) {
+      if (current[name] === previous[name]) {
+        oracleFailure(
+          `$.snapshots[${index}].report.${name}`,
+          "expected strict forward progress",
+        );
+      }
+    }
+  }
+  const first = verified[0].progress;
+  const last = verified.at(-1).progress;
+  const delta = progressDelta(first, last);
+  if (delta.viFields < sustainedViFields) {
+    oracleFailure(
+      "$.snapshots",
+      `expected at least ${sustainedViFields} new VI fields, got ${delta.viFields}`,
+    );
+  }
+  for (const name of [
+    "gxCommands",
+    "hostPresentations",
+    "primitives",
+    "rendererPresents",
+    "siPolls",
+    "xfbCopies",
+  ]) {
+    if (delta[name] <= 0) {
+      oracleFailure("$.snapshots", `expected ${name} to advance`);
+    }
+  }
+  if (new Set(verified.map(sample => sample.progress.rgbSha256)).size < 2) {
+    oracleFailure(
+      "$.snapshots",
+      "expected at least two distinct selected-XFB RGB hashes",
+    );
+  }
+  return Object.freeze({
+    delta,
+    game: game.key,
+    image: game.image.sha256,
+    samples: verified.length,
     schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
     surface,
   });
