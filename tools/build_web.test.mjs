@@ -266,8 +266,10 @@ test("local harness retains controls removed from the public frontend", async ()
   assert.match(harness, /id="resume-runner"[^>]*>Resume<\/button>/);
   assert.match(harness, /id="diagnostics"/);
   assert.match(harness, /id="stop-runner"[^>]*>Stop<\/button>/);
-  assert.match(harness, /class="button primary disc-picker"/);
+  assert.match(harness, /class="button primary file-picker disc-picker"/);
   assert.match(harness, /id="disc-file"[^>]*aria-label="Open ISO or CISO"/);
+  assert.match(harness, /class="button file-picker ipl-picker"/);
+  assert.match(harness, /id="ipl-file"[^>]*aria-label="Use local IPL"/);
   assert.match(harness, /data-surface="debug"/);
   assert.match(
     harness,

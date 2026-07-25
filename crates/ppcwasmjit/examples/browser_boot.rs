@@ -390,7 +390,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     button:hover, .button:hover { background: #2a3038; }
-    button:focus-visible, .button:focus-visible, .disc-picker:focus-within,
+    button:focus-visible, .button:focus-visible, .file-picker:focus-within,
     input:focus-visible, summary:focus-visible {
       outline: 2px solid #a8c7ff;
       outline-offset: 2px;
@@ -435,12 +435,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       letter-spacing: 0.04em;
     }
 
-    .disc-picker {
+    .file-picker {
       position: relative;
       overflow: hidden;
     }
 
-    #disc-file {
+    .file-picker input[type="file"] {
       position: absolute;
       inset: 0;
       width: 100%;
@@ -449,7 +449,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       cursor: pointer;
     }
 
-    #disc-status {
+    #disc-status, #ipl-status {
       overflow: hidden;
       max-width: min(32vw, 19rem);
       color: #aeb4be;
@@ -614,13 +614,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       font-size: 0.75rem;
     }
 
-    .shell[data-surface="release"] #disc-status {
+    .shell[data-surface="release"] #disc-status,
+    .shell[data-surface="release"] #ipl-status {
       max-width: min(36vw, 24rem);
       color: #8f98a6;
       font-size: 0.75rem;
     }
 
-    .shell[data-surface="release"] .disc-picker {
+    .shell[data-surface="release"] .file-picker {
       min-height: 2.15rem;
       border-color: rgba(255, 255, 255, 0.22);
       border-radius: 999px;
@@ -654,7 +655,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       white-space: nowrap;
     }
 
-    body:not([data-status="waiting"]) .shell[data-surface="release"] .disc-picker {
+    body:not([data-status="waiting"]) .shell[data-surface="release"] .file-picker {
       border-color: rgba(255, 255, 255, 0.14);
       background: rgba(14, 15, 18, 0.64);
       color: #d9dde4;
@@ -663,8 +664,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       transition: opacity 150ms ease, background 150ms ease;
     }
 
-    body:not([data-status="waiting"]) .shell[data-surface="release"] .disc-picker:hover,
-    body:not([data-status="waiting"]) .shell[data-surface="release"] .disc-picker:focus-within {
+    body:not([data-status="waiting"]) .shell[data-surface="release"] .file-picker:hover,
+    body:not([data-status="waiting"]) .shell[data-surface="release"] .file-picker:focus-within {
       background: rgba(14, 15, 18, 0.88);
       opacity: 1;
     }
@@ -791,7 +792,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     body[data-status="waiting"] .shell[data-surface="release"] .status-group { display: none; }
 
-    body[data-status="waiting"] .shell[data-surface="release"] .disc-picker {
+    body[data-status="waiting"] .shell[data-surface="release"] .file-picker {
       min-width: 11rem;
       text-align: center;
     }
@@ -892,10 +893,16 @@ const TEMPLATE: &str = r##"<!doctype html>
         <span id="runner-status">starting</span>
         <span aria-hidden="true">·</span>
         <span id="disc-status">ready</span>
+        <span aria-hidden="true">·</span>
+        <span id="ipl-status">bundled font</span>
       </div>
-      <label class="button primary disc-picker">
+      <label class="button primary file-picker disc-picker">
         Open ISO or CISO
         <input id="disc-file" type="file" aria-label="Open ISO or CISO" accept=".iso,.ciso,.cso,application/octet-stream">
+      </label>
+      <label class="button file-picker ipl-picker">
+        <span id="ipl-picker-label">Use local IPL</span>
+        <input id="ipl-file" type="file" aria-label="Use local IPL" accept=".bin,application/octet-stream">
       </label>
     </header>
 
@@ -5018,6 +5025,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     // These redistributable replacement fonts occupy the same decoded IPL
     // windows as the console fonts. Keeping the sparse virtual image inside
     // the existing frontend asset avoids a font fetch or public asset route.
+    // A local retail IPL can replace this image through the one-shot,
+    // client-only message path below.
     function createBundledExiIplImage() {
       const image = new Uint8Array(exiIplImageBytes);
       image.set(
@@ -5045,16 +5054,41 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     async function configuredExiIplImage(config) {
       config ??= globalThis.iplSourceConfig ?? { kind: "bundled-default" };
-      if (config.kind !== "bundled-default") {
+      if (config.kind === "bundled-default") {
+        const image = await createBundledExiIplImage();
+        return {
+          image: image === null
+            ? null
+            : validateExiIplImage(image, "bundled IPL-compatible image"),
+          source: { kind: "bundled-default" },
+        };
+      }
+      if (config.kind !== "file-message") {
         throw new Error("unsupported IPL source configuration");
       }
-      const image = await createBundledExiIplImage();
-      return {
-        image: image === null
-          ? null
-          : validateExiIplImage(image, "bundled IPL-compatible image"),
-        source: { kind: "bundled-default" },
-      };
+      return new Promise((resolve, reject) => {
+        const receive = event => {
+          if (event.data?.type !== "ipl-source-image") return;
+          removeEventListener("message", receive);
+          try {
+            if (!(event.data.image instanceof ArrayBuffer)) {
+              throw new TypeError("IPL picker did not transfer an ArrayBuffer");
+            }
+            const image = validateExiIplImage(
+              new Uint8Array(event.data.image),
+              "local IPL image"
+            );
+            const region = event.data.region === "PAL" ? "PAL" : "NTSC";
+            resolve({
+              image,
+              source: { kind: "local-file", region },
+            });
+          } catch (error) {
+            reject(error);
+          }
+        };
+        addEventListener("message", receive);
+      });
     }
 
     function createWeightedLruCache(maximumEntries, maximumWeight, weightOf) {
@@ -5280,7 +5314,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const hookCalls = new Map();
     const deviceEvents = new Map();
     // The transport consumes a decoded 2 MiB IPL-compatible image supplied
-    // by the bundled replacement-font image.
+    // by the bundled replacement-font image or by the client-only picker.
     // No proprietary IPL bytes belong in this generated harness.
     let exiIplImage = configuredExiIpl.image;
     const exiIplSource = configuredExiIpl.source;
@@ -20393,6 +20427,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       return decodeRetailIplImage(new Uint8Array(await file.arrayBuffer()));
     }
 
+    function activateLocalIpl(decoded) {
+      selectedLocalIpl = {
+        image: decoded.image,
+        region: decoded.region,
+      };
+      if (activeDiscConfig !== null) {
+        startWorker(activeDiscConfig, activeDiscLabel);
+      }
+      return selectedLocalIpl;
+    }
+
     globalThis.lazuliRendererDiagnostics = Object.freeze({
       capturePerformance: captureRendererPerformance,
       captureSelectedXfb,
@@ -20446,11 +20491,15 @@ const TEMPLATE: &str = r##"<!doctype html>
         ? { kind: "boot-assets" }
         : null;
     const discStatus = document.querySelector("#disc-status");
+    const iplStatus = document.querySelector("#ipl-status");
     let worker = null;
     let workerUrl = null;
     let terminalPublicationSequence = 0;
     let controllerScenarioState = null;
     let selectedCompatibilityRunnerSearch = "";
+    let selectedLocalIpl = null;
+    let activeDiscConfig = null;
+    let activeDiscLabel = null;
 
     function resetPresentation() {
       output.textContent = "STARTING";
@@ -20462,6 +20511,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function startWorker(discConfig, label) {
+      activeDiscConfig = discConfig;
+      activeDiscLabel = label;
       const replacingWorker = worker !== null;
       resetCompositorCaptureForWorker(replacingWorker);
       controllerScenarioState = null;
@@ -20476,6 +20527,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const workerDiscConfig = discConfig.kind === "file"
         ? { kind: "file-message" }
         : discConfig;
+      const workerIplConfig = selectedLocalIpl === null
+        ? { kind: "bundled-default" }
+        : { kind: "file-message" };
       document.body.dataset.status = "loading";
       runnerStatus.textContent = "loading";
       const bootstrap = [
@@ -20488,6 +20542,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         )};`,
         `globalThis.runnerScenarioOptional = ${JSON.stringify(!debugSurface)};`,
         `globalThis.discSourceConfig = ${JSON.stringify(workerDiscConfig)};`,
+        `globalThis.iplSourceConfig = ${JSON.stringify(workerIplConfig)};`,
         `globalThis.dolUrl = ${JSON.stringify(new URL("/boot.dol", location.href).href)};`,
         `globalThis.compilerWasmUrl = ${JSON.stringify(new URL("/ppcwasmjit.wasm", location.href).href)};`,
       ].join("\n");
@@ -20499,6 +20554,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       worker.addEventListener("error", handleWorkerError);
       if (discConfig.kind === "file") {
         worker.postMessage({ type: "disc-source-file", file: discConfig.file });
+      }
+      if (selectedLocalIpl !== null) {
+        const workerImage = selectedLocalIpl.image.slice();
+        worker.postMessage({
+          type: "ipl-source-image",
+          image: workerImage.buffer,
+          region: selectedLocalIpl.region,
+        }, [workerImage.buffer]);
       }
       globalThis.lazuliWorker = worker;
       discStatus.textContent = label;
@@ -20562,6 +20625,33 @@ const TEMPLATE: &str = r##"<!doctype html>
       const file = event.currentTarget.files?.[0];
       if (file === undefined) return;
       startWorker({ kind: "file", file }, `local: ${file.name}`);
+    });
+    const iplFileInput = document.querySelector("#ipl-file");
+    const iplPickerLabel = document.querySelector("#ipl-picker-label");
+    let iplSelectionSequence = 0;
+    iplFileInput.addEventListener("click", event => {
+      event.currentTarget.value = "";
+    });
+    iplFileInput.addEventListener("change", async event => {
+      const file = event.currentTarget.files?.[0];
+      if (file === undefined) return;
+      const sequence = ++iplSelectionSequence;
+      iplFileInput.disabled = true;
+      iplPickerLabel.textContent = "Reading IPL…";
+      iplStatus.textContent = "reading local IPL";
+      try {
+        const decoded = await readLocalIplFile(file);
+        if (sequence !== iplSelectionSequence) return;
+        activateLocalIpl(decoded);
+        iplPickerLabel.textContent = `IPL: ${decoded.region}`;
+        iplStatus.textContent = `local IPL: ${file.name} (${decoded.region})`;
+      } catch (error) {
+        if (sequence !== iplSelectionSequence) return;
+        iplPickerLabel.textContent = "IPL rejected";
+        iplStatus.textContent = String(error?.message ?? error);
+      } finally {
+        if (sequence === iplSelectionSequence) iplFileInput.disabled = false;
+      }
     });
     const pauseRunnerButton = document.querySelector("#pause-runner");
     if (pauseRunnerButton !== null) {

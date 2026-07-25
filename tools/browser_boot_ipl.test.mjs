@@ -85,6 +85,13 @@ function makeDecoderContext() {
     Uint8Array,
     localIplImageBytes: imageBytes,
     palIplHeader: palHeader,
+    selectedLocalIpl: null,
+    activeDiscConfig: null,
+    activeDiscLabel: null,
+    workerStarts: [],
+    startWorker(config, label) {
+      context.workerStarts.push({ config, label });
+    },
   };
   vm.createContext(context);
   vm.runInContext(
@@ -93,9 +100,49 @@ function makeDecoderContext() {
       "descrambleRetailIplRange",
       "decodeRetailIplImage",
       "readLocalIplFile",
+      "activateLocalIpl",
     ].map(extractFunction).join("\n\n"),
     context,
     { filename: "browser_boot.ipl-root.js" },
+  );
+  return context;
+}
+
+function makeWorkerBoundaryContext() {
+  let listener = null;
+  const context = {
+    ArrayBuffer,
+    Error,
+    Object,
+    RangeError,
+    TypeError,
+    Uint8Array,
+    exiIplImageBytes: imageBytes,
+    iplSourceConfig: { kind: "bundled-default" },
+    addEventListener(type, receive) {
+      assert.equal(type, "message");
+      assert.equal(listener, null);
+      listener = receive;
+    },
+    removeEventListener(type, receive) {
+      assert.equal(type, "message");
+      assert.equal(receive, listener);
+      listener = null;
+    },
+    dispatch(message) {
+      assert.notEqual(listener, null, "worker IPL listener was not installed");
+      listener({ data: message });
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "createBundledExiIplImage",
+      "validateExiIplImage",
+      "configuredExiIplImage",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.ipl-worker.js" },
   );
   return context;
 }
@@ -152,7 +199,7 @@ test("retail IPL decoding rejects a header without a NUL terminator", () => {
   );
 });
 
-test("local IPL reader rejects size before reading file bytes", async () => {
+test("local IPL reader rejects size before reading and never mutates selection", async () => {
   const context = makeDecoderContext();
   let read = false;
   class ObservedBlob extends Blob {
@@ -168,6 +215,58 @@ test("local IPL reader rejects size before reading file bytes", async () => {
     /IPL file must be exactly 2 MiB/,
   );
   assert.equal(read, false);
+  assert.equal(context.selectedLocalIpl, null);
+  assert.equal(context.workerStarts.length, 0);
+});
+
+test("local IPL selection persists before a disc and restarts the active disc", () => {
+  const context = makeDecoderContext();
+  const first = { image: new Uint8Array(imageBytes), region: "NTSC" };
+  context.activateLocalIpl(first);
+
+  assert.equal(context.selectedLocalIpl.image, first.image);
+  assert.equal(context.selectedLocalIpl.region, "NTSC");
+  assert.equal(context.workerStarts.length, 0);
+
+  const discConfig = { kind: "file", file: { opaque: true } };
+  context.activeDiscConfig = discConfig;
+  context.activeDiscLabel = "local: game.ciso";
+  const second = { image: new Uint8Array(imageBytes), region: "PAL" };
+  context.activateLocalIpl(second);
+
+  assert.equal(context.selectedLocalIpl.image, second.image);
+  assert.equal(context.selectedLocalIpl.region, "PAL");
+  assert.equal(context.workerStarts.length, 1);
+  assert.equal(context.workerStarts[0].config, discConfig);
+  assert.equal(context.workerStarts[0].label, "local: game.ciso");
+});
+
+test("worker IPL boundary accepts only an exact transferred image", async () => {
+  const context = makeWorkerBoundaryContext();
+  const pending = context.configuredExiIplImage({ kind: "file-message" });
+  const buffer = new ArrayBuffer(imageBytes);
+  context.dispatch({
+    type: "ipl-source-image",
+    image: buffer,
+    region: "PAL",
+  });
+  const configured = await pending;
+
+  assert.equal(configured.image.byteLength, imageBytes);
+  assert.equal(configured.image.buffer, buffer);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(configured.source)),
+    { kind: "local-file", region: "PAL" },
+  );
+
+  const invalidContext = makeWorkerBoundaryContext();
+  const invalid = invalidContext.configuredExiIplImage({ kind: "file-message" });
+  invalidContext.dispatch({
+    type: "ipl-source-image",
+    image: new ArrayBuffer(imageBytes - 1),
+    region: "NTSC",
+  });
+  await assert.rejects(invalid, /must be exactly 2097152 bytes/);
 });
 
 test("bundled IPL font image is pinned, sparse, and route-free", () => {
@@ -207,5 +306,22 @@ test("bundled IPL font image is pinned, sparse, and route-free", () => {
   assert.doesNotMatch(
     bundledImage,
     /\bfetch\b|new URL|localStorage|sessionStorage|\bcaches\b/,
+  );
+});
+
+test("public root keeps the local-only IPL picker and transferable handoff", () => {
+  const firstDebugMarker = source.indexOf("<!-- LAZULI DEBUG UI START -->");
+  const picker = source.indexOf('id="ipl-file"');
+  assert.notEqual(picker, -1);
+  assert.ok(picker < firstDebugMarker, "IPL picker would be stripped from release UI");
+
+  const reader = extractFunction("readLocalIplFile");
+  assert.doesNotMatch(reader, /\bfetch\b|localStorage|sessionStorage|\bcaches\b/);
+  assert.match(source, /globalThis\.iplSourceConfig =/);
+  assert.match(source, /type:\s*"ipl-source-image"/);
+  assert.match(source, /\}, \[workerImage\.buffer\]\);/);
+  assert.match(
+    source,
+    /body:not\(\[data-status="waiting"\]\)[\s\S]*\.file-picker/,
   );
 });
