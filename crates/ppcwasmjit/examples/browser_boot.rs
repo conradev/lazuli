@@ -5288,6 +5288,341 @@ const TEMPLATE: &str = r##"<!doctype html>
       return value === null ? Number.POSITIVE_INFINITY : Number(value);
     }
     const searchParams = new URLSearchParams(globalThis.runnerSearch);
+    const wariowareNextMicrogameQueryName = "wariowareNextMicrogame";
+    const wariowareNextMicrogameQueryValue = "0x63";
+    const wariowareNextMicrogameSetterPc = 0x80046050;
+    const wariowareNextMicrogameActivationPc = 0x80046174;
+    const wariowareNextMicrogameActivationCallers = [
+      {
+        objectLoad: 0x80770000,
+        ownerLoad: 0x80970000,
+      },
+      {
+        objectLoad: 0x807c0000,
+        ownerLoad: 0x809c0000,
+      },
+    ];
+    const wariowareFilteredNextMicrogameSelectorPc = 0x80046c44;
+    const wariowareNextMicrogameSelectorPc = 0x80046d20;
+    const wariowareRepellionMicrogameId = 0x63;
+    const wariowareMaximumRetailMicrogameId = 0x117;
+    const wariowareNextMicrogameSetterSignature = [
+      0x9421ffe0,
+      0x7c0802a6,
+      0x2c04270f,
+      0x90010024,
+      0x93e1001c,
+      0x93c10018,
+    ];
+    const wariowareNextMicrogameActivationSignature = [
+      0x9421ffe0,
+      0x7c0802a6,
+      0x90010024,
+      0x93e1001c,
+      0x7c7f1b78,
+      0x2c1f270f,
+    ];
+    const wariowareNextMicrogameSelectorSignature = [
+      0x9421fff0,
+      0x7c0802a6,
+      0x3c608027,
+      0x90010014,
+      0x8403861c,
+      0x2c000000,
+    ];
+    const wariowareFilteredNextMicrogameSelectorSignature = [
+      0x9421fff0,
+      0x7c0802a6,
+      0x3c808027,
+      0x90010014,
+      0x38000000,
+      0x93e1000c,
+    ];
+    function exactWarioWareRevisionZero(disc = boot) {
+      return disc?.identifier === "GZWE01"
+        && disc.discId === 0
+        && disc.version === 0;
+    }
+    function createWarioWareNextMicrogameOverride(
+      params,
+      disc = boot
+    ) {
+      const values = params.getAll(wariowareNextMicrogameQueryName);
+      const requested = values.length === 1
+        && values[0] === wariowareNextMicrogameQueryValue;
+      return {
+        requested,
+        eligible: requested && exactWarioWareRevisionZero(disc),
+        applied: false,
+        cycle: null,
+        pc: null,
+        original: null,
+        forced: requested ? wariowareRepellionMicrogameId : null,
+        player: null,
+        caller: null,
+        lr: null,
+        selectorCycle: null,
+        selectorPc: null,
+        selectorLr: null,
+      };
+    }
+    const wariowareNextMicrogameOverride =
+      createWarioWareNextMicrogameOverride(searchParams, boot);
+    function warioWareNextMicrogameOverridePending(
+      override = wariowareNextMicrogameOverride
+    ) {
+      return override.eligible === true && override.applied !== true;
+    }
+    function warioWareNextMicrogameOverrideRegionSafe(
+      region,
+      override = wariowareNextMicrogameOverride,
+      activeMicrogameId = null
+    ) {
+      if (!warioWareNextMicrogameOverridePending(override)) return true;
+      if (
+        isUint32(activeMicrogameId)
+        && activeMicrogameId >= 1
+        && activeMicrogameId <= wariowareMaximumRetailMicrogameId
+      ) return false;
+      const pcs = region?.pcs;
+      if (!Array.isArray(pcs) || pcs.length === 0) return false;
+      const seen = new Set();
+      for (const regionPc of pcs) {
+        if (!isUint32(regionPc) || seen.has(regionPc)) return false;
+        seen.add(regionPc);
+        if (
+          regionPc === wariowareFilteredNextMicrogameSelectorPc
+          || regionPc === wariowareNextMicrogameSelectorPc
+          || regionPc === wariowareNextMicrogameSetterPc
+          || regionPc === wariowareNextMicrogameActivationPc
+        ) return false;
+      }
+      return true;
+    }
+    function warioWareNextMicrogameSetterSignatureMatches(
+      readInstruction = probeInstructionWord
+    ) {
+      return wariowareNextMicrogameSetterSignature.every(
+        (word, index) =>
+          readInstruction(wariowareNextMicrogameSetterPc + index * 4) === word
+      );
+    }
+    function warioWareNextMicrogameActivationSignatureMatches(
+      readInstruction = probeInstructionWord
+    ) {
+      return wariowareNextMicrogameActivationSignature.every(
+        (word, index) =>
+          readInstruction(wariowareNextMicrogameActivationPc + index * 4) === word
+      );
+    }
+    function warioWareNextMicrogameSelectorSignatureMatches(
+      currentPc,
+      readInstruction = probeInstructionWord
+    ) {
+      const signature = currentPc === wariowareFilteredNextMicrogameSelectorPc
+        ? wariowareFilteredNextMicrogameSelectorSignature
+        : currentPc === wariowareNextMicrogameSelectorPc
+          ? wariowareNextMicrogameSelectorSignature
+          : null;
+      return signature !== null && signature.every(
+        (word, index) =>
+          readInstruction(currentPc + index * 4) === word
+      );
+    }
+    function isUint32(value) {
+      return Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+    }
+    function relativeBranchTarget(instruction, address, link = true) {
+      if (!isUint32(instruction) || !isUint32(address)) return null;
+      if ((instruction & 0xfc000003) !== (0x48000000 | Number(link))) return null;
+      let displacement = instruction & 0x03fffffc;
+      if ((displacement & 0x02000000) !== 0) displacement -= 0x04000000;
+      return (address + displacement) >>> 0;
+    }
+    function observeWarioWareNextMicrogameSelection(
+      currentPc,
+      override = wariowareNextMicrogameOverride,
+      readLinkRegister = readLr,
+      readInstruction = probeInstructionWord,
+      disc = boot,
+      observedCycles = cycles
+    ) {
+      if (
+        !warioWareNextMicrogameOverridePending(override)
+        || !exactWarioWareRevisionZero(disc)
+        || !warioWareNextMicrogameSelectorSignatureMatches(
+          currentPc,
+          readInstruction
+        )
+      ) return false;
+      const selectorLr = readLinkRegister();
+      if (!isUint32(selectorLr)) return false;
+      if (!warioWareNextMicrogameCallerMatches(
+        null,
+        selectorLr,
+        currentPc,
+        readInstruction
+      )) return false;
+      override.selectorCycle = observedCycles;
+      override.selectorPc = currentPc;
+      override.selectorLr = selectorLr;
+      return true;
+    }
+    function warioWareNextMicrogameCallerMatches(
+      setterLr,
+      selectorLr,
+      selectorPc,
+      readInstruction = probeInstructionWord
+    ) {
+      if (
+        (setterLr !== null && !isUint32(setterLr))
+        || !isUint32(selectorLr)
+        || !isUint32(selectorPc)
+        || selectorLr > 0xffffffe3
+        || (setterLr !== null && (setterLr & 3) !== 0)
+        || (selectorLr & 3) !== 0
+        || (selectorPc & 3) !== 0
+      ) return false;
+      const selectedCall = (selectorLr - 4) >>> 0;
+      if (relativeBranchTarget(
+        readInstruction(selectedCall),
+        selectedCall
+      ) !== selectorPc) return false;
+      if (readInstruction(selectorLr) !== 0x907b278c) return false;
+
+      let expectedSetterLr;
+      if (selectorPc === wariowareNextMicrogameSelectorPc) {
+        if (
+          readInstruction((selectorLr + 4) >>> 0) !== 0x809b278c
+          || readInstruction((selectorLr + 8) >>> 0) !== 0x38600000
+        ) return false;
+        expectedSetterLr = selectorLr + 0x10;
+      } else if (selectorPc === wariowareFilteredNextMicrogameSelectorPc) {
+        if (readInstruction((selectorLr - 8) >>> 0) !== 0x38602000) return false;
+        if (
+          readInstruction((selectorLr + 4) >>> 0) === 0x38600000
+          && readInstruction((selectorLr + 8) >>> 0) === 0x809b278c
+        ) {
+          expectedSetterLr = selectorLr + 0x10;
+        } else if (
+          relativeBranchTarget(
+            readInstruction((selectorLr + 4) >>> 0),
+            (selectorLr + 4) >>> 0,
+            false
+          ) === selectorLr + 0x10
+          && readInstruction((selectorLr + 0x10) >>> 0) === 0x809b278c
+          && readInstruction((selectorLr + 0x14) >>> 0) === 0x38600000
+        ) {
+          expectedSetterLr = selectorLr + 0x1c;
+        } else {
+          return false;
+        }
+      } else {
+        return false;
+      }
+      if (setterLr !== null && setterLr !== expectedSetterLr) return false;
+      const setterCall = (expectedSetterLr - 4) >>> 0;
+      return relativeBranchTarget(
+        readInstruction(setterCall),
+        setterCall
+      ) === wariowareNextMicrogameSetterPc;
+    }
+    function warioWareNextMicrogameActivationCallerMatches(
+      lr,
+      readInstruction = probeInstructionWord
+    ) {
+      if (!isUint32(lr) || lr < 0x1c || lr > 0xffffffe7) return false;
+      if (
+        readInstruction((lr - 0x1c) >>> 0) !== 0x38000000
+        || readInstruction((lr - 0x18) >>> 0) !== 0x480002c4
+      ) return false;
+      const objectLoad = readInstruction((lr - 0x0c) >>> 0);
+      const ownerLoad = readInstruction(lr);
+      const callerMatches = wariowareNextMicrogameActivationCallers.some(
+        candidate =>
+          objectLoad === candidate.objectLoad
+          && ownerLoad === candidate.ownerLoad
+      );
+      if (!callerMatches) return false;
+      const call = (lr - 4) >>> 0;
+      return relativeBranchTarget(
+        readInstruction(call),
+        call
+      ) === wariowareNextMicrogameActivationPc
+        && readInstruction((lr - 0x08) >>> 0) === 0x80630050
+        && readInstruction((lr + 0x04) >>> 0) === 0x9064004c
+        && readInstruction((lr + 0x08) >>> 0) === ownerLoad
+        && readInstruction((lr + 0x0c) >>> 0) === 0x8004004c
+        && readInstruction((lr + 0x10) >>> 0) === 0x28000000
+        && readInstruction((lr + 0x14) >>> 0) === 0x4182ffe0;
+    }
+    function applyWarioWareNextMicrogameOverride(
+      currentPc,
+      override = wariowareNextMicrogameOverride,
+      readRegister = readGpr,
+      writeRegister = writeGpr,
+      readLinkRegister = readLr,
+      readInstruction = probeInstructionWord,
+      disc = boot,
+      observedCycles = cycles
+    ) {
+      if (
+        !warioWareNextMicrogameOverridePending(override)
+        || !exactWarioWareRevisionZero(disc)
+      ) return false;
+
+      const playerSetter = currentPc === wariowareNextMicrogameSetterPc
+        && warioWareNextMicrogameSetterSignatureMatches(readInstruction);
+      const activationSetter = currentPc === wariowareNextMicrogameActivationPc
+        && warioWareNextMicrogameActivationSignatureMatches(readInstruction);
+      if (!playerSetter && !activationSetter) return false;
+      const lr = readLinkRegister();
+      if (!isUint32(lr)) return false;
+      if (
+        playerSetter
+          ? !warioWareNextMicrogameCallerMatches(
+            lr,
+            override.selectorLr,
+            override.selectorPc,
+            readInstruction
+          )
+          : !warioWareNextMicrogameActivationCallerMatches(lr, readInstruction)
+      ) return false;
+      const player = activationSetter ? 0 : readRegister(3);
+      if (!isUint32(player) || player !== 0) return false;
+      const argumentRegister = activationSetter ? 3 : 4;
+      const original = readRegister(argumentRegister);
+      if (!isUint32(original)) return false;
+      if (original > wariowareMaximumRetailMicrogameId) return false;
+      writeRegister(argumentRegister, wariowareRepellionMicrogameId);
+      override.applied = true;
+      override.cycle = observedCycles;
+      override.pc = currentPc;
+      override.original = original;
+      override.player = player;
+      override.caller = (lr - 4) >>> 0;
+      override.lr = lr;
+      return true;
+    }
+    function snapshotWarioWareNextMicrogameOverride(
+      override = wariowareNextMicrogameOverride
+    ) {
+      return {
+        requested: override.requested,
+        eligible: override.eligible,
+        applied: override.applied,
+        cycle: override.cycle,
+        pc: hex32(override.pc),
+        original: override.original,
+        forced: override.forced,
+        player: override.player,
+        caller: hex32(override.caller),
+        lr: hex32(override.lr),
+        selectorCycle: override.selectorCycle,
+        selectorPc: hex32(override.selectorPc),
+        selectorLr: hex32(override.selectorLr),
+      };
+    }
     dispatchLimit = readRunnerLimit(searchParams, "dispatches");
     cycleLimit = readRunnerLimit(searchParams, "cycles");
     const runnerSliceMs = Math.max(1, Number(searchParams.get("sliceMs") ?? 12));
@@ -15086,6 +15421,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           ? null
           : guestS32(playerObjectResultAddress),
         lastActiveGameplayInput: wariowareLastActiveGameplayInput,
+        nextMicrogameOverride: snapshotWarioWareNextMicrogameOverride(),
       };
     }
 
@@ -15245,6 +15581,14 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function readGpr(index) {
       return view.getUint32(cpu + gprOffsets[index], true);
+    }
+
+    function writeGpr(index, value) {
+      view.setUint32(cpu + gprOffsets[index], value >>> 0, true);
+    }
+
+    function readLr() {
+      return view.getUint32(cpu + lrOffset, true);
     }
 
     function viRegisterAccess(physical, size) {
@@ -19545,6 +19889,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           await honorRunnerControl();
           continue;
         }
+        observeWarioWareNextMicrogameSelection(pc);
+        applyWarioWareNextMicrogameOverride(pc);
         stage = "compile";
         let block = compiledBlock(pc);
         if (
@@ -19637,7 +19983,16 @@ const TEMPLATE: &str = r##"<!doctype html>
         let executedRegion = false;
         let regionRequestedExit = false;
         const retainedRegion = compiledRegion(pc);
+        const wariowareActiveMicrogameId =
+          warioWareNextMicrogameOverridePending()
+            ? guestU32(0x80295ed0)
+            : null;
         const region = retainedRegion !== undefined
+          && warioWareNextMicrogameOverrideRegionSafe(
+            retainedRegion,
+            wariowareNextMicrogameOverride,
+            wariowareActiveMicrogameId
+          )
           && compiledRegionIsExecutable(retainedRegion)
           ? retainedRegion
           : undefined;

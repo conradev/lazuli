@@ -955,7 +955,7 @@ test("IBAT and MSR hooks synchronize fetch mappings before another block", () =>
   assert.match(source, /const retainedRegion = compiledRegion\(pc\)/);
   assert.match(
     source,
-    /const region = retainedRegion !== undefined\s*&& compiledRegionIsExecutable\(retainedRegion\)/,
+    /const region = retainedRegion !== undefined\s*&& warioWareNextMicrogameOverrideRegionSafe\(\s*retainedRegion,\s*wariowareNextMicrogameOverride,\s*wariowareActiveMicrogameId\s*\)\s*&& compiledRegionIsExecutable\(retainedRegion\)/,
     "a retained region must pass translation-dependency validation before execution",
   );
 });

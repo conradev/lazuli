@@ -30,10 +30,25 @@ function makeContext(identifier = "GZWE01") {
   const view = new DataView(memory);
   const context = {
     Number,
-    boot: { identifier },
+    boot: { identifier, discId: 0, version: 0 },
     controllerAppliedSequence: 0,
     serialLastActiveHostPublication: null,
     wariowareLastActiveGameplayInput: null,
+    wariowareNextMicrogameOverride: {
+      requested: false,
+      eligible: false,
+      applied: false,
+      cycle: null,
+      pc: null,
+      original: null,
+      forced: null,
+      player: null,
+      caller: null,
+      lr: null,
+      selectorCycle: null,
+      selectorPc: null,
+      selectorLr: null,
+    },
     view,
     ramPointer(address, length) {
       const physical = address & 0x1fffffff;
@@ -49,6 +64,7 @@ function makeContext(identifier = "GZWE01") {
     "guestU16",
     "guestS32",
     "hex32",
+    "snapshotWarioWareNextMicrogameOverride",
     "inspectWarioWareGameState",
     "sampleWarioWareGameplayInput",
     "inspectGuestGameState",
@@ -102,6 +118,21 @@ test("WarioWare snapshots expose the exact live Repellion state", () => {
       playerObjectResultAddress: "0x802aa230",
       playerObjectResult: 3,
       lastActiveGameplayInput: null,
+      nextMicrogameOverride: {
+        requested: false,
+        eligible: false,
+        applied: false,
+        cycle: null,
+        pc: null,
+        original: null,
+        forced: null,
+        player: null,
+        caller: null,
+        lr: null,
+        selectorCycle: null,
+        selectorPc: null,
+        selectorLr: null,
+      },
     },
   );
 });

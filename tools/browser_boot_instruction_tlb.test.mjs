@@ -254,7 +254,7 @@ test("browser runtime exposes the tlbie set invalidation contract", () => {
   );
   assert.match(
     source,
-    /const region = retainedRegion !== undefined[\s\S]{0,120}compiledRegionIsExecutable\(retainedRegion\)/,
+    /const region = retainedRegion !== undefined[\s\S]{0,120}warioWareNextMicrogameOverrideRegionSafe\(\s*retainedRegion,\s*wariowareNextMicrogameOverride,\s*wariowareActiveMicrogameId\s*\)[\s\S]{0,120}compiledRegionIsExecutable\(retainedRegion\)/,
     "linked regions pass the dependency gate before execution",
   );
 });
