@@ -9,8 +9,11 @@
 use std::fmt;
 
 use super::project::{GxExactProjectionError, GxExactProjectionState};
-use super::{GxClipError, gx_post_clip_triangle, gx_source_triangle_indices};
+use super::{
+    GxClipError, GxRasterClipVertex, gx_post_clip_raster_triangle, gx_source_triangle_indices,
+};
 use crate::packet::{GxDraw, GxExactClipState};
+use crate::raster::gx_normalized_raster_channel_u8;
 use crate::tev::TEV_VERTEX_FLOATS;
 use crate::{EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxRasterScissor};
 
@@ -29,7 +32,7 @@ pub(crate) enum GxExactGeometryError {
     CullModeStateMismatch,
     UnsupportedMultisampling,
     UnsupportedZFreeze,
-    UnsupportedSourceRaster,
+    NonCanonicalSourceRaster,
     UnsupportedPostClipW,
     UnsupportedPostClipPosition,
     UnsupportedPostClipDepth,
@@ -56,8 +59,11 @@ impl fmt::Display for GxExactGeometryError {
                 write!(formatter, "multisampled GX coverage is not yet exact")
             }
             Self::UnsupportedZFreeze => write!(formatter, "GX Z-freeze is not yet exact"),
-            Self::UnsupportedSourceRaster => {
-                write!(formatter, "GX source raster channels are not flat")
+            Self::NonCanonicalSourceRaster => {
+                write!(
+                    formatter,
+                    "GX source raster endpoint is not canonical u8/255"
+                )
             }
             Self::UnsupportedPostClipW => {
                 write!(formatter, "GX post-clip W is not strictly positive")
@@ -158,6 +164,15 @@ fn gx_exact_raster_geometry(
     {
         return Err(GxExactGeometryError::NonFiniteSourceVertex);
     }
+    for vertex in source_vertices.chunks_exact(TEV_VERTEX_FLOATS) {
+        for value in &vertex[4..12] {
+            let byte = gx_normalized_raster_channel_u8(*value);
+            let canonical = f32::from(byte) / 255.0;
+            if !(*value == 0.0 && canonical == 0.0) && value.to_bits() != canonical.to_bits() {
+                return Err(GxExactGeometryError::NonCanonicalSourceRaster);
+            }
+        }
+    }
     if topology > 4 {
         return Err(GxClipError::UnsupportedTopology(topology).into());
     }
@@ -191,26 +206,32 @@ fn gx_exact_raster_geometry(
     let mut vertices = Vec::new();
     let mut output_source_indices = Vec::new();
     for indices in source_triangles {
-        if !gx_triangle_components_are_flat(source_vertices, indices, 4..12) {
-            return Err(GxExactGeometryError::UnsupportedSourceRaster);
-        }
-        let reference = indices[0] * TEV_VERTEX_FLOATS;
-        let flat_rasters: [f32; 8] = source_vertices[reference + 4..reference + 12]
-            .try_into()
-            .expect("validated GX raster channel payload");
         let clip_triangle = indices.map(|index| {
             let source =
                 &source_vertices[index * TEV_VERTEX_FLOATS..(index + 1) * TEV_VERTEX_FLOATS];
             let mut vertex = [0.0; GX_EXACT_CLIP_PAYLOAD_FLOATS];
             vertex[..4].copy_from_slice(&clip_positions[index]);
             vertex[4..].copy_from_slice(&source[12..]);
-            vertex
+            let raster_channels =
+                std::array::from_fn(|channel| gx_normalized_raster_channel_u8(source[4 + channel]));
+            GxRasterClipVertex::new(vertex, raster_channels)
         });
-        for clipped in gx_post_clip_triangle(clip_triangle, cull_mode, projection.viewport()[1])? {
+        for clipped in
+            gx_post_clip_raster_triangle(clip_triangle, cull_mode, projection.viewport()[1])?
+        {
             let projected = [
-                gx_exact_raster_vertex(projection.project(clipped[0])?, flat_rasters),
-                gx_exact_raster_vertex(projection.project(clipped[1])?, flat_rasters),
-                gx_exact_raster_vertex(projection.project(clipped[2])?, flat_rasters),
+                gx_exact_raster_vertex(
+                    projection.project(clipped[0].components())?,
+                    clipped[0].raster_channels(),
+                ),
+                gx_exact_raster_vertex(
+                    projection.project(clipped[1].components())?,
+                    clipped[1].raster_channels(),
+                ),
+                gx_exact_raster_vertex(
+                    projection.project(clipped[2].components())?,
+                    clipped[2].raster_channels(),
+                ),
             ];
             if !gx_projected_triangle_is_supported(&projected) {
                 return Err(gx_projected_triangle_error(&projected));
@@ -240,27 +261,15 @@ fn gx_exact_empty_geometry() -> GxExactRasterGeometry {
 
 fn gx_exact_raster_vertex(
     projected: [f32; GX_EXACT_CLIP_PAYLOAD_FLOATS],
-    flat_rasters: [f32; 8],
+    raster_channels: [u8; 8],
 ) -> [f32; TEV_VERTEX_FLOATS] {
     let mut vertex = [0.0; TEV_VERTEX_FLOATS];
     vertex[..4].copy_from_slice(&projected[..4]);
-    vertex[4..12].copy_from_slice(&flat_rasters);
+    for (destination, channel) in vertex[4..12].iter_mut().zip(raster_channels) {
+        *destination = f32::from(channel) / 255.0;
+    }
     vertex[12..].copy_from_slice(&projected[4..]);
     vertex
-}
-
-fn gx_triangle_components_are_flat(
-    vertices: &[f32],
-    indices: [usize; 3],
-    components: impl Iterator<Item = usize>,
-) -> bool {
-    let reference = indices[0] * TEV_VERTEX_FLOATS;
-    components.into_iter().all(|component| {
-        let expected = vertices[reference + component].to_bits();
-        indices[1..]
-            .iter()
-            .all(|index| vertices[index * TEV_VERTEX_FLOATS + component].to_bits() == expected)
-    })
 }
 
 fn gx_projected_triangle_is_supported(vertices: &[[f32; TEV_VERTEX_FLOATS]; 3]) -> bool {

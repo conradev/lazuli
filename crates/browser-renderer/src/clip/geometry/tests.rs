@@ -19,7 +19,16 @@ fn exact_state(cull_mode: u8) -> GxExactClipState {
 }
 
 fn source_vertices(vertex_count: usize) -> Vec<f32> {
-    let flat_rasters = [0.0, -0.0, 0.25, 1.0, 2.0, 4.0, 8.0, 255.0];
+    let flat_rasters = [
+        0.0,
+        -0.0,
+        64.0 / 255.0,
+        1.0,
+        2.0 / 255.0,
+        4.0 / 255.0,
+        8.0 / 255.0,
+        1.0,
+    ];
     let mut vertices = vec![0.0; vertex_count * TEV_VERTEX_FLOATS];
     for vertex in 0..vertex_count {
         let offset = vertex * TEV_VERTEX_FLOATS;
@@ -85,47 +94,109 @@ fn partial_clip_composes_exact_fan_payload_and_source_provenance() {
         [0.0, 1.0, 3.0, 0.0, 3.0, 4.0],
         "STQ payload follows the literal OUT + ((IN - OUT) * T) fan walk"
     );
-    for vertex in vertices {
+    for vertex in &vertices {
         assert_eq!(
             vertex[4..12]
                 .iter()
                 .copied()
-                .map(f32::to_bits)
+                .map(gx_normalized_raster_channel_u8)
                 .collect::<Vec<_>>(),
             source[4..12]
                 .iter()
                 .copied()
-                .map(f32::to_bits)
+                .map(gx_normalized_raster_channel_u8)
                 .collect::<Vec<_>>(),
-            "flat rasters are stamped instead of using the inexact color clip path"
+            "canonical flat raster bytes survive the integer color clip path"
         );
     }
+    assert_eq!(
+        source[5].to_bits(),
+        (-0.0_f32).to_bits(),
+        "the source fixture pins accepted signed zero"
+    );
+    assert_eq!(
+        vertices[0][5].to_bits(),
+        0.0_f32.to_bits(),
+        "the byte-domain clip transport canonicalizes either signed zero to byte zero"
+    );
 }
 
 #[test]
-fn source_rasters_are_flat_but_legacy_depth_may_vary() {
-    let source = source_vertices(3);
+fn source_rasters_may_vary_but_must_be_canonical_bytes() {
+    let mut source = source_vertices(3);
     assert_ne!(source[2].to_bits(), source[TEV_VERTEX_FLOATS + 2].to_bits());
+    for (vertex, red) in [1_u8, 127, 254].into_iter().enumerate() {
+        source[vertex * TEV_VERTEX_FLOATS + 4] = f32::from(red) / 255.0;
+    }
     let clip = [
         [-0.5, -0.5, -0.5, 1.0],
         [0.5, -0.5, -0.5, 1.0],
         [-0.5, 0.5, -0.5, 1.0],
     ];
-    assert!(
-        gx_exact_raster_geometry(2, 0, &source, &clip, exact_state(0)).is_ok(),
-        "exact projected depth replaces the legacy f64 projection"
+    let geometry = gx_exact_raster_geometry(2, 0, &source, &clip, exact_state(0)).unwrap();
+    assert_eq!(
+        vertex_slices(geometry.vertices())
+            .iter()
+            .map(|vertex| gx_normalized_raster_channel_u8(vertex[4]))
+            .collect::<Vec<_>>(),
+        [1, 127, 254],
+        "post-cull vertices retain their own raster endpoints"
     );
 
-    for component in 4..12 {
-        let mut varying = source.clone();
-        varying[TEV_VERTEX_FLOATS + component] =
-            f32::from_bits(varying[TEV_VERTEX_FLOATS + component].to_bits() ^ 1);
-        assert_eq!(
-            gx_exact_raster_geometry(2, 0, &varying, &clip, exact_state(0)),
-            Err(GxExactGeometryError::UnsupportedSourceRaster),
-            "varying raster component {component} was accepted"
-        );
+    source[TEV_VERTEX_FLOATS + 4] = 0.5;
+    assert_eq!(
+        gx_exact_raster_geometry(2, 0, &source, &clip, exact_state(0)),
+        Err(GxExactGeometryError::NonCanonicalSourceRaster),
+    );
+}
+
+#[test]
+fn clipped_raster_endpoints_use_dolphins_u8_8_integer_lerp() {
+    let mut source = source_vertices(3);
+    for (vertex, (raster0, raster1)) in [
+        ([10, 20, 30, 40], [210, 200, 190, 180]),
+        ([250, 240, 230, 220], [10, 20, 30, 40]),
+        ([90, 100, 110, 120], [130, 140, 150, 160]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = vertex * TEV_VERTEX_FLOATS + 4;
+        for (destination, byte) in source[offset..offset + 8]
+            .iter_mut()
+            .zip(raster0.into_iter().chain(raster1))
+        {
+            *destination = byte as f32 / 255.0;
+        }
     }
+    let clip = [
+        [0.0, 0.0, -0.5, 1.0],
+        [2.01, 0.0, -0.5, 1.0],
+        [0.0, 1.0, -0.5, 1.0],
+    ];
+    let geometry = gx_exact_raster_geometry(2, 0, &source, &clip, exact_state(0)).unwrap();
+    let vertices = vertex_slices(geometry.vertices());
+    assert_eq!(vertices.len(), 6);
+    let raster_bytes = vertices
+        .iter()
+        .map(|vertex| {
+            std::array::from_fn::<_, 8, _>(|channel| {
+                gx_normalized_raster_channel_u8(vertex[4 + channel])
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        raster_bytes,
+        [
+            [10, 20, 30, 40, 210, 200, 190, 180],
+            [130, 130, 130, 130, 110, 110, 110, 110],
+            [170, 170, 170, 170, 70, 80, 90, 100],
+            [10, 20, 30, 40, 210, 200, 190, 180],
+            [170, 170, 170, 170, 70, 80, 90, 100],
+            [90, 100, 110, 120, 130, 140, 150, 160],
+        ],
+        "negative deltas use signed arithmetic shift after truncating t*256",
+    );
 }
 
 #[test]
