@@ -1053,6 +1053,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const smbSustainedViPending = new Map();
     let smbSustainedViFailure = null;
     let smbReadyPlayAnchor = null;
+    let wariowareLastActiveGameplayInput = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -15010,6 +15011,123 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function inspectWarioWareGameState() {
+      if (boot.identifier !== "GZWE01") return null;
+
+      // Retail GZWE01 stores the four current-game identifiers here.
+      // Microgame 0x63 is Repellion, the first live A-button game reached
+      // after continuing without a Memory Card.
+      const activeGameSlotAddresses = [
+        0x80295ed0,
+        0x80295ed4,
+        0x80295ed8,
+        0x80295edc,
+      ];
+      const activeGameIds = activeGameSlotAddresses.map(guestU32);
+      const cardDialogStateAddress = 0x802958ac;
+      const cardDialogChoiceAddress = 0x802958b4;
+      const cardDialogState = guestS32(cardDialogStateAddress);
+      const runtimePointerAddress = 0x802f6860;
+      const runtime = guestU32(runtimePointerAddress);
+      const runtimeMapped = Number.isSafeInteger(runtime)
+        && runtime >= 0x80000000
+        && runtime <= 0x817b4c04;
+      const gameplayButtonsAddress = runtimeMapped ? runtime + 0x4b160 : null;
+      const playerObjectPointerAddress = runtimeMapped ? runtime + 0x4b178 : null;
+      const playerResultAddress = runtimeMapped ? runtime + 0x4b3f8 : null;
+      const playerObject = playerObjectPointerAddress === null
+        ? null
+        : guestU32(playerObjectPointerAddress);
+      const playerObjectMapped = Number.isSafeInteger(playerObject)
+        && playerObject >= 0x80000000
+        && playerObject <= 0x817fedcc;
+      const playerObjectResultAddress = playerObjectMapped
+        ? playerObject + 0x1230
+        : null;
+      const gameplayButtons = gameplayButtonsAddress === null
+        ? null
+        : guestU16(gameplayButtonsAddress);
+      return {
+        activeGameSlots: activeGameSlotAddresses.map((address, index) => ({
+          address: hex32(address),
+          id: activeGameIds[index],
+        })),
+        activeMicrogameId: activeGameIds[0],
+        player0RepellionActive: activeGameIds[0] === 0x63,
+        repellionActive: activeGameIds.includes(0x63),
+        cardDialogStateAddress: hex32(cardDialogStateAddress),
+        cardDialogState,
+        cardDialogChoiceAddress: hex32(cardDialogChoiceAddress),
+        cardDialogChoice: guestS32(cardDialogChoiceAddress),
+        noMemoryCardDialog: cardDialogState === 11,
+        noCardFlowActive: cardDialogState === 11 || cardDialogState === 0x21,
+        runtimePointerAddress: hex32(runtimePointerAddress),
+        runtime: runtimeMapped ? hex32(runtime) : null,
+        gameplayButtonsAddress: hex32(gameplayButtonsAddress),
+        gameplayButtons,
+        aActive: gameplayButtons === null
+          ? null
+          : (gameplayButtons & 0x0100) !== 0,
+        playerObjectPointerAddress: hex32(playerObjectPointerAddress),
+        playerObject: playerObjectMapped ? hex32(playerObject) : null,
+        playerResultAddress: hex32(playerResultAddress),
+        playerResult: playerResultAddress === null
+          ? null
+          : guestS32(playerResultAddress),
+        playerObjectResultAddress: hex32(playerObjectResultAddress),
+        playerObjectResult: playerObjectResultAddress === null
+          ? null
+          : guestS32(playerObjectResultAddress),
+        lastActiveGameplayInput: wariowareLastActiveGameplayInput,
+      };
+    }
+
+    function sampleWarioWareGameplayInput(sampleCycle) {
+      if (boot.identifier !== "GZWE01") return;
+      const publication = serialLastActiveHostPublication;
+      if (
+        publication === null
+        || (publication.buttons & 0x0100) === 0
+        || publication.observedCycle > sampleCycle
+        || controllerAppliedSequence !== publication.sequence
+        || guestU32(0x80295ed0) !== 0x63
+      ) return;
+      const previousSequence =
+        wariowareLastActiveGameplayInput?.hostPublication?.sequence;
+      if (
+        Number.isSafeInteger(previousSequence)
+        && previousSequence >= publication.sequence
+      ) return;
+      const runtime = guestU32(0x802f6860);
+      if (
+        !Number.isSafeInteger(runtime)
+        || runtime < 0x80000000
+        || runtime > 0x817b4c04
+      ) return;
+      const gameplayButtonsAddress = runtime + 0x4b160;
+      const gameplayButtons = guestU16(gameplayButtonsAddress);
+      if (gameplayButtons === null || (gameplayButtons & 0x0100) === 0) return;
+      const playerObject = guestU32(runtime + 0x4b178);
+      const playerObjectMapped = Number.isSafeInteger(playerObject)
+        && playerObject >= 0x80000000
+        && playerObject <= 0x817fedcc;
+      wariowareLastActiveGameplayInput = {
+        cycle: sampleCycle,
+        buttons: gameplayButtons,
+        controllerAppliedSequence,
+        hostPublication: { ...publication },
+        playerObject: playerObjectMapped ? hex32(playerObject) : null,
+        playerObjectResult: playerObjectMapped
+          ? guestS32(playerObject + 0x1230)
+          : null,
+      };
+    }
+
+    function inspectGuestGameState() {
+      return inspectSuperMonkeyBallGameState()
+        ?? inspectWarioWareGameState();
+    }
+
     function hex32(value) {
       return value === null ? null : "0x" + value.toString(16).padStart(8, "0");
     }
@@ -15802,6 +15920,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           );
         }
         if (scanoutDue) {
+          sampleWarioWareGameplayInput(scheduledCycle);
           if (scanoutTarget !== undefined) {
             const snapshot = latchViScanoutBoundary(
               scanoutTarget.field,
@@ -18902,7 +19021,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         ...(controllerScenario?.id === "smb-sustained-play" ? {
           sustainedPlay: snapshotSmbSustainedPlay(controllerScenario),
         } : {}),
-        guestGame: inspectSuperMonkeyBallGameState(),
+        guestGame: inspectGuestGameState(),
         serialInterface: {
           transferInterruptAcknowledgements: serialTransferInterruptAcknowledgements,
           noResponseByChannel: [...serialNoResponseByChannel],
