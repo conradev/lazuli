@@ -161,6 +161,60 @@ fn exact_seven_twelfths_rejects_the_dolphin_nine_sixteenths_only_pixel() {
 }
 
 #[test]
+fn nonempty_bounds_can_contain_no_exact_sample() {
+    let triangle = raw_triangle(
+        [
+            GxRasterPoint28_4::from_raw(0, 0),
+            GxRasterPoint28_4::from_raw(0, 1),
+            GxRasterPoint28_4::from_raw(16, 15),
+        ],
+        GxRasterScissor::full_efb(),
+    );
+    assert_eq!(
+        triangle.bounds(),
+        GxRasterBounds {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        },
+    );
+    assert!(!triangle.covers_pixel(0, 0));
+    assert!(!triangle.has_covered_sample());
+}
+
+#[test]
+fn covered_sample_interval_solver_matches_pixel_coverage() {
+    let scissor = GxRasterScissor::new(0, 0, 4, 4, 0, 0).unwrap();
+    let coordinates = [-8, 0, 1, 9, 16, 24, 32, 48, 64];
+    for x1 in coordinates {
+        for y1 in coordinates {
+            for x2 in coordinates {
+                for y2 in coordinates {
+                    let points = [
+                        GxRasterPoint28_4::from_raw(0, 0),
+                        GxRasterPoint28_4::from_raw(x1, y1),
+                        GxRasterPoint28_4::from_raw(x2, y2),
+                    ];
+                    let GxRasterSetup::Triangle(triangle) =
+                        GxRasterTriangle28_4::setup_post_cull(points, raw_winding(points), scissor)
+                    else {
+                        continue;
+                    };
+                    let scanned = (0..4).any(|y| (0..4).any(|x| triangle.covers_pixel(x, y)));
+                    assert_eq!(
+                        triangle.has_covered_sample(),
+                        scanned,
+                        "points={:?}",
+                        points.map(GxRasterPoint28_4::raw),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn rational_top_left_bias_is_not_scaled_with_the_edge_equation() {
     let edge = GxRasterEdge28_4::new(
         GxRasterPoint28_4::from_raw(0, 1),
@@ -595,6 +649,56 @@ fn attribute_planes_interpolate_screen_linear_raster_channels() {
     assert_eq!(
         gx_non_aa_raster_color_rgba8(planes, 2, 3).unwrap(),
         [52, 37, 100, 255],
+    );
+}
+
+#[test]
+fn normalized_raster_endpoints_round_trip_bytes_and_truncate_noncanonical_values() {
+    for byte in 0..=u8::MAX {
+        assert_eq!(
+            gx_normalized_raster_channel_u8(f32::from(byte) / 255.0),
+            byte,
+        );
+    }
+    assert_eq!(gx_normalized_raster_channel_u8(-1.0), 0);
+    assert_eq!(gx_normalized_raster_channel_u8(f32::NAN), 0);
+    assert_eq!(gx_normalized_raster_channel_u8(2.0), 255);
+    assert_eq!(
+        gx_normalized_raster_channel_u8(127.999 / 255.0),
+        127,
+        "transport recovery truncates instead of rounding",
+    );
+}
+
+#[test]
+fn both_raster_channels_clamp_and_truncate_screen_linear_samples() {
+    let positions = [[0.0, 0.0], [12.0, 0.0], [0.0, 12.0]];
+    let planes = |endpoints: [[f32; 4]; 3]| {
+        std::array::from_fn(|channel| {
+            GxRasterAttributePlaneF32::from_screen_triangle(
+                positions,
+                endpoints.map(|vertex| vertex[channel]),
+            )
+            .unwrap()
+        })
+    };
+    let raster0 = planes([
+        [-10.0, 0.999, 254.999, 255.0],
+        [-10.0, 12.999, 266.999, 255.0],
+        [-10.0, 24.999, 278.999, 255.0],
+    ]);
+    let raster1 = planes([
+        [1.999, 250.0, 128.999, 0.0],
+        [13.999, 238.0, 116.999, 12.0],
+        [25.999, 226.0, 104.999, 24.0],
+    ]);
+    assert_eq!(
+        gx_non_aa_raster_color_rgba8(raster0, 0, 0).unwrap(),
+        [0, 2, 255, 255],
+    );
+    assert_eq!(
+        gx_non_aa_raster_color_rgba8(raster1, 0, 0).unwrap(),
+        [3, 248, 127, 1],
     );
 }
 
