@@ -4919,7 +4919,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let dspUcodeHash = null;
     let dspMode = "rom";
     let dspUcodeBooted = false;
-    let dspAxCommandListPending = false;
+    let dspAxCommandState = emptyDspAxCommandState();
     let dspZeldaCommandState = emptyDspZeldaCommandState();
     let dspScheduledMail = null;
     const dspAudioDmaEnableInterruptLatencyCycles = 200;
@@ -10431,11 +10431,24 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function consumeDspMail() {
       if (dspCurrentMail === null) return;
-      traceDsp("mail-consumed", { mail: hex32(dspCurrentMail) });
+      const consumedMail = dspCurrentMail;
+      traceDsp("mail-consumed", { mail: hex32(consumedMail) });
       dspCurrentMail = null;
       view.setUint16(mmio + 0x5004, 0, false);
       view.setUint16(mmio + 0x5006, 0, false);
       deviceEvents.set("dspMailConsumed", (deviceEvents.get("dspMailConsumed") ?? 0) + 1);
+      if (
+        dspMode === "ax"
+        && dspAxCommandState.phase === "yield-pending"
+        && consumedMail === 0xdcd10002
+      ) {
+        dspAxCommandState.phase = "task-wait";
+        traceDsp("ax-yield-consumed", { mail: hex32(consumedMail) });
+        deviceEvents.set(
+          "dspAxYieldConsumed",
+          (deviceEvents.get("dspAxYieldConsumed") ?? 0) + 1
+        );
+      }
       loadNextDspMail();
     }
 
@@ -10448,6 +10461,23 @@ const TEMPLATE: &str = r##"<!doctype html>
         startPc: null,
         malformed: false,
         malformedReason: null,
+      };
+    }
+
+    function emptyDspAxCommandState() {
+      return {
+        phase: "waiting-size",
+        sizeWords: 0,
+        address: null,
+        listCount: 0,
+        wordCount: 0,
+        commandCount: 0,
+        commandSample: [],
+        writeCount: 0,
+        clearedBytes: 0,
+        rejected: false,
+        reason: null,
+        lastTaskMail: null,
       };
     }
 
@@ -10555,7 +10585,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function rejectDspUcodeBoot(reason, details = {}) {
       dspMode = "rom";
       dspUcodeBooted = false;
-      dspAxCommandListPending = false;
+      dspAxCommandState = emptyDspAxCommandState();
       dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       traceDsp("ucode-boot-rejected", { reason, ...details });
@@ -10609,6 +10639,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       dspMode = mode;
       dspUcodeBooted = true;
+      dspAxCommandState = emptyDspAxCommandState();
       dspZeldaCommandState = emptyDspZeldaCommandState();
       traceDsp("ucode-boot", {
         hash: hex32(hash),
@@ -10626,6 +10657,426 @@ const TEMPLATE: &str = r##"<!doctype html>
       deviceEvents.set("dspUcodeBoot", (deviceEvents.get("dspUcodeBoot") ?? 0) + 1);
       dspUcodeUpload = emptyDspUcodeUpload();
       return true;
+    }
+
+    function rejectDspAxCommand(reason, details = {}) {
+      dspAxCommandState.phase = "halted";
+      dspAxCommandState.rejected = true;
+      dspAxCommandState.reason = reason;
+      dspScheduledMail = null;
+      traceDsp("ax-command-rejected", { reason, ...details });
+      deviceEvents.set(
+        "dspAxCommandRejected",
+        (deviceEvents.get("dspAxCommandRejected") ?? 0) + 1
+      );
+      return false;
+    }
+
+    function dspAxCommandArity(command) {
+      switch (command) {
+        case 0x00: return 2;
+        case 0x01: return 5;
+        case 0x02: return 2;
+        case 0x03: return 0;
+        case 0x04:
+        case 0x05: return 4;
+        case 0x06:
+        case 0x07: return 2;
+        case 0x08: return 10;
+        case 0x09: return 2;
+        case 0x0a:
+        case 0x0b:
+        case 0x0c: return 0;
+        case 0x0d: return 3;
+        case 0x0e: return 4;
+        case 0x0f: return 0;
+        case 0x10: return 4;
+        case 0x11: return 2;
+        case 0x12: return 4;
+        case 0x13: return 12;
+        default: return null;
+      }
+    }
+
+    function dspAxAddress(high, low) {
+      return (((high & 0xffff) << 16) | (low & 0xffff)) >>> 0;
+    }
+
+    function dspAxParseFailure(reason, details = {}) {
+      return { ok: false, reason, details };
+    }
+
+    function dspAxSilentWriteRange(address, size, command) {
+      const logical = address >>> 0;
+      const pointer = ramPointer(logical, size);
+      if (pointer === null) {
+        return dspAxParseFailure("write-out-of-bounds", {
+          command,
+          address: hex32(logical),
+          size,
+        });
+      }
+      return {
+        ok: true,
+        write: {
+          command,
+          address: logical,
+          physical: (pointer - ram) >>> 0,
+          pointer,
+          size,
+        },
+      };
+    }
+
+    function collectDspAxSilentWrites(command, arguments_, writes) {
+      const ranges = [];
+      switch (command) {
+        case 0x04:
+        case 0x05: {
+          const address = dspAxAddress(arguments_[0], arguments_[1]);
+          if (address !== 0) ranges.push([address, 3 * 5 * 32 * 4]);
+          break;
+        }
+        case 0x06:
+          ranges.push([
+            dspAxAddress(arguments_[0], arguments_[1]),
+            3 * 5 * 32 * 4,
+          ]);
+          break;
+        case 0x0e:
+          ranges.push([
+            dspAxAddress(arguments_[0], arguments_[1]),
+            5 * 32 * 4,
+          ]);
+          ranges.push([
+            dspAxAddress(arguments_[2], arguments_[3]),
+            5 * 32 * 2 * 2,
+          ]);
+          break;
+        case 0x10:
+          ranges.push([
+            dspAxAddress(arguments_[0], arguments_[1]),
+            2 * 5 * 32 * 4,
+          ]);
+          break;
+        case 0x13:
+          ranges.push([
+            dspAxAddress(arguments_[0], arguments_[1]),
+            3 * 5 * 32 * 4,
+          ]);
+          ranges.push([
+            dspAxAddress(arguments_[2], arguments_[3]),
+            5 * 32 * 4,
+          ]);
+          break;
+        default:
+          break;
+      }
+
+      for (const [address, size] of ranges) {
+        const result = dspAxSilentWriteRange(address, size, command);
+        if (!result.ok) return result;
+        writes.push(result.write);
+      }
+      return { ok: true };
+    }
+
+    function parseDspAxCommandLists(initialAddress, initialSizeWords) {
+      const maximumListWords = 511;
+      const maximumLists = 32;
+      const maximumTotalWords = 8192;
+      const seenPhysicalAddresses = new Set();
+      const writes = [];
+      const commandSample = [];
+      let address = initialAddress >>> 0;
+      let sizeWords = initialSizeWords;
+      let listCount = 0;
+      let wordCount = 0;
+      let commandCount = 0;
+
+      while (true) {
+        if (
+          !Number.isSafeInteger(sizeWords)
+          || sizeWords <= 0
+          || sizeWords > maximumListWords
+        ) {
+          return dspAxParseFailure("invalid-list-size", {
+            address: hex32(address),
+            sizeWords,
+          });
+        }
+        if (listCount >= maximumLists) {
+          return dspAxParseFailure("list-limit", {
+            address: hex32(address),
+            maximumLists,
+          });
+        }
+        if (wordCount + sizeWords > maximumTotalWords) {
+          return dspAxParseFailure("word-limit", {
+            address: hex32(address),
+            wordCount: wordCount + sizeWords,
+            maximumTotalWords,
+          });
+        }
+
+        const byteLength = sizeWords * 2;
+        const pointer = ramPointer(address, byteLength);
+        if (pointer === null) {
+          return dspAxParseFailure("list-out-of-bounds", {
+            address: hex32(address),
+            sizeWords,
+          });
+        }
+        const physical = (pointer - ram) >>> 0;
+        if (seenPhysicalAddresses.has(physical)) {
+          return dspAxParseFailure("list-cycle", {
+            address: hex32(address),
+            physical: hex32(physical),
+          });
+        }
+        seenPhysicalAddresses.add(physical);
+        listCount += 1;
+        wordCount += sizeWords;
+
+        let index = 0;
+        let chained = false;
+        while (index < sizeWords) {
+          const command = view.getUint16(pointer + index * 2, false);
+          index += 1;
+          const arity = dspAxCommandArity(command);
+          if (arity === null) {
+            return dspAxParseFailure("unknown-command", {
+              command,
+              list: listCount - 1,
+              word: index - 1,
+            });
+          }
+          if (command === 0x12 && dspUcodeHash === 0x4e8a8b21) {
+            return dspAxParseFailure("unsupported-command-for-ucode", {
+              command,
+              hash: hex32(dspUcodeHash),
+            });
+          }
+          if (index + arity > sizeWords) {
+            return dspAxParseFailure("truncated-command", {
+              command,
+              list: listCount - 1,
+              word: index - 1,
+              arity,
+              remaining: sizeWords - index,
+            });
+          }
+
+          const arguments_ = [];
+          for (let argument = 0; argument < arity; argument += 1) {
+            arguments_.push(
+              view.getUint16(pointer + (index + argument) * 2, false)
+            );
+          }
+          index += arity;
+          commandCount += 1;
+          if (commandSample.length < 32) commandSample.push(command);
+
+          const writeResult = collectDspAxSilentWrites(
+            command,
+            arguments_,
+            writes
+          );
+          if (!writeResult.ok) return writeResult;
+
+          if (command === 0x0f) {
+            return {
+              ok: true,
+              address: initialAddress >>> 0,
+              sizeWords: initialSizeWords,
+              listCount,
+              wordCount,
+              commandCount,
+              commandSample,
+              writes,
+            };
+          }
+          if (command === 0x0d) {
+            address = dspAxAddress(arguments_[0], arguments_[1]);
+            sizeWords = arguments_[2];
+            chained = true;
+            break;
+          }
+        }
+        if (!chained) {
+          return dspAxParseFailure("missing-end", {
+            address: hex32(address),
+            sizeWords,
+          });
+        }
+      }
+    }
+
+    function applyDspAxSilentWrites(writes) {
+      let clearedBytes = 0;
+      for (const write of writes) {
+        invalidateDataReservationForExternalWrite(
+          write.physical,
+          write.size
+        );
+        bytes.fill(0, write.pointer, write.pointer + write.size);
+        clearedBytes += write.size;
+        traceDsp("ax-silent-write", {
+          command: write.command,
+          address: hex32(write.address),
+          size: write.size,
+        });
+      }
+      return clearedBytes;
+    }
+
+    function beginDspAxCommandList(sizeWords) {
+      if (
+        !Number.isSafeInteger(sizeWords)
+        || sizeWords <= 0
+        || sizeWords >= 512
+      ) {
+        return rejectDspAxCommand("invalid-list-size", { sizeWords });
+      }
+      dspAxCommandState = {
+        ...emptyDspAxCommandState(),
+        phase: "waiting-address",
+        sizeWords,
+      };
+      traceDsp("ax-command-list-size", { sizeWords });
+      return true;
+    }
+
+    function executeDspAxCommandList(address) {
+      const result = parseDspAxCommandLists(
+        address,
+        dspAxCommandState.sizeWords
+      );
+      if (!result.ok) {
+        return rejectDspAxCommand(result.reason, result.details);
+      }
+
+      const clearedBytes = applyDspAxSilentWrites(result.writes);
+      dspAxCommandState.phase = "yield-pending";
+      dspAxCommandState.address = result.address;
+      dspAxCommandState.listCount = result.listCount;
+      dspAxCommandState.wordCount = result.wordCount;
+      dspAxCommandState.commandCount = result.commandCount;
+      dspAxCommandState.commandSample = result.commandSample;
+      dspAxCommandState.writeCount = result.writes.length;
+      dspAxCommandState.clearedBytes = clearedBytes;
+      dspAxCommandState.rejected = false;
+      dspAxCommandState.reason = null;
+      dspScheduledMail = {
+        mail: 0xdcd10002,
+        completionCycle: cycles + 2500,
+      };
+      traceDsp("ax-command-list", {
+        address: hex32(result.address),
+        sizeWords: result.sizeWords,
+        lists: result.listCount,
+        words: result.wordCount,
+        commands: result.commandCount,
+        writes: result.writes.length,
+        clearedBytes,
+      });
+      deviceEvents.set(
+        "dspAxCommandList",
+        (deviceEvents.get("dspAxCommandList") ?? 0) + 1
+      );
+      deviceEvents.set(
+        "dspAxCommand",
+        (deviceEvents.get("dspAxCommand") ?? 0) + result.commandCount
+      );
+      deviceEvents.set(
+        "dspAxSilentWrite",
+        (deviceEvents.get("dspAxSilentWrite") ?? 0) + result.writes.length
+      );
+      deviceEvents.set(
+        "dspAxSilentBytes",
+        (deviceEvents.get("dspAxSilentBytes") ?? 0) + clearedBytes
+      );
+      return true;
+    }
+
+    function handleDspAxMail(mail) {
+      const payload = mail >>> 0;
+      switch (dspAxCommandState.phase) {
+        case "waiting-size":
+          if (((payload & 0xffff0000) >>> 0) !== 0xbabe0000) {
+            return rejectDspAxCommand("expected-list-size", {
+              mail: hex32(payload),
+            });
+          }
+          return beginDspAxCommandList(payload & 0xffff);
+
+        case "waiting-address":
+          return executeDspAxCommandList(payload);
+
+        case "yield-pending":
+          return rejectDspAxCommand("task-before-yield-consumed", {
+            mail: hex32(payload),
+            scheduled: dspScheduledMail !== null,
+            currentMail: hex32(dspCurrentMail),
+          });
+
+        case "task-wait": {
+          dspAxCommandState.lastTaskMail = payload;
+          const action = payload & 0xffff;
+          const canonicalMail = (0xcdd10000 | action) >>> 0;
+          if (action === 0x0000) {
+            dspAxCommandState.phase = "waiting-size";
+            pushDspMail(0xdcd10001, true, "ax-task-resume");
+            traceDsp("ax-task-resume", {
+              mail: hex32(payload),
+              canonicalMail: hex32(canonicalMail),
+            });
+            deviceEvents.set(
+              "dspAxTaskResume",
+              (deviceEvents.get("dspAxTaskResume") ?? 0) + 1
+            );
+            return true;
+          }
+          if (action === 0x0001) {
+            return rejectDspAxCommand("unsupported-task-switch", {
+              mail: hex32(payload),
+              canonicalMail: hex32(canonicalMail),
+            });
+          }
+          if (action === 0x0002) {
+            traceDsp("ax-task-reset", {
+              mail: hex32(payload),
+              canonicalMail: hex32(canonicalMail),
+            });
+            resetDspMailbox();
+            return true;
+          }
+          if (action === 0x0003) {
+            dspAxCommandState.phase = "waiting-size";
+            traceDsp("ax-task-continue", {
+              mail: hex32(payload),
+              canonicalMail: hex32(canonicalMail),
+            });
+            deviceEvents.set(
+              "dspAxTaskContinue",
+              (deviceEvents.get("dspAxTaskContinue") ?? 0) + 1
+            );
+            return true;
+          }
+          return rejectDspAxCommand("unsupported-task-mail", {
+            mail: hex32(payload),
+            canonicalMail: hex32(canonicalMail),
+          });
+        }
+
+        case "halted":
+          return false;
+
+        default:
+          return rejectDspAxCommand("invalid-state", {
+            phase: dspAxCommandState.phase,
+          });
+      }
     }
 
     function rejectDspZeldaCommand(reason, details = {}) {
@@ -10992,7 +11443,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspUcodeHash = null;
       dspMode = "rom";
       dspUcodeBooted = false;
-      dspAxCommandListPending = false;
+      dspAxCommandState = emptyDspAxCommandState();
       dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       view.setUint16(mmio + 0x5000, 0, false);
@@ -11011,7 +11462,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspUcodeHash = null;
       dspMode = "init";
       dspUcodeBooted = false;
-      dspAxCommandListPending = false;
+      dspAxCommandState = emptyDspAxCommandState();
       dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       view.setUint16(mmio + 0x5004, 0, false);
@@ -11040,20 +11491,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (parameter === 0x80f3d001) bootDspUcode();
         }
       } else if (dspMode === "ax") {
-        if (dspAxCommandListPending) {
-          dspAxCommandListPending = false;
-          dspScheduledMail = { mail: 0xdcd10002, completionCycle: cycles + 2500 };
-          deviceEvents.set(
-            "dspAxCommandList",
-            (deviceEvents.get("dspAxCommandList") ?? 0) + 1
-          );
-        } else if (mail === 0xcdd10000) {
-          pushDspMail(0xdcd10001, true);
-        } else if (mail === 0xcdd10002) {
-          resetDspMailbox();
-        } else if (((mail & 0xffff0000) >>> 0) === 0xbabe0000) {
-          dspAxCommandListPending = true;
-        }
+        handleDspAxMail(mail);
       } else if (dspMode === "zelda") {
         handleDspZeldaMail(mail);
       }
@@ -16395,6 +16833,29 @@ const TEMPLATE: &str = r##"<!doctype html>
           dspScheduledMail,
           dspMode,
           dspUcodeHash: dspUcodeHash === null ? null : hex32(dspUcodeHash),
+          dspAxCommand: {
+            phase: dspAxCommandState.phase,
+            sizeWords: dspAxCommandState.sizeWords,
+            address:
+              dspAxCommandState.address === null
+                ? null
+                : hex32(dspAxCommandState.address),
+            listCount: dspAxCommandState.listCount,
+            wordCount: dspAxCommandState.wordCount,
+            commandCount: dspAxCommandState.commandCount,
+            commandSample: dspAxCommandState.commandSample.map(
+              command =>
+                "0x" + command.toString(16).padStart(2, "0")
+            ),
+            writeCount: dspAxCommandState.writeCount,
+            clearedBytes: dspAxCommandState.clearedBytes,
+            rejected: dspAxCommandState.rejected,
+            reason: dspAxCommandState.reason,
+            lastTaskMail:
+              dspAxCommandState.lastTaskMail === null
+                ? null
+                : hex32(dspAxCommandState.lastTaskMail),
+          },
           dspZeldaCommand: {
             phase: dspZeldaCommandState.phase,
             expectedWords: dspZeldaCommandState.expectedWords,

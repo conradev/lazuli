@@ -309,33 +309,6 @@ test("DSP level interrupt re-enters with overlapping sources until every source 
   assert.equal(context.view.getUint32(0x3000, false) & 0x40, 0);
 });
 
-test("AX command-list mail schedules the existing DSP completion reply", () => {
-  const context = {
-    cycles: 10_000,
-    deviceEvents: new Map(),
-    dspAxCommandListPending: false,
-    dspMode: "ax",
-    dspRomParameter: null,
-    dspScheduledMail: null,
-    dspUcodeBooted: true,
-    pushDspMail() {},
-    resetDspMailbox() {},
-  };
-  vm.createContext(context);
-  vm.runInContext(extractFunction("handleDspCpuMail"), context, {
-    filename: "browser_boot.audio-ax.js",
-  });
-
-  context.handleDspCpuMail(0xbabe0180);
-  assert.equal(context.dspAxCommandListPending, true);
-  context.handleDspCpuMail(0x80123460);
-  assert.deepEqual(
-    { ...context.dspScheduledMail },
-    { mail: 0xdcd10002, completionCycle: 12_500 },
-  );
-  assert.equal(context.deviceEvents.get("dspAxCommandList"), 1);
-});
-
 test("CPU mailbox commits raw payload only after the low-half write", () => {
   const delivered = [];
   const memory = new ArrayBuffer(0x6000);

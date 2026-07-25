@@ -44,6 +44,7 @@ function extractFunction(name) {
 const dspFunctionNames = [
   "hex32",
   "emptyDspUcodeUpload",
+  "emptyDspAxCommandState",
   "emptyDspZeldaRenderState",
   "emptyDspZeldaCommandState",
   "traceDsp",
@@ -83,7 +84,7 @@ function dspContext(mode = "zelda") {
     bytes,
     cycles: 10_000,
     deviceEvents: new Map(),
-    dspAxCommandListPending: false,
+    dspAxCommandState: null,
     dspCpuMailbox: 0,
     dspCurrentMail: null,
     dspMailQueue: [],
@@ -93,6 +94,7 @@ function dspContext(mode = "zelda") {
     dspTrace: [],
     dspUcodeBooted: true,
     dspUcodeHash: mode === "zelda" ? 0x2fcdf1ec : 0x4e8a8b21,
+    handleDspAxMail() {},
     invalidateDataReservationForExternalWrite() {},
     mmio: 0,
     pc: 0x80001000,
@@ -124,6 +126,7 @@ function dspContext(mode = "zelda") {
     { filename: "browser_boot.dsp-zelda.js" },
   );
   context.dspUcodeUpload = context.emptyDspUcodeUpload();
+  context.dspAxCommandState = context.emptyDspAxCommandState();
   context.dspZeldaCommandState = context.emptyDspZeldaCommandState();
   return context;
 }
@@ -485,7 +488,7 @@ test("Zelda command parsing is isolated from AX mail handling", () => {
   assert.equal(context.dspCurrentMail, null);
   assert.equal(context.dspMailQueue.length, 0);
   assert.equal(context.dspScheduledMail, null);
-  assert.equal(context.dspAxCommandListPending, false);
+  assert.equal(context.dspAxCommandState.phase, "waiting-size");
   assert.equal(context.deviceEvents.get("dspZeldaCommand"), undefined);
   assert.equal(context.deviceEvents.get("dspZeldaRenderCommand"), undefined);
   assert.equal(context.deviceEvents.get("dspZeldaRenderSync"), undefined);

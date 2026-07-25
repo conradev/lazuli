@@ -46,6 +46,7 @@ const dspFunctionNames = [
   "ramPointer",
   "hex32",
   "emptyDspUcodeUpload",
+  "emptyDspAxCommandState",
   "emptyDspZeldaRenderState",
   "emptyDspZeldaCommandState",
   "dspUcodeHashEctor",
@@ -82,7 +83,7 @@ function dspContext(payload = axHashFixture) {
     bytes: new Uint8Array(memory),
     cycles: 10_000,
     deviceEvents: new Map(),
-    dspAxCommandListPending: false,
+    dspAxCommandState: null,
     dspCpuMailbox: 0,
     dspCurrentMail: null,
     dspMailQueue: [],
@@ -106,6 +107,7 @@ function dspContext(payload = axHashFixture) {
     { filename: "browser_boot.dsp-ucode.js" },
   );
   context.dspUcodeUpload = context.emptyDspUcodeUpload();
+  context.dspAxCommandState = context.emptyDspAxCommandState();
   context.dspZeldaCommandState = context.emptyDspZeldaCommandState();
   context.bytes.set(payload, 0x1000);
   return context;
@@ -251,7 +253,7 @@ test("Zelda upload emits DSP_INIT before its non-interrupt handshake", () => {
 
   sendDspMail(context, 0xbabe0180);
   sendDspMail(context, 0x00123460);
-  assert.equal(context.dspAxCommandListPending, false);
+  assert.equal(context.dspAxCommandState.phase, "waiting-size");
   assert.equal(context.dspScheduledMail, null);
   assert.equal(context.deviceEvents.get("dspAxCommandList"), undefined);
 });
@@ -397,7 +399,7 @@ test("DSP reset clears partial classification state before its ROM greeting", ()
   context.dspUcodeHash = 0x2fcdf1ec;
   context.dspMode = "zelda";
   context.dspUcodeBooted = true;
-  context.dspAxCommandListPending = true;
+  context.dspAxCommandState.phase = "task-wait";
   context.dspScheduledMail = { mail: 0xdcd10002, completionCycle: 12_500 };
   context.dspCurrentMail = 0xdcd10000;
   context.dspMailQueue.push({ mail: 0xf3551111, interrupt: false });
@@ -410,7 +412,7 @@ test("DSP reset clears partial classification state before its ROM greeting", ()
   assert.equal(context.dspUcodeHash, null);
   assert.equal(context.dspMode, "rom");
   assert.equal(context.dspUcodeBooted, false);
-  assert.equal(context.dspAxCommandListPending, false);
+  assert.equal(context.dspAxCommandState.phase, "waiting-size");
   assert.equal(context.dspScheduledMail, null);
   assert.equal(context.dspCurrentMail, 0x8071feed);
   assert.equal(context.dspMailQueue.length, 0);
