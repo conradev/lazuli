@@ -15,6 +15,40 @@ pub(crate) const MAX_TEV_RASTER_CHANNELS: usize = 8;
 pub(crate) const TEV_VERTEX_FLOATS: usize = 36;
 pub(crate) const TEV_DRAW_STATE_BYTES: usize = 464;
 pub(crate) const TEV_TEXTURE_METADATA_WORDS: usize = MAX_TEV_TEXTURES * 5;
+// One exact managed texture-coordinate sidecar record contains three inv-W
+// endpoint words followed by S/W, T/W, and Q/W endpoint triples for all eight
+// GX coordinates. The final word pads each per-primitive record to vec4<u32>
+// storage alignment without changing the 144-byte vertex transport.
+pub(crate) const MANAGED_TEX_COORD_SIDECAR_WORDS: usize = 76;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TevPipelineLayoutKind {
+    Legacy,
+    ManagedTexCoordSidecar,
+}
+
+impl TevPipelineLayoutKind {
+    pub(crate) const fn required_bind_group_count(self) -> u32 {
+        match self {
+            Self::Legacy => 2,
+            Self::ManagedTexCoordSidecar => 3,
+        }
+    }
+
+    pub(crate) const fn requires_managed_tex_coord_sidecar(self) -> bool {
+        matches!(self, Self::ManagedTexCoordSidecar)
+    }
+}
+
+pub(crate) const fn tev_pipeline_layout_kind(
+    managed_tex_coord_sidecar: bool,
+) -> TevPipelineLayoutKind {
+    if managed_tex_coord_sidecar {
+        TevPipelineLayoutKind::ManagedTexCoordSidecar
+    } else {
+        TevPipelineLayoutKind::Legacy
+    }
+}
 
 pub(crate) type TevColor = [i32; 4];
 
@@ -111,6 +145,107 @@ pub(crate) fn required_texture_coords(state: &[u8]) -> Result<[bool; MAX_TEV_TEX
         }
     }
     Ok(required)
+}
+
+pub(crate) fn managed_tex_coord_sidecar_record(
+    source_vertices: &[f32],
+    indices: [usize; 3],
+    required_coords: [bool; MAX_TEV_TEXTURES],
+) -> Option<[u32; MANAGED_TEX_COORD_SIDECAR_WORDS]> {
+    let vertex_count = source_vertices.len() / TEV_VERTEX_FLOATS;
+    if !source_vertices.len().is_multiple_of(TEV_VERTEX_FLOATS)
+        || indices.into_iter().any(|index| index >= vertex_count)
+    {
+        return None;
+    }
+    let mut record = [0_u32; MANAGED_TEX_COORD_SIDECAR_WORDS];
+    let mut wrote_inv_w = false;
+    for (texture_coord, required) in required_coords.into_iter().enumerate() {
+        if !required {
+            continue;
+        }
+        for (endpoint, index) in indices.into_iter().enumerate() {
+            let offset = index * TEV_VERTEX_FLOATS;
+            let inv_w = 1.0 / source_vertices[offset + 3];
+            if !inv_w.is_finite() {
+                return None;
+            }
+            if !wrote_inv_w {
+                record[endpoint] = inv_w.to_bits();
+            } else if record[endpoint] != inv_w.to_bits() {
+                return None;
+            }
+            let source = offset + 12 + texture_coord * 3;
+            let base = 3 + texture_coord * 9;
+            for component in 0..3 {
+                let over_w = source_vertices[source + component] * inv_w;
+                if !over_w.is_finite() {
+                    return None;
+                }
+                record[base + component * 3 + endpoint] = over_w.to_bits();
+            }
+        }
+        wrote_inv_w = true;
+    }
+    wrote_inv_w.then_some(record)
+}
+
+pub(crate) fn managed_tex_coord_sidecar_fits(
+    resident_words: usize,
+    candidate: Option<&[u32]>,
+    max_storage_bytes: usize,
+) -> bool {
+    let Some(candidate) = candidate else {
+        return true;
+    };
+    if !candidate
+        .len()
+        .is_multiple_of(MANAGED_TEX_COORD_SIDECAR_WORDS)
+    {
+        return false;
+    }
+    let Some(total_words) = resident_words.checked_add(candidate.len()) else {
+        return false;
+    };
+    let Some(total_bytes) = total_words.checked_mul(size_of::<u32>()) else {
+        return false;
+    };
+    total_bytes <= max_storage_bytes
+        && u32::try_from(total_words / MANAGED_TEX_COORD_SIDECAR_WORDS).is_ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedSidecarCapacityOutcome {
+    Managed,
+    NativeFallback,
+    RejectManagedPayload,
+}
+
+pub(crate) fn managed_sidecar_capacity_outcome(
+    required_exact: bool,
+    resident_words: usize,
+    candidate: Option<&[u32]>,
+    max_storage_bytes: usize,
+) -> ManagedSidecarCapacityOutcome {
+    if managed_tex_coord_sidecar_fits(resident_words, candidate, max_storage_bytes) {
+        ManagedSidecarCapacityOutcome::Managed
+    } else if required_exact {
+        ManagedSidecarCapacityOutcome::RejectManagedPayload
+    } else {
+        ManagedSidecarCapacityOutcome::NativeFallback
+    }
+}
+
+pub(crate) fn managed_tex_coord_sidecar_record_base(
+    resident_words: usize,
+    triangle_count: usize,
+) -> Option<u32> {
+    if !resident_words.is_multiple_of(MANAGED_TEX_COORD_SIDECAR_WORDS) {
+        return None;
+    }
+    let base = u32::try_from(resident_words / MANAGED_TEX_COORD_SIDECAR_WORDS).ok()?;
+    base.checked_add(u32::try_from(triangle_count).ok()?)?;
+    Some(base)
 }
 
 /// One TEV stage in the exact layout consumed by [`TEV_WGSL`].
@@ -705,7 +840,7 @@ struct ManagedCoverageVertexInput {
 
 struct ManagedCoverageVertexOutput {
     @invariant @builtin(position) position: vec4<f32>,
-    @location(0) @interpolate(flat) raster0_endpoints: vec3<u32>,
+    @location(0) @interpolate(flat) raster0_endpoints: vec4<u32>,
     @location(1) @interpolate(flat) raster1_endpoints: vec3<u32>,
     @location(2) @interpolate(flat) source_x_bits: vec3<u32>,
     @location(3) @interpolate(flat) source_y_bits: vec3<u32>,
@@ -722,6 +857,8 @@ struct CanonicalDepthOutput {
 };
 
 @group(0) @binding(2) var<uniform> draw_state: DrawState;
+@group(2) @binding(0) var<storage, read>
+    managed_tex_coord_sidecar: array<vec4<u32>>;
 
 fn gx_raster_depth24(depth24: f32) -> u32 {
     if !(depth24 > 0.0) {
@@ -817,7 +954,7 @@ fn vs_managed_coverage(
         (input.position.z / 16777215.0) * input.position.w,
         input.position.w,
     );
-    output.raster0_endpoints = input.raster0_endpoints.xyz;
+    output.raster0_endpoints = input.raster0_endpoints;
     output.raster1_endpoints = input.raster1_endpoints.xyz;
     output.source_x_bits = input.source_x_bits;
     output.source_y_bits = input.source_y_bits;
@@ -1233,7 +1370,7 @@ fn gx_managed_raster_colors(input: ManagedCoverageVertexOutput) -> array<vec4<i3
     let sample_y_bits = sf32_div(sf32_from_u32(pixel_y * 12u + 7u), 0x41400000u);
     return array<vec4<i32>, 8>(
         gx_managed_raster_color_bytes_at_sample(
-            input.source_x_bits, input.source_y_bits, input.raster0_endpoints,
+            input.source_x_bits, input.source_y_bits, input.raster0_endpoints.xyz,
             sample_x_bits, sample_y_bits,
         ),
         gx_managed_raster_color_bytes_at_sample(
@@ -1245,24 +1382,27 @@ fn gx_managed_raster_colors(input: ManagedCoverageVertexOutput) -> array<vec4<i3
     );
 }
 
-fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOutput {
-    let sample_x_numerator = floor(input.position.x) * 12.0 + 7.0;
-    let sample_y_numerator = floor(input.position.y) * 12.0 + 7.0;
-    let sample_x = sample_x_numerator / 12.0;
-    let sample_y = sample_y_numerator / 12.0;
-    let source_x = bitcast<vec3<f32>>(input.source_x_bits);
-    let source_y = bitcast<vec3<f32>>(input.source_y_bits);
+fn gx_managed_reconstructed_stq(
+    source_x: vec3<f32>,
+    source_y: vec3<f32>,
+    inv_w_endpoints: vec3<f32>,
+    s_over_w_endpoints: vec3<f32>,
+    t_over_w_endpoints: vec3<f32>,
+    q_over_w_endpoints: vec3<f32>,
+    sample_x: f32,
+    sample_y: f32,
+) -> vec3<f32> {
     let inv_w = gx_managed_attribute_at_sample(
-        source_x, source_y, input.stq2, sample_x, sample_y,
+        source_x, source_y, inv_w_endpoints, sample_x, sample_y,
     );
     let s_over_w = gx_managed_attribute_at_sample(
-        source_x, source_y, input.stq3, sample_x, sample_y,
+        source_x, source_y, s_over_w_endpoints, sample_x, sample_y,
     );
     let t_over_w = gx_managed_attribute_at_sample(
-        source_x, source_y, input.stq4, sample_x, sample_y,
+        source_x, source_y, t_over_w_endpoints, sample_x, sample_y,
     );
     let q_over_w = gx_managed_attribute_at_sample(
-        source_x, source_y, input.stq5, sample_x, sample_y,
+        source_x, source_y, q_over_w_endpoints, sample_x, sample_y,
     );
     // Match Dolphin's software rasterizer operation-for-operation: recover W,
     // recover Q with that once-rounded W, divide W by Q, and only then project
@@ -1273,10 +1413,24 @@ fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOu
     if q != 0.0 {
         projection = w / q;
     }
-    let reconstructed_stq = vec3<f32>(
+    return vec3<f32>(
         s_over_w * projection,
         t_over_w * projection,
         1.0,
+    );
+}
+
+fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOutput {
+    let sample_x_numerator = floor(input.position.x) * 12.0 + 7.0;
+    let sample_y_numerator = floor(input.position.y) * 12.0 + 7.0;
+    let sample_x = sample_x_numerator / 12.0;
+    let sample_y = sample_y_numerator / 12.0;
+    let source_x = bitcast<vec3<f32>>(input.source_x_bits);
+    let source_y = bitcast<vec3<f32>>(input.source_y_bits);
+    let reconstructed_stq = gx_managed_reconstructed_stq(
+        source_x, source_y,
+        input.stq2, input.stq3, input.stq4, input.stq5,
+        sample_x, sample_y,
     );
 
     var output: TevVertexOutput;
@@ -1295,6 +1449,115 @@ fn managed_coverage_tev_input(input: ManagedCoverageVertexOutput) -> TevVertexOu
     output.stq7 = reconstructed_stq;
     output.depth24 = gx_managed_attribute_at_sample(
         source_x, source_y, input.source_depth24, sample_x, sample_y,
+    );
+    return output;
+}
+
+fn gx_managed_tex_coord_sidecar_word(record: u32, word: u32) -> u32 {
+    let packed = managed_tex_coord_sidecar[record * 19u + word / 4u];
+    return packed[word & 3u];
+}
+
+fn gx_managed_sidecar_stq(
+    input: ManagedCoverageVertexOutput,
+    texture_coord: u32,
+) -> vec3<f32> {
+    let record = input.raster0_endpoints.w;
+    let source_x = bitcast<vec3<f32>>(input.source_x_bits);
+    let source_y = bitcast<vec3<f32>>(input.source_y_bits);
+    let inv_w = vec3<f32>(
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, 0u)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, 1u)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, 2u)),
+    );
+    let base = 3u + texture_coord * 9u;
+    let s_over_w = vec3<f32>(
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 1u)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 2u)),
+    );
+    let t_over_w = vec3<f32>(
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 3u)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 4u)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 5u)),
+    );
+    let q_over_w = vec3<f32>(
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 6u)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 7u)),
+        bitcast<f32>(gx_managed_tex_coord_sidecar_word(record, base + 8u)),
+    );
+    let sample_x = (floor(input.position.x) * 12.0 + 7.0) / 12.0;
+    let sample_y = (floor(input.position.y) * 12.0 + 7.0) / 12.0;
+    return gx_managed_reconstructed_stq(
+        source_x, source_y, inv_w, s_over_w, t_over_w, q_over_w,
+        sample_x, sample_y,
+    );
+}
+
+fn gx_managed_required_tex_coord_mask() -> u32 {
+    var mask = 0u;
+    var stage_index = 0u;
+    loop {
+        if stage_index >= min(tev_state.stage_count_and_padding.x, TEV_MAX_STAGES) {
+            break;
+        }
+        let refs = tev_state.stages[stage_index].refs;
+        if (refs & (1u << 6u)) != 0u {
+            mask |= 1u << ((refs >> 3u) & 7u);
+        }
+        stage_index += 1u;
+    }
+    return mask;
+}
+
+fn managed_multi_coord_tev_input(
+    input: ManagedCoverageVertexOutput,
+) -> TevVertexOutput {
+    let required_coord_mask = gx_managed_required_tex_coord_mask();
+    var output: TevVertexOutput;
+    output.position = input.position;
+    output.raster0 = vec4<f32>(0.0);
+    output.raster1 = vec4<f32>(0.0);
+    output.stq0 = vec3<f32>(0.0);
+    output.stq1 = vec3<f32>(0.0);
+    output.stq2 = vec3<f32>(0.0);
+    output.stq3 = vec3<f32>(0.0);
+    output.stq4 = vec3<f32>(0.0);
+    output.stq5 = vec3<f32>(0.0);
+    output.stq6 = vec3<f32>(0.0);
+    output.stq7 = vec3<f32>(0.0);
+    if (required_coord_mask & (1u << 0u)) != 0u {
+        output.stq0 = gx_managed_sidecar_stq(input, 0u);
+    }
+    if (required_coord_mask & (1u << 1u)) != 0u {
+        output.stq1 = gx_managed_sidecar_stq(input, 1u);
+    }
+    if (required_coord_mask & (1u << 2u)) != 0u {
+        output.stq2 = gx_managed_sidecar_stq(input, 2u);
+    }
+    if (required_coord_mask & (1u << 3u)) != 0u {
+        output.stq3 = gx_managed_sidecar_stq(input, 3u);
+    }
+    if (required_coord_mask & (1u << 4u)) != 0u {
+        output.stq4 = gx_managed_sidecar_stq(input, 4u);
+    }
+    if (required_coord_mask & (1u << 5u)) != 0u {
+        output.stq5 = gx_managed_sidecar_stq(input, 5u);
+    }
+    if (required_coord_mask & (1u << 6u)) != 0u {
+        output.stq6 = gx_managed_sidecar_stq(input, 6u);
+    }
+    if (required_coord_mask & (1u << 7u)) != 0u {
+        output.stq7 = gx_managed_sidecar_stq(input, 7u);
+    }
+    let sample_x = (floor(input.position.x) * 12.0 + 7.0) / 12.0;
+    let sample_y = (floor(input.position.y) * 12.0 + 7.0) / 12.0;
+    output.depth24 = gx_managed_attribute_at_sample(
+        bitcast<vec3<f32>>(input.source_x_bits),
+        bitcast<vec3<f32>>(input.source_y_bits),
+        input.source_depth24,
+        sample_x,
+        sample_y,
     );
     return output;
 }
@@ -1929,8 +2192,8 @@ fn tev_evaluate(
         var texture_base = vec4<i32>(255);
         if (stage.refs & (1u << 6u)) != 0u {
             if managed_exact_sampler {
-                // Managed coverage has already reconstructed the single live UV
-                // coordinate with Dolphin's BuildBlock operation order.
+                // Managed coverage has already reconstructed every live
+                // stage-selected UV with Dolphin's BuildBlock operation order.
                 texture_base =
                     tev_sample_texture_managed(texture_map, tex_coords[tex_coord].xy);
             } else {
@@ -2242,6 +2505,46 @@ fn fs_managed_coverage_depth_main(
 ) -> TevFragmentDepthOutput {
     let values = tev_fragment_values(
         managed_coverage_tev_input(input),
+        gx_managed_raster_colors(input),
+        true,
+        true,
+    );
+    if !gx_managed_coverage_passes(input) {
+        discard;
+    }
+    var output: TevFragmentDepthOutput;
+    output.primary = values.primary;
+    output.secondary = values.secondary;
+    let depth_encoding = (draw_state.fragment_flags >> 2u) & 7u;
+    output.depth = gx_efb_depth_to_attachment(values.buffer_depth, depth_encoding);
+    return output;
+}
+
+@fragment
+fn fs_managed_multi_coord_main(
+    input: ManagedCoverageVertexOutput,
+) -> TevFragmentOutput {
+    let values = tev_fragment_values(
+        managed_multi_coord_tev_input(input),
+        gx_managed_raster_colors(input),
+        false,
+        true,
+    );
+    if !gx_managed_coverage_passes(input) {
+        discard;
+    }
+    var output: TevFragmentOutput;
+    output.primary = values.primary;
+    output.secondary = values.secondary;
+    return output;
+}
+
+@fragment
+fn fs_managed_multi_coord_depth_main(
+    input: ManagedCoverageVertexOutput,
+) -> TevFragmentDepthOutput {
+    let values = tev_fragment_values(
+        managed_multi_coord_tev_input(input),
         gx_managed_raster_colors(input),
         true,
         true,
@@ -2910,7 +3213,7 @@ mod tests {
         assert!(!native_interfaces.contains("raster0_endpoints"));
         assert!(shader.contains("@location(1) raster0_endpoints: vec4<u32>"));
         assert!(shader.contains("@location(2) raster1_endpoints: vec4<u32>"));
-        assert!(shader.contains("@location(0) @interpolate(flat) raster0_endpoints: vec3<u32>"));
+        assert!(shader.contains("@location(0) @interpolate(flat) raster0_endpoints: vec4<u32>"));
         assert!(shader.contains("@location(1) @interpolate(flat) raster1_endpoints: vec3<u32>"));
         assert!(shader.contains("@location(3) source_x_bits: vec3<u32>"));
         assert!(shader.contains("@location(4) source_y_bits: vec3<u32>"));
@@ -3035,12 +3338,73 @@ mod tests {
             assert!(tev < coverage_test);
         }
         assert!(managed.contains("fn fs_managed_coverage_depth_main"));
+        let multi_start = managed
+            .find("@fragment\nfn fs_managed_multi_coord_main")
+            .unwrap();
         assert_eq!(
-            managed.matches("gx_managed_raster_colors(input)").count(),
+            managed[..multi_start]
+                .matches("gx_managed_raster_colors(input)")
+                .count(),
             2
         );
         assert!(shader.contains("raster_base = managed_raster_bytes[raster_channel]"));
         assert!(shader.contains("raster_base = tev_to_bytes(raster_colors[raster_channel])"));
+    }
+
+    #[test]
+    fn wgsl_managed_multi_coord_sidecar_selects_only_live_stage_coordinates() {
+        let shader = shader_source();
+        assert!(shader.contains(
+            "@group(2) @binding(0) var<storage, read>\n    managed_tex_coord_sidecar: array<vec4<u32>>"
+        ));
+        assert!(shader.contains("let record = input.raster0_endpoints.w"));
+        assert!(shader.contains("managed_tex_coord_sidecar[record * 19u + word / 4u]"));
+        assert!(shader.contains("let base = 3u + texture_coord * 9u"));
+        assert!(shader.contains("fn gx_managed_required_tex_coord_mask() -> u32"));
+        assert!(shader.contains("mask |= 1u << ((refs >> 3u) & 7u)"));
+
+        let start = shader.find("fn managed_multi_coord_tev_input(").unwrap();
+        let end = shader[start..]
+            .find("fn gx_managed_attribute_at_sample(")
+            .unwrap()
+            + start;
+        let multi = &shader[start..end];
+        for coord in 0..8 {
+            assert!(multi.contains(&format!(
+                "if (required_coord_mask & (1u << {coord}u)) != 0u"
+            )));
+            assert!(multi.contains(&format!(
+                "output.stq{coord} = gx_managed_sidecar_stq(input, {coord}u)"
+            )));
+            assert_eq!(
+                multi
+                    .matches(&format!("gx_managed_sidecar_stq(input, {coord}u)"))
+                    .count(),
+                1,
+                "coordinate {coord} must be reconstructed only behind its uniform live bit",
+            );
+        }
+        assert!(!multi.contains("output.stq0 = reconstructed_stq"));
+        assert!(!multi.contains("managed_coverage_tev_input(input)"));
+
+        for entry in [
+            "fs_managed_multi_coord_main",
+            "fs_managed_multi_coord_depth_main",
+        ] {
+            let start = shader.find(&format!("fn {entry}(")).unwrap();
+            let tail = &shader[start..];
+            let end = tail.find("\n}\n").unwrap() + 3;
+            let entry = &tail[..end];
+            let tev = entry.find("managed_multi_coord_tev_input(input)").unwrap();
+            let coverage = entry.find("if !gx_managed_coverage_passes(input)").unwrap();
+            assert!(
+                tev < coverage,
+                "manual-sampler derivatives stay in uniform control flow",
+            );
+        }
+        assert!(
+            shader.contains("tev_sample_texture_managed(texture_map, tex_coords[tex_coord].xy)")
+        );
     }
 
     #[test]
@@ -3355,6 +3719,148 @@ mod tests {
             [false, false, true, false, false, false, false, true],
         );
         assert!(required_texture_coords(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    fn sidecar_source(vertex_count: usize) -> Vec<f32> {
+        let mut source = vec![0.0; vertex_count * TEV_VERTEX_FLOATS];
+        for vertex in 0..vertex_count {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            source[offset + 3] = [1.0_f32, 2.0, 4.0, 8.0][vertex];
+            for coord in 0..MAX_TEV_TEXTURES {
+                let stq = offset + 12 + coord * 3;
+                source[stq] = coord as f32 + vertex as f32 * 0.125 + 0.25;
+                source[stq + 1] = coord as f32 * 0.5 + vertex as f32 * 0.25 + 0.5;
+                source[stq + 2] = 1.0 + coord as f32 * 0.0625;
+            }
+        }
+        source
+    }
+
+    #[test]
+    fn managed_sidecar_packs_all_eight_exact_planes_and_zeros_inactive_slots() {
+        let source = sidecar_source(3);
+        let record =
+            managed_tex_coord_sidecar_record(&source, [0, 1, 2], [true; MAX_TEV_TEXTURES]).unwrap();
+        assert_eq!(record[..3], [1.0_f32, 0.5, 0.25].map(f32::to_bits),);
+        for coord in 0..MAX_TEV_TEXTURES {
+            let base = 3 + coord * 9;
+            for component in 0..3 {
+                for endpoint in 0..3 {
+                    let offset = endpoint * TEV_VERTEX_FLOATS;
+                    let expected =
+                        source[offset + 12 + coord * 3 + component] * (1.0 / source[offset + 3]);
+                    assert_eq!(
+                        record[base + component * 3 + endpoint],
+                        expected.to_bits(),
+                        "coord {coord} component {component} endpoint {endpoint}",
+                    );
+                }
+            }
+        }
+        assert_eq!(record[MANAGED_TEX_COORD_SIDECAR_WORDS - 1], 0);
+
+        let mut required = [false; MAX_TEV_TEXTURES];
+        required[2] = true;
+        required[7] = true;
+        let sparse = managed_tex_coord_sidecar_record(&source, [0, 1, 2], required).unwrap();
+        for coord in 0..MAX_TEV_TEXTURES {
+            let words = &sparse[3 + coord * 9..3 + (coord + 1) * 9];
+            if coord == 2 || coord == 7 {
+                assert!(words.iter().any(|word| *word != 0));
+            } else {
+                assert_eq!(words, [0; 9]);
+            }
+        }
+    }
+
+    #[test]
+    fn managed_sidecar_keep021_order_bases_limits_and_reset_are_exact() {
+        let source = sidecar_source(4);
+        let mut required = [false; MAX_TEV_TEXTURES];
+        required[2] = true;
+        required[7] = true;
+        let first = managed_tex_coord_sidecar_record(&source, [0, 2, 1], required).unwrap();
+        let second = managed_tex_coord_sidecar_record(&source, [0, 3, 2], required).unwrap();
+        let coord2 = 3 + 2 * 9;
+        let source_s = |vertex: usize| {
+            let offset = vertex * TEV_VERTEX_FLOATS;
+            (source[offset + 12 + 2 * 3] / source[offset + 3]).to_bits()
+        };
+        assert_eq!(
+            first[coord2..coord2 + 3],
+            [source_s(0), source_s(2), source_s(1)],
+        );
+        assert_eq!(
+            second[coord2..coord2 + 3],
+            [source_s(0), source_s(3), source_s(2)],
+        );
+
+        assert_eq!(managed_tex_coord_sidecar_record_base(0, 2), Some(0));
+        assert_eq!(
+            managed_tex_coord_sidecar_record_base(2 * MANAGED_TEX_COORD_SIDECAR_WORDS, 2),
+            Some(2),
+        );
+        assert_eq!(
+            managed_tex_coord_sidecar_record_base(0, 1),
+            Some(0),
+            "clearing the segment sidecar resets the first global record ID",
+        );
+        assert_eq!(managed_tex_coord_sidecar_record_base(1, 1), None);
+
+        let bytes = MANAGED_TEX_COORD_SIDECAR_WORDS * size_of::<u32>();
+        assert!(managed_tex_coord_sidecar_fits(0, Some(&[]), 0));
+        assert!(managed_tex_coord_sidecar_fits(0, Some(&first), bytes));
+        assert!(!managed_tex_coord_sidecar_fits(0, Some(&first), bytes - 1));
+        assert_eq!(
+            managed_sidecar_capacity_outcome(false, 0, Some(&first), bytes - 1),
+            ManagedSidecarCapacityOutcome::NativeFallback,
+        );
+        assert_eq!(
+            managed_sidecar_capacity_outcome(true, 0, Some(&first), bytes - 1),
+            ManagedSidecarCapacityOutcome::RejectManagedPayload,
+        );
+        assert_eq!(
+            managed_sidecar_capacity_outcome(true, 0, Some(&first), bytes),
+            ManagedSidecarCapacityOutcome::Managed,
+        );
+    }
+
+    #[test]
+    fn legacy_only_segment_requires_only_draw_and_texture_bind_groups() {
+        let segment = [false, false, false].map(tev_pipeline_layout_kind);
+
+        assert_eq!(segment, [TevPipelineLayoutKind::Legacy; 3]);
+        assert_eq!(
+            segment.map(TevPipelineLayoutKind::required_bind_group_count),
+            [2; 3],
+        );
+        assert!(
+            segment
+                .iter()
+                .all(|kind| !kind.requires_managed_tex_coord_sidecar()),
+        );
+    }
+
+    #[test]
+    fn mixed_segment_switches_legacy_sidecar_legacy_binding_requirements() {
+        let segment = [false, true, false].map(tev_pipeline_layout_kind);
+
+        assert_eq!(
+            segment,
+            [
+                TevPipelineLayoutKind::Legacy,
+                TevPipelineLayoutKind::ManagedTexCoordSidecar,
+                TevPipelineLayoutKind::Legacy,
+            ],
+        );
+        assert_eq!(
+            segment.map(TevPipelineLayoutKind::required_bind_group_count),
+            [2, 3, 2],
+        );
+        assert_eq!(
+            segment.map(TevPipelineLayoutKind::requires_managed_tex_coord_sidecar),
+            [false, true, false],
+        );
     }
 
     #[test]

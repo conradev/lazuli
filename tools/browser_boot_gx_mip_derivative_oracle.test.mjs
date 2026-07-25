@@ -881,7 +881,12 @@ test("reference model stays coupled to the derivative-driven WGSL path", () => {
   );
   assert.match(
     samplerSource,
-    /let reconstructed_stq = vec3<f32>\([\s\S]*s_over_w \* projection,[\s\S]*t_over_w \* projection,/,
+    /fn gx_managed_reconstructed_stq\([\s\S]*return vec3<f32>\([\s\S]*s_over_w \* projection,[\s\S]*t_over_w \* projection,/,
+  );
+  assert.match(
+    samplerSource,
+    /output\.stq7 = gx_managed_sidecar_stq\(input, 7u\)/,
+    "multi-coordinate managed draws must feed each stage-selected derivative from its own plane",
   );
 });
 
