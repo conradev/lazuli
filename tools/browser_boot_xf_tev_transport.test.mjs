@@ -188,6 +188,30 @@ test("transforms and normalizes normals with the selected XF normal matrix", () 
   assertVector(transformed, [2 / length, 3 / length, 0]);
 });
 
+test("transforms NBT tangent and binormal vectors without normalizing their scale", () => {
+  const context = workerContext();
+  const matrixIndex = 6;
+  const base = 0x400 + 3 * matrixIndex;
+  [
+    2, 0, 0,
+    0, 3, 0,
+    0, 0, 4,
+  ].forEach((value, index) => setXfFloat(context, base + index, value));
+
+  assertVector(
+    context.gxTransformNormalVector([1, 1, 0], matrixIndex),
+    [2, 3, 0],
+  );
+  assertVector(
+    context.gxTransformNormalVector([0, 0, 0], matrixIndex),
+    [0, 0, 0],
+  );
+  assert.ok(
+    context.gxTransformNormal([0, 0, 0], matrixIndex).every(Number.isNaN),
+    "only the lighting normal follows Common::Vec3::Normalized zero semantics",
+  );
+});
+
 test("normal-source projective texgen scales post-transform ST but preserves Q", () => {
   const context = workerContext();
   const matrixIndex = 9;
@@ -399,8 +423,10 @@ test("worker draw capture routes XF attributes through the TEV transport", () =>
   assert.match(capture, /gxPackTevState\s*\(/);
   assert.match(capture, /const sourceVertices = new Float32Array\(vertices\)/);
   assert.match(capture, /vertices:\s*sourceVertices/);
-  assert.match(capture, /decoded\.colors\s*\[\s*0\s*\]/);
-  assert.match(capture, /decoded\.colors\s*\[\s*1\s*\]/);
+  assert.match(capture, /const \[raster0, raster1\] = decoded\.rasterColors/);
+  assert.match(capture, /rasterColorSets\[0\]\.push\(raster0\)/);
+  assert.match(capture, /rasterColorSets\[1\]\.push\(raster1\)/);
+  assert.doesNotMatch(capture, /decoded\.colors\s*\[/);
   assert.match(capture, /gxManagedCoverageStateCandidate\s*\(/);
   assert.match(capture, /sourcePositions\.push\(decoded\.position\)/);
   assert.match(capture, /positionMatrixIndices\.push\(decoded\.positionMatrix\)/);

@@ -999,8 +999,9 @@ test("all-projected draws preserve post-cull and optional exact behavior", () =>
   assert.equal(optional.exactCalls.length, 1);
 });
 
-test("projection recovery counters are declared and exposed in decoder telemetry", () => {
+test("projection recovery and lighting rejection counters are exposed in decoder telemetry", () => {
   for (const counter of [
+    "gxLightingRejectedVertices",
     "gxLegacyProjectionNullVertices",
     "gxExactRequiredDraws",
     "gxExactRequiredVertices",
@@ -1009,6 +1010,7 @@ test("projection recovery counters are declared and exposed in decoder telemetry
     assert.match(source, new RegExp(`let ${counter} = 0;`));
   }
   for (const [field, counter] of [
+    ["lightingRejectedVertices", "gxLightingRejectedVertices"],
     ["legacyProjectionNullVertices", "gxLegacyProjectionNullVertices"],
     ["exactRequiredDraws", "gxExactRequiredDraws"],
     ["exactRequiredVertices", "gxExactRequiredVertices"],
