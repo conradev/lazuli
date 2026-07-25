@@ -102,6 +102,29 @@ const STAGE_B = Object.freeze({
   map: TEXTURE_MAP_B,
   coordinate: TEXTURE_COORD_B,
 });
+const LEGACY_COORD_2_DEFINITION = Object.freeze({
+  id: "legacy-shared-coord2",
+  name: "both texture maps share coordinate 2",
+  stages: Object.freeze([
+    STAGE_A,
+    Object.freeze({
+      ...STAGE_B,
+      coordinate: TEXTURE_COORD_A,
+    }),
+  ]),
+});
+const LEGACY_COORD_7_DEFINITION = Object.freeze({
+  id: "legacy-shared-coord7",
+  name: "both texture maps share coordinate 7",
+  stages: Object.freeze([
+    Object.freeze({
+      ...STAGE_A,
+      coordinate: TEXTURE_COORD_B,
+    }),
+    STAGE_B,
+  ]),
+});
+
 const CASE_DEFINITIONS = Object.freeze([
   Object.freeze({
     id: "coord2-map1-then-coord7-map6",
@@ -998,6 +1021,211 @@ export function buildGxMultiCoordTevOraclePacket(
   return packet;
 }
 
+function gxMultiCoordTevPipelineLayoutPacketLayout(drawCount) {
+  const drawOffset = HEADER_BYTES;
+  const drawBytes = drawCount * DRAW_BYTES;
+  const textureOffset = drawOffset + drawBytes;
+  const textureBytes = TEXTURES.length * TEXTURE_BYTES;
+  const tevOffset = textureOffset + textureBytes;
+  const tevBytes = drawCount * TEV_BYTES;
+  const vertexOffset = tevOffset + tevBytes;
+  const vertexCount = drawCount * VERTEX_COUNT;
+  const vertexBytes = vertexCount * VERTEX_BYTES;
+  const keyOffset = vertexOffset + vertexBytes;
+  const keyBytes = TEXTURE_KEY_BYTES.reduce(
+    (sum, bytes) => sum + bytes.length,
+    0,
+  );
+  const pixelOffset = align16(keyOffset + keyBytes);
+  const texturePixelOffsets = Object.freeze(
+    TEXTURES.map((texture, index) => index * texture.texels.length),
+  );
+  const pixelBytes = align16(
+    TEXTURES.reduce(
+      (sum, texture) => sum + texture.texels.length,
+      0,
+    ),
+  );
+  const evidenceOffset = pixelOffset + pixelBytes;
+  const evidenceBytes = drawCount;
+  const packetBytes = align16(evidenceOffset + evidenceBytes);
+  return Object.freeze({
+    headerBytes: HEADER_BYTES,
+    drawCount,
+    drawOffset,
+    drawBytes,
+    textureOffset,
+    textureBytes,
+    textureRecordBytes: TEXTURE_BYTES,
+    textureCount: TEXTURES.length,
+    tevOffset,
+    tevBytes,
+    vertexOffset,
+    vertexBytes,
+    vertexFloats: VERTEX_FLOATS,
+    vertexRecordBytes: VERTEX_BYTES,
+    vertexCount,
+    keyOffset,
+    keyBytes,
+    pixelOffset,
+    pixelBytes,
+    texturePixelOffsets,
+    evidenceOffset,
+    evidenceBytes,
+    packetBytes,
+  });
+}
+
+function buildGxMultiCoordTevPipelineLayoutPacket(
+  definitions,
+  generation,
+) {
+  generation = generationU32(generation);
+  const baseline = buildGxMultiCoordTevOraclePacket(
+    CASE_DEFINITIONS[0].id,
+    generation,
+  );
+  const baselineLayout = gxMultiCoordTevOraclePacketLayout();
+  const layout = gxMultiCoordTevPipelineLayoutPacketLayout(
+    definitions.length,
+  );
+  const packet = new Uint8Array(layout.packetBytes);
+  const view = new DataView(
+    packet.buffer,
+    packet.byteOffset,
+    packet.byteLength,
+  );
+
+  packet.set(baseline.slice(0, HEADER_BYTES), 0);
+  putU32(view, 0x08, packet.length);
+  putU32(view, 0x14, definitions.length);
+  putU32(view, 0x1c, layout.drawOffset);
+  putU32(view, 0x20, layout.textureOffset);
+  putU32(view, 0x24, layout.tevOffset);
+  putU32(view, 0x28, layout.vertexOffset);
+  putU32(view, 0x2c, layout.keyOffset);
+  putU32(view, 0x30, layout.pixelOffset);
+  putU32(view, 0x34, layout.drawBytes);
+  putU32(view, 0x38, layout.textureBytes);
+  putU32(view, 0x3c, layout.tevBytes);
+  putU32(view, 0x40, layout.vertexBytes);
+  putU32(view, 0x44, layout.keyBytes);
+  putU32(view, 0x48, layout.pixelBytes);
+  putU32(view, 0x7c, layout.vertexCount);
+
+  packet.set(
+    baseline.slice(
+      baselineLayout.textureOffset,
+      baselineLayout.textureOffset + baselineLayout.textureBytes,
+    ),
+    layout.textureOffset,
+  );
+  packet.set(
+    baseline.slice(
+      baselineLayout.keyOffset,
+      baselineLayout.keyOffset + baselineLayout.keyBytes,
+    ),
+    layout.keyOffset,
+  );
+  packet.set(
+    baseline.slice(
+      baselineLayout.pixelOffset,
+      baselineLayout.pixelOffset + baselineLayout.pixelBytes,
+    ),
+    layout.pixelOffset,
+  );
+
+  for (
+    let drawIndex = 0;
+    drawIndex < definitions.length;
+    drawIndex += 1
+  ) {
+    const drawOffset = layout.drawOffset + drawIndex * DRAW_BYTES;
+    packet.set(
+      baseline.slice(
+        baselineLayout.drawOffset,
+        baselineLayout.drawOffset + DRAW_BYTES,
+      ),
+      drawOffset,
+    );
+    putU32(
+      view,
+      drawOffset + 0x08,
+      drawIndex * VERTEX_COUNT * VERTEX_BYTES,
+    );
+    putU32(view, drawOffset + 0x0c, drawIndex * TEV_BYTES);
+    writeTevState(
+      view,
+      layout.tevOffset + drawIndex * TEV_BYTES,
+      definitions[drawIndex],
+    );
+    for (
+      let vertexIndex = 0;
+      vertexIndex < VERTEX_COUNT;
+      vertexIndex += 1
+    ) {
+      writeVertex(
+        view,
+        layout.vertexOffset +
+          (drawIndex * VERTEX_COUNT + vertexIndex) *
+            VERTEX_BYTES,
+        vertexIndex,
+      );
+    }
+    packet[layout.evidenceOffset + drawIndex] =
+      KEEP_021_TWICE;
+  }
+  return packet;
+}
+
+export function gxMultiCoordTevPipelineLayoutOraclePacketLayout(
+  id,
+) {
+  const definitions =
+    id === "legacy-only"
+      ? [LEGACY_COORD_2_DEFINITION]
+      : id === "legacy-sidecar-legacy"
+        ? [
+            LEGACY_COORD_2_DEFINITION,
+            CASE_DEFINITIONS[0],
+            LEGACY_COORD_7_DEFINITION,
+          ]
+        : null;
+  if (definitions === null) {
+    throw new RangeError(
+      `unknown GX TEV pipeline-layout vector ${id}`,
+    );
+  }
+  return gxMultiCoordTevPipelineLayoutPacketLayout(
+    definitions.length,
+  );
+}
+
+export function buildGxMultiCoordTevPipelineLayoutOraclePacket(
+  id,
+  generation = 1,
+) {
+  const definitions =
+    id === "legacy-only"
+      ? [LEGACY_COORD_2_DEFINITION]
+      : id === "legacy-sidecar-legacy"
+        ? [
+            LEGACY_COORD_2_DEFINITION,
+            CASE_DEFINITIONS[0],
+            LEGACY_COORD_7_DEFINITION,
+          ]
+        : null;
+  if (definitions === null) {
+    throw new RangeError(
+      `unknown GX TEV pipeline-layout vector ${id}`,
+    );
+  }
+  return buildGxMultiCoordTevPipelineLayoutPacket(
+    definitions,
+    generation,
+  );
+}
+
 export function buildGxMultiCoordDerivativeTevOraclePacket(
   id,
   generation = 1,
@@ -1132,6 +1360,57 @@ export const gxMultiCoordDerivativeTevOracleCases = Object.freeze(
     });
   }),
 );
+
+const LEGACY_COORD_2_EXPECTED_RGBA =
+  modelGxMultiCoordTevDefinitionSurface(
+    LEGACY_COORD_2_DEFINITION,
+  );
+const LEGACY_COORD_7_EXPECTED_RGBA =
+  modelGxMultiCoordTevDefinitionSurface(
+    LEGACY_COORD_7_DEFINITION,
+  );
+
+export const gxMultiCoordTevPipelineLayoutCases = Object.freeze([
+  Object.freeze({
+    id: "legacy-only",
+    name: "one exact-managed shared-coordinate legacy draw",
+    pipelineLayouts: Object.freeze(["legacy"]),
+    drawCount: 1,
+    expectedManagedDraws: 1,
+    expectedManagedTriangles: 2,
+    expectedRgba: LEGACY_COORD_2_EXPECTED_RGBA,
+    expectedRgbaFnv1a64:
+      fnv1a64Hex(LEGACY_COORD_2_EXPECTED_RGBA),
+    packetFnv1a64: fnv1a64Hex(
+      buildGxMultiCoordTevPipelineLayoutOraclePacket(
+        "legacy-only",
+        1,
+      ),
+    ),
+  }),
+  Object.freeze({
+    id: "legacy-sidecar-legacy",
+    name:
+      "legacy then sidecar then legacy in one geometry segment",
+    pipelineLayouts: Object.freeze([
+      "legacy",
+      "sidecar",
+      "legacy",
+    ]),
+    drawCount: 3,
+    expectedManagedDraws: 3,
+    expectedManagedTriangles: 6,
+    expectedRgba: LEGACY_COORD_7_EXPECTED_RGBA,
+    expectedRgbaFnv1a64:
+      fnv1a64Hex(LEGACY_COORD_7_EXPECTED_RGBA),
+    packetFnv1a64: fnv1a64Hex(
+      buildGxMultiCoordTevPipelineLayoutOraclePacket(
+        "legacy-sidecar-legacy",
+        1,
+      ),
+    ),
+  }),
+]);
 
 export const gxMultiCoordTevCertificationCases = Object.freeze([
   ...gxMultiCoordTevOracleCases,

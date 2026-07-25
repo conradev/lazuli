@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildGxMultiCoordDerivativeTevOraclePacket,
+  buildGxMultiCoordTevPipelineLayoutOraclePacket,
   buildGxMultiCoordTevOraclePacket,
   fnv1a64Hex,
   gxMultiCoordDerivativeTevOracleCases,
@@ -12,6 +13,8 @@ import {
   gxMultiCoordTevOracle,
   gxMultiCoordTevOracleCases,
   gxMultiCoordTevOraclePacketLayout,
+  gxMultiCoordTevPipelineLayoutCases,
+  gxMultiCoordTevPipelineLayoutOraclePacketLayout,
   modelGxMultiCoordDerivativeTevSurface,
   modelGxMultiCoordTevSurface,
 } from "./browser_boot_gx_multi_coord_tev_oracle.mjs";
@@ -108,6 +111,120 @@ test("builds canonical local-only two-map V4 packets", () => {
       Array(15).fill(0),
     );
   }
+});
+
+test("builds legacy-only and legacy-sidecar-legacy packets with exact segment ordering", () => {
+  const legacyLayout =
+    gxMultiCoordTevPipelineLayoutOraclePacketLayout(
+      "legacy-only",
+    );
+  assert.equal(legacyLayout.drawCount, 1);
+  assert.equal(legacyLayout.drawBytes, 176);
+  assert.equal(legacyLayout.tevBytes, 464);
+  assert.equal(legacyLayout.vertexCount, 4);
+  assert.equal(legacyLayout.evidenceBytes, 1);
+
+  const mixedLayout =
+    gxMultiCoordTevPipelineLayoutOraclePacketLayout(
+      "legacy-sidecar-legacy",
+    );
+  assert.deepEqual(mixedLayout, {
+    headerBytes: 160,
+    drawCount: 3,
+    drawOffset: 160,
+    drawBytes: 528,
+    textureOffset: 688,
+    textureBytes: 128,
+    textureRecordBytes: 64,
+    textureCount: 2,
+    tevOffset: 816,
+    tevBytes: 1392,
+    vertexOffset: 2208,
+    vertexBytes: 1728,
+    vertexFloats: 36,
+    vertexRecordBytes: 144,
+    vertexCount: 12,
+    keyOffset: 3936,
+    keyBytes: 40,
+    pixelOffset: 3984,
+    pixelBytes: 32,
+    texturePixelOffsets: [0, 16],
+    evidenceOffset: 4016,
+    evidenceBytes: 3,
+    packetBytes: 4032,
+  });
+
+  const mixed =
+    buildGxMultiCoordTevPipelineLayoutOraclePacket(
+      "legacy-sidecar-legacy",
+      0x4d110001,
+    );
+  assert.equal(u16(mixed, 0x04), 4);
+  assert.equal(u32(mixed, 0x08), mixed.length);
+  assert.equal(u32(mixed, 0x14), 3);
+  assert.equal(u32(mixed, 0x3c), 3 * 464);
+  assert.equal(u32(mixed, 0x40), 12 * 144);
+  assert.equal(u32(mixed, 0x7c), 12);
+  assert.deepEqual(
+    Array.from(
+      mixed.slice(
+        mixedLayout.evidenceOffset,
+        mixedLayout.evidenceOffset +
+          mixedLayout.evidenceBytes,
+      ),
+    ),
+    [0x0f, 0x0f, 0x0f],
+  );
+
+  const expectedCoordinates = [[2, 2], [2, 7], [7, 7]];
+  for (let draw = 0; draw < 3; draw += 1) {
+    const drawOffset = mixedLayout.drawOffset + draw * 176;
+    assert.equal(u16(mixed, drawOffset + 0x02), 1);
+    assert.equal(u32(mixed, drawOffset + 0x04), 4);
+    assert.equal(u32(mixed, drawOffset + 0x08), draw * 4 * 144);
+    assert.equal(u32(mixed, drawOffset + 0x0c), draw * 464);
+    const tevOffset = mixedLayout.tevOffset + draw * 464;
+    assert.equal(u32(mixed, tevOffset + 448), 2);
+    assert.deepEqual(
+      [0, 1].map(stage => {
+        const references = u32(
+          mixed,
+          tevOffset + stage * 16 + 8,
+        );
+        return {
+          map: references & 7,
+          coordinate: (references >>> 3) & 7,
+        };
+      }),
+      [
+        { map: 1, coordinate: expectedCoordinates[draw][0] },
+        { map: 6, coordinate: expectedCoordinates[draw][1] },
+      ],
+    );
+  }
+
+  assert.deepEqual(
+    gxMultiCoordTevPipelineLayoutCases.map(entry => ({
+      id: entry.id,
+      pipelineLayouts: entry.pipelineLayouts,
+      draws: entry.expectedManagedDraws,
+      triangles: entry.expectedManagedTriangles,
+    })),
+    [
+      {
+        id: "legacy-only",
+        pipelineLayouts: ["legacy"],
+        draws: 1,
+        triangles: 2,
+      },
+      {
+        id: "legacy-sidecar-legacy",
+        pipelineLayouts: ["legacy", "sidecar", "legacy"],
+        draws: 3,
+        triangles: 6,
+      },
+    ],
+  );
 });
 
 test("binds only maps 1 and 6 to two distinct payload records", () => {
