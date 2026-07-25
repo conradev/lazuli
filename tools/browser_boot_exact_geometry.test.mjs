@@ -158,7 +158,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.doesNotMatch(prepare, /right - left \+ 1|bottom - top \+ 1/);
   assert.match(
     prepare,
-    /let exact_vertices = geometry\.into_vertices\(\);[\s\S]*let exact_empty = expanded\.is_empty\(\)[\s\S]*exact_geometry_is_raster_empty\(&exact_vertices, &expanded, scissor\)[\s\S]*let managed_vertices = \(!exact_empty\)[\s\S]*prepare_exact_managed_vertices\(draw, &exact_vertices, &expanded, scissor\)[\s\S]*let qualified = QualifiedExactDraw \{\s*scissor,\s*managed_vertices,\s*exact_empty,\s*\};[\s\S]*let required_managed_safe = required && qualified\.managed_vertices\.is_some\(\);/,
+    /let exact_vertices = geometry\.into_vertices\(\);[\s\S]*let exact_empty = expanded\.is_empty\(\)[\s\S]*exact_geometry_is_raster_empty\(&exact_vertices, &expanded, scissor\)[\s\S]*let managed_vertices = \(!exact_empty\)[\s\S]*prepare_exact_managed_vertices\(\s*draw,\s*&exact_vertices,\s*&expanded,\s*scissor,\s*sampler_states,\s*\)[\s\S]*let qualified = QualifiedExactDraw \{\s*scissor,\s*managed_vertices,\s*exact_empty,\s*\};[\s\S]*let required_managed_safe = required && qualified\.managed_vertices\.is_some\(\);/,
   );
 });
 

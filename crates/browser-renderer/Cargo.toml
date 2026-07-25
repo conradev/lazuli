@@ -18,3 +18,6 @@ wasm-bindgen = "0.2.114"
 wasm-bindgen-futures = "0.4.64"
 web-sys = { version = "0.3.91", features = ["HtmlCanvasElement"] }
 wgpu = { workspace = true, features = ["webgpu", "wgsl"] }
+
+[dev-dependencies]
+naga = { version = "29.0", features = ["wgsl-in"] }

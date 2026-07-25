@@ -47,10 +47,10 @@ test("WebGPU VI presentation reuses one uniform and a bounded two-view binding c
   const layoutStart = source.indexOf(
     'label: Some("browser XFB presentation layout")',
   );
-  const layoutEnd = source.indexOf("let samplers =", layoutStart);
-  const layout = source.slice(layoutStart, layoutEnd);
+  const layoutEnd = source.indexOf("let copy_clear =", layoutStart);
   assert.notEqual(layoutStart, -1);
   assert.notEqual(layoutEnd, -1);
+  const layout = source.slice(layoutStart, layoutEnd);
   assert.equal(
     [...layout.matchAll(/Float \{ filterable: false \}/g)].length,
     2,

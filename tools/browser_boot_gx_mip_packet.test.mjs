@@ -15,6 +15,10 @@ const rendererSource = readFileSync(
   new URL("../crates/browser-renderer/src/web.rs", import.meta.url),
   "utf8",
 );
+const rendererTevSource = readFileSync(
+  new URL("../crates/browser-renderer/src/tev.rs", import.meta.url),
+  "utf8",
+);
 
 function extractFunction(name) {
   const match = new RegExp(`function\\s+${name}\\s*\\(`).exec(source);
@@ -543,7 +547,11 @@ test("carries canonical v7 mip resources into strict WebGPU uploads", () => {
   );
   assert.match(
     rendererSource,
-    /mipmap_filter: wgpu::MipmapFilterMode::Nearest,[\s\S]*lod_min_clamp: 0\.0,[\s\S]*lod_max_clamp: 0\.0/,
+    /mipmap_filter: match identity\.mipmap_filter \{[\s\S]*TextureMipmapFilter::Nearest => wgpu::MipmapFilterMode::Nearest,[\s\S]*TextureMipmapFilter::Linear => wgpu::MipmapFilterMode::Linear,[\s\S]*lod_min_clamp: f32::from\(identity\.lod_min_sixteenths\) \/ 16\.0,[\s\S]*lod_max_clamp: f32::from\(identity\.lod_max_sixteenths\) \/ 16\.0/,
+  );
+  assert.match(
+    rendererTevSource,
+    /textureLoad\(texture, coord, i32\(mip_level\)\)/,
   );
   assert.match(
     rendererSource,

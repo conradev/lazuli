@@ -31,20 +31,20 @@ use crate::{
     GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
     GxDepthCompareLocation, GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding,
     GxEfbFormat, GxFogState, GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor,
-    GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding, GxXfbCopyParameters, GxZTextureFormat,
-    GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
-    RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
-    SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity, ViFieldDescriptor,
-    ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField,
-    ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
-    compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
-    decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
-    gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state, gx_early_depth_plan,
-    gx_efb_depth_encoding, gx_fog_state, gx_raster_center_evidence, gx_sampler_identity,
-    gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
-    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
-    rgba8_mip_chain_byte_len, select_mip_texture, xfb_copy_matches_selection, xfb_readback_layout,
-    xfb_scanout_plan, xfb_surface_extent_matches,
+    GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding, GxSamplerState, GxXfbCopyParameters,
+    GxZTextureFormat, GxZTextureOperation, GxZTextureState, RendererFailureState,
+    RendererHostTimings, RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture,
+    SurfacePixelOrder, SurfaceReadbackRequestError, TextureAddressMode, TextureBindingIdentity,
+    TextureMipmapFilter, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairState, ViFieldParity,
+    ViHostFrame, ViOwnedField, ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout,
+    XfbScanoutPlan, clipped_copy_extent, compact_surface_readback_rows, compact_xfb_scanout_rows,
+    decoded_texture_cache_hit, decoded_texture_is_available, gx_blend_factor_for_component,
+    gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state,
+    gx_early_depth_plan, gx_efb_depth_encoding, gx_fog_state, gx_raster_center_evidence,
+    gx_sampler_state, gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state,
+    merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
+    reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture,
+    xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -402,11 +402,13 @@ struct DrawUniform {
     fog_range1: [u32; 4],
     fog_parameters0: [u32; 4],
     fog_parameters1: [u32; 4],
-    sampler_modes0: [u32; 4],
-    sampler_modes1: [u32; 4],
+    sampler_mode0_lo: [u32; 4],
+    sampler_mode0_hi: [u32; 4],
+    sampler_mode1_lo: [u32; 4],
+    sampler_mode1_hi: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<DrawUniform>() == 128);
+const _: () = assert!(std::mem::size_of::<DrawUniform>() == 160);
 
 impl DrawUniform {
     fn from_gx(
@@ -464,14 +466,22 @@ impl DrawUniform {
                 fog.parameters[3],
             ],
             fog_parameters1: [fog.parameters[4], 0, 0, 0],
-            sampler_modes0: [0; 4],
-            sampler_modes1: [0; 4],
+            sampler_mode0_lo: [0; 4],
+            sampler_mode0_hi: [0; 4],
+            sampler_mode1_lo: [0; 4],
+            sampler_mode1_hi: [0; 4],
         }
     }
 
-    fn with_sampler_modes(mut self, sampler_modes: [u32; MAX_TEV_TEXTURES]) -> Self {
-        self.sampler_modes0.copy_from_slice(&sampler_modes[..4]);
-        self.sampler_modes1.copy_from_slice(&sampler_modes[4..]);
+    fn with_sampler_modes(
+        mut self,
+        sampler_mode0: [u32; MAX_TEV_TEXTURES],
+        sampler_mode1: [u32; MAX_TEV_TEXTURES],
+    ) -> Self {
+        self.sampler_mode0_lo.copy_from_slice(&sampler_mode0[..4]);
+        self.sampler_mode0_hi.copy_from_slice(&sampler_mode0[4..]);
+        self.sampler_mode1_lo.copy_from_slice(&sampler_mode1[..4]);
+        self.sampler_mode1_hi.copy_from_slice(&sampler_mode1[4..]);
         self
     }
 }
@@ -690,7 +700,25 @@ struct TevTextureInput<'a> {
     width: u32,
     height: u32,
     mip_level_count: u32,
-    sampler: u32,
+    mode0: u32,
+    mode1: u32,
+    full_lod_state: bool,
+}
+
+fn tev_sampler_states(
+    textures: &[TevTextureInput<'_>; MAX_TEV_TEXTURES],
+) -> Result<[GxSamplerState; MAX_TEV_TEXTURES], String> {
+    let mut states = [GxSamplerState::default(); MAX_TEV_TEXTURES];
+    for (map, input) in textures.iter().enumerate() {
+        states[map] = gx_sampler_state(
+            input.mode0,
+            input.mode1,
+            input.mip_level_count,
+            input.full_lod_state,
+        )
+        .map_err(|error| format!("TEV texture map {map}: {error}"))?;
+    }
+    Ok(states)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1950,7 +1978,9 @@ impl WebGpuRenderer {
                 width: texture_metadata[metadata + 2],
                 height: texture_metadata[metadata + 3],
                 mip_level_count: 1,
-                sampler: texture_metadata[metadata + 4],
+                mode0: texture_metadata[metadata + 4],
+                mode1: 0,
+                full_lod_state: false,
             }
         });
         let texture_pixel_bytes = pixel_storage.iter().map(Vec::len).sum();
@@ -2005,6 +2035,12 @@ impl WebGpuRenderer {
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let header = *packet.header();
         let payload_bytes: usize = packet.textures().map(|texture| texture.pixels.len()).sum();
+        // V7 requires at least one genuine mip binding, while v2-v6 always
+        // synthesize one resident level. This invariant lets the renderer
+        // retain byte-stable legacy semantics without widening the packet API.
+        let full_lod_state = packet
+            .textures()
+            .any(|texture| texture.record.mip_level_count > 1);
 
         self.ensure_healthy()?;
         let mut source_vertices =
@@ -2017,9 +2053,26 @@ impl WebGpuRenderer {
             .map(|draw| {
                 let vertex_start = draw.record.vertex_relative_offset as usize / size_of::<f32>();
                 let vertex_len = draw.record.vertex_count as usize * TEV_VERTEX_FLOATS;
+                let mut sampler_states = [GxSamplerState::default(); MAX_TEV_TEXTURES];
+                for (map, slot) in draw.record.textures.iter().enumerate() {
+                    let Some(texture_index) = slot.texture else {
+                        continue;
+                    };
+                    let texture = packet
+                        .texture(texture_index as usize)
+                        .expect("validated GX texture reference");
+                    sampler_states[map] = gx_sampler_state(
+                        slot.sampler_bits,
+                        slot.mode1,
+                        texture.record.mip_level_count,
+                        full_lod_state,
+                    )
+                    .unwrap_or_default();
+                }
                 prepare_exact_draw(
                     draw,
                     &source_vertices[vertex_start..vertex_start + vertex_len],
+                    sampler_states,
                 )
             })
             .collect::<Vec<_>>();
@@ -2038,6 +2091,13 @@ impl WebGpuRenderer {
                 let texture = packet
                     .texture(index as usize)
                     .expect("validated GX texture reference");
+                gx_sampler_state(
+                    slot.sampler_bits,
+                    slot.mode1,
+                    texture.record.mip_level_count,
+                    full_lod_state,
+                )
+                .map_err(|error| JsValue::from_str(&format!("TEV texture map {map}: {error}")))?;
                 let cached_layout = self
                     .texture_cache
                     .get(texture.key)
@@ -2108,7 +2168,9 @@ impl WebGpuRenderer {
                                 width: texture.record.width,
                                 height: texture.record.height,
                                 mip_level_count: texture.record.mip_level_count,
-                                sampler: slot.sampler_bits,
+                                mode0: slot.sampler_bits,
+                                mode1: slot.mode1,
+                                full_lod_state,
                             }
                         }
                         None => TevTextureInput {
@@ -2119,7 +2181,9 @@ impl WebGpuRenderer {
                             width: 0,
                             height: 0,
                             mip_level_count: 1,
-                            sampler: 0,
+                            mode0: 0,
+                            mode1: 0,
+                            full_lod_state,
                         },
                     }
                 });
@@ -2346,8 +2410,11 @@ impl WebGpuRenderer {
             required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
         let required_coords =
             required_texture_coords(tev_state).map_err(|error| JsValue::from_str(&error))?;
-        let sampler_modes = std::array::from_fn(|map| textures[map].sampler);
-        let sampler_identities = sampler_modes.map(gx_sampler_identity);
+        let sampler_states =
+            tev_sampler_states(textures).map_err(|error| JsValue::from_str(&error))?;
+        let sampler_mode0 = sampler_states.map(|state| state.mode0);
+        let sampler_mode1 = sampler_states.map(|state| state.mode1);
+        let sampler_identities = sampler_states.map(|state| state.identity);
         let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let fog = gx_fog_state(
@@ -2431,8 +2498,7 @@ impl WebGpuRenderer {
                     early_depth,
                     required_maps,
                     required_coords,
-                    sampler_modes,
-                    sampler_identities,
+                    sampler_states,
                     fog,
                     z_texture,
                     source_vertices,
@@ -2481,7 +2547,7 @@ impl WebGpuRenderer {
             pipeline.canonical_fragment_depth,
             fog,
         )
-        .with_sampler_modes(sampler_modes);
+        .with_sampler_modes(sampler_mode0, sampler_mode1);
         if pipeline.cull == CullMode::All {
             return Ok(());
         }
@@ -2613,6 +2679,12 @@ impl WebGpuRenderer {
                     SelectedTexture::White => &self.white_texture.view,
                 })
                 .collect::<Vec<_>>();
+            for identity in sampler_identities {
+                if !self.samplers.contains_key(&identity) {
+                    self.samplers
+                        .insert(identity, sampler(&self.device, identity));
+                }
+            }
             let samplers = sampler_identities.map(|identity| &self.samplers[&identity]);
             let mut entries = Vec::with_capacity(1 + MAX_TEV_TEXTURES * 2);
             entries.push(wgpu::BindGroupEntry {
@@ -3730,9 +3802,8 @@ impl WebGpuRenderer {
                 },
             ],
         });
-        let samplers = create_samplers(&device);
         let copy_clear = create_copy_clear_resources(&device);
-        let xfb_copy = create_xfb_copy_resources(&device, &efb_color_view, &samplers);
+        let xfb_copy = create_xfb_copy_resources(&device, &efb_color_view);
         let xfb_present = create_xfb_present_resources(&device);
         let pipelines = create_pipelines(
             &device,
@@ -3772,7 +3843,7 @@ impl WebGpuRenderer {
             tev_draw_layout,
             tev_texture_layout,
             present_layout,
-            samplers,
+            samplers: HashMap::new(),
             white_texture,
             texture_cache: HashMap::new(),
             efb_copy_cache: HashMap::new(),
@@ -4247,20 +4318,15 @@ fn managed_coverage_texture_coord(
 
 fn managed_coverage_samplers_are_safe(
     required_maps: [bool; MAX_TEV_TEXTURES],
-    sampler_modes: [u32; MAX_TEV_TEXTURES],
-    sampler_identities: [SamplerIdentity; MAX_TEV_TEXTURES],
+    sampler_states: [GxSamplerState; MAX_TEV_TEXTURES],
 ) -> bool {
-    // LZGX v4 transports mode0's wrap/filter byte plus max-anisotropy bits.
+    // The manual WGSL path implements the Dolphin-compatible mip reference
+    // model. Base-level samplers retain the existing exact-managed constraint:
+    // equal min/mag filters avoid an unmodeled derivative-dependent choice.
     required_maps
         .into_iter()
-        .zip(sampler_modes)
-        .zip(sampler_identities)
-        .all(|((required, mode), identity)| {
-            !required
-                || ((mode & 0x60) == 0
-                    && (mode & (3 << 19)) == 0
-                    && identity.mag_filter == identity.min_filter)
-        })
+        .zip(sampler_states)
+        .all(|(required, state)| !required || state.managed_exact_eligible)
 }
 
 const MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD: [[f32; 3]; 6] = [
@@ -4580,8 +4646,7 @@ fn prepare_managed_coverage_vertices(
     early_depth: GxEarlyDepthPlan,
     required_maps: [bool; MAX_TEV_TEXTURES],
     required_coords: [bool; MAX_TEV_TEXTURES],
-    sampler_modes: [u32; MAX_TEV_TEXTURES],
-    sampler_identities: [SamplerIdentity; MAX_TEV_TEXTURES],
+    sampler_states: [GxSamplerState; MAX_TEV_TEXTURES],
     fog: GxFogState,
     z_texture: GxZTextureState,
     source_vertices: &[f32],
@@ -4595,7 +4660,7 @@ fn prepare_managed_coverage_vertices(
         || primitive != Primitive::Triangles
         || raster_center != GxRasterCenterEvidence::KnownNonAntialiased
         || early_depth != GxEarlyDepthPlan::FixedFunction
-        || !managed_coverage_samplers_are_safe(required_maps, sampler_modes, sampler_identities)
+        || !managed_coverage_samplers_are_safe(required_maps, sampler_states)
         || fog != GxFogState::default()
         || z_texture.operation != GxZTextureOperation::Disabled
         || !expanded.len().is_multiple_of(3)
@@ -4695,8 +4760,7 @@ fn managed_coverage_draw_is_safe(
     early_depth: GxEarlyDepthPlan,
     required_maps: [bool; MAX_TEV_TEXTURES],
     required_coords: [bool; MAX_TEV_TEXTURES],
-    sampler_modes: [u32; MAX_TEV_TEXTURES],
-    sampler_identities: [SamplerIdentity; MAX_TEV_TEXTURES],
+    sampler_states: [GxSamplerState; MAX_TEV_TEXTURES],
     fog: GxFogState,
     z_texture: GxZTextureState,
     source_vertices: &[f32],
@@ -4710,8 +4774,7 @@ fn managed_coverage_draw_is_safe(
         early_depth,
         required_maps,
         required_coords,
-        sampler_modes,
-        sampler_identities,
+        sampler_states,
         fog,
         z_texture,
         source_vertices,
@@ -4974,8 +5037,7 @@ fn classify_exact_required_rejection(
     let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
     let required_maps = required_texture_maps(tev_state).ok();
     let required_coords = required_texture_coords(tev_state).ok();
-    let sampler_modes = std::array::from_fn(|map| textures[map].sampler);
-    let sampler_identities = sampler_modes.map(gx_sampler_identity);
+    let sampler_states = tev_sampler_states(textures).ok();
     let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control).ok();
     let fog = gx_fog_state(
         fog_range_base,
@@ -5011,7 +5073,7 @@ fn classify_exact_required_rejection(
         texture_coordinates_supported: required_coords
             .is_some_and(|coords| managed_coverage_texture_coord(coords).is_some()),
         samplers_supported: required_maps.is_some_and(|maps| {
-            managed_coverage_samplers_are_safe(maps, sampler_modes, sampler_identities)
+            sampler_states.is_some_and(|states| managed_coverage_samplers_are_safe(maps, states))
         }),
         z_texture_supported: z_texture
             .is_some_and(|state| state.operation == GxZTextureOperation::Disabled),
@@ -5103,6 +5165,7 @@ fn prepare_exact_managed_vertices(
     exact_vertices: &[f32],
     expanded: &[usize],
     scissor: Option<ScissorRect>,
+    sampler_states: [GxSamplerState; MAX_TEV_TEXTURES],
 ) -> Option<Vec<TevVertex>> {
     if expanded.is_empty() {
         return None;
@@ -5134,8 +5197,6 @@ fn prepare_exact_managed_vertices(
     let Ok(required_coords) = required_texture_coords(draw.tev_state) else {
         return None;
     };
-    let sampler_modes = draw.record.textures.map(|slot| slot.sampler_bits);
-    let sampler_identities = sampler_modes.map(gx_sampler_identity);
     let Ok(z_texture) = gx_z_texture_state(
         draw.record.fragment_tail.z_texture_bias,
         draw.record.fragment_tail.z_texture_mode,
@@ -5179,8 +5240,7 @@ fn prepare_exact_managed_vertices(
         early_depth,
         required_maps,
         required_coords,
-        sampler_modes,
-        sampler_identities,
+        sampler_states,
         fog,
         z_texture,
         exact_vertices,
@@ -5192,6 +5252,7 @@ fn prepare_exact_managed_vertices(
 fn prepare_exact_draw(
     draw: crate::packet::GxDraw<'_>,
     source_vertices: &[f32],
+    sampler_states: [GxSamplerState; MAX_TEV_TEXTURES],
 ) -> Option<PreparedExactDraw> {
     draw.exact_clip_input?;
     let required = draw.record.exact_clip_required;
@@ -5222,7 +5283,15 @@ fn prepare_exact_draw(
     let exact_empty = expanded.is_empty()
         || exact_geometry_is_raster_empty(&exact_vertices, &expanded, scissor).unwrap_or(false);
     let managed_vertices = (!exact_empty)
-        .then(|| prepare_exact_managed_vertices(draw, &exact_vertices, &expanded, scissor))
+        .then(|| {
+            prepare_exact_managed_vertices(
+                draw,
+                &exact_vertices,
+                &expanded,
+                scissor,
+                sampler_states,
+            )
+        })
         .flatten();
     let qualified = QualifiedExactDraw {
         scissor,
@@ -5312,9 +5381,13 @@ fn sampler(device: &wgpu::Device, identity: SamplerIdentity) -> wgpu::Sampler {
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: filter_mode(identity.mag_filter),
         min_filter: filter_mode(identity.min_filter),
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-        lod_min_clamp: 0.0,
-        lod_max_clamp: 0.0,
+        mipmap_filter: match identity.mipmap_filter {
+            TextureMipmapFilter::Nearest => wgpu::MipmapFilterMode::Nearest,
+            TextureMipmapFilter::Linear => wgpu::MipmapFilterMode::Linear,
+        },
+        lod_min_clamp: f32::from(identity.lod_min_sixteenths) / 16.0,
+        lod_max_clamp: f32::from(identity.lod_max_sixteenths) / 16.0,
+        anisotropy_clamp: u16::from(identity.max_anisotropy),
         ..Default::default()
     })
 }
@@ -5325,31 +5398,6 @@ fn address_mode(mode: TextureAddressMode) -> wgpu::AddressMode {
         TextureAddressMode::Repeat => wgpu::AddressMode::Repeat,
         TextureAddressMode::MirrorRepeat => wgpu::AddressMode::MirrorRepeat,
     }
-}
-
-fn create_samplers(device: &wgpu::Device) -> HashMap<SamplerIdentity, wgpu::Sampler> {
-    let mut samplers = HashMap::new();
-    let address_modes = [
-        TextureAddressMode::ClampToEdge,
-        TextureAddressMode::Repeat,
-        TextureAddressMode::MirrorRepeat,
-    ];
-    for mag_filter in [false, true] {
-        for min_filter in [false, true] {
-            for address_u in address_modes {
-                for address_v in address_modes {
-                    let identity = SamplerIdentity {
-                        mag_filter,
-                        min_filter,
-                        address_u,
-                        address_v,
-                    };
-                    samplers.insert(identity, sampler(device, identity));
-                }
-            }
-        }
-    }
-    samplers
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5669,7 +5717,6 @@ fn webgpu_cull_mode(cull: CullMode) -> Option<wgpu::Face> {
 fn create_xfb_copy_resources(
     device: &wgpu::Device,
     efb_color_view: &wgpu::TextureView,
-    samplers: &HashMap<SamplerIdentity, wgpu::Sampler>,
 ) -> XfbCopyResources {
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("browser GX EFB-to-XFB copy layout"),
@@ -5708,13 +5755,17 @@ fn create_xfb_copy_resources(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let bind_group = |label, linear| {
-        let sampler = &samplers[&SamplerIdentity {
-            mag_filter: linear,
-            min_filter: linear,
-            address_u: TextureAddressMode::ClampToEdge,
-            address_v: TextureAddressMode::ClampToEdge,
-        }];
+    let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("browser GX nearest EFB-to-XFB copy sampler"),
+        ..Default::default()
+    });
+    let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("browser GX linear EFB-to-XFB copy sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bind_group = |label, sampler: &wgpu::Sampler| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
             layout: &layout,
@@ -5734,8 +5785,14 @@ fn create_xfb_copy_resources(
             ],
         })
     };
-    let nearest_bind_group = bind_group("browser GX nearest EFB-to-XFB copy bind group", false);
-    let linear_bind_group = bind_group("browser GX linear EFB-to-XFB copy bind group", true);
+    let nearest_bind_group = bind_group(
+        "browser GX nearest EFB-to-XFB copy bind group",
+        &nearest_sampler,
+    );
+    let linear_bind_group = bind_group(
+        "browser GX linear EFB-to-XFB copy bind group",
+        &linear_sampler,
+    );
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("browser GX EFB-to-XFB copy shader"),
         source: wgpu::ShaderSource::Wgsl(XFB_COPY_SHADER.into()),
@@ -6027,9 +6084,8 @@ mod tests {
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS};
     use crate::{
         GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState,
-        GxRasterCenterEvidence, GxZTextureOperation, SamplerIdentity, TextureAddressMode,
-        TextureBindingIdentity, gx_destination_alpha_state, gx_sampler_identity,
-        gx_z_texture_state,
+        GxRasterCenterEvidence, GxSamplerState, GxZTextureOperation, SamplerIdentity,
+        TextureBindingIdentity, gx_destination_alpha_state, gx_sampler_state, gx_z_texture_state,
     };
 
     fn encoded_blend_mode(
@@ -6056,18 +6112,17 @@ mod tests {
     }
 
     fn binding_key(draw: DrawUniform) -> TevBindingKey {
-        let sampler = SamplerIdentity {
-            mag_filter: false,
-            min_filter: false,
-            address_u: TextureAddressMode::ClampToEdge,
-            address_v: TextureAddressMode::ClampToEdge,
-        };
+        let sampler = SamplerIdentity::default();
         TevBindingKey {
             textures: std::array::from_fn(|_| TextureBindingIdentity::White),
             samplers: [sampler; MAX_TEV_TEXTURES],
             state: vec![0; 464],
             draw,
         }
+    }
+
+    fn legacy_sampler_states(modes: [u32; MAX_TEV_TEXTURES]) -> [GxSamplerState; MAX_TEV_TEXTURES] {
+        modes.map(|mode| gx_sampler_state(mode, 0, 1, false).unwrap())
     }
 
     #[test]
@@ -6273,8 +6328,7 @@ mod tests {
             GxEarlyDepthPlan::FixedFunction,
             required_maps,
             required_coords,
-            sampler_modes,
-            sampler_modes.map(gx_sampler_identity),
+            legacy_sampler_states(sampler_modes),
             GxFogState::default(),
             gx_z_texture_state(0, 0, 0).unwrap(),
             source,
@@ -6305,8 +6359,7 @@ mod tests {
             GxEarlyDepthPlan::FixedFunction,
             [false; MAX_TEV_TEXTURES],
             [false; MAX_TEV_TEXTURES],
-            [0; MAX_TEV_TEXTURES],
-            [gx_sampler_identity(0); MAX_TEV_TEXTURES],
+            [GxSamplerState::default(); MAX_TEV_TEXTURES],
             GxFogState::default(),
             gx_z_texture_state(0, 0, 0).unwrap(),
             source,
@@ -6540,8 +6593,7 @@ mod tests {
                 early_depth,
                 [false; MAX_TEV_TEXTURES],
                 [false; MAX_TEV_TEXTURES],
-                [0; MAX_TEV_TEXTURES],
-                [gx_sampler_identity(0); MAX_TEV_TEXTURES],
+                [GxSamplerState::default(); MAX_TEV_TEXTURES],
                 fog,
                 z_texture,
                 source,
@@ -6556,8 +6608,7 @@ mod tests {
             GxEarlyDepthPlan::FixedFunction,
             [false; MAX_TEV_TEXTURES],
             [false; MAX_TEV_TEXTURES],
-            [0; MAX_TEV_TEXTURES],
-            [gx_sampler_identity(0); MAX_TEV_TEXTURES],
+            [GxSamplerState::default(); MAX_TEV_TEXTURES],
             GxFogState::default(),
             z_texture,
             &source,
@@ -6953,23 +7004,28 @@ mod tests {
         for mode in [0, 0x0f, 0x90, 0x9f] {
             let mut modes = [0; MAX_TEV_TEXTURES];
             modes[0] = mode;
-            let identities = modes.map(gx_sampler_identity);
             assert!(managed_coverage_samplers_are_safe(
                 required_maps,
-                modes,
-                identities,
+                legacy_sampler_states(modes),
             ));
         }
 
         for mode in [0x10, 0x20, 0x40, 0xb0, 0xd0, 1 << 19, 3 << 19] {
             let mut modes = [0; MAX_TEV_TEXTURES];
             modes[0] = mode;
-            let identities = modes.map(gx_sampler_identity);
             assert!(
-                !managed_coverage_samplers_are_safe(required_maps, modes, identities),
+                !managed_coverage_samplers_are_safe(required_maps, legacy_sampler_states(modes),),
                 "sampler mode {mode:#x} was admitted",
             );
         }
+
+        let mut full_lod_states = [GxSamplerState::default(); MAX_TEV_TEXTURES];
+        full_lod_states[0] = gx_sampler_state(2 << 5, 0x2010, 3, true).unwrap();
+        assert!(full_lod_states[0].derivative_lod_oracle_gap);
+        assert!(managed_coverage_samplers_are_safe(
+            required_maps,
+            full_lod_states,
+        ));
     }
 
     #[test]
@@ -7591,9 +7647,9 @@ mod tests {
     }
 
     #[test]
-    fn draw_uniform_transports_all_eight_sampler_words_into_the_binding_key() {
-        assert_eq!(std::mem::size_of::<DrawUniform>(), 128);
-        let sampler_modes = [
+    fn draw_uniform_transports_all_mode0_and_mode1_words_into_the_binding_key() {
+        assert_eq!(std::mem::size_of::<DrawUniform>(), 160);
+        let sampler_mode0 = [
             0x0000_0000,
             0x0000_0011,
             0x0000_0022,
@@ -7603,6 +7659,16 @@ mod tests {
             0x0000_0066,
             0x0018_0097,
         ];
+        let sampler_mode1 = [
+            0x0000_0000,
+            0x0000_1000,
+            0x0000_2010,
+            0x0000_3020,
+            0x0000_4030,
+            0x0000_5040,
+            0x0000_6050,
+            0x0000_7060,
+        ];
         let draw = DrawUniform::from_gx(
             0,
             gx_destination_alpha_state(0, 0, 0),
@@ -7611,11 +7677,13 @@ mod tests {
             false,
             GxFogState::default(),
         )
-        .with_sampler_modes(sampler_modes);
-        assert_eq!(draw.sampler_modes0, sampler_modes[..4]);
-        assert_eq!(draw.sampler_modes1, sampler_modes[4..]);
+        .with_sampler_modes(sampler_mode0, sampler_mode1);
+        assert_eq!(draw.sampler_mode0_lo, sampler_mode0[..4]);
+        assert_eq!(draw.sampler_mode0_hi, sampler_mode0[4..]);
+        assert_eq!(draw.sampler_mode1_lo, sampler_mode1[..4]);
+        assert_eq!(draw.sampler_mode1_hi, sampler_mode1[4..]);
 
-        let different = draw.with_sampler_modes([0; MAX_TEV_TEXTURES]);
+        let different = draw.with_sampler_modes([0; MAX_TEV_TEXTURES], [0; MAX_TEV_TEXTURES]);
         assert_ne!(binding_key(draw), binding_key(different));
     }
 

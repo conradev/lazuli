@@ -654,8 +654,10 @@ struct DrawState {
     fog_range1: vec4<u32>,
     fog_parameters0: vec4<u32>,
     fog_parameters1: vec4<u32>,
-    sampler_modes0: vec4<u32>,
-    sampler_modes1: vec4<u32>,
+    sampler_mode0_lo: vec4<u32>,
+    sampler_mode0_hi: vec4<u32>,
+    sampler_mode1_lo: vec4<u32>,
+    sampler_mode1_hi: vec4<u32>,
 };
 
 struct TevVertexInput {
@@ -1472,54 +1474,30 @@ fn gx_native_normalized_uv(texture: texture_2d<f32>, texel_uv: vec2<f32>) -> vec
     return texel_uv / vec2<f32>(textureDimensions(texture, 0));
 }
 
-fn tev_sample_texture_native(map: u32, stq: vec3<f32>) -> vec4<i32> {
-    // Q remains part of the interpolant until the fragment stage.
-    let uv = stq.xy / stq.z;
-    var sampled = vec4<f32>(1.0);
+fn gx_sampler_mode0(map: u32) -> u32 {
     switch map & 7u {
-        case 0u: {
-            sampled = textureSample(
-                tev_texture0, tev_sampler0, gx_native_normalized_uv(tev_texture0, uv),
-            );
-        }
-        case 1u: {
-            sampled = textureSample(
-                tev_texture1, tev_sampler1, gx_native_normalized_uv(tev_texture1, uv),
-            );
-        }
-        case 2u: {
-            sampled = textureSample(
-                tev_texture2, tev_sampler2, gx_native_normalized_uv(tev_texture2, uv),
-            );
-        }
-        case 3u: {
-            sampled = textureSample(
-                tev_texture3, tev_sampler3, gx_native_normalized_uv(tev_texture3, uv),
-            );
-        }
-        case 4u: {
-            sampled = textureSample(
-                tev_texture4, tev_sampler4, gx_native_normalized_uv(tev_texture4, uv),
-            );
-        }
-        case 5u: {
-            sampled = textureSample(
-                tev_texture5, tev_sampler5, gx_native_normalized_uv(tev_texture5, uv),
-            );
-        }
-        case 6u: {
-            sampled = textureSample(
-                tev_texture6, tev_sampler6, gx_native_normalized_uv(tev_texture6, uv),
-            );
-        }
-        case 7u: {
-            sampled = textureSample(
-                tev_texture7, tev_sampler7, gx_native_normalized_uv(tev_texture7, uv),
-            );
-        }
-        default: {}
+        case 0u: { return draw_state.sampler_mode0_lo.x; }
+        case 1u: { return draw_state.sampler_mode0_lo.y; }
+        case 2u: { return draw_state.sampler_mode0_lo.z; }
+        case 3u: { return draw_state.sampler_mode0_lo.w; }
+        case 4u: { return draw_state.sampler_mode0_hi.x; }
+        case 5u: { return draw_state.sampler_mode0_hi.y; }
+        case 6u: { return draw_state.sampler_mode0_hi.z; }
+        default: { return draw_state.sampler_mode0_hi.w; }
     }
-    return tev_to_bytes(sampled);
+}
+
+fn gx_sampler_mode1(map: u32) -> u32 {
+    switch map & 7u {
+        case 0u: { return draw_state.sampler_mode1_lo.x; }
+        case 1u: { return draw_state.sampler_mode1_lo.y; }
+        case 2u: { return draw_state.sampler_mode1_lo.z; }
+        case 3u: { return draw_state.sampler_mode1_lo.w; }
+        case 4u: { return draw_state.sampler_mode1_hi.x; }
+        case 5u: { return draw_state.sampler_mode1_hi.y; }
+        case 6u: { return draw_state.sampler_mode1_hi.z; }
+        default: { return draw_state.sampler_mode1_hi.w; }
+    }
 }
 
 fn gx_managed_wrap_coord(coord: i32, wrap_mode: u32, image_size: i32) -> i32 {
@@ -1545,35 +1523,36 @@ fn gx_managed_wrap_coord(coord: i32, wrap_mode: u32, image_size: i32) -> i32 {
 fn gx_managed_texture_load_bytes(
     texture: texture_2d<f32>,
     coord: vec2<i32>,
+    mip_level: u32,
 ) -> vec4<u32> {
-    return vec4<u32>(tev_to_bytes(textureLoad(texture, coord, 0)));
+    return vec4<u32>(tev_to_bytes(textureLoad(texture, coord, i32(mip_level))));
 }
 
-fn gx_managed_sample_texture(
+fn gx_manual_sample_level(
     texture: texture_2d<f32>,
-    sampler_mode: u32,
-    uv: vec2<f32>,
-) -> vec4<i32> {
-    // Dolphin's software sampler first truncates each reconstructed coordinate
-    // to GX's signed S17.7 representation.
-    var s = i32(uv.x * 128.0);
-    var t = i32(uv.y * 128.0);
-    let image_size = vec2<i32>(textureDimensions(texture, 0));
-    let wrap_s = sampler_mode & 3u;
-    let wrap_t = (sampler_mode >> 2u) & 3u;
+    mode0: u32,
+    s17_7: vec2<i32>,
+    mip_level: u32,
+    linear: bool,
+) -> vec4<u32> {
+    let image_size = vec2<i32>(textureDimensions(texture, mip_level));
+    let wrap_s = mode0 & 3u;
+    let wrap_t = (mode0 >> 2u) & 3u;
+    let level_s = s17_7.x >> mip_level;
+    let level_t = s17_7.y >> mip_level;
 
-    if (sampler_mode & (1u << 4u)) == 0u {
-        let image_s = gx_managed_wrap_coord(s >> 7, wrap_s, image_size.x);
-        let image_t = gx_managed_wrap_coord(t >> 7, wrap_t, image_size.y);
-        return vec4<i32>(
-            gx_managed_texture_load_bytes(texture, vec2<i32>(image_s, image_t)),
+    if !linear {
+        let image_s = gx_managed_wrap_coord(level_s >> 7u, wrap_s, image_size.x);
+        let image_t = gx_managed_wrap_coord(level_t >> 7u, wrap_t, image_size.y);
+        return gx_managed_texture_load_bytes(
+            texture, vec2<i32>(image_s, image_t), mip_level,
         );
     }
 
     // GX centers its 7-bit bilinear kernel half a texel before choosing the
     // integer base coordinates and weights.
-    s -= 64;
-    t -= 64;
+    let s = level_s - 64;
+    let t = level_t - 64;
     let image_s0 = s >> 7;
     let image_t0 = t >> 7;
     let image_s1 = image_s0 + 1;
@@ -1591,46 +1570,176 @@ fn gx_managed_sample_texture(
     let s1 = gx_managed_wrap_coord(image_s1, wrap_s, image_size.x);
     let t0 = gx_managed_wrap_coord(image_t0, wrap_t, image_size.y);
     let t1 = gx_managed_wrap_coord(image_t1, wrap_t, image_size.y);
-    let texel00 = gx_managed_texture_load_bytes(texture, vec2<i32>(s0, t0));
-    let texel10 = gx_managed_texture_load_bytes(texture, vec2<i32>(s1, t0));
-    let texel01 = gx_managed_texture_load_bytes(texture, vec2<i32>(s0, t1));
-    let texel11 = gx_managed_texture_load_bytes(texture, vec2<i32>(s1, t1));
+    let texel00 =
+        gx_managed_texture_load_bytes(texture, vec2<i32>(s0, t0), mip_level);
+    let texel10 =
+        gx_managed_texture_load_bytes(texture, vec2<i32>(s1, t0), mip_level);
+    let texel01 =
+        gx_managed_texture_load_bytes(texture, vec2<i32>(s0, t1), mip_level);
+    let texel11 =
+        gx_managed_texture_load_bytes(texture, vec2<i32>(s1, t1), mip_level);
     let filtered =
         texel00 * vec4<u32>(weight00) +
         texel10 * vec4<u32>(weight10) +
         texel01 * vec4<u32>(weight01) +
         texel11 * vec4<u32>(weight11);
-    return vec4<i32>(filtered >> vec4<u32>(14u));
+    return filtered >> vec4<u32>(14u);
+}
+
+fn gx_manual_sample_texture(
+    texture: texture_2d<f32>,
+    mode0: u32,
+    mode1: u32,
+    uv: vec2<f32>,
+) -> vec4<i32> {
+    // This is the explicit Dolphin-compatible reference model, not a claim
+    // that WebGPU's implementation-dependent implicit LOD matches GX.
+    let s17_7 = vec2<i32>(uv * 128.0);
+    let mip_mode = (mode0 >> 5u) & 3u;
+    let full_lod_state = (mode0 & 0x80000000u) != 0u;
+    if !full_lod_state && mip_mode == 0u {
+        let linear = (mode0 & (1u << 4u)) != 0u;
+        return vec4<i32>(gx_manual_sample_level(texture, mode0, s17_7, 0u, linear));
+    }
+
+    // Quantize before taking coarse derivatives, matching Dolphin's manual
+    // sampler. Edge LOD uses the componentwise maximum; diagonal LOD sums the
+    // two edge derivatives. The resulting LOD is fixed at 1/16 precision.
+    let uv_delta_x = abs(dpdxCoarse(vec2<f32>(s17_7)));
+    let uv_delta_y = abs(dpdyCoarse(vec2<f32>(s17_7)));
+    var uv_delta = max(uv_delta_x, uv_delta_y);
+    if (mode0 & (1u << 8u)) != 0u {
+        uv_delta = uv_delta_x + uv_delta_y;
+    }
+    let rho = max(uv_delta.x, uv_delta.y) / 128.0;
+    let max_lod = i32((mode1 >> 8u) & 0xffu);
+    let min_lod = min(i32(mode1 & 0xffu), max_lod);
+    let raw_bias = i32((mode0 >> 9u) & 0xffu);
+    let signed_bias = select(raw_bias, raw_bias - 256, raw_bias >= 128);
+    let bias_sixteenths = select(0, signed_bias >> 1u, mip_mode != 0u);
+    var lod = min_lod;
+    if rho != 0.0 {
+        lod = i32(floor(log2(rho) * 16.0)) + bias_sixteenths;
+    }
+    // GX chooses the magnification/minification texel filter before applying
+    // MODE1's LOD clamps.
+    let linear = select(
+        (mode0 & (1u << 4u)) != 0u,
+        (mode0 & (1u << 7u)) != 0u,
+        lod > 0,
+    );
+    if mip_mode == 0u {
+        return vec4<i32>(gx_manual_sample_level(texture, mode0, s17_7, 0u, linear));
+    }
+    lod = clamp(lod, min_lod, max_lod);
+    var base_lod = u32(lod >> 4u);
+    let fractional_lod = u32(lod & 15);
+    if mip_mode == 1u && fractional_lod >= 8u {
+        base_lod += 1u;
+    }
+
+    var result = gx_manual_sample_level(texture, mode0, s17_7, base_lod, linear);
+    if mip_mode == 2u && fractional_lod != 0u {
+        let next =
+            gx_manual_sample_level(texture, mode0, s17_7, base_lod + 1u, linear);
+        result =
+            (result * vec4<u32>(16u - fractional_lod) +
+             next * vec4<u32>(fractional_lod)) >> vec4<u32>(4u);
+    }
+    return vec4<i32>(result);
+}
+
+fn gx_native_sample_texture(
+    texture: texture_2d<f32>,
+    texture_sampler: sampler,
+    mode0: u32,
+    mode1: u32,
+    uv: vec2<f32>,
+) -> vec4<i32> {
+    if (mode0 & 0x80000000u) != 0u {
+        return gx_manual_sample_texture(texture, mode0, mode1, uv);
+    }
+    return tev_to_bytes(textureSample(
+        texture, texture_sampler, gx_native_normalized_uv(texture, uv),
+    ));
+}
+
+fn tev_sample_texture_native(map: u32, stq: vec3<f32>) -> vec4<i32> {
+    // Q remains part of the interpolant until the fragment stage.
+    let uv = stq.xy / stq.z;
+    let mode0 = gx_sampler_mode0(map);
+    let mode1 = gx_sampler_mode1(map);
+    switch map & 7u {
+        case 0u: {
+            return gx_native_sample_texture(
+                tev_texture0, tev_sampler0, mode0, mode1, uv,
+            );
+        }
+        case 1u: {
+            return gx_native_sample_texture(
+                tev_texture1, tev_sampler1, mode0, mode1, uv,
+            );
+        }
+        case 2u: {
+            return gx_native_sample_texture(
+                tev_texture2, tev_sampler2, mode0, mode1, uv,
+            );
+        }
+        case 3u: {
+            return gx_native_sample_texture(
+                tev_texture3, tev_sampler3, mode0, mode1, uv,
+            );
+        }
+        case 4u: {
+            return gx_native_sample_texture(
+                tev_texture4, tev_sampler4, mode0, mode1, uv,
+            );
+        }
+        case 5u: {
+            return gx_native_sample_texture(
+                tev_texture5, tev_sampler5, mode0, mode1, uv,
+            );
+        }
+        case 6u: {
+            return gx_native_sample_texture(
+                tev_texture6, tev_sampler6, mode0, mode1, uv,
+            );
+        }
+        default: {
+            return gx_native_sample_texture(
+                tev_texture7, tev_sampler7, mode0, mode1, uv,
+            );
+        }
+    }
 }
 
 fn tev_sample_texture_managed(map: u32, uv: vec2<f32>) -> vec4<i32> {
+    let mode0 = gx_sampler_mode0(map);
+    let mode1 = gx_sampler_mode1(map);
     switch map & 7u {
         case 0u: {
-            return gx_managed_sample_texture(tev_texture0, draw_state.sampler_modes0.x, uv);
+            return gx_manual_sample_texture(tev_texture0, mode0, mode1, uv);
         }
         case 1u: {
-            return gx_managed_sample_texture(tev_texture1, draw_state.sampler_modes0.y, uv);
+            return gx_manual_sample_texture(tev_texture1, mode0, mode1, uv);
         }
         case 2u: {
-            return gx_managed_sample_texture(tev_texture2, draw_state.sampler_modes0.z, uv);
+            return gx_manual_sample_texture(tev_texture2, mode0, mode1, uv);
         }
         case 3u: {
-            return gx_managed_sample_texture(tev_texture3, draw_state.sampler_modes0.w, uv);
+            return gx_manual_sample_texture(tev_texture3, mode0, mode1, uv);
         }
         case 4u: {
-            return gx_managed_sample_texture(tev_texture4, draw_state.sampler_modes1.x, uv);
+            return gx_manual_sample_texture(tev_texture4, mode0, mode1, uv);
         }
         case 5u: {
-            return gx_managed_sample_texture(tev_texture5, draw_state.sampler_modes1.y, uv);
+            return gx_manual_sample_texture(tev_texture5, mode0, mode1, uv);
         }
         case 6u: {
-            return gx_managed_sample_texture(tev_texture6, draw_state.sampler_modes1.z, uv);
-        }
-        case 7u: {
-            return gx_managed_sample_texture(tev_texture7, draw_state.sampler_modes1.w, uv);
+            return gx_manual_sample_texture(tev_texture6, mode0, mode1, uv);
         }
         default: {
-            return vec4<i32>(255);
+            return gx_manual_sample_texture(tev_texture7, mode0, mode1, uv);
         }
     }
 }
@@ -2110,15 +2219,17 @@ fn fs_depth_main(input: TevVertexOutput) -> TevFragmentDepthOutput {
 
 @fragment
 fn fs_managed_coverage_main(input: ManagedCoverageVertexOutput) -> TevFragmentOutput {
-    if !gx_managed_coverage_passes(input) {
-        discard;
-    }
     let values = tev_fragment_values(
         managed_coverage_tev_input(input),
         gx_managed_raster_colors(input),
         false,
         true,
     );
+    // Keep the manual sampler's coarse derivatives in uniform control flow.
+    // Coverage remains authoritative because no output escapes this discard.
+    if !gx_managed_coverage_passes(input) {
+        discard;
+    }
     var output: TevFragmentOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -2129,15 +2240,15 @@ fn fs_managed_coverage_main(input: ManagedCoverageVertexOutput) -> TevFragmentOu
 fn fs_managed_coverage_depth_main(
     input: ManagedCoverageVertexOutput,
 ) -> TevFragmentDepthOutput {
-    if !gx_managed_coverage_passes(input) {
-        discard;
-    }
     let values = tev_fragment_values(
         managed_coverage_tev_input(input),
         gx_managed_raster_colors(input),
         true,
         true,
     );
+    if !gx_managed_coverage_passes(input) {
+        discard;
+    }
     var output: TevFragmentDepthOutput;
     output.primary = values.primary;
     output.secondary = values.secondary;
@@ -2669,8 +2780,10 @@ mod tests {
         assert!(shader.contains(
             "struct DrawState {\n    alpha_test: u32,\n    destination_alpha: u32,\n    fragment_flags: u32,\n    z_texture: u32,\n    fog_control: vec4<u32>,"
         ));
-        assert!(shader.contains("sampler_modes0: vec4<u32>"));
-        assert!(shader.contains("sampler_modes1: vec4<u32>"));
+        assert!(shader.contains("sampler_mode0_lo: vec4<u32>"));
+        assert!(shader.contains("sampler_mode0_hi: vec4<u32>"));
+        assert!(shader.contains("sampler_mode1_lo: vec4<u32>"));
+        assert!(shader.contains("sampler_mode1_hi: vec4<u32>"));
         assert!(shader.contains(
             "struct TevFragmentOutput {\n    @location(0) @blend_src(0) primary: vec4<f32>,\n    @location(0) @blend_src(1) secondary: vec4<f32>,\n};"
         ));
@@ -2686,59 +2799,105 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_native_texture_path_normalizes_texel_space_per_map() {
+    fn complete_wgsl_parses_and_validates_with_derivative_uniformity_enabled() {
         let shader = shader_source();
-        let native_start = shader.find("fn gx_native_normalized_uv(").unwrap();
-        let native_end = shader
-            .find("fn gx_managed_wrap_coord(")
-            .or_else(|| shader.find("fn tev_swizzle("))
-            .unwrap();
-        let native = &shader[native_start..native_end];
-        assert!(native.contains("let uv = stq.xy / stq.z"));
-        assert!(native.contains("return texel_uv / vec2<f32>(textureDimensions(texture, 0))"));
-        for map in 0..MAX_TEV_TEXTURES {
-            assert!(native.contains(&format!(
-                "tev_texture{map}, tev_sampler{map}, gx_native_normalized_uv(tev_texture{map}, uv)"
-            )));
-        }
-        assert_eq!(native.matches("textureSample(").count(), MAX_TEV_TEXTURES);
-        assert!(!native.contains("textureSampleLevel("));
-        assert!(!native.contains("textureLoad("));
+        let module = naga::front::wgsl::parse_str(&shader)
+            .unwrap_or_else(|error| panic!("browser TEV WGSL parse failed: {error}"));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("browser TEV WGSL validation failed: {error}"));
     }
 
     #[test]
-    fn wgsl_managed_texture_path_keeps_texel_space_and_samples_exactly() {
+    fn wgsl_native_texture_path_keeps_legacy_implicit_sampling_but_not_v7_lod() {
+        let shader = shader_source();
+        let native_start = shader.find("fn gx_native_normalized_uv(").unwrap();
+        let native_end = shader.find("fn tev_sample_texture_managed(").unwrap();
+        let native = &shader[native_start..native_end];
+        assert!(native.contains("let uv = stq.xy / stq.z"));
+        assert!(native.contains("return texel_uv / vec2<f32>(textureDimensions(texture, 0))"));
+        assert!(native.contains("if (mode0 & 0x80000000u) != 0u"));
+        assert!(native.contains("return gx_manual_sample_texture(texture, mode0, mode1, uv)"));
+        for map in 0..MAX_TEV_TEXTURES {
+            assert!(native.contains(&format!(
+                "tev_texture{map}, tev_sampler{map}, mode0, mode1, uv"
+            )));
+        }
+        assert_eq!(native.matches("textureSample(").count(), 1);
+        assert!(native.contains("textureLoad(texture, coord, i32(mip_level))"));
+        assert!(!native.contains("textureSampleBias("));
+        assert!(!native.contains("textureSampleLevel("));
+    }
+
+    #[test]
+    fn wgsl_manual_texture_path_carries_full_gx_lod_reference_state() {
         let shader = shader_source();
         let managed_start = shader.find("fn gx_managed_wrap_coord(").unwrap();
         let managed_end = shader[managed_start..].find("fn tev_swizzle(").unwrap() + managed_start;
         let managed = &shader[managed_start..managed_end];
-        assert!(managed.contains("var s = i32(uv.x * 128.0)"));
-        assert!(managed.contains("var t = i32(uv.y * 128.0)"));
+        assert!(managed.contains("let s17_7 = vec2<i32>(uv * 128.0)"));
         assert!(!managed.contains("uv / vec2<f32>"));
-        assert!(managed.contains("textureLoad(texture, coord, 0)"));
+        assert!(managed.contains("textureLoad(texture, coord, i32(mip_level))"));
         assert!(managed.contains("return coord & mask"));
         assert!(managed.contains("if (mirrored & image_size) != 0"));
         assert!(managed.contains("mirrored = ~mirrored"));
         assert!(managed.contains("return clamp(coord, 0, mask)"));
-        assert!(managed.contains("s -= 64"));
-        assert!(managed.contains("t -= 64"));
+        assert!(managed.contains("let s = level_s - 64"));
+        assert!(managed.contains("let t = level_t - 64"));
         assert!(managed.contains("let fract_s = u32(s & 0x7f)"));
         assert!(managed.contains("let fract_t = u32(t & 0x7f)"));
         assert!(managed.contains("filtered >> vec4<u32>(14u)"));
-        for (map, field) in [
-            (0, "sampler_modes0.x"),
-            (1, "sampler_modes0.y"),
-            (2, "sampler_modes0.z"),
-            (3, "sampler_modes0.w"),
-            (4, "sampler_modes1.x"),
-            (5, "sampler_modes1.y"),
-            (6, "sampler_modes1.z"),
-            (7, "sampler_modes1.w"),
-        ] {
+        assert!(managed.contains("let uv_delta_x = abs(dpdxCoarse(vec2<f32>(s17_7)))"));
+        assert!(managed.contains("let uv_delta_y = abs(dpdyCoarse(vec2<f32>(s17_7)))"));
+        assert!(managed.contains("uv_delta = uv_delta_x + uv_delta_y"));
+        assert!(managed.contains("i32(floor(log2(rho) * 16.0)) + bias_sixteenths"));
+        assert!(managed.contains("let max_lod = i32((mode1 >> 8u) & 0xffu)"));
+        assert!(managed.contains("let min_lod = min(i32(mode1 & 0xffu), max_lod)"));
+        assert!(managed.contains("lod > 0"));
+        assert!(managed.contains("fractional_lod >= 8u"));
+        assert!(managed.contains("next * vec4<u32>(fractional_lod)"));
+        let manual_start = managed.find("fn gx_manual_sample_texture(").unwrap();
+        let manual_end = managed.find("fn gx_native_sample_texture(").unwrap();
+        let manual = &managed[manual_start..manual_end];
+        let filter_selection = manual.find("let linear = select(").unwrap();
+        let lod_clamp = manual.find("lod = clamp(lod, min_lod, max_lod)").unwrap();
+        assert!(filter_selection < lod_clamp);
+        assert!(!manual.contains("textureSample("));
+        assert!(!manual.contains("textureSampleBias("));
+        assert!(!manual.contains("textureSampleLevel("));
+        for map in 0..MAX_TEV_TEXTURES {
             assert!(managed.contains(&format!(
-                "gx_managed_sample_texture(tev_texture{map}, draw_state.{field}, uv)"
+                "gx_manual_sample_texture(tev_texture{map}, mode0, mode1, uv)"
             )));
         }
+        for field in [
+            "sampler_mode0_lo.x",
+            "sampler_mode0_lo.y",
+            "sampler_mode0_lo.z",
+            "sampler_mode0_lo.w",
+            "sampler_mode0_hi.x",
+            "sampler_mode0_hi.y",
+            "sampler_mode0_hi.z",
+            "sampler_mode0_hi.w",
+            "sampler_mode1_lo.x",
+            "sampler_mode1_lo.y",
+            "sampler_mode1_lo.z",
+            "sampler_mode1_lo.w",
+            "sampler_mode1_hi.x",
+            "sampler_mode1_hi.y",
+            "sampler_mode1_hi.z",
+            "sampler_mode1_hi.w",
+        ] {
+            assert!(
+                shader.contains(field),
+                "missing DrawState field access {field}"
+            );
+        }
+        assert!(!managed.contains("textureSampleBias("));
+        assert!(!managed.contains("textureSampleLevel("));
     }
 
     #[test]
@@ -2867,11 +3026,14 @@ mod tests {
         assert!(!native.contains("gx_managed_coverage_passes"));
 
         let managed = &shader[managed_start..];
-        let coverage_test = managed
-            .find("if !gx_managed_coverage_passes(input)")
-            .unwrap();
-        let tev = managed.find("gx_managed_raster_colors(input)").unwrap();
-        assert!(coverage_test < tev);
+        let depth_start = managed.find("fn fs_managed_coverage_depth_main").unwrap();
+        let color_entry = &managed[..depth_start];
+        let depth_entry = &managed[depth_start..];
+        for entry in [color_entry, depth_entry] {
+            let tev = entry.find("gx_managed_raster_colors(input)").unwrap();
+            let coverage_test = entry.find("if !gx_managed_coverage_passes(input)").unwrap();
+            assert!(tev < coverage_test);
+        }
         assert!(managed.contains("fn fs_managed_coverage_depth_main"));
         assert_eq!(
             managed.matches("gx_managed_raster_colors(input)").count(),

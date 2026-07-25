@@ -313,26 +313,222 @@ pub(crate) enum TextureAddressMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TextureMipmapFilter {
+    Nearest,
+    Linear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SamplerIdentity {
     pub(crate) mag_filter: bool,
     pub(crate) min_filter: bool,
+    pub(crate) mipmap_filter: TextureMipmapFilter,
     pub(crate) address_u: TextureAddressMode,
     pub(crate) address_v: TextureAddressMode,
+    pub(crate) lod_min_sixteenths: u8,
+    pub(crate) lod_max_sixteenths: u8,
+    pub(crate) max_anisotropy: u8,
 }
 
-pub(crate) fn gx_sampler_identity(mode0: u32) -> SamplerIdentity {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxSamplerState {
+    pub(crate) identity: SamplerIdentity,
+    pub(crate) mip_filter: Option<TextureMipmapFilter>,
+    pub(crate) diagonal_lod: bool,
+    /// Signed GX S2.5 bias converted to the manual sampler's 1/16 LOD units.
+    pub(crate) lod_bias_sixteenths: i8,
+    /// MODE0 as consumed by WGSL. Legacy packets have mip-only fields
+    /// canonicalized away so their level-zero sampling remains unchanged.
+    pub(crate) mode0: u32,
+    /// Effective MODE1 after clamping the guest range to resident mip levels.
+    pub(crate) mode1: u32,
+    pub(crate) manual_sampling: bool,
+    /// WGSL derivatives/log2 are not portable bit-exact at GX's 1/16 LOD
+    /// boundaries. Full V7 state therefore remains a reference-model oracle
+    /// gap even though its arithmetic follows Dolphin's manual sampler.
+    pub(crate) derivative_lod_oracle_gap: bool,
+    pub(crate) managed_exact_eligible: bool,
+}
+
+pub(crate) const GX_MANUAL_SAMPLING_MODE0_FLAG: u32 = 1 << 31;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxSamplerStateError {
+    EmptyMipChain,
+    ReservedMinificationMode(u8),
+    UnsupportedLodAndBiasClamp,
+    UnsupportedAnisotropy(u8),
+    ReservedAnisotropyEncoding,
+}
+
+impl std::fmt::Display for GxSamplerStateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyMipChain => write!(formatter, "GX sampler has an empty mip chain"),
+            Self::ReservedMinificationMode(mode) => write!(
+                formatter,
+                "GX sampler uses reserved minification mode {mode}"
+            ),
+            Self::UnsupportedLodAndBiasClamp => write!(
+                formatter,
+                "GX sampler requests the undocumented LOD/bias clamp"
+            ),
+            Self::UnsupportedAnisotropy(value) => write!(
+                formatter,
+                "GX sampler requests unsupported {value}x anisotropy"
+            ),
+            Self::ReservedAnisotropyEncoding => {
+                write!(formatter, "GX sampler uses reserved anisotropy encoding 3")
+            }
+        }
+    }
+}
+
+pub(crate) fn gx_sampler_state(
+    mode0: u32,
+    mode1: u32,
+    mip_level_count: u32,
+    full_lod_state: bool,
+) -> Result<GxSamplerState, GxSamplerStateError> {
+    if mip_level_count == 0 {
+        return Err(GxSamplerStateError::EmptyMipChain);
+    }
+
     let address_mode = |value| match value & 3 {
         1 => TextureAddressMode::Repeat,
         2 => TextureAddressMode::MirrorRepeat,
         // GX treats the reserved wrap value three as clamp.
         _ => TextureAddressMode::ClampToEdge,
     };
-    SamplerIdentity {
-        mag_filter: mode0 & (1 << 4) != 0,
-        min_filter: mode0 & (1 << 7) != 0,
-        address_u: address_mode(mode0),
-        address_v: address_mode(mode0 >> 2),
+
+    // LZGX v2-v6 carry only base-level texels. Preserve their historical
+    // min/mag and wrap behavior even when a guest happened to leave mip-only
+    // MODE0 fields set.
+    if !full_lod_state {
+        let canonical_mode0 = mode0 & 0x9f;
+        return Ok(GxSamplerState {
+            identity: SamplerIdentity {
+                mag_filter: canonical_mode0 & (1 << 4) != 0,
+                min_filter: canonical_mode0 & (1 << 7) != 0,
+                mipmap_filter: TextureMipmapFilter::Nearest,
+                address_u: address_mode(canonical_mode0),
+                address_v: address_mode(canonical_mode0 >> 2),
+                lod_min_sixteenths: 0,
+                lod_max_sixteenths: 0,
+                max_anisotropy: 1,
+            },
+            mip_filter: None,
+            diagonal_lod: false,
+            lod_bias_sixteenths: 0,
+            mode0: canonical_mode0,
+            mode1: 0,
+            manual_sampling: false,
+            derivative_lod_oracle_gap: false,
+            managed_exact_eligible: (mode0 & 0x60) == 0
+                && (mode0 & (3 << 19)) == 0
+                && (mode0 & (1 << 4) != 0) == (mode0 & (1 << 7) != 0),
+        });
     }
+
+    if mode0 & (1 << 21) != 0 {
+        return Err(GxSamplerStateError::UnsupportedLodAndBiasClamp);
+    }
+    let anisotropy_log2 = ((mode0 >> 19) & 3) as u8;
+    if anisotropy_log2 == 3 {
+        return Err(GxSamplerStateError::ReservedAnisotropyEncoding);
+    }
+    if anisotropy_log2 != 0 {
+        return Err(GxSamplerStateError::UnsupportedAnisotropy(
+            1 << anisotropy_log2,
+        ));
+    }
+
+    let minification_mode = ((mode0 >> 5) & 7) as u8;
+    let (min_filter, mipmap_filter, uses_mips) = match minification_mode {
+        0 => (false, TextureMipmapFilter::Nearest, false),
+        1 => (false, TextureMipmapFilter::Nearest, true),
+        2 => (false, TextureMipmapFilter::Linear, true),
+        4 => (true, TextureMipmapFilter::Nearest, false),
+        5 => (true, TextureMipmapFilter::Nearest, true),
+        6 => (true, TextureMipmapFilter::Linear, true),
+        reserved => {
+            return Err(GxSamplerStateError::ReservedMinificationMode(reserved));
+        }
+    };
+
+    let mut effective_min = 0;
+    let mut effective_max = 0;
+    if uses_mips {
+        let resident_max = mip_level_count
+            .saturating_sub(1)
+            .saturating_mul(16)
+            .min(u32::from(u8::MAX)) as u8;
+        effective_max = ((mode1 >> 8) as u8).min(resident_max);
+        // GX compares max first; if the programmed minimum exceeds it, max
+        // wins rather than making the range invalid.
+        effective_min = (mode1 as u8).min(effective_max);
+    }
+
+    let effective_mode1 = u32::from(effective_min) | (u32::from(effective_max) << 8);
+    let lod_bias_raw = ((mode0 >> 9) & 0xff) as u8 as i8;
+    Ok(GxSamplerState {
+        identity: SamplerIdentity {
+            mag_filter: mode0 & (1 << 4) != 0,
+            min_filter,
+            mipmap_filter,
+            address_u: address_mode(mode0),
+            address_v: address_mode(mode0 >> 2),
+            lod_min_sixteenths: effective_min,
+            lod_max_sixteenths: effective_max,
+            max_anisotropy: 1,
+        },
+        mip_filter: uses_mips.then_some(mipmap_filter),
+        diagonal_lod: mode0 & (1 << 8) != 0,
+        lod_bias_sixteenths: if uses_mips { lod_bias_raw >> 1 } else { 0 },
+        mode0: mode0 | GX_MANUAL_SAMPLING_MODE0_FLAG,
+        mode1: effective_mode1,
+        manual_sampling: true,
+        derivative_lod_oracle_gap: true,
+        managed_exact_eligible: true,
+    })
+}
+
+impl Default for SamplerIdentity {
+    fn default() -> Self {
+        Self {
+            mag_filter: false,
+            min_filter: false,
+            mipmap_filter: TextureMipmapFilter::Nearest,
+            address_u: TextureAddressMode::ClampToEdge,
+            address_v: TextureAddressMode::ClampToEdge,
+            lod_min_sixteenths: 0,
+            lod_max_sixteenths: 0,
+            max_anisotropy: 1,
+        }
+    }
+}
+
+impl Default for GxSamplerState {
+    fn default() -> Self {
+        Self {
+            identity: SamplerIdentity::default(),
+            mip_filter: None,
+            diagonal_lod: false,
+            lod_bias_sixteenths: 0,
+            mode0: 0,
+            mode1: 0,
+            manual_sampling: false,
+            derivative_lod_oracle_gap: false,
+            managed_exact_eligible: true,
+        }
+    }
+}
+
+#[cfg(test)]
+fn legacy_gx_sampler_identity(mode0: u32) -> SamplerIdentity {
+    gx_sampler_state(mode0, 0, 1, false)
+        .expect("legacy base-level sampler")
+        .identity
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2473,14 +2669,15 @@ pub use web::WebGpuRenderer;
 mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, ExactRequiredRejectionInputs, ExactRequiredRejectionReason,
-        GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX, GX_NON_AA_RASTER_CENTER_EFB,
-        GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxAlphaTestOutcome, GxBlendFactor,
-        GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxDepthCompression,
-        GxEarlyDepthPlan, GxEfbDepthDecodeError, GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError,
-        GxFogProjection, GxFogState, GxFogType, GxRasterCenterEvidence, GxZTextureDecodeError,
-        GxZTextureFormat, GxZTextureOperation, RendererFailureState, RendererMetrics,
-        RendererPhaseTiming, SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
-        TextureAddressMode, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
+        GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX, GX_MANUAL_SAMPLING_MODE0_FLAG,
+        GX_NON_AA_RASTER_CENTER_EFB, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
+        GxAlphaTestOutcome, GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxCopyGamma,
+        GxDepthCompareLocation, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthDecodeError,
+        GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
+        GxRasterCenterEvidence, GxSamplerStateError, GxZTextureDecodeError, GxZTextureFormat,
+        GxZTextureOperation, RendererFailureState, RendererMetrics, RendererPhaseTiming,
+        SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError, TextureAddressMode,
+        TextureMipmapFilter, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
         ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode, WEBGPU_RASTER_CENTER_EFB,
         XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
         compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
@@ -2489,9 +2686,9 @@ mod tests {
         gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
         gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
         gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
-        gx_fog_reference, gx_fog_state, gx_raster_center_evidence, gx_sampler_identity,
+        gx_fog_reference, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
         gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
-        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
+        legacy_gx_sampler_identity, materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture, select_texture,
         valid_rgba8_mip_chain, valid_rgba8_texture, xfb_copy_matches_selection,
@@ -4008,18 +4205,136 @@ mod tests {
     }
 
     #[test]
-    fn gx_sampler_state_preserves_filter_and_both_wrap_modes() {
-        let sampler = gx_sampler_identity(1 | (2 << 2) | (1 << 4) | (1 << 7));
+    fn legacy_gx_sampler_state_preserves_filter_wrap_and_level_zero_bytes() {
+        let sampler = legacy_gx_sampler_identity(1 | (2 << 2) | (1 << 4) | (1 << 7));
         assert!(sampler.mag_filter);
         assert!(sampler.min_filter);
+        assert_eq!(sampler.mipmap_filter, TextureMipmapFilter::Nearest);
+        assert_eq!(sampler.lod_min_sixteenths, 0);
+        assert_eq!(sampler.lod_max_sixteenths, 0);
+        assert_eq!(sampler.max_anisotropy, 1);
         assert_eq!(sampler.address_u, TextureAddressMode::Repeat);
         assert_eq!(sampler.address_v, TextureAddressMode::MirrorRepeat);
 
-        let reserved = gx_sampler_identity(3 | (3 << 2));
+        let reserved = legacy_gx_sampler_identity(3 | (3 << 2));
         assert!(!reserved.mag_filter);
         assert!(!reserved.min_filter);
         assert_eq!(reserved.address_u, TextureAddressMode::ClampToEdge);
         assert_eq!(reserved.address_v, TextureAddressMode::ClampToEdge);
+
+        for low_byte in 0..=u8::MAX {
+            let mode0 = u32::from(low_byte) | (3 << 19) | (1 << 21);
+            let state = gx_sampler_state(mode0, 0xffff, 1, false).unwrap();
+            assert_eq!(state.mode0, mode0 & 0x9f);
+            assert_eq!(state.mode1, 0);
+            assert!(!state.manual_sampling);
+            assert!(!state.derivative_lod_oracle_gap);
+            assert_eq!(state.identity.mag_filter, mode0 & (1 << 4) != 0);
+            assert_eq!(state.identity.min_filter, mode0 & (1 << 7) != 0);
+            assert_eq!(state.identity.lod_min_sixteenths, 0);
+            assert_eq!(state.identity.lod_max_sixteenths, 0);
+        }
+    }
+
+    #[test]
+    fn full_gx_sampler_state_exhausts_minification_modes_and_lod_fields() {
+        let expected = [
+            Some((false, TextureMipmapFilter::Nearest, false)),
+            Some((false, TextureMipmapFilter::Nearest, true)),
+            Some((false, TextureMipmapFilter::Linear, true)),
+            None,
+            Some((true, TextureMipmapFilter::Nearest, false)),
+            Some((true, TextureMipmapFilter::Nearest, true)),
+            Some((true, TextureMipmapFilter::Linear, true)),
+            None,
+        ];
+        for (raw, expected) in expected.into_iter().enumerate() {
+            let mode0 = (raw as u32) << 5 | (1 << 4) | (1 << 8) | (0x81 << 9);
+            match expected {
+                Some((min_filter, mipmap_filter, uses_mips)) => {
+                    let state = gx_sampler_state(mode0, 0x4f20, 4, true).unwrap();
+                    assert_ne!(state.mode0 & GX_MANUAL_SAMPLING_MODE0_FLAG, 0);
+                    assert_eq!(state.mode0 & !GX_MANUAL_SAMPLING_MODE0_FLAG, mode0);
+                    assert!(state.manual_sampling);
+                    assert!(state.derivative_lod_oracle_gap);
+                    assert!(state.diagonal_lod);
+                    assert_eq!(state.mip_filter, uses_mips.then_some(mipmap_filter),);
+                    assert_eq!(state.lod_bias_sixteenths, if uses_mips { -64 } else { 0 },);
+                    assert!(state.identity.mag_filter);
+                    assert_eq!(state.identity.min_filter, min_filter);
+                    assert_eq!(state.identity.mipmap_filter, mipmap_filter);
+                    assert_eq!(state.identity.max_anisotropy, 1);
+                    if uses_mips {
+                        // Four resident levels cap raw max 79 to level 3;
+                        // raw min 32 remains below that effective maximum.
+                        assert_eq!(state.mode1, 0x3020);
+                        assert_eq!(state.identity.lod_min_sixteenths, 32);
+                        assert_eq!(state.identity.lod_max_sixteenths, 48);
+                    } else {
+                        assert_eq!(state.mode1, 0);
+                        assert_eq!(state.identity.lod_min_sixteenths, 0);
+                        assert_eq!(state.identity.lod_max_sixteenths, 0);
+                    }
+                }
+                None => assert_eq!(
+                    gx_sampler_state(mode0, 0x4f20, 4, true),
+                    Err(GxSamplerStateError::ReservedMinificationMode(raw as u8)),
+                ),
+            }
+        }
+        let max_wins = gx_sampler_state(1 << 5, 0x1020, 8, true).unwrap();
+        assert_eq!(max_wins.mode1, 0x1010);
+        assert_eq!(max_wins.identity.lod_min_sixteenths, 16);
+        assert_eq!(max_wins.identity.lod_max_sixteenths, 16);
+
+        for bias_raw in 0..=u8::MAX {
+            for diagonal_lod in [false, true] {
+                let mode0 = (1 << 5) | (u32::from(bias_raw) << 9) | (u32::from(diagonal_lod) << 8);
+                let state = gx_sampler_state(mode0, 0x1000, 2, true).unwrap();
+                assert_eq!(state.lod_bias_sixteenths, (bias_raw as i8) >> 1);
+                assert_eq!(state.diagonal_lod, diagonal_lod);
+            }
+        }
+    }
+
+    #[test]
+    fn full_gx_sampler_state_decodes_wraps_and_fails_closed_unknown_sampling() {
+        let addresses = [
+            TextureAddressMode::ClampToEdge,
+            TextureAddressMode::Repeat,
+            TextureAddressMode::MirrorRepeat,
+            TextureAddressMode::ClampToEdge,
+        ];
+        for wrap_u in 0..4_u32 {
+            for wrap_v in 0..4_u32 {
+                let state =
+                    gx_sampler_state(wrap_u | (wrap_v << 2) | (1 << 5), 0x2010, 3, true).unwrap();
+                assert_eq!(state.identity.address_u, addresses[wrap_u as usize]);
+                assert_eq!(state.identity.address_v, addresses[wrap_v as usize]);
+            }
+        }
+        for minification in [0_u32, 1, 2, 4, 5, 6] {
+            let base = minification << 5;
+            assert_eq!(
+                gx_sampler_state(base | (1 << 21), 0, 1, true),
+                Err(GxSamplerStateError::UnsupportedLodAndBiasClamp),
+            );
+            for anisotropy_log2 in 1..=3 {
+                let expected = if anisotropy_log2 == 3 {
+                    GxSamplerStateError::ReservedAnisotropyEncoding
+                } else {
+                    GxSamplerStateError::UnsupportedAnisotropy(1 << anisotropy_log2)
+                };
+                assert_eq!(
+                    gx_sampler_state(base | (anisotropy_log2 << 19), 0, 1, true,),
+                    Err(expected),
+                );
+            }
+        }
+        assert_eq!(
+            gx_sampler_state(0, 0, 0, true),
+            Err(GxSamplerStateError::EmptyMipChain),
+        );
     }
 
     #[test]
