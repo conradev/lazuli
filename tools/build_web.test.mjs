@@ -6,7 +6,11 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { buildWeb, withoutDebugUi } from "./build_web.mjs";
+import {
+  assertGenericFrontend,
+  buildWeb,
+  withoutDebugUi,
+} from "./build_web.mjs";
 import {
   RELEASE_SCHEMA,
   WASM_CHUNK_SIZE,
@@ -34,7 +38,38 @@ test("release markup retains one hidden terminal report sink", () => {
   );
 });
 
-test("builds a deterministic GPL release from a generic generated frontend", async () => {
+const genericDiscSourceConfig = `const defaultDiscSourceConfig = false
+      ? {
+          kind: "logical-range-endpoint",
+          url: new URL("/disc", location.href).href,
+        }
+      : false
+        ? { kind: "boot-assets" }
+        : null;`;
+
+test("release builder accepts only a generic generated frontend", () => {
+  assert.doesNotThrow(() => assertGenericFrontend(genericDiscSourceConfig));
+  assert.throws(
+    () => assertGenericFrontend(
+      genericDiscSourceConfig.replace(
+        "const defaultDiscSourceConfig = false",
+        "const defaultDiscSourceConfig = true",
+      ),
+    ),
+    /generated frontend is disc-bound/,
+  );
+  assert.throws(
+    () => assertGenericFrontend(
+      genericDiscSourceConfig.replace(
+        ": false\n        ? { kind: \"boot-assets\" }",
+        ": true\n        ? { kind: \"boot-assets\" }",
+      ),
+    ),
+    /generated frontend is disc-bound/,
+  );
+});
+
+test("builds a deterministic licensed release from a generic generated frontend", async () => {
   const directory = await mkdtemp(join(tmpdir(), "lazuli-web-build-"));
   temporaryDirectories.push(directory);
   const appPath = join(directory, "index.html");
@@ -57,7 +92,9 @@ test("builds a deterministic GPL release from a generic generated frontend", asy
 <details id="diagnostics"><button id="stop-runner">Stop</button></details>
 <!-- LAZULI DEBUG UI END -->
 <script type="module">import initRenderer from "/browser_renderer.js";
-new URL("/ppcwasmjit.wasm", location.href)</script></main></body>`,
+new URL("/ppcwasmjit.wasm", location.href);
+${genericDiscSourceConfig}
+</script></main></body>`,
   );
   const wasm = Buffer.alloc(WASM_CHUNK_SIZE * 2 + 17);
   for (let index = 0; index < wasm.length; index += 1) wasm[index] = index * 31 & 0xff;

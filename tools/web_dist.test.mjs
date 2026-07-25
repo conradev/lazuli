@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
+import { assertGenericFrontend } from "./build_web.mjs";
+
 test("generated public artifact contains only the release surface", async () => {
   const directory = new URL("../web/dist/", import.meta.url);
   const release = JSON.parse(await readFile(new URL("release.json", directory), "utf8"));
@@ -14,6 +16,7 @@ test("generated public artifact contains only the release surface", async () => 
     "utf8",
   );
 
+  assert.doesNotThrow(() => assertGenericFrontend(frontend));
   assert.match(frontend, /data-surface="release"/);
   assert.doesNotMatch(frontend, /data-surface="debug"|LAZULI DEBUG UI/);
   for (const id of ["disc-file", "display", "controller-controls"]) {

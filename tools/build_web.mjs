@@ -19,6 +19,14 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const RENDERER_JAVASCRIPT_NAME = "browser_renderer.js";
 const RENDERER_WASM_NAME = "browser_renderer_bg.wasm";
 const RENDERER_IMPORT_URL = `/${RENDERER_JAVASCRIPT_NAME}`;
+const GENERIC_DISC_SOURCE_CONFIG = `const defaultDiscSourceConfig = false
+      ? {
+          kind: "logical-range-endpoint",
+          url: new URL("/disc", location.href).href,
+        }
+      : false
+        ? { kind: "boot-assets" }
+        : null;`;
 const STATIC_FILES = [
   "index.html",
   "app.webmanifest",
@@ -111,7 +119,15 @@ export function withoutDebugUi(html) {
   return result;
 }
 
+export function assertGenericFrontend(html) {
+  check(
+    html.includes(GENERIC_DISC_SOURCE_CONFIG),
+    "generated frontend is disc-bound; regenerate it without boot or disc arguments",
+  );
+}
+
 function licensedFrontend(html, source, rendererJavascriptUrl) {
+  assertGenericFrontend(html);
   html = withoutDebugUi(html);
   const sourceAnchor = '<a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a>';
   check(html.includes(sourceAnchor), "generated frontend does not contain the expected source link");
