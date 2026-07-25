@@ -1054,6 +1054,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let smbSustainedViFailure = null;
     let smbReadyPlayAnchor = null;
     let wariowareLastActiveGameplayInput = null;
+    let luigisMansionLastActiveGameplayInput = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -14895,6 +14896,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       return pointer === null ? null : view.getInt32(pointer, false);
     }
 
+    function guestF32(address) {
+      const pointer = ramPointer(address, 4);
+      return pointer === null ? null : view.getFloat32(pointer, false);
+    }
+
     function guestS16(address) {
       const pointer = ramPointer(address, 2);
       return pointer === null ? null : view.getInt16(pointer, false);
@@ -15008,6 +15014,306 @@ const TEMPLATE: &str = r##"<!doctype html>
         submode,
         readyMain: submode === 0x31,
         playRequested: submodeRequest === 0x32 || submode >= 0x32,
+      };
+    }
+
+    function luigisMansionMappedPointer(value, length = 1) {
+      return Number.isSafeInteger(value)
+        && Number.isSafeInteger(length)
+        && length > 0
+        && value >= 0x80000000
+        && value <= 0x81800000 - length
+        && ramPointer(value, length) !== null;
+    }
+
+    function inspectLuigisMansionPosition(address) {
+      if (!luigisMansionMappedPointer(address, 12)) return null;
+      return {
+        x: guestF32(address),
+        y: guestF32(address + 4),
+        z: guestF32(address + 8),
+      };
+    }
+
+    function inspectLuigisMansionGameState() {
+      if (boot.identifier !== "GLME01" || boot.version !== 0) return null;
+
+      // These addresses and layouts are from retail GLME01 revision zero.
+      // The mansion map's SRoomDef entry two is room_02 (the Foyer), whose
+      // exact game-maintained room bitfield is 0x02000102.
+      const sceneIdAddress = 0x804d80a0;
+      const menuModeAddress = 0x804d80c4;
+      const openMapIdAddress = 0x804d80c8;
+      const executingEventAddress = 0x804d8378;
+      const gameModeAddress = 0x804d8728;
+      const currentPlayerPositionAddress = 0x803a3ca0;
+      const currentRoomInfoAddress = 0x803a3cac;
+      const playerRootPointerAddress = 0x804d8c60;
+      const playerObjectTableAddress = 0x803d48a0;
+      const playerVtable = 0x80359d48;
+      const foyerRoomInfo = 0x02000102;
+      const gamePadPointerAddress = 0x804d8078;
+
+      const rootValue = guestU32(playerRootPointerAddress);
+      const rootMapped = luigisMansionMappedPointer(rootValue, 12);
+      const managerPointerAddress = rootMapped ? rootValue + 8 : null;
+      const managerValue = managerPointerAddress === null
+        ? null
+        : guestU32(managerPointerAddress);
+      const managerMapped = luigisMansionMappedPointer(managerValue, 0xe0c);
+      const handleAddress = managerMapped ? managerValue + 0xe08 : null;
+      const handle = handleAddress === null ? null : guestU32(handleAddress);
+      const maximumHandle = Math.floor(
+        (0x817ffffc - playerObjectTableAddress) / 4
+      );
+      const objectSlotAddress = Number.isSafeInteger(handle)
+          && handle >= 0
+          && handle <= maximumHandle
+        ? playerObjectTableAddress + handle * 4
+        : null;
+      const playerValue = objectSlotAddress === null
+        ? null
+        : guestU32(objectSlotAddress);
+      const playerMapped = luigisMansionMappedPointer(playerValue, 0x7d8);
+      const actualPlayerVtable = playerMapped ? guestU32(playerValue) : null;
+      const playerValid = playerMapped && actualPlayerVtable === playerVtable;
+
+      const playerPositionAddress = playerValid ? playerValue + 0x44 : null;
+      const playerHeadingAddress = playerValid ? playerValue + 0x88 : null;
+      const playerRoomInfoAddress = playerValid ? playerValue + 0xb4 : null;
+      const playerGamePadPointerAddress = playerValid ? playerValue + 0x794 : null;
+      const playerControllerPointerAddress = playerValid ? playerValue + 0x7d4 : null;
+      const playerGamePadValue = playerGamePadPointerAddress === null
+        ? null
+        : guestU32(playerGamePadPointerAddress);
+      const playerControllerValue = playerControllerPointerAddress === null
+        ? null
+        : guestU32(playerControllerPointerAddress);
+      const controllerMapped = luigisMansionMappedPointer(
+        playerControllerValue,
+        0x1e0
+      );
+
+      const gamePadValue = guestU32(gamePadPointerAddress);
+      const gamePadMapped = luigisMansionMappedPointer(gamePadValue, 0x77);
+      const controllerInputSourceAddress = controllerMapped
+        ? playerControllerValue + 0x1b0
+        : null;
+      const controllerMainStickMagnitudeAddress = controllerMapped
+        ? playerControllerValue + 0x1c0
+        : null;
+      const controllerPreviousMainStickMagnitudeAddress = controllerMapped
+        ? playerControllerValue + 0x1dc
+        : null;
+      const controllerInputSourceValue = controllerInputSourceAddress === null
+        ? null
+        : guestU32(controllerInputSourceAddress);
+      const currentPlayerPosition = inspectLuigisMansionPosition(
+        currentPlayerPositionAddress
+      );
+      const playerPosition = playerPositionAddress === null
+        ? null
+        : inspectLuigisMansionPosition(playerPositionAddress);
+      const currentRoomInfoValue = guestU32(currentRoomInfoAddress);
+      const playerRoomInfoValue = playerRoomInfoAddress === null
+        ? null
+        : guestU32(playerRoomInfoAddress);
+      const sceneId = guestU32(sceneIdAddress);
+      const menuMode = guestU32(menuModeAddress);
+      const openMapId = guestU32(openMapIdAddress);
+      const executingEventValue = guestU32(executingEventAddress);
+      const gameMode = guestU32(gameModeAddress);
+      const padHeld = gamePadMapped ? guestU32(gamePadValue + 0x18) : null;
+      const padTrigger = gamePadMapped ? guestU32(gamePadValue + 0x1c) : null;
+      const padMainStickX = gamePadMapped ? guestF32(gamePadValue + 0x44) : null;
+      const padMainStickY = gamePadMapped ? guestF32(gamePadValue + 0x48) : null;
+      const padMainStickValue = gamePadMapped
+        ? guestF32(gamePadValue + 0x4c)
+        : null;
+      const padPort = gamePadMapped ? guestS16(gamePadValue + 0x74) : null;
+      const padError = gamePadMapped ? guestU8(gamePadValue + 0x76) : null;
+      const controllerMainStickMagnitude =
+        controllerMainStickMagnitudeAddress === null
+          ? null
+          : guestF32(controllerMainStickMagnitudeAddress);
+      const controllerPreviousMainStickMagnitude =
+        controllerPreviousMainStickMagnitudeAddress === null
+          ? null
+          : guestF32(controllerPreviousMainStickMagnitudeAddress);
+      const finitePosition = position => position !== null
+        && Number.isFinite(position.x)
+        && Number.isFinite(position.y)
+        && Number.isFinite(position.z);
+      const controlsEnabled = playerValid
+        && gamePadMapped
+        && controllerMapped
+        && playerGamePadValue === gamePadValue
+        && controllerInputSourceValue === gamePadValue
+        && padPort === 0
+        && padError === 0;
+      const neutralInput = padHeld === 0
+        && padTrigger === 0
+        && padMainStickX === 0
+        && padMainStickY === 0
+        && padMainStickValue === 0
+        && controllerMainStickMagnitude === 0;
+      const mainGameScene = sceneId === 2;
+      const menuClosed = menuMode === 0;
+      const mansionOpen = openMapId === 2;
+      const eventInactive = executingEventValue === 0;
+      const gameplayMode = gameMode === 2;
+      const foyerActive = currentRoomInfoValue === foyerRoomInfo;
+      const controllableFoyer = mainGameScene
+        && menuClosed
+        && mansionOpen
+        && eventInactive
+        && gameplayMode
+        && foyerActive
+        && playerRoomInfoValue === foyerRoomInfo
+        && finitePosition(currentPlayerPosition)
+        && finitePosition(playerPosition)
+        && controlsEnabled;
+
+      return {
+        sceneIdAddress: hex32(sceneIdAddress),
+        sceneId,
+        mainGameScene,
+        menuModeAddress: hex32(menuModeAddress),
+        menuMode,
+        menuClosed,
+        openMapIdAddress: hex32(openMapIdAddress),
+        openMapId,
+        mansionOpen,
+        executingEventAddress: hex32(executingEventAddress),
+        executingEvent: executingEventValue === 0
+          ? null
+          : hex32(executingEventValue),
+        eventInactive,
+        gameModeAddress: hex32(gameModeAddress),
+        gameMode,
+        gameplayMode,
+        currentRoomInfoAddress: hex32(currentRoomInfoAddress),
+        currentRoomInfo: hex32(currentRoomInfoValue),
+        foyerActive,
+        currentPlayerPositionAddress: hex32(currentPlayerPositionAddress),
+        currentPlayerPosition,
+        playerLookup: {
+          rootPointerAddress: hex32(playerRootPointerAddress),
+          root: rootMapped ? hex32(rootValue) : null,
+          managerPointerAddress: hex32(managerPointerAddress),
+          manager: managerMapped ? hex32(managerValue) : null,
+          handleAddress: hex32(handleAddress),
+          handle,
+          objectSlotAddress: hex32(objectSlotAddress),
+        },
+        player: {
+          address: playerMapped ? hex32(playerValue) : null,
+          vtableAddress: playerMapped ? hex32(playerValue) : null,
+          vtable: playerMapped ? hex32(actualPlayerVtable) : null,
+          valid: playerValid,
+          positionAddress: hex32(playerPositionAddress),
+          position: playerPosition,
+          headingAddress: hex32(playerHeadingAddress),
+          heading: playerHeadingAddress === null
+            ? null
+            : guestU16(playerHeadingAddress),
+          roomInfoAddress: hex32(playerRoomInfoAddress),
+          roomInfo: hex32(playerRoomInfoValue),
+          gamePadPointerAddress: hex32(playerGamePadPointerAddress),
+          gamePad: luigisMansionMappedPointer(playerGamePadValue, 0x77)
+            ? hex32(playerGamePadValue)
+            : null,
+          controllerPointerAddress: hex32(playerControllerPointerAddress),
+          controller: controllerMapped ? hex32(playerControllerValue) : null,
+        },
+        pad: {
+          pointerAddress: hex32(gamePadPointerAddress),
+          address: gamePadMapped ? hex32(gamePadValue) : null,
+          heldAddress: gamePadMapped ? hex32(gamePadValue + 0x18) : null,
+          held: padHeld,
+          triggerAddress: gamePadMapped ? hex32(gamePadValue + 0x1c) : null,
+          trigger: padTrigger,
+          mainStickXAddress: gamePadMapped ? hex32(gamePadValue + 0x44) : null,
+          mainStickX: padMainStickX,
+          mainStickYAddress: gamePadMapped ? hex32(gamePadValue + 0x48) : null,
+          mainStickY: padMainStickY,
+          mainStickValueAddress: gamePadMapped ? hex32(gamePadValue + 0x4c) : null,
+          mainStickValue: padMainStickValue,
+          portAddress: gamePadMapped ? hex32(gamePadValue + 0x74) : null,
+          port: padPort,
+          errorAddress: gamePadMapped ? hex32(gamePadValue + 0x76) : null,
+          error: padError,
+        },
+        controller: {
+          address: controllerMapped ? hex32(playerControllerValue) : null,
+          inputSourceAddress: hex32(controllerInputSourceAddress),
+          inputSource: luigisMansionMappedPointer(controllerInputSourceValue, 0x77)
+            ? hex32(controllerInputSourceValue)
+            : null,
+          mainStickMagnitudeAddress: hex32(controllerMainStickMagnitudeAddress),
+          mainStickMagnitude: controllerMainStickMagnitude,
+          previousMainStickMagnitudeAddress:
+            hex32(controllerPreviousMainStickMagnitudeAddress),
+          previousMainStickMagnitude: controllerPreviousMainStickMagnitude,
+        },
+        controlsEnabled,
+        neutralInput,
+        controllableFoyer,
+        lastActiveGameplayInput: luigisMansionLastActiveGameplayInput,
+      };
+    }
+
+    function sampleLuigisMansionGameplayInput(sampleCycle) {
+      if (boot.identifier !== "GLME01" || boot.version !== 0) return;
+      const publication = serialLastActiveHostPublication;
+      if (
+        publication === null
+        || publication.buttons !== 0x0001
+        || !Number.isSafeInteger(publication.scheduledCycle)
+        || !Number.isSafeInteger(publication.observedCycle)
+        || publication.scheduledCycle > publication.observedCycle
+        || publication.observedCycle > sampleCycle
+        || controllerAppliedSequence !== publication.sequence
+      ) return;
+      const previousSequence =
+        luigisMansionLastActiveGameplayInput?.hostPublication?.sequence;
+      if (
+        Number.isSafeInteger(previousSequence)
+        && previousSequence >= publication.sequence
+      ) return;
+      const state = inspectLuigisMansionGameState();
+      if (
+        state === null
+        || state.controllableFoyer !== true
+        || state.pad.held !== 0x01000001
+        || !Number.isFinite(state.pad.mainStickX)
+        || state.pad.mainStickX > -0.5
+        || !Number.isFinite(state.pad.mainStickY)
+        || Math.abs(state.pad.mainStickY) > 0.125
+        || !Number.isFinite(state.pad.mainStickValue)
+        || state.pad.mainStickValue < 0.5
+        || !Number.isFinite(state.controller.mainStickMagnitude)
+        || state.controller.mainStickMagnitude < 0.5
+      ) return;
+      luigisMansionLastActiveGameplayInput = {
+        cycle: sampleCycle,
+        controllerAppliedSequence,
+        hostPublication: { ...publication },
+        player: state.player.address,
+        roomInfo: state.currentRoomInfo,
+        position: { ...state.currentPlayerPosition },
+        heading: state.player.heading,
+        pad: {
+          held: state.pad.held,
+          trigger: state.pad.trigger,
+          mainStickX: state.pad.mainStickX,
+          mainStickY: state.pad.mainStickY,
+          mainStickValue: state.pad.mainStickValue,
+        },
+        controller: {
+          inputSource: state.controller.inputSource,
+          mainStickMagnitude: state.controller.mainStickMagnitude,
+        },
       };
     }
 
@@ -15125,7 +15431,13 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function inspectGuestGameState() {
       return inspectSuperMonkeyBallGameState()
+        ?? inspectLuigisMansionGameState()
         ?? inspectWarioWareGameState();
+    }
+
+    function sampleGuestGameplayInput(sampleCycle) {
+      sampleLuigisMansionGameplayInput(sampleCycle);
+      sampleWarioWareGameplayInput(sampleCycle);
     }
 
     function hex32(value) {
@@ -15920,7 +16232,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           );
         }
         if (scanoutDue) {
-          sampleWarioWareGameplayInput(scheduledCycle);
+          sampleGuestGameplayInput(scheduledCycle);
           if (scanoutTarget !== undefined) {
             const snapshot = latchViScanoutBoundary(
               scanoutTarget.field,
