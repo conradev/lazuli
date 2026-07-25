@@ -4721,7 +4721,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const gxTextureCache = createWeightedLruCache(
       64,
       gxTextureCacheByteLimit,
-      texture => texture.pixels.byteLength
+      texture => texture.mipPixels.byteLength
     );
     const gxTevTextureCache = createWeightedLruCache(
       64,
@@ -7317,7 +7317,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxPrearmTextureCopyProducer(address) {
-      if (!gxTextureCopyConsumers.has(address)) return false;
+      if (
+        !gxTextureCopyConsumers.has(address)
+        && !gxTextureCopyIsBound(address)
+      ) {
+        return false;
+      }
       if (gxFrameSkippedPrimitives !== 0) {
         gxTextureCopyProducerLateArms += 1;
         return false;
@@ -7361,7 +7366,35 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxBpRegisters[registers.image2],
           gxBpRegisters[registers.image3]
         );
-        if (source.kind === "main-memory" && source.address === address) return true;
+        if (source.kind !== "main-memory") continue;
+        if (source.address === address) return true;
+        const image0 = gxBpRegisters[registers.image0];
+        const width = (image0 & 0x3ff) + 1;
+        const height = ((image0 >>> 10) & 0x3ff) + 1;
+        const layout = gxTextureLayout((image0 >>> 20) & 0xf);
+        if (
+          layout === null
+          || width > 1024
+          || height > 1024
+          || width * height > 1_048_576
+        ) {
+          continue;
+        }
+        const mipChain = gxTextureMipChainLayout(
+          width,
+          height,
+          layout,
+          gxBpRegisters[registers.mode0],
+          gxBpRegisters[registers.mode1]
+        );
+        if (mipChain === null || mipChain.levelCount <= 1) continue;
+        const relativeAddress = (address >>> 0) - (source.address >>> 0);
+        if (
+          relativeAddress >= mipChain.levels[1].encodedOffset
+          && relativeAddress < mipChain.encodedBytes
+        ) {
+          return true;
+        }
       }
       return false;
     }
@@ -7635,105 +7668,49 @@ const TEMPLATE: &str = r##"<!doctype html>
       // so a TLUT upload does not invalidate unrelated or identical entries.
     }
 
-    function gxTextureSamplerState(mode0) {
+    function gxTextureSamplerState(mode0, mode1) {
+      const canonicalMode0 = (mode0 & 0x0039ffff) >>> 0;
+      const canonicalMode1 = (mode1 & 0xffff) >>> 0;
       return {
-        wrapS: mode0 & 3,
-        wrapT: (mode0 >>> 2) & 3,
-        magFilter: (mode0 >>> 4) & 1,
-        minFilter: (mode0 >>> 5) & 7,
-        maxAnisotropy: (mode0 >>> 19) & 3,
+        mode0: canonicalMode0,
+        mode1: canonicalMode1,
+        wrapS: canonicalMode0 & 3,
+        wrapT: (canonicalMode0 >>> 2) & 3,
+        magFilter: (canonicalMode0 >>> 4) & 1,
+        minFilter: (canonicalMode0 >>> 5) & 7,
+        maxAnisotropy: (canonicalMode0 >>> 19) & 3,
       };
     }
 
-    function gxDecodeTexture(textureMap) {
-      const registers = gxTextureRegisters(textureMap);
-      const image0 = gxBpRegisters[registers.image0];
-      const mode0 = gxBpRegisters[registers.mode0];
-      const mode1 = gxBpRegisters[registers.mode1];
-      const sampler = gxTextureSamplerState(mode0);
-      const width = (image0 & 0x3ff) + 1;
-      const height = ((image0 >>> 10) & 0x3ff) + 1;
-      const format = (image0 >>> 20) & 0xf;
-      const layout = gxTextureLayout(format);
-      if (layout === null || width > 1024 || height > 1024 || width * height > 1_048_576) {
-        gxTextureDecodeErrors += 1;
-        return null;
-      }
-      const mipChain = gxTextureMipChainLayout(width, height, layout, mode0, mode1);
-      if (mipChain === null) {
-        // MODE0 mip mode 3 is reserved. Do not silently reinterpret it as a
-        // base-only or MODE1-selected source chain.
-        gxTextureDecodeErrors += 1;
-        return null;
-      }
-      const imageSource = gxTextureImageSource(
-        gxBpRegisters[registers.image1],
-        gxBpRegisters[registers.image2],
-        gxBpRegisters[registers.image3]
-      );
-      if (imageSource.kind === "preloaded-tmem") {
-        // IMAGE3 is not a main-memory address when IMAGE1 selects manually
-        // managed/preloaded TMEM. Reject that path until its even/odd TMEM
-        // banks are modeled instead of decoding unrelated DRAM.
-        gxTextureDecodeErrors += 1;
-        return null;
-      }
-      const address = imageSource.address;
-      gxMarkTextureCopyConsumer(address);
-      // LZGX v6 carries only the base image. Model the complete source chain
-      // here, but keep the existing decoded texture and packet shape until a
-      // mip-aware transport version is negotiated end to end.
-      const baseLevel = mipChain.levels[0];
-      const blocksWide = baseLevel.blocksWide;
-      const blocksHigh = baseLevel.blocksHigh;
-      const encodedBytes = baseLevel.encodedBytes;
-      const pointer = ramPointer(address, encodedBytes);
-      if (pointer === null) {
-        gxTextureDecodeErrors += 1;
-        return null;
-      }
-      const source = bytes.subarray(pointer, pointer + encodedBytes);
-      let hash = 0x811c9dc5;
-      for (const byte of source) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
-      const paletteEntries = format === 8 ? 16 : format === 9 ? 256 : format === 10 ? 16384 : 0;
-      let paletteOffset = 0;
-      let paletteFormat = 0;
-      let paletteHash = 0;
-      if (paletteEntries !== 0) {
-        const tlut = gxBpRegisters[registers.tlut];
-        paletteOffset = (tlut & 0x3ff) << 9;
-        paletteFormat = (tlut >>> 10) & 3;
-        const paletteBytes = paletteEntries * 2;
-        if (paletteFormat > 2 || paletteOffset + paletteBytes > gxTmem.length) {
-          gxTextureDecodeErrors += 1;
-          return null;
-        }
-        paletteHash = 0x811c9dc5;
-        for (let offset = 0; offset < paletteBytes; offset += 1) {
-          paletteHash = Math.imul(
-            paletteHash ^ gxTmem[paletteOffset + offset],
-            0x01000193
-          ) >>> 0;
+    function gxTextureLowerMipCopyGeneration(address, mipChain) {
+      if (mipChain.levelCount <= 1) return null;
+      const lowerMipOffset = mipChain.levels[1].encodedOffset;
+      for (const [destination, generation] of gxTextureCopyDestinations) {
+        const relativeAddress = (destination >>> 0) - (address >>> 0);
+        if (
+          relativeAddress >= lowerMipOffset
+          && relativeAddress < mipChain.encodedBytes
+        ) {
+          return { address: destination >>> 0, generation };
         }
       }
-      const textureCopyIndex = gxTextureCopyDestinations.get(address);
-      const key = [
-        textureMap, address, width, height, format, hash,
-        paletteOffset, paletteFormat, paletteHash, textureCopyIndex ?? "ram",
-      ].join(":");
-      const cached = gxTextureCache.get(key);
-      if (cached !== undefined) {
-        gxTextureCacheHits += 1;
-        // Sampling state is draw state, not decoded-image identity. Return a
-        // fresh snapshot so a BP mode change cannot rewrite an earlier draw or
-        // inherit the sampler from the cache entry's first decode.
-        return { ...cached, ...sampler };
-      }
+      return null;
+    }
 
-      const pixels = new Uint8ClampedArray(width * height * 4);
-      let blockOffset = 0;
-      for (let blockY = 0; blockY < blocksHigh; blockY += 1) {
-        for (let blockX = 0; blockX < blocksWide; blockX += 1) {
+    function gxDecodeTextureLevel(
+      pixels,
+      level,
+      format,
+      layout,
+      source,
+      paletteOffset,
+      paletteFormat
+    ) {
+      const width = level.width;
+      const height = level.height;
+      let blockOffset = level.encodedOffset;
+      for (let blockY = 0; blockY < level.blocksHigh; blockY += 1) {
+        for (let blockX = 0; blockX < level.blocksWide; blockX += 1) {
           const originX = blockX * layout.blockWidth;
           const originY = blockY * layout.blockHeight;
           if (format === 0 || format === 8) {
@@ -7840,6 +7817,114 @@ const TEMPLATE: &str = r##"<!doctype html>
           blockOffset += layout.blockBytes;
         }
       }
+    }
+
+    function gxDecodeTexture(textureMap) {
+      const registers = gxTextureRegisters(textureMap);
+      const image0 = gxBpRegisters[registers.image0];
+      const mode0 = gxBpRegisters[registers.mode0];
+      const mode1 = gxBpRegisters[registers.mode1];
+      const sampler = gxTextureSamplerState(mode0, mode1);
+      const width = (image0 & 0x3ff) + 1;
+      const height = ((image0 >>> 10) & 0x3ff) + 1;
+      const format = (image0 >>> 20) & 0xf;
+      const layout = gxTextureLayout(format);
+      if (layout === null || width > 1024 || height > 1024 || width * height > 1_048_576) {
+        gxTextureDecodeErrors += 1;
+        return null;
+      }
+      const mipChain = gxTextureMipChainLayout(width, height, layout, mode0, mode1);
+      if (mipChain === null) {
+        // MODE0 mip mode 3 is reserved. Do not silently reinterpret it as a
+        // base-only or MODE1-selected source chain.
+        gxTextureDecodeErrors += 1;
+        return null;
+      }
+      const imageSource = gxTextureImageSource(
+        gxBpRegisters[registers.image1],
+        gxBpRegisters[registers.image2],
+        gxBpRegisters[registers.image3]
+      );
+      if (imageSource.kind === "preloaded-tmem") {
+        // IMAGE3 is not a main-memory address when IMAGE1 selects manually
+        // managed/preloaded TMEM. Reject that path until its even/odd TMEM
+        // banks are modeled instead of decoding unrelated DRAM.
+        gxTextureDecodeErrors += 1;
+        return null;
+      }
+      const address = imageSource.address;
+      const textureCopyIndex = gxTextureCopyDestinations.get(address);
+      if (gxTextureLowerMipCopyGeneration(address, mipChain) !== null) {
+        // LZGX v6 can identify only the base texture-copy generation. A copied
+        // EFB surface inside a lower level would otherwise be silently decoded
+        // as unrelated RAM and then cached under incomplete provenance.
+        gxTextureDecodeErrors += 1;
+        return null;
+      }
+      for (const level of mipChain.levels) {
+        gxMarkTextureCopyConsumer((address + level.encodedOffset) >>> 0);
+      }
+      const encodedBytes = mipChain.encodedBytes;
+      const pointer = ramPointer(address, encodedBytes);
+      if (pointer === null) {
+        gxTextureDecodeErrors += 1;
+        return null;
+      }
+      const source = bytes.subarray(pointer, pointer + encodedBytes);
+      let hash = 0x811c9dc5;
+      for (const byte of source) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+      const paletteEntries = format === 8 ? 16 : format === 9 ? 256 : format === 10 ? 16384 : 0;
+      let paletteOffset = 0;
+      let paletteFormat = 0;
+      let paletteHash = 0;
+      if (paletteEntries !== 0) {
+        const tlut = gxBpRegisters[registers.tlut];
+        paletteOffset = (tlut & 0x3ff) << 9;
+        paletteFormat = (tlut >>> 10) & 3;
+        const paletteBytes = paletteEntries * 2;
+        if (paletteFormat > 2 || paletteOffset + paletteBytes > gxTmem.length) {
+          gxTextureDecodeErrors += 1;
+          return null;
+        }
+        paletteHash = 0x811c9dc5;
+        for (let offset = 0; offset < paletteBytes; offset += 1) {
+          paletteHash = Math.imul(
+            paletteHash ^ gxTmem[paletteOffset + offset],
+            0x01000193
+          ) >>> 0;
+        }
+      }
+      const key = [
+        textureMap, address, width, height, format, mipChain.levelCount, hash,
+        paletteOffset, paletteFormat, paletteHash, textureCopyIndex ?? "ram",
+      ].join(":");
+      const cached = gxTextureCache.get(key);
+      if (cached !== undefined) {
+        gxTextureCacheHits += 1;
+        // Sampling state is draw state, not decoded-image identity. Return a
+        // fresh snapshot so a BP mode change cannot rewrite an earlier draw or
+        // inherit the sampler from the cache entry's first decode.
+        return { ...cached, ...sampler };
+      }
+
+      const mipPixels = new Uint8ClampedArray(mipChain.decodedBytes);
+      const mipLevels = mipChain.levels.map(level => {
+        const pixels = mipPixels.subarray(
+          level.decodedOffset,
+          level.decodedOffset + level.decodedBytes
+        );
+        gxDecodeTextureLevel(
+          pixels,
+          level,
+          format,
+          layout,
+          source,
+          paletteOffset,
+          paletteFormat
+        );
+        return { ...level, pixels };
+      });
+      const pixels = mipLevels[0].pixels;
 
       const texture = {
         key,
@@ -7849,10 +7934,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         height,
         format,
         formatName: layout.name,
+        levelCount: mipChain.levelCount,
         encodedBytes,
         hash: "0x" + hash.toString(16).padStart(8, "0"),
         ...sampler,
         pixels,
+        mipPixels,
+        mipLevels,
       };
       if (textureCopyIndex !== undefined) texture.textureCopyIndex = textureCopyIndex;
       if (paletteEntries !== 0) {
@@ -7865,7 +7953,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         };
       }
       gxTextureDecodes += 1;
-      gxTextureDecodedBytes += pixels.byteLength;
+      gxTextureDecodedBytes += mipPixels.byteLength;
       gxTextureFormatCounts.set(
         layout.name,
         (gxTextureFormatCounts.get(layout.name) ?? 0) + 1
@@ -7876,8 +7964,36 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function gxTextureSummary(texture) {
       if (texture === null) return null;
-      const { pixels: _pixels, ...summary } = texture;
-      return summary;
+      const {
+        pixels: _pixels,
+        mipPixels: _mipPixels,
+        mipLevels,
+        ...summary
+      } = texture;
+      if (mipLevels === undefined) return summary;
+      return {
+        ...summary,
+        mipLevels: mipLevels.map(({ pixels: _levelPixels, ...level }) => level),
+      };
+    }
+
+    function gxTextureBaseOnly(texture, pixels) {
+      const {
+        pixels: _pixels,
+        mipPixels: _mipPixels,
+        mipLevels,
+        ...base
+      } = texture;
+      const mode0 = (texture.mode0 & ~(3 << 5)) >>> 0;
+      return {
+        ...base,
+        mode0,
+        mode1: 0,
+        levelCount: 1,
+        encodedBytes: mipLevels?.[0]?.encodedBytes ?? texture.encodedBytes,
+        minFilter: (mode0 >>> 5) & 7,
+        pixels,
+      };
     }
 
     function gxTevStageState(stageIndex) {
@@ -8334,7 +8450,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
       const rendered = {
-        ...primary.texture,
+        ...gxTextureBaseOnly(primary.texture, pixels),
         width,
         height,
         renderKey,
@@ -8345,7 +8461,6 @@ const TEMPLATE: &str = r##"<!doctype html>
           colorRegisters: gxTevColorRegisters.map(register => register.slice()),
           konstRegisters: gxTevKonstRegisters.map(register => register.slice()),
         },
-        pixels,
       };
       gxTevTextureCache.set(renderKey, rendered);
       return { texture: rendered, texCoordIndex: primary.texCoordIndex, stages: stageSummaries };

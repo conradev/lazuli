@@ -729,9 +729,12 @@ test("texture sampling state is a complete per-draw snapshot outside decode iden
     | (1 << 4)
     | (4 << 5)
     | (3 << 19);
+  const mode1 = 0xabcd1234;
   assert.deepEqual(
-    { ...context.gxTextureSamplerState(mode0) },
+    { ...context.gxTextureSamplerState(mode0, mode1) },
     {
+      mode0: (mode0 & 0x0039ffff) >>> 0,
+      mode1: 0x1234,
       wrapS: 2,
       wrapT: 1,
       magFilter: 1,
@@ -741,7 +744,7 @@ test("texture sampling state is a complete per-draw snapshot outside decode iden
   );
   assert.match(
     source,
-    /const sampler = gxTextureSamplerState\(mode0\)/,
+    /const sampler = gxTextureSamplerState\(mode0, mode1\)/,
   );
   assert.match(
     source,

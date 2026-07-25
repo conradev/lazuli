@@ -29,6 +29,8 @@ function extractFunction(name) {
 const pureFunctions = [
   "gxTextureRegisters",
   "gxTextureLayout",
+  "gxTextureMipCount",
+  "gxTextureMipChainLayout",
   "gxTextureImageSource",
 ];
 

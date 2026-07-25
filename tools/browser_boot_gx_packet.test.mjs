@@ -585,6 +585,58 @@ test("negotiates LZGX v6 without changing canonical v4 or v5 bytes", () => {
   assert.deepEqual(packetBytes(optionalV6), packetBytes(optionalV5));
 });
 
+test("LZGX v6 ignores decoded mip backing and serializes the exact level-0 view", () => {
+  const context = packetContext();
+  const frameWithMips = exactClipXfbFrame();
+  frameWithMips.geometry.draws[0].exactGeometryRequired = true;
+  frameWithMips.geometry.draws[0].tevState = tevState([0], 0);
+  const mipPixels = Uint8Array.of(
+    1, 2, 3, 4, 5, 6, 7, 8,
+    9, 10, 11, 12,
+  );
+  const baseTexture = {
+    key: "mip-v6-base",
+    address: 0x00123000,
+    textureCopyIndex: 17,
+    width: 2,
+    height: 1,
+    wrapS: 1,
+    wrapT: 2,
+    magFilter: 1,
+    minFilter: 5,
+    maxAnisotropy: 2,
+    pixels: mipPixels.subarray(0, 8),
+  };
+  frameWithMips.geometry.draws[0].textures = [{
+    ...baseTexture,
+    levelCount: 2,
+    mipPixels,
+    mipLevels: [
+      { level: 0, width: 2, height: 1, pixels: mipPixels.subarray(0, 8) },
+      { level: 1, width: 1, height: 1, pixels: mipPixels.subarray(8, 12) },
+    ],
+  }];
+
+  const frameWithoutMips = exactClipXfbFrame();
+  frameWithoutMips.geometry.draws[0].exactGeometryRequired = true;
+  frameWithoutMips.geometry.draws[0].tevState = tevState([0], 0);
+  frameWithoutMips.geometry.draws[0].textures = [{
+    ...baseTexture,
+    pixels: Uint8Array.from(baseTexture.pixels),
+  }];
+
+  const withMips = context.packGxFramePacketV6(2, frameWithMips);
+  const withoutMips = context.packGxFramePacketV6(2, frameWithoutMips);
+  assert.deepEqual(packetBytes(withMips), packetBytes(withoutMips));
+
+  const view = new DataView(withMips);
+  const textureOffset = view.getUint32(0x20, true);
+  assert.equal(view.getUint16(0x04, true), 6);
+  assert.equal(view.getUint32(0x18, true), 1);
+  assert.equal(view.getUint32(textureOffset + 0x0c, true), 8);
+  assert.equal(view.getUint32(0x48, true), 16);
+});
+
 test("marks required exact GX geometry in canonical LZGX v6", () => {
   const context = packetContext();
   const frame = exactClipXfbFrame();
