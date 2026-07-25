@@ -399,6 +399,36 @@ mod tests {
         Ins::new(code, Extensions::gekko_broadway())
     }
 
+    fn ps_arithmetic(fd: u8, fa: u8, fc: u8, fb: u8, subopcode: u8) -> Ins {
+        let code = 4 << 26
+            | u32::from(fd) << 21
+            | u32::from(fa) << 16
+            | u32::from(fb) << 11
+            | u32::from(fc) << 6
+            | u32::from(subopcode) << 1;
+        Ins::new(code, Extensions::gekko_broadway())
+    }
+
+    fn ps_add(fd: u8, fa: u8, fb: u8) -> Ins {
+        ps_arithmetic(fd, fa, 0, fb, 21)
+    }
+
+    fn ps_div(fd: u8, fa: u8, fb: u8) -> Ins {
+        ps_arithmetic(fd, fa, 0, fb, 18)
+    }
+
+    fn ps_mul(fd: u8, fa: u8, fc: u8) -> Ins {
+        ps_arithmetic(fd, fa, fc, 0, 25)
+    }
+
+    fn ps_madd(fd: u8, fa: u8, fc: u8, fb: u8) -> Ins {
+        ps_arithmetic(fd, fa, fc, fb, 29)
+    }
+
+    fn ps_sum0(fd: u8, fa: u8, fc: u8, fb: u8) -> Ins {
+        ps_arithmetic(fd, fa, fc, fb, 10)
+    }
+
     fn conditional_branch(bo: u8, bi: u8, displacement: i16) -> Ins {
         let code = 16 << 26
             | u32::from(bo) << 21
@@ -1287,6 +1317,140 @@ for (const [offset, expected] of [
                 &expected_f2[1].to_string(),
                 &expected_f4[0].to_string(),
                 &expected_f4[1].to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "node failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn paired_single_results_round_to_f32_in_native_and_webassembly_jits() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+            return;
+        }
+
+        const ROUNDING_DELTA: f64 = f64::from_bits(0x3e60_0000_0000_0000);
+        const ONE_BITS: u64 = 0x3ff0_0000_0000_0000;
+        const THREE_BITS: u64 = 0x4008_0000_0000_0000;
+        const SEVEN_BITS: u64 = 0x401c_0000_0000_0000;
+        const NEG_FIVE_BITS: u64 = 0xc014_0000_0000_0000;
+        const NEG_SEVEN_BITS: u64 = 0xc01c_0000_0000_0000;
+        const SINGLE_THIRD_BITS: u64 = 0x3fd5_5555_6000_0000;
+
+        let sequence = [
+            ps_add(4, 1, 2),
+            ps_sum0(5, 1, 3, 2),
+            ps_madd(6, 1, 3, 2),
+            ps_mul(7, 1, 3),
+            ps_div(9, 1, 8),
+        ];
+        let block = Jit::new().build(sequence).unwrap();
+        Validator::new().validate_all(block.wasm()).unwrap();
+
+        let native = execute_with_native_jit_initialized(&sequence, 0x8000_1000, 0, |state| {
+            state.cpu.supervisor.config.msr = state
+                .cpu
+                .supervisor
+                .config
+                .msr
+                .clone()
+                .with_float_available(true);
+            state.cpu.user.fpr[1] = FloatPair([1.0, -1.0]);
+            state.cpu.user.fpr[2] = FloatPair([ROUNDING_DELTA, 2.0]);
+            state.cpu.user.fpr[3] = FloatPair([1.0 + ROUNDING_DELTA, 7.0 + ROUNDING_DELTA]);
+            state.cpu.user.fpr[8] = FloatPair([3.0, -3.0]);
+        });
+        let expected = [
+            [ONE_BITS, ONE_BITS],
+            [THREE_BITS, SEVEN_BITS],
+            [ONE_BITS, NEG_FIVE_BITS],
+            [ONE_BITS, NEG_SEVEN_BITS],
+            [SINGLE_THIRD_BITS, SINGLE_THIRD_BITS],
+        ];
+        for (register, expected_bits) in (4..=7).chain([9]).zip(expected) {
+            assert_eq!(
+                [
+                    native.cpu.user.fpr[register][0].to_bits(),
+                    native.cpu.user.fpr[register][1].to_bits(),
+                ],
+                expected_bits,
+                "unexpected paired-single bits in f{register}",
+            );
+        }
+
+        let wasm = block
+            .wasm()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let script = r#"
+const [wasmHex, pcOffset, msrOffset, f1Offset, f2Offset, f3Offset, f4Offset, f5Offset, f6Offset, f7Offset, f8Offset, f9Offset, initialMsr, expectedExecuted, expectedPc, roundingDeltaBits, oneBits, sevenPlusDeltaBits, singleThirdBits] = process.argv.slice(1);
+const memory = new WebAssembly.Memory({ initial: 1 });
+const view = new DataView(memory.buffer);
+const cpu = 64;
+view.setUint32(cpu + Number(pcOffset), 0x80001000, true);
+view.setUint32(cpu + Number(msrOffset), Number(initialMsr), true);
+for (const [offset, bits0, bits1] of [
+  [Number(f1Offset), BigInt(oneBits), 0xbff0000000000000n],
+  [Number(f2Offset), BigInt(roundingDeltaBits), 0x4000000000000000n],
+  [Number(f3Offset), 0x3ff0000008000000n, BigInt(sevenPlusDeltaBits)],
+  [Number(f8Offset), 0x4008000000000000n, 0xc008000000000000n],
+]) {
+  view.setBigUint64(cpu + offset, bits0, true);
+  view.setBigUint64(cpu + offset + 8, bits1, true);
+}
+const { instance } = await WebAssembly.instantiate(Buffer.from(wasmHex, "hex"), {
+  lazuli: { memory },
+  lazuli_hooks: { user_1_0() { throw new Error("unexpected floating-point exception"); } },
+});
+const executed = instance.exports.run(0, cpu, 0) >>> 0;
+if (executed !== (Number(expectedExecuted) >>> 0)) throw new Error(`bad execution metadata: 0x${executed.toString(16)}`);
+const pc = view.getUint32(cpu + Number(pcOffset), true);
+if (pc !== (Number(expectedPc) >>> 0)) throw new Error(`bad pc: 0x${pc.toString(16)}`);
+for (const [offset, expected0, expected1] of [
+  [Number(f4Offset), BigInt(oneBits), BigInt(oneBits)],
+  [Number(f5Offset), 0x4008000000000000n, 0x401c000000000000n],
+  [Number(f6Offset), BigInt(oneBits), 0xc014000000000000n],
+  [Number(f7Offset), BigInt(oneBits), 0xc01c000000000000n],
+  [Number(f9Offset), BigInt(singleThirdBits), BigInt(singleThirdBits)],
+]) {
+  const actual0 = view.getBigUint64(cpu + offset, true);
+  const actual1 = view.getBigUint64(cpu + offset + 8, true);
+  if (actual0 !== expected0 || actual1 !== expected1) {
+    throw new Error(`bad paired-single bits at ${offset}: [0x${actual0.toString(16)}, 0x${actual1.toString(16)}]`);
+  }
+}
+"#;
+        let output = Command::new("node")
+            .args([
+                "--input-type=module",
+                "--eval",
+                script,
+                &wasm,
+                &Reg::PC.offset().to_string(),
+                &Reg::MSR.offset().to_string(),
+                &FPR::R1.offset().to_string(),
+                &FPR::R2.offset().to_string(),
+                &FPR::R3.offset().to_string(),
+                &FPR::R4.offset().to_string(),
+                &FPR::R5.offset().to_string(),
+                &FPR::R6.offset().to_string(),
+                &FPR::R7.offset().to_string(),
+                &FPR::R8.offset().to_string(),
+                &FPR::R9.offset().to_string(),
+                &native.cpu.supervisor.config.msr.to_bits().to_string(),
+                &block.metadata().executed.pack().to_string(),
+                &native.cpu.pc.value().to_string(),
+                &ROUNDING_DELTA.to_bits().to_string(),
+                &ONE_BITS.to_string(),
+                &(7.0 + ROUNDING_DELTA).to_bits().to_string(),
+                &SINGLE_THIRD_BITS.to_string(),
             ])
             .output()
             .unwrap();
