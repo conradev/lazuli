@@ -2527,6 +2527,370 @@ const TEMPLATE: &str = r##"<!doctype html>
       return packet;
     }
 
+    function gxFramePacketMipLayout(width, height, mode0, mode1, name) {
+      const mipMode = (mode0 >>> 5) & 3;
+      if (mipMode === 3) {
+        throw new Error(`GX frame packet ${name}.mode0 uses reserved mip mode 3`);
+      }
+      const theoreticalLevels =
+        Math.floor(Math.log2(Math.max(width, height))) + 1;
+      const requestedLevels = Math.ceil(((mode1 >>> 8) & 0xff) / 16) + 1;
+      const levelCount = mipMode === 0
+        ? 1
+        : Math.min(theoreticalLevels, requestedLevels);
+      let levelWidth = width;
+      let levelHeight = height;
+      let decodedBytes = 0;
+      let baseBytes = 0;
+      for (let level = 0; level < levelCount; level += 1) {
+        const levelBytes = gxFramePacketMultiply(
+          gxFramePacketMultiply(
+            levelWidth,
+            levelHeight,
+            `${name} mip level ${level} pixel count`
+          ),
+          4,
+          `${name} mip level ${level} pixel bytes`
+        );
+        if (level === 0) baseBytes = levelBytes;
+        decodedBytes = gxFramePacketAdd(
+          decodedBytes,
+          levelBytes,
+          `${name} decoded mip bytes`
+        );
+        levelWidth = Math.max(1, Math.floor(levelWidth / 2));
+        levelHeight = Math.max(1, Math.floor(levelHeight / 2));
+      }
+      return { levelCount, baseBytes, decodedBytes };
+    }
+
+    function gxFramePacketMipTexture(texture, legacyMode0, name) {
+      const mode0 = texture.mode0 === undefined
+        ? legacyMode0
+        : gxFramePacketInteger(texture.mode0, `${name}.mode0`);
+      if ((mode0 & (~0x0039ffff >>> 0)) !== 0) {
+        throw new Error(
+          `GX frame packet ${name}.mode0 has noncanonical bits outside 0x0039ffff`
+        );
+      }
+      const mode1 = texture.mode1 === undefined
+        ? 0
+        : gxFramePacketInteger(texture.mode1, `${name}.mode1`);
+      if ((mode1 & (~0x0000ffff >>> 0)) !== 0) {
+        throw new Error(
+          `GX frame packet ${name}.mode1 has noncanonical bits outside 0x0000ffff`
+        );
+      }
+      const width = gxFramePacketInteger(texture.width, `${name}.width`, 1024);
+      const height = gxFramePacketInteger(texture.height, `${name}.height`, 1024);
+      const layout = gxFramePacketMipLayout(width, height, mode0, mode1, name);
+      if (
+        layout.levelCount > 1
+        && texture.levelCount === undefined
+      ) {
+        throw new Error(
+          `GX frame packet ${name}.levelCount must declare the derived mip count`
+        );
+      }
+      if (texture.levelCount !== undefined) {
+        const declaredLevelCount = gxFramePacketInteger(
+          texture.levelCount,
+          `${name}.levelCount`,
+          32
+        );
+        if (declaredLevelCount !== layout.levelCount) {
+          throw new Error(
+            `GX frame packet ${name}.levelCount ${declaredLevelCount}`
+            + ` conflicts with derived count ${layout.levelCount}`
+          );
+        }
+      }
+
+      const basePixels = gxFramePacketBytes(
+        texture.pixels === undefined ? new Uint8Array() : texture.pixels,
+        `${name}.pixels`
+      );
+      if (
+        basePixels.byteLength !== 0
+        && basePixels.byteLength !== layout.baseBytes
+      ) {
+        throw new RangeError(
+          `GX frame packet ${name}.pixels must be empty or contain`
+          + ` ${layout.baseBytes} level-0 bytes`
+        );
+      }
+      let mipPixels;
+      if (texture.mipPixels === undefined) {
+        if (layout.levelCount > 1) {
+          throw new TypeError(
+            `GX frame packet ${name}.mipPixels is required for a mip chain`
+          );
+        }
+        mipPixels = basePixels;
+      } else {
+        mipPixels = gxFramePacketBytes(texture.mipPixels, `${name}.mipPixels`);
+        if (mipPixels.byteLength !== layout.decodedBytes) {
+          throw new RangeError(
+            `GX frame packet ${name}.mipPixels must contain`
+            + ` ${layout.decodedBytes} decoded mip bytes`
+          );
+        }
+        if (
+          basePixels.byteLength !== 0
+          && !gxFramePacketEqualBytes(
+            basePixels,
+            mipPixels.subarray(0, layout.baseBytes)
+          )
+        ) {
+          throw new Error(
+            `GX frame packet ${name}.pixels conflicts with the mipPixels prefix`
+          );
+        }
+      }
+      if (
+        mipPixels.byteLength !== 0
+        && mipPixels.byteLength !== layout.decodedBytes
+      ) {
+        throw new RangeError(
+          `GX frame packet ${name} decoded payload must contain`
+          + ` ${layout.decodedBytes} bytes`
+        );
+      }
+      return {
+        mode0,
+        mode1,
+        levelCount: layout.levelCount,
+        decodedBytes: layout.decodedBytes,
+        mipPixels,
+      };
+    }
+
+    function gxFramePacketEqualMipTexture(left, right) {
+      return (
+        left.levelCount === right.levelCount
+        && left.decodedBytes === right.decodedBytes
+        && gxFramePacketEqualBytes(left.mipPixels, right.mipPixels)
+      );
+    }
+
+    // LZGX v7 extends the canonical v4-v6 packet only for a referenced,
+    // derived mip chain. Texture records retain their 64-byte ABI while +0x24
+    // declares the level count, payloads contain tightly packed decoded
+    // levels, draw sampler words carry full canonical MODE0, and an aligned
+    // 32-byte-per-draw tail carries MODE1 after all exact-clip chunks.
+    function packGxFramePacketV7(copyKind, frame, residentTextureKeys = null) {
+      const legacy = packGxFramePacketV6(
+        copyKind,
+        frame,
+        residentTextureKeys
+      );
+      const legacyBytes = new Uint8Array(legacy);
+      const legacyView = new DataView(legacy);
+      const drawCount = legacyView.getUint32(0x14, true);
+      const textureCount = legacyView.getUint32(0x18, true);
+      const drawTableOffset = legacyView.getUint32(0x1c, true);
+      const textureTableOffset = legacyView.getUint32(0x20, true);
+      const pixelOffset = legacyView.getUint32(0x30, true);
+      const legacyPixelBytes = legacyView.getUint32(0x48, true);
+      const drawRecordBytes = legacyView.getUint16(0x78, true);
+      const textureRecordBytes = legacyView.getUint16(0x7a, true);
+      if (
+        legacyView.getUint16(0x06, true) !== 160
+        || drawRecordBytes !== 176
+        || textureRecordBytes !== 64
+      ) {
+        throw new Error("GX frame packet v7 requires the fixed legacy record ABI");
+      }
+
+      const textures = new Array(textureCount);
+      const drawMode0 = Array.from(
+        { length: drawCount },
+        () => new Uint32Array(8)
+      );
+      const drawMode1 = Array.from(
+        { length: drawCount },
+        () => new Uint32Array(8)
+      );
+      let evidenceBytes = 0;
+      let hasMipChain = false;
+      for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
+        const draw = frame.geometry.draws[drawIndex];
+        const drawTextures = draw.textures ?? [];
+        const recordOffset = drawTableOffset + drawIndex * drawRecordBytes;
+        const flags = legacyView.getUint16(recordOffset + 0x02, true);
+        if (flags !== 0 && flags !== 1 && flags !== 2 && flags !== 6) {
+          throw new Error(
+            `GX frame packet draws[${drawIndex}] has unsupported v7 flags ${flags}`
+          );
+        }
+        if (flags === 1) {
+          const topology = legacyBytes[recordOffset];
+          const vertexCount = legacyView.getUint32(recordOffset + 0x04, true);
+          evidenceBytes = gxFramePacketAdd(
+            evidenceBytes,
+            Math.ceil(gxSourceTriangleCount(topology, vertexCount) / 4),
+            "v7 post-cull evidence bytes"
+          );
+        }
+        for (let textureMap = 0; textureMap < 8; textureMap += 1) {
+          const referenceOffset = recordOffset + 0x30 + textureMap * 8;
+          const textureIndex = legacyView.getUint32(referenceOffset, true);
+          const legacyMode0 = legacyView.getUint32(referenceOffset + 4, true);
+          if (textureIndex === 0xffffffff) {
+            if (legacyMode0 !== 0) {
+              throw new Error(
+                `GX frame packet draws[${drawIndex}] unused texture map`
+                + ` ${textureMap} must have zero MODE0`
+              );
+            }
+            continue;
+          }
+          if (textureIndex >= textureCount) {
+            throw new RangeError(
+              `GX frame packet draws[${drawIndex}] texture map ${textureMap}`
+              + " has an out-of-range texture index"
+            );
+          }
+          const texture = drawTextures[textureMap];
+          const name = `draws[${drawIndex}].textures[${textureMap}]`;
+          if (texture === null || typeof texture !== "object") {
+            throw new TypeError(`GX frame packet ${name} must be an object`);
+          }
+          const normalized = gxFramePacketMipTexture(texture, legacyMode0, name);
+          drawMode0[drawIndex][textureMap] = normalized.mode0;
+          drawMode1[drawIndex][textureMap] = normalized.mode1;
+          hasMipChain ||= normalized.levelCount > 1;
+          if (textures[textureIndex] === undefined) {
+            const key = texture.renderKey ?? texture.key;
+            textures[textureIndex] = { ...normalized, key };
+          } else if (
+            !gxFramePacketEqualMipTexture(textures[textureIndex], normalized)
+          ) {
+            const key = texture.renderKey ?? texture.key;
+            throw new Error(
+              `GX frame packet texture key ${JSON.stringify(key)}`
+              + " has conflicting mip contents"
+            );
+          }
+        }
+      }
+      if (!hasMipChain) return legacy;
+      if (textures.includes(undefined)) {
+        throw new Error("GX frame packet v7 texture table has an unreferenced entry");
+      }
+
+      let pixelBytes = 0;
+      for (let textureIndex = 0; textureIndex < textureCount; textureIndex += 1) {
+        const texture = textures[textureIndex];
+        const resident = residentTextureKeys?.has(texture.key) ?? false;
+        if (!resident && texture.mipPixels.byteLength !== texture.decodedBytes) {
+          throw new RangeError(
+            `GX frame packet texture ${textureIndex} has an incomplete mip payload`
+          );
+        }
+        texture.pixels = resident ? new Uint8Array() : texture.mipPixels;
+        texture.pixelRelativeOffset = texture.pixels.byteLength === 0
+          ? 0
+          : gxFramePacketAlign16(pixelBytes, "v7 texture pixel relative offset");
+        if (texture.pixels.byteLength !== 0) {
+          pixelBytes = gxFramePacketAdd(
+            texture.pixelRelativeOffset,
+            texture.pixels.byteLength,
+            "v7 pixel bytes"
+          );
+        }
+      }
+      pixelBytes = gxFramePacketAlign16(pixelBytes, "v7 pixelBytes");
+
+      const legacyEvidenceOffset = gxFramePacketAdd(
+        pixelOffset,
+        legacyPixelBytes,
+        "legacy evidence offset"
+      );
+      const legacyExactOffset = gxFramePacketAlign16(
+        gxFramePacketAdd(
+          legacyEvidenceOffset,
+          evidenceBytes,
+          "legacy exact-clip offset"
+        ),
+        "legacy exact-clip offset"
+      );
+      if (legacyExactOffset > legacy.byteLength) {
+        throw new Error("GX frame packet legacy evidence layout is not canonical");
+      }
+      const exactBytes = legacy.byteLength - legacyExactOffset;
+      const evidenceOffset = gxFramePacketAdd(
+        pixelOffset,
+        pixelBytes,
+        "v7 evidence offset"
+      );
+      const exactOffset = gxFramePacketAlign16(
+        gxFramePacketAdd(evidenceOffset, evidenceBytes, "v7 exact-clip offset"),
+        "v7 exact-clip offset"
+      );
+      const mode1Offset = gxFramePacketAdd(
+        exactOffset,
+        exactBytes,
+        "v7 MODE1 offset"
+      );
+      const mode1Bytes = gxFramePacketMultiply(
+        drawCount,
+        32,
+        "v7 MODE1 bytes"
+      );
+      const packetBytes = gxFramePacketAdd(
+        mode1Offset,
+        mode1Bytes,
+        "v7 packet bytes"
+      );
+      const packet = new ArrayBuffer(packetBytes);
+      const bytes = new Uint8Array(packet);
+      const view = new DataView(packet);
+      bytes.set(legacyBytes.subarray(0, pixelOffset));
+      bytes.set(
+        legacyBytes.subarray(
+          legacyEvidenceOffset,
+          legacyEvidenceOffset + evidenceBytes
+        ),
+        evidenceOffset
+      );
+      bytes.set(legacyBytes.subarray(legacyExactOffset), exactOffset);
+
+      view.setUint16(0x04, 7, true);
+      view.setUint32(0x08, packetBytes, true);
+      view.setUint32(0x48, pixelBytes, true);
+      for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
+        const recordOffset = drawTableOffset + drawIndex * drawRecordBytes;
+        for (let textureMap = 0; textureMap < 8; textureMap += 1) {
+          view.setUint32(
+            recordOffset + 0x34 + textureMap * 8,
+            drawMode0[drawIndex][textureMap],
+            true
+          );
+          view.setUint32(
+            mode1Offset + drawIndex * 32 + textureMap * 4,
+            drawMode1[drawIndex][textureMap],
+            true
+          );
+        }
+      }
+      for (let textureIndex = 0; textureIndex < textureCount; textureIndex += 1) {
+        const texture = textures[textureIndex];
+        const recordOffset =
+          textureTableOffset + textureIndex * textureRecordBytes;
+        view.setUint32(recordOffset + 0x08, texture.pixelRelativeOffset, true);
+        view.setUint32(recordOffset + 0x0c, texture.pixels.byteLength, true);
+        view.setUint32(
+          recordOffset + 0x20,
+          texture.pixels.byteLength === 0 ? 0 : 1,
+          true
+        );
+        view.setUint32(recordOffset + 0x24, texture.levelCount, true);
+        bytes.set(texture.pixels, pixelOffset + texture.pixelRelativeOffset);
+      }
+      return packet;
+    }
+
     function completeRendererFrame(message) {
       const rendererSequence = Number(message.rendererSequence);
       if (

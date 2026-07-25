@@ -1999,6 +1999,14 @@ impl WebGpuRenderer {
         self.record_wasm_bridge_call(packet_bytes.len());
         let packet = GxFramePacket::parse(&packet_bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        if packet
+            .textures()
+            .any(|texture| texture.record.mip_level_count > 1)
+        {
+            return Err(JsValue::from_str(
+                "LZGX mip transport requires WebGPU mip upload support",
+            ));
+        }
         let header = *packet.header();
         let payload_bytes: usize = packet.textures().map(|texture| texture.pixels.len()).sum();
 

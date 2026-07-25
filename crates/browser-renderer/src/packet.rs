@@ -23,6 +23,7 @@ const GX_PACKET_VERSION_V2: u16 = 2;
 const GX_PACKET_VERSION_V3: u16 = 3;
 const GX_PACKET_VERSION_V5: u16 = 5;
 const GX_PACKET_VERSION_V6: u16 = 6;
+pub(crate) const GX_PACKET_VERSION_V7: u16 = 7;
 const GX_DRAW_RECORD_BYTES_V2: u16 = 128;
 const PACKET_ALIGNMENT: u32 = 16;
 const COPY_FLAG_CLEAR: u32 = 1;
@@ -35,6 +36,9 @@ const EXACT_CLIP_VERTEX_BYTES: u32 = 16;
 const TEXTURE_FLAG_PAYLOAD: u32 = 1;
 const SAMPLER_BITS_MASK_V3: u32 = 0xff;
 const SAMPLER_BITS_MASK_V4: u32 = SAMPLER_BITS_MASK_V3 | (3 << 19);
+const SAMPLER_MODE0_MASK_V7: u32 = 0x0039_ffff;
+const SAMPLER_MODE1_MASK_V7: u32 = 0xffff;
+const GX_MODE1_TAIL_BYTES_PER_DRAW: u32 = (MAX_TEV_TEXTURES as u32) * 4;
 const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
 const FOG_RANGE_ADJUSTMENT_ENABLE: u32 = 1 << 10;
 
@@ -105,6 +109,7 @@ pub(crate) struct GxPacketHeader {
 pub(crate) struct GxTextureSlot {
     pub(crate) texture: Option<u32>,
     pub(crate) sampler_bits: u32,
+    pub(crate) mode1: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -210,6 +215,7 @@ pub(crate) struct GxTextureRecord {
     pub(crate) generation: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) mip_level_count: u32,
     pub(crate) has_payload: bool,
 }
 
@@ -282,7 +288,7 @@ impl<'a> GxFramePacket<'a> {
         let draw_record_bytes = match version {
             GX_PACKET_VERSION_V2 => GX_DRAW_RECORD_BYTES_V2,
             GX_PACKET_VERSION_V3 | GX_PACKET_VERSION | GX_PACKET_VERSION_V5
-            | GX_PACKET_VERSION_V6 => GX_DRAW_RECORD_BYTES,
+            | GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7 => GX_DRAW_RECORD_BYTES,
             _ => return Err(GxPacketError::UnsupportedVersion(version)),
         };
         expect_u16(
@@ -460,7 +466,7 @@ impl<'a> GxFramePacket<'a> {
         }
         if matches!(
             version,
-            GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6
+            GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7
         ) {
             if packet_bytes < packet_base_bytes {
                 return Err(GxPacketError::SectionOutOfBounds("base packet"));
@@ -557,7 +563,7 @@ impl<'a> GxFramePacket<'a> {
                         ));
                     }
                 }
-                GX_PACKET_VERSION_V6 => {
+                GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7 => {
                     let required_exact =
                         DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE | DRAW_FLAG_EXACT_CLIP_REQUIRED;
                     if ![
@@ -777,20 +783,28 @@ impl<'a> GxFramePacket<'a> {
             let mut texture_slots = [GxTextureSlot {
                 texture: None,
                 sampler_bits: 0,
+                mode1: 0,
             }; MAX_TEV_TEXTURES];
-            let sampler_bits_mask = if matches!(
-                version,
-                GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6
-            ) {
-                SAMPLER_BITS_MASK_V4
-            } else {
-                SAMPLER_BITS_MASK_V3
+            let sampler_bits_mask = match version {
+                GX_PACKET_VERSION_V7 => SAMPLER_MODE0_MASK_V7,
+                GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 => {
+                    SAMPLER_BITS_MASK_V4
+                }
+                GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => SAMPLER_BITS_MASK_V3,
+                _ => unreachable!("validated LZGX packet version"),
             };
             for map in 0..MAX_TEV_TEXTURES {
                 let slot_offset = 0x30 + map * 8;
                 let reference = read_u32(record, slot_offset);
                 let sampler_bits = read_u32(record, slot_offset + 4);
                 if sampler_bits & !sampler_bits_mask != 0 {
+                    return Err(GxPacketError::InvalidSampler {
+                        draw: draw_index,
+                        map,
+                        sampler_bits,
+                    });
+                }
+                if version == GX_PACKET_VERSION_V7 && (sampler_bits >> 5) & 3 == 3 {
                     return Err(GxPacketError::InvalidSampler {
                         draw: draw_index,
                         map,
@@ -837,6 +851,7 @@ impl<'a> GxFramePacket<'a> {
                 texture_slots[map] = GxTextureSlot {
                     texture: Some(reference),
                     sampler_bits,
+                    mode1: 0,
                 };
             }
 
@@ -880,11 +895,25 @@ impl<'a> GxFramePacket<'a> {
         )?;
         let exact_clip_start = match version {
             GX_PACKET_VERSION => align_packet(evidence_end, "post-cull evidence padding")?,
-            GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 => {
+            GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7 => {
                 align_packet(evidence_end, "exact clip input alignment")?
             }
             GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => evidence_end,
             _ => unreachable!("validated LZGX packet version"),
+        };
+        let exact_clip_end = checked_add(
+            exact_clip_start,
+            exact_clip_tail_bytes,
+            "exact clip input end",
+        )?;
+        let mode1_tail_bytes = if version == GX_PACKET_VERSION_V7 {
+            checked_mul(
+                draw_count,
+                GX_MODE1_TAIL_BYTES_PER_DRAW,
+                "MODE1 tail byte length",
+            )?
+        } else {
+            0
         };
         let expected_packet_bytes = match version {
             GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => packet_base_bytes,
@@ -895,11 +924,7 @@ impl<'a> GxFramePacket<'a> {
                         "version 5 requires at least one exact clip input",
                     ));
                 }
-                checked_add(
-                    exact_clip_start,
-                    exact_clip_tail_bytes,
-                    "exact clip input end",
-                )?
+                exact_clip_end
             }
             GX_PACKET_VERSION_V6 => {
                 if required_exact_clip_draw_count == 0 {
@@ -907,11 +932,10 @@ impl<'a> GxFramePacket<'a> {
                         "version 6 requires at least one required exact clip input",
                     ));
                 }
-                checked_add(
-                    exact_clip_start,
-                    exact_clip_tail_bytes,
-                    "exact clip input end",
-                )?
+                exact_clip_end
+            }
+            GX_PACKET_VERSION_V7 => {
+                checked_add(exact_clip_end, mode1_tail_bytes, "MODE1 tail end")?
             }
             _ => unreachable!("validated LZGX packet version"),
         };
@@ -954,7 +978,10 @@ impl<'a> GxFramePacket<'a> {
             evidence_offset = chunk_end;
         }
         debug_assert_eq!(evidence_offset, to_usize(evidence_end));
-        if matches!(version, GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6) {
+        if matches!(
+            version,
+            GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7
+        ) {
             require_zero(bytes, evidence_offset, to_usize(exact_clip_start))?;
 
             let mut exact_clip_offset = exact_clip_start;
@@ -1048,9 +1075,56 @@ impl<'a> GxFramePacket<'a> {
                 });
                 exact_clip_offset = chunk_end;
             }
-            debug_assert_eq!(exact_clip_offset, expected_packet_bytes);
+            debug_assert_eq!(exact_clip_offset, exact_clip_end);
         } else {
             require_zero(bytes, evidence_offset, to_usize(expected_packet_bytes))?;
+        }
+
+        if version == GX_PACKET_VERSION_V7 {
+            let mode1_tail_start = to_usize(exact_clip_end);
+            for (draw_index, draw) in draws.iter_mut().enumerate() {
+                for map in 0..MAX_TEV_TEXTURES {
+                    let draw_relative_offset = checked_mul(
+                        u32::try_from(draw_index).expect("draw count originated as u32"),
+                        GX_MODE1_TAIL_BYTES_PER_DRAW,
+                        "draw MODE1 tail offset",
+                    )?;
+                    let map_relative_offset = checked_mul(
+                        u32::try_from(map).expect("GX texture map count fits u32"),
+                        size_of::<u32>() as u32,
+                        "texture map MODE1 tail offset",
+                    )?;
+                    let mode1_offset = checked_add(
+                        exact_clip_end,
+                        checked_add(
+                            draw_relative_offset,
+                            map_relative_offset,
+                            "MODE1 tail field offset",
+                        )?,
+                        "MODE1 tail field offset",
+                    )?;
+                    debug_assert!(to_usize(mode1_offset) >= mode1_tail_start);
+                    let mode1 = read_u32(bytes, to_usize(mode1_offset));
+                    if mode1 & !SAMPLER_MODE1_MASK_V7 != 0 {
+                        return Err(GxPacketError::InvalidSamplerMode1 {
+                            draw: draw_index,
+                            map,
+                            mode1,
+                        });
+                    }
+                    let slot = &mut draw.textures[map];
+                    if slot.texture.is_none() {
+                        if mode1 != 0 {
+                            return Err(GxPacketError::UnexpectedTextureReference {
+                                draw: draw_index,
+                                map,
+                            });
+                        }
+                    } else {
+                        slot.mode1 = mode1;
+                    }
+                }
+            }
         }
 
         let mut textures = Vec::with_capacity(texture_count_usize);
@@ -1071,13 +1145,20 @@ impl<'a> GxFramePacket<'a> {
             let width = read_u32(record, 0x18);
             let height = read_u32(record, 0x1c);
             let flags = read_u32(record, 0x20);
+            let mip_level_count = if version == GX_PACKET_VERSION_V7 {
+                let count = read_u32(record, 0x24);
+                require_zero(record, 0x28, 0x40)?;
+                count
+            } else {
+                require_zero(record, 0x24, 0x40)?;
+                1
+            };
             if flags & !TEXTURE_FLAG_PAYLOAD != 0 {
                 return Err(GxPacketError::InvalidField {
                     field: "texture flags",
                     value: u64::from(flags),
                 });
             }
-            require_zero(record, 0x24, 0x40)?;
             expect_u32(
                 "texture key relative offset",
                 key_relative_offset,
@@ -1122,11 +1203,14 @@ impl<'a> GxFramePacket<'a> {
                     actual: pixel_len,
                 });
             }
-            let expected_pixel_len = checked_mul(
-                checked_mul(width, height, "texture texel count")?,
-                4,
-                "RGBA8 texture byte length",
-            )?;
+            let theoretical_mip_level_count = texture_theoretical_mip_level_count(width, height);
+            if mip_level_count == 0 || mip_level_count > theoretical_mip_level_count {
+                return Err(GxPacketError::InvalidField {
+                    field: "texture mip level count",
+                    value: u64::from(mip_level_count),
+                });
+            }
+            let expected_pixel_len = texture_mip_payload_bytes(width, height, mip_level_count)?;
             let has_payload = flags & TEXTURE_FLAG_PAYLOAD != 0;
             if has_payload {
                 expect_u32(
@@ -1183,6 +1267,7 @@ impl<'a> GxFramePacket<'a> {
                 generation: texture_generation,
                 width,
                 height,
+                mip_level_count,
                 has_payload,
             });
         }
@@ -1196,6 +1281,35 @@ impl<'a> GxFramePacket<'a> {
             next_pixel_relative_offset,
             pixel_bytes,
         )?;
+        if version == GX_PACKET_VERSION_V7 {
+            let mut has_genuine_lod_binding = false;
+            for draw in &draws {
+                for slot in &draw.textures {
+                    let Some(texture_index) = slot.texture else {
+                        continue;
+                    };
+                    let texture = &textures[to_usize(texture_index)];
+                    let derived_mip_level_count = texture_binding_mip_level_count(
+                        texture.width,
+                        texture.height,
+                        slot.sampler_bits,
+                        slot.mode1,
+                    )
+                    .expect("reserved mip mode rejected with the draw record");
+                    expect_u32(
+                        "texture mip level count",
+                        texture.mip_level_count,
+                        derived_mip_level_count,
+                    )?;
+                    has_genuine_lod_binding |= derived_mip_level_count > 1;
+                }
+            }
+            if !has_genuine_lod_binding {
+                return Err(GxPacketError::NonCanonical(
+                    "version 7 requires at least one referenced mipmapped texture binding",
+                ));
+            }
+        }
 
         Ok(Self {
             bytes,
@@ -1299,6 +1413,11 @@ pub(crate) enum GxPacketError {
         map: usize,
         sampler_bits: u32,
     },
+    InvalidSamplerMode1 {
+        draw: usize,
+        map: usize,
+        mode1: u32,
+    },
     InvalidTriangleAction {
         draw: usize,
         triangle: usize,
@@ -1390,6 +1509,10 @@ impl fmt::Display for GxPacketError {
             } => write!(
                 formatter,
                 "LZGX draw {draw} texture map {map} has invalid sampler bits {sampler_bits:#x}"
+            ),
+            Self::InvalidSamplerMode1 { draw, map, mode1 } => write!(
+                formatter,
+                "LZGX draw {draw} texture map {map} has invalid MODE1 bits {mode1:#x}"
             ),
             Self::InvalidTriangleAction {
                 draw,
@@ -1515,6 +1638,39 @@ fn checked_mul(left: u32, right: u32, field: &'static str) -> Result<u32, GxPack
 
 fn align_packet(value: u32, field: &'static str) -> Result<u32, GxPacketError> {
     checked_add(value, PACKET_ALIGNMENT - 1, field).map(|value| value & !(PACKET_ALIGNMENT - 1))
+}
+
+fn texture_theoretical_mip_level_count(width: u32, height: u32) -> u32 {
+    u32::BITS - width.max(height).leading_zeros()
+}
+
+fn texture_binding_mip_level_count(width: u32, height: u32, mode0: u32, mode1: u32) -> Option<u32> {
+    match (mode0 >> 5) & 3 {
+        0 => Some(1),
+        3 => None,
+        _ => {
+            let theoretical = texture_theoretical_mip_level_count(width, height);
+            let maximum_lod_sixteenths = (mode1 >> 8) & 0xff;
+            let requested = maximum_lod_sixteenths.div_ceil(16) + 1;
+            Some(theoretical.min(requested))
+        }
+    }
+}
+
+fn texture_mip_payload_bytes(
+    width: u32,
+    height: u32,
+    mip_level_count: u32,
+) -> Result<u32, GxPacketError> {
+    let mut total = 0u32;
+    for level in 0..mip_level_count {
+        let level_width = width.checked_shr(level).unwrap_or(0).max(1);
+        let level_height = height.checked_shr(level).unwrap_or(0).max(1);
+        let level_texels = checked_mul(level_width, level_height, "texture mip texel count")?;
+        let level_bytes = checked_mul(level_texels, 4, "RGBA8 texture mip byte length")?;
+        total = checked_add(total, level_bytes, "RGBA8 texture mip-chain byte length")?;
+    }
+    Ok(total)
 }
 
 fn source_triangle_count(topology: u8, vertex_count: u32) -> u32 {
@@ -1834,6 +1990,66 @@ mod tests {
         }
         put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V6);
         bytes
+    }
+
+    fn promote_textured_xfb_to_v7(mut bytes: Vec<u8>) -> Vec<u8> {
+        assert!(matches!(
+            read_u16(&bytes, 0x04),
+            GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6
+        ));
+        assert_eq!(read_u32(&bytes, 0x14), 2);
+        assert_eq!(read_u32(&bytes, 0x18), 2);
+
+        let draw_table_offset = read_u32(&bytes, 0x1c) as usize;
+        let texture_table_offset = read_u32(&bytes, 0x20) as usize;
+        let pixel_offset = read_u32(&bytes, 0x30) as usize;
+        let second_draw = draw_table_offset + usize::from(GX_DRAW_RECORD_BYTES);
+        let second_texture = texture_table_offset + usize::from(GX_TEXTURE_RECORD_BYTES);
+
+        // Texture 0 is 2x1: its second decoded RGBA8 level is one texel.
+        put_u32(&mut bytes, texture_table_offset + 0x0c, 12);
+        put_u32(&mut bytes, texture_table_offset + 0x24, 2);
+        put_u32(&mut bytes, second_texture + 0x24, 1);
+        bytes[pixel_offset + 8..pixel_offset + 12].copy_from_slice(&[9, 10, 11, 12]);
+
+        // Texture 1 is 1x1, so its binding must remain non-mipmapped.
+        put_u32(&mut bytes, draw_table_offset + 0x44, 0);
+
+        let mode1_tail_start = bytes.len();
+        let mode1_tail_bytes =
+            read_u32(&bytes, 0x14) as usize * GX_MODE1_TAIL_BYTES_PER_DRAW as usize;
+        bytes.resize(mode1_tail_start + mode1_tail_bytes, 0);
+        put_u32(&mut bytes, mode1_tail_start, 0x1000);
+        put_u32(
+            &mut bytes,
+            mode1_tail_start + GX_MODE1_TAIL_BYTES_PER_DRAW as usize + 4,
+            0x1000,
+        );
+
+        assert_eq!(read_u32(&bytes, draw_table_offset + 0x30), 0);
+        assert_eq!(read_u32(&bytes, second_draw + 0x38), 0);
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V7);
+        let packet_bytes = bytes.len() as u32;
+        put_u32(&mut bytes, 0x08, packet_bytes);
+        bytes
+    }
+
+    fn textured_xfb_copy_v7() -> Vec<u8> {
+        let mut bytes = textured_xfb_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        promote_textured_xfb_to_v7(bytes)
+    }
+
+    fn textured_xfb_copy_v7_with_exact() -> Vec<u8> {
+        let mut bytes = textured_xfb_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut bytes, V3_DRAW_OFFSET + 0x04, 3);
+        let second_draw = V3_DRAW_OFFSET + usize::from(GX_DRAW_RECORD_BYTES);
+        put_u32(&mut bytes, second_draw + 0x04, 0);
+        put_u32(&mut bytes, second_draw + 0x08, 3 * GX_VERTEX_BYTES);
+        let positions = exact_clip_positions();
+        let bytes = promote_v4_to_v5(bytes, &[(0, exact_clip_state(2), positions.as_slice())]);
+        promote_textured_xfb_to_v7(bytes)
     }
 
     fn textured_xfb_copy() -> Vec<u8> {
@@ -2199,6 +2415,323 @@ mod tests {
         let texture = packet.texture(0).unwrap();
         assert_eq!(texture.key, "alpha");
         assert_eq!(texture.pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn parses_canonical_v7_mip_transport_without_exact_clip_input() {
+        let bytes = textured_xfb_copy_v7();
+        assert_eq!(bytes.len(), 2112);
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+
+        let first_texture = packet.texture(0).unwrap();
+        assert_eq!(first_texture.record.mip_level_count, 2);
+        assert_eq!(
+            first_texture.pixels,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+        assert_eq!(packet.texture(1).unwrap().record.mip_level_count, 1);
+
+        let first_draw = packet.draw(0).unwrap();
+        assert_eq!(first_draw.record.textures[0].sampler_bits, 0xb9);
+        assert_eq!(first_draw.record.textures[0].mode1, 0x1000);
+        assert_eq!(first_draw.record.textures[2].mode1, 0);
+        assert!(first_draw.exact_clip_input.is_none());
+        assert_eq!(packet.draw(1).unwrap().record.textures[1].mode1, 0x1000);
+    }
+
+    #[test]
+    fn v7_places_mode1_after_optional_exact_clip_chunks() {
+        let positions = exact_clip_positions();
+        let bytes = textured_xfb_copy_v7_with_exact();
+        assert_eq!(bytes.len(), 2208);
+        assert_eq!(read_u32(&bytes, 2048), EXACT_CLIP_INPUT_ENCODING_F32_V1);
+        assert_eq!(read_u32(&bytes, 2144), 0x1000);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(
+            packet
+                .draw(0)
+                .unwrap()
+                .exact_clip_input
+                .unwrap()
+                .positions()
+                .collect::<Vec<_>>(),
+            positions,
+        );
+        assert_eq!(packet.draw(0).unwrap().record.textures[0].mode1, 0x1000);
+
+        let mut required = bytes;
+        put_u16(
+            &mut required,
+            V3_DRAW_OFFSET + 0x02,
+            DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE | DRAW_FLAG_EXACT_CLIP_REQUIRED,
+        );
+        assert!(
+            GxFramePacket::parse(&required)
+                .unwrap()
+                .draw(0)
+                .unwrap()
+                .record
+                .exact_clip_required
+        );
+    }
+
+    #[test]
+    fn v7_places_aligned_mode1_after_post_cull_evidence() {
+        let mut bytes = textured_xfb_copy_v7();
+        let mode1_tail_start = bytes.len() - 2 * GX_MODE1_TAIL_BYTES_PER_DRAW as usize;
+        let mode1_tail = bytes[mode1_tail_start..].to_vec();
+        put_u32(&mut bytes, V3_DRAW_OFFSET + 0x04, 3);
+        put_u16(
+            &mut bytes,
+            V3_DRAW_OFFSET + 0x02,
+            DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE,
+        );
+        let second_draw = V3_DRAW_OFFSET + usize::from(GX_DRAW_RECORD_BYTES);
+        put_u32(&mut bytes, second_draw + 0x04, 0);
+        put_u32(&mut bytes, second_draw + 0x08, 3 * GX_VERTEX_BYTES);
+        bytes.truncate(mode1_tail_start);
+        bytes.push(2);
+        bytes.resize(mode1_tail_start + PACKET_ALIGNMENT as usize, 0);
+        bytes.extend_from_slice(&mode1_tail);
+        let packet_bytes = bytes.len() as u32;
+        put_u32(&mut bytes, 0x08, packet_bytes);
+
+        assert_eq!(bytes[2048], 2);
+        assert!(bytes[2049..2064].iter().all(|byte| *byte == 0));
+        assert_eq!(read_u32(&bytes, 2064), 0x1000);
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(
+            packet.draw(0).unwrap().record.post_cull_actions.as_deref(),
+            Some([GxTriangleAction::Keep012].as_slice())
+        );
+        assert_eq!(packet.draw(0).unwrap().record.textures[0].mode1, 0x1000);
+    }
+
+    #[test]
+    fn legacy_versions_synthesize_single_level_textures_and_zero_mode1() {
+        let v2 = textured_xfb_copy_v2();
+        let v3 = textured_xfb_copy();
+        let mut v4 = textured_xfb_copy();
+        put_u16(&mut v4, 0x04, GX_PACKET_VERSION);
+
+        let mut exact_base = v4.clone();
+        put_u32(&mut exact_base, V3_DRAW_OFFSET + 0x04, 3);
+        let second_draw = V3_DRAW_OFFSET + usize::from(GX_DRAW_RECORD_BYTES);
+        put_u32(&mut exact_base, second_draw + 0x04, 0);
+        put_u32(&mut exact_base, second_draw + 0x08, 3 * GX_VERTEX_BYTES);
+        let positions = exact_clip_positions();
+        let v5 = promote_v4_to_v5(
+            exact_base,
+            &[(0, exact_clip_state(2), positions.as_slice())],
+        );
+        let v6 = promote_v5_to_v6(v5.clone(), &[0]);
+
+        for bytes in [v2, v3, v4, v5, v6] {
+            let packet = GxFramePacket::parse(&bytes).unwrap();
+            assert!(
+                packet
+                    .textures()
+                    .all(|texture| texture.record.mip_level_count == 1)
+            );
+            assert!(
+                packet
+                    .draws()
+                    .flat_map(|draw| draw.record.textures)
+                    .all(|slot| slot.mode1 == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn v7_validates_mode_masks_reserved_mip_mode_and_absent_mode1() {
+        let valid = textured_xfb_copy_v7();
+        let mode1_tail_start = valid.len() - 2 * GX_MODE1_TAIL_BYTES_PER_DRAW as usize;
+
+        let mut invalid_mode0 = valid.clone();
+        put_u32(&mut invalid_mode0, V3_DRAW_OFFSET + 0x34, 0xb9 | (1 << 22));
+        assert_eq!(
+            GxFramePacket::parse(&invalid_mode0).unwrap_err(),
+            GxPacketError::InvalidSampler {
+                draw: 0,
+                map: 0,
+                sampler_bits: 0xb9 | (1 << 22),
+            }
+        );
+
+        let mut reserved_mip_mode = valid.clone();
+        put_u32(
+            &mut reserved_mip_mode,
+            V3_DRAW_OFFSET + 0x34,
+            (0xb9 & !(3 << 5)) | (3 << 5),
+        );
+        assert_eq!(
+            GxFramePacket::parse(&reserved_mip_mode).unwrap_err(),
+            GxPacketError::InvalidSampler {
+                draw: 0,
+                map: 0,
+                sampler_bits: (0xb9 & !(3 << 5)) | (3 << 5),
+            }
+        );
+
+        let mut invalid_mode1 = valid.clone();
+        put_u32(&mut invalid_mode1, mode1_tail_start, 0x1_1000);
+        assert_eq!(
+            GxFramePacket::parse(&invalid_mode1).unwrap_err(),
+            GxPacketError::InvalidSamplerMode1 {
+                draw: 0,
+                map: 0,
+                mode1: 0x1_1000,
+            }
+        );
+
+        let mut absent_mode1 = valid;
+        put_u32(&mut absent_mode1, mode1_tail_start + 4, 1);
+        assert_eq!(
+            GxFramePacket::parse(&absent_mode1).unwrap_err(),
+            GxPacketError::UnexpectedTextureReference { draw: 0, map: 1 }
+        );
+    }
+
+    #[test]
+    fn v7_validates_declared_mip_counts_and_unpadded_payload_lengths() {
+        assert_eq!(texture_mip_payload_bytes(3, 5, 3).unwrap(), 72);
+
+        let valid = textured_xfb_copy_v7();
+        let mut zero_count = valid.clone();
+        put_u32(&mut zero_count, V3_TEXTURE_OFFSET + 0x24, 0);
+        assert_eq!(
+            GxFramePacket::parse(&zero_count).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "texture mip level count",
+                value: 0,
+            }
+        );
+
+        let mut mismatched_count = valid.clone();
+        put_u32(&mut mismatched_count, V3_TEXTURE_OFFSET + 0x24, 1);
+        assert_eq!(
+            GxFramePacket::parse(&mismatched_count).unwrap_err(),
+            GxPacketError::InvalidTextureSize {
+                texture: 0,
+                width: 2,
+                height: 1,
+                expected: Some(8),
+                actual: 12,
+            }
+        );
+
+        let mut mismatched_binding = valid.clone();
+        let mode1_tail_start = mismatched_binding.len() - 2 * GX_MODE1_TAIL_BYTES_PER_DRAW as usize;
+        put_u32(&mut mismatched_binding, mode1_tail_start, 0);
+        assert_eq!(
+            GxFramePacket::parse(&mismatched_binding).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "texture mip level count",
+                expected: 1,
+                actual: 2,
+            }
+        );
+
+        let mut base_only_payload = valid;
+        put_u32(&mut base_only_payload, V3_TEXTURE_OFFSET + 0x0c, 8);
+        assert_eq!(
+            GxFramePacket::parse(&base_only_payload).unwrap_err(),
+            GxPacketError::InvalidTextureSize {
+                texture: 0,
+                width: 2,
+                height: 1,
+                expected: Some(12),
+                actual: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn v7_mip_count_derivation_ceil_divides_lod_and_caps_to_theoretical_levels() {
+        assert_eq!(texture_binding_mip_level_count(3, 5, 0, 0xffff), Some(1));
+        assert_eq!(texture_binding_mip_level_count(3, 5, 1 << 5, 0), Some(1));
+        assert_eq!(
+            texture_binding_mip_level_count(3, 5, 1 << 5, 1 << 8),
+            Some(2)
+        );
+        assert_eq!(
+            texture_binding_mip_level_count(3, 5, 1 << 5, 16 << 8),
+            Some(2)
+        );
+        assert_eq!(
+            texture_binding_mip_level_count(3, 5, 1 << 5, 17 << 8),
+            Some(3)
+        );
+        assert_eq!(
+            texture_binding_mip_level_count(3, 5, 1 << 5, 0xff << 8),
+            Some(3)
+        );
+        assert_eq!(texture_binding_mip_level_count(3, 5, 3 << 5, 0), None);
+    }
+
+    #[test]
+    fn v7_resident_textures_keep_mip_metadata_without_pixel_bytes() {
+        let mut bytes = textured_xfb_copy_v7();
+        let mode1_tail_start = bytes.len() - 2 * GX_MODE1_TAIL_BYTES_PER_DRAW as usize;
+        let mode1_tail = bytes[mode1_tail_start..].to_vec();
+        let second_pixels = bytes[V3_PIXEL_OFFSET + 16..V3_PIXEL_OFFSET + 20].to_vec();
+
+        put_u32(&mut bytes, V3_TEXTURE_OFFSET + 0x0c, 0);
+        put_u32(&mut bytes, V3_TEXTURE_OFFSET + 0x20, 0);
+        let second_texture = V3_TEXTURE_OFFSET + usize::from(GX_TEXTURE_RECORD_BYTES);
+        put_u32(&mut bytes, second_texture + 0x08, 0);
+        put_u32(&mut bytes, 0x48, 16);
+        bytes[V3_PIXEL_OFFSET..V3_PIXEL_OFFSET + 4].copy_from_slice(&second_pixels);
+        bytes[V3_PIXEL_OFFSET + 4..V3_PIXEL_OFFSET + 16].fill(0);
+        bytes.truncate(V3_PIXEL_OFFSET + 16);
+        bytes.extend_from_slice(&mode1_tail);
+        let packet_bytes = bytes.len() as u32;
+        put_u32(&mut bytes, 0x08, packet_bytes);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        let resident = packet.texture(0).unwrap();
+        assert_eq!(resident.record.mip_level_count, 2);
+        assert!(!resident.record.has_payload);
+        assert!(resident.pixels.is_empty());
+        assert_eq!(packet.texture(1).unwrap().pixels, [0xfa, 0xfb, 0xfc, 0xfd]);
+    }
+
+    #[test]
+    fn v7_rejects_truncated_mode1_tail_and_packets_without_genuine_lod() {
+        let mut truncated = textured_xfb_copy_v7();
+        truncated.truncate(truncated.len() - 4);
+        let truncated_bytes = truncated.len() as u32;
+        put_u32(&mut truncated, 0x08, truncated_bytes);
+        assert_eq!(
+            GxFramePacket::parse(&truncated).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "packet bytes",
+                expected: 2112,
+                actual: 2108,
+            }
+        );
+
+        let mut no_lod = textured_xfb_copy_v7();
+        let mode1_tail_start = no_lod.len() - 2 * GX_MODE1_TAIL_BYTES_PER_DRAW as usize;
+        put_u32(&mut no_lod, V3_TEXTURE_OFFSET + 0x0c, 8);
+        put_u32(&mut no_lod, V3_TEXTURE_OFFSET + 0x24, 1);
+        no_lod[V3_PIXEL_OFFSET + 8..V3_PIXEL_OFFSET + 16].fill(0);
+        put_u32(&mut no_lod, V3_DRAW_OFFSET + 0x34, 0);
+        let second_draw = V3_DRAW_OFFSET + usize::from(GX_DRAW_RECORD_BYTES);
+        put_u32(&mut no_lod, second_draw + 0x3c, 0);
+        put_u32(&mut no_lod, mode1_tail_start, 0);
+        put_u32(
+            &mut no_lod,
+            mode1_tail_start + GX_MODE1_TAIL_BYTES_PER_DRAW as usize + 4,
+            0,
+        );
+        assert_eq!(
+            GxFramePacket::parse(&no_lod).unwrap_err(),
+            GxPacketError::NonCanonical(
+                "version 7 requires at least one referenced mipmapped texture binding"
+            )
+        );
     }
 
     #[test]
@@ -3107,10 +3640,10 @@ mod tests {
     #[test]
     fn rejects_unknown_packet_version() {
         let mut bytes = textured_xfb_copy();
-        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V6 + 1);
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION_V7 + 1);
         assert_eq!(
             GxFramePacket::parse(&bytes).unwrap_err(),
-            GxPacketError::UnsupportedVersion(GX_PACKET_VERSION_V6 + 1)
+            GxPacketError::UnsupportedVersion(GX_PACKET_VERSION_V7 + 1)
         );
     }
 
