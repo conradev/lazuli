@@ -476,6 +476,48 @@ test("exact authoritative no-ops have distinct renderer compatibility counters",
   );
 });
 
+test("required exact no-ops expose one bounded compatibility-reason map", () => {
+  const reasonCodes = [
+    "exactPreparation",
+    "scissor",
+    "primitive",
+    "earlyDepth",
+    "rasterCenter",
+    "depthEncoding",
+    "tevState",
+    "textureCoordinates",
+    "sampler",
+    "zTexture",
+    "fog",
+    "fullyCulled",
+    "managedPayload",
+    "unclassified",
+  ];
+  assert.match(
+    rendererCoreSource,
+    /EXACT_REQUIRED_REJECTION_REASON_COUNT: usize = 14/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /exact_required_rejection_reasons:\s*\[u64; EXACT_REQUIRED_REJECTION_REASON_COUNT\]/,
+  );
+  for (const code of reasonCodes) {
+    assert.match(
+      rendererCoreSource,
+      new RegExp(`=> "${code}"`),
+      `missing stable exact rejection code ${code}`,
+    );
+  }
+  assert.match(
+    rendererSource,
+    /for reason in ExactRequiredRejectionReason::ALL[\s\S]*"exactRequiredRejectionReasons"/,
+  );
+  assert.match(
+    rendererSource,
+    /fn record_exact_required_rejection[\s\S]*exact_required_rejected_draws[\s\S]*record_exact_required_rejection_reason\(reason\)/,
+  );
+});
+
 test("draw transport is counted before empty, clipped, and culled exits", () => {
   const start = rendererSource.indexOf("pub fn push_tev_draw");
   const end = rendererSource.indexOf("pub fn copy_efb_to_texture", start);
