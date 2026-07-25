@@ -7938,16 +7938,25 @@ const TEMPLATE: &str = r##"<!doctype html>
       a &= 0xff;
       b &= 0xff;
       c &= 0xff;
-      const mixed = ((255 - c) * a + c * b + 127) / 255;
-      let result = ((combiner >>> 18) & 1) !== 0 ? d - mixed : d + mixed;
+      // Flipper expands C from 0..255 to 0..256 and performs the interpolation
+      // in fixed point. Scaling the numerator before its arithmetic shift is
+      // observable at scale two and four.
+      c += c >> 7;
       const bias = (combiner >>> 16) & 3;
-      if (bias === 1) result += 128;
-      if (bias === 2) result -= 128;
+      if (bias === 1) d += 128;
+      if (bias === 2) d -= 128;
+      const subtract = ((combiner >>> 18) & 1) !== 0;
       const scale = (combiner >>> 20) & 3;
-      if (scale === 1) result *= 2;
-      if (scale === 2) result *= 4;
-      if (scale === 3) result *= 0.5;
-      result = Math.round(result);
+      let mixed = (a << 8) + (b - a) * c;
+      if (scale !== 3) {
+        mixed <<= scale;
+        d <<= scale;
+        mixed += subtract ? 127 : 128;
+      }
+      mixed >>= 8;
+      let result = subtract ? d - mixed : d + mixed;
+      // Divide-by-two is the one scale mode without a rounding bias.
+      if (scale === 3) result >>= 1;
       return (combiner & 0x00080000) !== 0
         ? Math.max(0, Math.min(255, result))
         : Math.max(-1024, Math.min(1023, result));
@@ -9594,9 +9603,16 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (address !== 0xfe) gxBpRegisters[0xfe] = 0x00ffffff;
       gxBpLoads += 1;
       if (address >= 0xe0 && address <= 0xe7) {
-        const registerIndex = gxTevRegisterIndex((address - 0xe0) >>> 1);
+        const registerSlot = (address - 0xe0) >>> 1;
         const registerValue = gxBpRegisters[address];
-        const target = (registerValue & 0x00800000) !== 0
+        const isKonst = (registerValue & 0x00800000) !== 0;
+        // BP konst slots map directly to K0..K3. Color slots instead encode
+        // PREV, C0, C1, C2 and need rotation into the renderer's C0..PREV
+        // array order.
+        const registerIndex = isKonst
+          ? registerSlot
+          : gxTevRegisterIndex(registerSlot);
+        const target = isKonst
           ? gxTevKonstRegisters[registerIndex]
           : gxTevColorRegisters[registerIndex];
         const signed11 = bits => (bits & 0x400) !== 0 ? bits - 0x800 : bits;

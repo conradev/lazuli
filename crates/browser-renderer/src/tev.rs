@@ -373,30 +373,33 @@ fn clamp_result(value: i32, combiner: u32) -> i32 {
 pub(crate) fn evaluate_regular(a: i32, b: i32, c: i32, d: i32, combiner: u32) -> i32 {
     // A/B/C read through unsigned eight-bit lanes. D preserves the signed
     // eleven-bit register range across stages.
-    let a = f64::from(a & 0xff);
-    let b = f64::from(b & 0xff);
-    let c = f64::from(c & 0xff);
-    let mixed = ((255.0 - c) * a + c * b + 127.0) / 255.0;
-    let mut result = if combiner & (1 << 18) != 0 {
-        f64::from(d) - mixed
-    } else {
-        f64::from(d) + mixed
-    };
+    let a = a & 0xff;
+    let b = b & 0xff;
+    let mut c = c & 0xff;
+    // Flipper expands C from 0..255 to 0..256 and keeps the interpolation in
+    // fixed point. Scaling before the arithmetic shift preserves extra bits.
+    c += c >> 7;
+    let mut d = d;
     match (combiner >> 16) & 3 {
-        1 => result += 128.0,
-        2 => result -= 128.0,
+        1 => d += 128,
+        2 => d -= 128,
         _ => {}
     }
-    match (combiner >> 20) & 3 {
-        1 => result *= 2.0,
-        2 => result *= 4.0,
-        3 => result *= 0.5,
-        _ => {}
+    let subtract = combiner & (1 << 18) != 0;
+    let scale = (combiner >> 20) & 3;
+    let mut mixed = (a << 8) + (b - a) * c;
+    if scale != 3 {
+        mixed <<= scale;
+        d <<= scale;
+        mixed += if subtract { 127 } else { 128 };
     }
-
-    // JavaScript Math.round, used by the boot harness reference, rounds a tie
-    // toward positive infinity (including negative ties).
-    clamp_result((result + 0.5).floor() as i32, combiner)
+    mixed >>= 8;
+    let mut result = if subtract { d - mixed } else { d + mixed };
+    // Divide-by-two is the one scale mode without a rounding bias.
+    if scale == 3 {
+        result >>= 1;
+    }
+    clamp_result(result, combiner)
 }
 
 fn comparison(a: u32, b: u32, combiner: u32) -> bool {
@@ -1717,21 +1720,26 @@ fn tev_clamp_result(value: i32, combiner: u32) -> i32 {
 }
 
 fn tev_regular(a_raw: i32, b_raw: i32, c_raw: i32, d: i32, combiner: u32) -> i32 {
-    let a = f32(a_raw & 255);
-    let b = f32(b_raw & 255);
-    let c = f32(c_raw & 255);
-    let mixed = ((255.0 - c) * a + c * b + 127.0) / 255.0;
-    var result = f32(d);
-    if (combiner & (1u << 18u)) != 0u { result -= mixed; } else { result += mixed; }
+    let a = a_raw & 255;
+    let b = b_raw & 255;
+    var c = c_raw & 255;
+    c += c >> 7u;
+    var biased_d = d;
     let bias = (combiner >> 16u) & 3u;
-    if bias == 1u { result += 128.0; }
-    if bias == 2u { result -= 128.0; }
+    if bias == 1u { biased_d += 128; }
+    if bias == 2u { biased_d -= 128; }
+    let subtract = (combiner & (1u << 18u)) != 0u;
     let scale = (combiner >> 20u) & 3u;
-    if scale == 1u { result *= 2.0; }
-    if scale == 2u { result *= 4.0; }
-    if scale == 3u { result *= 0.5; }
-    // floor(x + .5) matches the boot harness's Math.round for negative ties.
-    return tev_clamp_result(i32(floor(result + 0.5)), combiner);
+    var mixed = (a << 8u) + (b - a) * c;
+    if scale != 3u {
+        mixed <<= scale;
+        biased_d <<= scale;
+        mixed += select(128, 127, subtract);
+    }
+    mixed >>= 8u;
+    var result = select(biased_d + mixed, biased_d - mixed, subtract);
+    if scale == 3u { result >>= 1u; }
+    return tev_clamp_result(result, combiner);
 }
 
 fn tev_comparison(a: u32, b: u32, combiner: u32) -> bool {
@@ -2179,6 +2187,44 @@ mod tests {
             | if operation >= 8 { 3 << 16 } else { 0 }
     }
 
+    fn dolphin_regular_reference(
+        a: i32,
+        b: i32,
+        c: i32,
+        d: i32,
+        bias: u32,
+        subtract: bool,
+        scale: u32,
+        clamp: bool,
+    ) -> i32 {
+        let a = a & 0xff;
+        let b = b & 0xff;
+        let c = (c & 0xff) + ((c & 0xff) >> 7);
+        let biased_d = d + [0, 128, -128][bias as usize];
+        let interpolation = (a << 8) + (b - a) * c;
+        let result = if scale == 3 {
+            let mixed = interpolation >> 8;
+            (if subtract {
+                biased_d - mixed
+            } else {
+                biased_d + mixed
+            }) >> 1
+        } else {
+            let mixed = ((interpolation << scale) + if subtract { 127 } else { 128 }) >> 8;
+            let scaled_d = biased_d << scale;
+            if subtract {
+                scaled_d - mixed
+            } else {
+                scaled_d + mixed
+            }
+        };
+        if clamp {
+            result.clamp(0, 255)
+        } else {
+            result.clamp(-1024, 1023)
+        }
+    }
+
     #[test]
     fn gpu_records_have_the_documented_pod_layout() {
         assert_eq!(size_of::<TevStage>(), 16);
@@ -2319,38 +2365,45 @@ mod tests {
     fn regular_combiner_exhausts_operation_control_fields_and_signed_boundaries() {
         let lanes = [-1024, -1, 0, 1, 127, 128, 255, 1023];
         for bias in 0..3_u32 {
-            for negate in 0..2_u32 {
+            for subtract in [false, true] {
                 for scale in 0..4_u32 {
-                    for clamp in 0..2_u32 {
-                        let combiner = bias << 16 | negate << 18 | clamp << 19 | scale << 20;
+                    for clamp in [false, true] {
+                        let combiner = bias << 16
+                            | u32::from(subtract) << 18
+                            | u32::from(clamp) << 19
+                            | scale << 20;
                         for index in 0..lanes.len() {
                             let a = lanes[index];
                             let b = lanes[(index + 3) % lanes.len()];
                             let c = lanes[(index + 5) % lanes.len()];
                             let d = lanes[(index + 7) % lanes.len()];
-                            let a8 = f64::from(a & 255);
-                            let b8 = f64::from(b & 255);
-                            let c8 = f64::from(c & 255);
-                            let mixed = ((255.0 - c8) * a8 + c8 * b8 + 127.0) / 255.0;
-                            let sign = if negate == 0 { 1.0 } else { -1.0 };
-                            let bias_value = [0.0, 128.0, -128.0][bias as usize];
-                            let scale_value = [1.0, 2.0, 4.0, 0.5][scale as usize];
-                            let rounded = ((f64::from(d) + sign * mixed + bias_value) * scale_value
-                                + 0.5)
-                                .floor() as i32;
-                            let expected = if clamp == 0 {
-                                rounded.clamp(-1024, 1023)
-                            } else {
-                                rounded.clamp(0, 255)
-                            };
+                            let expected =
+                                dolphin_regular_reference(a, b, c, d, bias, subtract, scale, clamp);
                             assert_eq!(evaluate_regular(a, b, c, d, combiner), expected);
                         }
                     }
                 }
             }
         }
-        assert_eq!(evaluate_regular(-1, 0, 0, 0, 1 << 19), 255);
-        assert_eq!(evaluate_regular(0, 0, 0, -1, 0), -1);
+
+        let edge_cases = [
+            ((0, 0, 0, 0, 0, false, 1, false), 0),
+            ((0, 128, 179, -90, 0, false, 1, false), 0),
+            ((0, 128, 182, 91, 0, true, 0, false), 0),
+            ((0, 1, 128, 0, 0, false, 3, false), 0),
+            ((0, 0, 0, -1, 0, false, 3, false), -1),
+            ((0, 0, 0, -1, 1, false, 1, false), 254),
+            ((-1, 0, 0, 0, 0, false, 0, true), 255),
+        ];
+        for ((a, b, c, d, bias, subtract, scale, clamp), expected) in edge_cases {
+            let combiner =
+                bias << 16 | u32::from(subtract) << 18 | u32::from(clamp) << 19 | scale << 20;
+            assert_eq!(
+                evaluate_regular(a, b, c, d, combiner),
+                expected,
+                "{a}, {b}, {c}, {d}, bias {bias}, subtract {subtract}, scale {scale}, clamp {clamp}",
+            );
+        }
     }
 
     #[test]
