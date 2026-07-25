@@ -125,7 +125,7 @@ test("CLI wrapper reads reports and atomically writes the derived transcript", a
     assert.equal(stdout, `${outputPath}\n`);
 
     const unsupported = corpus.games.find(
-      candidate => candidate.key === "luigis-mansion-usa",
+      candidate => candidate.key === "wind-waker-usa",
     );
     const unsupportedReports = makeGameFirstPlayableReportPair(unsupported);
     await Promise.all([
