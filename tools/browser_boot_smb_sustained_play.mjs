@@ -639,6 +639,54 @@ function compareDerived(expected, actual, path = "$.sustainedPlay.oracle") {
   }
 }
 
+function validateV2CompatibilityTelemetry(report) {
+  const metrics = requireObject(
+    report.rendering?.metrics,
+    "$.rendering.metrics",
+  );
+  exact(metrics.scope, "current-worker", "$.rendering.metrics.scope");
+  const webgpu = requireObject(
+    metrics.webgpu,
+    "$.rendering.metrics.webgpu",
+  );
+  nonNegativeInteger(
+    webgpu.exactRasterEmptyDraws,
+    "$.rendering.metrics.webgpu.exactRasterEmptyDraws",
+  );
+  exact(
+    webgpu.exactRequiredRejectedDraws,
+    0,
+    "$.rendering.metrics.webgpu.exactRequiredRejectedDraws",
+  );
+
+  const decoder = requireObject(
+    report.gxFifo?.decoder,
+    "$.gxFifo.decoder",
+  );
+  for (const [field, value] of [
+    ["droppedVertices", decoder.droppedVertices],
+    ["lightingRejectedVertices", decoder.lightingRejectedVertices],
+    ["vertexDecodeErrors", decoder.vertexDecodeErrors],
+    ["exactRequiredCaptureMisses", decoder.exactRequiredCaptureMisses],
+  ]) {
+    exact(value, 0, `$.gxFifo.decoder.${field}`);
+  }
+  const textures = requireObject(
+    decoder.textures,
+    "$.gxFifo.decoder.textures",
+  );
+  exact(
+    textures.decodeErrors,
+    0,
+    "$.gxFifo.decoder.textures.decodeErrors",
+  );
+  exact(
+    textures.tlutErrors,
+    0,
+    "$.gxFifo.decoder.textures.tlutErrors",
+  );
+}
+
 function readyPlayAnchorErrorPath(path) {
   if (path === "$report" || path.startsWith("$report.")) {
     return `$.sustainedPlay.readyPlayAnchor${path.slice("$report".length)}`;
@@ -725,6 +773,7 @@ export function deriveSmbSustainedPlayOracle(report) {
       sustained.schema,
     );
   }
+  if (pairedReceipts) validateV2CompatibilityTelemetry(report);
   const readyPlayAnchor = requireObject(
     sustained.readyPlayAnchor,
     "$.sustainedPlay.readyPlayAnchor",

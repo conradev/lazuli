@@ -196,6 +196,11 @@ function expectFailure(report, path, ordinal = null) {
 
 test("legacy v1 receipts remain replayable", () => {
   const report = sustainedReport();
+  delete report.rendering.metrics.webgpu.exactRasterEmptyDraws;
+  delete report.rendering.metrics.webgpu.exactRequiredRejectedDraws;
+  delete report.gxFifo.decoder.droppedVertices;
+  delete report.gxFifo.decoder.lightingRejectedVertices;
+  delete report.gxFifo.decoder.exactRequiredCaptureMisses;
   const oracle = verifySmbSustainedPlay(report);
   assert.deepEqual(oracle, {
     capacity: 120,
@@ -241,6 +246,7 @@ test("legacy v1 receipts remain replayable", () => {
 
 test("v2 independently proves 60 staged and 60 presented field pairs", () => {
   const report = sustainedReport(SMB_SUSTAINED_PLAY_SCHEMA_V2);
+  report.rendering.metrics.webgpu.exactRasterEmptyDraws = 17;
   const oracle = verifySmbSustainedPlay(report);
   assert.equal(oracle.received, 120);
   assert.equal(oracle.drained, 120);
@@ -251,6 +257,57 @@ test("v2 independently proves 60 staged and 60 presented field pairs", () => {
   assert.equal(oracle.topFields, 60);
   assert.equal(oracle.bottomFields, 60);
   assert.equal(oracle.complete, true);
+  assert.equal(Object.hasOwn(oracle, "exactRasterEmptyDraws"), false);
+});
+
+test("v2 requires clean terminal producer and renderer compatibility telemetry", () => {
+  const cases = [
+    [
+      report => { report.rendering.metrics.scope = "lifetime"; },
+      "$.rendering.metrics.scope",
+    ],
+    [
+      report => { report.rendering.metrics.webgpu.exactRasterEmptyDraws = -1; },
+      "$.rendering.metrics.webgpu.exactRasterEmptyDraws",
+    ],
+    [
+      report => { report.rendering.metrics.webgpu.exactRasterEmptyDraws = 0.5; },
+      "$.rendering.metrics.webgpu.exactRasterEmptyDraws",
+    ],
+    [
+      report => { report.rendering.metrics.webgpu.exactRequiredRejectedDraws = 1; },
+      "$.rendering.metrics.webgpu.exactRequiredRejectedDraws",
+    ],
+    [
+      report => { report.gxFifo.decoder.droppedVertices = 1; },
+      "$.gxFifo.decoder.droppedVertices",
+    ],
+    [
+      report => { report.gxFifo.decoder.lightingRejectedVertices = 1; },
+      "$.gxFifo.decoder.lightingRejectedVertices",
+    ],
+    [
+      report => { report.gxFifo.decoder.vertexDecodeErrors = 1; },
+      "$.gxFifo.decoder.vertexDecodeErrors",
+    ],
+    [
+      report => { report.gxFifo.decoder.exactRequiredCaptureMisses = 1; },
+      "$.gxFifo.decoder.exactRequiredCaptureMisses",
+    ],
+    [
+      report => { report.gxFifo.decoder.textures.decodeErrors = 1; },
+      "$.gxFifo.decoder.textures.decodeErrors",
+    ],
+    [
+      report => { report.gxFifo.decoder.textures.tlutErrors = 1; },
+      "$.gxFifo.decoder.textures.tlutErrors",
+    ],
+  ];
+  for (const [mutate, path] of cases) {
+    const report = sustainedReport(SMB_SUSTAINED_PLAY_SCHEMA_V2);
+    mutate(report);
+    expectFailure(report, path);
+  }
 });
 
 test("v2 rejects untruthful pairing status, epochs, and presentation serials", () => {
