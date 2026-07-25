@@ -269,6 +269,7 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     gxLoadTlut() { assert.fail("unexpected TLUT load"); },
     gxMarkTextureCopyConsumer() { assert.fail("unexpected texture consumer"); },
     gxPrearmTextureCopyProducer() { assert.fail("unexpected texture producer"); },
+    gxRecordXfbCopyGeneration() {},
     gxRecordTextureCopyGeneration() {},
     gxShouldCollectNextXfb() { return false; },
     gxTextureCopyConsumers: new Set(),

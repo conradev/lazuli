@@ -701,7 +701,10 @@ test("VI BFBL retains its sampled shared POFF across queued buffer generations",
       check(condition, message) {
         if (!condition) throw new Error(message);
       },
-      gxXfbCopies: [lowFrame, highFrame],
+      gxXfbCopyDestinations: new Map([
+        [lowFrame.destination, lowFrame],
+        [highFrame.destination, highFrame],
+      ]),
       hex32(value) {
         return "0x" + (value >>> 0).toString(16).padStart(8, "0");
       },

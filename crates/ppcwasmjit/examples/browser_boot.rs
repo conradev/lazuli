@@ -4708,6 +4708,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     gxBpRegisters[0xf3] = 0x003f0000;
     gxBpRegisters[0xfe] = 0x00ffffff;
     const gxXfbCopies = [];
+    // Keep renderer residency separate from the rolling copy diagnostics.
+    // Sparse rendering leaves the most recently captured surface resident at
+    // each destination even after sixteen newer uncaptured guest copies have
+    // aged its diagnostic record out of gxXfbCopies.
+    const gxXfbCopyDestinations = new Map();
     const gxTextureCopies = [];
     const gxPrimitiveSamples = [];
     const gxRecentPrimitiveSamples = [];
@@ -7282,6 +7287,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function gxRecordXfbCopyGeneration(frame) {
+      if (!frame.captured) return;
+      gxXfbCopyDestinations.delete(frame.destination);
+      gxXfbCopyDestinations.set(frame.destination, frame);
+      if (gxXfbCopyDestinations.size > 16) {
+        gxXfbCopyDestinations.delete(gxXfbCopyDestinations.keys().next().value);
+      }
+    }
+
     function gxRememberTextureCopyConsumer(address) {
       gxTextureCopyConsumers.delete(address);
       gxTextureCopyConsumers.set(address, gxXfbCopyCount);
@@ -9723,14 +9737,16 @@ const TEMPLATE: &str = r##"<!doctype html>
       delete frameDiagnostics.copyState;
       if (copyToXfb) {
         gxXfbCopyCount += 1;
-        gxXfbCopies.push({
+        const recorded = {
           ...frameDiagnostics,
           captured: gxCollectFrameGeometry,
           geometry: {
             drawCalls: frame.geometry.drawCalls,
             vertices: frame.geometry.vertices,
           },
-        });
+        };
+        gxXfbCopies.push(recorded);
+        gxRecordXfbCopyGeneration(recorded);
         if (gxXfbCopies.length > 16) gxXfbCopies.shift();
         if (!gxCollectFrameGeometry) {
           gxFramesSkipped += 1;
@@ -14892,13 +14908,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxResolveXfbCopy(address) {
-      for (let index = gxXfbCopies.length - 1; index >= 0; index -= 1) {
-        const frame = gxXfbCopies[index];
-        if (frame.captured && frame.destination === address) return { frame, row: 0 };
+      const resident = [...gxXfbCopyDestinations.values()];
+      for (let index = resident.length - 1; index >= 0; index -= 1) {
+        const frame = resident[index];
+        if (frame.destination === address) return { frame, row: 0 };
       }
-      for (let index = gxXfbCopies.length - 1; index >= 0; index -= 1) {
-        const frame = gxXfbCopies[index];
-        if (!frame.captured) continue;
+      for (let index = resident.length - 1; index >= 0; index -= 1) {
+        const frame = resident[index];
         const row = gxXfbCopyRowOffset(frame, address);
         if (row !== null && row <= 1) return { frame, row };
       }

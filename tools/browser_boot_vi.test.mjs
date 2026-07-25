@@ -118,19 +118,56 @@ test("VI single-field timing excludes the unused even field", () => {
 });
 
 test("XFB selection rejects an unrelated double buffer as a deep row alias", () => {
+  const frame = {
+    index: 12,
+    captured: true,
+    destination: 0x00307180,
+    stride: 0x500,
+    height: 448,
+  };
   const context = evaluateFunctions(["gxXfbCopyRowOffset", "gxResolveXfbCopy"], {
-    gxXfbCopies: [{
-      index: 12,
-      captured: true,
-      destination: 0x00307180,
-      stride: 0x500,
-      height: 448,
-    }],
+    gxXfbCopyDestinations: new Map([[frame.destination, frame]]),
   });
 
-  assert.equal(context.gxXfbCopyRowOffset(context.gxXfbCopies[0], 0x00392c80), 447);
+  assert.equal(context.gxXfbCopyRowOffset(frame, 0x00392c80), 447);
   assert.equal(context.gxResolveXfbCopy(0x00392c80), null);
   assert.equal(context.gxResolveXfbCopy(0x00307680).row, 1);
+});
+
+test("sparse XFB residency outlives the rolling sixteen-copy diagnostics window", () => {
+  const context = evaluateFunctions(
+    ["gxRecordXfbCopyGeneration", "gxXfbCopyRowOffset", "gxResolveXfbCopy"],
+    { gxXfbCopyDestinations: new Map() },
+  );
+  const captured = {
+    index: 4,
+    captured: true,
+    destination: 0x01200000,
+    stride: 0x500,
+    height: 480,
+  };
+  context.gxRecordXfbCopyGeneration(captured);
+
+  const diagnostics = [captured];
+  for (let index = 5; index <= 21; index += 1) {
+    diagnostics.push({
+      index,
+      captured: false,
+      destination: captured.destination,
+      stride: captured.stride,
+      height: captured.height,
+    });
+    if (diagnostics.length > 16) diagnostics.shift();
+  }
+
+  assert.equal(diagnostics.includes(captured), false);
+  assert.strictEqual(context.gxResolveXfbCopy(captured.destination).frame, captured);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.gxResolveXfbCopy(
+      captured.destination + captured.stride,
+    ))),
+    { frame: captured, row: 1 },
+  );
 });
 
 test("VI presentation deadline exists without a configured comparator", () => {
@@ -278,6 +315,7 @@ test("VI field service selects a cached XFB independently of comparators", () =>
       deviceEvents: new Map(),
       gxFramesPresented: 0,
       gxXfbCopies: [frame],
+      gxXfbCopyDestinations: new Map([[frame.destination, frame]]),
       check(condition, message) {
         if (!condition) throw new Error(message);
       },
