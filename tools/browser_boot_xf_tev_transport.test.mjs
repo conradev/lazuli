@@ -57,6 +57,7 @@ function workerContext() {
     Uint32Array,
     bytes,
     gxBpRegisters,
+    gxBpLoads: 0,
     gxCpRegisters,
     gxFifoScratch: new DataView(new ArrayBuffer(4)),
     gxTevColorRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
@@ -69,9 +70,13 @@ function workerContext() {
     },
   };
   vm.createContext(context);
-  vm.runInContext(gxFunctionSources(), context, {
-    filename: "browser_boot.xf-tev-transport.js",
-  });
+  vm.runInContext(
+    `${gxFunctionSources()}\n\n${extractFunction("recordGxBpWrite")}`,
+    context,
+    {
+      filename: "browser_boot.xf-tev-transport.js",
+    },
+  );
   return context;
 }
 
@@ -416,6 +421,62 @@ test("packs the exact 464-byte WebGPU TEV uniform layout", () => {
   );
   assert.equal(u32(448), 2);
   assert.ok(packed.subarray(452).every(value => value === 0));
+});
+
+test("BP TEV writes keep konst physical slots and rotate color slots", () => {
+  const context = workerContext();
+  context.gxBpRegisters[0xfe] = 0x00ffffff;
+
+  const writeBp = (address, value) => {
+    context.recordGxBpWrite(
+      ((address << 24) | (value & 0x00ffffff)) >>> 0,
+    );
+  };
+  const pair = (first, second, konst) => (
+    (konst ? 0x00800000 : 0)
+    | ((second & 0x7ff) << 12)
+    | (first & 0x7ff)
+  );
+  const writePair = (slot, color, konst) => {
+    writeBp(0xe0 + slot * 2, pair(color[0], color[3], konst));
+    writeBp(0xe1 + slot * 2, pair(color[2], color[1], konst));
+  };
+
+  const k0 = [0, 0, 226, 88];
+  const k1 = [179, 0, 0, 182];
+  const k2 = [255, 0, 255, 128];
+  const c0 = [-90, 0, -114, 135];
+  writePair(0, k0, true);
+  writePair(1, k1, true);
+  writePair(2, k2, true);
+  // Color slot one is GX_TEVREG0; it must rotate to renderer register C0
+  // without disturbing the independently stored K1 value.
+  writePair(1, c0, false);
+
+  assert.deepEqual(plain(context.gxTevKonstRegisters), [
+    k0,
+    k1,
+    k2,
+    [0, 0, 0, 0],
+  ]);
+  assert.deepEqual(plain(context.gxTevColorRegisters), [
+    c0,
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+  ]);
+
+  const packed = context.gxPackTevState([]);
+  const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
+  const packedI32 = (offset, count) => Array.from(
+    { length: count },
+    (_unused, index) => view.getInt32(offset + index * 4, true),
+  );
+  assert.deepEqual(packedI32(256, 4), c0);
+  assert.deepEqual(packedI32(320, 4), k0);
+  assert.deepEqual(packedI32(336, 4), k1);
+  assert.deepEqual(packedI32(352, 4), k2);
+  assert.deepEqual(packedI32(368, 4), [0, 0, 0, 0]);
 });
 
 test("worker draw capture routes XF attributes through the TEV transport", () => {

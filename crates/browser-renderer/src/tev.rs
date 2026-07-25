@@ -2593,6 +2593,43 @@ mod tests {
     }
 
     #[test]
+    fn mkdd_four_stage_thp_yuv_conversion_matches_integer_goldens() {
+        // Exact THPGXYuv2RgbSetup state from MKDD's THPDraw.c.
+        let stages = [
+            TevStage::from_bp(0x00f8_e2, 0x04f3_10, refs(1, 1, true, 7), 12, 28),
+            TevStage::from_bp(0x10f8_e0, 0x04f3_00, refs(2, 1, true, 7), 13, 29),
+            TevStage::from_bp(0x08f8_c0, 0x089f_80, refs(0, 0, true, 7), 0, 0),
+            TevStage::from_bp(0x0810_ef, 0x08ff_f0, refs(0, 0, false, 7), 14, 0),
+        ];
+        let mut state = TevDrawState::default();
+        state.set_stages(&stages);
+        state.color_registers[0] = [-90, 0, -114, 135];
+        state.konst_registers[0] = [0, 0, 226, 88];
+        state.konst_registers[1] = [179, 0, 0, 182];
+        state.konst_registers[2] = [255, 0, 255, 128];
+
+        let goldens = [
+            ((0, 128, 128), [0, 0, 0, 0]),
+            ((16, 128, 128), [16, 16, 16, 0]),
+            ((255, 128, 128), [255, 255, 255, 0]),
+            ((76, 84, 255), [255, 0, 0, 0]),
+            ((149, 43, 21), [0, 254, 0, 0]),
+            ((29, 255, 107), [0, 0, 253, 0]),
+        ];
+        for ((y, u, v), expected) in goldens {
+            let mut inputs = TevFragmentInputs::default();
+            inputs.textures[0] = [y; 4];
+            inputs.textures[1] = [u; 4];
+            inputs.textures[2] = [v; 4];
+            assert_eq!(
+                evaluate(&state, &inputs).raw,
+                expected,
+                "THP YUV ({y}, {u}, {v})",
+            );
+        }
+    }
+
+    #[test]
     fn wgsl_contract_has_fixed_bindings_projective_sampling_and_full_stage_loop() {
         assert!(TEV_WGSL.contains("@group(1) @binding(0) var<uniform> tev_state"));
         for map in 0..MAX_TEV_TEXTURES {
@@ -2604,6 +2641,22 @@ mod tests {
         assert!(TEV_WGSL.contains("fn tev_color_combiner"));
         assert!(TEV_WGSL.contains("fn tev_alpha_combiner"));
         assert!(TEV_WGSL.contains("fn tev_evaluate"));
+        let regular_start = TEV_WGSL
+            .find("fn tev_regular(")
+            .expect("WGSL regular TEV combiner");
+        let regular_end = TEV_WGSL[regular_start..]
+            .find("\nfn tev_comparison(")
+            .expect("WGSL comparison after regular combiner")
+            + regular_start;
+        let regular = &TEV_WGSL[regular_start..regular_end];
+        assert!(regular.contains("var c = c_raw & 255;\n    c += c >> 7u;"));
+        assert!(regular.contains("mixed <<= scale;\n        biased_d <<= scale;"));
+        assert!(regular.contains("mixed += select(128, 127, subtract);"));
+        assert!(regular.contains("mixed >>= 8u;"));
+        assert!(regular.contains("if scale == 3u { result >>= 1u; }"));
+        assert!(!regular.contains("f32"));
+        assert!(!regular.contains("floor"));
+        assert!(!regular.contains("/ 255"));
         assert!(TEV_VERTEX_WGSL.contains("input.position.z / 16777215.0"));
         assert!(!TEV_VERTEX_WGSL.contains("input.position.z / 16777216.0"));
     }

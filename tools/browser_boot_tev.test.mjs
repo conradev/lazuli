@@ -49,6 +49,40 @@ vm.runInContext(
   { filename: "browser_boot.tev.js" },
 );
 
+function dolphinTevRegular(
+  a, b, c, d, { bias = 0, subtract = false, scale = 0, clamp = false } = {},
+) {
+  a &= 0xff;
+  b &= 0xff;
+  c &= 0xff;
+  c += c >> 7;
+  d += [0, 128, -128][bias];
+  const interpolation = (a << 8) + (b - a) * c;
+  let result;
+  if (scale === 3) {
+    const mixed = interpolation >> 8;
+    result = (subtract ? d - mixed : d + mixed) >> 1;
+  } else {
+    const mixed = (
+      (interpolation << scale) + (subtract ? 127 : 128)
+    ) >> 8;
+    const scaledD = d << scale;
+    result = subtract ? scaledD - mixed : scaledD + mixed;
+  }
+  return clamp
+    ? Math.max(0, Math.min(255, result))
+    : Math.max(-1024, Math.min(1023, result));
+}
+
+function regularCombiner({
+  bias = 0, subtract = false, scale = 0, clamp = false,
+} = {}) {
+  return (bias << 16)
+    | (Number(subtract) << 18)
+    | (Number(clamp) << 19)
+    | (scale << 20);
+}
+
 test("TEV register encoding maps R3 before R0, R1, and R2", () => {
   assert.deepEqual(
     [0, 1, 2, 3].map(context.gxTevRegisterIndex),
@@ -92,13 +126,67 @@ test("TEV color and alpha inputs read the encoded register", () => {
   );
 });
 
-test("TEV regular combiner reads A, B, and C as unsigned 8-bit lanes", () => {
-  const clampedAdd = 1 << 19;
+test("TEV regular combiner matches Dolphin fixed-point controls and edges", () => {
+  const lanes = [-1024, -1, 0, 1, 127, 128, 255, 1023];
+  for (const bias of [0, 1, 2]) {
+    for (const subtract of [false, true]) {
+      for (const scale of [0, 1, 2, 3]) {
+        for (const clamp of [false, true]) {
+          const controls = { bias, subtract, scale, clamp };
+          const combiner = regularCombiner(controls);
+          for (let index = 0; index < lanes.length; index += 1) {
+            const values = [
+              lanes[index],
+              lanes[(index + 3) % lanes.length],
+              lanes[(index + 5) % lanes.length],
+              lanes[(index + 7) % lanes.length],
+            ];
+            assert.equal(
+              context.gxTevRegular(...values, combiner),
+              dolphinTevRegular(...values, controls),
+              `${values.join(",")} bias ${bias} subtract ${subtract} scale ${scale} clamp ${clamp}`,
+            );
+          }
+        }
+      }
+    }
+  }
 
-  assert.equal(context.gxTevRegular(-1, 0, 0, 0, clampedAdd), 255);
-  assert.equal(context.gxTevRegular(0, -1, 255, 0, clampedAdd), 255);
-  assert.equal(context.gxTevRegular(0, 255, -1, 0, clampedAdd), 255);
-  assert.equal(context.gxTevRegular(0, 0, 0, -1, 0), -1);
+  const edgeCases = [
+    { values: [0, 0, 0, 0], controls: { scale: 1 }, expected: 0 },
+    {
+      values: [0, 128, 179, -90],
+      controls: { scale: 1 },
+      expected: 0,
+    },
+    {
+      values: [0, 128, 182, 91],
+      controls: { subtract: true },
+      expected: 0,
+    },
+    { values: [0, 1, 128, 0], controls: { scale: 3 }, expected: 0 },
+    { values: [0, 0, 0, -1], controls: { scale: 3 }, expected: -1 },
+    {
+      values: [0, 0, 0, -1],
+      controls: { bias: 1, scale: 1 },
+      expected: 254,
+    },
+    {
+      values: [-1, 0, 0, 0],
+      controls: { clamp: true },
+      expected: 255,
+    },
+  ];
+  for (const { values, controls, expected } of edgeCases) {
+    assert.equal(
+      context.gxTevRegular(
+        ...values,
+        regularCombiner(controls),
+      ),
+      expected,
+      `${values.join(",")} ${JSON.stringify(controls)}`,
+    );
+  }
 });
 
 test("SMB alpha combiner preserves opaque texels from signed TEV registers", () => {
@@ -128,6 +216,123 @@ test("SMB alpha combiner preserves opaque texels from signed TEV registers", () 
   assert.equal(evaluate(0), 0);
   assert.equal(evaluate(1), 1);
   assert.equal(evaluate(255), 255);
+});
+
+function evaluateMkddThp(y, u, v) {
+  const stages = [
+    {
+      color: 0x00f8e2,
+      alpha: 0x04f310,
+      texture: [u, u, u, u],
+      konstColor: [0, 0, 226],
+      konstAlpha: 88,
+    },
+    {
+      color: 0x10f8e0,
+      alpha: 0x04f300,
+      texture: [v, v, v, v],
+      konstColor: [179, 0, 0],
+      konstAlpha: 182,
+    },
+    {
+      color: 0x08f8c0,
+      alpha: 0x089f80,
+      texture: [y, y, y, y],
+      konstColor: [255, 255, 255],
+      konstAlpha: 255,
+    },
+    {
+      color: 0x0810ef,
+      alpha: 0x08fff0,
+      texture: [255, 255, 255, 255],
+      konstColor: [255, 0, 255],
+      konstAlpha: 128,
+    },
+  ];
+  const registers = [
+    [-90, 0, -114, 135],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+  ];
+  const zeroRaster = [0, 0, 0, 0];
+  const trace = [];
+  for (const stage of stages) {
+    const colorArguments = {
+      a: (stage.color >>> 12) & 0xf,
+      b: (stage.color >>> 8) & 0xf,
+      c: (stage.color >>> 4) & 0xf,
+      d: stage.color & 0xf,
+    };
+    const alphaArguments = context.gxTevAlphaArguments(stage.alpha);
+    const colorInput = argument => Array.from(
+      { length: 3 },
+      (_unused, channel) => context.gxTevColorArgument(
+        argument,
+        channel,
+        registers,
+        stage.texture,
+        zeroRaster,
+        stage.konstColor,
+      ),
+    );
+    const colorA = colorInput(colorArguments.a);
+    const colorB = colorInput(colorArguments.b);
+    const color = context.gxTevColorCombiner(
+      colorA,
+      colorB,
+      colorInput(colorArguments.c),
+      colorInput(colorArguments.d),
+      stage.color,
+    );
+    const alphaInput = argument => context.gxTevAlphaArgument(
+      argument,
+      registers,
+      stage.texture,
+      zeroRaster,
+      stage.konstAlpha,
+    );
+    const alpha = context.gxTevAlphaCombiner(
+      colorA,
+      colorB,
+      alphaInput(alphaArguments.a),
+      alphaInput(alphaArguments.b),
+      alphaInput(alphaArguments.c),
+      alphaInput(alphaArguments.d),
+      stage.alpha,
+    );
+    const colorDestination = context.gxTevRegisterIndex(
+      (stage.color >>> 22) & 3,
+    );
+    const alphaDestination = context.gxTevRegisterIndex(
+      (stage.alpha >>> 22) & 3,
+    );
+    registers[colorDestination].splice(0, 3, ...color);
+    registers[alphaDestination][3] = alpha;
+    trace.push(Array.from(registers[3]));
+  }
+  return { rgba: Array.from(registers[3]), trace };
+}
+
+test("MKDD four-stage THP YUV conversion matches integer goldens", () => {
+  const neutral = evaluateMkddThp(16, 128, 128);
+  assert.deepEqual(neutral.trace, [
+    [-90, 0, 0, 91],
+    [0, 0, 0, 0],
+    [16, 16, 16, 16],
+    [16, 16, 16, 0],
+  ]);
+
+  const goldens = [
+    [[0, 128, 128], [0, 0, 0, 0]],
+    [[255, 128, 128], [255, 255, 255, 0]],
+    [[76, 84, 255], [255, 0, 0, 0]],
+    [[149, 43, 21], [0, 254, 0, 0]],
+    [[29, 255, 107], [0, 0, 253, 0]],
+  ];
+  for (const [yuv, expected] of goldens) {
+    assert.deepEqual(evaluateMkddThp(...yuv).rgba, expected, yuv.join(","));
+  }
 });
 
 function comparativeCombiner(operation, clamp = true) {
