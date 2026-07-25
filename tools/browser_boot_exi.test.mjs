@@ -74,6 +74,8 @@ const exiFunctions = [
   "normalizePhysicalMemoryAddress",
   "physicalRamPointer",
   "writeProcessorInterfaceInterruptCause",
+  "readExternalInterfaceTransferRegister",
+  "writeExternalInterfaceTransferRegister",
   "writeExternalInterfaceParameter",
   "transitionExternalInterfaceChipSelect",
   "completeExternalInterfaceTransfer",
@@ -123,6 +125,8 @@ function makeContext(exiIplImage = syntheticIpl()) {
     exiAttachInterrupt: 0x00000800,
     exiDeviceConnected: 0x00001000,
     exiRomDisable: 0x00002000,
+    exiDmaRegisterMask: 0x03ffffe0,
+    exiTransferControlMask: 0x0000003f,
     deviceEvents: new Map(),
     exiIplImageBytes: 2 * 1024 * 1024,
     exiIplImage,
@@ -130,8 +134,14 @@ function makeContext(exiIplImage = syntheticIpl()) {
     exiTransferTraceLimit: 64,
     exiTransferTrace: [],
     exiTransferOutcomes: new Map(),
+    exiDmaOutcomes: new Map(),
+    exiDmaReasons: new Map(),
     exiTransferSequence: 0,
     exiTransferTraceDropped: 0,
+    exiDmaAttempts: 0,
+    exiDmaCompletions: 0,
+    exiDmaZeroLengthCompletions: 0,
+    exiLastDma: null,
     exi0IplChipSelectActive: false,
     exi0IplCommandWord: 0,
     exi0IplCommandBytes: 0,
@@ -241,13 +251,13 @@ function writeIplAddress(context, sourceOffset, cycle = 1) {
 
 function readIplDma(context, dmaBase, dmaLength, cycle = 2, mode = 0) {
   selectIplDevice(context);
-  context.view.setUint32(context.mmio + 0x6804, dmaBase, false);
-  context.view.setUint32(context.mmio + 0x6808, dmaLength, false);
+  context.writeExternalInterfaceTransferRegister(0, 4, dmaBase);
+  context.writeExternalInterfaceTransferRegister(0, 8, dmaLength);
   // TSTART, DMA, caller-selected transfer mode.
-  context.view.setUint32(
-    context.mmio + 0x680c,
+  context.writeExternalInterfaceTransferRegister(
+    0,
+    12,
     1 | 2 | (mode << 2),
-    false,
   );
   assert.equal(context.serviceExi0(cycle), true);
 }
@@ -1173,6 +1183,149 @@ test("EXI0 IPL address command orders and completes a bounded DMA read", () => {
   });
 });
 
+test("EXI transfer registers expose only hardware bits on every channel", () => {
+  const context = makeContext();
+
+  for (let channel = 0; channel < 3; channel += 1) {
+    for (const registerOffset of [4, 8]) {
+      assert.equal(
+        context.writeExternalInterfaceTransferRegister(
+          channel,
+          registerOffset,
+          0xffffffff,
+        ),
+        context.exiDmaRegisterMask,
+      );
+      assert.equal(
+        context.view.getUint32(
+          context.mmio + 0x6800 + channel * 0x14 + registerOffset,
+          false,
+        ),
+        context.exiDmaRegisterMask,
+      );
+      assert.equal(
+        context.readExternalInterfaceTransferRegister(
+          channel,
+          registerOffset,
+        ),
+        context.exiDmaRegisterMask,
+      );
+    }
+    assert.equal(
+      context.writeExternalInterfaceTransferRegister(
+        channel,
+        12,
+        0xffffffff,
+      ),
+      context.exiTransferControlMask,
+    );
+    assert.equal(
+      context.view.getUint32(
+        context.mmio + 0x680c + channel * 0x14,
+        false,
+      ),
+      context.exiTransferControlMask,
+    );
+    assert.equal(
+      context.readExternalInterfaceTransferRegister(channel, 12),
+      context.exiTransferControlMask,
+    );
+  }
+
+  assert.throws(
+    () => context.writeExternalInterfaceTransferRegister(3, 4, 0),
+    /EXI channel must be 0, 1, or 2/,
+  );
+  assert.throws(
+    () => context.writeExternalInterfaceTransferRegister(0, 16, 0),
+    /EXI transfer register offset must be 4, 8, or 12/,
+  );
+  assert.throws(
+    () => context.readExternalInterfaceTransferRegister(-1, 4),
+    /EXI channel must be 0, 1, or 2/,
+  );
+
+  const writeInteger = extractFunction("writeInteger");
+  assert.match(
+    writeInteger,
+    /writeExternalInterfaceTransferRegister\(\s*channel,\s*registerOffset,\s*value\s*\)/,
+  );
+  assert.match(
+    writeInteger,
+    /external-interface-transfer-register-rejected/,
+  );
+  const readInteger = extractFunction("readInteger");
+  assert.match(
+    readInteger,
+    /readExternalInterfaceTransferRegister\(\s*channel,\s*registerOffset\s*\)/,
+  );
+  assert.match(
+    readInteger,
+    /external-interface-transfer-register-rejected/,
+  );
+});
+
+test("EXI0 DMA aligns registers and completes a zero-byte read", () => {
+  const image = syntheticIpl();
+  const sourceOffset = 0x1aff00;
+  image.set(
+    Uint8Array.from({ length: 64 }, (_unused, index) => index + 1),
+    sourceOffset,
+  );
+  const context = makeContext(image);
+
+  writeIplAddress(context, sourceOffset, 10);
+  readIplDma(context, 0xfc00241f, 63, 20);
+
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6804, false),
+    0x2400,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6808, false),
+    32,
+  );
+  assert.deepEqual(
+    Array.from(
+      context.bytes.subarray(context.ram + 0x2400, context.ram + 0x2420),
+    ),
+    Array.from(image.subarray(sourceOffset, sourceOffset + 32)),
+  );
+  assert.equal(context.exi0IplCursor, sourceOffset + 32);
+
+  readIplDma(context, 0xffffffff, 31, 30);
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6804, false),
+    context.exiDmaRegisterMask,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6808, false),
+    0,
+  );
+  assert.equal(context.exiTransferTrace.at(-1).outcome, "complete");
+  assert.equal(context.exi0IplCursor, sourceOffset + 32);
+  assert.equal(context.exi0IplDmaBytes, 32);
+  assert.deepEqual(
+    context.reservationInvalidations,
+    [{ address: 0x2400, length: 32 }],
+  );
+  assert.equal(context.view.getUint32(context.mmio + 0x680c, false), 2);
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6800, false)
+      & context.exiTransferInterrupt,
+    context.exiTransferInterrupt,
+  );
+  const dma = plain(context.snapshotExternalInterface()).transfers.dma;
+  assert.equal(dma.attempts, 2);
+  assert.equal(dma.completions, 2);
+  assert.equal(dma.zeroLengthCompletions, 1);
+  assert.deepEqual(dma.outcomes, { complete: 2 });
+  assert.deepEqual(dma.reasons, {});
+  assert.equal(dma.last.dmaBase, "0x03ffffe0");
+  assert.equal(dma.last.dmaLength, 0);
+  assert.equal(dma.last.outcome, "complete");
+});
+
 test("EXI0 IPL cursor advances across consecutive DMA reads", () => {
   const image = syntheticIpl();
   const sourceOffset = 0x1aff00;
@@ -1212,6 +1365,98 @@ test("EXI0 IPL cursor advances across consecutive DMA reads", () => {
   assert.equal(context.exi0IplCommandAddress, sourceOffset);
   assert.equal(context.exi0IplCursor, sourceOffset + 64);
   assert.equal(context.exi0IplDmaBytes, 64);
+});
+
+test("EXI0 DMA honors exact bounds and rejects overflows atomically", () => {
+  const image = syntheticIpl();
+  const exactSource = image.byteLength - 64;
+  const exactTarget = 0x10000 - 64;
+  const payload = Uint8Array.from(
+    { length: 64 },
+    (_unused, index) => (index * 29 + 7) & 0xff,
+  );
+  image.set(payload, exactSource);
+  const exact = makeContext(image);
+
+  writeIplAddress(exact, exactSource);
+  readIplDma(exact, exactTarget, 64);
+  assert.deepEqual(
+    Array.from(
+      exact.bytes.subarray(
+        exact.ram + exactTarget,
+        exact.ram + exactTarget + payload.length,
+      ),
+    ),
+    Array.from(payload),
+  );
+  assert.equal(exact.exi0IplCursor, image.byteLength);
+  assert.equal(exact.exi0IplDmaBytes, 64);
+  assert.deepEqual(
+    exact.reservationInvalidations,
+    [{ address: exactTarget, length: 64 }],
+  );
+
+  const sourceOverflow = makeContext(image);
+  const guardedTarget = 0x2000;
+  sourceOverflow.bytes.fill(
+    0xa5,
+    sourceOverflow.ram + guardedTarget,
+    sourceOverflow.ram + guardedTarget + 96,
+  );
+  writeIplAddress(sourceOverflow, exactSource);
+  const sourceAddressSequence = sourceOverflow.exi0IplAddressSequence;
+  readIplDma(sourceOverflow, guardedTarget, 96);
+  assert.equal(
+    sourceOverflow.exiTransferTrace.at(-1).reason,
+    "ipl-source-out-of-bounds",
+  );
+  assert.deepEqual(
+    Array.from(
+      sourceOverflow.bytes.subarray(
+        sourceOverflow.ram + guardedTarget,
+        sourceOverflow.ram + guardedTarget + 96,
+      ),
+    ),
+    Array(96).fill(0xa5),
+  );
+  assert.equal(sourceOverflow.exi0IplCursor, exactSource);
+  assert.equal(
+    sourceOverflow.exi0IplAddressSequence,
+    sourceAddressSequence,
+  );
+  assert.equal(sourceOverflow.exi0IplDmaBytes, 0);
+  assert.deepEqual(sourceOverflow.reservationInvalidations, []);
+
+  const targetOverflow = makeContext(image);
+  const targetStart = targetOverflow.ramSize - 32;
+  targetOverflow.bytes.fill(
+    0x5a,
+    targetOverflow.ram + targetStart,
+    targetOverflow.ram + targetStart + 64,
+  );
+  writeIplAddress(targetOverflow, 0x3000);
+  const targetAddressSequence = targetOverflow.exi0IplAddressSequence;
+  readIplDma(targetOverflow, targetStart, 64);
+  assert.equal(
+    targetOverflow.exiTransferTrace.at(-1).reason,
+    "ram-target-out-of-bounds",
+  );
+  assert.deepEqual(
+    Array.from(
+      targetOverflow.bytes.subarray(
+        targetOverflow.ram + targetStart,
+        targetOverflow.ram + targetStart + 64,
+      ),
+    ),
+    Array(64).fill(0x5a),
+  );
+  assert.equal(targetOverflow.exi0IplCursor, 0x3000);
+  assert.equal(
+    targetOverflow.exi0IplAddressSequence,
+    targetAddressSequence,
+  );
+  assert.equal(targetOverflow.exi0IplDmaBytes, 0);
+  assert.deepEqual(targetOverflow.reservationInvalidations, []);
 });
 
 test("EXI0 IPL DMA reports an absent local image without mutating RAM", () => {
@@ -1255,7 +1500,7 @@ test("EXI0 IPL DMA rejects wrong modes and source or RAM range overflow", () => 
 
   const targetOverflow = makeContext();
   writeIplAddress(targetOverflow, 0x3000);
-  readIplDma(targetOverflow, targetOverflow.ramSize - 16, 32);
+  readIplDma(targetOverflow, targetOverflow.ramSize, 32);
   assert.equal(
     targetOverflow.exiTransferTrace.at(-1).reason,
     "ram-target-out-of-bounds",
@@ -1344,11 +1589,11 @@ test("EXI1 and EXI2 retain the previous bounded no-device completion", () => {
 
   assert.equal(
     context.view.getUint32(context.mmio + 0x6820, false),
-    0x80000000,
+    0,
   );
   assert.equal(
     context.view.getUint32(context.mmio + 0x6834, false),
-    0x40000000,
+    0,
   );
   assert.equal(context.deviceEvents.get("exiChannel1"), 1);
   assert.equal(context.deviceEvents.get("exiChannel2"), 1);

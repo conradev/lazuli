@@ -1125,6 +1125,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     const exiAttachInterrupt = 0x00000800;
     const exiDeviceConnected = 0x00001000;
     const exiRomDisable = 0x00002000;
+    const exiDmaRegisterMask = 0x03ffffe0;
+    const exiTransferControlMask = 0x0000003f;
     const siTransferStart = 0x00000001;
     const siReadStatusInterruptMask = 0x08000000;
     const siReadStatusInterrupt = 0x10000000;
@@ -5332,8 +5334,14 @@ const TEMPLATE: &str = r##"<!doctype html>
     const exiTransferTraceLimit = 64;
     const exiTransferTrace = [];
     const exiTransferOutcomes = new Map();
+    const exiDmaOutcomes = new Map();
+    const exiDmaReasons = new Map();
     let exiTransferSequence = 0;
     let exiTransferTraceDropped = 0;
+    let exiDmaAttempts = 0;
+    let exiDmaCompletions = 0;
+    let exiDmaZeroLengthCompletions = 0;
+    let exiLastDma = null;
     let exi0IplChipSelectActive = false;
     let exi0IplCommandWord = 0;
     let exi0IplCommandBytes = 0;
@@ -13178,6 +13186,28 @@ const TEMPLATE: &str = r##"<!doctype html>
         view.setUint32(pointer, processorInterfaceFifoValue, true);
         return 1;
       }
+      for (let channel = 0; channel < 3; channel += 1) {
+        const channelBase = 0x0c006800 + channel * 0x14;
+        for (const registerOffset of [4, 8, 12]) {
+          const register = channelBase + registerOffset;
+          if (physical >= register + 4 || physical + size <= register) continue;
+          if (physical === register && size === 4) {
+            view.setUint32(
+              pointer,
+              readExternalInterfaceTransferRegister(
+                channel,
+                registerOffset
+              ),
+              true
+            );
+            return 1;
+          }
+          return reject(
+            "device",
+            "external-interface-transfer-register-rejected"
+          );
+        }
+      }
       if (physical === 0x0c006c08 && size === 4) {
         updateAudioSampleCounter(cycles);
       }
@@ -13762,6 +13792,25 @@ const TEMPLATE: &str = r##"<!doctype html>
           "device",
           "external-interface-parameter-register-rejected"
         );
+      }
+      for (let channel = 0; channel < 3; channel += 1) {
+        const channelBase = 0x0c006800 + channel * 0x14;
+        for (const registerOffset of [4, 8, 12]) {
+          const register = channelBase + registerOffset;
+          if (physical >= register + 4 || physical + size <= register) continue;
+          if (physical === register && size === 4) {
+            writeExternalInterfaceTransferRegister(
+              channel,
+              registerOffset,
+              value
+            );
+            return 1;
+          }
+          return reject(
+            "device",
+            "external-interface-transfer-register-rejected"
+          );
+        }
       }
       if (physical >= 0x0c008000 && physical < 0x0c008020) {
         switch (size) {
@@ -16395,6 +16444,51 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
+    function writeExternalInterfaceTransferRegister(
+      channel,
+      registerOffset,
+      value
+    ) {
+      if (!Number.isInteger(channel) || channel < 0 || channel >= 3) {
+        throw new RangeError("EXI channel must be 0, 1, or 2");
+      }
+      if (![4, 8, 12].includes(registerOffset)) {
+        throw new RangeError("EXI transfer register offset must be 4, 8, or 12");
+      }
+
+      // EXIMAR and EXILENGTH expose bits 5..25; EXICR exposes bits 0..5.
+      // Hardware therefore makes the RAM address and transfer length
+      // 32-byte aligned while every reserved bit reads back as zero.
+      const mask = registerOffset === 12
+        ? exiTransferControlMask
+        : exiDmaRegisterMask;
+      const stored = (value & mask) >>> 0;
+      view.setUint32(
+        mmio + 0x6800 + channel * 0x14 + registerOffset,
+        stored,
+        false
+      );
+      return stored;
+    }
+
+    function readExternalInterfaceTransferRegister(channel, registerOffset) {
+      if (!Number.isInteger(channel) || channel < 0 || channel >= 3) {
+        throw new RangeError("EXI channel must be 0, 1, or 2");
+      }
+      if (![4, 8, 12].includes(registerOffset)) {
+        throw new RangeError("EXI transfer register offset must be 4, 8, or 12");
+      }
+      const mask = registerOffset === 12
+        ? exiTransferControlMask
+        : exiDmaRegisterMask;
+      return (
+        view.getUint32(
+          mmio + 0x6800 + channel * 0x14 + registerOffset,
+          false
+        ) & mask
+      ) >>> 0;
+    }
+
     function writeExternalInterfaceParameter(channel, value) {
       if (!Number.isInteger(channel) || channel < 0 || channel >= 3) {
         throw new RangeError("EXI channel must be 0, 1, or 2");
@@ -16444,7 +16538,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       const parameterOffset = 0x6800 + channel * 0x14;
       const controlOffset = parameterOffset + 0x0c;
-      const control = view.getUint32(mmio + controlOffset, false);
+      const control = (
+        view.getUint32(mmio + controlOffset, false)
+        & exiTransferControlMask
+      ) >>> 0;
       if ((control & 1) === 0) return false;
       view.setUint32(mmio + controlOffset, (control & ~1) >>> 0, false);
       view.setUint32(
@@ -16706,6 +16803,26 @@ const TEMPLATE: &str = r##"<!doctype html>
         recorded.outcome,
         (exiTransferOutcomes.get(recorded.outcome) ?? 0) + 1
       );
+      if (recorded.dma) {
+        exiDmaAttempts += 1;
+        exiDmaOutcomes.set(
+          recorded.outcome,
+          (exiDmaOutcomes.get(recorded.outcome) ?? 0) + 1
+        );
+        if (recorded.reason !== null) {
+          exiDmaReasons.set(
+            recorded.reason,
+            (exiDmaReasons.get(recorded.reason) ?? 0) + 1
+          );
+        }
+        if (recorded.outcome === "complete") {
+          exiDmaCompletions += 1;
+          if (recorded.dmaLength === 0) {
+            exiDmaZeroLengthCompletions += 1;
+          }
+        }
+        exiLastDma = recorded;
+      }
       exiTransferTrace.push(recorded);
       if (exiTransferTrace.length > exiTransferTraceLimit) {
         exiTransferTrace.shift();
@@ -16716,9 +16833,18 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function serviceExi0(observedCycles) {
       const parameter = view.getUint32(mmio + 0x6800, false);
-      const dmaBase = view.getUint32(mmio + 0x6804, false);
-      const dmaLength = view.getUint32(mmio + 0x6808, false);
-      const controlBefore = view.getUint32(mmio + 0x680c, false);
+      const dmaBase = (
+        view.getUint32(mmio + 0x6804, false)
+        & exiDmaRegisterMask
+      ) >>> 0;
+      const dmaLength = (
+        view.getUint32(mmio + 0x6808, false)
+        & exiDmaRegisterMask
+      ) >>> 0;
+      const controlBefore = (
+        view.getUint32(mmio + 0x680c, false)
+        & exiTransferControlMask
+      ) >>> 0;
       const immediate = view.getUint32(mmio + 0x6810, false);
       if ((controlBefore & 1) === 0) return false;
 
@@ -16785,6 +16911,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         } else if (!imageStatus.valid) {
           outcome = "rejected";
           reason = "invalid-ipl-image";
+        } else if (dmaLength === 0) {
+          // Generic EXI devices clock zero bytes and still signal transfer
+          // completion. The RAM address is not consulted in that case.
+          outcome = "complete";
         } else if (
           exi0IplCursor > imageStatus.byteLength
           || dmaLength > imageStatus.byteLength - exi0IplCursor
@@ -16941,6 +17071,22 @@ const TEMPLATE: &str = r##"<!doctype html>
               left.localeCompare(right)
             )
           ),
+          dma: {
+            attempts: exiDmaAttempts,
+            completions: exiDmaCompletions,
+            zeroLengthCompletions: exiDmaZeroLengthCompletions,
+            outcomes: Object.fromEntries(
+              [...exiDmaOutcomes.entries()].sort(([left], [right]) =>
+                left.localeCompare(right)
+              )
+            ),
+            reasons: Object.fromEntries(
+              [...exiDmaReasons.entries()].sort(([left], [right]) =>
+                left.localeCompare(right)
+              )
+            ),
+            last: exiLastDma,
+          },
           trace: exiTransferTrace,
         },
       };
