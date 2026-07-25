@@ -232,6 +232,7 @@ impl BlockBuilder<'_> {
         let b1 = self.bd.ins().scalar_to_vector(ir::types::F64X2, b1);
 
         let value = self.bd.ins().fadd(ac, b1);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -257,6 +258,7 @@ impl BlockBuilder<'_> {
         let b1 = self.bd.ins().insertlane(fpr_b, zero, 0);
 
         let value = self.bd.ins().fadd(ca, b1);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);

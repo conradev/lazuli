@@ -597,6 +597,7 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let value = self.bd.ins().fadd(fpr_a, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -654,6 +655,7 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let value = self.bd.ins().fsub(fpr_a, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -961,6 +963,7 @@ impl BlockBuilder<'_> {
         let fpr_c = self.get(ins.fpr_c());
 
         let value = self.bd.ins().fma(fpr_a, fpr_c, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -1119,6 +1122,7 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let value = self.bd.ins().fdiv(fpr_a, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);

@@ -75,7 +75,7 @@ impl Default for CodegenSettings {
             nop_syscalls: false,
             force_fpu: false,
             ignore_unimplemented: false,
-            round_to_single: false,
+            round_to_single: true,
         }
     }
 }
