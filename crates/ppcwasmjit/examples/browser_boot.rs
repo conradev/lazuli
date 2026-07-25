@@ -10455,11 +10455,28 @@ const TEMPLATE: &str = r##"<!doctype html>
       return {
         phase: "waiting",
         expectedWords: 0,
+        commandWordCount: 0,
         words: [],
         rejected: false,
         reason: null,
         lastCommand: null,
         lastSync: null,
+        setup: null,
+        render: emptyDspZeldaRenderState(),
+      };
+    }
+
+    function emptyDspZeldaRenderState() {
+      return {
+        active: false,
+        awaitingTaskMail: false,
+        requestedFrames: 0,
+        currentFrame: 0,
+        currentVoice: 0,
+        outputVolume: 0,
+        outputLeftAddress: null,
+        outputRightAddress: null,
+        clearedBytes: 0,
       };
     }
 
@@ -10614,9 +10631,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     function rejectDspZeldaCommand(reason, details = {}) {
       dspZeldaCommandState.phase = "halted";
       dspZeldaCommandState.expectedWords = 0;
+      dspZeldaCommandState.commandWordCount = 0;
       dspZeldaCommandState.words.length = 0;
       dspZeldaCommandState.rejected = true;
       dspZeldaCommandState.reason = reason;
+      dspZeldaCommandState.render.active = false;
       traceDsp("zelda-command-rejected", { reason, ...details });
       deviceEvents.set(
         "dspZeldaCommandRejected",
@@ -10625,21 +10644,193 @@ const TEMPLATE: &str = r##"<!doctype html>
       return false;
     }
 
+    function validateDspZeldaOutputRange(address, size) {
+      return Number.isSafeInteger(size)
+        && size > 0
+        && ramPointer(address, size) !== null;
+    }
+
+    function clearDspZeldaSilentFrame() {
+      const render = dspZeldaCommandState.render;
+      const frameBytes = 0x50 * 2;
+      const frameOffset = render.currentFrame * frameBytes;
+      const leftAddress = (render.outputLeftAddress + frameOffset) >>> 0;
+      const rightAddress = (render.outputRightAddress + frameOffset) >>> 0;
+      const left = ramPointer(leftAddress, frameBytes);
+      const right = ramPointer(rightAddress, frameBytes);
+      if (left === null || right === null) {
+        return rejectDspZeldaCommand("output-frame-out-of-bounds", {
+          frame: render.currentFrame,
+          leftAddress: hex32(leftAddress),
+          rightAddress: hex32(rightAddress),
+        });
+      }
+
+      invalidateDataReservationForExternalWrite((left - ram) >>> 0, frameBytes);
+      invalidateDataReservationForExternalWrite((right - ram) >>> 0, frameBytes);
+      bytes.fill(0, left, left + frameBytes);
+      bytes.fill(0, right, right + frameBytes);
+      render.clearedBytes += frameBytes * 2;
+      traceDsp("zelda-silent-frame", {
+        frame: render.currentFrame,
+        leftAddress: hex32(leftAddress),
+        rightAddress: hex32(rightAddress),
+        bytes: frameBytes * 2,
+      });
+      deviceEvents.set(
+        "dspZeldaSilentFrame",
+        (deviceEvents.get("dspZeldaSilentFrame") ?? 0) + 1
+      );
+      return true;
+    }
+
+    function finishDspZeldaRenderFrame() {
+      const render = dspZeldaCommandState.render;
+      if (!clearDspZeldaSilentFrame()) return false;
+
+      const completedFrame = render.currentFrame;
+      pushDspMail(0xdcd10004, true, "zelda-render-sync");
+      pushDspMail(
+        (0xf355ff00 | completedFrame) >>> 0,
+        false,
+        "zelda-render-frame-ack"
+      );
+      render.currentFrame += 1;
+      render.currentVoice = 0;
+      dspZeldaCommandState.lastSync = (0xff00 | completedFrame) & 0xffff;
+      deviceEvents.set(
+        "dspZeldaRenderFrame",
+        (deviceEvents.get("dspZeldaRenderFrame") ?? 0) + 1
+      );
+
+      if (render.currentFrame === render.requestedFrames) {
+        render.active = false;
+        render.awaitingTaskMail = true;
+        dspZeldaCommandState.phase = "task-wait";
+        pushDspMail(0xdcd10005, true, "zelda-render-frame-end");
+        traceDsp("zelda-render-complete", {
+          frames: render.requestedFrames,
+          clearedBytes: render.clearedBytes,
+        });
+        deviceEvents.set(
+          "dspZeldaRenderComplete",
+          (deviceEvents.get("dspZeldaRenderComplete") ?? 0) + 1
+        );
+      } else {
+        dspZeldaCommandState.phase = "waiting";
+      }
+      return true;
+    }
+
     function handleDspZeldaMail(mail) {
       const payload = mail >>> 0;
       if (dspZeldaCommandState.phase === "halted") return false;
 
+      if (
+        (
+          dspZeldaCommandState.phase === "waiting"
+          || dspZeldaCommandState.phase === "task-wait"
+        )
+        && ((payload & 0xffff0000) >>> 0) === 0xcdd10000
+      ) {
+        if (payload === 0xcdd10000) {
+          dspZeldaCommandState.phase = "halted";
+          dspZeldaCommandState.render.active = false;
+          dspZeldaCommandState.render.awaitingTaskMail = false;
+          traceDsp("zelda-task-halt", { mail: hex32(payload) });
+          deviceEvents.set(
+            "dspZeldaTaskHalt",
+            (deviceEvents.get("dspZeldaTaskHalt") ?? 0) + 1
+          );
+          return true;
+        }
+        if (payload === 0xcdd10001) {
+          return rejectDspZeldaCommand("unsupported-task-switch", {
+            mail: hex32(payload),
+          });
+        }
+        if (payload === 0xcdd10002) {
+          resetDspMailbox();
+          return true;
+        }
+        if (payload !== 0xcdd10003) {
+          return rejectDspZeldaCommand("unsupported-task-mail", {
+            mail: hex32(payload),
+          });
+        }
+        dspZeldaCommandState.render.awaitingTaskMail = false;
+        dspZeldaCommandState.phase = "waiting";
+        dspZeldaCommandState.rejected = false;
+        dspZeldaCommandState.reason = null;
+        traceDsp("zelda-task-continue", { mail: hex32(payload) });
+        deviceEvents.set(
+          "dspZeldaTaskContinue",
+          (deviceEvents.get("dspZeldaTaskContinue") ?? 0) + 1
+        );
+        return true;
+      }
+      if (dspZeldaCommandState.phase === "task-wait") {
+        return rejectDspZeldaCommand("expected-task-mail", {
+          mail: hex32(payload),
+        });
+      }
+
+      if (dspZeldaCommandState.phase === "rendering") {
+        const render = dspZeldaCommandState.render;
+        const group = payload >>> 16;
+        const expectedGroup = render.currentVoice >>> 4;
+        if (
+          !render.active
+          || group !== expectedGroup
+          || group > 3
+        ) {
+          return rejectDspZeldaCommand("unsupported-render-sync", {
+            sync: hex32(payload),
+            group,
+            expectedGroup,
+          });
+        }
+        render.currentVoice += 16;
+        traceDsp("zelda-render-sync", {
+          frame: render.currentFrame,
+          group,
+          activeVoiceMap:
+            "0x" + (payload & 0xffff).toString(16).padStart(4, "0"),
+        });
+        deviceEvents.set(
+          "dspZeldaRenderSync",
+          (deviceEvents.get("dspZeldaRenderSync") ?? 0) + 1
+        );
+        if (render.currentVoice === dspZeldaCommandState.setup.voicesPerFrame) {
+          return finishDspZeldaRenderFrame();
+        }
+        dspZeldaCommandState.phase = "waiting";
+        return true;
+      }
+
       if (dspZeldaCommandState.phase === "waiting") {
         // The standard Zelda/JAudio protocol starts each command with the
-        // raw number of following 32-bit words. Only the five-word setup
-        // command is modeled until its state semantics are implemented.
-        if (payload !== 5) {
+        // raw number of following 32-bit words. During rendering, a zero
+        // count transfers the next per-16-voice synchronization bitmap.
+        if (payload === 0 && dspZeldaCommandState.render.active) {
+          dspZeldaCommandState.phase = "rendering";
+          return true;
+        }
+        if (dspZeldaCommandState.render.active) {
+          return rejectDspZeldaCommand("command-during-render", {
+            count: hex32(payload),
+            frame: dspZeldaCommandState.render.currentFrame,
+            voice: dspZeldaCommandState.render.currentVoice,
+          });
+        }
+        if (payload !== 5 && payload !== 3) {
           return rejectDspZeldaCommand("unsupported-count", {
             count: hex32(payload),
           });
         }
         dspZeldaCommandState.phase = "writing";
-        dspZeldaCommandState.expectedWords = 5;
+        dspZeldaCommandState.expectedWords = payload;
+        dspZeldaCommandState.commandWordCount = payload;
         dspZeldaCommandState.words.length = 0;
         dspZeldaCommandState.rejected = false;
         dspZeldaCommandState.reason = null;
@@ -10657,6 +10848,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (dspZeldaCommandState.expectedWords !== 0) return true;
 
       const words = dspZeldaCommandState.words.slice();
+      const commandWordCount = dspZeldaCommandState.commandWordCount;
       const commandMail = words[0] >>> 0;
       if ((commandMail & 0x80000000) === 0) {
         return rejectDspZeldaCommand("malformed-command", {
@@ -10664,16 +10856,30 @@ const TEMPLATE: &str = r##"<!doctype html>
         });
       }
       const command = (commandMail >>> 24) & 0x7f;
-      if (command !== 0x01) {
+      const expectedCommandWords = command === 0x01
+        ? 5
+        : command === 0x02
+          ? 3
+          : null;
+      if (expectedCommandWords === null) {
         return rejectDspZeldaCommand("unsupported-command", {
           command,
           commandMail: hex32(commandMail),
+        });
+      }
+      if (commandWordCount !== expectedCommandWords) {
+        return rejectDspZeldaCommand("malformed-command-envelope", {
+          command,
+          commandMail: hex32(commandMail),
+          words: commandWordCount,
+          expectedWords: expectedCommandWords,
         });
       }
 
       const sync = (commandMail >>> 16) & 0xffff;
       dspZeldaCommandState.phase = "waiting";
       dspZeldaCommandState.expectedWords = 0;
+      dspZeldaCommandState.commandWordCount = 0;
       dspZeldaCommandState.words.length = 0;
       dspZeldaCommandState.lastCommand = commandMail;
       dspZeldaCommandState.lastSync = sync;
@@ -10687,10 +10893,93 @@ const TEMPLATE: &str = r##"<!doctype html>
         (deviceEvents.get("dspZeldaCommand") ?? 0) + 1
       );
 
+      if (command === 0x01) {
+        dspZeldaCommandState.setup = {
+          voicesPerFrame: commandMail & 0xffff,
+          vpbBaseAddress: words[1] >>> 0,
+          coefficientAddress: words[2] >>> 0,
+          afcCoeffAddress: words[3] >>> 0,
+          reverbPbBaseAddress: words[4] >>> 0,
+        };
+        traceDsp("zelda-setup", {
+          voicesPerFrame: dspZeldaCommandState.setup.voicesPerFrame,
+          vpbBaseAddress: hex32(dspZeldaCommandState.setup.vpbBaseAddress),
+          coefficientAddress: hex32(
+            dspZeldaCommandState.setup.coefficientAddress
+          ),
+          afcCoeffAddress: hex32(dspZeldaCommandState.setup.afcCoeffAddress),
+          reverbPbBaseAddress: hex32(
+            dspZeldaCommandState.setup.reverbPbBaseAddress
+          ),
+        });
+        deviceEvents.set(
+          "dspZeldaSetup",
+          (deviceEvents.get("dspZeldaSetup") ?? 0) + 1
+        );
+
+        // Dolphin's standard Zelda protocol acknowledges setup commands in
+        // this exact order: interrupting DSP_SYNC, then the non-interrupt
+        // F355 token carrying the command's sync value.
+        pushDspMail(0xdcd10004, true, "zelda-command-sync");
+        pushDspMail((0xf3550000 | sync) >>> 0, false, "zelda-command-ack");
+        return true;
+      }
+
+      const setup = dspZeldaCommandState.setup;
+      if (setup === null) {
+        return rejectDspZeldaCommand("render-before-setup");
+      }
+      if (setup.voicesPerFrame !== 0x40) {
+        return rejectDspZeldaCommand("unsupported-voice-count", {
+          voicesPerFrame: setup.voicesPerFrame,
+        });
+      }
+      const requestedFrames = (commandMail >>> 16) & 0xff;
+      if (requestedFrames === 0) {
+        return rejectDspZeldaCommand("empty-render");
+      }
+      const outputBytes = requestedFrames * 0x50 * 2;
+      const outputLeftAddress = words[1] >>> 0;
+      const outputRightAddress = words[2] >>> 0;
+      if (
+        !validateDspZeldaOutputRange(outputLeftAddress, outputBytes)
+        || !validateDspZeldaOutputRange(outputRightAddress, outputBytes)
+      ) {
+        return rejectDspZeldaCommand("output-out-of-bounds", {
+          frames: requestedFrames,
+          bytesPerChannel: outputBytes,
+          leftAddress: hex32(outputLeftAddress),
+          rightAddress: hex32(outputRightAddress),
+        });
+      }
+      dspZeldaCommandState.render = {
+        active: true,
+        awaitingTaskMail: false,
+        requestedFrames,
+        currentFrame: 0,
+        currentVoice: 0,
+        outputVolume: commandMail & 0xffff,
+        outputLeftAddress,
+        outputRightAddress,
+        clearedBytes: 0,
+      };
+      traceDsp("zelda-render-command", {
+        frames: requestedFrames,
+        voicesPerFrame: setup.voicesPerFrame,
+        outputVolume: dspZeldaCommandState.render.outputVolume,
+        outputLeftAddress: hex32(outputLeftAddress),
+        outputRightAddress: hex32(outputRightAddress),
+        bytesPerChannel: outputBytes,
+      });
+      deviceEvents.set(
+        "dspZeldaRenderCommand",
+        (deviceEvents.get("dspZeldaRenderCommand") ?? 0) + 1
+      );
+
       // Dolphin's standard Zelda protocol acknowledges commands in this
-      // exact order: interrupting DSP_SYNC, then the non-interrupt F355 token.
-      pushDspMail(0xdcd10004, true, "zelda-command-sync");
-      pushDspMail((0xf3550000 | sync) >>> 0, false, "zelda-command-ack");
+      // family only after each requested audio frame has completed. The
+      // renderer therefore waits for the first zero-count synchronization
+      // pair and deliberately emits no command-02 ACK here.
       return true;
     }
 
@@ -16089,6 +16378,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           dspZeldaCommand: {
             phase: dspZeldaCommandState.phase,
             expectedWords: dspZeldaCommandState.expectedWords,
+            commandWordCount: dspZeldaCommandState.commandWordCount,
             bufferedWords: dspZeldaCommandState.words.length,
             rejected: dspZeldaCommandState.rejected,
             reason: dspZeldaCommandState.reason,
@@ -16101,6 +16391,48 @@ const TEMPLATE: &str = r##"<!doctype html>
                 ? null
                 : "0x" +
                   dspZeldaCommandState.lastSync.toString(16).padStart(4, "0"),
+            setup:
+              dspZeldaCommandState.setup === null
+                ? null
+                : {
+                    voicesPerFrame:
+                      dspZeldaCommandState.setup.voicesPerFrame,
+                    vpbBaseAddress: hex32(
+                      dspZeldaCommandState.setup.vpbBaseAddress
+                    ),
+                    coefficientAddress: hex32(
+                      dspZeldaCommandState.setup.coefficientAddress
+                    ),
+                    afcCoeffAddress: hex32(
+                      dspZeldaCommandState.setup.afcCoeffAddress
+                    ),
+                    reverbPbBaseAddress: hex32(
+                      dspZeldaCommandState.setup.reverbPbBaseAddress
+                    ),
+                  },
+            render: {
+              active: dspZeldaCommandState.render.active,
+              awaitingTaskMail:
+                dspZeldaCommandState.render.awaitingTaskMail,
+              requestedFrames:
+                dspZeldaCommandState.render.requestedFrames,
+              currentFrame: dspZeldaCommandState.render.currentFrame,
+              currentVoice: dspZeldaCommandState.render.currentVoice,
+              outputVolume: dspZeldaCommandState.render.outputVolume,
+              outputLeftAddress:
+                dspZeldaCommandState.render.outputLeftAddress === null
+                  ? null
+                  : hex32(
+                      dspZeldaCommandState.render.outputLeftAddress
+                    ),
+              outputRightAddress:
+                dspZeldaCommandState.render.outputRightAddress === null
+                  ? null
+                  : hex32(
+                      dspZeldaCommandState.render.outputRightAddress
+                    ),
+              clearedBytes: dspZeldaCommandState.render.clearedBytes,
+            },
           },
           dspTrace,
           dspAudioDma: {
