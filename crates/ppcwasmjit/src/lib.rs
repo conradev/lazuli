@@ -1517,6 +1517,81 @@ if (result[0] !== 7 || result[1] !== 250) {
     }
 
     #[test]
+    fn quantized_fastmem_loads_halfwords_in_guest_byte_order() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+            return;
+        }
+
+        let sequence = [
+            psq_l(2, 3, 0, false, 0),
+            psq_st(2, 3, 16, false, 0),
+            psq_l(3, 3, 4, false, 1),
+            psq_st(3, 3, 20, false, 1),
+        ];
+        let block = Jit::with_slow_memory().build(sequence).unwrap();
+        Validator::new().validate_all(block.wasm()).unwrap();
+        let wasm = block
+            .wasm()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let script = r#"
+const [wasmHex, pcOffset, msrOffset, r3Offset, gqr0Offset, gqr1Offset] = process.argv.slice(1);
+const memory = new WebAssembly.Memory({ initial: 8 });
+const view = new DataView(memory.buffer);
+const cpu = 64;
+const fmem = 0x10000;
+const page = 0x40000;
+view.setUint32(cpu + Number(pcOffset), 0x80001000, true);
+view.setUint32(cpu + Number(msrOffset), 0x2000, true);
+view.setUint32(cpu + Number(r3Offset), 0x80002000, true);
+view.setUint32(cpu + Number(gqr0Offset), (5 << 16) | 5, true);
+view.setUint32(cpu + Number(gqr1Offset), (7 << 16) | 7, true);
+view.setUint32(fmem + (0x80000000 >>> 17) * 4, page, true);
+const input = Uint8Array.of(0x12, 0x34, 0xab, 0xcd, 0x80, 0x01, 0x7f, 0xfe);
+new Uint8Array(memory.buffer, page + 0x2000, input.length).set(input);
+const hooks = new Proxy({}, {
+  get(_target, name) {
+    return () => { throw new Error("unexpected runtime hook: " + String(name)); };
+  },
+});
+const { instance } = await WebAssembly.instantiate(Buffer.from(wasmHex, "hex"), {
+  lazuli: { memory },
+  lazuli_hooks: hooks,
+});
+instance.exports.run(0, cpu, fmem);
+const result = new Uint8Array(memory.buffer, page + 0x2010, input.length);
+if (!result.every((value, index) => value === input[index])) {
+  throw new Error(
+    "bad quantized halfword byte order: "
+      + Buffer.from(result).toString("hex")
+  );
+}
+"#;
+        let output = Command::new("node")
+            .args([
+                "--input-type=module",
+                "--eval",
+                script,
+                &wasm,
+                &Reg::PC.offset().to_string(),
+                &Reg::MSR.offset().to_string(),
+                &GPR::R3.offset().to_string(),
+                &SPR::GQR[0].offset().to_string(),
+                &SPR::GQR[1].offset().to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "node failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
     fn executes_both_conditional_branch_paths_like_the_native_jit() {
         for (count, expected_r4) in [(2, 2), (1, 41)] {
             let sequence = [
