@@ -169,18 +169,25 @@ test("strict V7 preflight rejects raw state that legacy sampler masking would hi
   }
 });
 
-test("strict V7 preflight remains dormant while the live producer stays byte-stable V6", () => {
+test("strict V7 preflight feeds the atomic live producer before legacy masking", () => {
   assert.equal(
     source.match(/\bgxStrictV7TexturePreflight\s*\(/g)?.length,
-    1,
-    "the only preflight occurrence is its declaration until V7 activation",
+    3,
+    "preflight has one declaration, one raw decode, and one snapshot recomputation",
   );
   const post = extractFunction("postGxFrame");
-  assert.match(post, /packGxFramePacketV6\(/);
-  assert.doesNotMatch(post, /packGxFramePacketV7|gxStrictV7TexturePreflight/);
-  assert.doesNotMatch(
-    extractFunction("gxDecodeTexture"),
-    /gxStrictV7TexturePreflight/,
+  assert.match(post, /packGxFramePacketForRenderer\(/);
+  const decode = extractFunction("gxDecodeTexture");
+  assert.match(decode, /strictV7Preflight = gxStrictV7TexturePreflight\(/);
+  assert.ok(
+    decode.indexOf("gxStrictV7TexturePreflight(")
+      < decode.indexOf("gxTextureSamplerState("),
+    "strict V7 sees raw MODE0/MODE1 before the V6 mask",
+  );
+  assert.match(
+    extractFunction("gxStrictV7TextureSnapshotClassification"),
+    /canonicalPreflight = gxStrictV7TexturePreflight\(/,
+    "activation never trusts an attached accepted preflight without recomputing it",
   );
 });
 
@@ -358,7 +365,7 @@ test("strict V7 preflight enforces format and power-of-two activation constraint
   );
 });
 
-test("strict V7 preflight classifies SMB-relevant state without approximation", () => {
+test("strict V7 preflight classifies transport-safe SMB-relevant raw state", () => {
   const context = pureContext();
   const mode0 =
     1

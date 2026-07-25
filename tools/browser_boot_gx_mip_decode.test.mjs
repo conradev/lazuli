@@ -34,6 +34,7 @@ const decodeFunctions = [
   "gxPrearmTextureCopyProducer",
   "gxTextureLayout",
   "gxTextureMipCount",
+  "gxStrictV7TexturePreflight",
   "gxTextureMipChainLayout",
   "gxTextureImageSource",
   "gxExpand3",
@@ -183,6 +184,10 @@ test("decodes the complete GX mip chain into one allocation with an exact v6 bas
   assert.notEqual(texture, null);
   assert.equal(texture.mode0, (rawMode0 & 0x0039ffff) >>> 0);
   assert.equal(texture.mode1, 0x3004);
+  assert.deepEqual(plain(texture.strictV7Preflight), {
+    accepted: false,
+    reason: "noncanonical-mode0-bits",
+  });
   assert.equal(texture.levelCount, 4);
   assert.equal(texture.encodedBytes, 128);
   assert.equal(texture.mipPixels.byteLength, 340);
@@ -219,6 +224,54 @@ test("decodes the complete GX mip chain into one allocation with an exact v6 bas
     texture.pixels.byteLength,
     texture.width * texture.height * 4,
     "the existing packet-facing pixels view remains base-level sized",
+  );
+});
+
+test("refreshes raw strict-V7 preflight state on every decoded-image cache hit", () => {
+  const { context, bytes } = decodeContext();
+  const address = 0x100;
+  const mode0 = 1 << 5;
+  const mode1 = 0x30 << 8;
+  configureTexture(context, { address, mode0, mode1 });
+  const chain = textureChain(context, { mode0, mode1 });
+  fillLevelBytes(bytes, address, chain, [0x11, 0x22, 0x33, 0x44]);
+
+  const first = context.gxDecodeTexture(0);
+  assert.equal(first.strictV7Preflight.accepted, true);
+  assert.equal(first.strictV7Preflight.classification, "genuine-mip");
+
+  const registers = context.gxTextureRegisters(0);
+  context.gxBpRegisters[registers.mode0] = mode0 | 0x80000000;
+  const rejectedMode0 = context.gxDecodeTexture(0);
+  assert.equal(rejectedMode0.key, first.key);
+  assert.strictEqual(rejectedMode0.mipPixels, first.mipPixels);
+  assert.deepEqual(plain(rejectedMode0.strictV7Preflight), {
+    accepted: false,
+    reason: "noncanonical-mode0-bits",
+  });
+  assert.equal(
+    first.strictV7Preflight.accepted,
+    true,
+    "the prior draw snapshot remains immutable",
+  );
+
+  context.gxBpRegisters[registers.mode0] = mode0;
+  context.gxBpRegisters[registers.mode1] = mode1 | 0x80000000;
+  const rejectedMode1 = context.gxDecodeTexture(0);
+  assert.equal(rejectedMode1.key, first.key);
+  assert.strictEqual(rejectedMode1.mipPixels, first.mipPixels);
+  assert.deepEqual(plain(rejectedMode1.strictV7Preflight), {
+    accepted: false,
+    reason: "noncanonical-mode1-bits",
+  });
+  assert.equal(context.gxTextureDecodes, 1);
+  assert.equal(context.gxTextureCacheHits, 2);
+
+  const decodeSource = extractFunction("gxDecodeTexture");
+  assert.ok(
+    decodeSource.indexOf("gxStrictV7TexturePreflight(")
+      < decodeSource.indexOf("gxTextureSamplerState("),
+    "raw preflight must run before legacy sampler canonicalization",
   );
 });
 

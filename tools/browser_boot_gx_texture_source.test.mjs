@@ -30,6 +30,7 @@ const pureFunctions = [
   "gxTextureRegisters",
   "gxTextureLayout",
   "gxTextureMipCount",
+  "gxStrictV7TexturePreflight",
   "gxTextureMipChainLayout",
   "gxTextureImageSource",
 ];

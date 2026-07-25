@@ -1395,6 +1395,213 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function gxStrictV7RenderKey(key) {
+      const domainTag = "~LZGX7:";
+      if (
+        typeof key !== "string"
+        || key.length === 0
+        || key.includes(domainTag)
+      ) {
+        return null;
+      }
+      // Keep the original numeric decoded-image key as the sort prefix so the
+      // renderer's lexicographic-min eviction policy has no global V6/V7
+      // domain bias. The reserved suffix and encoded source length keep the
+      // V7 mapping injective and disjoint from generated legacy identities.
+      return `${key}${domainTag}${key.length}`;
+    }
+
+    function gxStrictV7TextureSnapshotClassification(texture) {
+      if (texture === null || typeof texture !== "object") return null;
+      const key = texture.renderKey ?? texture.key;
+      if (
+        typeof key !== "string"
+        || key.length === 0
+        || key.includes("~LZGX7:")
+      ) {
+        return null;
+      }
+      const preflight = texture.strictV7Preflight;
+      if (
+        preflight === null
+        || typeof preflight !== "object"
+        || preflight.accepted !== true
+        || preflight.mode0 !== texture.mode0
+        || preflight.mode1 !== texture.mode1
+        || preflight.format !== texture.format
+        || preflight.width !== texture.width
+        || preflight.height !== texture.height
+        || preflight.levelCount !== texture.levelCount
+      ) {
+        return null;
+      }
+      const canonicalPreflight = gxStrictV7TexturePreflight(
+        texture.mode0,
+        texture.mode1,
+        texture.format,
+        texture.width,
+        texture.height
+      );
+      if (
+        canonicalPreflight.accepted !== true
+        || preflight.classification !== canonicalPreflight.classification
+        || preflight.mode0 !== canonicalPreflight.mode0
+        || preflight.mode1 !== canonicalPreflight.mode1
+        || preflight.format !== canonicalPreflight.format
+        || preflight.width !== canonicalPreflight.width
+        || preflight.height !== canonicalPreflight.height
+        || preflight.levelCount !== canonicalPreflight.levelCount
+        || preflight.minFilter !== canonicalPreflight.minFilter
+        || preflight.mipMode !== canonicalPreflight.mipMode
+        || preflight.magLinear !== canonicalPreflight.magLinear
+        || preflight.minLinear !== canonicalPreflight.minLinear
+        || preflight.diagonalLod !== canonicalPreflight.diagonalLod
+        || preflight.lodBiasRaw !== canonicalPreflight.lodBiasRaw
+        || preflight.lodBiasSixteenths
+          !== canonicalPreflight.lodBiasSixteenths
+        || preflight.lodMinRaw !== canonicalPreflight.lodMinRaw
+        || preflight.lodMaxRaw !== canonicalPreflight.lodMaxRaw
+        || preflight.effectiveLodMinRaw
+          !== canonicalPreflight.effectiveLodMinRaw
+        || preflight.effectiveLodMaxRaw
+          !== canonicalPreflight.effectiveLodMaxRaw
+        || preflight.wrapS !== canonicalPreflight.wrapS
+        || preflight.wrapT !== canonicalPreflight.wrapT
+      ) {
+        return null;
+      }
+      const genuineMip =
+        preflight.classification === "genuine-mip"
+        && preflight.mipMode !== 0
+        && preflight.levelCount > 1;
+      const baseOnlyCompanion =
+        preflight.classification === "base-only-companion"
+        && (
+          preflight.mipMode === 0
+          || preflight.levelCount === 1
+        );
+      if (genuineMip) return "genuine-mip";
+      if (baseOnlyCompanion) return "base-only-companion";
+      return null;
+    }
+
+    function gxPrepareStrictV7Frame(frame) {
+      const geometry = frame?.geometry;
+      if (geometry === null || typeof geometry !== "object") return null;
+      if (!Array.isArray(geometry.draws)) return null;
+
+      // Pass zero is the allocation-free legacy hot path. An authentic live
+      // producer always labels its genuine snapshot here; an untrusted label
+      // can only request the strict validation pass, never bypass it.
+      let hasGenuineMip = false;
+      for (let drawIndex = 0; drawIndex < geometry.draws.length; drawIndex += 1) {
+        const draw = geometry.draws[drawIndex];
+        if (draw === null || typeof draw !== "object") return null;
+        const textures = draw.textures;
+        if (textures === undefined || textures === null) continue;
+        if (!Array.isArray(textures) || textures.length > 8) return null;
+        for (let textureMap = 0; textureMap < textures.length; textureMap += 1) {
+          const texture = textures[textureMap];
+          if (texture === undefined || texture === null) continue;
+          if (typeof texture !== "object") return null;
+
+          const key = texture.renderKey ?? texture.key;
+          // V4-V7 all treat an empty key as an unused slot.
+          if (key === undefined || key === null || key === "") continue;
+          const preflight = texture.strictV7Preflight;
+          hasGenuineMip ||= (
+            preflight !== null
+            && typeof preflight === "object"
+            && preflight.accepted === true
+            && preflight.classification === "genuine-mip"
+            && preflight.mipMode !== 0
+            && preflight.levelCount > 1
+          );
+        }
+      }
+      if (!hasGenuineMip) return null;
+
+      // Pass one recomputes canonical preflight for every bound snapshot only
+      // after a potential genuine chain has made the frame a V7 candidate.
+      hasGenuineMip = false;
+      for (let drawIndex = 0; drawIndex < geometry.draws.length; drawIndex += 1) {
+        const draw = geometry.draws[drawIndex];
+        const textures = draw.textures;
+        if (textures === undefined || textures === null) continue;
+        for (let textureMap = 0; textureMap < textures.length; textureMap += 1) {
+          const texture = textures[textureMap];
+          if (texture === undefined || texture === null) continue;
+          const key = texture.renderKey ?? texture.key;
+          if (key === undefined || key === null || key === "") continue;
+          // This snapshot was produced from the raw BP words before the
+          // legacy sampler mask. Recheck every occurrence, including repeated
+          // image keys whose draw-local sampler state can differ.
+          const classification =
+            gxStrictV7TextureSnapshotClassification(texture);
+          if (classification === null) return null;
+          hasGenuineMip ||= classification === "genuine-mip";
+        }
+      }
+      if (!hasGenuineMip) return null;
+
+      // Pass two is V7-only. Clone the frame structure, but allocate a new
+      // texture object only for genuine chains that require a disjoint layout
+      // identity. Base-only companions retain their V6 cache identity.
+      const draws = new Array(geometry.draws.length);
+      for (let drawIndex = 0; drawIndex < geometry.draws.length; drawIndex += 1) {
+        const draw = geometry.draws[drawIndex];
+        const textures = draw.textures ?? [];
+        const preparedTextures = textures.slice();
+        for (let textureMap = 0; textureMap < textures.length; textureMap += 1) {
+          const texture = textures[textureMap];
+          if (texture === undefined || texture === null) continue;
+          const key = texture.renderKey ?? texture.key;
+          if (key === undefined || key === null || key === "") continue;
+          if (texture.strictV7Preflight.classification !== "genuine-mip") {
+            continue;
+          }
+          const renderKey = gxStrictV7RenderKey(key);
+          if (renderKey === null) {
+            throw new Error("strict GX mip key changed after preflight");
+          }
+          // Base-only resources have the same one-level layout in V6 and V7,
+          // so they intentionally share legacy residency. Only a genuine mip
+          // chain needs a disjoint renderer-cache identity.
+          preparedTextures[textureMap] = { ...texture, renderKey };
+        }
+        draws[drawIndex] = { ...draw, textures: preparedTextures };
+      }
+      return {
+        ...frame,
+        geometry: {
+          ...geometry,
+          draws,
+        },
+      };
+    }
+
+    function packGxFramePacketForRenderer(
+      copyKind,
+      frame,
+      residentTextureKeys = null
+    ) {
+      const v7Frame = gxPrepareStrictV7Frame(frame);
+      if (v7Frame === null) {
+        return packGxFramePacketV6(copyKind, frame, residentTextureKeys);
+      }
+      const packet = packGxFramePacketV7(
+        copyKind,
+        v7Frame,
+        residentTextureKeys
+      );
+      if (new DataView(packet).getUint16(0x04, true) !== 7) {
+        // Eligibility promised a genuine chain. A legacy result is therefore
+        // a producer bug, not a reason to retry with a different cache layout.
+        throw new Error("strict GX mip activation did not produce LZGX v7");
+      }
+      return packet;
+    }
+
     function postGxFrame(copyKind, frame) {
       const diagnostics = {
         copyKind,
@@ -1413,9 +1620,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       let packet;
       try {
-        // The v6 encoder preserves canonical v4/v5 bytes until at least one
-        // draw declares exact homogeneous geometry authoritative.
-        packet = packGxFramePacketV6(copyKind, frame, residentTextureKeys);
+        packet = packGxFramePacketForRenderer(
+          copyKind,
+          frame,
+          residentTextureKeys
+        );
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
@@ -7790,7 +7999,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       return Math.min(theoreticalLevels, requestedLevels);
     }
 
-    // Future V7 activation must call this with the raw BP words before
+    // Live V7 activation snapshots this result from the raw BP words before
     // gxTextureSamplerState canonicalizes legacy V6 sampling state.
     function gxStrictV7TexturePreflight(rawMode0, rawMode1, format, width, height) {
       const reject = reason => ({ accepted: false, reason });
@@ -8296,18 +8505,31 @@ const TEMPLATE: &str = r##"<!doctype html>
     function gxDecodeTexture(textureMap) {
       const registers = gxTextureRegisters(textureMap);
       const image0 = gxBpRegisters[registers.image0];
-      const mode0 = gxBpRegisters[registers.mode0];
-      const mode1 = gxBpRegisters[registers.mode1];
-      const sampler = gxTextureSamplerState(mode0, mode1);
+      const rawMode0 = gxBpRegisters[registers.mode0];
+      const rawMode1 = gxBpRegisters[registers.mode1];
       const width = (image0 & 0x3ff) + 1;
       const height = ((image0 >>> 10) & 0x3ff) + 1;
       const format = (image0 >>> 20) & 0xf;
+      const strictV7Preflight = gxStrictV7TexturePreflight(
+        rawMode0,
+        rawMode1,
+        format,
+        width,
+        height
+      );
+      const sampler = gxTextureSamplerState(rawMode0, rawMode1);
       const layout = gxTextureLayout(format);
       if (layout === null || width > 1024 || height > 1024 || width * height > 1_048_576) {
         gxTextureDecodeErrors += 1;
         return null;
       }
-      const mipChain = gxTextureMipChainLayout(width, height, layout, mode0, mode1);
+      const mipChain = gxTextureMipChainLayout(
+        width,
+        height,
+        layout,
+        rawMode0,
+        rawMode1
+      );
       if (mipChain === null) {
         // MODE0 mip mode 3 is reserved. Do not silently reinterpret it as a
         // base-only or MODE1-selected source chain.
@@ -8329,9 +8551,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const address = imageSource.address;
       const textureCopyIndex = gxTextureCopyDestinations.get(address);
       if (gxTextureLowerMipCopyGeneration(address, mipChain) !== null) {
-        // LZGX v6 can identify only the base texture-copy generation. A copied
-        // EFB surface inside a lower level would otherwise be silently decoded
-        // as unrelated RAM and then cached under incomplete provenance.
+        // LZGX transport identifies only the base texture-copy generation. A
+        // copied EFB surface inside a lower level would otherwise be silently
+        // decoded as unrelated RAM and cached under incomplete provenance.
         gxTextureDecodeErrors += 1;
         return null;
       }
@@ -8378,7 +8600,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         // Sampling state is draw state, not decoded-image identity. Return a
         // fresh snapshot so a BP mode change cannot rewrite an earlier draw or
         // inherit the sampler from the cache entry's first decode.
-        return { ...cached, ...sampler };
+        return { ...cached, ...sampler, strictV7Preflight };
       }
 
       const mipPixels = new Uint8ClampedArray(mipChain.decodedBytes);
@@ -8412,6 +8634,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         encodedBytes,
         hash: "0x" + hash.toString(16).padStart(8, "0"),
         ...sampler,
+        strictV7Preflight,
         pixels,
         mipPixels,
         mipLevels,
@@ -9623,7 +9846,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       topology,
       vertexCount,
       pipeline,
-      texturedStages
+      texturedStages,
+      textures
     ) {
       if (
         gxSourceTriangleCount(topology, vertexCount) === 0
@@ -9637,6 +9861,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       let liveTexCoordMask = 0;
       let requiredTextureMapMask = 0;
+      let allLegacySamplersEligible = true;
       for (const stage of texturedStages) {
         if (
           stage === null
@@ -9656,19 +9881,61 @@ const TEMPLATE: &str = r##"<!doctype html>
       if ((liveTexCoordMask & (liveTexCoordMask - 1)) !== 0) return false;
       for (let textureMap = 0; textureMap < 8; textureMap += 1) {
         if ((requiredTextureMapMask & (1 << textureMap)) === 0) continue;
-        const mode0Register =
-          0x80 + (textureMap >= 4 ? 0x20 : 0) + (textureMap & 3);
-        const mode0 = gxBpRegisters[mode0Register] >>> 0;
+        const texture = Array.isArray(textures) ? textures[textureMap] : null;
+        const registers = gxTextureRegisters(textureMap);
+        const mode0 = texture === null || typeof texture !== "object"
+          ? gxBpRegisters[registers.mode0] >>> 0
+          : texture.mode0 >>> 0;
         const magFilter = (mode0 >>> 4) & 1;
         const minFilter = (mode0 >>> 5) & 7;
         const maxAnisotropy = (mode0 >>> 19) & 3;
-        if (
+        const image0 = gxBpRegisters[registers.image0] >>> 0;
+        const width = texture === null || typeof texture !== "object"
+          ? (image0 & 0x3ff) + 1
+          : texture.width;
+        const height = texture === null || typeof texture !== "object"
+          ? ((image0 >>> 10) & 0x3ff) + 1
+          : texture.height;
+        const wrapS = mode0 & 3;
+        const wrapT = (mode0 >>> 2) & 3;
+        const legacyWrapEligible = (
+          Number.isInteger(width)
+          && Number.isInteger(height)
+          && width >= 1
+          && height >= 1
+          && (
+            (wrapS !== 1 && wrapS !== 2)
+            || (width & (width - 1)) === 0
+          )
+          && (
+            (wrapT !== 1 && wrapT !== 2)
+            || (height & (height - 1)) === 0
+          )
+        );
+        const legacyBaseEligible = (
           (minFilter & 3) !== 0
-          || magFilter !== (minFilter >>> 2)
-          || maxAnisotropy !== 0
-        ) {
-          return false;
+            ? false
+            : magFilter === (minFilter >>> 2)
+              && maxAnisotropy === 0
+              && legacyWrapEligible
+        );
+        allLegacySamplersEligible &&= legacyBaseEligible;
+      }
+      if (!allLegacySamplersEligible) {
+        // V6 remains constrained to equal base-level min/mag filters. The
+        // alternative is packet-wide V7 manual sampling, which is safe only
+        // when every required draw snapshot is authentic and at least one
+        // required binding guarantees a genuine resident mip chain.
+        if (!Array.isArray(textures)) return false;
+        let hasStrictV7GenuineMip = false;
+        for (let textureMap = 0; textureMap < 8; textureMap += 1) {
+          if ((requiredTextureMapMask & (1 << textureMap)) === 0) continue;
+          const classification =
+            gxStrictV7TextureSnapshotClassification(textures[textureMap]);
+          if (classification === null) return false;
+          hasStrictV7GenuineMip ||= classification === "genuine-mip";
         }
+        if (!hasStrictV7GenuineMip) return false;
       }
       // The receiver currently manages only the fixed-function early-depth
       // path. This conservative subset avoids reproducing the complete alpha
@@ -10055,12 +10322,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxTevStageState(stageIndex)
       );
       const texturedStages = stages.filter(stage => stage.textureEnabled);
-      const collectCullSources = gxManagedCoverageStateCandidate(
-        topology,
-        vertexCount,
-        pipeline,
-        texturedStages
-      );
       const vertices = [];
       const texCoordSets = Array.from({ length: 8 }, () => []);
       const rawTextureCoordSets = Array.from({ length: 8 }, () => []);
@@ -10154,6 +10415,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
       const textures = gxTevTextures(stages);
+      const collectCullSources = gxManagedCoverageStateCandidate(
+        topology,
+        vertexCount,
+        pipeline,
+        texturedStages,
+        textures
+      );
       if (texturedStages.length !== 0) {
         gxTexturedDraws += 1;
         statusDataset.gxTextures = String(gxTexturedDraws);

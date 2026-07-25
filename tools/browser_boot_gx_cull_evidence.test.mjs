@@ -53,6 +53,9 @@ const pureFunctions = [
   "gxPostCullAction",
   "gxPostCullEvidence",
   "gxTextureRegisters",
+  "gxTextureMipCount",
+  "gxStrictV7TexturePreflight",
+  "gxStrictV7TextureSnapshotClassification",
   "gxTextureSamplerState",
   "gxManagedCoverageStateCandidate",
   "gxManagedCoverageVerticesCandidate",
@@ -632,9 +635,62 @@ test("producer gates exact cull work to the receiver's current managed subset", 
     context.gxBpRegisters[mode0] =
       (magFilter << 4) | (minFilter << 5) | (maxAnisotropy << 19);
   };
+  const setTextureImage = (
+    textureMap,
+    {
+      width = 4,
+      height = 4,
+      format = 6,
+      mode1 = 0x2000,
+    } = {},
+  ) => {
+    const registers = context.gxTextureRegisters(textureMap);
+    context.gxBpRegisters[registers.image0] =
+      ((width - 1) | ((height - 1) << 10) | (format << 20)) >>> 0;
+    context.gxBpRegisters[registers.mode1] = mode1 >>> 0;
+  };
+  const textureSnapshots = stages => {
+    const textures = Array(8).fill(null);
+    for (const { textureMap } of stages) {
+      if (textures[textureMap] !== null) continue;
+      const registers = context.gxTextureRegisters(textureMap);
+      const mode0 = context.gxBpRegisters[registers.mode0] >>> 0;
+      const mode1 = context.gxBpRegisters[registers.mode1] >>> 0;
+      const image0 = context.gxBpRegisters[registers.image0] >>> 0;
+      const width = (image0 & 0x3ff) + 1;
+      const height = ((image0 >>> 10) & 0x3ff) + 1;
+      const format = (image0 >>> 20) & 0xf;
+      const strictV7Preflight = context.gxStrictV7TexturePreflight(
+        mode0,
+        mode1,
+        format,
+        width,
+        height,
+      );
+      textures[textureMap] = {
+        key: `map-${textureMap}`,
+        mode0,
+        mode1,
+        format,
+        width,
+        height,
+        levelCount: strictV7Preflight.levelCount,
+        strictV7Preflight,
+      };
+    }
+    return textures;
+  };
+  const candidate = (topology, vertexCount, state, stages) =>
+    context.gxManagedCoverageStateCandidate(
+      topology,
+      vertexCount,
+      state,
+      stages,
+      textureSnapshots(stages),
+    );
 
   assert.equal(
-    context.gxManagedCoverageStateCandidate(2, 3, pipeline, []),
+    candidate(2, 3, pipeline, []),
     true,
   );
   for (const override of [
@@ -645,7 +701,7 @@ test("producer gates exact cull work to the receiver's current managed subset", 
     { zMode: 1 | (1 << 4), pixelControl: 1 << 6 },
   ]) {
     assert.equal(
-      context.gxManagedCoverageStateCandidate(
+      candidate(
         2,
         3,
         { ...pipeline, ...override },
@@ -657,14 +713,42 @@ test("producer gates exact cull work to the receiver's current managed subset", 
 
   setTextureMode(0, 1, 4);
   assert.equal(
-    context.gxManagedCoverageStateCandidate(0, 4, pipeline, [stage(0, 0)]),
+    candidate(0, 4, pipeline, [stage(0, 0)]),
     true,
     "saved SMB min-linear/mag-linear coord0 draws enter the coarse evidence subset",
   );
+  const texture0Registers = context.gxTextureRegisters(0);
+  setTextureImage(0, { width: 3, height: 4, mode1: 0 });
+  context.gxBpRegisters[texture0Registers.mode0] |= 1;
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    false,
+    "legacy repeat-S requires a power-of-two width",
+  );
+  context.gxBpRegisters[texture0Registers.mode0] &= ~3;
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    true,
+    "legacy clamp remains safe for a non-power-of-two width",
+  );
+  setTextureImage(0, { width: 4, height: 3, mode1: 0 });
+  context.gxBpRegisters[texture0Registers.mode0] |= 2 << 2;
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    false,
+    "legacy mirror-T requires a power-of-two height",
+  );
+  setTextureImage(0, { width: 4, height: 4, mode1: 0 });
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    true,
+    "legacy power-of-two repeat/mirror remains eligible",
+  );
+  setTextureMode(0, 1, 4);
 
   setTextureMode(1, 0, 0);
   assert.equal(
-    context.gxManagedCoverageStateCandidate(
+    candidate(
       0,
       4,
       pipeline,
@@ -675,7 +759,7 @@ test("producer gates exact cull work to the receiver's current managed subset", 
   );
   setTextureMode(1, 1, 0);
   assert.equal(
-    context.gxManagedCoverageStateCandidate(
+    candidate(
       0,
       4,
       pipeline,
@@ -689,24 +773,147 @@ test("producer gates exact cull work to the receiver's current managed subset", 
   for (const [name, magFilter, minFilter] of [
     ["nearest min with linear mag", 1, 0],
     ["linear min with nearest mag", 0, 4],
-    ["mipmapped min mode", 0, 1],
+    ["base-only mip state cannot activate V7", 0, 1],
   ]) {
     setTextureMode(0, magFilter, minFilter);
     assert.equal(
-      context.gxManagedCoverageStateCandidate(0, 4, pipeline, [stage(0, 0)]),
+      candidate(0, 4, pipeline, [stage(0, 0)]),
       false,
       name,
     );
   }
+  setTextureImage(0);
+  for (const [name, magFilter, minFilter] of [
+    ["nearest mip nearest", 0, 1],
+    ["nearest mip linear", 1, 2],
+    ["linear mip nearest", 0, 5],
+    ["linear mip linear", 1, 6],
+  ]) {
+    setTextureMode(0, magFilter, minFilter);
+    assert.equal(
+      candidate(0, 4, pipeline, [stage(0, 0)]),
+      true,
+      `canonical strict-V7 ${name} draw enters managed coverage`,
+    );
+  }
+  setTextureMode(0, 1, 1);
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    true,
+    "strict V7 handles a derivative-selected min/mag mismatch",
+  );
+  assert.equal(
+    context.gxManagedCoverageStateCandidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0)],
+    ),
+    false,
+    "raw BP mip bits cannot authorize managed coverage without a snapshot",
+  );
+  const rejectedSnapshot = textureSnapshots([stage(0, 0)]);
+  rejectedSnapshot[0].strictV7Preflight = {
+    accepted: false,
+    reason: "test-rejection",
+  };
+  assert.equal(
+    context.gxManagedCoverageStateCandidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0)],
+      rejectedSnapshot,
+    ),
+    false,
+    "a rejected strict-V7 snapshot cannot authorize managed coverage",
+  );
+
+  setTextureMode(1, 0, 0);
+  setTextureImage(1, { mode1: 0 });
+  const unsafeCompanion = textureSnapshots([stage(0, 0), stage(0, 1)]);
+  unsafeCompanion[1].strictV7Preflight = {
+    accepted: false,
+    reason: "test-companion-rejection",
+  };
+  assert.equal(
+    context.gxManagedCoverageStateCandidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0), stage(0, 1)],
+      unsafeCompanion,
+    ),
+    false,
+    "every required snapshot must pass the selector's strict-V7 validation",
+  );
+
+  setTextureMode(1, 0, 1);
+  setTextureImage(1, { mode1: 0 });
+  assert.equal(
+    candidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0), stage(0, 1)],
+    ),
+    true,
+    "a base-only mip companion is safe beside a genuine strict-V7 chain",
+  );
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 1)]),
+    false,
+    "a base-only mip companion cannot activate managed V7 by itself",
+  );
+  setTextureMode(1, 1, 0);
+  assert.equal(
+    candidate(
+      0,
+      4,
+      pipeline,
+      [stage(0, 0), stage(0, 1)],
+    ),
+    true,
+    "full V7 safely admits a base-only min/mag mismatch companion",
+  );
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 1)]),
+    false,
+    "the same min/mag mismatch remains outside the V6 managed subset",
+  );
+
+  setTextureMode(0, 0, 1, 1);
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    false,
+    "strict V7 preserves the anisotropy rejection",
+  );
+  setTextureMode(0, 0, 1);
+  const texture0 = context.gxTextureRegisters(0);
+  context.gxBpRegisters[texture0.mode0] |= 1 << 21;
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    false,
+    "strict V7 preserves the LOD/bias clamp rejection",
+  );
+  setTextureMode(0, 0, 1);
+  setTextureImage(0, { width: 3 });
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    false,
+    "strict V7 preserves the power-of-two mip constraint",
+  );
+
+  setTextureImage(0);
   setTextureMode(0, 1, 4, 1);
   assert.equal(
-    context.gxManagedCoverageStateCandidate(0, 4, pipeline, [stage(0, 0)]),
+    candidate(0, 4, pipeline, [stage(0, 0)]),
     false,
     "anisotropic sampling exceeds the managed sampler contract",
   );
   setTextureMode(0, 1, 4);
   assert.equal(
-    context.gxManagedCoverageStateCandidate(
+    candidate(
       0,
       4,
       pipeline,
@@ -716,7 +923,7 @@ test("producer gates exact cull work to the receiver's current managed subset", 
     "two live texcoords exceed the producer subset",
   );
   assert.equal(
-    context.gxManagedCoverageStateCandidate(5, 3, pipeline, []),
+    candidate(5, 3, pipeline, []),
     false,
   );
 });
@@ -744,11 +951,11 @@ test("texture sampling state is a complete per-draw snapshot outside decode iden
   );
   assert.match(
     source,
-    /const sampler = gxTextureSamplerState\(mode0, mode1\)/,
+    /const sampler = gxTextureSamplerState\(rawMode0, rawMode1\)/,
   );
   assert.match(
     source,
-    /return \{ \.\.\.cached, \.\.\.sampler \}/,
+    /return \{ \.\.\.cached, \.\.\.sampler, strictV7Preflight \}/,
     "cache hits must snapshot current mode0 without mutating earlier draws",
   );
   assert.match(
@@ -825,7 +1032,7 @@ test("draw capture keeps raw position provenance independent of managed eligibil
   const capture = extractFunction("recordGxPrimitive");
   assert.match(
     capture,
-    /const collectCullSources = gxManagedCoverageStateCandidate\(\s*topology,\s*vertexCount,\s*pipeline,\s*texturedStages\s*\)/,
+    /const collectCullSources = gxManagedCoverageStateCandidate\(\s*topology,\s*vertexCount,\s*pipeline,\s*texturedStages,\s*textures\s*\)/,
   );
   assert.match(
     capture,
@@ -838,10 +1045,6 @@ test("draw capture keeps raw position provenance independent of managed eligibil
   assert.doesNotMatch(
     capture,
     /if \(collectCullSources\)[\s\S]{0,160}sourcePositions\.push/,
-  );
-  assert.doesNotMatch(
-    capture,
-    /gxManagedCoverageStateCandidate\([\s\S]{0,180}texturedStages\.length/,
   );
 });
 
@@ -1246,8 +1449,13 @@ test("exact projection and viewport model pins scalar f32 operation order", () =
   );
   assert.match(
     extractFunction("postGxFrame"),
-    /packGxFramePacketV6\(/,
-    "live transport negotiates v6 only for frames carrying required exact geometry",
+    /packGxFramePacketForRenderer\(/,
+    "live transport atomically negotiates strict mip transport beside exact geometry",
+  );
+  assert.match(
+    extractFunction("packGxFramePacketForRenderer"),
+    /v7Frame === null[\s\S]*packGxFramePacketV6\([\s\S]*packGxFramePacketV7\(/,
+    "ineligible mip state retains canonical v6 exact-geometry bytes",
   );
   assert.doesNotMatch(
     extractFunction("postGxFrame"),

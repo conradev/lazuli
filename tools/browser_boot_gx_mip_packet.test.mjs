@@ -53,10 +53,16 @@ const packetFunctions = [
   "gxFramePacketExactClipInput",
   "packGxFramePacketV5",
   "packGxFramePacketV6",
+  "gxTextureMipCount",
+  "gxStrictV7TexturePreflight",
   "gxFramePacketMipLayout",
   "gxFramePacketMipTexture",
   "gxFramePacketEqualMipTexture",
   "packGxFramePacketV7",
+  "gxStrictV7RenderKey",
+  "gxStrictV7TextureSnapshotClassification",
+  "gxPrepareStrictV7Frame",
+  "packGxFramePacketForRenderer",
 ];
 
 function packetContext() {
@@ -230,6 +236,57 @@ function twoLevelTexture(overrides = {}) {
   };
 }
 
+function strictTexture(context, {
+  key = "strict-4x4",
+  mode0 = 1 << 5,
+  mode1 = 0x20 << 8,
+  width = 4,
+  height = 4,
+  format = 6,
+  seed = 0x31,
+  rawMode0 = mode0,
+  rawMode1 = mode1,
+  overrides = {},
+} = {}) {
+  const preflight = context.gxStrictV7TexturePreflight(
+    rawMode0,
+    rawMode1,
+    format,
+    width,
+    height,
+  );
+  const levelCount = preflight.accepted ? preflight.levelCount : 3;
+  let levelWidth = width;
+  let levelHeight = height;
+  let decodedBytes = 0;
+  for (let level = 0; level < levelCount; level += 1) {
+    decodedBytes += levelWidth * levelHeight * 4;
+    levelWidth = Math.max(1, Math.floor(levelWidth / 2));
+    levelHeight = Math.max(1, Math.floor(levelHeight / 2));
+  }
+  const mipPixels = sequence(decodedBytes, seed);
+  return {
+    key,
+    address: 0x00125000,
+    textureCopyIndex: 19,
+    width,
+    height,
+    format,
+    mode0: mode0 & 0x0039ffff,
+    mode1: mode1 & 0xffff,
+    levelCount,
+    wrapS: mode0 & 3,
+    wrapT: (mode0 >>> 2) & 3,
+    magFilter: (mode0 >>> 4) & 1,
+    minFilter: (mode0 >>> 5) & 7,
+    maxAnisotropy: (mode0 >>> 19) & 3,
+    pixels: mipPixels.subarray(0, width * height * 4),
+    mipPixels,
+    strictV7Preflight: preflight,
+    ...overrides,
+  };
+}
+
 function packetBytes(packet) {
   return Array.from(new Uint8Array(packet));
 }
@@ -237,6 +294,434 @@ function packetBytes(packet) {
 function align16(value) {
   return (value + 15) & ~15;
 }
+
+test("atomically rejects first or last unsafe binding without touching V6 bytes", () => {
+  const context = packetContext();
+  const good = strictTexture(context);
+  const rejected = strictTexture(context, {
+    key: "strict-rejected",
+    rawMode0: (1 << 5) + 0x80000000,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(rejected.strictV7Preflight)), {
+    accepted: false,
+    reason: "noncanonical-mode0-bits",
+  });
+
+  for (const draws of [
+    [baseDraw([rejected]), baseDraw([good])],
+    [baseDraw([good]), baseDraw([rejected])],
+  ]) {
+    const frame = frameWithDraws(draws);
+    const originalTextures = draws.map(draw => draw.textures);
+    const legacy = context.packGxFramePacketV6(2, frame);
+    const selected = context.packGxFramePacketForRenderer(2, frame);
+    assert.equal(context.gxPrepareStrictV7Frame(frame), null);
+    assert.deepEqual(packetBytes(selected), packetBytes(legacy));
+    assert.deepEqual(
+      draws.map(draw => draw.textures),
+      originalTextures,
+      "the rejected frame retains every original texture array",
+    );
+    assert.ok(draws.flatMap(draw => draw.textures).every(texture =>
+      !Object.hasOwn(texture, "renderKey")
+    ));
+  }
+});
+
+test("recomputes strict snapshots before accepting forged V7 preflight", () => {
+  const context = packetContext();
+  const canonical = strictTexture(context, { key: "forged-canonical" });
+  const cases = [
+    {
+      name: "LOD/bias clamp",
+      mode0: canonical.mode0 | (1 << 21),
+    },
+    {
+      name: "anisotropy",
+      mode0: canonical.mode0 | (1 << 19),
+    },
+    {
+      name: "non-power-of-two mip",
+      width: 3,
+      pixels: canonical.pixels.subarray(0, 3 * canonical.height * 4),
+    },
+  ];
+  for (const { name, ...changes } of cases) {
+    const forged = {
+      ...canonical,
+      key: `forged-${name}`,
+      ...changes,
+      strictV7Preflight: {
+        ...canonical.strictV7Preflight,
+        ...changes,
+        accepted: true,
+        classification: "genuine-mip",
+      },
+    };
+    assert.equal(forged.strictV7Preflight.accepted, true);
+    assert.equal(
+      context.gxStrictV7TextureSnapshotClassification(forged),
+      null,
+      `${name} bypassed canonical recomputation`,
+    );
+    const frame = frameWithDraws([baseDraw([forged])]);
+    assert.equal(context.gxPrepareStrictV7Frame(frame), null);
+    assert.deepEqual(
+      packetBytes(context.packGxFramePacketForRenderer(2, frame)),
+      packetBytes(context.packGxFramePacketV6(2, frame)),
+      `${name} did not retain exact V6 fallback bytes`,
+    );
+  }
+});
+
+test("namespaces only genuine V7 chains while preflighting base companions", () => {
+  const context = packetContext();
+  const mip = strictTexture(context, { key: "mip:key" });
+  const companion = strictTexture(context, {
+    key: "base:key:with:separators",
+    mode0: 0,
+    mode1: 0x20 << 8,
+    seed: 0x71,
+  });
+  assert.equal(mip.strictV7Preflight.classification, "genuine-mip");
+  assert.equal(
+    companion.strictV7Preflight.classification,
+    "base-only-companion",
+  );
+  const frame = frameWithDraws([baseDraw([mip, companion])]);
+  const prepared = context.gxPrepareStrictV7Frame(frame);
+  assert.notEqual(prepared, null);
+  const [preparedMip, preparedCompanion] =
+    prepared.geometry.draws[0].textures;
+  assert.equal(
+    preparedMip.renderKey,
+    `${mip.key}~LZGX7:${mip.key.length}`,
+  );
+  assert.equal("renderKey" in preparedCompanion, false);
+  assert.strictEqual(preparedCompanion, companion);
+  assert.notEqual(preparedMip.renderKey, companion.key);
+  assert.equal("renderKey" in mip, false);
+  assert.equal("renderKey" in companion, false);
+  assert.notStrictEqual(prepared, frame);
+  assert.notStrictEqual(prepared.geometry, frame.geometry);
+  assert.notStrictEqual(prepared.geometry.draws[0], frame.geometry.draws[0]);
+
+  const packet = context.packGxFramePacketForRenderer(2, frame);
+  assert.equal(new DataView(packet).getUint16(0x04, true), 7);
+  assert.equal(
+    context.gxStrictV7RenderKey("left:2:right"),
+    "left:2:right~LZGX7:12",
+  );
+  assert.notEqual(
+    context.gxStrictV7RenderKey("1:a:b"),
+    context.gxStrictV7RenderKey("3:a:b"),
+  );
+  assert.equal(
+    context.gxStrictV7RenderKey("old~LZGX7:3"),
+    null,
+    "an already-namespaced legacy key cannot alias this generation",
+  );
+});
+
+test("reuses V6 residency for accepted base-only companions inside V7", () => {
+  const context = packetContext();
+  const mip = strictTexture(context, { key: "mip-resident" });
+  const companion = strictTexture(context, {
+    key: "base-resident",
+    mode0: 0,
+    mode1: 0,
+    seed: 0x61,
+  });
+  const companionFrame = frameWithDraws([baseDraw([companion])]);
+  assert.equal(
+    new DataView(
+      context.packGxFramePacketForRenderer(2, companionFrame),
+    ).getUint32(0x48, true),
+    64,
+  );
+  assert.equal(
+    new DataView(
+      context.packGxFramePacketForRenderer(
+        2,
+        companionFrame,
+        new Set([companion.key]),
+      ),
+    ).getUint32(0x48, true),
+    0,
+    "the legacy key acknowledges the base-only V6 resource",
+  );
+
+  const frame = frameWithDraws([baseDraw([mip, companion])]);
+  const prepared = context.gxPrepareStrictV7Frame(frame);
+  const mipKey = prepared.geometry.draws[0].textures[0].renderKey;
+  const companionKey = prepared.geometry.draws[0].textures[1].key;
+  assert.equal(companionKey, companion.key);
+  assert.equal("renderKey" in prepared.geometry.draws[0].textures[1], false);
+
+  const companionResident = context.packGxFramePacketForRenderer(
+    2,
+    frame,
+    new Set([companion.key]),
+  );
+  const companionResidentView = new DataView(companionResident);
+  const textureOffset = companionResidentView.getUint32(0x20, true);
+  assert.equal(companionResidentView.getUint16(0x04, true), 7);
+  assert.equal(companionResidentView.getUint32(0x48, true), 96);
+  assert.equal(companionResidentView.getUint32(textureOffset + 0x0c, true), 84);
+  assert.equal(
+    companionResidentView.getUint32(textureOffset + 64 + 0x0c, true),
+    0,
+  );
+
+  const mipResident = context.packGxFramePacketForRenderer(
+    2,
+    frame,
+    new Set([mipKey]),
+  );
+  const mipResidentView = new DataView(mipResident);
+  assert.equal(mipResidentView.getUint32(0x48, true), 64);
+  assert.equal(mipResidentView.getUint32(textureOffset + 0x0c, true), 0);
+  assert.equal(
+    mipResidentView.getUint32(textureOffset + 64 + 0x0c, true),
+    64,
+    "the base companion retains its legacy payload and key",
+  );
+});
+
+test("checks duplicate image snapshots per draw and retains their sampler words", () => {
+  const context = packetContext();
+  const first = strictTexture(context, { key: "shared-image" });
+  const secondMode0 = (1 << 5) | 1;
+  const second = strictTexture(context, {
+    key: first.key,
+    mode0: secondMode0,
+  });
+  const frame = frameWithDraws([baseDraw([first]), baseDraw([second])]);
+  const packet = context.packGxFramePacketForRenderer(2, frame);
+  const view = new DataView(packet);
+  const drawOffset = view.getUint32(0x1c, true);
+  assert.equal(view.getUint16(0x04, true), 7);
+  assert.equal(view.getUint32(0x18, true), 1);
+  assert.equal(view.getUint32(drawOffset + 0x34, true), first.mode0);
+  assert.equal(view.getUint32(drawOffset + 176 + 0x34, true), second.mode0);
+
+  const rejectedDuplicate = strictTexture(context, {
+    key: first.key,
+    rawMode0: (1 << 5) + 0x80000000,
+  });
+  const rejectedFrame = frameWithDraws([
+    baseDraw([first]),
+    baseDraw([rejectedDuplicate]),
+  ]);
+  assert.equal(context.gxPrepareStrictV7Frame(rejectedFrame), null);
+  assert.deepEqual(
+    packetBytes(context.packGxFramePacketForRenderer(2, rejectedFrame)),
+    packetBytes(context.packGxFramePacketV6(2, rejectedFrame)),
+  );
+});
+
+test("keeps no-mip frames byte-identical to the canonical legacy packet", () => {
+  const context = packetContext();
+  const namespace = context.gxStrictV7RenderKey;
+  let namespaceCalls = 0;
+  context.gxStrictV7RenderKey = key => {
+    namespaceCalls += 1;
+    return namespace(key);
+  };
+  const companion = strictTexture(context, {
+    key: "base-only",
+    mode0: 0,
+    mode1: 0xff << 8,
+  });
+  const frame = frameWithDraws([exactDraw([companion], true)]);
+  assert.equal(context.gxPrepareStrictV7Frame(frame), null);
+  const legacy = context.packGxFramePacketV6(2, frame);
+  const selected = context.packGxFramePacketForRenderer(2, frame);
+  assert.equal(new DataView(selected).getUint16(0x04, true), 6);
+  assert.deepEqual(packetBytes(selected), packetBytes(legacy));
+  assert.equal(
+    namespaceCalls,
+    0,
+    "legacy/no-mip frames never enter namespace allocation",
+  );
+
+  const prepare = extractFunction("gxPrepareStrictV7Frame");
+  const legacyReturn = prepare.indexOf("if (!hasGenuineMip) return null;");
+  const clonePass = prepare.indexOf("const draws = new Array(");
+  assert.ok(legacyReturn >= 0 && clonePass > legacyReturn);
+  assert.doesNotMatch(
+    prepare.slice(0, legacyReturn),
+    /gxStrictV7RenderKey\(|new Array\(|\.slice\(\)|\{\s*\.\.\./,
+    "the validation pass allocates no frame, draw, texture, or namespace clone",
+  );
+});
+
+test("keeps V6 and V7 residency transitions in disjoint cache namespaces", () => {
+  const context = packetContext();
+  const sharedKey = "layout-transition";
+  const companion = strictTexture(context, {
+    key: sharedKey,
+    mode0: 0,
+    mode1: 0,
+  });
+  const mip = strictTexture(context, { key: sharedKey });
+  const v6Frame = frameWithDraws([baseDraw([companion])]);
+  const v7Frame = frameWithDraws([baseDraw([mip])]);
+  const v7Key = context.gxStrictV7RenderKey(sharedKey);
+
+  const initialV6 = context.packGxFramePacketForRenderer(2, v6Frame);
+  assert.notEqual(new DataView(initialV6).getUint16(0x04, true), 7);
+  assert.equal(new DataView(initialV6).getUint32(0x48, true), 64);
+
+  const v7AfterV6Ack = context.packGxFramePacketForRenderer(
+    2,
+    v7Frame,
+    new Set([sharedKey]),
+  );
+  assert.equal(new DataView(v7AfterV6Ack).getUint16(0x04, true), 7);
+  assert.equal(
+    new DataView(v7AfterV6Ack).getUint32(0x48, true),
+    96,
+    "a V6 acknowledgement cannot suppress a V7 mip payload",
+  );
+
+  const residentV7 = context.packGxFramePacketForRenderer(
+    2,
+    v7Frame,
+    new Set([v7Key]),
+  );
+  assert.equal(new DataView(residentV7).getUint16(0x04, true), 7);
+  assert.equal(new DataView(residentV7).getUint32(0x48, true), 0);
+
+  const v6AfterV7Ack = context.packGxFramePacketForRenderer(
+    2,
+    v6Frame,
+    new Set([v7Key]),
+  );
+  assert.equal(new DataView(v6AfterV7Ack).getUint32(0x48, true), 64);
+  assert.deepEqual(packetBytes(v6AfterV7Ack), packetBytes(initialV6));
+});
+
+test("avoids global domain starvation across V6-to-V7-to-V6 cache pressure", () => {
+  const capacityMatch = rendererSource.match(
+    /const DECODED_TEXTURE_CACHE_CAPACITY: usize = (\d+);/,
+  );
+  assert.notEqual(capacityMatch, null);
+  const capacity = Number(capacityMatch[1]);
+  assert.equal(capacity, 128);
+  assert.match(
+    rendererSource,
+    /self\.texture_cache\.len\(\) >= DECODED_TEXTURE_CACHE_CAPACITY[\s\S]*?\.filter\(\|key\| \{[\s\S]*?!protected_keys\.contains\(key\.as_str\(\)\)[\s\S]*?packet_protected_keys[\s\S]*?\.min\(\)[\s\S]*?self\.texture_cache\.remove\(&key\);/,
+    "uploads evict the lexicographic minimum outside current draw and packet keys",
+  );
+  assert.match(
+    rendererSource,
+    /while self\.texture_cache\.len\(\) > DECODED_TEXTURE_CACHE_CAPACITY \{[\s\S]*?self\.texture_cache\.keys\(\)\.min\(\)[\s\S]*?self\.texture_cache\.remove\(&key\);/,
+    "post-frame overflow cleanup removes the global lexicographic minimum",
+  );
+  assert.match(
+    source,
+    /const key = \[\s*textureMap,[\s\S]*?\]\.join\(":"\);/,
+    "live legacy decoded-image identities begin with a numeric texture-map index",
+  );
+
+  const context = packetContext();
+  const legacyKey = ordinal =>
+    `0:${ordinal}:4:4:6:1:${ordinal}:0:0:0:ram`;
+  const lowLegacy = legacyKey(1000);
+  const highLegacy = legacyKey(2000);
+  const lowV7 = context.gxStrictV7RenderKey(lowLegacy);
+  const highV7 = context.gxStrictV7RenderKey(highLegacy);
+  assert.ok(lowLegacy < lowV7);
+  assert.ok(lowV7 < highLegacy);
+  assert.ok(highLegacy < highV7);
+
+  const transition = (staleKey, incomingKey) => {
+    // Mirrors push_tev_draw_inner plus submit_gx_frame's final overflow trim.
+    const cache = new Set(
+      Array.from({ length: capacity }, (_unused, index) =>
+        staleKey(1000 + index)
+      ),
+    );
+    const incoming = [];
+    const submitFrame = packetKeys => {
+      const packetProtected = new Set(packetKeys);
+      for (const key of packetKeys) {
+        if (cache.has(key)) continue;
+        if (cache.size >= capacity) {
+          const candidate = [...cache]
+            .filter(cached => !packetProtected.has(cached))
+            .sort()[0];
+          if (candidate !== undefined) cache.delete(candidate);
+        }
+        cache.add(key);
+      }
+      while (cache.size > capacity) {
+        cache.delete([...cache].sort()[0]);
+      }
+      return [...cache].sort();
+    };
+    for (let frame = 0; frame < 32; frame += 1) {
+      const key = incomingKey(2000 + frame);
+      incoming.push(key);
+      const resident = submitFrame([key]);
+      assert.equal(resident.length, capacity);
+      assert.ok(
+        incoming.every(previous => resident.includes(previous)),
+        `varying identity ${frame + 1} remains resident on later frames`,
+      );
+    }
+    return { cache, incoming };
+  };
+
+  const v6ToV7 = transition(
+    legacyKey,
+    ordinal => context.gxStrictV7RenderKey(legacyKey(ordinal)),
+  );
+  assert.equal(
+    [...v6ToV7.cache].filter(key => key.includes("~LZGX7:")).length,
+    32,
+    "V7 identities accumulate instead of churning behind stale V6",
+  );
+  const v7ToV6 = transition(
+    ordinal => context.gxStrictV7RenderKey(legacyKey(ordinal)),
+    legacyKey,
+  );
+  assert.equal(
+    [...v7ToV6.cache].filter(key => !key.includes("~LZGX7:")).length,
+    32,
+    "fallback V6 identities accumulate instead of churning behind stale V7",
+  );
+  assert.ok(
+    v6ToV7.incoming.every(key => v6ToV7.cache.has(key))
+      && v7ToV6.incoming.every(key => v7ToV6.cache.has(key)),
+    "both varying 32-entry domains remain acknowledged after 160 identities",
+  );
+});
+
+test("treats an eligible non-V7 result as fatal without a legacy retry", () => {
+  const context = packetContext();
+  const frame = frameWithDraws([baseDraw([strictTexture(context)])]);
+  let legacyCalls = 0;
+  let v7Calls = 0;
+  context.packGxFramePacketV6 = () => {
+    legacyCalls += 1;
+    return new ArrayBuffer(160);
+  };
+  context.packGxFramePacketV7 = () => {
+    v7Calls += 1;
+    const packet = new ArrayBuffer(160);
+    new DataView(packet).setUint16(0x04, 6, true);
+    return packet;
+  };
+
+  assert.throws(
+    () => context.packGxFramePacketForRenderer(2, frame),
+    /strict GX mip activation did not produce LZGX v7/,
+  );
+  assert.equal(v7Calls, 1);
+  assert.equal(legacyCalls, 0);
+});
 
 test("packs an NPOT decoded mip chain without per-level padding", () => {
   const context = packetContext();
@@ -481,14 +966,21 @@ test("rejects conflicting mip count or lower bytes for one first-use key", () =>
   );
 });
 
-test("keeps live GX emission explicitly on v6", () => {
+test("routes live GX emission through one strict atomic V7 selector", () => {
   const postStart = source.indexOf("function postGxFrame(");
   const postEnd = source.indexOf("function gxFramePacketInteger(", postStart);
   assert.notEqual(postStart, -1);
   assert.notEqual(postEnd, -1);
   const postSource = source.slice(postStart, postEnd);
-  assert.match(postSource, /packet = packGxFramePacketV6\(/);
-  assert.doesNotMatch(postSource, /packGxFramePacketV7/);
+  assert.match(postSource, /packet = packGxFramePacketForRenderer\(/);
+  assert.doesNotMatch(postSource, /packGxFramePacketV[67]/);
+
+  const selector = extractFunction("packGxFramePacketForRenderer");
+  assert.match(selector, /gxPrepareStrictV7Frame\(frame\)/);
+  assert.match(selector, /return packGxFramePacketV6\(/);
+  assert.match(selector, /const packet = packGxFramePacketV7\(/);
+  assert.match(selector, /getUint16\(0x04, true\) !== 7/);
+  assert.doesNotMatch(selector, /\bcatch\b/);
 });
 
 test("carries canonical v7 mip resources into strict WebGPU uploads", () => {
