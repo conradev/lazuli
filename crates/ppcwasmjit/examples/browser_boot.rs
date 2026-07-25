@@ -961,6 +961,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererFrameResultMisses = 0;
     let rendererFailure = null;
     let rendererResidentTextureKeys = new Set();
+    const exiIplImageBytes = 2 * 1024 * 1024;
     const workerExecutionTimingSampleStride = 1024;
     let workerExecutionTimingEligibleCalls = 0;
     function newWorkerPhaseTiming(sampleStride) {
@@ -5204,6 +5205,19 @@ const TEMPLATE: &str = r##"<!doctype html>
     });
     const hookCalls = new Map();
     const deviceEvents = new Map();
+    // The device model accepts an exact decoded 2 MiB IPL-compatible image.
+    // Source providers are layered separately from the EXI transport.
+    let exiIplImage = null;
+    const exiIplSource = { kind: "unconfigured" };
+    const exiTransferTraceLimit = 64;
+    const exiTransferTrace = [];
+    const exiTransferOutcomes = new Map();
+    let exiTransferSequence = 0;
+    let exiTransferTraceDropped = 0;
+    let exi0IplCommandAddress = null;
+    let exi0IplCursor = 0;
+    let exi0IplAddressSequence = null;
+    let exi0IplDmaBytes = 0;
     const dspTrace = [];
     const accelerations = new Map();
     const exceptionCounts = new Map();
@@ -16192,6 +16206,211 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function exiTransferModeName(mode) {
+      switch (mode) {
+        case 0: return "read";
+        case 1: return "write";
+        case 2: return "read-write";
+        default: return "reserved";
+      }
+    }
+
+    function exiIplImageStatus() {
+      const configured = exiIplImage !== null;
+      const isUint8Array = configured
+        && Object.prototype.toString.call(exiIplImage) === "[object Uint8Array]";
+      const byteLength = isUint8Array ? exiIplImage.byteLength : null;
+      return {
+        configured,
+        valid: isUint8Array && byteLength === exiIplImageBytes,
+        byteLength,
+        expectedBytes: exiIplImageBytes,
+        source: exiIplSource,
+      };
+    }
+
+    function recordExi0Transfer(transfer) {
+      const recorded = {
+        sequence: ++exiTransferSequence,
+        channel: 0,
+        ...transfer,
+      };
+      exiTransferOutcomes.set(
+        recorded.outcome,
+        (exiTransferOutcomes.get(recorded.outcome) ?? 0) + 1
+      );
+      exiTransferTrace.push(recorded);
+      if (exiTransferTrace.length > exiTransferTraceLimit) {
+        exiTransferTrace.shift();
+        exiTransferTraceDropped += 1;
+      }
+      return recorded;
+    }
+
+    function serviceExi0(observedCycles) {
+      const parameter = view.getUint32(mmio + 0x6800, false);
+      const dmaBase = view.getUint32(mmio + 0x6804, false);
+      const dmaLength = view.getUint32(mmio + 0x6808, false);
+      const controlBefore = view.getUint32(mmio + 0x680c, false);
+      const immediate = view.getUint32(mmio + 0x6810, false);
+      if ((controlBefore & 1) === 0) return false;
+
+      const controlAfter = (controlBefore & ~1) >>> 0;
+      view.setUint32(mmio + 0x680c, controlAfter, false);
+      deviceEvents.set(
+        "exiChannel0",
+        (deviceEvents.get("exiChannel0") ?? 0) + 1
+      );
+
+      const deviceSelect = (parameter >>> 7) & 7;
+      const dma = (controlBefore & 2) !== 0;
+      const transferMode = (controlBefore >>> 2) & 3;
+      const commandWrite = (immediate & 0x80000000) !== 0;
+      const commandAddress = (immediate >>> 6) & 0x01ffffff;
+      const iplCommandAddressBefore = exi0IplCommandAddress;
+      const iplCursorBefore = exi0IplCursor;
+      let operation = "unhandled";
+      let outcome = "ignored";
+      let reason;
+      let dmaTarget = null;
+      let imageStatus = null;
+
+      if (deviceSelect !== 2) {
+        reason = "device-not-ipl-rtc-sram";
+      } else if (!dma) {
+        exi0IplAddressSequence = null;
+        exi0IplCommandAddress = null;
+        operation = "ipl-address";
+        if (transferMode !== 1) {
+          outcome = "rejected";
+          reason = "ipl-address-requires-write";
+        } else if (commandWrite || commandAddress >= exiIplImageBytes) {
+          operation = "unhandled";
+          reason = "non-ipl-command";
+        } else {
+          exi0IplCommandAddress = commandAddress;
+          exi0IplCursor = commandAddress;
+          outcome = "accepted";
+        }
+      } else {
+        operation = "ipl-dma-read";
+        imageStatus = exiIplImageStatus();
+        if (transferMode !== 0) {
+          outcome = "rejected";
+          reason = "ipl-dma-requires-read";
+        } else if (
+          commandWrite
+          || commandAddress !== exi0IplCommandAddress
+          || exi0IplAddressSequence === null
+        ) {
+          outcome = "rejected";
+          reason = "ipl-dma-without-address-command";
+        } else if (!imageStatus.configured) {
+          outcome = "unavailable";
+          reason = "ipl-image-not-configured";
+        } else if (!imageStatus.valid) {
+          outcome = "rejected";
+          reason = "invalid-ipl-image";
+        } else if (
+          exi0IplCursor > imageStatus.byteLength
+          || dmaLength > imageStatus.byteLength - exi0IplCursor
+        ) {
+          outcome = "rejected";
+          reason = "ipl-source-out-of-bounds";
+        } else {
+          dmaTarget = physicalRamPointer(dmaBase, dmaLength);
+          if (dmaTarget === null) {
+            outcome = "rejected";
+            reason = "ram-target-out-of-bounds";
+          } else {
+            invalidateDataReservationForExternalWrite(dmaBase, dmaLength);
+            bytes.set(
+              exiIplImage.subarray(exi0IplCursor, exi0IplCursor + dmaLength),
+              dmaTarget
+            );
+            exi0IplCursor += dmaLength;
+            exi0IplDmaBytes += dmaLength;
+            outcome = "complete";
+          }
+        }
+      }
+
+      const recorded = recordExi0Transfer({
+        cycle: observedCycles,
+        parameter: hex32(parameter),
+        deviceSelect,
+        dma,
+        transferMode: exiTransferModeName(transferMode),
+        transferModeCode: transferMode,
+        immediateLength: ((controlBefore >>> 4) & 3) + 1,
+        controlBefore: hex32(controlBefore),
+        controlAfter: hex32(controlAfter),
+        immediate: hex32(immediate),
+        commandDirection: commandWrite ? "write" : "read",
+        commandAddress: hex32(commandAddress),
+        dmaBase: hex32(dmaBase),
+        dmaLength,
+        operation,
+        outcome,
+        reason: reason ?? null,
+        iplCommandAddressBefore: hex32(iplCommandAddressBefore),
+        iplCommandAddressAfter: hex32(exi0IplCommandAddress),
+        iplCursorBefore: hex32(iplCursorBefore),
+        iplCursorAfter: hex32(exi0IplCursor),
+        addressSequence: exi0IplAddressSequence,
+        sourceConfigured: imageStatus?.configured ?? exiIplImage !== null,
+      });
+      if (operation === "ipl-address" && outcome === "accepted") {
+        exi0IplAddressSequence = recorded.sequence;
+      }
+      return true;
+    }
+
+    function serviceExternalInterface(observedCycles) {
+      serviceExi0(observedCycles);
+      for (const [channel, offset] of [[1, 0x6820], [2, 0x6834]]) {
+        const control = view.getUint32(mmio + offset, false);
+        if ((control & 1) === 0) continue;
+        view.setUint32(mmio + offset, control & ~1, false);
+        const event = "exiChannel" + channel;
+        deviceEvents.set(event, (deviceEvents.get(event) ?? 0) + 1);
+      }
+    }
+
+    function snapshotExternalInterface() {
+      const image = exiIplImageStatus();
+      const parameter = view.getUint32(mmio + 0x6800, false);
+      return {
+        channel0: {
+          parameter: hex32(parameter),
+          deviceSelect: (parameter >>> 7) & 7,
+          dmaBase: hex32(view.getUint32(mmio + 0x6804, false)),
+          dmaLength: view.getUint32(mmio + 0x6808, false),
+          control: hex32(view.getUint32(mmio + 0x680c, false)),
+          immediate: hex32(view.getUint32(mmio + 0x6810, false)),
+        },
+        ipl: {
+          ...image,
+          commandAddress: hex32(exi0IplCommandAddress),
+          cursor: hex32(exi0IplCursor),
+          addressSequence: exi0IplAddressSequence,
+          dmaBytes: exi0IplDmaBytes,
+        },
+        transfers: {
+          total: exiTransferSequence,
+          retained: exiTransferTrace.length,
+          dropped: exiTransferTraceDropped,
+          limit: exiTransferTraceLimit,
+          outcomes: Object.fromEntries(
+            [...exiTransferOutcomes.entries()].sort(([left], [right]) =>
+              left.localeCompare(right)
+            )
+          ),
+          trace: exiTransferTrace,
+        },
+      };
+    }
+
     function serviceMmio(observedCycles) {
       if (
         cpFifoState.distance !== 0
@@ -16202,13 +16421,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       serviceCommandProcessorInterrupt(observedCycles);
       ensureViSchedule(observedCycles);
       serviceViDueEvents(observedCycles);
-      for (const offset of [0x680c, 0x6820, 0x6834]) {
-        const control = view.getUint32(mmio + offset, false);
-        if ((control & 1) === 0) continue;
-        view.setUint32(mmio + offset, control & ~1, false);
-        const channel = "exiChannel" + ((offset - 0x680c) / 0x14);
-        deviceEvents.set(channel, (deviceEvents.get(channel) ?? 0) + 1);
-      }
+      serviceExternalInterface(observedCycles);
       serviceAudioInterface(observedCycles);
       serviceDsp(observedCycles);
       serviceSerial(observedCycles);
@@ -17861,6 +18074,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           disk: Array.from({ length: 10 }, (_unused, index) =>
             "0x" + view.getUint32(mmio + 0x6000 + index * 4, false).toString(16).padStart(8, "0")
           ),
+          externalInterface: snapshotExternalInterface(),
           diskTransfer,
           serialTransfer,
           peFinishCycle,
