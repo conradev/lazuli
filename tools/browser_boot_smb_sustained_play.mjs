@@ -10,9 +10,13 @@ import {
   deriveSmbReadyPlayGameplayTranscript,
   verifySmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
+import {
+  verifySmbSustainedPresentedSurfaceHistory,
+} from "./browser_boot_smb_sustained_surface_history.mjs";
 
 export const SMB_SUSTAINED_PLAY_SCHEMA_V1 = "lazuli-smb-sustained-play-v1";
 export const SMB_SUSTAINED_PLAY_SCHEMA_V2 = "lazuli-smb-sustained-play-v2";
+export const SMB_SUSTAINED_PLAY_SCHEMA_V3 = "lazuli-smb-sustained-play-v3";
 export const SMB_SUSTAINED_VI_RECEIPT_CAPACITY = 120;
 
 const HEX_32 = /^0x[0-9a-f]{8}$/;
@@ -886,13 +890,18 @@ export function deriveSmbSustainedPlayOracle(report) {
   const input = validateInputWitness(scenario);
 
   const sustained = requireObject(report.sustainedPlay, "$.sustainedPlay");
-  const pairedReceipts = sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V2;
+  const pairedReceipts = sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V2
+    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3;
   if (!pairedReceipts && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V1) {
     fail(
       "invariant",
       "$.sustainedPlay.schema",
       null,
-      [SMB_SUSTAINED_PLAY_SCHEMA_V1, SMB_SUSTAINED_PLAY_SCHEMA_V2],
+      [
+        SMB_SUSTAINED_PLAY_SCHEMA_V1,
+        SMB_SUSTAINED_PLAY_SCHEMA_V2,
+        SMB_SUSTAINED_PLAY_SCHEMA_V3,
+      ],
       sustained.schema,
     );
   }
@@ -956,6 +965,12 @@ export function deriveSmbSustainedPlayOracle(report) {
   exact(report.rendering?.error ?? null, null, "$.rendering.error");
   exact(report.rendering?.metrics?.operations?.pending, 0, "$.rendering.metrics.operations.pending");
   exact(report.controller?.queueOverflows, 0, "$.controller.queueOverflows");
+  if (sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3) {
+    verifySmbSustainedPresentedSurfaceHistory(
+      report.rendering?.sustainedPresentedSurfaces,
+      sustained.receipts,
+    );
+  }
 
   const drained = sustained.receipts.filter(receipt => receipt.drained === true).length;
   const presented = sustained.receipts.filter(receipt => receipt.presented === true).length;

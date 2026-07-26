@@ -7,11 +7,16 @@ import test from "node:test";
 import {
   SMB_SUSTAINED_PLAY_SCHEMA_V1,
   SMB_SUSTAINED_PLAY_SCHEMA_V2,
+  SMB_SUSTAINED_PLAY_SCHEMA_V3,
   SmbSustainedPlayValidationError,
   deriveSmbSustainedPlayOracle,
   verifySmbSustainedPlay,
   verifySmbSustainedPlayPrefix,
 } from "./browser_boot_smb_sustained_play.mjs";
+import {
+  SmbSustainedSurfaceHistoryValidationError,
+  deriveSmbSustainedPresentedSurfaceHistoryOracle,
+} from "./browser_boot_smb_sustained_surface_history.mjs";
 import {
   smbSustainedPlayReport,
 } from "./browser_boot_smb_sustained_play_test_fixture.mjs";
@@ -26,6 +31,18 @@ function expectFailure(report, path, ordinal = null) {
       && Object.hasOwn(error, "actual")
       && Object.hasOwn(error, "previous"),
   );
+}
+
+function syncSurfacePopulations(surface) {
+  const fields = [surface.fields.top, surface.fields.bottom];
+  for (const name of ["black", "white", "other"]) {
+    surface.rgb[name] = fields
+      .reduce((sum, field) => sum + field.rgb[name], 0);
+  }
+  for (const name of ["dark", "light", "other"]) {
+    surface.visualRgb[name] = fields
+      .reduce((sum, field) => sum + field.visualRgb[name], 0);
+  }
 }
 
 function sustainedPrefixReport(receipts = 16, pending = 0) {
@@ -159,6 +176,223 @@ test("v2 independently proves 60 staged and 60 presented field pairs", () => {
   assert.equal(oracle.bottomFields, 60);
   assert.equal(oracle.complete, true);
   assert.equal(Object.hasOwn(oracle, "exactRasterEmptyDraws"), false);
+});
+
+test("v3 binds all 60 retained WebGPU surfaces to exact completed VI pairs", () => {
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+  const oracle = verifySmbSustainedPlay(report);
+  const surfaces = report.rendering.sustainedPresentedSurfaces;
+  assert.equal(oracle.presented, 60);
+  assert.equal(surfaces.frames.length, 60);
+  assert.equal(surfaces.oracle.captured, 60);
+  assert.equal(surfaces.oracle.distinctPairEpochs, 60);
+  assert.equal(surfaces.oracle.distinctPresentationSerials, 60);
+  assert.equal(surfaces.oracle.extremeThresholdPpm, 850_000);
+  assert.equal(surfaces.oracle.darkChannelMaximum, 8);
+  assert.equal(surfaces.oracle.lightChannelMinimum, 247);
+  assert.equal(surfaces.oracle.monochromeOrdinals.length, 0);
+  assert.equal(surfaces.oracle.nearBlackOrdinals.length, 0);
+  assert.equal(surfaces.oracle.nearWhiteOrdinals.length, 0);
+  assert.equal(surfaces.oracle.topFieldMonochromeOrdinals.length, 0);
+  assert.equal(surfaces.oracle.bottomFieldMonochromeOrdinals.length, 0);
+  assert.equal(surfaces.oracle.topFieldNearBlackOrdinals.length, 0);
+  assert.equal(surfaces.oracle.topFieldNearWhiteOrdinals.length, 0);
+  assert.equal(surfaces.oracle.bottomFieldNearBlackOrdinals.length, 0);
+  assert.equal(surfaces.oracle.bottomFieldNearWhiteOrdinals.length, 0);
+  assert.equal(surfaces.oracle.sourceBlackWhiteSplitOrdinals.length, 0);
+  assert.equal(surfaces.oracle.sourceNearBlackWhiteSplitOrdinals.length, 0);
+});
+
+test("v3 rejects missing, mismatched, extreme, split, and static surfaces", () => {
+  const expectSurfaceFailure = (mutate, path) => {
+    const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+    mutate(report);
+    assert.throws(
+      () => verifySmbSustainedPlay(report),
+      error => error instanceof SmbSustainedSurfaceHistoryValidationError
+        && error.path === path,
+    );
+  };
+  expectSurfaceFailure(
+    report => { report.rendering.sustainedPresentedSurfaces.frames.pop(); },
+    "$.rendering.sustainedPresentedSurfaces.frames",
+  );
+  expectSurfaceFailure(
+    report => {
+      report.rendering.sustainedPresentedSurfaces.frames[3]
+        .presentedSurface.presentationSerial += 1;
+    },
+    "$.rendering.sustainedPresentedSurfaces.frames[3]"
+      + ".presentedSurface.presentationSerial",
+  );
+  expectSurfaceFailure(
+    report => {
+      report.rendering.sustainedPresentedSurfaces.frames[7]
+        .presentedSurface.fields.top.generation += 1;
+    },
+    "$.rendering.sustainedPresentedSurfaces.frames[7]"
+      + ".presentedSurface.fields.top.generation",
+  );
+  expectSurfaceFailure(
+    report => {
+      report.rendering.sustainedPresentedSurfaces.frames[8]
+        .presentedSurface.fields.top.fieldStrideBytes = 1_280;
+    },
+    "$.rendering.sustainedPresentedSurfaces.frames[8]"
+      + ".presentedSurface.fields.top.fieldStrideBytes",
+  );
+  expectSurfaceFailure(
+    report => {
+      report.rendering.sustainedPresentedSurfaces.frames[9]
+        .presentedSurface.fields.bottom.sourceRowStep = 1;
+    },
+    "$.rendering.sustainedPresentedSurfaces.frames[9]"
+      + ".presentedSurface.fields.bottom.sourceRowStep",
+  );
+  expectSurfaceFailure(
+    report => {
+      report.rendering.sustainedPresentedSurfaces.frames[10]
+        .presentedSurface.fields.bottom.sourceRow = 0;
+    },
+    "$.rendering.sustainedPresentedSurfaces.frames[10]"
+      + ".presentedSurface.fields.bottom.sourceRow",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const surface = history.frames[10].presentedSurface;
+      const top = surface.fields.top;
+      const pixels = top.width * top.height;
+      const black = Math.ceil(pixels * 0.9);
+      top.rgb = {
+        black,
+        white: 0,
+        other: pixels - black,
+        unique: 2,
+      };
+      top.visualRgb = { dark: 0, light: 0, other: pixels };
+      syncSurfacePopulations(surface);
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.frames[10]"
+      + ".presentedSurface.fields.top.visualRgb.dark",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const surface = history.frames[11].presentedSurface;
+      for (const field of Object.values(surface.fields)) {
+        const pixels = field.width * field.height;
+        field.rgb = { black: pixels, white: 0, other: 0, unique: 1 };
+        field.visualRgb = { dark: pixels, light: 0, other: 0 };
+      }
+      const pixels = surface.width * surface.height;
+      surface.rgb.unique = 1;
+      syncSurfacePopulations(surface);
+      assert.equal(surface.rgb.black, pixels);
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.oracle.monochromeOrdinals",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const surface = history.frames[12].presentedSurface;
+      for (const field of Object.values(surface.fields)) {
+        const pixels = field.width * field.height;
+        const dark = Math.ceil(pixels * 0.85);
+        field.visualRgb = { dark, light: 0, other: pixels - dark };
+      }
+      syncSurfacePopulations(surface);
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.oracle.nearBlackOrdinals",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const { top, bottom } = history.frames[13].presentedSurface.fields;
+      const topPixels = top.width * top.height;
+      const bottomPixels = bottom.width * bottom.height;
+      top.rgb = { black: topPixels, white: 0, other: 0, unique: 1 };
+      bottom.rgb = { black: 0, white: bottomPixels, other: 0, unique: 1 };
+      top.visualRgb = { dark: topPixels, light: 0, other: 0 };
+      bottom.visualRgb = { dark: 0, light: bottomPixels, other: 0 };
+      syncSurfacePopulations(history.frames[13].presentedSurface);
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.oracle"
+      + ".sourceBlackWhiteSplitOrdinals",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const { top, bottom } = history.frames[14].presentedSurface.fields;
+      const topPixels = top.width * top.height;
+      const bottomPixels = bottom.width * bottom.height;
+      const topDark = Math.ceil(topPixels * 0.85);
+      const bottomLight = Math.ceil(bottomPixels * 0.85);
+      top.visualRgb = {
+        dark: topDark,
+        light: top.rgb.white,
+        other: topPixels - topDark - top.rgb.white,
+      };
+      bottom.visualRgb = {
+        dark: bottom.rgb.black,
+        light: bottomLight,
+        other: bottomPixels - bottom.rgb.black - bottomLight,
+      };
+      syncSurfacePopulations(history.frames[14].presentedSurface);
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.oracle"
+      + ".sourceNearBlackWhiteSplitOrdinals",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const top = history.frames[15].presentedSurface.fields.top;
+      const pixels = top.width * top.height;
+      top.rgb = { black: pixels, white: 0, other: 0, unique: 1 };
+      top.visualRgb = { dark: pixels, light: 0, other: 0 };
+      syncSurfacePopulations(history.frames[15].presentedSurface);
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.oracle"
+      + ".topFieldMonochromeOrdinals",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const bottom = history.frames[16].presentedSurface.fields.bottom;
+      const pixels = bottom.width * bottom.height;
+      bottom.rgb = { black: 0, white: pixels, other: 0, unique: 1 };
+      bottom.visualRgb = { dark: 0, light: pixels, other: 0 };
+      syncSurfacePopulations(history.frames[16].presentedSurface);
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.oracle"
+      + ".bottomFieldMonochromeOrdinals",
+  );
+  expectSurfaceFailure(
+    report => {
+      const history = report.rendering.sustainedPresentedSurfaces;
+      const hash = history.frames[0].presentedSurface.rgbSha256;
+      for (const frame of history.frames) {
+        frame.presentedSurface.rgbSha256 = hash;
+      }
+      history.oracle =
+        deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+    },
+    "$.rendering.sustainedPresentedSurfaces.oracle.distinctRgbHashes",
+  );
 });
 
 test("v2 requires clean terminal producer and renderer compatibility telemetry", () => {
