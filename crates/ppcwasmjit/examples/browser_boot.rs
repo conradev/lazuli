@@ -27,6 +27,8 @@ const FASTMEM_LUT_COUNT: usize = 1 << 15;
 const DISC_BI2_OFFSET: u64 = 0x440;
 const DISC_BI2_SIZE: usize = 0x2000;
 const DISC_SOURCE_RUNTIME: &str = include_str!("browser_disc_source.mjs");
+const DSP_AX_VOICE_REFERENCE_RUNTIME: &str =
+    include_str!("../../../tools/browser_dsp_ax_voice_reference.mjs");
 const IPL_IMAGE_SIZE: usize = 2 * 1024 * 1024;
 const IPL_FONT_JAPANESE_OFFSET: usize = 0x1a_ff00;
 const IPL_FONT_JAPANESE: &[u8] = include_bytes!("../../../resources/ipl/font_japanese.bin");
@@ -198,6 +200,39 @@ fn copy_browser_asset(source: &PathBuf, destination: &PathBuf, label: &str) {
     });
 }
 
+fn scoped_reference_runtime(source: &str, export_name: &str) -> String {
+    assert!(
+        export_name
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric()),
+        "reference export name must be a JavaScript identifier"
+    );
+    assert!(
+        source.contains(&format!("export function {export_name}(")),
+        "reference module must export {export_name}"
+    );
+
+    let mut runtime = String::with_capacity(source.len());
+    let mut export_count = 0;
+    for line in source.split_inclusive('\n') {
+        if let Some(unexported) = line.strip_prefix("export ") {
+            runtime.push_str(unexported);
+            export_count += 1;
+        } else {
+            runtime.push_str(line);
+        }
+    }
+    assert!(export_count > 0, "reference module must contain exports");
+    assert!(
+        !runtime
+            .lines()
+            .any(|line| line.trim_start().starts_with("export ")),
+        "reference module contains an unsupported nested export"
+    );
+
+    format!("(() => {{\n{runtime}\n  return Object.freeze({{ {export_name} }});\n}})()")
+}
+
 fn main() {
     let mut arguments = env::args_os().skip(1);
     let output = arguments
@@ -271,6 +306,14 @@ fn main() {
         |path| path.display().to_string(),
     );
 
+    assert!(
+        !DSP_AX_VOICE_REFERENCE_RUNTIME
+            .to_ascii_lowercase()
+            .contains("</script"),
+        "AX voice reference cannot be embedded in a raw-text script element"
+    );
+    let dsp_ax_voice_reference_runtime =
+        scoped_reference_runtime(DSP_AX_VOICE_REFERENCE_RUNTIME, "renderAxVoiceReference");
     let html = TEMPLATE
         .replace("__DISC_SOURCE_RUNTIME__", DISC_SOURCE_RUNTIME)
         .replace(
@@ -344,7 +387,13 @@ fn main() {
         .replace("__DEC_OFFSET__", &SPR::DEC.offset().to_string())
         .replace("__TB_OFFSET__", &SPR::TBL.offset().to_string())
         .replace("__DMAU_OFFSET__", &SPR::DMAU.offset().to_string())
-        .replace("__DMAL_OFFSET__", &SPR::DMAL.offset().to_string());
+        .replace("__DMAL_OFFSET__", &SPR::DMAL.offset().to_string())
+        // Keep the canonical module replacement last so its source cannot be
+        // rewritten by any frontend template placeholder.
+        .replace(
+            "__DSP_AX_VOICE_REFERENCE_RUNTIME__",
+            &dsp_ax_voice_reference_runtime,
+        );
 
     fs::write(&output, html).expect("failed to write browser harness");
     println!("{}", output.display());
@@ -961,6 +1010,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     </footer>
   </main>
   <script id="runner-source" type="text/plain">
+    const { renderAxVoiceReference } =
+      __DSP_AX_VOICE_REFERENCE_RUNTIME__;
     const statusDataset = new Proxy({}, {
       set(target, name, value) {
         const text = String(value);
@@ -12041,6 +12092,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         commandSample: [],
         writeCount: 0,
         clearedBytes: 0,
+        voiceMode: "inactive",
+        voiceReason: null,
+        voiceCommand: null,
+        voiceParameterBlocks: 0,
+        voiceParameterBlockBytes: 0,
+        voiceOutputBytes: 0,
+        voiceNonZeroSampleValues: 0,
+        voiceOutputHash: null,
         rejected: false,
         reason: null,
         lastTaskMail: null,
@@ -12275,7 +12334,182 @@ const TEMPLATE: &str = r##"<!doctype html>
       return { ok: false, reason, details };
     }
 
-    function dspAxSilentWriteRange(address, size, command) {
+    function emptyDspAxVoicePlan() {
+      return {
+        active: false,
+        setupSeen: false,
+        setupZero: false,
+        parameterBlockSeen: false,
+        parameterBlockAddress: null,
+        processSequence: null,
+        outputSequence: null,
+        outputSurroundAddress: null,
+        outputLrAddress: null,
+        fallbackReason: null,
+        fallbackCommand: null,
+      };
+    }
+
+    function markDspAxVoiceFallback(plan, reason, command = null) {
+      plan.active = true;
+      if (plan.fallbackReason !== null) return;
+      plan.fallbackReason = reason;
+      plan.fallbackCommand = command === null ? null : command & 0xffff;
+    }
+
+    function inspectDspAxZeroSetup(plan, address) {
+      const setupBytes = 9 * 3 * 2;
+      const pointer = ramPointer(address, setupBytes);
+      if (pointer === null) {
+        markDspAxVoiceFallback(plan, "setup-out-of-bounds", 0x00);
+        return;
+      }
+      for (let descriptor = 0; descriptor < 9; descriptor += 1) {
+        const offset = pointer + descriptor * 6;
+        // Dolphin initializes each accumulator from the first two words.
+        // Delta is immaterial only when that exact signed 32-bit value is zero.
+        if (
+          view.getUint16(offset, false) !== 0
+          || view.getUint16(offset + 2, false) !== 0
+        ) {
+          markDspAxVoiceFallback(plan, "nonzero-setup-buffer", 0x00);
+          return;
+        }
+      }
+      plan.setupZero = true;
+    }
+
+    function observeDspAxVoiceCommand(
+      plan,
+      command,
+      arguments_,
+      sequence
+    ) {
+      switch (command) {
+        case 0x00: {
+          plan.active = true;
+          if (plan.setupSeen || plan.processSequence !== null) {
+            markDspAxVoiceFallback(plan, "unsupported-setup-order", command);
+            return;
+          }
+          plan.setupSeen = true;
+          inspectDspAxZeroSetup(
+            plan,
+            dspAxAddress(arguments_[0], arguments_[1])
+          );
+          return;
+        }
+        case 0x02:
+          plan.active = true;
+          if (
+            plan.parameterBlockSeen
+            || plan.processSequence !== null
+          ) {
+            markDspAxVoiceFallback(
+              plan,
+              "unsupported-parameter-block-order",
+              command
+            );
+            return;
+          }
+          plan.parameterBlockSeen = true;
+          plan.parameterBlockAddress = dspAxAddress(
+            arguments_[0],
+            arguments_[1]
+          );
+          return;
+        case 0x03:
+          plan.active = true;
+          if (
+            !plan.setupZero
+            || !plan.parameterBlockSeen
+            || plan.processSequence !== null
+          ) {
+            markDspAxVoiceFallback(plan, "unsupported-process-order", command);
+            return;
+          }
+          plan.processSequence = sequence;
+          return;
+        case 0x0e:
+          plan.active = true;
+          if (
+            plan.processSequence === null
+            || plan.outputSequence !== null
+          ) {
+            markDspAxVoiceFallback(plan, "unsupported-output-order", command);
+            return;
+          }
+          plan.outputSequence = sequence;
+          plan.outputSurroundAddress = dspAxAddress(
+            arguments_[0],
+            arguments_[1]
+          );
+          plan.outputLrAddress = dspAxAddress(
+            arguments_[2],
+            arguments_[3]
+          );
+          return;
+
+        // These commands are no-ops in every supported GameCube AX ucode.
+        case 0x0a:
+        case 0x0b:
+        case 0x0c:
+        case 0x0d:
+        case 0x0f:
+          return;
+
+        // These commands can upload, replace, mix into, or otherwise mutate
+        // main L/R, or have semantics Dolphin itself does not implement
+        // exactly. In particular, AUX commands 0x04, 0x05, and 0x09 add their
+        // CPU effect-return buffers back into main L/R/S.
+        case 0x01:
+        case 0x04:
+        case 0x05:
+        case 0x06:
+        case 0x07:
+        case 0x08:
+        case 0x09:
+        case 0x10:
+        case 0x11:
+        case 0x12:
+        case 0x13:
+          markDspAxVoiceFallback(
+            plan,
+            "unsupported-main-buffer-command",
+            command
+          );
+          return;
+        default:
+          return;
+      }
+    }
+
+    function finalizeDspAxVoicePlan(plan) {
+      if (!plan.active || plan.fallbackReason !== null) return plan;
+      if (!plan.setupZero) {
+        markDspAxVoiceFallback(plan, "missing-zero-setup");
+      } else if (!plan.parameterBlockSeen) {
+        markDspAxVoiceFallback(plan, "missing-parameter-block-address");
+      } else if (plan.processSequence === null) {
+        markDspAxVoiceFallback(plan, "missing-process");
+      } else if (plan.outputSequence === null) {
+        markDspAxVoiceFallback(plan, "missing-output");
+      } else if (
+        dspUcodeHash !== 0x4e8a8b21
+        && dspUcodeHash !== 0x07f88145
+      ) {
+        markDspAxVoiceFallback(plan, "uncertified-voice-ucode");
+      }
+      return plan;
+    }
+
+    function dspAxSilentWriteRange(
+      address,
+      size,
+      command,
+      sequence,
+      role
+    ) {
       const logical = address >>> 0;
       const pointer = ramPointer(logical, size);
       if (pointer === null) {
@@ -12293,57 +12527,78 @@ const TEMPLATE: &str = r##"<!doctype html>
           physical: (pointer - ram) >>> 0,
           pointer,
           size,
+          sequence,
+          role,
         },
       };
     }
 
-    function collectDspAxSilentWrites(command, arguments_, writes) {
+    function collectDspAxSilentWrites(
+      command,
+      arguments_,
+      writes,
+      sequence
+    ) {
       const ranges = [];
       switch (command) {
         case 0x04:
         case 0x05: {
           const address = dspAxAddress(arguments_[0], arguments_[1]);
-          if (address !== 0) ranges.push([address, 3 * 5 * 32 * 4]);
+          if (address !== 0) {
+            ranges.push([address, 3 * 5 * 32 * 4, "aux-zero"]);
+          }
           break;
         }
         case 0x06:
           ranges.push([
             dspAxAddress(arguments_[0], arguments_[1]),
             3 * 5 * 32 * 4,
+            "main-upload-zero",
           ]);
           break;
         case 0x0e:
           ranges.push([
             dspAxAddress(arguments_[0], arguments_[1]),
             5 * 32 * 4,
+            "output-surround",
           ]);
           ranges.push([
             dspAxAddress(arguments_[2], arguments_[3]),
             5 * 32 * 2 * 2,
+            "output-lr",
           ]);
           break;
         case 0x10:
           ranges.push([
             dspAxAddress(arguments_[0], arguments_[1]),
             2 * 5 * 32 * 4,
+            "main-mix-zero",
           ]);
           break;
         case 0x13:
           ranges.push([
             dspAxAddress(arguments_[0], arguments_[1]),
             3 * 5 * 32 * 4,
+            "aux-upload-zero",
           ]);
           ranges.push([
             dspAxAddress(arguments_[2], arguments_[3]),
             5 * 32 * 4,
+            "aux-surround-zero",
           ]);
           break;
         default:
           break;
       }
 
-      for (const [address, size] of ranges) {
-        const result = dspAxSilentWriteRange(address, size, command);
+      for (const [address, size, role] of ranges) {
+        const result = dspAxSilentWriteRange(
+          address,
+          size,
+          command,
+          sequence,
+          role
+        );
         if (!result.ok) return result;
         writes.push(result.write);
       }
@@ -12357,6 +12612,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const seenPhysicalAddresses = new Set();
       const writes = [];
       const commandSample = [];
+      const voicePlan = emptyDspAxVoicePlan();
       let address = initialAddress >>> 0;
       let sizeWords = initialSizeWords;
       let listCount = 0;
@@ -12451,11 +12707,18 @@ const TEMPLATE: &str = r##"<!doctype html>
           index += arity;
           commandCount += 1;
           if (commandSample.length < 32) commandSample.push(command);
+          observeDspAxVoiceCommand(
+            voicePlan,
+            command,
+            arguments_,
+            commandCount
+          );
 
           const writeResult = collectDspAxSilentWrites(
             command,
             arguments_,
-            writes
+            writes,
+            commandCount
           );
           if (!writeResult.ok) return writeResult;
 
@@ -12469,6 +12732,7 @@ const TEMPLATE: &str = r##"<!doctype html>
               commandCount,
               commandSample,
               writes,
+              voicePlan: finalizeDspAxVoicePlan(voicePlan),
             };
           }
           if (command === 0x0d) {
@@ -12505,6 +12769,254 @@ const TEMPLATE: &str = r##"<!doctype html>
       return clearedBytes;
     }
 
+    function dspAxVoiceByteArray(value) {
+      return Object.prototype.toString.call(value) === "[object Uint8Array]";
+    }
+
+    function dspAxVoiceReason(value, fallback) {
+      if (typeof value !== "string" || value.length === 0) return fallback;
+      return value.slice(0, 96);
+    }
+
+    function dspAxVoiceOutputHash(data) {
+      let hash = 0x811c9dc5;
+      for (const value of data) {
+        hash = Math.imul(hash ^ value, 0x01000193) >>> 0;
+      }
+      return "0x" + hash.toString(16).padStart(8, "0");
+    }
+
+    function dspAxVoiceNonZeroSamples(data) {
+      let count = 0;
+      for (let offset = 0; offset < data.length; offset += 2) {
+        if (data[offset] !== 0 || data[offset + 1] !== 0) count += 1;
+      }
+      return count;
+    }
+
+    function dspAxVoiceRangesOverlap(left, right) {
+      return (
+        left.physical < right.physical + right.size
+        && right.physical < left.physical + left.size
+      );
+    }
+
+    function dspAxVoiceFallback(plan, reason, command = null) {
+      return {
+        rendered: false,
+        mode: plan.active ? "silent-fallback" : "inactive",
+        reason: plan.active ? dspAxVoiceReason(reason, "unsupported-voice") : null,
+        command:
+          plan.active && command !== null
+            ? command & 0xffff
+            : null,
+        operations: [],
+        parameterBlocks: 0,
+        parameterBlockBytes: 0,
+        outputBytes: 0,
+        nonZeroSampleValues: 0,
+        outputHash: null,
+      };
+    }
+
+    function prepareDspAxVoiceTransaction(parsed) {
+      const plan = parsed.voicePlan;
+      if (!plan.active) return dspAxVoiceFallback(plan, null);
+      if (plan.fallbackReason !== null) {
+        return dspAxVoiceFallback(
+          plan,
+          plan.fallbackReason,
+          plan.fallbackCommand
+        );
+      }
+
+      let model;
+      try {
+        model = renderAxVoiceReference({
+          mram: bytes.subarray(ram, ram + ramSize),
+          aram,
+          headAddress: plan.parameterBlockAddress,
+          ucodeHash: dspUcodeHash,
+        });
+      } catch (error) {
+        return dspAxVoiceFallback(
+          plan,
+          "voice-model-" + dspAxVoiceReason(error?.name, "exception")
+        );
+      }
+      if (model === null || typeof model !== "object") {
+        return dspAxVoiceFallback(plan, "invalid-voice-model-result");
+      }
+      if (Object.prototype.hasOwnProperty.call(model, "updatedMram")) {
+        return dspAxVoiceFallback(plan, "unexpected-mram-clone");
+      }
+      if (!model.ok) {
+        return dspAxVoiceFallback(
+          plan,
+          dspAxVoiceReason(
+            model.error?.reason,
+            "voice-model-rejected"
+          )
+        );
+      }
+
+      const output = model.output;
+      if (
+        output === null
+        || typeof output !== "object"
+        || output.order !== "R,L"
+        || !dspAxVoiceByteArray(output.bytes)
+        || output.bytes.length !== 5 * 32 * 2 * 2
+      ) {
+        return dspAxVoiceFallback(plan, "invalid-voice-output");
+      }
+      if (
+        !Array.isArray(model.parameterBlockWrites)
+        || model.parameterBlockWrites.length > 64
+      ) {
+        return dspAxVoiceFallback(plan, "invalid-parameter-block-writes");
+      }
+
+      const expectedParameterBlockBytes =
+        dspUcodeHash === 0x4e8a8b21 ? 236 : 244;
+      const operations = [];
+      let parameterBlockBytes = 0;
+      for (
+        let index = 0;
+        index < model.parameterBlockWrites.length;
+        index += 1
+      ) {
+        const write = model.parameterBlockWrites[index];
+        if (
+          write === null
+          || typeof write !== "object"
+          || !Number.isSafeInteger(write.logicalAddress)
+          || write.logicalAddress < 0
+          || write.logicalAddress > 0xffffffff
+          || !dspAxVoiceByteArray(write.data)
+          || write.data.length !== expectedParameterBlockBytes
+          || write.byteLength !== write.data.length
+        ) {
+          return dspAxVoiceFallback(plan, "invalid-parameter-block-write");
+        }
+        const pointer = ramPointer(write.logicalAddress, write.data.length);
+        if (pointer === null) {
+          return dspAxVoiceFallback(
+            plan,
+            "parameter-block-write-out-of-bounds"
+          );
+        }
+        const physical = (pointer - ram) >>> 0;
+        if (
+          !Number.isSafeInteger(write.physicalAddress)
+          || write.physicalAddress < 0
+          || write.physicalAddress > 0xffffffff
+          || write.physicalAddress !== physical
+        ) {
+          return dspAxVoiceFallback(
+            plan,
+            "parameter-block-alias-mismatch"
+          );
+        }
+        operations.push({
+          command: 0x03,
+          role: "parameter-block",
+          sequence: plan.processSequence,
+          ordinal: index,
+          address: write.logicalAddress >>> 0,
+          physical,
+          pointer,
+          size: write.data.length,
+          data: write.data,
+        });
+        parameterBlockBytes += write.data.length;
+      }
+
+      let outputLrWrites = 0;
+      let outputSurroundWrites = 0;
+      for (let index = 0; index < parsed.writes.length; index += 1) {
+        const write = parsed.writes[index];
+        let data = null;
+        if (write.role === "output-lr") {
+          outputLrWrites += 1;
+          data = output.bytes;
+        } else if (write.role === "output-surround") {
+          outputSurroundWrites += 1;
+        }
+        operations.push({
+          ...write,
+          ordinal: index,
+          data,
+        });
+      }
+      if (outputLrWrites !== 1 || outputSurroundWrites !== 1) {
+        return dspAxVoiceFallback(plan, "invalid-output-write-plan");
+      }
+
+      operations.sort((left, right) =>
+        left.sequence - right.sequence || left.ordinal - right.ordinal
+      );
+      for (let left = 0; left < operations.length; left += 1) {
+        for (let right = left + 1; right < operations.length; right += 1) {
+          if (dspAxVoiceRangesOverlap(operations[left], operations[right])) {
+            return dspAxVoiceFallback(plan, "overlapping-voice-writes");
+          }
+        }
+      }
+
+      return {
+        rendered: true,
+        mode: "rendered",
+        reason: null,
+        command: null,
+        operations,
+        parameterBlocks: model.parameterBlockWrites.length,
+        parameterBlockBytes,
+        outputBytes: output.bytes.length,
+        nonZeroSampleValues: dspAxVoiceNonZeroSamples(output.bytes),
+        outputHash: dspAxVoiceOutputHash(output.bytes),
+      };
+    }
+
+    function applyDspAxVoiceTransaction(transaction) {
+      let clearedBytes = 0;
+      let zeroWriteCount = 0;
+      let dataWriteCount = 0;
+      let dataBytes = 0;
+      for (const operation of transaction.operations) {
+        invalidateDataReservationForExternalWrite(
+          operation.physical,
+          operation.size
+        );
+        if (operation.data === null) {
+          bytes.fill(
+            0,
+            operation.pointer,
+            operation.pointer + operation.size
+          );
+          clearedBytes += operation.size;
+          zeroWriteCount += 1;
+        } else {
+          bytes.set(operation.data, operation.pointer);
+          dataBytes += operation.size;
+          dataWriteCount += 1;
+        }
+        traceDsp("ax-voice-write", {
+          command: operation.command,
+          role: operation.role,
+          address: hex32(operation.address),
+          size: operation.size,
+          data: operation.data !== null,
+        });
+      }
+      return {
+        clearedBytes,
+        zeroWriteCount,
+        dataWriteCount,
+        dataBytes,
+      };
+    }
+
     function beginDspAxCommandList(sizeWords) {
       if (
         !Number.isSafeInteger(sizeWords)
@@ -12531,15 +13043,68 @@ const TEMPLATE: &str = r##"<!doctype html>
         return rejectDspAxCommand(result.reason, result.details);
       }
 
-      const clearedBytes = applyDspAxSilentWrites(result.writes);
+      const voiceTransaction = prepareDspAxVoiceTransaction(result);
+      let writeCount;
+      let clearedBytes;
+      let silentWriteCount;
+      if (voiceTransaction.rendered) {
+        const applied = applyDspAxVoiceTransaction(voiceTransaction);
+        writeCount = voiceTransaction.operations.length;
+        clearedBytes = applied.clearedBytes;
+        silentWriteCount = applied.zeroWriteCount;
+        deviceEvents.set(
+          "dspAxVoiceRender",
+          (deviceEvents.get("dspAxVoiceRender") ?? 0) + 1
+        );
+        deviceEvents.set(
+          "dspAxVoiceParameterBlockWrite",
+          (deviceEvents.get("dspAxVoiceParameterBlockWrite") ?? 0)
+            + voiceTransaction.parameterBlocks
+        );
+        deviceEvents.set(
+          "dspAxVoiceDataBytes",
+          (deviceEvents.get("dspAxVoiceDataBytes") ?? 0)
+            + applied.dataBytes
+        );
+      } else {
+        clearedBytes = applyDspAxSilentWrites(result.writes);
+        writeCount = result.writes.length;
+        silentWriteCount = result.writes.length;
+        if (voiceTransaction.mode === "silent-fallback") {
+          latchDspFirstUnsupported(
+            "voice",
+            voiceTransaction.reason,
+            voiceTransaction.command
+          );
+          deviceEvents.set(
+            "dspAxVoiceFallback",
+            (deviceEvents.get("dspAxVoiceFallback") ?? 0) + 1
+          );
+          traceDsp("ax-voice-fallback", {
+            reason: voiceTransaction.reason,
+            command: voiceTransaction.command,
+          });
+        }
+      }
       dspAxCommandState.phase = "yield-pending";
       dspAxCommandState.address = result.address;
       dspAxCommandState.listCount = result.listCount;
       dspAxCommandState.wordCount = result.wordCount;
       dspAxCommandState.commandCount = result.commandCount;
       dspAxCommandState.commandSample = result.commandSample;
-      dspAxCommandState.writeCount = result.writes.length;
+      dspAxCommandState.writeCount = writeCount;
       dspAxCommandState.clearedBytes = clearedBytes;
+      dspAxCommandState.voiceMode = voiceTransaction.mode;
+      dspAxCommandState.voiceReason = voiceTransaction.reason;
+      dspAxCommandState.voiceCommand = voiceTransaction.command;
+      dspAxCommandState.voiceParameterBlocks =
+        voiceTransaction.parameterBlocks;
+      dspAxCommandState.voiceParameterBlockBytes =
+        voiceTransaction.parameterBlockBytes;
+      dspAxCommandState.voiceOutputBytes = voiceTransaction.outputBytes;
+      dspAxCommandState.voiceNonZeroSampleValues =
+        voiceTransaction.nonZeroSampleValues;
+      dspAxCommandState.voiceOutputHash = voiceTransaction.outputHash;
       dspAxCommandState.rejected = false;
       dspAxCommandState.reason = null;
       dspScheduledMail = {
@@ -12552,8 +13117,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         lists: result.listCount,
         words: result.wordCount,
         commands: result.commandCount,
-        writes: result.writes.length,
+        writes: writeCount,
         clearedBytes,
+        voiceMode: voiceTransaction.mode,
+        voiceReason: voiceTransaction.reason,
+        voiceParameterBlocks: voiceTransaction.parameterBlocks,
+        voiceOutputBytes: voiceTransaction.outputBytes,
+        voiceOutputHash: voiceTransaction.outputHash,
       });
       deviceEvents.set(
         "dspAxCommandList",
@@ -12565,7 +13135,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       deviceEvents.set(
         "dspAxSilentWrite",
-        (deviceEvents.get("dspAxSilentWrite") ?? 0) + result.writes.length
+        (deviceEvents.get("dspAxSilentWrite") ?? 0) + silentWriteCount
       );
       deviceEvents.set(
         "dspAxSilentBytes",
@@ -22812,6 +23382,16 @@ const TEMPLATE: &str = r##"<!doctype html>
             ),
             writeCount: dspAxCommandState.writeCount,
             clearedBytes: dspAxCommandState.clearedBytes,
+            voiceMode: dspAxCommandState.voiceMode,
+            voiceReason: dspAxCommandState.voiceReason,
+            voiceCommand: dspAxCommandState.voiceCommand,
+            voiceParameterBlocks: dspAxCommandState.voiceParameterBlocks,
+            voiceParameterBlockBytes:
+              dspAxCommandState.voiceParameterBlockBytes,
+            voiceOutputBytes: dspAxCommandState.voiceOutputBytes,
+            voiceNonZeroSampleValues:
+              dspAxCommandState.voiceNonZeroSampleValues,
+            voiceOutputHash: dspAxCommandState.voiceOutputHash,
             rejected: dspAxCommandState.rejected,
             reason: dspAxCommandState.reason,
             lastTaskMail:
