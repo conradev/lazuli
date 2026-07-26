@@ -1056,6 +1056,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let wariowareLastActiveGameplayInput = null;
     let luigisMansionLastActiveGameplayInput = null;
     let windWakerLastActiveGameplayInput = null;
+    let meleeLastActiveGameplayInput = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -15229,6 +15230,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       return pointer === null ? null : view.getUint8(pointer);
     }
 
+    function guestS8(address) {
+      const pointer = ramPointer(address, 1);
+      return pointer === null ? null : view.getInt8(pointer);
+    }
+
     function guestU16(address) {
       const pointer = ramPointer(address, 2);
       return pointer === null ? null : view.getUint16(pointer, false);
@@ -15891,6 +15897,511 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function meleeMappedPointer(value, length = 1) {
+      return Number.isSafeInteger(value)
+        && Number.isSafeInteger(length)
+        && length > 0
+        && (value & 3) === 0
+        && value >= 0x80000000
+        && value <= 0x81800000 - length
+        && ramPointer(value, length) !== null;
+    }
+
+    function inspectMeleePosition(address) {
+      if (!meleeMappedPointer(address, 12)) return null;
+      return {
+        x: guestF32(address),
+        y: guestF32(address + 4),
+        z: guestF32(address + 8),
+      };
+    }
+
+    function inspectMeleeGameState() {
+      if (boot.identifier !== "GALE01" || boot.version !== 2) return null;
+
+      // These addresses and layouts are from retail GALE01 revision two.
+      // Pin the VS routing state, live match record, first human player slot,
+      // fighter GObj/user-data relationship, fighter-consumed input, and the
+      // HSD game-pad copy so menus, pauses, and dead fighters fail closed.
+      const routingAddress = 0x80479d30;
+      const currentSceneInfoPointerAddress = 0x804d6720;
+      const expectedSceneInfo = 0x803dd9dc;
+      const expectedSceneLoadData = 0x80480530;
+      const expectedSceneLeaveData = 0x80479d98;
+      const matchAddress = 0x8046b6a0;
+      const pauseBitsAddress = 0x80479d68;
+      const playerSlotAddress = 0x80453080;
+      const playerSlotSize = 0xe90;
+      const gamePadAddress = 0x804c21cc;
+      const fighterSize = 0x23ec;
+
+      const currentMode = guestU8(routingAddress);
+      const currentSceneIndex = guestU8(routingAddress + 3);
+      const pendingRoute = guestU8(routingAddress + 0x0c);
+      const currentSceneInfo = guestU32(currentSceneInfoPointerAddress);
+      const currentSceneInfoMapped = meleeMappedPointer(currentSceneInfo, 12);
+      const currentSceneClass = currentSceneInfoMapped
+        ? guestU8(currentSceneInfo)
+        : null;
+      const currentSceneLoadData = currentSceneInfoMapped
+        ? guestU32(currentSceneInfo + 4)
+        : null;
+      const currentSceneLeaveData = currentSceneInfoMapped
+        ? guestU32(currentSceneInfo + 8)
+        : null;
+      const exactSceneInfo = currentSceneInfo === expectedSceneInfo
+        && currentSceneClass === 2
+        && currentSceneLoadData === expectedSceneLoadData
+        && currentSceneLeaveData === expectedSceneLeaveData;
+      const versusMatchScene = currentMode === 2
+        && currentSceneIndex === 2
+        && pendingRoute === 0
+        && exactSceneInfo;
+
+      const matchState = guestU8(matchAddress);
+      const pauseTimer = guestU8(matchAddress + 2);
+      const unpauseTimer = guestU8(matchAddress + 4);
+      const hudEnabled = guestU8(matchAddress + 5);
+      const terminateMatch = guestU8(matchAddress + 6);
+      const singlePlayer = guestU8(matchAddress + 7);
+      const matchResult = guestU8(matchAddress + 8);
+      const matchOver = guestU8(matchAddress + 0x0e);
+      const frameCount = guestU32(matchAddress + 0x24);
+      const playerMatchSlotType = guestU8(matchAddress + 0x3a);
+      const playerRespawnTimer = guestU8(matchAddress + 0x42);
+      const pauseBits = guestU8(pauseBitsAddress);
+      const matchInProgress = matchState === 0
+        && pauseTimer === 0
+        && unpauseTimer === 0
+        && hudEnabled === 1
+        && terminateMatch === 0
+        && singlePlayer === 0
+        && matchResult === 0
+        && matchOver === 0
+        && playerMatchSlotType === 0
+        && playerRespawnTimer === 0
+        && pauseBits === 0;
+
+      const playerState = guestS32(playerSlotAddress);
+      const character = guestS32(playerSlotAddress + 4);
+      const slotType = guestS32(playerSlotAddress + 8);
+      const transformedIndex = guestU8(playerSlotAddress + 0x0c);
+      const subColor = guestU8(playerSlotAddress + 0x46);
+      const playerId = guestU8(playerSlotAddress + 0x48);
+      const stocks = guestU8(playerSlotAddress + 0x8e);
+      const joystickDirectionCountAddress =
+        Number.isSafeInteger(transformedIndex)
+          && transformedIndex >= 0
+          && transformedIndex < 2
+          ? playerSlotAddress + 0xa0 + transformedIndex * 4
+          : null;
+      const joystickDirectionCount = joystickDirectionCountAddress === null
+        ? null
+        : guestS32(joystickDirectionCountAddress);
+      const opponents = Array.from({ length: 3 }, (_, index) => {
+        const slot = index + 1;
+        const address = playerSlotAddress + slot * playerSlotSize;
+        const state = guestS32(address);
+        const type = guestS32(address + 8);
+        return {
+          slot,
+          address: hex32(address),
+          stateAddress: hex32(address),
+          state,
+          slotTypeAddress: hex32(address + 8),
+          slotType: type,
+          active: state === 2 && (type === 0 || type === 1),
+        };
+      });
+      const hasOpponent = opponents.some(opponent => opponent.active);
+      const entityPointerAddress = Number.isSafeInteger(transformedIndex)
+          && transformedIndex >= 0
+          && transformedIndex < 2
+        ? playerSlotAddress + 0xb0 + transformedIndex * 4
+        : null;
+      const entityValue = entityPointerAddress === null
+        ? null
+        : guestU32(entityPointerAddress);
+      const entityMapped = meleeMappedPointer(entityValue, 0x38);
+      const classifier = entityMapped ? guestU16(entityValue) : null;
+      const processLink = entityMapped ? guestU8(entityValue + 2) : null;
+      const processPriority = entityMapped ? guestU8(entityValue + 4) : null;
+      const userDataKind = entityMapped ? guestU8(entityValue + 7) : null;
+      const fighterPointerAddress = entityMapped ? entityValue + 0x2c : null;
+      const fighterValue = fighterPointerAddress === null
+        ? null
+        : guestU32(fighterPointerAddress);
+      const fighterMapped = meleeMappedPointer(fighterValue, fighterSize);
+
+      const fighterGobj = fighterMapped ? guestU32(fighterValue) : null;
+      const fighterKind = fighterMapped ? guestS32(fighterValue + 4) : null;
+      const fighterPlayerId = fighterMapped ? guestU8(fighterValue + 0x0c) : null;
+      const motionId = fighterMapped ? guestS32(fighterValue + 0x10) : null;
+      const facingDirection = fighterMapped
+        ? guestF32(fighterValue + 0x2c)
+        : null;
+      const positionAddress = fighterMapped ? fighterValue + 0xb0 : null;
+      const previousPositionAddress = fighterMapped ? fighterValue + 0xbc : null;
+      const position = positionAddress === null
+        ? null
+        : inspectMeleePosition(positionAddress);
+      const previousPosition = previousPositionAddress === null
+        ? null
+        : inspectMeleePosition(previousPositionAddress);
+      const groundOrAir = fighterMapped ? guestS32(fighterValue + 0xe0) : null;
+      const fighterPadPlayerId = fighterMapped
+        ? guestU8(fighterValue + 0x618)
+        : null;
+      const fighterSubColor = fighterMapped
+        ? guestU8(fighterValue + 0x61a)
+        : null;
+      const selfVelocityX = fighterMapped ? guestF32(fighterValue + 0x80) : null;
+      const positionDeltaX = fighterMapped ? guestF32(fighterValue + 0xc8) : null;
+      const leftStickX = fighterMapped ? guestF32(fighterValue + 0x620) : null;
+      const leftStickY = fighterMapped ? guestF32(fighterValue + 0x624) : null;
+      const previousLeftStickX = fighterMapped
+        ? guestF32(fighterValue + 0x628)
+        : null;
+      const previousLeftStickY = fighterMapped
+        ? guestF32(fighterValue + 0x62c)
+        : null;
+      const heldInputs = fighterMapped ? guestU32(fighterValue + 0x65c) : null;
+      const pressedInputs = fighterMapped ? guestU32(fighterValue + 0x668) : null;
+      const releasedInputs = fighterMapped
+        ? guestU32(fighterValue + 0x66c)
+        : null;
+
+      const padButtons = guestU32(gamePadAddress);
+      const padTrigger = guestU32(gamePadAddress + 8);
+      const rawStickX = guestS8(gamePadAddress + 0x18);
+      const rawStickY = guestS8(gamePadAddress + 0x19);
+      const normalizedStickX = guestF32(gamePadAddress + 0x20);
+      const normalizedStickY = guestF32(gamePadAddress + 0x24);
+      const padError = guestU8(gamePadAddress + 0x41);
+      const finitePosition = value => value !== null
+        && Number.isFinite(value.x)
+        && Number.isFinite(value.y)
+        && Number.isFinite(value.z);
+      const finiteInput = [
+        facingDirection,
+        selfVelocityX,
+        positionDeltaX,
+        leftStickX,
+        leftStickY,
+        previousLeftStickX,
+        previousLeftStickY,
+        normalizedStickX,
+        normalizedStickY,
+      ].every(Number.isFinite);
+      const aliveMotion = Number.isSafeInteger(motionId) && motionId > 10;
+      const playerSlotPlayable = playerState === 2
+        && character >= 0
+        && character < 0x1a
+        && slotType === 0
+        && Number.isSafeInteger(subColor)
+        && subColor >= 0
+        && subColor < 5
+        && playerId === 0
+        && stocks > 0
+        && stocks < 0x80
+        && Number.isSafeInteger(joystickDirectionCount)
+        && joystickDirectionCount >= 0
+        && entityMapped;
+      const fighterValid = fighterMapped
+        && classifier === 4
+        && processLink === 8
+        && processPriority === 0
+        && userDataKind === 4
+        && fighterGobj === entityValue
+        && fighterKind >= 0
+        && fighterKind < 0x21
+        && fighterPlayerId === 0
+        && fighterPadPlayerId === playerId
+        && fighterSubColor === subColor
+        && (groundOrAir === 0 || groundOrAir === 1)
+        && aliveMotion
+        && finitePosition(position)
+        && finitePosition(previousPosition)
+        && finiteInput;
+      const controlsEnabled = playerSlotPlayable
+        && fighterValid
+        && padError === 0;
+      const neutralInput = padButtons === 0
+        && padTrigger === 0
+        && rawStickX === 0
+        && rawStickY === 0
+        && normalizedStickX === 0
+        && normalizedStickY === 0
+        && leftStickX === 0
+        && leftStickY === 0
+        && heldInputs === 0
+        && pressedInputs === 0;
+      const activeMatch = versusMatchScene
+        && matchInProgress
+        && Number.isSafeInteger(frameCount)
+        && frameCount > 0
+        && hasOpponent
+        && controlsEnabled;
+
+      return {
+        routing: {
+          address: hex32(routingAddress),
+          currentModeAddress: hex32(routingAddress),
+          currentMode,
+          currentSceneIndexAddress: hex32(routingAddress + 3),
+          currentSceneIndex,
+          pendingAddress: hex32(routingAddress + 0x0c),
+          pending: pendingRoute,
+          currentSceneInfoPointerAddress:
+            hex32(currentSceneInfoPointerAddress),
+          currentSceneInfo: currentSceneInfoMapped
+            ? hex32(currentSceneInfo)
+            : null,
+          expectedSceneInfo: hex32(expectedSceneInfo),
+          currentSceneClassAddress: currentSceneInfoMapped
+            ? hex32(currentSceneInfo)
+            : null,
+          currentSceneClass,
+          currentSceneLoadDataAddress: currentSceneInfoMapped
+            ? hex32(currentSceneInfo + 4)
+            : null,
+          currentSceneLoadData: hex32(currentSceneLoadData),
+          currentSceneLeaveDataAddress: currentSceneInfoMapped
+            ? hex32(currentSceneInfo + 8)
+            : null,
+          currentSceneLeaveData: hex32(currentSceneLeaveData),
+          exactSceneInfo,
+          versusMatchScene,
+        },
+        match: {
+          address: hex32(matchAddress),
+          stateAddress: hex32(matchAddress),
+          state: matchState,
+          pauseTimerAddress: hex32(matchAddress + 2),
+          pauseTimer,
+          unpauseTimerAddress: hex32(matchAddress + 4),
+          unpauseTimer,
+          hudEnabledAddress: hex32(matchAddress + 5),
+          hudEnabled,
+          terminateMatchAddress: hex32(matchAddress + 6),
+          terminateMatch,
+          singlePlayerAddress: hex32(matchAddress + 7),
+          singlePlayer,
+          matchResultAddress: hex32(matchAddress + 8),
+          matchResult,
+          matchOverAddress: hex32(matchAddress + 0x0e),
+          matchOver,
+          frameCountAddress: hex32(matchAddress + 0x24),
+          frameCount,
+          playerMatchSlotTypeAddress: hex32(matchAddress + 0x3a),
+          playerMatchSlotType,
+          playerRespawnTimerAddress: hex32(matchAddress + 0x42),
+          playerRespawnTimer,
+          pauseBitsAddress: hex32(pauseBitsAddress),
+          pauseBits,
+          inProgress: matchInProgress,
+        },
+        playerSlot: {
+          address: hex32(playerSlotAddress),
+          size: playerSlotSize,
+          stateAddress: hex32(playerSlotAddress),
+          state: playerState,
+          characterAddress: hex32(playerSlotAddress + 4),
+          character,
+          slotTypeAddress: hex32(playerSlotAddress + 8),
+          slotType,
+          transformedIndexAddress: hex32(playerSlotAddress + 0x0c),
+          transformedIndex,
+          subColorAddress: hex32(playerSlotAddress + 0x46),
+          subColor,
+          playerIdAddress: hex32(playerSlotAddress + 0x48),
+          playerId,
+          stocksAddress: hex32(playerSlotAddress + 0x8e),
+          stocks,
+          joystickDirectionCountAddress:
+            hex32(joystickDirectionCountAddress),
+          joystickDirectionCount,
+          playable: playerSlotPlayable,
+        },
+        opponents,
+        hasOpponent,
+        fighterLookup: {
+          entityPointerAddress: hex32(entityPointerAddress),
+          entity: entityMapped ? hex32(entityValue) : null,
+          classifierAddress: entityMapped ? hex32(entityValue) : null,
+          classifier,
+          processLinkAddress: entityMapped ? hex32(entityValue + 2) : null,
+          processLink,
+          processPriorityAddress: entityMapped ? hex32(entityValue + 4) : null,
+          processPriority,
+          userDataKindAddress: entityMapped ? hex32(entityValue + 7) : null,
+          userDataKind,
+          fighterPointerAddress: hex32(fighterPointerAddress),
+          fighter: fighterMapped ? hex32(fighterValue) : null,
+        },
+        fighter: {
+          address: fighterMapped ? hex32(fighterValue) : null,
+          size: fighterSize,
+          gobjAddress: fighterMapped ? hex32(fighterValue) : null,
+          gobj: entityMapped && meleeMappedPointer(fighterGobj, 0x38)
+            ? hex32(fighterGobj)
+            : null,
+          kindAddress: fighterMapped ? hex32(fighterValue + 4) : null,
+          kind: fighterKind,
+          playerIdAddress: fighterMapped ? hex32(fighterValue + 0x0c) : null,
+          playerId: fighterPlayerId,
+          motionIdAddress: fighterMapped ? hex32(fighterValue + 0x10) : null,
+          motionId,
+          aliveMotion,
+          facingDirectionAddress: fighterMapped
+            ? hex32(fighterValue + 0x2c)
+            : null,
+          facingDirection,
+          positionAddress: hex32(positionAddress),
+          position,
+          previousPositionAddress: hex32(previousPositionAddress),
+          previousPosition,
+          groundOrAirAddress: fighterMapped ? hex32(fighterValue + 0xe0) : null,
+          groundOrAir,
+          selfVelocityXAddress: fighterMapped
+            ? hex32(fighterValue + 0x80)
+            : null,
+          selfVelocityX,
+          positionDeltaXAddress: fighterMapped
+            ? hex32(fighterValue + 0xc8)
+            : null,
+          positionDeltaX,
+          padPlayerIdAddress: fighterMapped
+            ? hex32(fighterValue + 0x618)
+            : null,
+          padPlayerId: fighterPadPlayerId,
+          subColorAddress: fighterMapped
+            ? hex32(fighterValue + 0x61a)
+            : null,
+          subColor: fighterSubColor,
+          input: {
+            leftStickXAddress: fighterMapped
+              ? hex32(fighterValue + 0x620)
+              : null,
+            leftStickX,
+            leftStickYAddress: fighterMapped
+              ? hex32(fighterValue + 0x624)
+              : null,
+            leftStickY,
+            previousLeftStickXAddress: fighterMapped
+              ? hex32(fighterValue + 0x628)
+              : null,
+            previousLeftStickX,
+            previousLeftStickYAddress: fighterMapped
+              ? hex32(fighterValue + 0x62c)
+              : null,
+            previousLeftStickY,
+            heldInputsAddress: fighterMapped
+              ? hex32(fighterValue + 0x65c)
+              : null,
+            heldInputs,
+            pressedInputsAddress: fighterMapped
+              ? hex32(fighterValue + 0x668)
+              : null,
+            pressedInputs,
+            releasedInputsAddress: fighterMapped
+              ? hex32(fighterValue + 0x66c)
+              : null,
+            releasedInputs,
+          },
+          valid: fighterValid,
+        },
+        pad: {
+          address: hex32(gamePadAddress),
+          buttonsAddress: hex32(gamePadAddress),
+          buttons: padButtons,
+          triggerAddress: hex32(gamePadAddress + 8),
+          trigger: padTrigger,
+          rawStickXAddress: hex32(gamePadAddress + 0x18),
+          rawStickX,
+          rawStickYAddress: hex32(gamePadAddress + 0x19),
+          rawStickY,
+          normalizedStickXAddress: hex32(gamePadAddress + 0x20),
+          normalizedStickX,
+          normalizedStickYAddress: hex32(gamePadAddress + 0x24),
+          normalizedStickY,
+          errorAddress: hex32(gamePadAddress + 0x41),
+          error: padError,
+        },
+        controlsEnabled,
+        neutralInput,
+        activeMatch,
+        lastActiveGameplayInput: meleeLastActiveGameplayInput,
+      };
+    }
+
+    function sampleMeleeGameplayInput(sampleCycle) {
+      if (boot.identifier !== "GALE01" || boot.version !== 2) return;
+      const publication = serialLastActiveHostPublication;
+      if (
+        !Number.isSafeInteger(sampleCycle)
+        || sampleCycle < 0
+        || publication === null
+        || publication.buttons !== 0x0001
+        || !Number.isSafeInteger(publication.sequence)
+        || publication.sequence <= 0
+        || !Number.isSafeInteger(publication.scheduledCycle)
+        || !Number.isSafeInteger(publication.observedCycle)
+        || publication.scheduledCycle > publication.observedCycle
+        || publication.observedCycle > sampleCycle
+        || controllerAppliedSequence !== publication.sequence
+      ) return;
+      const previousSequence =
+        meleeLastActiveGameplayInput?.hostPublication?.sequence;
+      if (
+        Number.isSafeInteger(previousSequence)
+        && previousSequence >= publication.sequence
+      ) return;
+      const state = inspectMeleeGameState();
+      if (
+        state === null
+        || state.activeMatch !== true
+        || state.fighter.groundOrAir !== 0
+        || state.pad.buttons !== 0x00040001
+        || state.pad.trigger !== 0x00040001
+        || state.pad.rawStickX !== -80
+        || state.pad.rawStickY !== 0
+        || state.pad.normalizedStickX !== -1
+        || state.pad.normalizedStickY !== 0
+        || state.fighter.input.leftStickX !== state.pad.normalizedStickX
+        || state.fighter.input.leftStickY !== state.pad.normalizedStickY
+        || state.fighter.input.heldInputs !== 0x00040001
+        || state.fighter.input.pressedInputs !== 0x00040001
+      ) return;
+      meleeLastActiveGameplayInput = {
+        cycle: sampleCycle,
+        controllerAppliedSequence,
+        hostPublication: { ...publication },
+        matchFrame: state.match.frameCount,
+        transformedIndex: state.playerSlot.transformedIndex,
+        joystickDirectionCount: state.playerSlot.joystickDirectionCount,
+        entity: state.fighterLookup.entity,
+        fighter: state.fighter.address,
+        motionId: state.fighter.motionId,
+        position: { ...state.fighter.position },
+        pad: {
+          buttons: state.pad.buttons,
+          trigger: state.pad.trigger,
+          rawStickX: state.pad.rawStickX,
+          rawStickY: state.pad.rawStickY,
+          normalizedStickX: state.pad.normalizedStickX,
+          normalizedStickY: state.pad.normalizedStickY,
+          error: state.pad.error,
+        },
+        fighterInput: {
+          leftStickX: state.fighter.input.leftStickX,
+          leftStickY: state.fighter.input.leftStickY,
+          heldInputs: state.fighter.input.heldInputs,
+          pressedInputs: state.fighter.input.pressedInputs,
+        },
+      };
+    }
+
     function inspectWarioWareGameState() {
       if (boot.identifier !== "GZWE01") return null;
 
@@ -16008,12 +16519,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       return inspectSuperMonkeyBallGameState()
         ?? inspectLuigisMansionGameState()
         ?? inspectWindWakerGameState()
+        ?? inspectMeleeGameState()
         ?? inspectWarioWareGameState();
     }
 
     function sampleGuestGameplayInput(sampleCycle) {
       sampleLuigisMansionGameplayInput(sampleCycle);
       sampleWindWakerGameplayInput(sampleCycle);
+      sampleMeleeGameplayInput(sampleCycle);
       sampleWarioWareGameplayInput(sampleCycle);
     }
 

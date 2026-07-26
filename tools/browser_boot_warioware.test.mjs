@@ -63,6 +63,9 @@ function makeContext(identifier = "GZWE01") {
     inspectWindWakerGameState() {
       return identifier === "GZLE01" ? { game: "wind" } : null;
     },
+    inspectMeleeGameState() {
+      return null;
+    },
   };
   vm.createContext(context);
   vm.runInContext([

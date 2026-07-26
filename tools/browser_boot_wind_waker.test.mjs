@@ -46,10 +46,16 @@ function makeContext(identifier = "GZLE01", version = 0) {
     inspectLuigisMansionGameState() {
       return identifier === "GLME01" ? { game: "luigi" } : null;
     },
+    inspectMeleeGameState() {
+      return identifier === "GALE01" && version === 2
+        ? { game: "melee" }
+        : null;
+    },
     inspectWarioWareGameState() {
       return identifier === "GZWE01" ? { game: "wario" } : null;
     },
     sampleLuigisMansionGameplayInput() {},
+    sampleMeleeGameplayInput() {},
     sampleWarioWareGameplayInput() {},
   };
   vm.createContext(context);
@@ -378,7 +384,7 @@ test("guest diagnostics and VI sampling dispatch Wind Waker by exact identity", 
   assert.equal(makeContext("GZLE01", 1).inspectGuestGameState(), null);
   assert.match(
     source,
-    /function sampleGuestGameplayInput\(sampleCycle\) \{\s+sampleLuigisMansionGameplayInput\(sampleCycle\);\s+sampleWindWakerGameplayInput\(sampleCycle\);\s+sampleWarioWareGameplayInput\(sampleCycle\);/,
+    /function sampleGuestGameplayInput\(sampleCycle\) \{\s+sampleLuigisMansionGameplayInput\(sampleCycle\);\s+sampleWindWakerGameplayInput\(sampleCycle\);\s+sampleMeleeGameplayInput\(sampleCycle\);\s+sampleWarioWareGameplayInput\(sampleCycle\);/,
   );
   assert.match(
     source,
