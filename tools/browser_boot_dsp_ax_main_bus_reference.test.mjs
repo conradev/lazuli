@@ -31,6 +31,24 @@ function writeMainInput(mram, physicalAddress, samples) {
   }
 }
 
+function writeLrsInput(
+  mram,
+  physicalAddress,
+  { left, right, surround },
+) {
+  writeMainInput(mram, physicalAddress, left);
+  writeMainInput(
+    mram,
+    physicalAddress + AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes,
+    right,
+  );
+  writeMainInput(
+    mram,
+    physicalAddress + 2 * AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes,
+    surround,
+  );
+}
+
 function writeCompressorEntry(
   mram,
   physicalTableAddress,
@@ -53,6 +71,14 @@ function writeCompressorEntry(
 
 function setLr(address) {
   return { code: AX_MAIN_BUS_COMMAND.SET_LR, address };
+}
+
+function uploadLrs(address) {
+  return { code: AX_MAIN_BUS_COMMAND.UPLOAD_LRS, address };
+}
+
+function mixAuxBNoWrite(address) {
+  return { code: AX_MAIN_BUS_COMMAND.MIX_AUXB_NOWRITE, address };
 }
 
 function processCommand() {
@@ -98,6 +124,38 @@ function applyWrites(mram, writes) {
   return updated;
 }
 
+function fnv1a(parts) {
+  let hash = 0x811c9dc5;
+  for (const bytes of parts) {
+    for (const value of bytes) {
+      hash = Math.imul(hash ^ value, 0x01000193) >>> 0;
+    }
+  }
+  return "0x" + hash.toString(16).padStart(8, "0");
+}
+
+function assertExactOwnedResultBuffers(result, mram) {
+  const payloads = [
+    ...result.uploads.map(upload => upload.data),
+    result.output.surround.bytes,
+    result.output.main.bytes,
+    result.output.surround.samples,
+    result.output.main.samples,
+  ];
+  for (const payload of payloads) {
+    assert.ok(ArrayBuffer.isView(payload));
+    assert.ok(payload.buffer instanceof ArrayBuffer);
+    assert.equal(payload.byteOffset, 0);
+    assert.equal(payload.byteLength, payload.buffer.byteLength);
+    assert.notEqual(payload.buffer, mram.buffer);
+  }
+  assert.equal(
+    new Set(payloads.map(payload => payload.buffer)).size,
+    payloads.length,
+    "every independently returned payload owns a distinct exact buffer",
+  );
+}
+
 function patternedSamples() {
   const samples = new Int32Array(AX_MAIN_BUS_LIMITS.frames);
   for (let frame = 0; frame < samples.length; frame += 1) {
@@ -122,7 +180,9 @@ function patternedSamples() {
 test("pins GameCube AX command IDs and the five-millisecond envelope", () => {
   assert.deepEqual(AX_MAIN_BUS_COMMAND, {
     PROCESS: 0x03,
+    UPLOAD_LRS: 0x06,
     SET_LR: 0x07,
+    MIX_AUXB_NOWRITE: 0x09,
     OUTPUT: 0x0e,
     SET_OPPOSITE_LR: 0x11,
     COMPRESSOR: 0x12,
@@ -132,6 +192,8 @@ test("pins GameCube AX command IDs and the five-millisecond envelope", () => {
   assert.equal(AX_MAIN_BUS_LIMITS.milliseconds, 5);
   assert.equal(AX_MAIN_BUS_LIMITS.compressorEntryBytes, 320);
   assert.equal(AX_MAIN_BUS_LIMITS.attackEntryCount, 11);
+  assert.equal(AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes, 640);
+  assert.equal(AX_MAIN_BUS_LIMITS.accumulatorLrsBytes, 1_920);
 });
 
 test("CMD_SET_LR reads cached big-endian s32 and emits exact R,L s16", () => {
@@ -250,6 +312,525 @@ test("CMD_SET_OPPOSITE_LR wraps INT32_MIN and honors uncached aliases", () => {
     result.telemetry.transactionHash,
     "0xe2c34d2a",
   );
+});
+
+test("PROCESS then UPLOAD_LRS snapshots post-voice accumulators in order", () => {
+  const mram = new Uint8Array(0x10_000);
+  const initialLeft = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (0x1020_3040 + frame * 0x0102_0304) | 0,
+  );
+  const initialRight = Int32Array.from(
+    initialLeft,
+    value => (~value) | 0,
+  );
+  const initialSurround = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (frame * 0x0011_2233) | 0,
+  );
+  const voiceLeft = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (0x3141_5926 - frame * 0x0001_0203) | 0,
+  );
+  const voiceRight = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (-0x2718_2818 + frame * 0x0003_0201) | 0,
+  );
+  const opposite = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => ((frame * 1_000_003) - 80_000_000) | 0,
+  );
+  opposite[0] = -0x8000_0000;
+  opposite[1] = 0x7fff_ffff;
+
+  const auxLeft = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (frame * 101 - 8_000) | 0,
+  );
+  const auxRight = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (8_000 - frame * 103) | 0,
+  );
+  const auxSurround = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (0x1234_0000 + frame * 257) | 0,
+  );
+  auxLeft[0] = -1;
+  auxRight[0] = -1;
+  auxLeft[1] = -2;
+  auxRight[1] = 1;
+
+  writeMainInput(mram, 0x1000, opposite);
+  writeLrsInput(mram, 0x2000, {
+    left: auxLeft,
+    right: auxRight,
+    surround: auxSurround,
+  });
+  const before = new Uint8Array(mram);
+  const processInputs = [];
+  const result = executeAxMainBusReference({
+    mram,
+    initialMainBus: {
+      left: initialLeft,
+      right: initialRight,
+      surround: initialSurround,
+    },
+    processMainBus: ({ left, right }) => {
+      processInputs.push({ left, right });
+      return {
+        left: new Int32Array(voiceLeft),
+        right: new Int32Array(voiceRight),
+      };
+    },
+    commands: [
+      processCommand(),
+      uploadLrs(0x8000_0100),
+      setOppositeLr(0xc000_1000),
+      mixAuxBNoWrite(0x4000_2000),
+      output(0x5000, 0x6000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before, "the authority model must not mutate MRAM");
+  assert.equal(processInputs.length, 1);
+  assert.deepEqual(processInputs[0].left, initialLeft);
+  assert.deepEqual(processInputs[0].right, initialRight);
+  assert.notEqual(processInputs[0].left.buffer, initialLeft.buffer);
+  assert.notEqual(processInputs[0].right.buffer, initialRight.buffer);
+  assert.equal(result.uploads.length, 1);
+  assert.equal(result.writes.length, 3);
+  assertExactOwnedResultBuffers(result, mram);
+  assert.deepEqual(
+    result.writes.map(write => ({
+      sequence: write.sequence,
+      commandIndex: write.commandIndex,
+      kind: write.kind,
+      physicalAddress: write.physicalAddress,
+      byteLength: write.byteLength,
+      aliasesMram: write.data.buffer === mram.buffer,
+    })),
+    [
+      {
+        sequence: 0,
+        commandIndex: 1,
+        kind: "main-lrs-s32-be",
+        physicalAddress: 0x100,
+        byteLength: 1_920,
+        aliasesMram: false,
+      },
+      {
+        sequence: 1,
+        commandIndex: 4,
+        kind: "surround-s32-be",
+        physicalAddress: 0x6000,
+        byteLength: 640,
+        aliasesMram: false,
+      },
+      {
+        sequence: 2,
+        commandIndex: 4,
+        kind: "main-rl-s16-be",
+        physicalAddress: 0x5000,
+        byteLength: 640,
+        aliasesMram: false,
+      },
+    ],
+  );
+  assert.equal(result.writes[0].data, result.uploads[0].data);
+
+  const uploadView = new DataView(result.uploads[0].data.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(uploadView.getInt32(frame * 4, false), voiceLeft[frame]);
+    assert.equal(
+      uploadView.getInt32(
+        AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes + frame * 4,
+        false,
+      ),
+      voiceRight[frame],
+    );
+    assert.equal(
+      uploadView.getInt32(
+        2 * AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes + frame * 4,
+        false,
+      ),
+      initialSurround[frame],
+    );
+  }
+  assert.notEqual(
+    uploadView.getInt32(0, false),
+    initialLeft[0],
+    "the upload snapshots post-PROCESS L/R rather than initial accumulators",
+  );
+
+  const mainView = new DataView(result.output.main.bytes.buffer);
+  const surroundView = new DataView(result.output.surround.bytes.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    const expectedLeft = (((-opposite[frame]) | 0) + auxLeft[frame]) | 0;
+    const expectedRight = (opposite[frame] + auxRight[frame]) | 0;
+    assert.equal(
+      mainView.getInt16(frame * 4, false),
+      clampSigned16(expectedRight),
+    );
+    assert.equal(
+      mainView.getInt16(frame * 4 + 2, false),
+      clampSigned16(expectedLeft),
+    );
+    assert.equal(
+      surroundView.getInt32(frame * 4, false),
+      auxSurround[frame],
+    );
+  }
+  assert.equal(
+    mainView.getInt16(0, false),
+    0x7fff,
+    "INT32_MIN plus -1 wraps to INT32_MAX before output clamping",
+  );
+  assert.equal(mainView.getInt16(4, false), -0x8000);
+  assert.equal(result.telemetry.uploadLrsCommands, 1);
+  assert.equal(result.telemetry.setOppositeLrCommands, 1);
+  assert.equal(result.telemetry.mixAuxBNoWriteCommands, 1);
+  assert.equal(result.telemetry.processCommands, 1);
+  assert.equal(result.telemetry.uploadWriteBytes, 1_920);
+  assert.equal(result.telemetry.outputWriteBytes, 1_280);
+  assert.equal(result.telemetry.transactionWriteBytes, 3_200);
+  assert.equal(
+    result.telemetry.outputHash,
+    fnv1a([
+      result.output.surround.bytes,
+      result.output.main.bytes,
+    ]),
+  );
+  assert.equal(
+    result.telemetry.transactionHash,
+    fnv1a(result.writes.map(write => write.data)),
+  );
+
+  const applied = applyWrites(mram, result.writes);
+  assert.deepEqual(
+    applied.slice(0x100, 0x100 + 1_920),
+    result.uploads[0].data,
+  );
+  assert.deepEqual(
+    applied.slice(0x5000, 0x5000 + 640),
+    result.output.main.bytes,
+  );
+  assert.deepEqual(
+    applied.slice(0x6000, 0x6000 + 640),
+    result.output.surround.bytes,
+  );
+});
+
+test("WarioWare main-bus-only postmix uploads zero initial accumulators", () => {
+  const mram = new Uint8Array(0x10_000);
+  const opposite = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => frame * 10_003 - 800_000,
+  );
+  const aux = {
+    left: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(101),
+    right: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(-103),
+    surround: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(0x1234_5678),
+  };
+  writeMainInput(mram, 0x1000, opposite);
+  writeLrsInput(mram, 0x2000, aux);
+  const before = new Uint8Array(mram);
+  const result = executeAxMainBusReference({
+    mram,
+    commands: [
+      uploadLrs(0x8000_0100),
+      setOppositeLr(0xc000_1000),
+      mixAuxBNoWrite(0x4000_2000),
+      output(0x5000, 0x6000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  assert.equal(result.telemetry.processCommands, 0);
+  assert.equal(result.telemetry.commands, 4);
+  assert.equal(result.uploads.length, 1);
+  assert.ok(result.uploads[0].data.every(value => value === 0));
+  assert.deepEqual(
+    result.writes.map(write => [
+      write.sequence,
+      write.commandIndex,
+      write.kind,
+    ]),
+    [
+      [0, 0, "main-lrs-s32-be"],
+      [1, 3, "surround-s32-be"],
+      [2, 3, "main-rl-s16-be"],
+    ],
+  );
+  const mainView = new DataView(result.output.main.bytes.buffer);
+  const surroundView = new DataView(result.output.surround.bytes.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(
+      mainView.getInt16(frame * 4, false),
+      clampSigned16((opposite[frame] - 103) | 0),
+    );
+    assert.equal(
+      mainView.getInt16(frame * 4 + 2, false),
+      clampSigned16((((-opposite[frame]) | 0) + 101) | 0),
+    );
+    assert.equal(
+      surroundView.getInt32(frame * 4, false),
+      aux.surround[frame],
+    );
+  }
+  assert.equal(
+    result.telemetry.outputHash,
+    fnv1a([
+      result.output.surround.bytes,
+      result.output.main.bytes,
+    ]),
+  );
+  assert.equal(
+    result.telemetry.transactionHash,
+    fnv1a(result.writes.map(write => write.data)),
+  );
+  assert.notEqual(
+    result.telemetry.transactionHash,
+    result.telemetry.outputHash,
+    "the transaction hash includes the 1,920-byte upload",
+  );
+});
+
+test("staged upload aliases feed later partial SET reads across planes", () => {
+  const mram = new Uint8Array(0x8000);
+  const initialLeft = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => 10_000 + frame * 17,
+  );
+  const initialRight = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => -20_000 - frame * 19,
+  );
+  const initialSurround = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => 30_000 + frame * 23,
+  );
+  const before = new Uint8Array(mram);
+  const result = executeAxMainBusReference({
+    mram,
+    initialMainBus: {
+      left: initialLeft,
+      right: initialRight,
+      surround: initialSurround,
+    },
+    commands: [
+      uploadLrs(0x8000_1000),
+      setOppositeLr(0xc000_1200),
+      output(0x5000, 0x6000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  const source = new Int32Array(AX_MAIN_BUS_LIMITS.frames);
+  source.set(initialLeft.subarray(128), 0);
+  source.set(initialRight.subarray(0, 128), 32);
+  const mainView = new DataView(result.output.main.bytes.buffer);
+  const surroundView = new DataView(result.output.surround.bytes.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(
+      mainView.getInt16(frame * 4, false),
+      clampSigned16(source[frame]),
+    );
+    assert.equal(
+      mainView.getInt16(frame * 4 + 2, false),
+      clampSigned16((-source[frame]) | 0),
+    );
+    assert.equal(surroundView.getInt32(frame * 4, false), 0);
+  }
+});
+
+test("partial aliased reads merge staged and MRAM bytes exactly", () => {
+  const mram = new Uint8Array(0x8000);
+  for (let address = 0x1780; address < 0x1900; address += 1) {
+    mram[address] = (address * 37 + 11) & 0xff;
+  }
+  const initialLeft = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (0x1020_3040 + frame * 0x0101_0101) | 0,
+  );
+  const initialRight = Int32Array.from(
+    initialLeft,
+    value => (~value) | 0,
+  );
+  const initialSurround = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => (0x5060_7080 - frame * 0x0001_0203) | 0,
+  );
+  const before = new Uint8Array(mram);
+  const result = executeAxMainBusReference({
+    mram,
+    initialMainBus: {
+      left: initialLeft,
+      right: initialRight,
+      surround: initialSurround,
+    },
+    commands: [
+      uploadLrs(0x8000_1000),
+      setLr(0xc000_1602),
+      output(0x5000, 0x6000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  const stagedImage = new Uint8Array(mram);
+  stagedImage.set(result.uploads[0].data, 0x1000);
+  const stagedView = new DataView(stagedImage.buffer);
+  const mainView = new DataView(result.output.main.bytes.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    const expected = stagedView.getInt32(0x1602 + frame * 4, false);
+    assert.equal(
+      mainView.getInt16(frame * 4, false),
+      clampSigned16(expected),
+    );
+    assert.equal(
+      mainView.getInt16(frame * 4 + 2, false),
+      clampSigned16(expected),
+    );
+  }
+});
+
+test("overlapping staged uploads retain command-order last-write-wins reads", () => {
+  const mram = new Uint8Array(0x10_000);
+  const firstLeft = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => 1_000 + frame,
+  );
+  const firstRight = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => 2_000 + frame,
+  );
+  const firstSurround = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => 3_000 + frame,
+  );
+  const secondMono = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => -4_000 - frame,
+  );
+  writeMainInput(mram, 0x5000, secondMono);
+  const before = new Uint8Array(mram);
+  const result = executeAxMainBusReference({
+    mram,
+    initialMainBus: {
+      left: firstLeft,
+      right: firstRight,
+      surround: firstSurround,
+    },
+    commands: [
+      uploadLrs(0x8000_1000),
+      setLr(0x5000),
+      uploadLrs(0x4000_1200),
+      setLr(0xc000_1100),
+      output(0x7000, 0x8000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  assert.equal(result.uploads.length, 2);
+  const source = new Int32Array(AX_MAIN_BUS_LIMITS.frames);
+  source.set(firstLeft.subarray(64, 128), 0);
+  source.set(secondMono.subarray(0, 96), 64);
+  const mainView = new DataView(result.output.main.bytes.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(
+      mainView.getInt16(frame * 4, false),
+      clampSigned16(source[frame]),
+    );
+    assert.equal(
+      mainView.getInt16(frame * 4 + 2, false),
+      clampSigned16(source[frame]),
+    );
+  }
+});
+
+test("staged upload aliases feed all three AUX-B return planes", () => {
+  const mram = new Uint8Array(0x8000);
+  const initialLeft = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => frame - 80,
+  );
+  const initialRight = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => frame * 2 - 160,
+  );
+  const initialSurround = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => 1_000 + frame,
+  );
+  const before = new Uint8Array(mram);
+  const result = executeAxMainBusReference({
+    mram,
+    initialMainBus: {
+      left: initialLeft,
+      right: initialRight,
+      surround: initialSurround,
+    },
+    commands: [
+      uploadLrs(0x8000_1000),
+      mixAuxBNoWrite(0xc000_1000),
+      output(0x5000, 0x6000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  const mainView = new DataView(result.output.main.bytes.buffer);
+  const surroundView = new DataView(result.output.surround.bytes.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(
+      mainView.getInt16(frame * 4, false),
+      initialRight[frame] * 2,
+    );
+    assert.equal(
+      mainView.getInt16(frame * 4 + 2, false),
+      initialLeft[frame] * 2,
+    );
+    assert.equal(
+      surroundView.getInt32(frame * 4, false),
+      initialSurround[frame] * 2,
+    );
+  }
+});
+
+test("staged upload aliases feed compressor coefficients", () => {
+  const mram = new Uint8Array(0x8000);
+  const packedCoefficients = new Int32Array(
+    AX_MAIN_BUS_LIMITS.frames,
+  ).fill(0x0001_0001);
+  const before = new Uint8Array(mram);
+  const result = executeAxMainBusReference({
+    mram,
+    initialMainBus: {
+      left: packedCoefficients,
+      right: packedCoefficients,
+      surround: new Int32Array(AX_MAIN_BUS_LIMITS.frames),
+    },
+    commands: [
+      uploadLrs(0x4000_1000),
+      compressor({
+        threshold: 0,
+        releaseFrames: 1,
+        tableAddress: 0x8000_1000,
+      }),
+      output(0x5000, 0x6000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  assert.equal(result.compressorPosition, 1);
+  assert.deepEqual(result.output.main.samples, new Int16Array(
+    AX_MAIN_BUS_LIMITS.frames * AX_MAIN_BUS_LIMITS.channels,
+  ).fill(2));
 });
 
 test("final output preserves surround s32 and writes surround before R,L", () => {
@@ -763,6 +1344,16 @@ test("invalid commands and MRAM ranges fail closed at bounded envelopes", () => 
     {
       name: "input range",
       commands: [setLr(0x8000_3f00), validOutput],
+      reason: "mram-range-out-of-bounds",
+    },
+    {
+      name: "upload range",
+      commands: [uploadLrs(0x8000_3f00), validOutput],
+      reason: "mram-range-out-of-bounds",
+    },
+    {
+      name: "AUX-B return range",
+      commands: [mixAuxBNoWrite(0x8000_3f00), validOutput],
       reason: "mram-range-out-of-bounds",
     },
     {
