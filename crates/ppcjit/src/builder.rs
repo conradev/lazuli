@@ -707,6 +707,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Lhzx => self.lhzx(ins),
             Opcode::Lmw => self.lmw(ins),
             Opcode::Lswi => self.lswi(ins),
+            Opcode::Lswx => self.lswx(ins),
             Opcode::Lwarx => self.lwarx(ins),
             Opcode::Lwbrx => self.lwbrx(ins),
             Opcode::Lwz => self.lwz(ins),

@@ -2,7 +2,9 @@ use std::alloc::Layout;
 
 use cranelift_codegen::isa;
 use gekko::disasm::{Extensions, Ins, Opcode};
-use gekko::{Address, CondReg, Cpu, Exception, FloatControlReg, FloatPair, ProgramExceptionCause};
+use gekko::{
+    Address, CondReg, Cpu, Exception, FloatControlReg, FloatPair, ProgramExceptionCause, XerReg,
+};
 
 use crate::block::{BlockFn, Executed, ExitReason, Meta};
 use crate::hooks::{Context, ExitData, Hooks};
@@ -77,6 +79,13 @@ fn compile_sequence(isa: isa::Builder, sequence: Sequence) -> (Artifact, Meta) {
     );
 
     jit.build_artifact(sequence.0.into_iter()).unwrap()
+}
+
+fn lswx(rd: u8, ra: u8, rb: u8) -> Ins {
+    Ins::new(
+        0x7c00_042a | u32::from(rd) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11,
+        Extensions::gekko_broadway(),
+    )
 }
 
 fn test_sequence(name: &str, sequence: Sequence) {
@@ -223,6 +232,54 @@ struct NativeProgramExceptionContext {
     exit_executed: Executed,
 }
 
+struct NativeLswxContext {
+    cpu: Cpu,
+    fastmem: Box<FastmemLut>,
+    bytes: [u8; 128],
+    reads: Vec<u32>,
+    fail_at: Option<usize>,
+    exit_executed: Executed,
+}
+
+extern "C-unwind" fn native_lswx_registers(ctx: *mut Context) -> *mut Cpu {
+    let ctx = unsafe { &mut *ctx.cast::<NativeLswxContext>() };
+    &raw mut ctx.cpu
+}
+
+extern "C-unwind" fn native_lswx_fastmem(ctx: *mut Context) -> *mut FastmemLut {
+    let ctx = unsafe { &mut *ctx.cast::<NativeLswxContext>() };
+    &raw mut *ctx.fastmem
+}
+
+extern "C-unwind" fn native_lswx_read_i8(
+    ctx: *mut Context,
+    address: Address,
+    output: *mut i8,
+) -> bool {
+    let ctx = unsafe { &mut *ctx.cast::<NativeLswxContext>() };
+    let index = ctx.reads.len();
+    ctx.reads.push(address.value());
+    if ctx.fail_at == Some(index) {
+        ctx.cpu.supervisor.exception.dsisr = 0x4200_0000;
+        return false;
+    }
+    unsafe {
+        output.write(ctx.bytes[index].cast_signed());
+    }
+    true
+}
+
+extern "C-unwind" fn native_lswx_exit(
+    ctx: *const Context,
+    _: *mut ExitData,
+    _: ExitReason,
+    executed: Executed,
+) -> Option<BlockFn> {
+    let ctx = unsafe { &mut *ctx.cast_mut().cast::<NativeLswxContext>() };
+    ctx.exit_executed = executed;
+    None
+}
+
 extern "C-unwind" fn native_program_exception_registers(ctx: *mut Context) -> *mut Cpu {
     let ctx = unsafe { &mut *ctx.cast::<NativeProgramExceptionContext>() };
     &raw mut ctx.cpu
@@ -286,6 +343,288 @@ fn native_illegal_instruction_records_the_program_cause_before_exit() {
         ProgramExceptionCause::IllegalInstruction.srr1_bits()
     );
     assert_eq!(context.exit_srr1, context.cpu.supervisor.exception.srr[1]);
+}
+
+#[test]
+fn native_lswx_observes_defined_counts_partial_faults_and_alignment_boundaries() {
+    let indexed = lswx(1, 0, 0);
+    assert_eq!(indexed.op, Opcode::Lswx);
+    for isa in [
+        jitclif::isa::x86_64_v1(),
+        jitclif::isa::x86_64_v3(),
+        jitclif::isa::aarch64(),
+    ] {
+        let (_, meta) = compile_sequence(isa, Sequence(vec![indexed]));
+        assert_eq!(meta.seq.0, [indexed]);
+        assert_eq!(meta.cycles, 10);
+    }
+
+    // This trailing instruction must be left for the next translation because lswx has a
+    // runtime-selected destination range and therefore ends the current register-cache epoch.
+    let trailing = Ins::new(0x3863_0001, Extensions::gekko_broadway());
+
+    let mut hooks = unsafe { Hooks::stub() };
+    hooks.get_registers = native_lswx_registers;
+    hooks.get_fastmem = native_lswx_fastmem;
+    hooks.read_i8 = native_lswx_read_i8;
+    hooks.exit = native_lswx_exit;
+    let mut jit = Jit::new(
+        Settings {
+            codegen: CodegenSettings::default(),
+            cache_path: None,
+            exit_data_layout: Layout::new::<u8>(),
+        },
+        hooks,
+    );
+    let block = jit.build([indexed, trailing].into_iter()).unwrap();
+    assert_eq!(block.meta().seq.0, [indexed]);
+    assert_eq!(block.meta().cycles, 10);
+
+    let bytes = std::array::from_fn(|index| (index as u8).wrapping_mul(37).wrapping_add(11));
+    let mut context = NativeLswxContext {
+        cpu: Cpu::default(),
+        fastmem: Box::new([None; FASTMEM_LUT_COUNT]),
+        bytes,
+        reads: Vec::new(),
+        fail_at: None,
+        exit_executed: Executed::default(),
+    };
+    let initial_pc = 0x8000_5000;
+
+    // r1 through r31 can receive at most 124 bytes without overlapping the r0/r0 address
+    // operands. This covers every architecturally defined XER count for this instruction form;
+    // counts 125 through 127 necessarily cover all GPRs and are boundedly undefined.
+    for count in 0u32..=124 {
+        let mut initial = std::array::from_fn(|index| 0xa500_0000 | index as u32);
+        initial[0] = 0x0000_2000;
+        context.cpu = Cpu {
+            pc: Address(initial_pc),
+            ..Cpu::default()
+        };
+        context.cpu.user.gpr = initial;
+        context.cpu.user.xer = XerReg::from_bits(0xc000_0000 | count);
+        context.reads.clear();
+        context.fail_at = None;
+        context.exit_executed = Executed::default();
+
+        unsafe {
+            jit.call((&raw mut context).cast::<Context>(), block.as_ptr());
+        }
+
+        let mut expected = initial;
+        for index in 0..count as usize {
+            let register = 1 + index / 4;
+            let shift = 8 * (3 - index % 4);
+            if index % 4 == 0 {
+                expected[register] = 0;
+            }
+            expected[register] |= u32::from(bytes[index]) << shift;
+        }
+        assert_eq!(context.cpu.user.gpr, expected, "XER count {count}");
+        assert_eq!(
+            context.reads,
+            (0..count).map(|offset| 0x2000 + offset).collect::<Vec<_>>(),
+            "XER count {count}"
+        );
+        assert_eq!(context.cpu.user.xer.to_bits(), 0xc000_0000 | count);
+        assert_eq!(context.cpu.pc, Address(initial_pc + 4));
+        assert_eq!(context.exit_executed.instructions, 1);
+        assert_eq!(context.exit_executed.cycles, 10);
+    }
+
+    // Counts 125 through 127 necessarily make the destination range overlap r0, the indexed
+    // address operand. Their register results are architecturally undefined, but execution
+    // remains bounded: the implementation latches EA and issues exactly the selected byte count.
+    for count in 125u32..=127 {
+        context.cpu = Cpu {
+            pc: Address(initial_pc),
+            ..Cpu::default()
+        };
+        context.cpu.user.gpr[0] = 0x0000_2000;
+        context.cpu.user.xer = XerReg::from_bits(0x4000_0000 | count);
+        context.reads.clear();
+        context.fail_at = None;
+        context.exit_executed = Executed::default();
+
+        unsafe {
+            jit.call((&raw mut context).cast::<Context>(), block.as_ptr());
+        }
+
+        assert_eq!(
+            context.reads,
+            (0..count).map(|offset| 0x2000 + offset).collect::<Vec<_>>(),
+            "boundedly undefined XER count {count}"
+        );
+        assert_eq!(context.cpu.user.xer.to_bits(), 0x4000_0000 | count);
+        assert_eq!(context.cpu.pc, Address(initial_pc + 4));
+        assert_eq!(context.exit_executed.instructions, 1);
+        assert_eq!(context.exit_executed.cycles, 10);
+    }
+
+    // Exercise EA addition while the destination register range wraps r31-r0.
+    let wrapping = lswx(30, 3, 4);
+    let wrapping_block = jit.build([wrapping].into_iter()).unwrap();
+    let mut initial = std::array::from_fn(|index| 0x5a00_0000 | index as u32);
+    initial[3] = 0x0000_2ff0;
+    initial[4] = 0x0000_0010;
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.user.gpr = initial;
+    context.cpu.user.xer = XerReg::from_bits(0x8000_000a);
+    context.reads.clear();
+    context.fail_at = None;
+    unsafe {
+        jit.call(
+            (&raw mut context).cast::<Context>(),
+            wrapping_block.as_ptr(),
+        );
+    }
+    let mut expected = initial;
+    for (index, byte) in bytes[..10].iter().copied().enumerate() {
+        let register = (30 + index / 4) % 32;
+        let shift = 8 * (3 - index % 4);
+        if index % 4 == 0 {
+            expected[register] = 0;
+        }
+        expected[register] |= u32::from(byte) << shift;
+    }
+    assert_eq!(context.cpu.user.gpr, expected);
+    assert_eq!(
+        context.reads,
+        [
+            0x3000, 0x3001, 0x3002, 0x3003, 0x3004, 0x3005, 0x3006, 0x3007, 0x3008, 0x3009
+        ]
+    );
+
+    // PowerPC permits partial multiple/string loads. Match the MPC750's discrete accesses and
+    // Dolphin's Gekko behavior by retaining successful bytes but not the faulting byte.
+    let fault_initial = initial;
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.user.gpr = fault_initial;
+    context.cpu.user.gpr[3] = 0x3000;
+    context.cpu.user.gpr[4] = 0x20;
+    let fault_initial = context.cpu.user.gpr;
+    context.cpu.user.xer = XerReg::from_bits(7);
+    context.reads.clear();
+    context.fail_at = Some(6);
+    context.exit_executed = Executed::default();
+    unsafe {
+        jit.call(
+            (&raw mut context).cast::<Context>(),
+            wrapping_block.as_ptr(),
+        );
+    }
+    let mut fault_expected = fault_initial;
+    fault_expected[30] = bytes[..4]
+        .iter()
+        .fold(0u32, |word, byte| word << 8 | u32::from(*byte));
+    fault_expected[31] = u32::from(bytes[4]) << 24 | u32::from(bytes[5]) << 16;
+    assert_eq!(context.cpu.user.gpr, fault_expected);
+    assert_eq!(
+        context.reads,
+        [0x3020, 0x3021, 0x3022, 0x3023, 0x3024, 0x3025, 0x3026]
+    );
+    assert_eq!(context.cpu.supervisor.exception.dar, 0x3026);
+    assert_eq!(context.cpu.supervisor.exception.dsisr, 0x4200_0000);
+    assert_eq!(context.cpu.supervisor.exception.srr[0], initial_pc);
+    assert_eq!(context.cpu.pc, Address(0xfff0_0300));
+    assert_eq!(context.exit_executed.instructions, 1);
+    assert_eq!(context.exit_executed.cycles, 10);
+
+    // MPC750 detects both string-range boundary cases before issuing a memory access.
+    for (base, count) in [(0x0000_0ffdu32, 4u32), (0x0fff_fffcu32, 8u32)] {
+        context.cpu = Cpu {
+            pc: Address(initial_pc),
+            ..Cpu::default()
+        };
+        context.cpu.user.gpr = fault_initial;
+        context.cpu.user.gpr[3] = base;
+        context.cpu.user.gpr[4] = 0;
+        let boundary_initial = context.cpu.user.gpr;
+        context.cpu.user.xer = XerReg::from_bits(count);
+        context.reads.clear();
+        context.fail_at = None;
+        context.exit_executed = Executed::default();
+        unsafe {
+            jit.call(
+                (&raw mut context).cast::<Context>(),
+                wrapping_block.as_ptr(),
+            );
+        }
+        assert_eq!(context.cpu.user.gpr, boundary_initial);
+        assert!(context.reads.is_empty());
+        assert_eq!(context.cpu.supervisor.exception.dar, base);
+        assert_eq!(context.cpu.supervisor.exception.dsisr, 0x0000_a3c3);
+        assert_eq!(context.cpu.supervisor.exception.srr[0], initial_pc);
+        assert_eq!(context.cpu.pc, Address(0xfff0_0600));
+        assert_eq!(context.exit_executed.instructions, 1);
+        assert_eq!(context.exit_executed.cycles, 10);
+    }
+
+    // Zero has literal zero-byte semantics and cannot manufacture a crossing exception.
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.user.gpr = fault_initial;
+    context.cpu.user.gpr[3] = 0x0fff_ffff;
+    context.cpu.user.gpr[4] = 0;
+    let zero_initial = context.cpu.user.gpr;
+    context.cpu.user.xer = XerReg::from_bits(0);
+    context.reads.clear();
+    context.fail_at = None;
+    context.exit_executed = Executed::default();
+    unsafe {
+        jit.call(
+            (&raw mut context).cast::<Context>(),
+            wrapping_block.as_ptr(),
+        );
+    }
+    assert_eq!(context.cpu.user.gpr, zero_initial);
+    assert!(context.reads.is_empty());
+    assert_eq!(context.cpu.pc, Address(initial_pc + 4));
+    assert_eq!(context.exit_executed.instructions, 1);
+    assert_eq!(context.exit_executed.cycles, 10);
+
+    // String loads in little-endian mode raise Alignment before translation or memory access.
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.user.gpr = fault_initial;
+    context.cpu.user.gpr[3] = 0x4000;
+    context.cpu.user.gpr[4] = 0x20;
+    let alignment_initial = context.cpu.user.gpr;
+    context.cpu.user.xer = XerReg::from_bits(7);
+    context.cpu.supervisor.config.msr = context
+        .cpu
+        .supervisor
+        .config
+        .msr
+        .clone()
+        .with_little_endian(true);
+    context.reads.clear();
+    context.fail_at = None;
+    context.exit_executed = Executed::default();
+    unsafe {
+        jit.call(
+            (&raw mut context).cast::<Context>(),
+            wrapping_block.as_ptr(),
+        );
+    }
+    assert_eq!(context.cpu.user.gpr, alignment_initial);
+    assert!(context.reads.is_empty());
+    assert_eq!(context.cpu.supervisor.exception.dar, 0x4020);
+    assert_eq!(context.cpu.supervisor.exception.dsisr, 0x0000_a3c3);
+    assert_eq!(context.cpu.supervisor.exception.srr[0], initial_pc);
+    assert_eq!(context.cpu.pc, Address(0xfff0_0600));
+    assert_eq!(context.exit_executed.instructions, 1);
+    assert_eq!(context.exit_executed.cycles, 10);
 }
 
 #[test]
