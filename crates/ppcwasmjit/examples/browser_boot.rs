@@ -12051,6 +12051,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 0xe2136399:
         case 0x3389a79e:
           return "ax";
+        case 0x86840740: // Zelda WW - US
         case 0x2fcdf1ec:
         case 0x42f64ac4:
           return "zelda";

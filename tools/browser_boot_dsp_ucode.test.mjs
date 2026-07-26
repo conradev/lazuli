@@ -75,6 +75,9 @@ const zeldaHashFixture = Uint8Array.from([
 const luigiZeldaHashFixture = Uint8Array.from([
   172, 2, 1, 0, 2, 7, 5, 4, 4, 0, 0, 0,
 ]);
+const windWakerZeldaHashFixture = Uint8Array.from([
+  116, 0, 2, 0, 6, 4, 1, 0, 0, 0, 0, 0,
+]);
 const uploadAddress = 0x80001000;
 
 function dspContext(payload = axHashFixture) {
@@ -162,12 +165,17 @@ test("Dolphin HashEctor fixtures pin the AX and Zelda ucode hashes", () => {
     context.dspUcodeHashEctor(luigiZeldaHashFixture),
     0x42f64ac4,
   );
+  assert.equal(
+    context.dspUcodeHashEctor(windWakerZeldaHashFixture),
+    0x86840740,
+  );
   assert.equal(context.classifyDspUcode(0x4e8a8b21), "ax");
   assert.equal(context.classifyDspUcode(0x3ad3b7ac), "ax");
   assert.equal(context.classifyDspUcode(0x3daf59b9), "ax");
   assert.equal(context.classifyDspUcode(0x07f88145), "ax");
   assert.equal(context.classifyDspUcode(0xe2136399), "ax");
   assert.equal(context.classifyDspUcode(0x3389a79e), "ax");
+  assert.equal(context.classifyDspUcode(0x86840740), "zelda");
   assert.equal(context.classifyDspUcode(0x2fcdf1ec), "zelda");
   assert.equal(context.classifyDspUcode(0x42f64ac4), "zelda");
   assert.equal(context.classifyDspUcode(0), null);
@@ -291,6 +299,35 @@ test("Luigi Zelda upload emits its startup handshake and release diagnostics", (
       startPc: 0,
     },
   );
+});
+
+test("Wind Waker US Zelda upload selects its family and emits the ordered startup handshake", () => {
+  const context = dspContext(windWakerZeldaHashFixture);
+  sendUcodeUpload(context, { length: windWakerZeldaHashFixture.length });
+
+  assert.equal(context.dspMode, "zelda");
+  assert.equal(context.dspUcodeBooted, true);
+  assert.equal(context.dspUcodeHash, 0x86840740);
+  assert.equal(context.dspCurrentMail, 0xdcd10000);
+  assert.deepEqual(
+    context.dspMailQueue.map(entry => [entry.mail, entry.interrupt]),
+    [[0xf3551111, false]],
+  );
+  assert.deepEqual(producedMailTrace(context), [
+    ["0xdcd10000", true, "zelda-ucode"],
+    ["0xf3551111", false, "zelda-ucode-handshake"],
+  ]);
+  assert.equal(context.deviceEvents.get("dspUcodeBoot"), 1);
+  assert.equal(context.deviceEvents.get("dspUcodeBootRejected"), undefined);
+  assert.equal(
+    context.dspTrace.some(entry => entry.event === "ucode-boot-rejected"),
+    false,
+  );
+
+  context.consumeDspMail();
+  assert.equal(context.dspCurrentMail, 0xf3551111);
+  context.consumeDspMail();
+  assert.equal(context.dspCurrentMail, null);
 });
 
 test("unknown ucode hash fails closed without a startup mail", () => {
