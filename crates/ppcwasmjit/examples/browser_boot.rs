@@ -29,6 +29,8 @@ const DISC_BI2_SIZE: usize = 0x2000;
 const DISC_SOURCE_RUNTIME: &str = include_str!("browser_disc_source.mjs");
 const DSP_AX_VOICE_REFERENCE_RUNTIME: &str =
     include_str!("../../../tools/browser_dsp_ax_voice_reference.mjs");
+const DSP_AX_MAIN_BUS_REFERENCE_RUNTIME: &str =
+    include_str!("../../../tools/browser_dsp_ax_main_bus_reference.mjs");
 const IPL_IMAGE_SIZE: usize = 2 * 1024 * 1024;
 const IPL_FONT_JAPANESE_OFFSET: usize = 0x1a_ff00;
 const IPL_FONT_JAPANESE: &[u8] = include_bytes!("../../../resources/ipl/font_japanese.bin");
@@ -312,8 +314,18 @@ fn main() {
             .contains("</script"),
         "AX voice reference cannot be embedded in a raw-text script element"
     );
+    assert!(
+        !DSP_AX_MAIN_BUS_REFERENCE_RUNTIME
+            .to_ascii_lowercase()
+            .contains("</script"),
+        "AX main-bus reference cannot be embedded in a raw-text script element"
+    );
     let dsp_ax_voice_reference_runtime =
         scoped_reference_runtime(DSP_AX_VOICE_REFERENCE_RUNTIME, "renderAxVoiceReference");
+    let dsp_ax_main_bus_reference_runtime = scoped_reference_runtime(
+        DSP_AX_MAIN_BUS_REFERENCE_RUNTIME,
+        "executeAxMainBusReference",
+    );
     let html = TEMPLATE
         .replace("__DISC_SOURCE_RUNTIME__", DISC_SOURCE_RUNTIME)
         .replace(
@@ -388,8 +400,12 @@ fn main() {
         .replace("__TB_OFFSET__", &SPR::TBL.offset().to_string())
         .replace("__DMAU_OFFSET__", &SPR::DMAU.offset().to_string())
         .replace("__DMAL_OFFSET__", &SPR::DMAL.offset().to_string())
-        // Keep the canonical module replacement last so its source cannot be
+        // Keep canonical module replacements last so their source cannot be
         // rewritten by any frontend template placeholder.
+        .replace(
+            "__DSP_AX_MAIN_BUS_REFERENCE_RUNTIME__",
+            &dsp_ax_main_bus_reference_runtime,
+        )
         .replace(
             "__DSP_AX_VOICE_REFERENCE_RUNTIME__",
             &dsp_ax_voice_reference_runtime,
@@ -1010,6 +1026,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     </footer>
   </main>
   <script id="runner-source" type="text/plain">
+    const { executeAxMainBusReference } =
+      __DSP_AX_MAIN_BUS_REFERENCE_RUNTIME__;
     const { renderAxVoiceReference } =
       __DSP_AX_VOICE_REFERENCE_RUNTIME__;
     const statusDataset = new Proxy({}, {
@@ -6086,6 +6104,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let dspUcodeBooted = false;
     let dspFirstUnsupported = null;
     let dspAxCommandState = emptyDspAxCommandState();
+    let dspAxCompressorPosition = 0;
     let dspZeldaCommandState = emptyDspZeldaCommandState();
     let dspScheduledMail = null;
     const dspAudioDmaEnableInterruptLatencyCycles = 200;
@@ -12100,6 +12119,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         voiceOutputBytes: 0,
         voiceNonZeroSampleValues: 0,
         voiceOutputHash: null,
+        mainBusRendered: false,
+        mainBusCommands: 0,
+        mainBusSetLrCommands: 0,
+        mainBusSetOppositeLrCommands: 0,
+        mainBusCompressorCommands: 0,
+        mainBusCompressorPositionBefore: null,
+        mainBusCompressorPositionAfter: null,
+        mainBusOutputHash: null,
         rejected: false,
         reason: null,
         lastTaskMail: null,
@@ -12213,6 +12240,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMode = "rom";
       dspUcodeBooted = false;
       dspAxCommandState = emptyDspAxCommandState();
+      dspAxCompressorPosition = 0;
       dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       traceDsp("ucode-boot-rejected", { reason, ...details });
@@ -12267,6 +12295,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMode = mode;
       dspUcodeBooted = true;
       dspAxCommandState = emptyDspAxCommandState();
+      dspAxCompressorPosition = 0;
       dspZeldaCommandState = emptyDspZeldaCommandState();
       traceDsp("ucode-boot", {
         hash: hex32(hash),
@@ -12334,6 +12363,24 @@ const TEMPLATE: &str = r##"<!doctype html>
       return { ok: false, reason, details };
     }
 
+    function dspAxMramRange(address, size) {
+      const logical = address >>> 0;
+      const physical = (logical & 0x3fffffff) >>> 0;
+      if (
+        !Number.isSafeInteger(size)
+        || size < 0
+        || physical > ramSize - size
+      ) {
+        return null;
+      }
+      return {
+        logical,
+        physical,
+        pointer: ram + physical,
+        size,
+      };
+    }
+
     function emptyDspAxVoicePlan() {
       return {
         active: false,
@@ -12345,6 +12392,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         outputSequence: null,
         outputSurroundAddress: null,
         outputLrAddress: null,
+        mainBusActive: false,
+        mainBusCommands: [],
         fallbackReason: null,
         fallbackCommand: null,
       };
@@ -12359,11 +12408,12 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function inspectDspAxZeroSetup(plan, address) {
       const setupBytes = 9 * 3 * 2;
-      const pointer = ramPointer(address, setupBytes);
-      if (pointer === null) {
+      const range = dspAxMramRange(address, setupBytes);
+      if (range === null) {
         markDspAxVoiceFallback(plan, "setup-out-of-bounds", 0x00);
         return;
       }
+      const pointer = range.pointer;
       for (let descriptor = 0; descriptor < 9; descriptor += 1) {
         const offset = pointer + descriptor * 6;
         // Dolphin initializes each accumulator from the first two words.
@@ -12429,6 +12479,10 @@ const TEMPLATE: &str = r##"<!doctype html>
             return;
           }
           plan.processSequence = sequence;
+          plan.mainBusCommands.push({
+            code: command,
+            sequence,
+          });
           return;
         case 0x0e:
           plan.active = true;
@@ -12448,6 +12502,53 @@ const TEMPLATE: &str = r##"<!doctype html>
             arguments_[2],
             arguments_[3]
           );
+          plan.mainBusCommands.push({
+            code: command,
+            sequence,
+            surroundAddress: plan.outputSurroundAddress,
+            lrAddress: plan.outputLrAddress,
+          });
+          return;
+        case 0x07:
+        case 0x11:
+          plan.active = true;
+          plan.mainBusActive = true;
+          if (dspUcodeHash !== 0x07f88145 || !plan.setupZero) {
+            markDspAxVoiceFallback(
+              plan,
+              dspUcodeHash === 0x07f88145
+                ? "unsupported-main-bus-order"
+                : "unsupported-main-buffer-command",
+              command
+            );
+            return;
+          }
+          plan.mainBusCommands.push({
+            code: command,
+            sequence,
+            address: dspAxAddress(arguments_[0], arguments_[1]),
+          });
+          return;
+        case 0x12:
+          plan.active = true;
+          plan.mainBusActive = true;
+          if (dspUcodeHash !== 0x07f88145 || !plan.setupZero) {
+            markDspAxVoiceFallback(
+              plan,
+              dspUcodeHash === 0x07f88145
+                ? "unsupported-main-bus-order"
+                : "unsupported-main-buffer-command",
+              command
+            );
+            return;
+          }
+          plan.mainBusCommands.push({
+            code: command,
+            sequence,
+            threshold: arguments_[0],
+            releaseFrames: arguments_[1],
+            tableAddress: dspAxAddress(arguments_[2], arguments_[3]),
+          });
           return;
 
         // These commands are no-ops in every supported GameCube AX ucode.
@@ -12466,12 +12567,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 0x04:
         case 0x05:
         case 0x06:
-        case 0x07:
         case 0x08:
         case 0x09:
         case 0x10:
-        case 0x11:
-        case 0x12:
         case 0x13:
           markDspAxVoiceFallback(
             plan,
@@ -12511,8 +12609,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       role
     ) {
       const logical = address >>> 0;
-      const pointer = ramPointer(logical, size);
-      if (pointer === null) {
+      const range = dspAxMramRange(logical, size);
+      if (range === null) {
         return dspAxParseFailure("write-out-of-bounds", {
           command,
           address: hex32(logical),
@@ -12524,8 +12622,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         write: {
           command,
           address: logical,
-          physical: (pointer - ram) >>> 0,
-          pointer,
+          physical: range.physical,
+          pointer: range.pointer,
           size,
           sequence,
           role,
@@ -12611,6 +12709,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const maximumTotalWords = 8192;
       const seenPhysicalAddresses = new Set();
       const writes = [];
+      const listRanges = [];
       const commandSample = [];
       const voicePlan = emptyDspAxVoicePlan();
       let address = initialAddress >>> 0;
@@ -12645,14 +12744,15 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
 
         const byteLength = sizeWords * 2;
-        const pointer = ramPointer(address, byteLength);
-        if (pointer === null) {
+        const listRange = dspAxMramRange(address, byteLength);
+        if (listRange === null) {
           return dspAxParseFailure("list-out-of-bounds", {
             address: hex32(address),
             sizeWords,
           });
         }
-        const physical = (pointer - ram) >>> 0;
+        const pointer = listRange.pointer;
+        const physical = listRange.physical;
         if (seenPhysicalAddresses.has(physical)) {
           return dspAxParseFailure("list-cycle", {
             address: hex32(address),
@@ -12660,6 +12760,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           });
         }
         seenPhysicalAddresses.add(physical);
+        listRanges.push({
+          physical,
+          size: byteLength,
+          commandsBeforeRead: commandCount,
+        });
         listCount += 1;
         wordCount += sizeWords;
 
@@ -12732,6 +12837,7 @@ const TEMPLATE: &str = r##"<!doctype html>
               commandCount,
               commandSample,
               writes,
+              listRanges,
               voicePlan: finalizeDspAxVoicePlan(voicePlan),
             };
           }
@@ -12771,6 +12877,18 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function dspAxVoiceByteArray(value) {
       return Object.prototype.toString.call(value) === "[object Uint8Array]";
+    }
+
+    function dspAxVoiceExactByteArray(value, size, forbiddenBuffers) {
+      return (
+        dspAxVoiceByteArray(value)
+        && Object.prototype.toString.call(value.buffer)
+          === "[object ArrayBuffer]"
+        && value.byteOffset === 0
+        && value.byteLength === size
+        && value.buffer.byteLength === size
+        && !forbiddenBuffers.has(value.buffer)
+      );
     }
 
     function dspAxVoiceReason(value, fallback) {
@@ -12816,6 +12934,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         outputBytes: 0,
         nonZeroSampleValues: 0,
         outputHash: null,
+        mainBusRendered: false,
+        mainBusCommands: 0,
+        mainBusSetLrCommands: 0,
+        mainBusSetOppositeLrCommands: 0,
+        mainBusCompressorCommands: 0,
+        mainBusCompressorPositionBefore: null,
+        mainBusCompressorPositionAfter: null,
+        mainBusOutputHash: null,
       };
     }
 
@@ -12830,20 +12956,131 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
       }
 
-      let model;
-      try {
-        model = renderAxVoiceReference({
-          mram: bytes.subarray(ram, ram + ramSize),
-          aram,
-          headAddress: plan.parameterBlockAddress,
-          ucodeHash: dspUcodeHash,
-        });
-      } catch (error) {
-        return dspAxVoiceFallback(
-          plan,
-          "voice-model-" + dspAxVoiceReason(error?.name, "exception")
-        );
+      const mram = bytes.subarray(ram, ram + ramSize);
+      let model = null;
+      let mainBusModel = null;
+      let mainBusTelemetry = null;
+      let voiceFailureReason = null;
+      const renderVoice = initialMainBus => {
+        try {
+          model = renderAxVoiceReference({
+            mram,
+            aram,
+            headAddress: plan.parameterBlockAddress,
+            ucodeHash: dspUcodeHash,
+            initialMainLeft: initialMainBus?.left,
+            initialMainRight: initialMainBus?.right,
+          });
+        } catch (error) {
+          voiceFailureReason =
+            "voice-model-" + dspAxVoiceReason(error?.name, "exception");
+          throw error;
+        }
+        if (model === null || typeof model !== "object") {
+          voiceFailureReason = "invalid-voice-model-result";
+          throw new TypeError(voiceFailureReason);
+        }
+        if (Object.prototype.hasOwnProperty.call(model, "updatedMram")) {
+          voiceFailureReason = "unexpected-mram-clone";
+          throw new TypeError(voiceFailureReason);
+        }
+        if (!model.ok) {
+          voiceFailureReason = dspAxVoiceReason(
+            model.error?.reason,
+            "voice-model-rejected"
+          );
+          throw new TypeError(voiceFailureReason);
+        }
+        if (!plan.mainBusActive) return null;
+        return {
+          left: model.mainAccumulators?.left,
+          right: model.mainAccumulators?.right,
+        };
+      };
+
+      if (plan.mainBusActive) {
+        try {
+          mainBusModel = executeAxMainBusReference({
+            mram,
+            commands: plan.mainBusCommands,
+            compressorPosition: dspAxCompressorPosition,
+            processMainBus: renderVoice,
+          });
+        } catch (error) {
+          return dspAxVoiceFallback(
+            plan,
+            "main-bus-model-" + dspAxVoiceReason(error?.name, "exception")
+          );
+        }
+        if (
+          mainBusModel === null
+          || typeof mainBusModel !== "object"
+          || Object.prototype.hasOwnProperty.call(
+            mainBusModel,
+            "updatedMram"
+          )
+        ) {
+          return dspAxVoiceFallback(plan, "invalid-main-bus-model-result");
+        }
+        if (!mainBusModel.ok) {
+          return dspAxVoiceFallback(
+            plan,
+            voiceFailureReason
+              ?? "main-bus-" + dspAxVoiceReason(
+                mainBusModel.error?.reason,
+                "model-rejected"
+              )
+          );
+        }
+        mainBusTelemetry = mainBusModel.telemetry;
+        const expectedMainBusCounts = {
+          commands: plan.mainBusCommands.length,
+          processCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x03
+          ).length,
+          setLrCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x07
+          ).length,
+          setOppositeLrCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x11
+          ).length,
+          compressorCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x12
+          ).length,
+        };
+        if (
+          mainBusTelemetry === null
+          || typeof mainBusTelemetry !== "object"
+          || !Number.isSafeInteger(mainBusModel.compressorPosition)
+          || mainBusModel.compressorPosition < 0
+          || mainBusModel.compressorPosition > 0xffff
+          || mainBusTelemetry.compressorPositionBefore
+            !== dspAxCompressorPosition
+          || mainBusTelemetry.compressorPositionAfter
+            !== mainBusModel.compressorPosition
+          || Object.entries(expectedMainBusCounts).some(
+            ([name, count]) => mainBusTelemetry[name] !== count
+          )
+          || !/^0x[0-9a-f]{8}$/.test(
+            mainBusTelemetry.transactionHash ?? ""
+          )
+        ) {
+          return dspAxVoiceFallback(plan, "invalid-main-bus-state");
+        }
+        if (model === null) {
+          return dspAxVoiceFallback(plan, "main-bus-missing-process");
+        }
+      } else {
+        try {
+          renderVoice(null);
+        } catch (_error) {
+          return dspAxVoiceFallback(
+            plan,
+            voiceFailureReason ?? "voice-model-exception"
+          );
+        }
       }
+
       if (model === null || typeof model !== "object") {
         return dspAxVoiceFallback(plan, "invalid-voice-model-result");
       }
@@ -12860,16 +13097,26 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
       }
 
-      const output = model.output;
+      const output = plan.mainBusActive
+        ? mainBusModel.output?.main
+        : model.output;
+      const transactionDataBuffers = new Set([
+        bytes.buffer,
+        aram.buffer,
+      ]);
       if (
         output === null
         || typeof output !== "object"
         || output.order !== "R,L"
-        || !dspAxVoiceByteArray(output.bytes)
-        || output.bytes.length !== 5 * 32 * 2 * 2
+        || !dspAxVoiceExactByteArray(
+          output.bytes,
+          5 * 32 * 2 * 2,
+          transactionDataBuffers
+        )
       ) {
         return dspAxVoiceFallback(plan, "invalid-voice-output");
       }
+      transactionDataBuffers.add(output.bytes.buffer);
       if (
         !Array.isArray(model.parameterBlockWrites)
         || model.parameterBlockWrites.length > 64
@@ -12893,20 +13140,27 @@ const TEMPLATE: &str = r##"<!doctype html>
           || !Number.isSafeInteger(write.logicalAddress)
           || write.logicalAddress < 0
           || write.logicalAddress > 0xffffffff
-          || !dspAxVoiceByteArray(write.data)
-          || write.data.length !== expectedParameterBlockBytes
+          || !dspAxVoiceExactByteArray(
+            write.data,
+            expectedParameterBlockBytes,
+            transactionDataBuffers
+          )
           || write.byteLength !== write.data.length
         ) {
           return dspAxVoiceFallback(plan, "invalid-parameter-block-write");
         }
-        const pointer = ramPointer(write.logicalAddress, write.data.length);
-        if (pointer === null) {
+        transactionDataBuffers.add(write.data.buffer);
+        const range = dspAxMramRange(
+          write.logicalAddress,
+          write.data.length
+        );
+        if (range === null) {
           return dspAxVoiceFallback(
             plan,
             "parameter-block-write-out-of-bounds"
           );
         }
-        const physical = (pointer - ram) >>> 0;
+        const physical = range.physical;
         if (
           !Number.isSafeInteger(write.physicalAddress)
           || write.physicalAddress < 0
@@ -12925,7 +13179,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           ordinal: index,
           address: write.logicalAddress >>> 0,
           physical,
-          pointer,
+          pointer: range.pointer,
           size: write.data.length,
           data: write.data,
         });
@@ -12934,20 +13188,89 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       let outputLrWrites = 0;
       let outputSurroundWrites = 0;
-      for (let index = 0; index < parsed.writes.length; index += 1) {
-        const write = parsed.writes[index];
-        let data = null;
-        if (write.role === "output-lr") {
-          outputLrWrites += 1;
-          data = output.bytes;
-        } else if (write.role === "output-surround") {
-          outputSurroundWrites += 1;
+      if (plan.mainBusActive) {
+        if (
+          !Array.isArray(mainBusModel.writes)
+          || mainBusModel.writes.length !== 2
+          || !dspAxVoiceExactByteArray(
+            mainBusModel.output?.surround?.bytes,
+            5 * 32 * 4,
+            transactionDataBuffers
+          )
+        ) {
+          return dspAxVoiceFallback(plan, "invalid-main-bus-output");
         }
-        operations.push({
-          ...write,
-          ordinal: index,
-          data,
-        });
+        transactionDataBuffers.add(
+          mainBusModel.output.surround.bytes.buffer
+        );
+        const expectedWrites = [
+          {
+            kind: "surround-s32-be",
+            role: "output-surround",
+            address: plan.outputSurroundAddress,
+            size: 5 * 32 * 4,
+          },
+          {
+            kind: "main-rl-s16-be",
+            role: "output-lr",
+            address: plan.outputLrAddress,
+            size: 5 * 32 * 2 * 2,
+          },
+        ];
+        for (let index = 0; index < expectedWrites.length; index += 1) {
+          const expected = expectedWrites[index];
+          const write = mainBusModel.writes[index];
+          const expectedData = index === 0
+            ? mainBusModel.output.surround.bytes
+            : output.bytes;
+          const range = dspAxMramRange(expected.address, expected.size);
+          if (
+            write === null
+            || typeof write !== "object"
+            || range === null
+            || write.kind !== expected.kind
+            || write.logicalAddress !== expected.address
+            || write.physicalAddress !== range.physical
+            || write.byteLength !== expected.size
+            || write.data !== expectedData
+          ) {
+            return dspAxVoiceFallback(
+              plan,
+              "invalid-main-bus-output-write"
+            );
+          }
+          if (expected.role === "output-lr") outputLrWrites += 1;
+          if (expected.role === "output-surround") {
+            outputSurroundWrites += 1;
+          }
+          operations.push({
+            command: 0x0e,
+            role: expected.role,
+            sequence: plan.outputSequence,
+            ordinal: index,
+            address: expected.address,
+            physical: range.physical,
+            pointer: range.pointer,
+            size: expected.size,
+            data: write.data,
+          });
+        }
+      } else {
+        for (let index = 0; index < parsed.writes.length; index += 1) {
+          const write = parsed.writes[index];
+          let data = null;
+          if (write.role === "output-lr") {
+            outputLrWrites += 1;
+            data = output.bytes;
+          } else if (write.role === "output-surround") {
+            outputSurroundWrites += 1;
+          }
+          operations.push({
+            ...write,
+            ordinal: index,
+            data,
+          });
+        }
       }
       if (outputLrWrites !== 1 || outputSurroundWrites !== 1) {
         return dspAxVoiceFallback(plan, "invalid-output-write-plan");
@@ -12964,6 +13287,95 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
 
+      if (plan.mainBusActive) {
+        const selections =
+          mainBusModel.telemetry?.compressorSelections;
+        const compressorCommands = plan.mainBusCommands.filter(
+          command => command.code === 0x12
+        );
+        if (
+          !Array.isArray(selections)
+          || selections.length !== compressorCommands.length
+        ) {
+          return dspAxVoiceFallback(
+            plan,
+            "invalid-main-bus-compressor-telemetry"
+          );
+        }
+        const reads = [];
+        let compressorIndex = 0;
+        for (const command of plan.mainBusCommands) {
+          let range = null;
+          let role = null;
+          if (command.code === 0x07 || command.code === 0x11) {
+            range = dspAxMramRange(command.address, 5 * 32 * 4);
+            role = "main-bus-input";
+          } else if (command.code === 0x12) {
+            const selection = selections[compressorIndex];
+            compressorIndex += 1;
+            const tableAddress = selection?.tableAddress;
+            if (
+              tableAddress !== null
+              && (
+                !Number.isSafeInteger(tableAddress)
+                || tableAddress < 0
+                || tableAddress > 0xffffffff
+              )
+            ) {
+              return dspAxVoiceFallback(
+                plan,
+                "invalid-main-bus-compressor-telemetry"
+              );
+            }
+            if (tableAddress !== null) {
+              range = dspAxMramRange(
+                tableAddress,
+                5 * 32 * 2
+              );
+              role = "compressor-table";
+            }
+          }
+          if (role !== null && range === null) {
+            return dspAxVoiceFallback(
+              plan,
+              "invalid-main-bus-read-range",
+              command.code
+            );
+          }
+          if (range !== null) {
+            reads.push({
+              ...range,
+              sequence: command.sequence,
+              role,
+            });
+          }
+        }
+        for (const operation of operations) {
+          for (const read of reads) {
+            if (
+              operation.sequence < read.sequence
+              && dspAxVoiceRangesOverlap(operation, read)
+            ) {
+              return dspAxVoiceFallback(
+                plan,
+                "main-bus-read-after-write-alias"
+              );
+            }
+          }
+          for (const listRange of parsed.listRanges) {
+            if (
+              operation.sequence <= listRange.commandsBeforeRead
+              && dspAxVoiceRangesOverlap(operation, listRange)
+            ) {
+              return dspAxVoiceFallback(
+                plan,
+                "command-list-read-after-write-alias"
+              );
+            }
+          }
+        }
+      }
+
       return {
         rendered: true,
         mode: "rendered",
@@ -12972,9 +13384,30 @@ const TEMPLATE: &str = r##"<!doctype html>
         operations,
         parameterBlocks: model.parameterBlockWrites.length,
         parameterBlockBytes,
-        outputBytes: output.bytes.length,
+        outputBytes:
+          output.bytes.length
+          + (plan.mainBusActive ? 5 * 32 * 4 : 0),
         nonZeroSampleValues: dspAxVoiceNonZeroSamples(output.bytes),
         outputHash: dspAxVoiceOutputHash(output.bytes),
+        mainBusRendered: plan.mainBusActive,
+        mainBusCommands: mainBusTelemetry?.commands ?? 0,
+        mainBusSetLrCommands: mainBusTelemetry?.setLrCommands ?? 0,
+        mainBusSetOppositeLrCommands:
+          mainBusTelemetry?.setOppositeLrCommands ?? 0,
+        mainBusCompressorCommands:
+          mainBusTelemetry?.compressorCommands ?? 0,
+        mainBusCompressorPositionBefore:
+          plan.mainBusActive
+            ? mainBusTelemetry?.compressorPositionBefore ?? null
+            : null,
+        mainBusCompressorPositionAfter:
+          plan.mainBusActive
+            ? mainBusModel.compressorPosition
+            : null,
+        mainBusOutputHash:
+          plan.mainBusActive
+            ? mainBusTelemetry?.transactionHash ?? null
+            : null,
       };
     }
 
@@ -13008,6 +13441,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           size: operation.size,
           data: operation.data !== null,
         });
+      }
+      if (transaction.mainBusRendered) {
+        dspAxCompressorPosition =
+          transaction.mainBusCompressorPositionAfter;
       }
       return {
         clearedBytes,
@@ -13066,6 +13503,21 @@ const TEMPLATE: &str = r##"<!doctype html>
           (deviceEvents.get("dspAxVoiceDataBytes") ?? 0)
             + applied.dataBytes
         );
+        if (voiceTransaction.mainBusRendered) {
+          deviceEvents.set(
+            "dspAxMainBusRender",
+            (deviceEvents.get("dspAxMainBusRender") ?? 0) + 1
+          );
+          deviceEvents.set(
+            "dspAxMainBusWrite",
+            (deviceEvents.get("dspAxMainBusWrite") ?? 0) + 2
+          );
+          deviceEvents.set(
+            "dspAxMainBusBytes",
+            (deviceEvents.get("dspAxMainBusBytes") ?? 0)
+              + 5 * 32 * (4 + 2 * 2)
+          );
+        }
       } else {
         clearedBytes = applyDspAxSilentWrites(result.writes);
         writeCount = result.writes.length;
@@ -13105,6 +13557,22 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspAxCommandState.voiceNonZeroSampleValues =
         voiceTransaction.nonZeroSampleValues;
       dspAxCommandState.voiceOutputHash = voiceTransaction.outputHash;
+      dspAxCommandState.mainBusRendered =
+        voiceTransaction.mainBusRendered;
+      dspAxCommandState.mainBusCommands =
+        voiceTransaction.mainBusCommands;
+      dspAxCommandState.mainBusSetLrCommands =
+        voiceTransaction.mainBusSetLrCommands;
+      dspAxCommandState.mainBusSetOppositeLrCommands =
+        voiceTransaction.mainBusSetOppositeLrCommands;
+      dspAxCommandState.mainBusCompressorCommands =
+        voiceTransaction.mainBusCompressorCommands;
+      dspAxCommandState.mainBusCompressorPositionBefore =
+        voiceTransaction.mainBusCompressorPositionBefore;
+      dspAxCommandState.mainBusCompressorPositionAfter =
+        voiceTransaction.mainBusCompressorPositionAfter;
+      dspAxCommandState.mainBusOutputHash =
+        voiceTransaction.mainBusOutputHash;
       dspAxCommandState.rejected = false;
       dspAxCommandState.reason = null;
       dspScheduledMail = {
@@ -13124,6 +13592,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         voiceParameterBlocks: voiceTransaction.parameterBlocks,
         voiceOutputBytes: voiceTransaction.outputBytes,
         voiceOutputHash: voiceTransaction.outputHash,
+        mainBusRendered: voiceTransaction.mainBusRendered,
+        mainBusCommands: voiceTransaction.mainBusCommands,
+        mainBusCompressorPositionBefore:
+          voiceTransaction.mainBusCompressorPositionBefore,
+        mainBusCompressorPositionAfter:
+          voiceTransaction.mainBusCompressorPositionAfter,
+        mainBusOutputHash: voiceTransaction.mainBusOutputHash,
       });
       deviceEvents.set(
         "dspAxCommandList",
@@ -13625,6 +14100,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMode = "rom";
       dspUcodeBooted = false;
       dspAxCommandState = emptyDspAxCommandState();
+      dspAxCompressorPosition = 0;
       dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       view.setUint16(mmio + 0x5000, 0, false);
@@ -13644,6 +14120,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       dspMode = "init";
       dspUcodeBooted = false;
       dspAxCommandState = emptyDspAxCommandState();
+      dspAxCompressorPosition = 0;
       dspZeldaCommandState = emptyDspZeldaCommandState();
       dspScheduledMail = null;
       view.setUint16(mmio + 0x5004, 0, false);
@@ -23366,6 +23843,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           dspScheduledMail,
           dspMode,
           dspUcodeHash: dspUcodeHash === null ? null : hex32(dspUcodeHash),
+          dspAxCompressorPosition,
           dspAxCommand: {
             phase: dspAxCommandState.phase,
             sizeWords: dspAxCommandState.sizeWords,
@@ -23392,6 +23870,19 @@ const TEMPLATE: &str = r##"<!doctype html>
             voiceNonZeroSampleValues:
               dspAxCommandState.voiceNonZeroSampleValues,
             voiceOutputHash: dspAxCommandState.voiceOutputHash,
+            mainBusRendered: dspAxCommandState.mainBusRendered,
+            mainBusCommands: dspAxCommandState.mainBusCommands,
+            mainBusSetLrCommands:
+              dspAxCommandState.mainBusSetLrCommands,
+            mainBusSetOppositeLrCommands:
+              dspAxCommandState.mainBusSetOppositeLrCommands,
+            mainBusCompressorCommands:
+              dspAxCommandState.mainBusCompressorCommands,
+            mainBusCompressorPositionBefore:
+              dspAxCommandState.mainBusCompressorPositionBefore,
+            mainBusCompressorPositionAfter:
+              dspAxCommandState.mainBusCompressorPositionAfter,
+            mainBusOutputHash: dspAxCommandState.mainBusOutputHash,
             rejected: dspAxCommandState.rejected,
             reason: dspAxCommandState.reason,
             lastTaskMail:
