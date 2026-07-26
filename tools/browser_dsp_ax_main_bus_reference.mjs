@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 // Pure, deterministic reference for the GameCube AX main-bus commands used by
-// F-Zero GX. The command and arithmetic semantics follow Dolphin's AX.cpp.
+// F-Zero GX and WarioWare. The command and arithmetic semantics follow
+// Dolphin's AX.cpp.
 //
 // This deliberately models one bounded 5 ms transaction. It reads only the
-// selected MRAM ranges, never clones or mutates MRAM, and returns two ordered
-// output writes only after every command and range has been validated. The
-// caller persists only compressorPosition between transactions.
+// selected MRAM ranges, never clones or mutates MRAM, and returns ordered
+// intermediate/final writes only after every command and range has been
+// validated. The caller persists only compressorPosition between transactions.
 
 export const AX_MAIN_BUS_REFERENCE_SCHEMA =
   "lazuli-ax-gc-main-bus-reference-v1";
 
 export const AX_MAIN_BUS_COMMAND = Object.freeze({
   PROCESS: 0x03,
+  UPLOAD_LRS: 0x06,
   SET_LR: 0x07,
+  MIX_AUXB_NOWRITE: 0x09,
   OUTPUT: 0x0e,
   SET_OPPOSITE_LR: 0x11,
   COMPRESSOR: 0x12,
@@ -28,13 +31,15 @@ export const AX_MAIN_BUS_LIMITS = Object.freeze({
   maximumMramBytes: 64 * 1024 * 1024,
   attackEntryCount: 11,
   compressorEntryBytes: 160 * 2,
+  accumulatorPlaneBytes: 160 * 4,
+  accumulatorLrsBytes: 3 * 160 * 4,
   surroundOutputBytes: 160 * 4,
   mainOutputBytes: 160 * 2 * 2,
 });
 
 export const AX_MAIN_BUS_NON_GOALS = Object.freeze([
   "DSP mailbox and AX command-list parsing",
-  "voice, AUX, depop, and effect-buffer processing",
+  "voice, AUX accumulator routing, depop, and CPU effect processing",
   "CMD_SETUP accumulator initialization",
   "AI DMA and host audio output",
 ]);
@@ -186,16 +191,78 @@ function physicalMramRange({
   return physicalAddress;
 }
 
-function readBigEndianU16(bytes, offset) {
-  return (bytes[offset] << 8) | bytes[offset + 1];
+function readByteThroughStagedUploads(
+  mram,
+  physicalAddress,
+  stagedUploads,
+) {
+  // Dolphin commits CMD_UPLOAD_LRS immediately. Keep this reference model
+  // atomic by leaving MRAM untouched, but make every later command observe the
+  // same byte image. Walk newest-to-oldest so overlapping uploads retain exact
+  // command-order last-write-wins semantics.
+  for (let index = stagedUploads.length - 1; index >= 0; index -= 1) {
+    const upload = stagedUploads[index];
+    const uploadOffset = physicalAddress - upload.physicalAddress;
+    if (uploadOffset >= 0 && uploadOffset < upload.byteLength) {
+      return upload.data[uploadOffset];
+    }
+  }
+  return mram[physicalAddress];
 }
 
-function readBigEndianS32(bytes, offset) {
+function readBigEndianU16ThroughStagedUploads(
+  mram,
+  physicalAddress,
+  stagedUploads,
+) {
   return (
-    (bytes[offset] << 24)
-    | (bytes[offset + 1] << 16)
-    | (bytes[offset + 2] << 8)
-    | bytes[offset + 3]
+    (
+      readByteThroughStagedUploads(
+        mram,
+        physicalAddress,
+        stagedUploads,
+      ) << 8
+    )
+    | readByteThroughStagedUploads(
+      mram,
+      physicalAddress + 1,
+      stagedUploads,
+    )
+  );
+}
+
+function readBigEndianS32ThroughStagedUploads(
+  mram,
+  physicalAddress,
+  stagedUploads,
+) {
+  return (
+    (
+      readByteThroughStagedUploads(
+        mram,
+        physicalAddress,
+        stagedUploads,
+      ) << 24
+    )
+    | (
+      readByteThroughStagedUploads(
+        mram,
+        physicalAddress + 1,
+        stagedUploads,
+      ) << 16
+    )
+    | (
+      readByteThroughStagedUploads(
+        mram,
+        physicalAddress + 2,
+        stagedUploads,
+      ) << 8
+    )
+    | readByteThroughStagedUploads(
+      mram,
+      physicalAddress + 3,
+      stagedUploads,
+    )
   );
 }
 
@@ -282,6 +349,8 @@ function normalizeCommands(commands) {
 
       case AX_MAIN_BUS_COMMAND.SET_LR:
       case AX_MAIN_BUS_COMMAND.SET_OPPOSITE_LR:
+      case AX_MAIN_BUS_COMMAND.UPLOAD_LRS:
+      case AX_MAIN_BUS_COMMAND.MIX_AUXB_NOWRITE:
         return Object.freeze({
           code,
           address: commandU32(
@@ -425,15 +494,37 @@ function validateStaticRanges(mram, commands) {
   for (let commandIndex = 0; commandIndex < commands.length; commandIndex += 1) {
     const command = commands[commandIndex];
     switch (command.code) {
+      case AX_MAIN_BUS_COMMAND.UPLOAD_LRS:
+        physicalMramRange({
+          mram,
+          address: command.address,
+          byteLength: AX_MAIN_BUS_LIMITS.accumulatorLrsBytes,
+          commandIndex,
+          code: command.code,
+          role: "main-upload-lrs-s32",
+        });
+        break;
+
       case AX_MAIN_BUS_COMMAND.SET_LR:
       case AX_MAIN_BUS_COMMAND.SET_OPPOSITE_LR:
         physicalMramRange({
           mram,
           address: command.address,
-          byteLength: AX_MAIN_BUS_LIMITS.frames * 4,
+          byteLength: AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes,
           commandIndex,
           code: command.code,
           role: "main-input-s32",
+        });
+        break;
+
+      case AX_MAIN_BUS_COMMAND.MIX_AUXB_NOWRITE:
+        physicalMramRange({
+          mram,
+          address: command.address,
+          byteLength: AX_MAIN_BUS_LIMITS.accumulatorLrsBytes,
+          commandIndex,
+          code: command.code,
+          role: "aux-b-return-lrs-s32",
         });
         break;
 
@@ -459,20 +550,100 @@ function validateStaticRanges(mram, commands) {
   }
 }
 
-function loadMainInput(mram, command, commandIndex, buffers, opposite) {
+function serializeMainUpload(
+  mram,
+  command,
+  commandIndex,
+  buffers,
+  writeSequence,
+) {
   const physicalAddress = physicalMramRange({
     mram,
     address: command.address,
-    byteLength: AX_MAIN_BUS_LIMITS.frames * 4,
+    byteLength: AX_MAIN_BUS_LIMITS.accumulatorLrsBytes,
+    commandIndex,
+    code: command.code,
+    role: "main-upload-lrs-s32",
+  });
+  const bytes = new Uint8Array(AX_MAIN_BUS_LIMITS.accumulatorLrsBytes);
+  const planes = [buffers.left, buffers.right, buffers.surround];
+  for (let channel = 0; channel < planes.length; channel += 1) {
+    const plane = planes[channel];
+    const planeOffset = channel * AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes;
+    for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+      writeBigEndianS32(
+        bytes,
+        planeOffset + frame * 4,
+        plane[frame],
+      );
+    }
+  }
+  return Object.freeze({
+    sequence: writeSequence,
+    commandIndex,
+    kind: "main-lrs-s32-be",
+    logicalAddress: command.address,
+    physicalAddress,
+    byteLength: bytes.length,
+    data: bytes,
+  });
+}
+
+function loadMainInput(
+  mram,
+  command,
+  commandIndex,
+  buffers,
+  opposite,
+  stagedUploads,
+) {
+  const physicalAddress = physicalMramRange({
+    mram,
+    address: command.address,
+    byteLength: AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes,
     commandIndex,
     code: command.code,
     role: "main-input-s32",
   });
   for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
-    const sample = readBigEndianS32(mram, physicalAddress + frame * 4);
+    const sample = readBigEndianS32ThroughStagedUploads(
+      mram,
+      physicalAddress + frame * 4,
+      stagedUploads,
+    );
     buffers.left[frame] = opposite ? (-sample) | 0 : sample;
     buffers.right[frame] = sample;
     buffers.surround[frame] = 0;
+  }
+}
+
+function mixAuxBNoWrite(
+  mram,
+  command,
+  commandIndex,
+  buffers,
+  stagedUploads,
+) {
+  const physicalAddress = physicalMramRange({
+    mram,
+    address: command.address,
+    byteLength: AX_MAIN_BUS_LIMITS.accumulatorLrsBytes,
+    commandIndex,
+    code: command.code,
+    role: "aux-b-return-lrs-s32",
+  });
+  const planes = [buffers.left, buffers.right, buffers.surround];
+  for (let channel = 0; channel < planes.length; channel += 1) {
+    const plane = planes[channel];
+    const planeOffset = channel * AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes;
+    for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+      const sample = readBigEndianS32ThroughStagedUploads(
+        mram,
+        physicalAddress + planeOffset + frame * 4,
+        stagedUploads,
+      );
+      plane[frame] = (plane[frame] + sample) | 0;
+    }
   }
 }
 
@@ -482,6 +653,7 @@ function runCompressor({
   commandIndex,
   buffers,
   compressorPosition,
+  stagedUploads,
 }) {
   let triggered = false;
   for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
@@ -535,9 +707,10 @@ function runCompressor({
     role: `${phase}-compressor-table`,
   });
   for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
-    const coefficient = readBigEndianU16(
+    const coefficient = readBigEndianU16ThroughStagedUploads(
       mram,
       physicalAddress + frame * 2,
+      stagedUploads,
     );
     buffers.left[frame] = multiplyQ15Signed32(
       buffers.left[frame],
@@ -561,7 +734,13 @@ function runCompressor({
   });
 }
 
-function serializeOutput(mram, command, commandIndex, buffers) {
+function serializeOutput(
+  mram,
+  command,
+  commandIndex,
+  buffers,
+  writeSequenceStart,
+) {
   const surroundPhysicalAddress = physicalMramRange({
     mram,
     address: command.surroundAddress,
@@ -614,7 +793,8 @@ function serializeOutput(mram, command, commandIndex, buffers) {
 
   const writes = Object.freeze([
     Object.freeze({
-      sequence: 0,
+      sequence: writeSequenceStart,
+      commandIndex,
       kind: "surround-s32-be",
       logicalAddress: command.surroundAddress,
       physicalAddress: surroundPhysicalAddress,
@@ -622,7 +802,8 @@ function serializeOutput(mram, command, commandIndex, buffers) {
       data: surroundBytes,
     }),
     Object.freeze({
-      sequence: 1,
+      sequence: writeSequenceStart + 1,
+      commandIndex,
       kind: "main-rl-s16-be",
       logicalAddress: command.lrAddress,
       physicalAddress: lrPhysicalAddress,
@@ -693,9 +874,12 @@ export function executeAxMainBusReference({
     let position = normalizedPosition;
     let setLrCommands = 0;
     let setOppositeLrCommands = 0;
+    let uploadLrsCommands = 0;
+    let mixAuxBNoWriteCommands = 0;
     let processCommands = 0;
     let outputCommand = null;
     const compressorSelections = [];
+    const stagedUploads = [];
 
     for (
       let commandIndex = 0;
@@ -722,6 +906,7 @@ export function executeAxMainBusReference({
             commandIndex,
             buffers,
             false,
+            stagedUploads,
           );
           setLrCommands += 1;
           break;
@@ -733,8 +918,31 @@ export function executeAxMainBusReference({
             commandIndex,
             buffers,
             true,
+            stagedUploads,
           );
           setOppositeLrCommands += 1;
+          break;
+
+        case AX_MAIN_BUS_COMMAND.UPLOAD_LRS:
+          stagedUploads.push(serializeMainUpload(
+            mram,
+            command,
+            commandIndex,
+            buffers,
+            stagedUploads.length,
+          ));
+          uploadLrsCommands += 1;
+          break;
+
+        case AX_MAIN_BUS_COMMAND.MIX_AUXB_NOWRITE:
+          mixAuxBNoWrite(
+            mram,
+            command,
+            commandIndex,
+            buffers,
+            stagedUploads,
+          );
+          mixAuxBNoWriteCommands += 1;
           break;
 
         case AX_MAIN_BUS_COMMAND.COMPRESSOR: {
@@ -744,6 +952,7 @@ export function executeAxMainBusReference({
             commandIndex,
             buffers,
             compressorPosition: position,
+            stagedUploads,
           });
           position = selection.positionAfter;
           compressorSelections.push(selection);
@@ -761,15 +970,23 @@ export function executeAxMainBusReference({
       outputCommand.command,
       outputCommand.commandIndex,
       buffers,
+      stagedUploads.length,
     );
+    const writes = Object.freeze([
+      ...stagedUploads,
+      ...serialized.writes,
+    ]);
     const surroundHash = fnv1a32Parts([
       serialized.output.surround.bytes,
     ]);
     const mainHash = fnv1a32Parts([serialized.output.main.bytes]);
-    const transactionHash = fnv1a32Parts([
+    const outputHash = fnv1a32Parts([
       serialized.output.surround.bytes,
       serialized.output.main.bytes,
     ]);
+    const transactionHash = fnv1a32Parts(
+      writes.map(write => write.data),
+    );
     const compressorAttackFrames = compressorSelections.filter(
       selection => selection.phase === "attack",
     ).length;
@@ -783,15 +1000,18 @@ export function executeAxMainBusReference({
     return Object.freeze({
       ok: true,
       compressorPosition: position,
-      writes: serialized.writes,
+      uploads: Object.freeze(stagedUploads),
+      writes,
       output: serialized.output,
       telemetry: Object.freeze({
         schema: AX_MAIN_BUS_REFERENCE_SCHEMA,
         initialMainBus: buffers.contract,
         commands: normalizedCommands.length,
         processCommands,
+        uploadLrsCommands,
         setLrCommands,
         setOppositeLrCommands,
+        mixAuxBNoWriteCommands,
         compressorCommands: compressorSelections.length,
         compressorAttackFrames,
         compressorReleaseFrames,
@@ -805,10 +1025,17 @@ export function executeAxMainBusReference({
         outputWriteBytes:
           AX_MAIN_BUS_LIMITS.surroundOutputBytes
           + AX_MAIN_BUS_LIMITS.mainOutputBytes,
+        uploadWriteBytes:
+          uploadLrsCommands * AX_MAIN_BUS_LIMITS.accumulatorLrsBytes,
+        transactionWriteBytes: writes.reduce(
+          (total, write) => total + write.byteLength,
+          0,
+        ),
         clippedSampleValues: serialized.clippedSampleValues,
         peakAbsoluteSample: serialized.peakAbsoluteSample,
         surroundHash: hex32(surroundHash),
         mainHash: hex32(mainHash),
+        outputHash: hex32(outputHash),
         transactionHash: hex32(transactionHash),
       }),
     });
