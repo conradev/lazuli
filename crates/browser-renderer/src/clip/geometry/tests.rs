@@ -386,7 +386,7 @@ fn proven_clip_disable_noops_preserve_exact_geometry_bit_for_bit() {
 }
 
 #[test]
-fn clipping_detection_disable_requires_strict_positive_w_inside_endpoints() {
+fn clipping_detection_disable_keeps_xy_guardband_and_nonpositive_w_fail_closed() {
     let source = source_vertices(3);
     let base = [
         [-0.5, -0.5, -0.5, 1.0],
@@ -398,8 +398,6 @@ fn clipping_detection_disable_requires_strict_positive_w_inside_endpoints() {
         [-2.0, 0.0, -0.5, 1.0],
         [0.0, 2.0, -0.5, 1.0],
         [0.0, -2.0, -0.5, 1.0],
-        [0.0, 0.0, 0.5, 1.0],
-        [0.0, 0.0, -2.0, 1.0],
     ];
     for value in [1, 3, 5, 7] {
         let expected = Err(GxExactGeometryError::Projection(
@@ -425,6 +423,101 @@ fn clipping_detection_disable_requires_strict_positive_w_inside_endpoints() {
                 gx_exact_raster_geometry(2, 0, &source, &clip, state),
                 expected,
                 "mode {value} cannot bypass an unproved W endpoint",
+            );
+        }
+    }
+}
+
+#[test]
+fn positive_w_depth_clip_disable_bypasses_only_the_polygon_walk() {
+    let source = source_vertices(3);
+    let crossing_near = [
+        [-0.5, -0.5, -1.5, 1.0],
+        [0.5, -0.5, -1.0, 1.0],
+        [-0.5, 0.5, -1.0, 1.0],
+    ];
+    for value in [0, 2, 4, 6] {
+        let mut state = exact_state(0);
+        state.xf_clip_disable = value;
+        let geometry = gx_exact_raster_geometry(2, 0, &source, &crossing_near, state).unwrap();
+        assert_eq!(geometry.triangle_count(), 0, "mode {value}");
+        assert!(!geometry.bypasses_depth_clip(), "mode {value}");
+    }
+
+    let mut bypass_references = Vec::new();
+    for value in [1, 3, 5, 7] {
+        let mut state = exact_state(0);
+        state.xf_clip_disable = value;
+        let geometry = gx_exact_raster_geometry(2, 0, &source, &crossing_near, state).unwrap();
+        assert_eq!(geometry.triangle_count(), 1, "mode {value}");
+        assert!(geometry.bypasses_depth_clip(), "mode {value}");
+        assert_eq!(geometry.source_indices(), [[0, 1, 2]], "mode {value}");
+        let depths = vertex_slices(geometry.vertices())
+            .iter()
+            .map(|vertex| vertex[2])
+            .collect::<Vec<_>>();
+        assert!(
+            depths[0] < 0.0 && depths[1] == 0.0 && depths[2] == 0.0,
+            "mode {value} must retain the original out-of-range projected depth: {depths:?}",
+        );
+        bypass_references.push(geometry);
+    }
+    for geometry in &bypass_references[1..] {
+        assert_geometry_bits_eq(
+            geometry,
+            &bypass_references[0],
+            "bits 1 and 2 cannot change a nontrivially-rejected bypass",
+        );
+    }
+}
+
+#[test]
+fn depth_bypass_preserves_or_disables_trivial_rejection_from_bit_one() {
+    let source = source_vertices(3);
+    let uniform_depth_cases = [
+        (
+            "near",
+            [
+                [-0.5, -0.5, -1.5, 1.0],
+                [0.5, -0.5, -1.5, 1.0],
+                [-0.5, 0.5, -1.5, 1.0],
+            ],
+        ),
+        (
+            "far",
+            [
+                [-0.5, -0.5, 0.5, 1.0],
+                [0.5, -0.5, 0.5, 1.0],
+                [-0.5, 0.5, 0.5, 1.0],
+            ],
+        ),
+    ];
+    for (side, uniform_depth) in uniform_depth_cases {
+        for value in [0, 1, 2, 4, 5, 6] {
+            let mut state = exact_state(0);
+            state.xf_clip_disable = value;
+            let geometry = gx_exact_raster_geometry(2, 0, &source, &uniform_depth, state).unwrap();
+            assert_eq!(
+                geometry.triangle_count(),
+                0,
+                "{side} mode {value} must retain either clipping or trivial rejection",
+            );
+        }
+        for value in [3, 7] {
+            let mut state = exact_state(0);
+            state.xf_clip_disable = value;
+            let geometry = gx_exact_raster_geometry(2, 0, &source, &uniform_depth, state).unwrap();
+            assert_eq!(geometry.triangle_count(), 1, "{side} mode {value}");
+            assert!(geometry.bypasses_depth_clip(), "{side} mode {value}");
+            assert!(
+                vertex_slices(geometry.vertices()).iter().all(|vertex| {
+                    if side == "near" {
+                        vertex[2] < 0.0
+                    } else {
+                        vertex[2] > GX_DEPTH24_MAX as f32
+                    }
+                }),
+                "{side} mode {value} must retain all three out-of-range depths",
             );
         }
     }

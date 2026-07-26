@@ -290,6 +290,37 @@ pub(crate) fn gx_post_clip_raster_triangle<const COMPONENTS: usize>(
     cull_mode: u8,
     viewport_height: f32,
 ) -> Result<Vec<[GxRasterClipVertex<COMPONENTS>; 3]>, GxClipError> {
+    let Some((ordered, mask)) =
+        gx_post_cull_raster_triangle(triangle, cull_mode, viewport_height, false)?
+    else {
+        return Ok(Vec::new());
+    };
+    let polygon = gx_raster_clip_polygon(ordered, mask)?;
+    Ok(gx_triangulate_raster_polygon(&polygon))
+}
+
+fn gx_bypass_clip_raster_triangle<const COMPONENTS: usize>(
+    triangle: [GxRasterClipVertex<COMPONENTS>; 3],
+    cull_mode: u8,
+    viewport_height: f32,
+    disable_trivial_rejection: bool,
+) -> Result<Vec<[GxRasterClipVertex<COMPONENTS>; 3]>, GxClipError> {
+    Ok(gx_post_cull_raster_triangle(
+        triangle,
+        cull_mode,
+        viewport_height,
+        disable_trivial_rejection,
+    )?
+    .map(|(ordered, _mask)| vec![ordered])
+    .unwrap_or_default())
+}
+
+fn gx_post_cull_raster_triangle<const COMPONENTS: usize>(
+    triangle: [GxRasterClipVertex<COMPONENTS>; 3],
+    cull_mode: u8,
+    viewport_height: f32,
+    disable_trivial_rejection: bool,
+) -> Result<Option<([GxRasterClipVertex<COMPONENTS>; 3], u8)>, GxClipError> {
     if COMPONENTS < GX_CLIP_COMPONENTS {
         return Err(GxClipError::InvalidComponentCount);
     }
@@ -312,8 +343,8 @@ pub(crate) fn gx_post_clip_raster_triangle<const COMPONENTS: usize>(
         gx_clip_mask(&triangle[1].components)?,
         gx_clip_mask(&triangle[2].components)?,
     ];
-    if masks[0] & masks[1] & masks[2] != 0 {
-        return Ok(Vec::new());
+    if !disable_trivial_rejection && masks[0] & masks[1] & masks[2] != 0 {
+        return Ok(None);
     }
 
     let component_triangle = [
@@ -328,7 +359,7 @@ pub(crate) fn gx_post_clip_raster_triangle<const COMPONENTS: usize>(
     }
     let survives = cull_mode == 0 || (cull_mode == 1 && backface) || (cull_mode == 2 && !backface);
     if !survives {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let ordered = if backface {
@@ -336,8 +367,7 @@ pub(crate) fn gx_post_clip_raster_triangle<const COMPONENTS: usize>(
     } else {
         triangle
     };
-    let polygon = gx_raster_clip_polygon(ordered, masks[0] | masks[1] | masks[2])?;
-    Ok(gx_triangulate_raster_polygon(&polygon))
+    Ok(Some((ordered, masks[0] | masks[1] | masks[2])))
 }
 
 fn gx_clip_polygon<const COMPONENTS: usize>(

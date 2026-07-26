@@ -334,6 +334,7 @@ enum ManagedCoverageEvidence {
     None,
     TrustedPostCull,
     TrustedExactClip,
+    TrustedExactDepthClipBypass,
 }
 
 /// Exact raster geometry prepared while a complete packet is still immutable.
@@ -5095,7 +5096,8 @@ fn prepare_managed_coverage_vertices(
         if vertex.iter().any(|component| !component.is_finite())
             || !(0.0..=EFB_WIDTH as f32).contains(&vertex[0])
             || !(0.0..=EFB_HEIGHT as f32).contains(&vertex[1])
-            || !(0.0..=GX_DEPTH24_MAX as f32).contains(&vertex[2])
+            || (evidence != ManagedCoverageEvidence::TrustedExactDepthClipBypass
+                && !(0.0..=GX_DEPTH24_MAX as f32).contains(&vertex[2]))
             || vertex[3] <= 0.0
         {
             return None;
@@ -5194,9 +5196,14 @@ fn prepare_managed_coverage_vertices(
         ) {
             return None;
         }
-        let vertices =
-            managed_coverage_triangle_vertices(source_vertices, indices, texture_coord, scissor)
-                .ok()?;
+        let vertices = managed_coverage_triangle_vertices(
+            source_vertices,
+            indices,
+            texture_coord,
+            scissor,
+            evidence == ManagedCoverageEvidence::TrustedExactDepthClipBypass,
+        )
+        .ok()?;
         if let Some(vertices) = vertices {
             if let Some(sidecar) = tex_coord_sidecar.as_mut() {
                 sidecar.extend_from_slice(&managed_tex_coord_sidecar_record(
@@ -5259,6 +5266,7 @@ fn managed_coverage_triangle_vertices(
     indices: [usize; 3],
     texture_coord: Option<usize>,
     scissor: ScissorRect,
+    canonical_cover_depth: bool,
 ) -> Result<Option<[TevVertex; 3]>, crate::GxRasterError> {
     let raster_scissor = GxRasterScissor::new(
         scissor.x as u16,
@@ -5333,9 +5341,14 @@ fn managed_coverage_triangle_vertices(
     flat.raster1 = [raster1[0], raster1[1], raster1[2], 0].map(f32::from_bits);
     flat.tex_coords[6] = [point0, point1, point2].map(f32::from_bits);
     flat.tex_coords[7] = depths;
+    let cover_depth = if canonical_cover_depth {
+        GX_DEPTH24_MAX as f32 / 2.0
+    } else {
+        flat.position[2]
+    };
     Ok(Some(cover.map(|[x, y]| {
         let mut vertex = flat;
-        vertex.position = [x, y, flat.position[2], 1.0];
+        vertex.position = [x, y, cover_depth, 1.0];
         vertex
     })))
 }
@@ -5629,6 +5642,7 @@ fn prepare_exact_managed_vertices(
     expanded: &[usize],
     scissor: Option<ScissorRect>,
     sampler_states: [GxSamplerState; MAX_TEV_TEXTURES],
+    bypasses_depth_clip: bool,
 ) -> Option<PreparedManagedCoverageVertices> {
     if expanded.is_empty() {
         return None;
@@ -5697,7 +5711,11 @@ fn prepare_exact_managed_vertices(
         return None;
     }
     prepare_managed_coverage_vertices(
-        ManagedCoverageEvidence::TrustedExactClip,
+        if bypasses_depth_clip {
+            ManagedCoverageEvidence::TrustedExactDepthClipBypass
+        } else {
+            ManagedCoverageEvidence::TrustedExactClip
+        },
         primitive,
         raster_center,
         early_depth,
@@ -5747,6 +5765,7 @@ fn prepare_exact_draw(
             preparation_failure: Some(GxExactPreparationFailure::InvalidPreparedScissor),
         });
     }
+    let bypasses_depth_clip = geometry.bypasses_depth_clip();
     let exact_vertices = geometry.into_vertices();
     let exact_empty = expanded.is_empty()
         || exact_geometry_is_raster_empty(&exact_vertices, &expanded, scissor).unwrap_or(false);
@@ -5758,6 +5777,7 @@ fn prepare_exact_draw(
                 &expanded,
                 scissor,
                 sampler_states,
+                bypasses_depth_clip,
             )
         })
         .flatten();
@@ -6560,8 +6580,8 @@ mod tests {
         BlendComponentState, CopyClearUniform, CullMode, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
         DepthCommitPipelineKey, DrawUniform, ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT,
-        GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxRasterPoint28_4, GxRasterScissor,
-        GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
+        GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxExactPreparationFailure, GxRasterPoint28_4,
+        GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
         MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
         MANAGED_TEX_COORD_SIDECAR_WORDS, ManagedCoverageEvidence, ManagedSidecarCapacityOutcome,
         PipelineKey, PreparedExactDraw, Primitive, QualifiedExactDraw, REQUIRED_WEBGPU_FEATURES,
@@ -6581,8 +6601,8 @@ mod tests {
     use crate::packet::GxTriangleAction;
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS, managed_tex_coord_sidecar_fits};
     use crate::{
-        GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState,
-        GxRasterCenterEvidence, GxSamplerState, GxZTextureOperation, SamplerIdentity,
+        GX_DEPTH24_MAX, GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding,
+        GxFogState, GxRasterCenterEvidence, GxSamplerState, GxZTextureOperation, SamplerIdentity,
         TextureBindingIdentity, gx_destination_alpha_state, gx_sampler_state, gx_z_texture_state,
     };
 
@@ -6862,6 +6882,30 @@ mod tests {
     fn qualifying_exact_managed_draw(source: &[f32]) -> bool {
         managed_coverage_draw_is_safe(
             ManagedCoverageEvidence::TrustedExactClip,
+            Primitive::Triangles,
+            GxRasterCenterEvidence::KnownNonAntialiased,
+            GxEarlyDepthPlan::FixedFunction,
+            [false; MAX_TEV_TEXTURES],
+            [false; MAX_TEV_TEXTURES],
+            [GxSamplerState::default(); MAX_TEV_TEXTURES],
+            GxFogState::default(),
+            gx_z_texture_state(0, 0, 0).unwrap(),
+            source,
+            &[0, 1, 2],
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 528,
+            },
+        )
+    }
+
+    fn qualifying_exact_depth_bypass_draw(
+        source: &[f32],
+    ) -> Option<super::PreparedManagedCoverageVertices> {
+        prepare_managed_coverage_vertices(
+            ManagedCoverageEvidence::TrustedExactDepthClipBypass,
             Primitive::Triangles,
             GxRasterCenterEvidence::KnownNonAntialiased,
             GxEarlyDepthPlan::FixedFunction,
@@ -7264,6 +7308,65 @@ mod tests {
     }
 
     #[test]
+    fn exact_depth_clip_bypass_uses_host_safe_cover_and_raw_source_depths() {
+        for depths in [
+            [-8_388_607.5, 0.0, 0.0],
+            [25_165_822.0, GX_DEPTH24_MAX as f32, GX_DEPTH24_MAX as f32],
+        ] {
+            let mut source = flat_triangle_source([[0.0, 0.0], [12.0, 0.0], [0.0, 12.0]]);
+            for (vertex, depth) in depths.into_iter().enumerate() {
+                source[vertex * TEV_VERTEX_FLOATS + 2] = depth;
+            }
+            assert!(
+                !qualifying_exact_managed_draw(&source),
+                "ordinary exact clipping must retain the EFB depth-range guard",
+            );
+            let prepared = qualifying_exact_depth_bypass_draw(&source)
+                .expect("trusted positive-W depth bypass survives managed preparation");
+            assert_eq!(prepared.vertices.len(), 3);
+            for vertex in &prepared.vertices {
+                assert_eq!(
+                    vertex.position[2].to_bits(),
+                    (GX_DEPTH24_MAX as f32 / 2.0).to_bits(),
+                    "synthetic host cover depth stays inside WebGPU's clip volume",
+                );
+                assert_eq!(vertex.position[3], 1.0);
+                assert_eq!(
+                    managed_coverage_payload(*vertex)[3..],
+                    depths.map(|depth| depth.to_bits() as i32),
+                    "GX depths travel separately for fragment reconstruction and clamping",
+                );
+            }
+
+            let direct = managed_coverage_triangle_vertices(
+                &source,
+                [0, 1, 2],
+                None,
+                ScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 528,
+                },
+                true,
+            )
+            .unwrap()
+            .expect("depth-bypass triangle has visible GX coverage");
+            assert_eq!(
+                bytemuck::cast_slice::<TevVertex, u8>(&direct),
+                bytemuck::cast_slice::<TevVertex, u8>(&prepared.vertices),
+            );
+        }
+
+        let mut nonfinite = flat_triangle_source([[0.0, 0.0], [12.0, 0.0], [0.0, 12.0]]);
+        nonfinite[2] = f32::NEG_INFINITY;
+        assert!(
+            qualifying_exact_depth_bypass_draw(&nonfinite).is_none(),
+            "the relaxed range never admits non-finite depth",
+        );
+    }
+
+    #[test]
     fn managed_exact_vertices_pack_both_raster_endpoint_channels_in_trusted_order() {
         let mut source = flat_triangle_source([[0.590, 0.0], [4.0, 0.0], [4.0, 4.0]]);
         let endpoints = [
@@ -7287,6 +7390,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            false,
         )
         .unwrap()
         .expect("trusted exact varying-raster triangle survives managed setup");
@@ -7321,6 +7425,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            false,
         )
         .unwrap()
         .expect("the trusted exact triangle survives managed setup");
@@ -7401,6 +7506,7 @@ mod tests {
                 width: 32,
                 height: 8,
             },
+            false,
         )
         .unwrap()
         .expect("the negative snapped triangle must survive managed setup");
@@ -7456,6 +7562,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            false,
         )
         .unwrap()
         .expect("eligible textured face survives managed setup");
@@ -7743,6 +7850,7 @@ mod tests {
                     width: 8,
                     height: 8,
                 },
+                false,
             )
             .unwrap()
             .unwrap();
@@ -7923,6 +8031,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            false,
         )
         .unwrap()
         .expect("trusted post-cull face must survive managed setup");
@@ -7960,6 +8069,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            false,
         )
         .unwrap()
         .unwrap();
@@ -7978,6 +8088,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            false,
         )
         .unwrap()
         .unwrap();

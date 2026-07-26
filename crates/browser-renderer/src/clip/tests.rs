@@ -308,6 +308,55 @@ fn culling_precedes_backface_reorder_and_ordered_clipping() {
 }
 
 #[test]
+fn clip_bypass_retains_trivial_rejection_culling_and_backface_order() {
+    let raster = |components| GxRasterClipVertex::new(components, [0; 8]);
+    let crossing_near = [
+        raster([-0.5, -0.5, -1.5, 1.0]),
+        raster([0.5, -0.5, -1.0, 1.0]),
+        raster([-0.5, 0.5, -1.0, 1.0]),
+    ];
+    assert_eq!(
+        gx_post_clip_raster_triangle(crossing_near, 0, -264.0)
+            .unwrap()
+            .len(),
+        0,
+    );
+    assert_eq!(
+        gx_bypass_clip_raster_triangle(crossing_near, 0, -264.0, false).unwrap(),
+        [crossing_near],
+    );
+
+    let uniform_near = crossing_near.map(|mut vertex| {
+        vertex.components[2] = -1.5;
+        vertex
+    });
+    assert!(
+        gx_bypass_clip_raster_triangle(uniform_near, 0, -264.0, false)
+            .unwrap()
+            .is_empty(),
+        "bit zero alone must retain pre-clip trivial rejection",
+    );
+    assert_eq!(
+        gx_bypass_clip_raster_triangle(uniform_near, 0, -264.0, true).unwrap(),
+        [uniform_near],
+        "bit one bypasses the otherwise identical trivial rejection",
+    );
+
+    let backface = [crossing_near[0], crossing_near[2], crossing_near[1]];
+    assert_eq!(
+        gx_bypass_clip_raster_triangle(backface, 0, -264.0, false).unwrap(),
+        [crossing_near],
+        "backfaces are normalized to the same post-cull edge order",
+    );
+    assert!(
+        gx_bypass_clip_raster_triangle(crossing_near, 1, -264.0, false)
+            .unwrap()
+            .is_empty(),
+        "culling remains ahead of the polygon-clip bypass",
+    );
+}
+
+#[test]
 fn viewport_sign_and_all_cull_modes_match_the_js_oracle() {
     let front = [
         [0.0, 0.0, -0.5, 1.0],

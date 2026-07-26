@@ -10,8 +10,8 @@ use std::fmt;
 
 use super::project::{GxExactProjectionError, GxExactProjectionState};
 use super::{
-    GxClipError, GxRasterClipVertex, gx_clip_mask, gx_post_clip_raster_triangle,
-    gx_source_triangle_indices,
+    GxClipError, GxRasterClipVertex, gx_bypass_clip_raster_triangle, gx_clip_mask,
+    gx_post_clip_raster_triangle, gx_source_triangle_indices,
 };
 use crate::packet::{GxDraw, GxExactClipState};
 use crate::raster::gx_normalized_raster_channel_u8;
@@ -27,6 +27,20 @@ const GX_GEN_MODE_CULL_MASK: u32 = 3;
 const GX_GEN_MODE_Z_FREEZE: u32 = 1 << 19;
 const GX_XF_CLIP_DISABLE_DEFINED_MASK: u32 = 0b111;
 const GX_XF_DISABLE_CLIPPING_DETECTION: u32 = 1 << 0;
+const GX_XF_DISABLE_TRIVIAL_REJECTION: u32 = 1 << 1;
+const GX_CLIP_XY_MASK: u8 = 0x0f;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GxExactClipPath {
+    Clip,
+    BypassDepth { disable_trivial_rejection: bool },
+}
+
+impl GxExactClipPath {
+    const fn bypasses_depth_clip(self) -> bool {
+        matches!(self, Self::BypassDepth { .. })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GxExactGeometryError {
@@ -241,6 +255,7 @@ pub(crate) struct GxExactRasterGeometry {
     vertices: Vec<f32>,
     source_indices: Vec<[usize; 3]>,
     raster_scissor: GxRasterScissor,
+    bypasses_depth_clip: bool,
 }
 
 impl GxExactRasterGeometry {
@@ -266,6 +281,10 @@ impl GxExactRasterGeometry {
 
     pub(crate) const fn scissor_rect(&self) -> [u16; 4] {
         self.raster_scissor.rect()
+    }
+
+    pub(crate) const fn bypasses_depth_clip(&self) -> bool {
+        self.bypasses_depth_clip
     }
 }
 
@@ -333,12 +352,12 @@ fn gx_exact_raster_geometry(
     if state.bp_gen_mode & GX_GEN_MODE_Z_FREEZE != 0 {
         return Err(GxExactGeometryError::UnsupportedZFreeze);
     }
+    let clip_path = gx_exact_clip_path(state.xf_clip_disable, clip_positions);
     let mut projection_state = state;
-    if gx_clip_disable_is_proven_noop(state.xf_clip_disable, clip_positions) {
+    if clip_path.is_some() {
         // Qualification remains deliberately fail-closed for raw nonzero
         // state. Clear the field only after this draw has supplied enough
-        // geometry evidence to prove that the enabled stages cannot change
-        // its observable result.
+        // geometry evidence to select a bounded exact path.
         projection_state.xf_clip_disable = 0;
     }
     let projection = match GxExactProjectionState::qualify(projection_state) {
@@ -348,6 +367,7 @@ fn gx_exact_raster_geometry(
         }
         Err(error) => return Err(error.into()),
     };
+    let clip_path = clip_path.expect("qualified GX clip-disable path");
 
     let source_triangles = gx_source_triangle_indices(topology, vertex_count);
     if source_triangles.is_empty() {
@@ -366,9 +386,20 @@ fn gx_exact_raster_geometry(
                 std::array::from_fn(|channel| gx_normalized_raster_channel_u8(source[4 + channel]));
             GxRasterClipVertex::new(vertex, raster_channels)
         });
-        for clipped in
-            gx_post_clip_raster_triangle(clip_triangle, cull_mode, projection.viewport()[1])?
-        {
+        let raster_triangles = match clip_path {
+            GxExactClipPath::Clip => {
+                gx_post_clip_raster_triangle(clip_triangle, cull_mode, projection.viewport()[1])?
+            }
+            GxExactClipPath::BypassDepth {
+                disable_trivial_rejection,
+            } => gx_bypass_clip_raster_triangle(
+                clip_triangle,
+                cull_mode,
+                projection.viewport()[1],
+                disable_trivial_rejection,
+            )?,
+        };
+        for clipped in raster_triangles {
             let projected = [
                 gx_exact_raster_vertex(
                     projection.project(clipped[0].components())?,
@@ -383,8 +414,11 @@ fn gx_exact_raster_geometry(
                     clipped[2].raster_channels(),
                 ),
             ];
-            if !gx_projected_triangle_is_supported(&projected) {
-                return Err(gx_projected_triangle_error(&projected));
+            if !gx_projected_triangle_is_supported(&projected, clip_path.bypasses_depth_clip()) {
+                return Err(gx_projected_triangle_error(
+                    &projected,
+                    clip_path.bypasses_depth_clip(),
+                ));
             }
             for vertex in projected {
                 vertices.extend_from_slice(&vertex);
@@ -397,27 +431,42 @@ fn gx_exact_raster_geometry(
         vertices,
         source_indices: output_source_indices,
         raster_scissor: projection.raster_scissor(),
+        bypasses_depth_clip: clip_path.bypasses_depth_clip(),
     })
 }
 
-fn gx_clip_disable_is_proven_noop(clip_disable: u32, clip_positions: &[[f32; 4]]) -> bool {
+fn gx_exact_clip_path(clip_disable: u32, clip_positions: &[[f32; 4]]) -> Option<GxExactClipPath> {
     if clip_disable & !GX_XF_CLIP_DISABLE_DEFINED_MASK != 0 {
-        return false;
+        return None;
     }
     if clip_disable & GX_XF_DISABLE_CLIPPING_DETECTION == 0 {
         // Bits 1 and 2 only suppress an early rejection and a clipping
         // acceleration. With clipping still enabled (and Z-freeze rejected
         // above), neither can change the final geometry in this exact subset.
-        return true;
+        return Some(GxExactClipPath::Clip);
     }
 
-    // Disabling clipping detection is observationally inert only when every
-    // transported endpoint has positive W and is already on or inside every
-    // GX clip plane. In that case neither trivial rejection nor the polygon
-    // clip walk can alter any primitive, independent of bits 1 and 2.
-    clip_positions
-        .iter()
-        .all(|position| position[3] > 0.0 && matches!(gx_clip_mask(position), Ok(0)))
+    let mut mask = 0;
+    for position in clip_positions {
+        if position[3] <= 0.0 {
+            return None;
+        }
+        mask |= gx_clip_mask(position).ok()?;
+    }
+    if mask == 0 {
+        // In-frustum positive-W geometry remains on the normal clip path so
+        // every f32 and u8 interpolation bit stays identical to mode zero.
+        return Some(GxExactClipPath::Clip);
+    }
+    if mask & GX_CLIP_XY_MASK != 0 {
+        // GX X/Y clipping uses a measured +/-2W guardband rather than the
+        // software clipper's +/-W planes. Keep that independent behavior
+        // fail-closed until the complete guardband path is certified.
+        return None;
+    }
+    Some(GxExactClipPath::BypassDepth {
+        disable_trivial_rejection: clip_disable & GX_XF_DISABLE_TRIVIAL_REJECTION != 0,
+    })
 }
 
 fn gx_exact_empty_geometry() -> GxExactRasterGeometry {
@@ -426,6 +475,7 @@ fn gx_exact_empty_geometry() -> GxExactRasterGeometry {
         source_indices: Vec::new(),
         raster_scissor: GxRasterScissor::new(0, 0, 0, 0, 0, 0)
             .expect("canonical empty GX raster scissor"),
+        bypasses_depth_clip: false,
     }
 }
 
@@ -442,16 +492,22 @@ fn gx_exact_raster_vertex(
     vertex
 }
 
-fn gx_projected_triangle_is_supported(vertices: &[[f32; TEV_VERTEX_FLOATS]; 3]) -> bool {
+fn gx_projected_triangle_is_supported(
+    vertices: &[[f32; TEV_VERTEX_FLOATS]; 3],
+    allow_out_of_range_depth: bool,
+) -> bool {
     vertices.iter().all(|vertex| {
         vertex[3] > 0.0
             && (0.0..=EFB_WIDTH as f32).contains(&vertex[0])
             && (0.0..=EFB_HEIGHT as f32).contains(&vertex[1])
-            && (0.0..=GX_DEPTH24_MAX as f32).contains(&vertex[2])
+            && (allow_out_of_range_depth || (0.0..=GX_DEPTH24_MAX as f32).contains(&vertex[2]))
     })
 }
 
-fn gx_projected_triangle_error(vertices: &[[f32; TEV_VERTEX_FLOATS]; 3]) -> GxExactGeometryError {
+fn gx_projected_triangle_error(
+    vertices: &[[f32; TEV_VERTEX_FLOATS]; 3],
+    allow_out_of_range_depth: bool,
+) -> GxExactGeometryError {
     if vertices.iter().any(|vertex| vertex[3] <= 0.0) {
         return GxExactGeometryError::UnsupportedPostClipW;
     }
@@ -461,6 +517,7 @@ fn gx_projected_triangle_error(vertices: &[[f32; TEV_VERTEX_FLOATS]; 3]) -> GxEx
     }) {
         return GxExactGeometryError::UnsupportedPostClipPosition;
     }
+    debug_assert!(!allow_out_of_range_depth);
     GxExactGeometryError::UnsupportedPostClipDepth
 }
 
