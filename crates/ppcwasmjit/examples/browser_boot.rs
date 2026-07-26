@@ -1059,6 +1059,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     let meleeLastActiveGameplayInput = null;
     let fzeroLastActiveGameplayInput = null;
     let metroidPrimeLastActiveGameplayInput = null;
+    let rogueLeaderLastActiveGameplayInput = null;
+    let rogueLeaderNeutralControlBaseline = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -17524,6 +17526,741 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function rogueLeaderMappedEffectiveAddress(value, alignment = 4) {
+      return Number.isSafeInteger(value)
+        && value >= 0
+        && value <= 0xffffffff
+        && Number.isSafeInteger(alignment)
+        && alignment > 0
+        && (alignment & (alignment - 1)) === 0
+        && (value & (alignment - 1)) === 0
+        && guestEffectivePointer(value, 1) !== null;
+    }
+
+    function rogueLeaderFinitePadAxis(value) {
+      const minimum = Math.fround(-128 / 72) - 0.000001;
+      // Global Y is the negated normalized axis, so raw -128 can become
+      // +128/72 even though the positive raw endpoint is only +127.
+      const maximum = Math.fround(128 / 72) + 0.000001;
+      return Number.isFinite(value) && value >= minimum && value <= maximum;
+    }
+
+    function rogueLeaderFiniteShapedAxis(value) {
+      return Number.isFinite(value) && value >= -1.001 && value <= 1.001;
+    }
+
+    function rogueLeaderShapedAxisDirectionCoherent(source, shaped) {
+      if (
+        !rogueLeaderFinitePadAxis(source)
+        || !rogueLeaderFiniteShapedAxis(shaped)
+      ) return false;
+      if (Math.abs(source) <= 0.02) return Math.abs(shaped) <= 0.125;
+      return Math.sign(source) === Math.sign(shaped);
+    }
+
+    function inspectRogueLeaderVector(address) {
+      if (!rogueLeaderMappedEffectiveAddress(address)) return null;
+      return {
+        x: guestEffectiveF32(address),
+        y: guestEffectiveF32(address + 4),
+        z: guestEffectiveF32(address + 8),
+      };
+    }
+
+    function rogueLeaderFiniteVector(vector) {
+      return vector !== null
+        && Number.isFinite(vector.x)
+        && Number.isFinite(vector.y)
+        && Number.isFinite(vector.z);
+    }
+
+    function rogueLeaderDot(left, right) {
+      return left.x * right.x + left.y * right.y + left.z * right.z;
+    }
+
+    function inspectRogueLeaderGameState() {
+      if (boot.identifier !== "GSWE64" || boot.version !== 0) return null;
+
+      // Retail GSWE64 revision zero moves its main executable through hashed
+      // effective aliases. The fixed addresses below are effective addresses,
+      // so every field is probed independently instead of assuming adjacent
+      // effective pages have adjacent physical backing.
+      const headerAddress = 0x80000000;
+      const playerManagerAddress = 0x7fdefe14;
+      const simulationManagerPointerAddress = 0x80095dc8;
+      const pad0Address = 0x7fdee6e8;
+      const normalizedPad0Address = 0x7fdee718;
+      const globalAxesAddress = 0x7fde97e0;
+      const levelIndexAddress = 0x7fde822c;
+      const sublevelIndexAddress = 0x7fde8230;
+
+      const headerGameCode = guestEffectiveU32(headerAddress);
+      const headerMakerCode = guestEffectiveU16(headerAddress + 4);
+      const headerDiscNumber = guestEffectiveU8(headerAddress + 6);
+      const headerRevision = guestEffectiveU8(headerAddress + 7);
+      const exactIdentity = headerGameCode === 0x47535745
+        && headerMakerCode === 0x3634
+        && headerDiscNumber === 0
+        && headerRevision === 0;
+
+      // PLAYER's craft factory at effective 0x7fc443e8 publishes the new
+      // PLAYERcraft pointer in the first word of this global manager.
+      const playerManagerMapped = rogueLeaderMappedEffectiveAddress(
+        playerManagerAddress
+      );
+      const activeCraftPointerAddress = playerManagerAddress;
+      const activeCraftValue = playerManagerMapped
+        ? guestEffectiveU32(activeCraftPointerAddress)
+        : null;
+      const craftMapped = rogueLeaderMappedEffectiveAddress(activeCraftValue);
+      const activeCraftHandleAddress = playerManagerAddress + 4;
+      const selectedCraftTypeAddress = playerManagerAddress + 8;
+      const playerStateAddress = playerManagerAddress + 0x0c;
+      const activeCraftHandle = playerManagerMapped
+        ? guestEffectiveS32(activeCraftHandleAddress)
+        : null;
+      const selectedCraftType = playerManagerMapped
+        ? guestEffectiveS32(selectedCraftTypeAddress)
+        : null;
+      const playerState = playerManagerMapped
+        ? guestEffectiveS32(playerStateAddress)
+        : null;
+
+      // PLAYERcraftXWing's constructor at effective 0x7fc64774 installs this
+      // final pair after the base constructor. Base/intermediate vtables are
+      // deliberately not accepted as a live craft.
+      const primaryVtableAddress = craftMapped ? activeCraftValue + 0x80 : null;
+      const interfaceVtableAddress = craftMapped
+        ? activeCraftValue + 0x1a0
+        : null;
+      const primaryVtable = primaryVtableAddress === null
+        ? null
+        : guestEffectiveU32(primaryVtableAddress);
+      const interfaceVtable = interfaceVtableAddress === null
+        ? null
+        : guestEffectiveU32(interfaceVtableAddress);
+      const xwingIdentity = selectedCraftType === 0
+        && primaryVtable === 0x7fdc75b8
+        && interfaceVtable === 0x7fdc760c;
+      const craftStateAddress = craftMapped ? activeCraftValue + 0x370 : null;
+      const craftState = craftStateAddress === null
+        ? null
+        : guestEffectiveS32(craftStateAddress);
+      const craftConfigPointerAddress = craftMapped
+        ? activeCraftValue + 0x37c
+        : null;
+      const craftControlPointerAddress = craftMapped
+        ? activeCraftValue + 0x380
+        : null;
+      const craftConfigValue = craftConfigPointerAddress === null
+        ? null
+        : guestEffectiveU32(craftConfigPointerAddress);
+      const craftControlValue = craftControlPointerAddress === null
+        ? null
+        : guestEffectiveU32(craftControlPointerAddress);
+      const craftConfigMapped = rogueLeaderMappedEffectiveAddress(
+        craftConfigValue
+      );
+      const craftControlMapped = rogueLeaderMappedEffectiveAddress(
+        craftControlValue
+      );
+      const exactCraftControl = craftControlValue === 0x7fdf0fa4;
+
+      // PLAYERcraft::updateFlightControl at effective 0x7fc32540 resolves the
+      // already-shaped logical X through +0x110 and Y through +0x10c from the
+      // control object's forty-float bank beginning at +8. It then bounds and
+      // normalizes stack copies before producing the response fields below.
+      const stickXIndexAddress = craftControlMapped
+        ? craftControlValue + 0x110
+        : null;
+      const stickYIndexAddress = craftControlMapped
+        ? craftControlValue + 0x10c
+        : null;
+      const stickXIndex = stickXIndexAddress === null
+        ? null
+        : guestEffectiveU32(stickXIndexAddress);
+      const stickYIndex = stickYIndexAddress === null
+        ? null
+        : guestEffectiveU32(stickYIndexAddress);
+      const stickXIndexValid = Number.isSafeInteger(stickXIndex)
+        && stickXIndex >= 0
+        && stickXIndex < 40;
+      const stickYIndexValid = Number.isSafeInteger(stickYIndex)
+        && stickYIndex >= 0
+        && stickYIndex < 40;
+      const exactStickMapping = stickXIndex === 0 && stickYIndex === 1;
+      const stickXAddress = stickXIndexValid
+        ? craftControlValue + 8 + stickXIndex * 4
+        : null;
+      const stickYAddress = stickYIndexValid
+        ? craftControlValue + 8 + stickYIndex * 4
+        : null;
+      const stickX = stickXAddress === null
+        ? null
+        : guestEffectiveF32(stickXAddress);
+      const stickY = stickYAddress === null
+        ? null
+        : guestEffectiveF32(stickYAddress);
+      const controlInputValid = craftControlMapped
+        && stickXIndexValid
+        && stickYIndexValid
+        && rogueLeaderFiniteShapedAxis(stickX)
+        && rogueLeaderFiniteShapedAxis(stickY);
+      const controlNeutral = controlInputValid
+        && Math.abs(stickX) <= 0.125
+        && Math.abs(stickY) <= 0.125;
+      const controlHostLeft = controlInputValid
+        && stickX >= -1.001
+        && stickX <= -0.5
+        && Math.abs(stickY) <= 0.125;
+
+      // The same routine writes the Y-derived response to +0x45c and the
+      // X-derived response pair to +0x460/+0x464. Preserve address-based names
+      // until the later motion projector assigns physical pitch/yaw semantics.
+      const response45cAddress = craftMapped
+        ? activeCraftValue + 0x45c
+        : null;
+      const response460Address = craftMapped
+        ? activeCraftValue + 0x460
+        : null;
+      const response464Address = craftMapped
+        ? activeCraftValue + 0x464
+        : null;
+      const response45c = response45cAddress === null
+        ? null
+        : guestEffectiveF32(response45cAddress);
+      const response460 = response460Address === null
+        ? null
+        : guestEffectiveF32(response460Address);
+      const response464 = response464Address === null
+        ? null
+        : guestEffectiveF32(response464Address);
+      const responseFinite = Number.isFinite(response45c)
+        && Number.isFinite(response460)
+        && Number.isFinite(response464);
+      const xResponseActive = responseFinite
+        && (
+          Math.abs(response460) > 0.0001
+          || Math.abs(response464) > 0.0001
+        );
+
+      // The base craft transform is nine orientation floats followed by
+      // position and world velocity. Read each vector independently so a page
+      // boundary never turns the diagnostic into a contiguous-physical-range
+      // requirement.
+      const orientation0Address = craftMapped
+        ? activeCraftValue + 0x84
+        : null;
+      const orientation1Address = craftMapped
+        ? activeCraftValue + 0x90
+        : null;
+      const orientation2Address = craftMapped
+        ? activeCraftValue + 0x9c
+        : null;
+      const positionAddress = craftMapped ? activeCraftValue + 0xa8 : null;
+      const velocityAddress = craftMapped ? activeCraftValue + 0xb4 : null;
+      const orientation0 = orientation0Address === null
+        ? null
+        : inspectRogueLeaderVector(orientation0Address);
+      const orientation1 = orientation1Address === null
+        ? null
+        : inspectRogueLeaderVector(orientation1Address);
+      const orientation2 = orientation2Address === null
+        ? null
+        : inspectRogueLeaderVector(orientation2Address);
+      const position = positionAddress === null
+        ? null
+        : inspectRogueLeaderVector(positionAddress);
+      const velocity = velocityAddress === null
+        ? null
+        : inspectRogueLeaderVector(velocityAddress);
+      const transformFinite = rogueLeaderFiniteVector(orientation0)
+        && rogueLeaderFiniteVector(orientation1)
+        && rogueLeaderFiniteVector(orientation2)
+        && rogueLeaderFiniteVector(position)
+        && rogueLeaderFiniteVector(velocity);
+      const orientationOrthonormal = transformFinite
+        && Math.abs(rogueLeaderDot(orientation0, orientation0) - 1) <= 0.02
+        && Math.abs(rogueLeaderDot(orientation1, orientation1) - 1) <= 0.02
+        && Math.abs(rogueLeaderDot(orientation2, orientation2) - 1) <= 0.02
+        && Math.abs(rogueLeaderDot(orientation0, orientation1)) <= 0.02
+        && Math.abs(rogueLeaderDot(orientation0, orientation2)) <= 0.02
+        && Math.abs(rogueLeaderDot(orientation1, orientation2)) <= 0.02;
+      const orientationDeterminant = transformFinite
+        ? orientation0.x * (
+          orientation1.y * orientation2.z
+          - orientation1.z * orientation2.y
+        ) - orientation0.y * (
+          orientation1.x * orientation2.z
+          - orientation1.z * orientation2.x
+        ) + orientation0.z * (
+          orientation1.x * orientation2.y
+          - orientation1.y * orientation2.x
+        )
+        : null;
+      const orientationRightHanded = orientationOrthonormal
+        && orientationDeterminant > 0;
+
+      // PAD update at effective 0x7fc240a4 reads the retail OS PADStatus for
+      // port zero, normalizes its signed stick bytes at 0x7fdee718, and the
+      // player-zero update at 0x7fc07830 copies X and negated Y into the global
+      // logical axes. Tie all three stages to the craft's consumed values.
+      const padMapped = rogueLeaderMappedEffectiveAddress(pad0Address, 2);
+      const padButtons = padMapped ? guestEffectiveU16(pad0Address) : null;
+      const rawStickXAddress = pad0Address + 2;
+      const rawStickYAddress = pad0Address + 3;
+      const padErrorAddress = pad0Address + 0x0a;
+      const rawStickX = padMapped
+        ? guestEffectiveS8(rawStickXAddress)
+        : null;
+      const rawStickY = padMapped
+        ? guestEffectiveS8(rawStickYAddress)
+        : null;
+      const padError = padMapped ? guestEffectiveS8(padErrorAddress) : null;
+      const normalizedStickXAddress = normalizedPad0Address;
+      const normalizedStickYAddress = normalizedPad0Address + 4;
+      const normalizedStickX = guestEffectiveF32(normalizedStickXAddress);
+      const normalizedStickY = guestEffectiveF32(normalizedStickYAddress);
+      const globalStickXAddress = globalAxesAddress;
+      const globalStickYAddress = globalAxesAddress + 4;
+      const globalStickX = guestEffectiveF32(globalStickXAddress);
+      const globalStickY = guestEffectiveF32(globalStickYAddress);
+      const expectedNormalizedStickX = rawStickX === null
+        ? null
+        : Math.fround(rawStickX / 72);
+      const expectedNormalizedStickY = rawStickY === null
+        ? null
+        : Math.fround(rawStickY / 72);
+      const inputValuesValid = padMapped
+        && padButtons !== null
+        && rawStickX !== null
+        && rawStickY !== null
+        && padError === 0
+        && rogueLeaderFinitePadAxis(normalizedStickX)
+        && rogueLeaderFinitePadAxis(normalizedStickY)
+        && rogueLeaderFinitePadAxis(globalStickX)
+        && rogueLeaderFinitePadAxis(globalStickY);
+      const rawNormalizationCoherent = inputValuesValid
+        && Math.abs(normalizedStickX - expectedNormalizedStickX) <= 0.000001
+        && Math.abs(normalizedStickY - expectedNormalizedStickY) <= 0.000001;
+      const globalAxesCoherent = rawNormalizationCoherent
+        && Math.abs(normalizedStickX - globalStickX) <= 0.000001
+        && Math.abs(normalizedStickY + globalStickY) <= 0.000001;
+      const shapedControlCoherent = globalAxesCoherent
+        && controlInputValid
+        && exactStickMapping
+        && rogueLeaderShapedAxisDirectionCoherent(globalStickX, stickX)
+        && rogueLeaderShapedAxisDirectionCoherent(globalStickY, stickY);
+      const inputPipelineCoherent = shapedControlCoherent;
+      const inputNeutral = inputPipelineCoherent
+        && Math.abs(rawStickX) <= 16
+        && Math.abs(rawStickY) <= 16
+        && Math.abs(stickX) <= 0.125
+        && Math.abs(stickY) <= 0.125;
+      const inputHostLeft = inputPipelineCoherent
+        && rawStickX >= -128
+        && rawStickX <= -36
+        && Math.abs(rawStickY) <= 16
+        && normalizedStickX <= -0.5
+        && globalStickX <= -0.5
+        && controlHostLeft
+        && Math.abs(stickY) <= 0.125;
+
+      // This global predicate controls only the auxiliary +0x11c/+0x120
+      // reads. X and Y at +0x110/+0x10c are consumed on both branches, so
+      // expose it without treating it as an active-flight gate.
+      const simulationManagerValue = guestEffectiveU32(
+        simulationManagerPointerAddress
+      );
+      const simulationManagerMapped = rogueLeaderMappedEffectiveAddress(
+        simulationManagerValue
+      );
+      const auxiliaryEnabledAddress = simulationManagerMapped
+        ? simulationManagerValue + 0xe04
+        : null;
+      const auxiliaryModeAddress = simulationManagerMapped
+        ? simulationManagerValue + 0xa7c
+        : null;
+      const auxiliaryEnabled = auxiliaryEnabledAddress === null
+        ? null
+        : guestEffectiveU8(auxiliaryEnabledAddress);
+      const auxiliaryMode = auxiliaryModeAddress === null
+        ? null
+        : guestEffectiveS32(auxiliaryModeAddress);
+      const auxiliaryControlMode = simulationManagerMapped
+        && auxiliaryEnabled !== 0
+        && auxiliaryEnabled !== null
+        && auxiliaryMode === 1;
+      const levelIndex = guestEffectiveS32(levelIndexAddress);
+      const sublevelIndex = guestEffectiveS32(sublevelIndexAddress);
+
+      const craftValid = craftMapped
+        && xwingIdentity
+        && craftConfigMapped
+        && craftControlMapped
+        && exactCraftControl
+        && controlInputValid
+        && responseFinite;
+      const controlsEnabled = inputPipelineCoherent;
+      const liveXwingControlPath = exactIdentity
+        && playerManagerMapped
+        && craftValid
+        && controlsEnabled;
+      // Construction and reset install state zero. Collision/impact handling
+      // moves it to state three, while states four and five explicitly zero
+      // world velocity. State zero is necessary but not, by itself, evidence
+      // that the mission update loop has run.
+      const normalCraftState = liveXwingControlPath && craftState === 0;
+      const normalStateTransformValid = normalCraftState
+        && orientationOrthonormal
+        && orientationRightHanded;
+      const hostLeftCorrelated = normalStateTransformValid
+        && inputHostLeft
+        && controlHostLeft
+        && xResponseActive;
+      const receiptLifetimeMatches = rogueLeaderLastActiveGameplayInput !== null
+        && rogueLeaderLastActiveGameplayInput.level.index === levelIndex
+        && rogueLeaderLastActiveGameplayInput.level.sublevelIndex
+          === sublevelIndex
+        && rogueLeaderLastActiveGameplayInput.craft.address
+          === (craftMapped ? hex32(activeCraftValue) : null)
+        && rogueLeaderLastActiveGameplayInput.craft.handle
+          === activeCraftHandle
+        && rogueLeaderLastActiveGameplayInput.craft.config
+          === (craftConfigMapped ? hex32(craftConfigValue) : null)
+        && rogueLeaderLastActiveGameplayInput.craft.control
+          === (craftControlMapped ? hex32(craftControlValue) : null)
+        && rogueLeaderLastActiveGameplayInput.craft.primaryVtable
+          === hex32(primaryVtable)
+        && rogueLeaderLastActiveGameplayInput.craft.interfaceVtable
+          === hex32(interfaceVtable);
+      const activeFlight = normalStateTransformValid && receiptLifetimeMatches;
+      const guestConsumedHostLeft = receiptLifetimeMatches;
+
+      return {
+        identity: {
+          headerAddress: hex32(headerAddress),
+          gameCode: hex32(headerGameCode),
+          makerCode: headerMakerCode,
+          discNumber: headerDiscNumber,
+          revision: headerRevision,
+          exact: exactIdentity,
+        },
+        level: {
+          indexAddress: hex32(levelIndexAddress),
+          index: levelIndex,
+          sublevelIndexAddress: hex32(sublevelIndexAddress),
+          sublevelIndex,
+        },
+        playerManager: {
+          address: hex32(playerManagerAddress),
+          mapped: playerManagerMapped,
+          activeCraftPointerAddress: hex32(activeCraftPointerAddress),
+          activeCraft: craftMapped ? hex32(activeCraftValue) : null,
+          activeCraftHandleAddress: hex32(activeCraftHandleAddress),
+          activeCraftHandle,
+          selectedCraftTypeAddress: hex32(selectedCraftTypeAddress),
+          selectedCraftType,
+          stateAddress: hex32(playerStateAddress),
+          state: playerState,
+        },
+        simulation: {
+          pointerAddress: hex32(simulationManagerPointerAddress),
+          manager: simulationManagerMapped
+            ? hex32(simulationManagerValue)
+            : null,
+          auxiliaryEnabledAddress: hex32(auxiliaryEnabledAddress),
+          auxiliaryEnabled,
+          auxiliaryModeAddress: hex32(auxiliaryModeAddress),
+          auxiliaryMode,
+          auxiliaryControlMode,
+        },
+        input: {
+          port: 0,
+          padAddress: hex32(pad0Address),
+          padMapped,
+          buttons: padButtons,
+          rawStickXAddress: hex32(rawStickXAddress),
+          rawStickX,
+          rawStickYAddress: hex32(rawStickYAddress),
+          rawStickY,
+          errorAddress: hex32(padErrorAddress),
+          error: padError,
+          normalizedStickXAddress: hex32(normalizedStickXAddress),
+          normalizedStickX,
+          expectedNormalizedStickX,
+          normalizedStickYAddress: hex32(normalizedStickYAddress),
+          normalizedStickY,
+          expectedNormalizedStickY,
+          globalStickXAddress: hex32(globalStickXAddress),
+          globalStickX,
+          globalStickYAddress: hex32(globalStickYAddress),
+          globalStickY,
+          valuesValid: inputValuesValid,
+          rawNormalizationCoherent,
+          globalAxesCoherent,
+          shapedControlCoherent,
+          pipelineCoherent: inputPipelineCoherent,
+          neutral: inputNeutral,
+          hostLeftRetained: inputHostLeft,
+        },
+        craft: {
+          address: craftMapped ? hex32(activeCraftValue) : null,
+          mapped: craftMapped,
+          identity: {
+            primaryVtableAddress: hex32(primaryVtableAddress),
+            primaryVtable: hex32(primaryVtable),
+            interfaceVtableAddress: hex32(interfaceVtableAddress),
+            interfaceVtable: hex32(interfaceVtable),
+            type: xwingIdentity ? "x-wing" : null,
+            exact: xwingIdentity,
+          },
+          stateAddress: hex32(craftStateAddress),
+          state: craftState,
+          configPointerAddress: hex32(craftConfigPointerAddress),
+          config: craftConfigMapped ? hex32(craftConfigValue) : null,
+          controlPointerAddress: hex32(craftControlPointerAddress),
+          control: craftControlMapped ? hex32(craftControlValue) : null,
+          exactControl: exactCraftControl,
+          controlInput: {
+            stickXIndexAddress: hex32(stickXIndexAddress),
+            stickXIndex,
+            stickXAddress: hex32(stickXAddress),
+            stickX,
+            stickYIndexAddress: hex32(stickYIndexAddress),
+            stickYIndex,
+            stickYAddress: hex32(stickYAddress),
+            stickY,
+            exactMapping: exactStickMapping,
+            valid: controlInputValid,
+            neutral: controlNeutral,
+            hostLeftRetained: controlHostLeft,
+          },
+          transform: {
+            orientation0Address: hex32(orientation0Address),
+            orientation0,
+            orientation1Address: hex32(orientation1Address),
+            orientation1,
+            orientation2Address: hex32(orientation2Address),
+            orientation2,
+            positionAddress: hex32(positionAddress),
+            position,
+            velocityAddress: hex32(velocityAddress),
+            velocity,
+            finite: transformFinite,
+            orthonormal: orientationOrthonormal,
+            determinant: orientationDeterminant,
+            rightHanded: orientationRightHanded,
+          },
+          response: {
+            field45cAddress: hex32(response45cAddress),
+            field45c: response45c,
+            field460Address: hex32(response460Address),
+            field460: response460,
+            field464Address: hex32(response464Address),
+            field464: response464,
+            finite: responseFinite,
+            xActive: xResponseActive,
+          },
+          valid: craftValid,
+        },
+        controlsEnabled,
+        liveXwingControlPath,
+        normalCraftState,
+        normalStateTransformValid,
+        hostLeftCorrelated,
+        receiptLifetimeMatches,
+        activeFlight,
+        guestConsumedHostLeft,
+        neutralControlBaseline: rogueLeaderNeutralControlBaseline,
+        lastActiveGameplayInput: rogueLeaderLastActiveGameplayInput,
+      };
+    }
+
+    function sampleRogueLeaderGameplayInput(sampleCycle) {
+      if (
+        boot.identifier !== "GSWE64"
+        || boot.version !== 0
+      ) return;
+      if (
+        !Number.isSafeInteger(sampleCycle)
+        || sampleCycle < 0
+        || !Number.isSafeInteger(controllerAppliedSequence)
+        || controllerAppliedSequence < 0
+      ) return;
+
+      const state = inspectRogueLeaderGameState();
+      if (state === null) return;
+      if (rogueLeaderLastActiveGameplayInput !== null) {
+        if (state.receiptLifetimeMatches) return;
+        rogueLeaderLastActiveGameplayInput = null;
+        rogueLeaderNeutralControlBaseline = null;
+      }
+      if (!state.normalStateTransformValid) {
+        rogueLeaderNeutralControlBaseline = null;
+        return;
+      }
+
+      let baseline = rogueLeaderNeutralControlBaseline;
+      const baselineLifetimeMatches = baseline !== null
+        && baseline.level.index === state.level.index
+        && baseline.level.sublevelIndex === state.level.sublevelIndex
+        && baseline.craft.address === state.craft.address
+        && baseline.craft.handle === state.playerManager.activeCraftHandle
+        && baseline.craft.config === state.craft.config
+        && baseline.craft.control === state.craft.control
+        && baseline.craft.primaryVtable === state.craft.identity.primaryVtable
+        && baseline.craft.interfaceVtable
+          === state.craft.identity.interfaceVtable;
+      if (baseline !== null && !baselineLifetimeMatches) {
+        rogueLeaderNeutralControlBaseline = null;
+        baseline = null;
+      }
+
+      const publication = serialLastActiveHostPublication;
+      const hostControllerNeutral = controllerState !== null
+        && typeof controllerState === "object"
+        && controllerState.buttons === 0
+        && controllerState.stickX === 0x80
+        && controllerState.stickY === 0x80;
+      if (
+        hostControllerNeutral
+        && state.input.neutral === true
+        && state.craft.controlInput.neutral === true
+      ) {
+        rogueLeaderNeutralControlBaseline = {
+          cycle: sampleCycle,
+          controllerAppliedSequence,
+          level: {
+            index: state.level.index,
+            sublevelIndex: state.level.sublevelIndex,
+          },
+          craft: {
+            address: state.craft.address,
+            handle: state.playerManager.activeCraftHandle,
+            config: state.craft.config,
+            control: state.craft.control,
+            primaryVtable: state.craft.identity.primaryVtable,
+            interfaceVtable: state.craft.identity.interfaceVtable,
+            state: state.craft.state,
+          },
+          response: {
+            field45c: state.craft.response.field45c,
+            field460: state.craft.response.field460,
+            field464: state.craft.response.field464,
+          },
+        };
+        return;
+      }
+
+      if (
+        publication === null
+        || publication.buttons !== 0x0001
+        || !Number.isSafeInteger(publication.sequence)
+        || publication.sequence <= 0
+        || !Number.isSafeInteger(publication.pollIndex)
+        || publication.pollIndex <= 0
+        || !Number.isSafeInteger(publication.scheduledCycle)
+        || publication.scheduledCycle < 0
+        || !Number.isSafeInteger(publication.observedCycle)
+        || publication.observedCycle < 0
+        || publication.scheduledCycle > publication.observedCycle
+        || publication.observedCycle > sampleCycle
+        || controllerAppliedSequence !== publication.sequence
+      ) return;
+
+      baseline = rogueLeaderNeutralControlBaseline;
+      const response460Delta = baseline === null
+        ? null
+        : state.craft.response.field460 - baseline.response.field460;
+      const response464Delta = baseline === null
+        ? null
+        : state.craft.response.field464 - baseline.response.field464;
+      const xResponseTransition = Number.isFinite(response460Delta)
+        && Number.isFinite(response464Delta)
+        && (
+          Math.abs(response460Delta) > 0.0001
+          || Math.abs(response464Delta) > 0.0001
+        );
+      if (
+        state.normalStateTransformValid !== true
+        || state.input.hostLeftRetained !== true
+        || state.craft.controlInput.hostLeftRetained !== true
+        || baseline === null
+        || baseline.cycle >= publication.observedCycle
+        || baseline.controllerAppliedSequence >= publication.sequence
+        || baseline.level.index !== state.level.index
+        || baseline.level.sublevelIndex !== state.level.sublevelIndex
+        || baseline.craft.address !== state.craft.address
+        || baseline.craft.handle !== state.playerManager.activeCraftHandle
+        || baseline.craft.config !== state.craft.config
+        || baseline.craft.control !== state.craft.control
+        || baseline.craft.primaryVtable !== state.craft.identity.primaryVtable
+        || baseline.craft.interfaceVtable
+          !== state.craft.identity.interfaceVtable
+        || !xResponseTransition
+      ) return;
+      rogueLeaderLastActiveGameplayInput = {
+        cycle: sampleCycle,
+        controllerAppliedSequence,
+        hostPublication: { ...publication },
+        level: {
+          index: state.level.index,
+          sublevelIndex: state.level.sublevelIndex,
+        },
+        playerManager: state.playerManager.address,
+        craft: {
+          address: state.craft.address,
+          handle: state.playerManager.activeCraftHandle,
+          config: state.craft.config,
+          control: state.craft.control,
+          primaryVtable: state.craft.identity.primaryVtable,
+          interfaceVtable: state.craft.identity.interfaceVtable,
+          type: state.craft.identity.type,
+          state: state.craft.state,
+        },
+        transform: {
+          orientation0: { ...state.craft.transform.orientation0 },
+          orientation1: { ...state.craft.transform.orientation1 },
+          orientation2: { ...state.craft.transform.orientation2 },
+          position: { ...state.craft.transform.position },
+          velocity: { ...state.craft.transform.velocity },
+        },
+        simulation: {
+          manager: state.simulation.manager,
+          auxiliaryEnabled: state.simulation.auxiliaryEnabled,
+          auxiliaryMode: state.simulation.auxiliaryMode,
+        },
+        input: {
+          port: state.input.port,
+          buttons: state.input.buttons,
+          rawStickX: state.input.rawStickX,
+          rawStickY: state.input.rawStickY,
+          normalizedStickX: state.input.normalizedStickX,
+          normalizedStickY: state.input.normalizedStickY,
+          globalStickX: state.input.globalStickX,
+          globalStickY: state.input.globalStickY,
+          stickX: state.craft.controlInput.stickX,
+          stickY: state.craft.controlInput.stickY,
+        },
+        response: {
+          field45c: state.craft.response.field45c,
+          field460: state.craft.response.field460,
+          field464: state.craft.response.field464,
+        },
+        neutralBaseline: {
+          cycle: baseline.cycle,
+          controllerAppliedSequence: baseline.controllerAppliedSequence,
+          response: { ...baseline.response },
+        },
+        responseTransition: {
+          field460Delta: response460Delta,
+          field464Delta: response464Delta,
+          xChanged: xResponseTransition,
+        },
+      };
+    }
+
     function inspectGuestGameState() {
       return inspectSuperMonkeyBallGameState()
         ?? inspectLuigisMansionGameState()
@@ -17531,6 +18268,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         ?? inspectMeleeGameState()
         ?? inspectFzeroGameState()
         ?? inspectWarioWareGameState()
+        ?? (
+          boot.identifier === "GSWE64"
+            ? inspectRogueLeaderGameState()
+            : null
+        )
         ?? (
           boot.identifier === "GM8E01"
             ? inspectMetroidPrimeGameState()
@@ -17544,6 +18286,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       sampleMeleeGameplayInput(sampleCycle);
       sampleFzeroGameplayInput(sampleCycle);
       sampleWarioWareGameplayInput(sampleCycle);
+      if (boot.identifier === "GSWE64") {
+        sampleRogueLeaderGameplayInput(sampleCycle);
+      }
       if (boot.identifier === "GM8E01") {
         sampleMetroidPrimeGameplayInput(sampleCycle);
       }
