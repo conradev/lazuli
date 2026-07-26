@@ -282,7 +282,7 @@ test("browser hook ABI exposes reservation operations and external invalidators"
 
   for (const name of [
     "serviceLockedCacheDma",
-    "serviceAramDma",
+    "startAramDma",
     "serviceExi0",
     "beginDiskCommand",
     "serviceDisk",

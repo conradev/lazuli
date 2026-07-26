@@ -324,20 +324,36 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
     aramTransfer: null,
     bytes: new Uint8Array(memory),
     cpu,
+    cpControlReadEnable: 1,
+    cpFifoState: { control: 0, distance: 0 },
     cycles: 1_000,
     deviceEvents: new Map(),
     dspScheduledMail: null,
+    ensureViSchedule() {},
     initializeDspAudioSystem() {},
     invalidateDataReservationForExternalWrite() {},
     mmio,
     msrOffset: 0,
     pushDspMail() {},
+    ram: 0,
+    ramSize: mmio,
     ramPointer(address, size) {
       return address + size <= mmio ? address : null;
     },
     resetDspAudioDma() {},
     resetDspMailbox() {},
+    serviceAudioInterface() {},
+    serviceCommandProcessorFifo() {},
+    serviceCommandProcessorInterrupt() {},
+    serviceDecrementer() {},
+    serviceDisk() {},
     serviceDspAudioDma() {},
+    serviceExternalInterface() {},
+    servicePixelEngine() {},
+    serviceSerial() {},
+    serviceViDueEvents() {},
+    serviceVideoInterrupt() {},
+    serviceVideoPresentation() {},
     traceDsp() {},
     translateDataRange(address) {
       return address >= 0xc0000000
@@ -361,6 +377,7 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
       "startAramDma",
       "serviceAramDma",
       "serviceDsp",
+      "serviceMmio",
       "writeDspControl",
       "writeInteger",
     ].map(extractFunction).join("\n\n"),
@@ -371,8 +388,12 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
   for (let index = 0; index < 32; index += 1) {
     context.bytes[0x100 + index] = index ^ 0x5a;
   }
-  context.view.setUint32(mmio + 0x5020, 0x100, false);
-  context.view.setUint32(mmio + 0x5024, 0x200, false);
+  assert.equal(context.writeInteger(0xcc005020, 0x0000013f, 4), 1);
+  assert.equal(context.view.getUint32(mmio + 0x5020, false), 0x120);
+  assert.equal(context.writeInteger(0xcc005024, 0x0400023f, 4), 1);
+  assert.equal(context.view.getUint32(mmio + 0x5024, false), 0x220);
+  assert.equal(context.writeInteger(0xcc005020, 0x100, 4), 1);
+  assert.equal(context.writeInteger(0xcc005024, 0x200, 4), 1);
   context.view.setUint32(mmio + 0x3004, 0x00000040, false);
 
   context.writeDspControl(0x0200);
@@ -382,9 +403,29 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
     "software cannot manufacture hardware-owned DMAState",
   );
 
-  context.startAramDma(0x20);
+  assert.equal(context.startAramDma(0x20), true);
   const completionCycle = context.aramTransfer.completionCycle;
+  const committed = [...context.bytes.subarray(0x100, 0x120)];
+  assert.equal(completionCycle, context.cycles + 246);
   assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0200);
+  assert.equal(context.view.getUint32(mmio + 0x5020, false), 0x120);
+  assert.equal(context.view.getUint32(mmio + 0x5024, false), 0x220);
+  assert.equal(context.view.getUint32(mmio + 0x5028, false), 0);
+  assert.deepEqual(
+    [...context.aram.subarray(0x200, 0x220)],
+    committed,
+    "ARAM data and post-incremented registers commit at trigger time",
+  );
+  context.bytes.fill(0xee, 0x100, 0x120);
+  assert.equal(context.serviceAramDma(completionCycle - 1), false);
+  assert.deepEqual([...context.aram.subarray(0x200, 0x220)], committed);
+  const acceptedTransfer = context.aramTransfer;
+  assert.equal(context.writeInteger(0xcc005028, 0x20, 4), 1);
+  assert.equal(context.aramTransfer, acceptedTransfer);
+  assert.equal(
+    context.deviceEvents.get("aramDmaBusyRetriggerRejected"),
+    1,
+  );
 
   assert.equal(context.writeInteger(0xcc005008, 0xabcd0000, 4), 1);
   assert.equal(
@@ -401,7 +442,7 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
   context.serviceDsp(completionCycle);
   assert.deepEqual(
     [...context.aram.subarray(0x200, 0x220)],
-    [...context.bytes.subarray(0x100, 0x120)],
+    committed,
   );
   assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0020);
   assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
@@ -424,6 +465,17 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
   context.serviceDsp(completionCycle);
   assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
   assert.equal(interrupts, 1);
+
+  assert.equal(context.writeInteger(0xcc005008, 0, 4), 1);
+  const zeroCycle = context.cycles;
+  assert.equal(context.writeInteger(0xcc005028, 0, 4), 1);
+  assert.equal(context.aramTransfer.completionCycle, zeroCycle);
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0200);
+  context.serviceMmio(zeroCycle);
+  assert.equal(context.aramTransfer, null);
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0020);
+  assert.equal(context.deviceEvents.get("aramDmaComplete"), 2);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
 });
 
 test("CPU mailbox commits raw payload only after the low-half write", () => {

@@ -14042,21 +14042,89 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function startAramDma(value) {
+      const control = view.getUint16(mmio + 0x500a, false);
+      if (aramTransfer !== null || (control & 0x0200) !== 0) {
+        deviceEvents.set(
+          "aramDmaBusyRetriggerRejected",
+          (deviceEvents.get("aramDmaBusyRetriggerRejected") ?? 0) + 1
+        );
+        return false;
+      }
+
       const written = value >>> 0;
       const countAndDirection = (
         (((written >>> 16) & 0x83ff) << 16)
         | (written & 0xffe0)
       ) >>> 0;
-      const length = countAndDirection & 0x7fffffe0;
+      const length = countAndDirection & 0x03ffffe0;
       const direction = countAndDirection >>> 31;
       const mmAddress = view.getUint32(mmio + 0x5020, false) & 0x03ffffe0;
       const aramAddress = view.getUint32(mmio + 0x5024, false) & 0x03ffffe0;
-      const transferCycles = Math.max(1, (length / 32) * 246);
+      const validRamLength = mmAddress >= ramSize
+        ? 0
+        : Math.min(length, ramSize - mmAddress);
+      const internalAram = aramAddress < aram.length;
 
-      view.setUint32(mmio + 0x5028, countAndDirection, false);
+      if (length !== 0 && internalAram && direction !== 0) {
+        if (validRamLength !== 0) {
+          invalidateDataReservationForExternalWrite(
+            mmAddress,
+            validRamLength
+          );
+          let copied = 0;
+          while (copied < validRamLength) {
+            const source = (aramAddress + copied) & (aram.length - 1);
+            const chunk = Math.min(
+              validRamLength - copied,
+              aram.length - source
+            );
+            bytes.set(
+              aram.subarray(source, source + chunk),
+              ram + mmAddress + copied
+            );
+            copied += chunk;
+          }
+        }
+      } else if (length !== 0 && internalAram) {
+        let copied = 0;
+        while (copied < length) {
+          const target = (aramAddress + copied) & (aram.length - 1);
+          const chunk = Math.min(length - copied, aram.length - target);
+          const source = mmAddress + copied;
+          const valid = source >= ramSize
+            ? 0
+            : Math.min(chunk, ramSize - source);
+          if (valid !== 0) {
+            aram.set(
+              bytes.subarray(ram + source, ram + source + valid),
+              target
+            );
+          }
+          if (valid !== chunk) {
+            aram.fill(0, target + valid, target + chunk);
+          }
+          copied += chunk;
+        }
+      }
+
+      if (internalAram && validRamLength !== length) {
+        deviceEvents.set(
+          "aramDmaUnmappedRam",
+          (deviceEvents.get("aramDmaUnmappedRam") ?? 0) + 1
+        );
+      } else if (!internalAram && length !== 0) {
+        deviceEvents.set(
+          "aramDmaExpansionNoOp",
+          (deviceEvents.get("aramDmaExpansionNoOp") ?? 0) + 1
+        );
+      }
+
+      view.setUint32(mmio + 0x5020, (mmAddress + length) & 0x03ffffe0, false);
+      view.setUint32(mmio + 0x5024, (aramAddress + length) & 0x03ffffe0, false);
+      view.setUint32(mmio + 0x5028, direction === 0 ? 0 : 0x80000000, false);
       view.setUint16(
         mmio + 0x500a,
-        view.getUint16(mmio + 0x500a, false) | 0x0200,
+        control | 0x0200,
         false
       );
       aramTransfer = {
@@ -14064,50 +14132,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         mmAddress,
         aramAddress,
         length,
-        completionCycle: cycles + transferCycles,
+        completionCycle: cycles + (length / 32) * 246,
       };
       deviceEvents.set("aramDmaStart", (deviceEvents.get("aramDmaStart") ?? 0) + 1);
+      return true;
     }
 
     function serviceAramDma(observedCycles) {
-      if (aramTransfer === null || observedCycles < aramTransfer.completionCycle) return;
+      if (
+        aramTransfer === null
+        || observedCycles < aramTransfer.completionCycle
+      ) return false;
 
-      const { direction, mmAddress, aramAddress, length } = aramTransfer;
-      const ramTarget = ramPointer(mmAddress, length);
-      if (ramTarget === null) {
-        deviceEvents.set(
-          "aramDmaUnmappedRam",
-          (deviceEvents.get("aramDmaUnmappedRam") ?? 0) + 1
-        );
-      } else if (direction !== 0) {
-        invalidateDataReservationForExternalWrite(
-          (ramTarget - ram) >>> 0,
-          length
-        );
-        if (aramAddress >= aram.length) {
-          bytes.fill(0, ramTarget, ramTarget + length);
-        } else {
-          let copied = 0;
-          while (copied < length) {
-            const source = (aramAddress + copied) & (aram.length - 1);
-            const chunk = Math.min(length - copied, aram.length - source);
-            bytes.set(aram.subarray(source, source + chunk), ramTarget + copied);
-            copied += chunk;
-          }
-        }
-      } else if (aramAddress < aram.length) {
-        let copied = 0;
-        while (copied < length) {
-          const target = (aramAddress + copied) & (aram.length - 1);
-          const chunk = Math.min(length - copied, aram.length - target);
-          aram.set(bytes.subarray(ramTarget + copied, ramTarget + copied + chunk), target);
-          copied += chunk;
-        }
-      }
-
-      view.setUint32(mmio + 0x5020, (mmAddress + length) & 0x03ffffe0, false);
-      view.setUint32(mmio + 0x5024, (aramAddress + length) & 0x03ffffe0, false);
-      view.setUint32(mmio + 0x5028, direction === 0 ? 0 : 0x80000000, false);
       view.setUint16(
         mmio + 0x500a,
         (view.getUint16(mmio + 0x500a, false) & ~0x0200) | 0x0020,
@@ -14118,6 +14154,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         "aramDmaComplete",
         (deviceEvents.get("aramDmaComplete") ?? 0) + 1
       );
+      return true;
     }
 
     function writeDspControl(value) {
@@ -14335,6 +14372,39 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if (physical === 0x0c005036 && size === 2) {
         writeDspAudioDmaControl(value);
+        return 1;
+      }
+      if (
+        (physical === 0x0c005020 || physical === 0x0c005024)
+        && size === 4
+      ) {
+        view.setUint32(
+          mmio + physical - 0x0c000000,
+          value & 0x03ffffe0,
+          false
+        );
+        return 1;
+      }
+      if (
+        (physical === 0x0c005020 || physical === 0x0c005024)
+        && size === 2
+      ) {
+        view.setUint16(
+          mmio + physical - 0x0c000000,
+          value & 0x03ff,
+          false
+        );
+        return 1;
+      }
+      if (
+        (physical === 0x0c005022 || physical === 0x0c005026)
+        && size === 2
+      ) {
+        view.setUint16(
+          mmio + physical - 0x0c000000,
+          value & 0xffe0,
+          false
+        );
         return 1;
       }
       if (physical === 0x0c005028 && size === 4) {
