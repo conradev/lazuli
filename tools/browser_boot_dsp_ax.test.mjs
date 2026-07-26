@@ -60,6 +60,7 @@ const dspFunctionNames = [
   "dspAxCommandArity",
   "dspAxAddress",
   "dspAxParseFailure",
+  "dspAxMramRange",
   "emptyDspAxVoicePlan",
   "markDspAxVoiceFallback",
   "inspectDspAxZeroSetup",
@@ -70,6 +71,7 @@ const dspFunctionNames = [
   "parseDspAxCommandLists",
   "applyDspAxSilentWrites",
   "dspAxVoiceByteArray",
+  "dspAxVoiceExactByteArray",
   "dspAxVoiceReason",
   "dspAxVoiceOutputHash",
   "dspAxVoiceNonZeroSamples",
@@ -101,6 +103,7 @@ function dspContext() {
     cycles: 10_000,
     deviceEvents: new Map(),
     dspAudioDmaRemainingBlocks: 0,
+    dspAxCompressorPosition: 7,
     dspCpuMailbox: 0,
     dspCurrentMail: null,
     dspFirstUnsupported: null,
@@ -316,8 +319,15 @@ test("AX validates a full silent list before bounded writeback and delayed yield
   assert.equal(context.deviceEvents.get("dspAxYieldConsumed"), 1);
 });
 
-test("physical, cached, and uncached AX list/output aliases share exact RAM", () => {
-  for (const alias of [0x00000000, 0x80000000, 0xc0000000]) {
+test("all four AX list/output aliases share exact physical RAM", () => {
+  for (
+    const alias of [
+      0x00000000,
+      0x40000000,
+      0x80000000,
+      0xc0000000,
+    ]
+  ) {
     const context = dspContext();
     const listAddress = (alias + 0x0100) >>> 0;
     const surroundAddress = (alias + 0x3000) >>> 0;
@@ -331,7 +341,9 @@ test("physical, cached, and uncached AX list/output aliases share exact RAM", ()
       0x000f,
     ];
 
-    sendAxList(context, listAddress, words);
+    writeWords(context, 0x0100, words);
+    context.handleDspCpuMail((0xbabe0000 | words.length) >>> 0);
+    context.handleDspCpuMail(listAddress);
     assert.equal(context.dspAxCommandState.rejected, false);
     assertClearedGuardedRange(context, 0x3000, 640);
     assertClearedGuardedRange(context, 0x4000, 640);
@@ -531,6 +543,7 @@ test("AX task cadence distinguishes continue, resume, reset, and deferred switch
   assert.equal(continued.dspAxCommandState.phase, "waiting-size");
   assert.equal(continued.dspAxCommandState.lastTaskMail, 0xdead0003);
   assert.equal(continued.dspCurrentMail, null);
+  assert.equal(continued.dspAxCompressorPosition, 7);
   assert.equal(continued.deviceEvents.get("dspAxTaskContinue"), 1);
   assert.equal(
     continued.dspTrace.find(entry => entry.event === "ax-task-continue")
@@ -545,6 +558,7 @@ test("AX task cadence distinguishes continue, resume, reset, and deferred switch
   resumed.handleDspCpuMail(0x00000000);
   assert.equal(resumed.dspAxCommandState.phase, "waiting-size");
   assert.equal(resumed.dspCurrentMail, 0xdcd10001);
+  assert.equal(resumed.dspAxCompressorPosition, 7);
   assert.equal(resumed.deviceEvents.get("dspAxTaskResume"), 1);
   assert.equal(
     resumed.dspTrace.find(entry => entry.source === "ax-task-resume")?.mail,
@@ -560,6 +574,7 @@ test("AX task cadence distinguishes continue, resume, reset, and deferred switch
   assert.equal(reset.dspUcodeBooted, false);
   assert.equal(reset.dspAxCommandState.phase, "waiting-size");
   assert.equal(reset.dspCurrentMail, 0x8071feed);
+  assert.equal(reset.dspAxCompressorPosition, 0);
 
   const switched = dspContext();
   sendAxList(switched, 0x80000100, simpleEndList());

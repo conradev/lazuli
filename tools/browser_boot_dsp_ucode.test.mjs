@@ -89,6 +89,7 @@ function dspContext(payload = axHashFixture) {
     cycles: 10_000,
     deviceEvents: new Map(),
     dspAxCommandState: null,
+    dspAxCompressorPosition: 7,
     dspCpuMailbox: 0,
     dspCurrentMail: null,
     dspFirstUnsupported: null,
@@ -206,6 +207,7 @@ test("AX upload hashes raw guest IRAM and emits only DSP_INIT", () => {
   assert.equal(context.dspMode, "ax");
   assert.equal(context.dspUcodeBooted, true);
   assert.equal(context.dspUcodeHash, 0x4e8a8b21);
+  assert.equal(context.dspAxCompressorPosition, 0);
   assert.equal(context.dspCurrentMail, 0xdcd10000);
   assert.equal(context.dspMailQueue.length, 0);
   assert.equal(context.deviceEvents.get("dspCpuMail"), 10);
@@ -342,6 +344,7 @@ test("unknown ucode hash fails closed without a startup mail", () => {
 
   assert.equal(context.dspMode, "rom");
   assert.equal(context.dspUcodeBooted, false);
+  assert.equal(context.dspAxCompressorPosition, 0);
   assert.equal(context.dspUcodeHash, 0);
   assert.equal(context.dspCurrentMail, null);
   assert.equal(context.dspMailQueue.length, 0);
@@ -502,6 +505,7 @@ test("DSP reset clears partial classification state before its ROM greeting", ()
   assert.equal(context.dspMode, "rom");
   assert.equal(context.dspUcodeBooted, false);
   assert.equal(context.dspAxCommandState.phase, "waiting-size");
+  assert.equal(context.dspAxCompressorPosition, 0);
   assert.equal(context.dspScheduledMail, null);
   assert.equal(context.dspCurrentMail, 0x8071feed);
   assert.equal(context.dspMailQueue.length, 0);

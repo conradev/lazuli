@@ -59,6 +59,7 @@ const runtimeFunctionNames = [
   "dspAxCommandArity",
   "dspAxAddress",
   "dspAxParseFailure",
+  "dspAxMramRange",
   "emptyDspAxVoicePlan",
   "markDspAxVoiceFallback",
   "inspectDspAxZeroSetup",
@@ -69,6 +70,7 @@ const runtimeFunctionNames = [
   "parseDspAxCommandLists",
   "applyDspAxSilentWrites",
   "dspAxVoiceByteArray",
+  "dspAxVoiceExactByteArray",
   "dspAxVoiceReason",
   "dspAxVoiceOutputHash",
   "dspAxVoiceNonZeroSamples",
@@ -423,6 +425,56 @@ test("runtime accepts the canonical model's bounded empty-PB transaction", () =>
     [[0x6000, 640], [0x7000, 640]],
   );
   assert.equal(context.dspFirstUnsupported, null);
+});
+
+test("PB write data must be a fresh exact model-owned buffer", () => {
+  const setupAddress = 0x1000;
+  const parameterBlockAddress = 0x2000;
+  const surroundAddress = 0x6000;
+  const lrAddress = 0x7000;
+  let context;
+  context = runtimeContext(() => ({
+    ok: true,
+    output: { order: "R,L", bytes: new Uint8Array(640) },
+    parameterBlockWrites: [{
+      logicalAddress: parameterBlockAddress,
+      physicalAddress: parameterBlockAddress,
+      byteLength: 236,
+      data: ramBytes(context, parameterBlockAddress, 236),
+    }],
+  }));
+  writeZeroSetup(context, setupAddress);
+  ramBytes(context, parameterBlockAddress, 236).fill(0x31);
+  ramBytes(context, surroundAddress, 640).fill(0x53);
+  ramBytes(context, lrAddress, 640).fill(0x64);
+
+  assert.equal(executeList(
+    context,
+    0x0100,
+    voiceList({
+      setupAddress,
+      parameterBlockAddress,
+      surroundAddress,
+      lrAddress,
+    }),
+  ), true);
+
+  assert.ok(
+    ramBytes(context, parameterBlockAddress, 236)
+      .every(value => value === 0x31),
+  );
+  assert.ok(
+    ramBytes(context, surroundAddress, 640).every(value => value === 0),
+  );
+  assert.ok(ramBytes(context, lrAddress, 640).every(value => value === 0));
+  assert.equal(
+    context.dspAxCommandState.voiceReason,
+    "invalid-parameter-block-write",
+  );
+  assert.deepEqual(
+    context.invalidations,
+    [[0x6000, 640], [0x7000, 640]],
+  );
 });
 
 test("invalid model writeback falls back before any PB data or reservation commits", () => {
