@@ -40,6 +40,7 @@ const PROGRESS_COUNTERS = [
   "instructions",
   "viFields",
   "hostPresentations",
+  "presentationSerial",
   "rendererPresents",
   "gxCommands",
   "primitives",
@@ -537,7 +538,12 @@ function verifySelectedXfb(report, rendering) {
   return { expected, presentationCount, selected };
 }
 
-function progressProjection(report, selected, presentationCount) {
+function progressProjection(
+  report,
+  selected,
+  presentationCount,
+  presentationSerial,
+) {
   return Object.freeze({
     controllerAppliedSequence: report.controller.appliedSequence,
     cycles: report.cycles,
@@ -546,6 +552,7 @@ function progressProjection(report, selected, presentationCount) {
     gxCommands: report.gxFifo.decoder.commands,
     hostPresentations: presentationCount,
     instructions: report.instructions,
+    presentationSerial,
     primitives: report.gxFifo.decoder.primitives,
     rendererPresents: report.rendering.metrics.webgpu.presentXfbCalls,
     rgbSha256: selected.rgbSha256,
@@ -572,11 +579,17 @@ export function verifyGameCompatibilitySnapshot({ environment, game, report }) {
   verifyDeviceHealth(report);
   verifyGx(report);
   const rendering = verifyWebGpu(report);
-  const { presentationCount, selected } = verifySelectedXfb(report, rendering);
+  const { expected, presentationCount, selected } =
+    verifySelectedXfb(report, rendering);
   return Object.freeze({
     game: game.key,
     image: game.image.sha256,
-    progress: progressProjection(report, selected, presentationCount),
+    progress: progressProjection(
+      report,
+      selected,
+      presentationCount,
+      expected.serial,
+    ),
     schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
     surface,
   });
@@ -592,10 +605,14 @@ export function verifyGameCompatibilityWindow({
   game,
   snapshots,
   sustainedViFields = 120,
+  viewportFrames = 64,
 }) {
   requireGame(game);
   if (!Number.isSafeInteger(sustainedViFields) || sustainedViFields < 120) {
     oracleFailure("$.sustainedViFields", "expected at least 120");
+  }
+  if (!Number.isSafeInteger(viewportFrames) || viewportFrames < 64) {
+    oracleFailure("$.viewportFrames", "expected at least 64");
   }
   if (!Array.isArray(snapshots) || snapshots.length < 2) {
     oracleFailure("$.snapshots", "expected at least two ordered snapshots");
@@ -637,6 +654,20 @@ export function verifyGameCompatibilityWindow({
     oracleFailure(
       "$.snapshots",
       `expected at least ${sustainedViFields} new VI fields, got ${delta.viFields}`,
+    );
+  }
+  if (delta.hostPresentations < viewportFrames) {
+    oracleFailure(
+      "$.snapshots",
+      `expected at least ${viewportFrames} completed host presentations, `
+        + `got ${delta.hostPresentations}`,
+    );
+  }
+  if (delta.presentationSerial < viewportFrames) {
+    oracleFailure(
+      "$.snapshots",
+      `expected the WebGPU presentation serial to advance by at least `
+        + `${viewportFrames}, got ${delta.presentationSerial}`,
     );
   }
   for (const name of [

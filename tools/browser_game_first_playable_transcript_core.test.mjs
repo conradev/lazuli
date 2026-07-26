@@ -71,6 +71,14 @@ test("generic core accepts per-game guest-consumption projectors", async () => {
     assert.equal(transcript.change.kind, "visual");
     assert.notEqual(transcript.change.before, transcript.change.after);
     assert.ok(transcript.window.delta.viFields >= corpus.evidence.sustainedViFields);
+    assert.ok(
+      transcript.window.delta.hostPresentations
+        >= corpus.evidence.viewportFrames,
+    );
+    assert.ok(
+      transcript.window.delta.presentationSerial
+        >= corpus.evidence.viewportFrames,
+    );
     assert.equal(
       transcript.reports.pre.sha256,
       checkpointSha256(reports.preReport),

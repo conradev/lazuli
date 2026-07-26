@@ -519,6 +519,7 @@ export function deriveGameFirstPlayableTranscriptCore({
     game,
     snapshots: [preSnapshot, postSnapshot],
     sustainedViFields: corpus.evidence.sustainedViFields,
+    viewportFrames: corpus.evidence.viewportFrames,
   });
   const publication = projectPublication(postReport, preReport, mask);
   const pre = reportProjection(preReport, "$.preReport", preVerified);

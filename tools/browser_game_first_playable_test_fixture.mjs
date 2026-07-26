@@ -33,7 +33,7 @@ export function makeGameFirstPlayableReport(game, offset) {
   const cycles = 100_000_000 + offset * 1_000_000_000;
   const generation = 3 + offset;
   const pairEpoch = 8 + offset;
-  const serial = 2 + offset;
+  const serial = 2 + offset * 70;
   return {
     status: "running",
     stage: "snapshot",

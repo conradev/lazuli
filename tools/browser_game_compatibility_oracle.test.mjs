@@ -45,7 +45,7 @@ function report(offset = 0, overrides = {}) {
   const height = 448;
   const generation = 3 + offset;
   const pairEpoch = 8 + offset;
-  const serial = 2 + offset;
+  const serial = 2 + offset * 70;
   return {
     status: "running",
     stage: "snapshot",
@@ -224,6 +224,7 @@ test("strict snapshot accepts private local WebGPU evidence", () => {
       gxCommands: 529,
       hostPresentations: 2,
       instructions: 14_000_000,
+      presentationSerial: 2,
       primitives: 2,
       rendererPresents: 11,
       rgbSha256: "2".repeat(64),
@@ -321,7 +322,7 @@ test("bounded incomplete GX command tails remain valid", () => {
   );
 });
 
-test("window requires 120 fields and every gameplay progress dimension", () => {
+test("window requires 120 fields, 64 completed viewport frames, and every gameplay progress dimension", () => {
   const verified = verifyGameCompatibilityWindow({
     game: game(),
     snapshots: [sample(0), sample(1)],
@@ -335,6 +336,7 @@ test("window requires 120 fields and every gameplay progress dimension", () => {
       gxCommands: 1_000,
       hostPresentations: 70,
       instructions: 20_000_000,
+      presentationSerial: 70,
       primitives: 300,
       rendererPresents: 140,
       siPolls: 140,
@@ -354,6 +356,24 @@ test("window rejects stalls, regressions, resets, and static selected XFBs", () 
     [
       value => { value[1].report.deviceEvents.viField = 130; },
       /expected at least 120 new VI fields/,
+    ],
+    [
+      value => {
+        value[1].report.mmioState.viInterruptModel.hostPresentationCount =
+          value[0].report.mmioState.viInterruptModel.hostPresentationCount + 63;
+      },
+      /expected at least 64 completed host presentations/,
+    ],
+    [
+      value => {
+        const serial =
+          value[0].report.mmioState.viInterruptModel.lastHostPresentationSerial
+          + 63;
+        value[1].report.mmioState.viInterruptModel.lastHostPresentationSerial =
+          serial;
+        value[1].report.rendering.selectedXfb.presentationSerial = serial;
+      },
+      /presentation serial to advance by at least 64/,
     ],
     [
       value => { value[1].report.gxFifo.decoder.primitives = 2; },
