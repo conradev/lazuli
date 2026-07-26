@@ -681,15 +681,27 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
   const end = rendererSource.indexOf("\n    fn xfb_present_bind_group", start);
   const present = rendererSource.slice(start, end);
   assert.match(bridge, /capture_surface: bool/);
+  assert.match(bridge, /capture_sustained_surface_history: bool/);
   assert.match(present, /capture_surface: bool/);
-  assert.match(present, /requested_surface_readback_layout\(\s*capture_surface,/);
-  assert.match(present, /let surface_capture = capture_plan\.map/);
+  assert.match(present, /capture_sustained_surface_history: bool/);
+  assert.match(
+    present,
+    /requested_surface_readback_layout\(\s*capture_surface \|\| capture_sustained_surface_history,/,
+  );
+  assert.match(present, /let surface_capture = capture_surface\.then/);
+  const helperStart = rendererSource.indexOf("fn encode_presented_surface_readback");
+  const helperEnd = rendererSource.indexOf(
+    "\nasync fn finish_presented_surface_readback",
+    helperStart,
+  );
+  const helper = rendererSource.slice(helperStart, helperEnd);
+  assert.match(helper, /wgpu::BufferUsages::COPY_DST \| wgpu::BufferUsages::MAP_READ/);
+  assert.match(helper, /encoder\.copy_texture_to_buffer/);
   const allocation = present.indexOf("browser presented surface readback");
-  const copy = present.indexOf("encoder.copy_texture_to_buffer", allocation);
-  const submit = present.indexOf("self.queue.submit", copy);
+  const submit = present.indexOf("self.queue.submit", allocation);
   const browserPresent = present.indexOf("output.present()", submit);
-  assert.ok(allocation > present.indexOf("capture_plan.map"));
-  assert.ok(allocation < copy && copy < submit && submit < browserPresent);
+  assert.ok(allocation > present.indexOf("capture_surface.then"));
+  assert.ok(allocation < submit && submit < browserPresent);
   for (const field of ["last_presented_xfb", "last_presented_surface"]) {
     assert.doesNotMatch(
       bridge,
@@ -700,9 +712,16 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
   const resetStart = rendererSource.indexOf("pub fn reset(&mut self)");
   const resetEnd = rendererSource.indexOf("pub fn reset_diagnostics", resetStart);
   const reset = rendererSource.slice(resetStart, resetEnd);
-  for (const field of ["last_presented_xfb", "last_presented_surface"]) {
+  for (const field of [
+    "last_presented_xfb",
+    "last_presented_surface",
+    "sustained_presented_surface_history",
+  ]) {
+    const resetStatement = field === "sustained_presented_surface_history"
+      ? `self.${field}.reset()`
+      : `self.${field} = None`;
     assert.ok(
-      reset.indexOf(`self.${field} = None`) < reset.indexOf("self.ensure_healthy()?"),
+      reset.indexOf(resetStatement) < reset.indexOf("self.ensure_healthy()?"),
       `reset must clear stale ${field} evidence before its fallible health check`,
     );
   }

@@ -20,6 +20,7 @@ pub(crate) const EFB_WIDTH: u32 = 640;
 pub(crate) const EFB_HEIGHT: u32 = 528;
 pub(crate) const GX_MAX_COPY_DIMENSION: u32 = 1024;
 pub(crate) const WEBGPU_COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
+pub(crate) const SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY: usize = 60;
 pub(crate) const GX_DEPTH16_MAX: u32 = 0x0000_ffff;
 pub(crate) const GX_DEPTH24_MAX: u32 = 0x00ff_ffff;
 pub(crate) const EXACT_REQUIRED_REJECTION_REASON_COUNT: usize = 14;
@@ -2633,6 +2634,141 @@ pub(crate) fn compact_surface_readback_rows(
     Some(rgba)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SustainedSurfaceHistoryError {
+    Unavailable,
+    Interrupted { captured: usize },
+    CapacityExceeded,
+    Incomplete { captured: usize },
+    Failed,
+}
+
+impl fmt::Display for SustainedSurfaceHistoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => {
+                write!(
+                    formatter,
+                    "sustained WebGPU presented-surface history was not requested"
+                )
+            }
+            Self::Interrupted { captured } => write!(
+                formatter,
+                "sustained WebGPU presented-surface history was interrupted after \
+                 {captured} of {SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY} captures"
+            ),
+            Self::CapacityExceeded => write!(
+                formatter,
+                "sustained WebGPU presented-surface history exceeded its exact \
+                 {SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY}-frame capacity"
+            ),
+            Self::Incomplete { captured } => write!(
+                formatter,
+                "sustained WebGPU presented-surface history contains {captured} of \
+                 {SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY} required captures"
+            ),
+            Self::Failed => write!(
+                formatter,
+                "sustained WebGPU presented-surface history is in a failed state"
+            ),
+        }
+    }
+}
+
+pub(crate) enum SustainedPresentedSurfaceHistory<T> {
+    Idle,
+    Recording(Vec<T>),
+    Failed,
+}
+
+impl<T> Default for SustainedPresentedSurfaceHistory<T> {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl<T> SustainedPresentedSurfaceHistory<T> {
+    pub(crate) fn capture_requested(
+        &mut self,
+        requested: bool,
+    ) -> Result<bool, SustainedSurfaceHistoryError> {
+        match self {
+            Self::Idle if !requested => Ok(false),
+            Self::Idle => {
+                *self = Self::Recording(Vec::with_capacity(
+                    SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY,
+                ));
+                Ok(true)
+            }
+            Self::Recording(captures)
+                if requested && captures.len() < SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY =>
+            {
+                Ok(true)
+            }
+            Self::Recording(captures) if requested => {
+                debug_assert_eq!(captures.len(), SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY);
+                *self = Self::Failed;
+                Err(SustainedSurfaceHistoryError::CapacityExceeded)
+            }
+            Self::Recording(captures)
+                if captures.len() == SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY =>
+            {
+                // The worker can service one more completed VI pair after the
+                // final requested capture while waiting for the renderer ack.
+                // Preserve the complete witness until the terminal drain.
+                Ok(false)
+            }
+            Self::Recording(captures) => {
+                let captured = captures.len();
+                *self = Self::Failed;
+                Err(SustainedSurfaceHistoryError::Interrupted { captured })
+            }
+            Self::Failed => Err(SustainedSurfaceHistoryError::Failed),
+        }
+    }
+
+    pub(crate) fn push(&mut self, capture: T) -> Result<(), SustainedSurfaceHistoryError> {
+        match self {
+            Self::Recording(captures)
+                if captures.len() < SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY =>
+            {
+                captures.push(capture);
+                Ok(())
+            }
+            Self::Recording(_) => {
+                *self = Self::Failed;
+                Err(SustainedSurfaceHistoryError::CapacityExceeded)
+            }
+            Self::Idle => Err(SustainedSurfaceHistoryError::Unavailable),
+            Self::Failed => Err(SustainedSurfaceHistoryError::Failed),
+        }
+    }
+
+    pub(crate) fn take_complete(&mut self) -> Result<Vec<T>, SustainedSurfaceHistoryError> {
+        let state = std::mem::replace(self, Self::Failed);
+        match state {
+            Self::Recording(captures)
+                if captures.len() == SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY =>
+            {
+                *self = Self::Idle;
+                Ok(captures)
+            }
+            Self::Recording(captures) => Err(SustainedSurfaceHistoryError::Incomplete {
+                captured: captures.len(),
+            }),
+            Self::Idle => {
+                *self = Self::Idle;
+                Err(SustainedSurfaceHistoryError::Unavailable)
+            }
+            Self::Failed => Err(SustainedSurfaceHistoryError::Failed),
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::Idle;
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn alpha_compare(value: u8, reference: u8, comparison: u8) -> bool {
     match comparison & 7 {
@@ -2676,19 +2812,21 @@ mod tests {
         GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
         GxRasterCenterEvidence, GxSamplerStateError, GxZTextureDecodeError, GxZTextureFormat,
         GxZTextureOperation, RendererFailureState, RendererMetrics, RendererPhaseTiming,
-        SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError, TextureAddressMode,
-        TextureMipmapFilter, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
-        ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode, WEBGPU_RASTER_CENTER_EFB,
-        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
-        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
-        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
-        gx_alpha_test_outcome, gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask,
-        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
-        gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
-        gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
-        gx_fog_reference, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
-        gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
-        legacy_gx_sampler_identity, materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
+        SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY, SelectedTexture, SurfacePixelOrder,
+        SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory,
+        SustainedSurfaceHistoryError, TextureAddressMode, TextureMipmapFilter, ViFieldDescriptor,
+        ViFieldPairOutcome, ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame,
+        ViPresentationMode, WEBGPU_RASTER_CENTER_EFB, XfbCopyMetadata, alpha_compare,
+        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
+        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
+        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_alpha_test_outcome,
+        gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
+        gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_from_units,
+        gx_depth24_to_float, gx_destination_alpha_state, gx_early_depth_plan,
+        gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24, gx_fog_reference, gx_fog_state,
+        gx_raster_center_evidence, gx_sampler_state, gx_xfb_copy_parameters, gx_xfb_output_height,
+        gx_z_texture_reference, gx_z_texture_state, legacy_gx_sampler_identity,
+        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture, select_texture,
         valid_rgba8_mip_chain, valid_rgba8_texture, xfb_copy_matches_selection,
@@ -3925,6 +4063,71 @@ mod tests {
             compact_surface_readback_rows(&mapped[..second], layout, SurfacePixelOrder::Rgba8,),
             None,
         );
+    }
+
+    #[test]
+    fn sustained_surface_history_is_exactly_sixty_ordered_captures() {
+        let mut history = SustainedPresentedSurfaceHistory::default();
+        assert_eq!(history.capture_requested(false), Ok(false));
+
+        for serial in 1..=SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY {
+            assert_eq!(history.capture_requested(true), Ok(true));
+            history.push(serial).unwrap();
+        }
+        assert_eq!(history.capture_requested(false), Ok(false));
+        assert_eq!(
+            history.take_complete().unwrap(),
+            (1..=SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            history.take_complete(),
+            Err(SustainedSurfaceHistoryError::Unavailable),
+        );
+    }
+
+    #[test]
+    fn sustained_surface_history_fails_closed_on_gaps_overflow_and_early_drain() {
+        let mut interrupted = SustainedPresentedSurfaceHistory::default();
+        interrupted.capture_requested(true).unwrap();
+        interrupted.push(1).unwrap();
+        assert_eq!(
+            interrupted.capture_requested(false),
+            Err(SustainedSurfaceHistoryError::Interrupted { captured: 1 }),
+        );
+        assert_eq!(
+            interrupted.capture_requested(true),
+            Err(SustainedSurfaceHistoryError::Failed),
+        );
+        interrupted.reset();
+        assert_eq!(interrupted.capture_requested(false), Ok(false));
+
+        let mut overflow = SustainedPresentedSurfaceHistory::default();
+        for serial in 1..=SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY {
+            overflow.capture_requested(true).unwrap();
+            overflow.push(serial).unwrap();
+        }
+        assert_eq!(
+            overflow.capture_requested(true),
+            Err(SustainedSurfaceHistoryError::CapacityExceeded),
+        );
+        assert_eq!(
+            overflow.take_complete(),
+            Err(SustainedSurfaceHistoryError::Failed),
+        );
+
+        let mut incomplete = SustainedPresentedSurfaceHistory::default();
+        incomplete.capture_requested(true).unwrap();
+        incomplete.push(1).unwrap();
+        assert_eq!(
+            incomplete.take_complete(),
+            Err(SustainedSurfaceHistoryError::Incomplete { captured: 1 }),
+        );
+        assert_eq!(
+            incomplete.take_complete(),
+            Err(SustainedSurfaceHistoryError::Failed),
+        );
+        incomplete.reset();
+        assert_eq!(incomplete.capture_requested(false), Ok(false));
     }
 
     #[test]
