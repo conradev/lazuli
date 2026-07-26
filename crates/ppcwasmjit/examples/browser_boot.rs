@@ -12147,11 +12147,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         address: null,
         listCount: 0,
         wordCount: 0,
+        paddingWords: 0,
         commandCount: 0,
         commandSample: [],
         writeCount: 0,
         clearedBytes: 0,
         voiceMode: "inactive",
+        voiceRendered: false,
+        mainBusOnly: false,
         voiceReason: null,
         voiceCommand: null,
         voiceParameterBlocks: 0,
@@ -12161,12 +12164,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         voiceOutputHash: null,
         mainBusRendered: false,
         mainBusCommands: 0,
+        mainBusUploadLrsCommands: 0,
         mainBusSetLrCommands: 0,
         mainBusSetOppositeLrCommands: 0,
+        mainBusMixAuxBNoWriteCommands: 0,
         mainBusCompressorCommands: 0,
+        mainBusWriteCount: 0,
+        mainBusWriteBytes: 0,
         mainBusCompressorPositionBefore: null,
         mainBusCompressorPositionAfter: null,
         mainBusOutputHash: null,
+        mainBusTransactionHash: null,
         rejected: false,
         reason: null,
         lastTaskMail: null,
@@ -12434,6 +12442,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         outputLrAddress: null,
         mainBusActive: false,
         mainBusCommands: [],
+        commandCodes: [],
         fallbackReason: null,
         fallbackCommand: null,
       };
@@ -12475,6 +12484,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       arguments_,
       sequence
     ) {
+      plan.commandCodes.push(command & 0xffff);
       switch (command) {
         case 0x00: {
           plan.active = true;
@@ -12527,7 +12537,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 0x0e:
           plan.active = true;
           if (
-            plan.processSequence === null
+            !plan.setupZero
+            || (
+              plan.processSequence === null
+              && !plan.mainBusActive
+            )
             || plan.outputSequence !== null
           ) {
             markDspAxVoiceFallback(plan, "unsupported-output-order", command);
@@ -12549,8 +12563,55 @@ const TEMPLATE: &str = r##"<!doctype html>
             lrAddress: plan.outputLrAddress,
           });
           return;
-        case 0x07:
         case 0x11:
+          plan.active = true;
+          plan.mainBusActive = true;
+          if (
+            (
+              dspUcodeHash !== 0x07f88145
+              && dspUcodeHash !== 0xe2136399
+            )
+            || !plan.setupZero
+          ) {
+            markDspAxVoiceFallback(
+              plan,
+              (
+                dspUcodeHash === 0x07f88145
+                || dspUcodeHash === 0xe2136399
+              )
+                ? "unsupported-main-bus-order"
+                : "unsupported-main-buffer-command",
+              command
+            );
+            return;
+          }
+          plan.mainBusCommands.push({
+            code: command,
+            sequence,
+            address: dspAxAddress(arguments_[0], arguments_[1]),
+          });
+          return;
+        case 0x06:
+        case 0x09:
+          plan.active = true;
+          plan.mainBusActive = true;
+          if (dspUcodeHash !== 0xe2136399 || !plan.setupZero) {
+            markDspAxVoiceFallback(
+              plan,
+              dspUcodeHash === 0xe2136399
+                ? "unsupported-main-bus-order"
+                : "unsupported-main-buffer-command",
+              command
+            );
+            return;
+          }
+          plan.mainBusCommands.push({
+            code: command,
+            sequence,
+            address: dspAxAddress(arguments_[0], arguments_[1]),
+          });
+          return;
+        case 0x07:
           plan.active = true;
           plan.mainBusActive = true;
           if (dspUcodeHash !== 0x07f88145 || !plan.setupZero) {
@@ -12599,16 +12660,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 0x0f:
           return;
 
-        // These commands can upload, replace, mix into, or otherwise mutate
-        // main L/R, or have semantics Dolphin itself does not implement
-        // exactly. In particular, AUX commands 0x04, 0x05, and 0x09 add their
-        // CPU effect-return buffers back into main L/R/S.
+        // These commands can replace, mix into, or otherwise mutate main L/R,
+        // or have semantics Dolphin itself does not implement exactly. In
+        // particular, AUX commands 0x04 and 0x05 add their CPU effect-return
+        // buffers back into main L/R/S.
         case 0x01:
         case 0x04:
         case 0x05:
-        case 0x06:
         case 0x08:
-        case 0x09:
         case 0x10:
         case 0x13:
           markDspAxVoiceFallback(
@@ -12626,10 +12685,41 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (!plan.active || plan.fallbackReason !== null) return plan;
       if (!plan.setupZero) {
         markDspAxVoiceFallback(plan, "missing-zero-setup");
-      } else if (!plan.parameterBlockSeen) {
+        return plan;
+      }
+      if (plan.processSequence === null) {
+        if (
+          dspUcodeHash === 0xe2136399
+          && plan.mainBusActive
+          && !plan.parameterBlockSeen
+        ) {
+          const expectedCommands = [0x00, 0x06, 0x11, 0x09, 0x0e, 0x0f];
+          if (
+            plan.commandCodes.length !== expectedCommands.length
+            || plan.commandCodes.some(
+              (command, index) => command !== expectedCommands[index]
+            )
+          ) {
+            markDspAxVoiceFallback(
+              plan,
+              "uncertified-main-bus-only-sequence"
+            );
+            return plan;
+          }
+          if (plan.outputSequence === null) {
+            markDspAxVoiceFallback(plan, "missing-output");
+          }
+          return plan;
+        }
+        if (!plan.parameterBlockSeen) {
+          markDspAxVoiceFallback(plan, "missing-parameter-block-address");
+        } else {
+          markDspAxVoiceFallback(plan, "missing-process");
+        }
+        return plan;
+      }
+      if (!plan.parameterBlockSeen) {
         markDspAxVoiceFallback(plan, "missing-parameter-block-address");
-      } else if (plan.processSequence === null) {
-        markDspAxVoiceFallback(plan, "missing-process");
       } else if (plan.outputSequence === null) {
         markDspAxVoiceFallback(plan, "missing-output");
       } else if (
@@ -12756,6 +12846,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       let sizeWords = initialSizeWords;
       let listCount = 0;
       let wordCount = 0;
+      let paddingWords = 0;
       let commandCount = 0;
 
       while (true) {
@@ -12868,12 +12959,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (!writeResult.ok) return writeResult;
 
           if (command === 0x0f) {
+            paddingWords += sizeWords - index;
             return {
               ok: true,
               address: initialAddress >>> 0,
               sizeWords: initialSizeWords,
               listCount,
               wordCount,
+              paddingWords,
               commandCount,
               commandSample,
               writes,
@@ -12882,6 +12975,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             };
           }
           if (command === 0x0d) {
+            paddingWords += sizeWords - index;
             address = dspAxAddress(arguments_[0], arguments_[1]);
             sizeWords = arguments_[2];
             chained = true;
@@ -12936,10 +13030,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       return value.slice(0, 96);
     }
 
-    function dspAxVoiceOutputHash(data) {
+    function dspAxVoiceOutputHash(...parts) {
       let hash = 0x811c9dc5;
-      for (const value of data) {
-        hash = Math.imul(hash ^ value, 0x01000193) >>> 0;
+      for (const data of parts) {
+        for (const value of data) {
+          hash = Math.imul(hash ^ value, 0x01000193) >>> 0;
+        }
       }
       return "0x" + hash.toString(16).padStart(8, "0");
     }
@@ -12962,6 +13058,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     function dspAxVoiceFallback(plan, reason, command = null) {
       return {
         rendered: false,
+        voiceRendered: false,
+        mainBusOnly:
+          dspUcodeHash === 0xe2136399
+          && plan.mainBusActive
+          && plan.processSequence === null,
         mode: plan.active ? "silent-fallback" : "inactive",
         reason: plan.active ? dspAxVoiceReason(reason, "unsupported-voice") : null,
         command:
@@ -12976,12 +13077,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         outputHash: null,
         mainBusRendered: false,
         mainBusCommands: 0,
+        mainBusUploadLrsCommands: 0,
         mainBusSetLrCommands: 0,
         mainBusSetOppositeLrCommands: 0,
+        mainBusMixAuxBNoWriteCommands: 0,
         mainBusCompressorCommands: 0,
+        mainBusWriteCount: 0,
+        mainBusWriteBytes: 0,
         mainBusCompressorPositionBefore: null,
         mainBusCompressorPositionAfter: null,
         mainBusOutputHash: null,
+        mainBusTransactionHash: null,
       };
     }
 
@@ -12997,11 +13103,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       const mram = bytes.subarray(ram, ram + ramSize);
+      const voiceModelRequired = plan.processSequence !== null;
       let model = null;
       let mainBusModel = null;
       let mainBusTelemetry = null;
       let voiceFailureReason = null;
+      let voiceModelCalls = 0;
       const renderVoice = initialMainBus => {
+        voiceModelCalls += 1;
         try {
           model = renderAxVoiceReference({
             mram,
@@ -13078,11 +13187,17 @@ const TEMPLATE: &str = r##"<!doctype html>
           processCommands: plan.mainBusCommands.filter(
             command => command.code === 0x03
           ).length,
+          uploadLrsCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x06
+          ).length,
           setLrCommands: plan.mainBusCommands.filter(
             command => command.code === 0x07
           ).length,
           setOppositeLrCommands: plan.mainBusCommands.filter(
             command => command.code === 0x11
+          ).length,
+          mixAuxBNoWriteCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x09
           ).length,
           compressorCommands: plan.mainBusCommands.filter(
             command => command.code === 0x12
@@ -13098,17 +13213,36 @@ const TEMPLATE: &str = r##"<!doctype html>
             !== dspAxCompressorPosition
           || mainBusTelemetry.compressorPositionAfter
             !== mainBusModel.compressorPosition
+          || (
+            expectedMainBusCounts.compressorCommands === 0
+            && mainBusModel.compressorPosition
+              !== dspAxCompressorPosition
+          )
           || Object.entries(expectedMainBusCounts).some(
             ([name, count]) => mainBusTelemetry[name] !== count
           )
           || !/^0x[0-9a-f]{8}$/.test(
+            mainBusTelemetry.outputHash ?? ""
+          )
+          || !/^0x[0-9a-f]{8}$/.test(
             mainBusTelemetry.transactionHash ?? ""
           )
+          || mainBusTelemetry.uploadWriteBytes
+            !== expectedMainBusCounts.uploadLrsCommands * 5 * 32 * 3 * 4
+          || mainBusTelemetry.outputWriteBytes !== 5 * 32 * (4 + 2 * 2)
+          || mainBusTelemetry.transactionWriteBytes
+            !== (
+              mainBusTelemetry.uploadWriteBytes
+              + mainBusTelemetry.outputWriteBytes
+            )
         ) {
           return dspAxVoiceFallback(plan, "invalid-main-bus-state");
         }
-        if (model === null) {
+        if (voiceModelRequired && model === null) {
           return dspAxVoiceFallback(plan, "main-bus-missing-process");
+        }
+        if (!voiceModelRequired && model !== null) {
+          return dspAxVoiceFallback(plan, "main-bus-unexpected-process");
         }
       } else {
         try {
@@ -13120,21 +13254,31 @@ const TEMPLATE: &str = r##"<!doctype html>
           );
         }
       }
-
-      if (model === null || typeof model !== "object") {
-        return dspAxVoiceFallback(plan, "invalid-voice-model-result");
-      }
-      if (Object.prototype.hasOwnProperty.call(model, "updatedMram")) {
-        return dspAxVoiceFallback(plan, "unexpected-mram-clone");
-      }
-      if (!model.ok) {
+      if (voiceModelCalls !== (voiceModelRequired ? 1 : 0)) {
         return dspAxVoiceFallback(
           plan,
-          dspAxVoiceReason(
-            model.error?.reason,
-            "voice-model-rejected"
-          )
+          plan.mainBusActive
+            ? "invalid-main-bus-process-count"
+            : "invalid-voice-process-count"
         );
+      }
+
+      if (voiceModelRequired) {
+        if (model === null || typeof model !== "object") {
+          return dspAxVoiceFallback(plan, "invalid-voice-model-result");
+        }
+        if (Object.prototype.hasOwnProperty.call(model, "updatedMram")) {
+          return dspAxVoiceFallback(plan, "unexpected-mram-clone");
+        }
+        if (!model.ok) {
+          return dspAxVoiceFallback(
+            plan,
+            dspAxVoiceReason(
+              model.error?.reason,
+              "voice-model-rejected"
+            )
+          );
+        }
       }
 
       const output = plan.mainBusActive
@@ -13157,9 +13301,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         return dspAxVoiceFallback(plan, "invalid-voice-output");
       }
       transactionDataBuffers.add(output.bytes.buffer);
+      const parameterBlockWrites = voiceModelRequired
+        ? model.parameterBlockWrites
+        : [];
       if (
-        !Array.isArray(model.parameterBlockWrites)
-        || model.parameterBlockWrites.length > 64
+        !Array.isArray(parameterBlockWrites)
+        || parameterBlockWrites.length > 64
       ) {
         return dspAxVoiceFallback(plan, "invalid-parameter-block-writes");
       }
@@ -13170,10 +13317,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       let parameterBlockBytes = 0;
       for (
         let index = 0;
-        index < model.parameterBlockWrites.length;
+        index < parameterBlockWrites.length;
         index += 1
       ) {
-        const write = model.parameterBlockWrites[index];
+        const write = parameterBlockWrites[index];
         if (
           write === null
           || typeof write !== "object"
@@ -13229,9 +13376,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       let outputLrWrites = 0;
       let outputSurroundWrites = 0;
       if (plan.mainBusActive) {
+        const uploadCommands = plan.mainBusCommands
+          .map((command, commandIndex) => ({ command, commandIndex }))
+          .filter(entry => entry.command.code === 0x06);
         if (
           !Array.isArray(mainBusModel.writes)
-          || mainBusModel.writes.length !== 2
+          || mainBusModel.writes.length !== uploadCommands.length + 2
+          || !Array.isArray(mainBusModel.uploads)
+          || mainBusModel.uploads.length !== uploadCommands.length
           || !dspAxVoiceExactByteArray(
             mainBusModel.output?.surround?.bytes,
             5 * 32 * 4,
@@ -13243,36 +13395,97 @@ const TEMPLATE: &str = r##"<!doctype html>
         transactionDataBuffers.add(
           mainBusModel.output.surround.bytes.buffer
         );
+        if (
+          mainBusTelemetry.outputHash
+            !== dspAxVoiceOutputHash(
+              mainBusModel.output.surround.bytes,
+              output.bytes
+            )
+        ) {
+          return dspAxVoiceFallback(plan, "invalid-main-bus-output-hash");
+        }
+        const outputCommandIndex = plan.mainBusCommands.findIndex(
+          command => command.code === 0x0e
+        );
+        if (outputCommandIndex < 0) {
+          return dspAxVoiceFallback(plan, "invalid-main-bus-output");
+        }
         const expectedWrites = [
+          ...uploadCommands.map((entry, uploadIndex) => {
+            const upload = mainBusModel.uploads[uploadIndex];
+            if (
+              upload === null
+              || typeof upload !== "object"
+              || !dspAxVoiceExactByteArray(
+                upload.data,
+                5 * 32 * 3 * 4,
+                transactionDataBuffers
+              )
+              || (
+                !voiceModelRequired
+                && upload.data.some(value => value !== 0)
+              )
+            ) {
+              return null;
+            }
+            transactionDataBuffers.add(upload.data.buffer);
+            return {
+              command: 0x06,
+              commandIndex: entry.commandIndex,
+              kind: "main-lrs-s32-be",
+              role: "main-upload-lrs",
+              sequence: entry.command.sequence,
+              address: entry.command.address,
+              size: 5 * 32 * 3 * 4,
+              data: upload.data,
+              upload,
+            };
+          }),
           {
+            command: 0x0e,
+            commandIndex: outputCommandIndex,
             kind: "surround-s32-be",
             role: "output-surround",
+            sequence: plan.outputSequence,
             address: plan.outputSurroundAddress,
             size: 5 * 32 * 4,
+            data: mainBusModel.output.surround.bytes,
+            upload: null,
           },
           {
+            command: 0x0e,
+            commandIndex: outputCommandIndex,
             kind: "main-rl-s16-be",
             role: "output-lr",
+            sequence: plan.outputSequence,
             address: plan.outputLrAddress,
             size: 5 * 32 * 2 * 2,
+            data: output.bytes,
+            upload: null,
           },
         ];
         for (let index = 0; index < expectedWrites.length; index += 1) {
           const expected = expectedWrites[index];
           const write = mainBusModel.writes[index];
-          const expectedData = index === 0
-            ? mainBusModel.output.surround.bytes
-            : output.bytes;
+          if (expected === null) {
+            return dspAxVoiceFallback(plan, "invalid-main-bus-upload");
+          }
           const range = dspAxMramRange(expected.address, expected.size);
           if (
             write === null
             || typeof write !== "object"
             || range === null
+            || write.sequence !== index
+            || write.commandIndex !== expected.commandIndex
             || write.kind !== expected.kind
             || write.logicalAddress !== expected.address
             || write.physicalAddress !== range.physical
             || write.byteLength !== expected.size
-            || write.data !== expectedData
+            || write.data !== expected.data
+            || (
+              expected.upload !== null
+              && write !== expected.upload
+            )
           ) {
             return dspAxVoiceFallback(
               plan,
@@ -13284,9 +13497,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             outputSurroundWrites += 1;
           }
           operations.push({
-            command: 0x0e,
+            command: expected.command,
             role: expected.role,
-            sequence: plan.outputSequence,
+            sequence: expected.sequence,
             ordinal: index,
             address: expected.address,
             physical: range.physical,
@@ -13294,6 +13507,17 @@ const TEMPLATE: &str = r##"<!doctype html>
             size: expected.size,
             data: write.data,
           });
+        }
+        if (
+          mainBusTelemetry.transactionHash
+            !== dspAxVoiceOutputHash(
+              ...mainBusModel.writes.map(write => write.data)
+            )
+        ) {
+          return dspAxVoiceFallback(
+            plan,
+            "invalid-main-bus-transaction-hash"
+          );
         }
       } else {
         for (let index = 0; index < parsed.writes.length; index += 1) {
@@ -13319,13 +13543,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       operations.sort((left, right) =>
         left.sequence - right.sequence || left.ordinal - right.ordinal
       );
-      for (let left = 0; left < operations.length; left += 1) {
-        for (let right = left + 1; right < operations.length; right += 1) {
-          if (dspAxVoiceRangesOverlap(operations[left], operations[right])) {
-            return dspAxVoiceFallback(plan, "overlapping-voice-writes");
-          }
-        }
-      }
 
       if (plan.mainBusActive) {
         const selections =
@@ -13350,6 +13567,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (command.code === 0x07 || command.code === 0x11) {
             range = dspAxMramRange(command.address, 5 * 32 * 4);
             role = "main-bus-input";
+          } else if (command.code === 0x09) {
+            range = dspAxMramRange(command.address, 5 * 32 * 3 * 4);
+            role = "aux-b-return";
           } else if (command.code === 0x12) {
             const selection = selections[compressorIndex];
             compressorIndex += 1;
@@ -13394,6 +13614,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           for (const read of reads) {
             if (
               operation.sequence < read.sequence
+              && operation.role !== "main-upload-lrs"
               && dspAxVoiceRangesOverlap(operation, read)
             ) {
               return dspAxVoiceFallback(
@@ -13418,24 +13639,44 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       return {
         rendered: true,
-        mode: "rendered",
+        voiceRendered: voiceModelRequired,
+        mainBusOnly: plan.mainBusActive && !voiceModelRequired,
+        mode: voiceModelRequired ? "rendered" : "main-bus-only",
         reason: null,
         command: null,
         operations,
-        parameterBlocks: model.parameterBlockWrites.length,
+        parameterBlocks: parameterBlockWrites.length,
         parameterBlockBytes,
-        outputBytes:
-          output.bytes.length
-          + (plan.mainBusActive ? 5 * 32 * 4 : 0),
-        nonZeroSampleValues: dspAxVoiceNonZeroSamples(output.bytes),
-        outputHash: dspAxVoiceOutputHash(output.bytes),
+        outputBytes: voiceModelRequired
+          ? (
+              plan.mainBusActive
+                ? mainBusTelemetry.outputWriteBytes
+                : output.bytes.length
+            )
+          : 0,
+        nonZeroSampleValues: voiceModelRequired
+          ? dspAxVoiceNonZeroSamples(output.bytes)
+          : 0,
+        outputHash: voiceModelRequired
+          ? dspAxVoiceOutputHash(output.bytes)
+          : null,
         mainBusRendered: plan.mainBusActive,
         mainBusCommands: mainBusTelemetry?.commands ?? 0,
+        mainBusUploadLrsCommands:
+          mainBusTelemetry?.uploadLrsCommands ?? 0,
         mainBusSetLrCommands: mainBusTelemetry?.setLrCommands ?? 0,
         mainBusSetOppositeLrCommands:
           mainBusTelemetry?.setOppositeLrCommands ?? 0,
+        mainBusMixAuxBNoWriteCommands:
+          mainBusTelemetry?.mixAuxBNoWriteCommands ?? 0,
         mainBusCompressorCommands:
           mainBusTelemetry?.compressorCommands ?? 0,
+        mainBusWriteCount:
+          plan.mainBusActive ? mainBusModel.writes.length : 0,
+        mainBusWriteBytes:
+          plan.mainBusActive
+            ? mainBusTelemetry.transactionWriteBytes
+            : 0,
         mainBusCompressorPositionBefore:
           plan.mainBusActive
             ? mainBusTelemetry?.compressorPositionBefore ?? null
@@ -13445,6 +13686,10 @@ const TEMPLATE: &str = r##"<!doctype html>
             ? mainBusModel.compressorPosition
             : null,
         mainBusOutputHash:
+          plan.mainBusActive
+            ? mainBusTelemetry?.outputHash ?? null
+            : null,
+        mainBusTransactionHash:
           plan.mainBusActive
             ? mainBusTelemetry?.transactionHash ?? null
             : null,
@@ -13474,13 +13719,18 @@ const TEMPLATE: &str = r##"<!doctype html>
           dataBytes += operation.size;
           dataWriteCount += 1;
         }
-        traceDsp("ax-voice-write", {
-          command: operation.command,
-          role: operation.role,
-          address: hex32(operation.address),
-          size: operation.size,
-          data: operation.data !== null,
-        });
+        traceDsp(
+          transaction.mainBusOnly
+            ? "ax-main-bus-write"
+            : "ax-voice-write",
+          {
+            command: operation.command,
+            role: operation.role,
+            address: hex32(operation.address),
+            size: operation.size,
+            data: operation.data !== null,
+          }
+        );
       }
       if (transaction.mainBusRendered) {
         dspAxCompressorPosition =
@@ -13529,20 +13779,22 @@ const TEMPLATE: &str = r##"<!doctype html>
         writeCount = voiceTransaction.operations.length;
         clearedBytes = applied.clearedBytes;
         silentWriteCount = applied.zeroWriteCount;
-        deviceEvents.set(
-          "dspAxVoiceRender",
-          (deviceEvents.get("dspAxVoiceRender") ?? 0) + 1
-        );
-        deviceEvents.set(
-          "dspAxVoiceParameterBlockWrite",
-          (deviceEvents.get("dspAxVoiceParameterBlockWrite") ?? 0)
-            + voiceTransaction.parameterBlocks
-        );
-        deviceEvents.set(
-          "dspAxVoiceDataBytes",
-          (deviceEvents.get("dspAxVoiceDataBytes") ?? 0)
-            + applied.dataBytes
-        );
+        if (voiceTransaction.voiceRendered) {
+          deviceEvents.set(
+            "dspAxVoiceRender",
+            (deviceEvents.get("dspAxVoiceRender") ?? 0) + 1
+          );
+          deviceEvents.set(
+            "dspAxVoiceParameterBlockWrite",
+            (deviceEvents.get("dspAxVoiceParameterBlockWrite") ?? 0)
+              + voiceTransaction.parameterBlocks
+          );
+          deviceEvents.set(
+            "dspAxVoiceDataBytes",
+            (deviceEvents.get("dspAxVoiceDataBytes") ?? 0)
+              + applied.dataBytes
+          );
+        }
         if (voiceTransaction.mainBusRendered) {
           deviceEvents.set(
             "dspAxMainBusRender",
@@ -13550,12 +13802,13 @@ const TEMPLATE: &str = r##"<!doctype html>
           );
           deviceEvents.set(
             "dspAxMainBusWrite",
-            (deviceEvents.get("dspAxMainBusWrite") ?? 0) + 2
+            (deviceEvents.get("dspAxMainBusWrite") ?? 0)
+              + voiceTransaction.mainBusWriteCount
           );
           deviceEvents.set(
             "dspAxMainBusBytes",
             (deviceEvents.get("dspAxMainBusBytes") ?? 0)
-              + 5 * 32 * (4 + 2 * 2)
+              + voiceTransaction.mainBusWriteBytes
           );
         }
       } else {
@@ -13563,30 +13816,49 @@ const TEMPLATE: &str = r##"<!doctype html>
         writeCount = result.writes.length;
         silentWriteCount = result.writes.length;
         if (voiceTransaction.mode === "silent-fallback") {
+          const fallbackDomain = voiceTransaction.mainBusOnly
+            ? "main-bus"
+            : "voice";
           latchDspFirstUnsupported(
-            "voice",
+            fallbackDomain,
             voiceTransaction.reason,
             voiceTransaction.command
           );
           deviceEvents.set(
-            "dspAxVoiceFallback",
-            (deviceEvents.get("dspAxVoiceFallback") ?? 0) + 1
+            voiceTransaction.mainBusOnly
+              ? "dspAxMainBusFallback"
+              : "dspAxVoiceFallback",
+            (
+              deviceEvents.get(
+                voiceTransaction.mainBusOnly
+                  ? "dspAxMainBusFallback"
+                  : "dspAxVoiceFallback"
+              ) ?? 0
+            ) + 1
           );
-          traceDsp("ax-voice-fallback", {
-            reason: voiceTransaction.reason,
-            command: voiceTransaction.command,
-          });
+          traceDsp(
+            voiceTransaction.mainBusOnly
+              ? "ax-main-bus-fallback"
+              : "ax-voice-fallback",
+            {
+              reason: voiceTransaction.reason,
+              command: voiceTransaction.command,
+            }
+          );
         }
       }
       dspAxCommandState.phase = "yield-pending";
       dspAxCommandState.address = result.address;
       dspAxCommandState.listCount = result.listCount;
       dspAxCommandState.wordCount = result.wordCount;
+      dspAxCommandState.paddingWords = result.paddingWords;
       dspAxCommandState.commandCount = result.commandCount;
       dspAxCommandState.commandSample = result.commandSample;
       dspAxCommandState.writeCount = writeCount;
       dspAxCommandState.clearedBytes = clearedBytes;
       dspAxCommandState.voiceMode = voiceTransaction.mode;
+      dspAxCommandState.voiceRendered = voiceTransaction.voiceRendered;
+      dspAxCommandState.mainBusOnly = voiceTransaction.mainBusOnly;
       dspAxCommandState.voiceReason = voiceTransaction.reason;
       dspAxCommandState.voiceCommand = voiceTransaction.command;
       dspAxCommandState.voiceParameterBlocks =
@@ -13601,18 +13873,28 @@ const TEMPLATE: &str = r##"<!doctype html>
         voiceTransaction.mainBusRendered;
       dspAxCommandState.mainBusCommands =
         voiceTransaction.mainBusCommands;
+      dspAxCommandState.mainBusUploadLrsCommands =
+        voiceTransaction.mainBusUploadLrsCommands;
       dspAxCommandState.mainBusSetLrCommands =
         voiceTransaction.mainBusSetLrCommands;
       dspAxCommandState.mainBusSetOppositeLrCommands =
         voiceTransaction.mainBusSetOppositeLrCommands;
+      dspAxCommandState.mainBusMixAuxBNoWriteCommands =
+        voiceTransaction.mainBusMixAuxBNoWriteCommands;
       dspAxCommandState.mainBusCompressorCommands =
         voiceTransaction.mainBusCompressorCommands;
+      dspAxCommandState.mainBusWriteCount =
+        voiceTransaction.mainBusWriteCount;
+      dspAxCommandState.mainBusWriteBytes =
+        voiceTransaction.mainBusWriteBytes;
       dspAxCommandState.mainBusCompressorPositionBefore =
         voiceTransaction.mainBusCompressorPositionBefore;
       dspAxCommandState.mainBusCompressorPositionAfter =
         voiceTransaction.mainBusCompressorPositionAfter;
       dspAxCommandState.mainBusOutputHash =
         voiceTransaction.mainBusOutputHash;
+      dspAxCommandState.mainBusTransactionHash =
+        voiceTransaction.mainBusTransactionHash;
       dspAxCommandState.rejected = false;
       dspAxCommandState.reason = null;
       dspScheduledMail = {
@@ -13624,21 +13906,32 @@ const TEMPLATE: &str = r##"<!doctype html>
         sizeWords: result.sizeWords,
         lists: result.listCount,
         words: result.wordCount,
+        paddingWords: result.paddingWords,
         commands: result.commandCount,
         writes: writeCount,
         clearedBytes,
         voiceMode: voiceTransaction.mode,
+        voiceRendered: voiceTransaction.voiceRendered,
+        mainBusOnly: voiceTransaction.mainBusOnly,
         voiceReason: voiceTransaction.reason,
         voiceParameterBlocks: voiceTransaction.parameterBlocks,
         voiceOutputBytes: voiceTransaction.outputBytes,
         voiceOutputHash: voiceTransaction.outputHash,
         mainBusRendered: voiceTransaction.mainBusRendered,
         mainBusCommands: voiceTransaction.mainBusCommands,
+        mainBusUploadLrsCommands:
+          voiceTransaction.mainBusUploadLrsCommands,
+        mainBusMixAuxBNoWriteCommands:
+          voiceTransaction.mainBusMixAuxBNoWriteCommands,
+        mainBusWriteCount: voiceTransaction.mainBusWriteCount,
+        mainBusWriteBytes: voiceTransaction.mainBusWriteBytes,
         mainBusCompressorPositionBefore:
           voiceTransaction.mainBusCompressorPositionBefore,
         mainBusCompressorPositionAfter:
           voiceTransaction.mainBusCompressorPositionAfter,
         mainBusOutputHash: voiceTransaction.mainBusOutputHash,
+        mainBusTransactionHash:
+          voiceTransaction.mainBusTransactionHash,
       });
       deviceEvents.set(
         "dspAxCommandList",
@@ -24383,6 +24676,7 @@ const TEMPLATE: &str = r##"<!doctype html>
                 : hex32(dspAxCommandState.address),
             listCount: dspAxCommandState.listCount,
             wordCount: dspAxCommandState.wordCount,
+            paddingWords: dspAxCommandState.paddingWords,
             commandCount: dspAxCommandState.commandCount,
             commandSample: dspAxCommandState.commandSample.map(
               command =>
@@ -24391,6 +24685,8 @@ const TEMPLATE: &str = r##"<!doctype html>
             writeCount: dspAxCommandState.writeCount,
             clearedBytes: dspAxCommandState.clearedBytes,
             voiceMode: dspAxCommandState.voiceMode,
+            voiceRendered: dspAxCommandState.voiceRendered,
+            mainBusOnly: dspAxCommandState.mainBusOnly,
             voiceReason: dspAxCommandState.voiceReason,
             voiceCommand: dspAxCommandState.voiceCommand,
             voiceParameterBlocks: dspAxCommandState.voiceParameterBlocks,
@@ -24402,17 +24698,25 @@ const TEMPLATE: &str = r##"<!doctype html>
             voiceOutputHash: dspAxCommandState.voiceOutputHash,
             mainBusRendered: dspAxCommandState.mainBusRendered,
             mainBusCommands: dspAxCommandState.mainBusCommands,
+            mainBusUploadLrsCommands:
+              dspAxCommandState.mainBusUploadLrsCommands,
             mainBusSetLrCommands:
               dspAxCommandState.mainBusSetLrCommands,
             mainBusSetOppositeLrCommands:
               dspAxCommandState.mainBusSetOppositeLrCommands,
+            mainBusMixAuxBNoWriteCommands:
+              dspAxCommandState.mainBusMixAuxBNoWriteCommands,
             mainBusCompressorCommands:
               dspAxCommandState.mainBusCompressorCommands,
+            mainBusWriteCount: dspAxCommandState.mainBusWriteCount,
+            mainBusWriteBytes: dspAxCommandState.mainBusWriteBytes,
             mainBusCompressorPositionBefore:
               dspAxCommandState.mainBusCompressorPositionBefore,
             mainBusCompressorPositionAfter:
               dspAxCommandState.mainBusCompressorPositionAfter,
             mainBusOutputHash: dspAxCommandState.mainBusOutputHash,
+            mainBusTransactionHash:
+              dspAxCommandState.mainBusTransactionHash,
             rejected: dspAxCommandState.rejected,
             reason: dspAxCommandState.reason,
             lastTaskMail:
