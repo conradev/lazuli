@@ -10,6 +10,52 @@ import {
   verifyGameCompatibilityWindow,
 } from "./browser_game_compatibility_oracle.mjs";
 
+const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS = [
+  "invalidVertexLayout",
+  "missingExactClipInput",
+  "positionCountMismatch",
+  "nonFiniteSourceVertex",
+  "cullModeStateMismatch",
+  "unsupportedMultisampling",
+  "unsupportedZFreeze",
+  "nonCanonicalSourceRaster",
+  "unsupportedPostClipW",
+  "unsupportedPostClipPosition",
+  "unsupportedPostClipDepth",
+  "clipInvalidComponentCount",
+  "unsupportedTopology5",
+  "unsupportedTopology6",
+  "unsupportedTopology7",
+  "unsupportedTopologyOther",
+  "clipNoSourceTriangles",
+  "clipInvalidCullMode",
+  "clipInvalidViewportHeight",
+  "clipNonFiniteVertex",
+  "clipArithmeticOverflow",
+  "projectionInvalidComponentCount",
+  "projectionInvalidBpState",
+  "projectionInvalidClipDisable",
+  "unsupportedClipDisable1",
+  "unsupportedClipDisable2",
+  "unsupportedClipDisable3",
+  "unsupportedClipDisable4",
+  "unsupportedClipDisable5",
+  "unsupportedClipDisable6",
+  "unsupportedClipDisable7",
+  "unsupportedClipDisableOther",
+  "projectionInvalidViewport",
+  "projectionInvalidScissor",
+  "projectionNoVisibleScissor",
+  "projectionWrappedScissor",
+  "projectionNonFiniteVertex",
+  "projectionZeroClipW",
+  "projectionArithmeticOverflow",
+  "invalidPreparedScissor",
+];
+
+const zeroCountMap = keys =>
+  Object.fromEntries(keys.map(key => [key, 0]));
+
 function game() {
   return {
     key: "example-game",
@@ -169,6 +215,9 @@ function report(offset = 0, overrides = {}) {
             managedPayload: 0,
             unclassified: 0,
           },
+          exactRequiredPreparationRejectionReasons: zeroCountMap(
+            EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS,
+          ),
         },
       },
       selectedXfb: {
@@ -282,7 +331,14 @@ test("snapshot fails closed on renderer, device, queue, GX, and XFB faults", () 
     [value => { value.report.execution.scheduler.rendererSync.failed = 1; }, /expected zero/],
     [value => { value.report.execution.scheduler.rendererSync.acknowledged -= 1; }, /acknowledged/],
     [value => { value.report.rendering.metrics.operations.pending = 1; }, /expected zero/],
-    [value => { value.report.rendering.metrics.webgpu.exactRequiredRejectedDraws = 1; }, /expected zero/],
+    [
+      value => {
+        value.report.rendering.metrics.webgpu.exactRequiredRejectedDraws = 1;
+        value.report.rendering.metrics.webgpu
+          .exactRequiredRejectionReasons.unclassified = 1;
+      },
+      /expected zero/,
+    ],
     [value => { value.report.deviceEvents.diskDeviceError = 1; }, /diskDeviceError/],
     [value => { value.report.deviceEvents.dspUcodeBootRejected = 1; }, /dspUcodeBootRejected/],
     [value => { value.report.exceptions.counts["0x0300"] = 1; }, /0x0300/],
@@ -303,6 +359,131 @@ test("snapshot fails closed on renderer, device, queue, GX, and XFB faults", () 
       pattern,
     );
   }
+});
+
+test("projection-null vertices recovered by exact capture remain compatible", () => {
+  const value = sample();
+  value.report.gxFifo.decoder.legacyProjectionNullVertices = 37;
+  assert.equal(
+    verifyGameCompatibilitySnapshot({ ...value, game: game() }).game,
+    "example-game",
+  );
+});
+
+test("projection-null telemetry remains typed and exact capture misses still fail", () => {
+  const invalidLegacyCount = sample();
+  invalidLegacyCount.report.gxFifo.decoder.legacyProjectionNullVertices = 0.5;
+  assert.throws(
+    () => verifyGameCompatibilitySnapshot({
+      ...invalidLegacyCount,
+      game: game(),
+    }),
+    /legacyProjectionNullVertices.*non-negative safe integer/,
+  );
+
+  const captureMiss = sample();
+  captureMiss.report.gxFifo.decoder.exactRequiredCaptureMisses = 1;
+  assert.throws(
+    () => verifyGameCompatibilitySnapshot({ ...captureMiss, game: game() }),
+    /exactRequiredCaptureMisses.*expected zero/,
+  );
+});
+
+test("exact rejection telemetry requires the complete parent and preparation taxonomies", () => {
+  const cases = [
+    [
+      value => {
+        delete value.report.rendering.metrics.webgpu
+          .exactRequiredRejectionReasons.unclassified;
+      },
+      /exactRequiredRejectionReasons\.\[keys\]/,
+    ],
+    [
+      value => {
+        value.report.rendering.metrics.webgpu
+          .exactRequiredRejectionReasons.futureReason = 0;
+      },
+      /exactRequiredRejectionReasons\.\[keys\]/,
+    ],
+    [
+      value => {
+        delete value.report.rendering.metrics.webgpu
+          .exactRequiredPreparationRejectionReasons.invalidPreparedScissor;
+      },
+      /exactRequiredPreparationRejectionReasons\.\[keys\]/,
+    ],
+    [
+      value => {
+        value.report.rendering.metrics.webgpu
+          .exactRequiredPreparationRejectionReasons.futureReason = 0;
+      },
+      /exactRequiredPreparationRejectionReasons\.\[keys\]/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const invalid = sample();
+    mutate(invalid);
+    assert.throws(
+      () => verifyGameCompatibilitySnapshot({ ...invalid, game: game() }),
+      pattern,
+    );
+  }
+});
+
+test("exact rejection telemetry rejects invalid counts and inconsistent sums", () => {
+  const cases = [
+    [
+      value => {
+        value.report.rendering.metrics.webgpu
+          .exactRequiredRejectionReasons.scissor = -1;
+      },
+      /exactRequiredRejectionReasons\.scissor.*non-negative safe integer/,
+    ],
+    [
+      value => {
+        value.report.rendering.metrics.webgpu
+          .exactRequiredPreparationRejectionReasons
+          .unsupportedClipDisable7 = 0.5;
+      },
+      /exactRequiredPreparationRejectionReasons\.unsupportedClipDisable7.*non-negative safe integer/,
+    ],
+    [
+      value => {
+        value.report.rendering.metrics.webgpu
+          .exactRequiredRejectionReasons.unclassified = 1;
+      },
+      /exactRequiredRejectionReasons\.\[sum\]/,
+    ],
+    [
+      value => {
+        const webgpu = value.report.rendering.metrics.webgpu;
+        webgpu.exactRequiredRejectedDraws = 1;
+        webgpu.exactRequiredRejectionReasons.exactPreparation = 1;
+      },
+      /exactRequiredPreparationRejectionReasons\.\[sum\]/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const invalid = sample();
+    mutate(invalid);
+    assert.throws(
+      () => verifyGameCompatibilitySnapshot({ ...invalid, game: game() }),
+      pattern,
+    );
+  }
+});
+
+test("internally consistent exact required rejections still fail compatibility", () => {
+  const invalid = sample();
+  const webgpu = invalid.report.rendering.metrics.webgpu;
+  webgpu.exactRequiredRejectedDraws = 1;
+  webgpu.exactRequiredRejectionReasons.exactPreparation = 1;
+  webgpu.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable7 = 1;
+  assert.throws(
+    () => verifyGameCompatibilitySnapshot({ ...invalid, game: game() }),
+    /exactRequiredRejectedDraws.*expected zero/,
+  );
 });
 
 test("bounded incomplete GX command tails remain valid", () => {

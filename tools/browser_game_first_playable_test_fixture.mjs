@@ -27,6 +27,51 @@ function exactRequiredRejectionReasons() {
   };
 }
 
+function exactRequiredPreparationRejectionReasons() {
+  return {
+    invalidVertexLayout: 0,
+    missingExactClipInput: 0,
+    positionCountMismatch: 0,
+    nonFiniteSourceVertex: 0,
+    cullModeStateMismatch: 0,
+    unsupportedMultisampling: 0,
+    unsupportedZFreeze: 0,
+    nonCanonicalSourceRaster: 0,
+    unsupportedPostClipW: 0,
+    unsupportedPostClipPosition: 0,
+    unsupportedPostClipDepth: 0,
+    clipInvalidComponentCount: 0,
+    unsupportedTopology5: 0,
+    unsupportedTopology6: 0,
+    unsupportedTopology7: 0,
+    unsupportedTopologyOther: 0,
+    clipNoSourceTriangles: 0,
+    clipInvalidCullMode: 0,
+    clipInvalidViewportHeight: 0,
+    clipNonFiniteVertex: 0,
+    clipArithmeticOverflow: 0,
+    projectionInvalidComponentCount: 0,
+    projectionInvalidBpState: 0,
+    projectionInvalidClipDisable: 0,
+    unsupportedClipDisable1: 0,
+    unsupportedClipDisable2: 0,
+    unsupportedClipDisable3: 0,
+    unsupportedClipDisable4: 0,
+    unsupportedClipDisable5: 0,
+    unsupportedClipDisable6: 0,
+    unsupportedClipDisable7: 0,
+    unsupportedClipDisableOther: 0,
+    projectionInvalidViewport: 0,
+    projectionInvalidScissor: 0,
+    projectionNoVisibleScissor: 0,
+    projectionWrappedScissor: 0,
+    projectionNonFiniteVertex: 0,
+    projectionZeroClipW: 0,
+    projectionArithmeticOverflow: 0,
+    invalidPreparedScissor: 0,
+  };
+}
+
 export function makeGameFirstPlayableReport(game, offset) {
   const width = 640;
   const height = 448;
@@ -165,6 +210,8 @@ export function makeGameFirstPlayableReport(game, offset) {
           presentXfbCalls: 11 + offset * 140,
           exactRequiredRejectedDraws: 0,
           exactRequiredRejectionReasons: exactRequiredRejectionReasons(),
+          exactRequiredPreparationRejectionReasons:
+            exactRequiredPreparationRejectionReasons(),
         },
       },
       selectedXfb: {

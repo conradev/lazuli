@@ -24,11 +24,68 @@ const DEVICE_FAILURE_EVENTS = [
   "dspUcodeBootRejected",
   "dspZeldaCommandRejected",
 ];
+const EXACT_REQUIRED_REJECTION_REASON_KEYS = [
+  "exactPreparation",
+  "scissor",
+  "primitive",
+  "earlyDepth",
+  "rasterCenter",
+  "depthEncoding",
+  "tevState",
+  "textureCoordinates",
+  "sampler",
+  "zTexture",
+  "fog",
+  "fullyCulled",
+  "managedPayload",
+  "unclassified",
+];
+const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS = [
+  "invalidVertexLayout",
+  "missingExactClipInput",
+  "positionCountMismatch",
+  "nonFiniteSourceVertex",
+  "cullModeStateMismatch",
+  "unsupportedMultisampling",
+  "unsupportedZFreeze",
+  "nonCanonicalSourceRaster",
+  "unsupportedPostClipW",
+  "unsupportedPostClipPosition",
+  "unsupportedPostClipDepth",
+  "clipInvalidComponentCount",
+  "unsupportedTopology5",
+  "unsupportedTopology6",
+  "unsupportedTopology7",
+  "unsupportedTopologyOther",
+  "clipNoSourceTriangles",
+  "clipInvalidCullMode",
+  "clipInvalidViewportHeight",
+  "clipNonFiniteVertex",
+  "clipArithmeticOverflow",
+  "projectionInvalidComponentCount",
+  "projectionInvalidBpState",
+  "projectionInvalidClipDisable",
+  "unsupportedClipDisable1",
+  "unsupportedClipDisable2",
+  "unsupportedClipDisable3",
+  "unsupportedClipDisable4",
+  "unsupportedClipDisable5",
+  "unsupportedClipDisable6",
+  "unsupportedClipDisable7",
+  "unsupportedClipDisableOther",
+  "projectionInvalidViewport",
+  "projectionInvalidScissor",
+  "projectionNoVisibleScissor",
+  "projectionWrappedScissor",
+  "projectionNonFiniteVertex",
+  "projectionZeroClipW",
+  "projectionArithmeticOverflow",
+  "invalidPreparedScissor",
+];
 const DECODER_FAILURE_COUNTERS = [
   "displayListErrors",
   "droppedVertices",
   "exactRequiredCaptureMisses",
-  "legacyProjectionNullVertices",
   "lightingRejectedVertices",
   "texgenFallbacks",
   "unknownOpcodes",
@@ -83,6 +140,30 @@ function requireNonNegativeInteger(value, path) {
     oracleFailure(path, "expected a non-negative safe integer");
   }
   return value;
+}
+
+function requireExactNonNegativeCountMap(value, expectedKeys, path) {
+  const counts = requiredObject(value, path);
+  const actualKeys = Object.keys(counts).sort();
+  const requiredKeys = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== requiredKeys.length
+    || actualKeys.some((key, index) => key !== requiredKeys[index])
+  ) {
+    oracleFailure(
+      `${path}.[keys]`,
+      `expected exactly ${requiredKeys.join(", ")}`,
+    );
+  }
+  let sum = 0;
+  for (const name of expectedKeys) {
+    const count = requireNonNegativeInteger(counts[name], `${path}.${name}`);
+    sum += count;
+    if (!Number.isSafeInteger(sum)) {
+      oracleFailure(`${path}.[sum]`, "expected a safe integer total");
+    }
+  }
+  return { counts, sum };
 }
 
 function requirePositiveInteger(value, path) {
@@ -303,6 +384,12 @@ function verifyGx(report) {
   for (const name of DECODER_FAILURE_COUNTERS) {
     requireZero(decoder[name], `$.report.gxFifo.decoder.${name}`);
   }
+  if (decoder.legacyProjectionNullVertices !== undefined) {
+    requireNonNegativeInteger(
+      decoder.legacyProjectionNullVertices,
+      "$.report.gxFifo.decoder.legacyProjectionNullVertices",
+    );
+  }
   const maximum = requirePositiveInteger(
     decoder.maximumBufferedBytes,
     "$.report.gxFifo.decoder.maximumBufferedBytes",
@@ -394,18 +481,48 @@ function verifyWebGpu(report) {
       `$.report.rendering.metrics.webgpu.${name}`,
     );
   }
-  requireZero(
+  const exactRequiredRejectedDraws = requireNonNegativeInteger(
     webgpu.exactRequiredRejectedDraws,
     "$.report.rendering.metrics.webgpu.exactRequiredRejectedDraws",
   );
-  const reasons = requiredObject(
-    webgpu.exactRequiredRejectionReasons,
-    "$.report.rendering.metrics.webgpu.exactRequiredRejectionReasons",
+  const rejectionPath =
+    "$.report.rendering.metrics.webgpu.exactRequiredRejectionReasons";
+  const { counts: reasons, sum: rejectionSum } =
+    requireExactNonNegativeCountMap(
+      webgpu.exactRequiredRejectionReasons,
+      EXACT_REQUIRED_REJECTION_REASON_KEYS,
+      rejectionPath,
+    );
+  requireExact(
+    rejectionSum,
+    exactRequiredRejectedDraws,
+    `${rejectionPath}.[sum]`,
   );
-  for (const [name, count] of Object.entries(reasons)) {
+  const preparationPath =
+    "$.report.rendering.metrics.webgpu"
+    + ".exactRequiredPreparationRejectionReasons";
+  const { counts: preparationReasons, sum: preparationSum } =
+    requireExactNonNegativeCountMap(
+      webgpu.exactRequiredPreparationRejectionReasons,
+      EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS,
+      preparationPath,
+    );
+  requireExact(
+    preparationSum,
+    reasons.exactPreparation,
+    `${preparationPath}.[sum]`,
+  );
+  requireZero(
+    exactRequiredRejectedDraws,
+    "$.report.rendering.metrics.webgpu.exactRequiredRejectedDraws",
+  );
+  for (const name of EXACT_REQUIRED_REJECTION_REASON_KEYS) {
+    requireZero(reasons[name], `${rejectionPath}.${name}`);
+  }
+  for (const name of EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS) {
     requireZero(
-      count,
-      `$.report.rendering.metrics.webgpu.exactRequiredRejectionReasons.${name}`,
+      preparationReasons[name],
+      `${preparationPath}.${name}`,
     );
   }
   return rendering;

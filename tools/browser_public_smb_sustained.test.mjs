@@ -7,8 +7,8 @@ import test from "node:test";
 
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V1,
   SMB_SUSTAINED_PLAY_SCHEMA_V3,
+  SMB_SUSTAINED_PLAY_SCHEMA_V4,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   PUBLIC_SMB_SUSTAINED_SCHEMA,
@@ -131,16 +131,16 @@ test("public sustained CLI requires exact commit and release pins", () => {
 
 test("public sustained envelope pins release, loaders, WebGPU, and canonical SMB", () => {
   const evidence = validEnvelope();
-  assert.equal(PUBLIC_SMB_SUSTAINED_SCHEMA, "lazuli-public-smb-sustained-v2");
+  assert.equal(PUBLIC_SMB_SUSTAINED_SCHEMA, "lazuli-public-smb-sustained-v3");
   assert.strictEqual(validatePublicSmbSustainedEnvelope(evidence), evidence);
 });
 
-test("public sustained envelope rejects the superseded v1 schema", () => {
+test("public sustained envelope rejects the superseded v2 schema", () => {
   const evidence = validEnvelope();
-  evidence.schema = "lazuli-public-smb-sustained-v1";
+  evidence.schema = "lazuli-public-smb-sustained-v2";
   assert.throws(
     () => validatePublicSmbSustainedEnvelope(evidence),
-    /\$\.schema: expected lazuli-public-smb-sustained-v2/,
+    /\$\.schema: expected lazuli-public-smb-sustained-v3/,
   );
 });
 
@@ -215,7 +215,7 @@ test("public sustained evidence delegates the terminal report to the strict orac
       source: { kind: "local-file" },
     },
     rendering: { backend: "wgpu-webgpu", error: null },
-    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V3 },
+    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V4 },
   };
   assert.throws(
     () => validatePublicSmbSustainedEvidence(evidence),
@@ -223,7 +223,7 @@ test("public sustained evidence delegates the terminal report to the strict orac
   );
 });
 
-test("public sustained evidence requires paired-field v3 cadence", () => {
+test("public sustained evidence requires per-surface rejection v4 evidence", () => {
   const evidence = validEnvelope();
   evidence.report = {
     disc: {
@@ -232,11 +232,11 @@ test("public sustained evidence requires paired-field v3 cadence", () => {
       source: { kind: "local-file" },
     },
     rendering: { backend: "wgpu-webgpu", error: null },
-    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V1 },
+    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V3 },
   };
   assert.throws(
     () => validatePublicSmbSustainedEvidence(evidence),
-    /report\.sustainedPlay\.schema: expected lazuli-smb-sustained-play-v3/,
+    /report\.sustainedPlay\.schema: expected lazuli-smb-sustained-play-v4/,
   );
 });
 

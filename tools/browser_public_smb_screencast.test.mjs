@@ -18,8 +18,8 @@ import {
 } from "./browser_public_smb_screencast.mjs";
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V1,
   SMB_SUSTAINED_PLAY_SCHEMA_V3,
+  SMB_SUSTAINED_PLAY_SCHEMA_V4,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   smbSustainedPlayReport,
@@ -177,7 +177,7 @@ function beginSustainedWindow(collector, overrides = {}) {
 }
 
 function runningSustainedReport(receipts) {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
   // Running prefix snapshots precede terminal surface-history publication.
   delete report.rendering.sustainedPresentedSurfaces;
   report.status = "running";
@@ -206,7 +206,7 @@ test("terminal wait actively snapshots and retries before the first completed pa
     Object.hasOwn(ready.rendering, "sustainedPresentedSurfaces"),
     false,
   );
-  const terminal = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+  const terminal = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
   terminal.execution.scheduler.renderEvery = 1;
   const runningState = {
     dataset: { renderer: "wgpu-webgpu", status: "running" },
@@ -511,7 +511,7 @@ test("sustained window discards earlier frames and retains 64 later frames", asy
 });
 
 test("terminal proof requires exact paired sustained play at default cadence", () => {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
   report.execution.scheduler.renderEvery = 1;
   const proof = derivePublicSmbTerminalProof(report);
   assert.equal(proof.status, "paused");
@@ -537,11 +537,11 @@ test("terminal proof requires exact paired sustained play at default cadence", (
     /default renderEvery 1/,
   );
 
-  const legacy = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V1);
+  const legacy = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
   legacy.execution.scheduler.renderEvery = 1;
   assert.throws(
     () => derivePublicSmbTerminalProof(legacy),
-    /requires lazuli-smb-sustained-play-v3/,
+    /requires lazuli-smb-sustained-play-v4/,
   );
 
   const fakeTwoStepReport = structuredClone(report);
@@ -588,7 +588,7 @@ test("stopScreencast failure still closes the collector and drains acknowledgeme
 });
 
 test("public SMB run URL remains the exact queryless outer root", () => {
-  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v3");
+  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v4");
   assert.equal(
     configuredPublicSmbCaptureUrl("https://gekko.free/"),
     "https://gekko.free/",
