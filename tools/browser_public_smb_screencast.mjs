@@ -11,11 +11,13 @@ import { identifyLocalDiscImage } from "./browser_boot_disc_identity.mjs";
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import { decodeCompositorPng } from "./browser_boot_compositor_png.mjs";
 import {
-  deriveSmbReadyPlayGameplayTranscript,
-} from "./browser_boot_gameplay_transcript.mjs";
+  SMB_SUSTAINED_PLAY_SCHEMA_V2,
+  SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
+  verifySmbSustainedPlay,
+  verifySmbSustainedPlayPrefix,
+} from "./browser_boot_smb_sustained_play.mjs";
 import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
 import {
-  PUBLIC_SCENARIO,
   PUBLIC_VIEWPORT,
   assignPublicDisc,
   clearPublicViewport,
@@ -27,16 +29,22 @@ import {
   publicDelay,
   publicPageTarget,
   publicReleaseState,
+  requestPublicSnapshot,
   waitForPublicRelease,
   waitForPublicRunner,
+  waitForPublicSnapshot,
 } from "./browser_public_cdp.mjs";
+import {
+  PUBLIC_SMB_SUSTAINED_SCENARIO,
+} from "./browser_public_smb_sustained.mjs";
 import {
   verifyPublicSmbScreencastReport,
 } from "./browser_public_smb_screencast_oracle.mjs";
 
-export const PUBLIC_SMB_SCREENCAST_SCHEMA = "lazuli-public-smb-screencast-v1";
+export const PUBLIC_SMB_SCREENCAST_SCHEMA = "lazuli-public-smb-screencast-v2";
 export const PUBLIC_SMB_SCREENCAST_PROTOCOL = "cdp-page-screencast-v1";
 export const PUBLIC_SMB_SCREENCAST_FRAMES = 64;
+export const PUBLIC_SMB_MIN_WINDOW_VI_RECEIPTS = 64;
 export const PUBLIC_SMB_MAX_FRAME_GAP_MS = 5_000;
 export const PUBLIC_SMB_MAX_TAIL_SPAN_MS = 180_000;
 export const PUBLIC_SMB_MAX_TERMINAL_TAIL_AGE_MS = 5_000;
@@ -160,6 +168,31 @@ function positiveInteger(value, name) {
   return value;
 }
 
+function nonNegativeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw captureFailure(`${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => [key, canonicalJson(value[key])]),
+    );
+  }
+  return value;
+}
+
+function canonicalJsonIdentity(value) {
+  const serialized = JSON.stringify(canonicalJson(value));
+  return {
+    bytes: Buffer.byteLength(serialized),
+    sha256: createHash("sha256").update(serialized).digest("hex"),
+  };
+}
+
 function decodeBase64Png(value) {
   if (
     typeof value !== "string"
@@ -200,7 +233,7 @@ function summarizeFrame(event, ordinal) {
   const decoded = decodeCompositorPng(decodeBase64Png(event.data), PNG_LIMITS);
   const { rgba: _discardedRgba, ...png } = decoded;
   return {
-    ordinal,
+    receivedOrdinal: ordinal,
     sessionId,
     metadata: compactMetadata(event.metadata),
     png,
@@ -228,6 +261,7 @@ export class PublicSmbScreencastCollector {
     this.capacityFrames = positiveInteger(capacityFrames, "capacityFrames");
     this.summarize = summarize;
     this.terminalTail = null;
+    this.window = null;
     this.unsubscribe = session.on(
       "Page.screencastFrame",
       event => this.receive(event),
@@ -250,6 +284,7 @@ export class PublicSmbScreencastCollector {
       });
     this.acknowledgements.add(acknowledgement);
     acknowledgement.finally(() => this.acknowledgements.delete(acknowledgement));
+    if (this.terminalTail !== null) return;
     if (this.error === null) {
       try {
         this.frames.push({
@@ -267,16 +302,120 @@ export class PublicSmbScreencastCollector {
     return this.frames.length === this.capacityFrames;
   }
 
+  beginSustainedWindow({
+    snapshotRequestedAtMs,
+    observedAtMs,
+    observedCycle,
+    pendingReceipts,
+    postedReceipts,
+    receiptPrefix,
+  }) {
+    this.throwIfFailed();
+    if (this.window !== null) {
+      throw captureFailure("sustained screenshot window was already started");
+    }
+    const snapshotRequested = positiveInteger(
+      snapshotRequestedAtMs,
+      "window.snapshotRequestedAtMs",
+    );
+    const observed = positiveInteger(observedAtMs, "window.observedAtMs");
+    if (snapshotRequested > observed) {
+      throw captureFailure(
+        "snapshot request cannot postdate sustained window observation",
+      );
+    }
+    const posted = nonNegativeInteger(
+      postedReceipts,
+      "window.postedReceipts",
+    );
+    const pending = nonNegativeInteger(
+      pendingReceipts,
+      "window.pendingReceipts",
+    );
+    const cycle = positiveInteger(observedCycle, "window.observedCycle");
+    if (!Array.isArray(receiptPrefix) || receiptPrefix.length < 2) {
+      throw captureFailure(
+        "sustained screenshot window requires a nonempty completed VI pair",
+      );
+    }
+    const accepted = receiptPrefix.length;
+    if (
+      posted
+      > SMB_SUSTAINED_VI_RECEIPT_CAPACITY
+        - PUBLIC_SMB_MIN_WINDOW_VI_RECEIPTS
+    ) {
+      throw captureFailure(
+        `sustained screenshot window requires at least `
+          + `${PUBLIC_SMB_MIN_WINDOW_VI_RECEIPTS} later VI receipts`,
+      );
+    }
+    if (accepted + pending !== posted) {
+      throw captureFailure(
+        "sustained screenshot window receipts and pending count do not match posted",
+      );
+    }
+    const lastPresented = receiptPrefix
+      .filter(receipt => receipt?.presented === true)
+      .at(-1) ?? null;
+    const lastPresentationSerial = lastPresented?.presentationSerial ?? null;
+    if (
+      !Number.isSafeInteger(lastPresentationSerial)
+      || lastPresentationSerial <= 0
+    ) {
+      throw captureFailure(
+        "sustained screenshot window requires a completed presented VI pair",
+      );
+    }
+    const lastReceipt = receiptPrefix.at(-1);
+    const lastReceiptOrdinal = positiveInteger(
+      lastReceipt?.ordinal,
+      "window.lastReceiptOrdinal",
+    );
+    const lastRendererSequence = positiveInteger(
+      lastReceipt?.rendererSequence,
+      "window.lastRendererSequence",
+    );
+    const receiptPrefixIdentity = canonicalJsonIdentity(receiptPrefix);
+    this.frames = [];
+    this.terminalTail = null;
+    this.window = {
+      scenario: PUBLIC_SMB_SUSTAINED_SCENARIO,
+      step: "sustained-play-presented",
+      snapshotRequestedAtMs: snapshotRequested,
+      observedAtMs: observed,
+      observedCycle: cycle,
+      receivedFramesBeforeWindow: this.receivedFrames,
+      postedReceipts: posted,
+      pendingReceipts: pending,
+      acceptedReceipts: accepted,
+      lastPresentationSerial,
+      lastReceiptOrdinal,
+      lastRendererSequence,
+      receiptPrefixBytes: receiptPrefixIdentity.bytes,
+      receiptPrefixSha256: receiptPrefixIdentity.sha256,
+    };
+    return this.window;
+  }
+
   canFinalize(terminalProof) {
-    return terminalProof !== null && this.tailReady();
+    return terminalProof !== null
+      && this.window !== null
+      && this.terminalTail !== null
+      && this.tailReady();
   }
 
   pinTerminalTail(terminalObservedAtMs) {
     this.throwIfFailed();
+    if (this.terminalTail !== null) {
+      throw captureFailure("terminal screenshot tail was already pinned");
+    }
     if (!this.tailReady()) {
       throw captureFailure(
         `rolling tail contains ${this.frames.length} of ${this.capacityFrames} frames`,
       );
+    }
+    if (this.window === null) {
+      throw captureFailure("sustained screenshot window was never started");
     }
     if (!Number.isSafeInteger(terminalObservedAtMs) || terminalObservedAtMs <= 0) {
       throw captureFailure("terminal observation time must be a positive safe integer");
@@ -299,17 +438,28 @@ export class PublicSmbScreencastCollector {
     }
     const first = this.frames[0];
     const last = this.frames.at(-1);
+    if (first.receivedAtMs < this.window.observedAtMs) {
+      throw captureFailure(
+        "rolling tail contains a frame from before the sustained window",
+      );
+    }
+    if (first.metadata.timestamp * 1_000 < this.window.observedAtMs) {
+      throw captureFailure(
+        "rolling tail contains a frame captured before the sustained window",
+      );
+    }
     const metadataSpanMs = (last.metadata.timestamp - first.metadata.timestamp) * 1_000;
     const receiptSpanMs = last.receivedAtMs - first.receivedAtMs;
-    const terminalMetadataAgeMs = Math.abs(
-      terminalObservedAtMs - last.metadata.timestamp * 1_000,
-    );
-    const terminalTailAgeMs = Math.abs(terminalObservedAtMs - last.receivedAtMs);
+    const terminalMetadataAgeMs =
+      terminalObservedAtMs - last.metadata.timestamp * 1_000;
+    const terminalTailAgeMs = terminalObservedAtMs - last.receivedAtMs;
     if (
       maxMetadataGapMs > PUBLIC_SMB_MAX_FRAME_GAP_MS
       || maxReceiptGapMs > PUBLIC_SMB_MAX_FRAME_GAP_MS
       || metadataSpanMs > PUBLIC_SMB_MAX_TAIL_SPAN_MS
       || receiptSpanMs > PUBLIC_SMB_MAX_TAIL_SPAN_MS
+      || terminalMetadataAgeMs < 0
+      || terminalTailAgeMs < 0
       || terminalMetadataAgeMs > PUBLIC_SMB_MAX_TERMINAL_TAIL_AGE_MS
       || terminalTailAgeMs > PUBLIC_SMB_MAX_TERMINAL_TAIL_AGE_MS
     ) {
@@ -317,8 +467,10 @@ export class PublicSmbScreencastCollector {
         "rolling tail is too sparse or stale at terminal scenario completion",
       );
     }
+    const terminalReceivedOrdinal = this.receivedFrames;
     this.terminalTail = {
       terminalObservedAtMs,
+      terminalReceivedOrdinal,
       firstReceivedAtMs: first.receivedAtMs,
       lastReceivedAtMs: last.receivedAtMs,
       metadataSpanMs,
@@ -355,21 +507,33 @@ export class PublicSmbScreencastCollector {
         `rolling tail contains ${this.frames.length} of ${this.capacityFrames} frames`,
       );
     }
-    const firstReceivedOrdinal = this.receivedFrames - this.frames.length + 1;
+    if (this.window === null) {
+      throw captureFailure("sustained screenshot window was never started");
+    }
+    if (this.terminalTail === null) {
+      throw captureFailure("terminal screenshot tail was never pinned");
+    }
+    const lastReceivedOrdinal = this.terminalTail.terminalReceivedOrdinal;
+    const firstReceivedOrdinal = lastReceivedOrdinal - this.frames.length + 1;
     return {
       protocol: PUBLIC_SMB_SCREENCAST_PROTOCOL,
       format: "png",
       everyNthFrame: 1,
       width: PUBLIC_VIEWPORT.width,
       height: PUBLIC_VIEWPORT.height,
-      selection: "rolling-tail",
+      selection: "sustained-window-tail",
       capacityFrames: this.capacityFrames,
       firstReceivedOrdinal,
-      lastReceivedOrdinal: this.receivedFrames,
+      lastReceivedOrdinal,
       receivedFrames: this.receivedFrames,
+      postTerminalFrames: this.receivedFrames - lastReceivedOrdinal,
       acknowledgedFrames: this.acknowledgedFrames,
-      frames: this.frames.map((frame, index) => ({ ...frame, ordinal: index + 1 })),
+      frames: this.frames.map((frame, index) => ({
+        ...frame,
+        selectedOrdinal: index + 1,
+      })),
       terminalTail: this.terminalTail,
+      window: this.window,
     };
   }
 }
@@ -535,18 +699,33 @@ export function derivePublicSmbTerminalProof(report) {
     scenario === null
     || typeof scenario !== "object"
     || Array.isArray(scenario)
-    || scenario.id !== PUBLIC_SCENARIO
+    || scenario.id !== PUBLIC_SMB_SUSTAINED_SCENARIO
     || scenario.gameIdentifier !== "GMBE8P"
     || scenario.status !== "complete"
     || scenario.failure !== null
     || scenario.currentStep !== null
     || scenario.startCycle !== 0
-    || scenario.hardCycleLimit !== 30_000_000_000
+    || scenario.hardCycleLimit !== 32_000_000_000
     || !Array.isArray(scenario.steps)
   ) {
-    throw captureFailure("terminal report does not prove exact smb-ready-play completion");
+    throw captureFailure(
+      "terminal report does not prove exact smb-sustained-play completion",
+    );
   }
-  const gameplayTranscript = deriveSmbReadyPlayGameplayTranscript(report);
+  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V2) {
+    throw captureFailure(
+      `terminal report requires ${SMB_SUSTAINED_PLAY_SCHEMA_V2}`,
+    );
+  }
+  let sustainedPlay;
+  try {
+    sustainedPlay = verifySmbSustainedPlay(report);
+  } catch (error) {
+    throw captureFailure(
+      `terminal sustained-play report failed strict validation: `
+        + `${error.message ?? String(error)}`,
+    );
+  }
   const completedCycle = terminalInteger(
     scenario.completedCycle,
     "scenario.completedCycle",
@@ -583,7 +762,8 @@ export function derivePublicSmbTerminalProof(report) {
       stepIndex: scenario.stepIndex,
       stepCount: scenario.steps.length,
     },
-    gameplayTranscript,
+    gameplayTranscript: report.gameplayTranscript,
+    sustainedPlay,
     rendering: {
       backend: rendering.backend,
       error: rendering.error ?? null,
@@ -591,15 +771,112 @@ export function derivePublicSmbTerminalProof(report) {
     scheduler: {
       renderEvery: scheduler.renderEvery,
     },
+    report,
   };
 }
 
-async function waitForPublicSmbTerminal(session, collector, { deadline, pollMs }) {
+function beginObservedSmbSustainedWindow(
+  report,
+  collector,
+  {
+    snapshotRequestedAtMs,
+    observedAtMs,
+  },
+) {
+  if (
+    collector.window !== null
+    || report?.status !== "running"
+    || report.scenario?.id !== PUBLIC_SMB_SUSTAINED_SCENARIO
+    || report.scenario?.status !== "running"
+    || report.scenario?.currentStep !== "sustained-play-presented"
+  ) return false;
+  let prefix;
+  try {
+    prefix = verifySmbSustainedPlayPrefix(report);
+  } catch (error) {
+    throw captureFailure(
+      `observed malformed sustained-play screenshot window entry: `
+        + `${error.message ?? String(error)}`,
+    );
+  }
+  if (
+    prefix.acceptedReceipts < 2
+    || prefix.lastPresentationSerial === null
+  ) return false;
+  const sustained = report.sustainedPlay;
+  collector.beginSustainedWindow({
+    snapshotRequestedAtMs,
+    observedAtMs,
+    observedCycle: prefix.observedCycle,
+    pendingReceipts: prefix.pendingReceipts,
+    postedReceipts: prefix.postedReceipts,
+    receiptPrefix: sustained.receipts,
+  });
+  return true;
+}
+
+export async function waitForPublicSmbTerminal(
+  session,
+  collector,
+  {
+    deadline,
+    delay = publicDelay,
+    getState = publicReleaseState,
+    now = Date.now,
+    pollMs,
+    requestSnapshot = requestPublicSnapshot,
+    waitSnapshot = waitForPublicSnapshot,
+  },
+) {
   let state = null;
-  while (Date.now() < deadline) {
+  while (now() < deadline) {
     collector.throwIfFailed();
-    state = await publicReleaseState(session);
-    const report = parsePublicReport(state.result);
+    state = await getState(session);
+    let report = parsePublicReport(state.result);
+    let snapshotRequestedAtMs = null;
+    let snapshotObservedAtMs = null;
+    const terminal =
+      report?.status === "paused"
+      || report?.stage === "scenario-complete";
+    if (!terminal && state.dataset.status === "running") {
+      snapshotRequestedAtMs = now();
+      if (await requestSnapshot(session) !== true) {
+        throw captureFailure(
+          "public SMB cycle runner cannot publish a sustained snapshot",
+        );
+      }
+      const snapshot = await waitSnapshot(session, {
+        deadline,
+        pollMs,
+      });
+      state = snapshot.state;
+      report = snapshot.report;
+      snapshotObservedAtMs = now();
+    }
+    if (
+      (state.dataset.status === "paused"
+        || state.dataset.status === "stopped")
+      && (report === null || report.status === "running")
+    ) {
+      await delay(pollMs);
+      continue;
+    }
+    if (
+      report?.status === "running"
+      && snapshotRequestedAtMs === null
+    ) {
+      throw captureFailure(
+        "running SMB report was not fenced by an active snapshot request",
+      );
+    }
+    beginObservedSmbSustainedWindow(
+      report,
+      collector,
+      {
+        snapshotRequestedAtMs,
+        observedAtMs: snapshotObservedAtMs,
+      },
+    );
     if (
       report?.status === "stopped"
       || report?.stage === "scenario-failed"
@@ -609,6 +886,11 @@ async function waitForPublicSmbTerminal(session, collector, { deadline, pollMs }
       throw captureFailure(`SMB scenario stopped before completion: ${JSON.stringify(report)}`);
     }
     if (report?.status === "paused" || report?.stage === "scenario-complete") {
+      if (collector.window === null) {
+        throw captureFailure(
+          "sustained play completed before its screenshot window was observed",
+        );
+      }
       const terminal = derivePublicSmbTerminalProof(report);
       if (
         state.dataset.status !== "paused"
@@ -617,9 +899,11 @@ async function waitForPublicSmbTerminal(session, collector, { deadline, pollMs }
       ) {
         throw captureFailure("terminal page state does not match scenario-complete report");
       }
-      return { state, terminal, observedAtMs: Date.now() };
+      const observedAtMs = now();
+      collector.pinTerminalTail(observedAtMs);
+      return { state, terminal, observedAtMs };
     }
-    await publicDelay(pollMs);
+    await delay(pollMs);
   }
   throw captureFailure(`SMB scenario did not complete before the deadline: ${JSON.stringify(state)}`);
 }
@@ -760,7 +1044,7 @@ async function collectPublicSmbScreencast(
     throw captureFailure("public root unexpectedly enabled viewport capture mode");
   }
   await configurePublicCompatibilityDebug(session, {
-    scenario: PUBLIC_SCENARIO,
+    scenario: PUBLIC_SMB_SUSTAINED_SCENARIO,
     viewportCapture: true,
   });
   const configuredState = await waitForPublicRelease(session, {
@@ -793,7 +1077,7 @@ async function collectPublicSmbScreencast(
   await waitForPublicRunner(session, {
     deadline,
     pollMs: options.pollMs,
-    stoppedLabel: "Super Monkey Ball",
+    stoppedLabel: "Super Monkey Ball sustained",
   });
   const before = await waitForCaptureSurface(session, {
     deadline,
@@ -825,8 +1109,6 @@ async function collectPublicSmbScreencast(
       `scenario completed with only ${collector.frames.length} rolling-tail frames`,
     );
   }
-  collector.pinTerminalTail(terminalResult.observedAtMs);
-
   const terminalRelease = await observePublicActiveRelease(session, options, release);
   const navigationAfter = await observePinnedNavigation(
     session,
@@ -837,8 +1119,8 @@ async function collectPublicSmbScreencast(
   const after = await observeCaptureState(session);
   const report = {
     schema: PUBLIC_SMB_SCREENCAST_SCHEMA,
-    mode: "passive-public-viewport",
-    alignment: "non-serial-aligned",
+    mode: "sustained-public-viewport",
+    alignment: "sustained-window-bounded",
     rendererControl: {
       compositorHandshake: false,
       rendererBackpressure: false,
