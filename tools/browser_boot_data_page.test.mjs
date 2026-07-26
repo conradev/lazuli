@@ -88,6 +88,8 @@ const dataPageFunctions = [
   "translateDataRange",
   "normalizePhysicalMemoryAddress",
   "physicalRamPointer",
+  "dataRamPointer",
+  "guestEffectivePointer",
 ];
 
 class SparseMemory {
@@ -917,4 +919,51 @@ test("runtime data wrappers read current MSR, DBAT, segment, and SDR1 state", ()
 
   writeDataBat(range.context, 0, 0x9000_0003, 0x0002_0002);
   assert.equal(range.context.translateDataAddress(0x9000_1234), 0x0002_1234);
+});
+
+test("effective guest probes leave hashed-page history and DTLB state untouched", () => {
+  const context = makeContext();
+  const effective = 0x7fdb_e4c0;
+  const physical = 0x0012_3000;
+  const segment = 0x0012_3456;
+  const segments = Array(16).fill(0);
+  segments[effective >>> 28] = segment;
+  writeRuntimeTranslationState(context, {
+    msr: 0x10,
+    sdr1: official.sdr1,
+    segments,
+  });
+  const installed = installPrimaryPte(
+    context,
+    effective,
+    segment,
+    official.sdr1,
+    physical | 2,
+  );
+  const set = context.dataTlbSets[context.dataTlbSetIndex(effective)];
+  set.lru = 1;
+  context.memory.clearAccesses();
+
+  assert.equal(
+    context.guestEffectivePointer(effective, 16),
+    context.ram + physical + (effective & 0xfff),
+  );
+  assert.equal(
+    readPte1(context, installed),
+    physical | 2,
+    "a diagnostic probe must not set referenced or changed",
+  );
+  assert.deepEqual(
+    set.entries,
+    [null, null],
+    "a diagnostic probe must not fill the DTLB",
+  );
+  assert.equal(set.lru, 1, "a diagnostic probe must not touch replacement order");
+  assert.deepEqual(
+    context.memory.accesses.filter(
+      access => access.kind === "write32"
+        && access.address === installed.pointer + 4,
+    ),
+    [],
+  );
 });

@@ -15227,6 +15227,56 @@ const TEMPLATE: &str = r##"<!doctype html>
       return pointer === null ? null : view.getUint32(pointer, false);
     }
 
+    function guestEffectivePointer(address, size) {
+      if (
+        !Number.isSafeInteger(address)
+        || address < 0
+        || address > 0xffffffff
+        || !Number.isSafeInteger(size)
+        || size <= 0
+        || size > 0x100000000 - address
+      ) return null;
+      // Compatibility diagnostics must observe the guest's effective address
+      // space without becoming a guest memory access. In particular, leave
+      // hashed-page R/C bits, DTLB residency, and replacement order untouched.
+      return dataRamPointer(address >>> 0, size, false, false);
+    }
+
+    function guestEffectiveU32(address) {
+      const pointer = guestEffectivePointer(address, 4);
+      return pointer === null ? null : view.getUint32(pointer, false);
+    }
+
+    function guestEffectiveS32(address) {
+      const pointer = guestEffectivePointer(address, 4);
+      return pointer === null ? null : view.getInt32(pointer, false);
+    }
+
+    function guestEffectiveF32(address) {
+      const pointer = guestEffectivePointer(address, 4);
+      return pointer === null ? null : view.getFloat32(pointer, false);
+    }
+
+    function guestEffectiveU16(address) {
+      const pointer = guestEffectivePointer(address, 2);
+      return pointer === null ? null : view.getUint16(pointer, false);
+    }
+
+    function guestEffectiveS16(address) {
+      const pointer = guestEffectivePointer(address, 2);
+      return pointer === null ? null : view.getInt16(pointer, false);
+    }
+
+    function guestEffectiveU8(address) {
+      const pointer = guestEffectivePointer(address, 1);
+      return pointer === null ? null : view.getUint8(pointer);
+    }
+
+    function guestEffectiveS8(address) {
+      const pointer = guestEffectivePointer(address, 1);
+      return pointer === null ? null : view.getInt8(pointer);
+    }
+
     function guestU8(address) {
       const pointer = ramPointer(address, 1);
       return pointer === null ? null : view.getUint8(pointer);
