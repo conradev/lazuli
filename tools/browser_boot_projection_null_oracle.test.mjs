@@ -16,6 +16,7 @@ import {
   projectionNullOracleXfb,
   projectionNullPacketLayout,
   projectionNullSourceVector,
+  projectionNullVisibleNativeCarrierPositions,
 } from "./browser_boot_projection_null_oracle.mjs";
 
 function u16(bytes, offset) {
@@ -193,6 +194,80 @@ test("native carrier is finite and degenerate while exact geometry is visible", 
       projectionNullSourceVector.exactClipPositions[0][3],
     true,
     "the W=0 source is removed by exact right-plane clipping",
+  );
+});
+
+test("projection-null packet options preserve v6 defaults and model v5 optional fallback", () => {
+  const generation = PROJECTION_NULL_HASH_GENERATION + 1;
+  const required = buildProjectionNullOraclePacket(generation, {
+    exactClipRequired: true,
+    xfClipDisable: 7,
+    visibleNativeCarrier: true,
+  });
+  const optional = buildProjectionNullOraclePacket(generation, {
+    exactClipRequired: false,
+    xfClipDisable: 7,
+    visibleNativeCarrier: true,
+  });
+  const draw = projectionNullPacketLayout.drawOffset;
+  const exact = projectionNullPacketLayout.exactChunkOffset;
+
+  assert.equal(u16(required, 0x04), 6);
+  assert.equal(u16(required, draw + 0x02), 6);
+  assert.equal(u16(optional, 0x04), 5);
+  assert.equal(u16(optional, draw + 0x02), 2);
+  assert.equal(u32(required, exact + 0x14), 7);
+  assert.equal(u32(optional, exact + 0x14), 7);
+  assert.deepEqual(
+    Array.from(required, (byte, offset) =>
+      byte === optional[offset] ? null : offset
+    ).filter((offset) => offset !== null),
+    [0x04, draw + 0x02],
+    "required and optional packets differ only in version and exact-required flag",
+  );
+
+  const positions = Array.from(
+    { length: projectionNullPacketLayout.vertexCount },
+    (_unused, vertex) =>
+      Array.from(
+        { length: 4 },
+        (_component, component) =>
+          f32(
+            optional,
+            projectionNullPacketLayout.vertexOffset +
+              vertex * projectionNullPacketLayout.vertexBytes +
+              component * 4,
+          ),
+      ),
+  );
+  assert.deepEqual(positions, projectionNullVisibleNativeCarrierPositions);
+  assert.notDeepEqual(
+    positions,
+    projectionNullSourceVector.nativeCarrierPositions,
+  );
+
+  assert.deepEqual(
+    buildProjectionNullOraclePacket(PROJECTION_NULL_HASH_GENERATION),
+    buildProjectionNullOraclePacket(PROJECTION_NULL_HASH_GENERATION, {}),
+    "the options object leaves the canonical packet byte-for-byte unchanged",
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      exactClipRequired: "yes",
+    }),
+    /exactClipRequired must be a boolean/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      xfClipDisable: 8,
+    }),
+    /xfClipDisable must be an integer from 0 through 7/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      visibleNativeCarrier: 1,
+    }),
+    /visibleNativeCarrier must be a boolean/,
   );
 });
 

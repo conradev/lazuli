@@ -17,6 +17,7 @@ const VERTEX_OFFSET = TEV_OFFSET + TEV_BYTES;
 const BASE_PACKET_BYTES = VERTEX_OFFSET + VERTEX_COUNT * VERTEX_BYTES;
 const EXACT_CHUNK_BYTES = 48 + VERTEX_COUNT * 4 * 4;
 const PACKET_BYTES = BASE_PACKET_BYTES + EXACT_CHUNK_BYTES;
+const DRAW_FLAG_EXACT_CLIP_INPUT = 2;
 const DRAW_FLAG_EXACT_CLIP_REQUIRED = 6;
 const DEPTH24_MAX = 0x00ffffff;
 const LEGACY_DEPTH = DEPTH24_MAX / 2;
@@ -72,6 +73,12 @@ export const projectionNullSourceVector = Object.freeze({
   ]),
 });
 
+export const projectionNullVisibleNativeCarrierPositions = freezeRows([
+  [0, 0, LEGACY_DEPTH, 1],
+  [1280, 0, LEGACY_DEPTH, 1],
+  [0, 1056, LEGACY_DEPTH, 1],
+]);
+
 export const projectionNullExactState = Object.freeze({
   bpGenMode: 0,
   bpScissorTopLeft: (342 << 12) | 342,
@@ -110,10 +117,13 @@ export const projectionNullOracleXfb = Object.freeze({
   stride: rasterCenterOracleXfb.stride,
 });
 
-function projectionNullDraw() {
+function projectionNullDraw(visibleNativeCarrier) {
+  const nativePositions = visibleNativeCarrier
+    ? projectionNullVisibleNativeCarrierPositions
+    : projectionNullSourceVector.nativeCarrierPositions;
   return {
     topology: 2,
-    vertices: projectionNullSourceVector.nativeCarrierPositions.map(
+    vertices: nativePositions.map(
       ([x, y, depth24]) => ({
         x,
         y,
@@ -136,9 +146,27 @@ function projectionNullDraw() {
 
 export function buildProjectionNullOraclePacket(
   generation = PROJECTION_NULL_HASH_GENERATION,
+  {
+    exactClipRequired = true,
+    xfClipDisable = projectionNullExactState.xfClipDisable,
+    visibleNativeCarrier = false,
+  } = {},
 ) {
+  if (typeof exactClipRequired !== "boolean") {
+    throw new TypeError("exactClipRequired must be a boolean");
+  }
+  if (
+    !Number.isInteger(xfClipDisable) ||
+    xfClipDisable < 0 ||
+    xfClipDisable > 7
+  ) {
+    throw new RangeError("xfClipDisable must be an integer from 0 through 7");
+  }
+  if (typeof visibleNativeCarrier !== "boolean") {
+    throw new TypeError("visibleNativeCarrier must be a boolean");
+  }
   const base = buildRasterCenterOraclePacket(
-    [projectionNullDraw()],
+    [projectionNullDraw(visibleNativeCarrier)],
     generation,
   );
   if (base.length !== BASE_PACKET_BYTES) {
@@ -154,11 +182,13 @@ export function buildProjectionNullOraclePacket(
     packet.byteOffset,
     packet.byteLength,
   );
-  view.setUint16(0x04, 6, true);
+  view.setUint16(0x04, exactClipRequired ? 6 : 5, true);
   view.setUint32(0x08, packet.length, true);
   view.setUint16(
     DRAW_OFFSET + 0x02,
-    DRAW_FLAG_EXACT_CLIP_REQUIRED,
+    exactClipRequired
+      ? DRAW_FLAG_EXACT_CLIP_REQUIRED
+      : DRAW_FLAG_EXACT_CLIP_INPUT,
     true,
   );
   view.setFloat32(
@@ -191,7 +221,7 @@ export function buildProjectionNullOraclePacket(
   );
   view.setUint32(
     exact + 0x14,
-    projectionNullExactState.xfClipDisable,
+    xfClipDisable,
     true,
   );
   projectionNullExactState.viewport.forEach((value, index) => {
