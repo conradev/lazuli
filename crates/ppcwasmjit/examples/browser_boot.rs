@@ -1058,6 +1058,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let windWakerLastActiveGameplayInput = null;
     let meleeLastActiveGameplayInput = null;
     let fzeroLastActiveGameplayInput = null;
+    let metroidPrimeLastActiveGameplayInput = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -16741,6 +16742,625 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function metroidPrimeMappedPointer(value, length = 1) {
+      return Number.isSafeInteger(value)
+        && Number.isSafeInteger(length)
+        && length > 0
+        && (value & 3) === 0
+        && value >= 0x80000000
+        && value <= 0x81800000 - length
+        && ramPointer(value, length) !== null;
+    }
+
+    function inspectMetroidPrimeVector(address) {
+      if (!metroidPrimeMappedPointer(address, 12)) return null;
+      return {
+        x: guestF32(address),
+        y: guestF32(address + 4),
+        z: guestF32(address + 8),
+      };
+    }
+
+    function inspectMetroidPrimeStridedVector(addresses) {
+      if (
+        !Array.isArray(addresses)
+        || addresses.length !== 3
+        || addresses.some(address => !metroidPrimeMappedPointer(address, 4))
+      ) return null;
+      return {
+        x: guestF32(addresses[0]),
+        y: guestF32(addresses[1]),
+        z: guestF32(addresses[2]),
+      };
+    }
+
+    function metroidPrimeFiniteVector(vector) {
+      return vector !== null
+        && Number.isFinite(vector.x)
+        && Number.isFinite(vector.y)
+        && Number.isFinite(vector.z);
+    }
+
+    function metroidPrimeDot(left, right) {
+      return left.x * right.x + left.y * right.y + left.z * right.z;
+    }
+
+    function inspectMetroidPrimeGameState() {
+      if (boot.identifier !== "GM8E01" || boot.version !== 2) return null;
+
+      // Retail GM8E01 revision two. The fixed manager/player allocations and
+      // revision-specific +0x10 CPhysicsActor/CPlayer layout were recovered
+      // directly from DOL 08cef9ce0416f74e7e33de0b4b527687ab946b388e95fc5b3d8ef26856dcc6f7.
+      // CTransform4f is row-major, so orientation/translation columns below
+      // are intentionally read from strided addresses.
+      const managerAddress = 0x8045b208;
+      const expectedPlayerAddress = 0x8046c9e8;
+      const finalInputAddress = managerAddress + 0xb54;
+      const managerMapped = metroidPrimeMappedPointer(managerAddress, 0xb84);
+
+      const headerGameCode = guestU32(0x80000000);
+      const headerMakerCode = guestU16(0x80000004);
+      const headerDiscNumber = guestU8(0x80000006);
+      const headerRevision = guestU8(0x80000007);
+      const exactIdentity = headerGameCode === 0x474d3845
+        && headerMakerCode === 0x3031
+        && headerDiscNumber === 0
+        && headerRevision === 2;
+
+      const playerPointerAddress = managerAddress + 0x84c;
+      const worldPointerAddress = managerAddress + 0x850;
+      const cameraManagerPointerAddress = managerAddress + 0x870;
+      const playerStateRefDataPointerAddress = managerAddress + 0x8b8;
+      const playerValue = managerMapped ? guestU32(playerPointerAddress) : null;
+      const worldValue = managerMapped ? guestU32(worldPointerAddress) : null;
+      const cameraManagerValue = managerMapped
+        ? guestU32(cameraManagerPointerAddress)
+        : null;
+      const playerStateRefDataValue = managerMapped
+        ? guestU32(playerStateRefDataPointerAddress)
+        : null;
+      const playerMapped = playerValue === expectedPlayerAddress
+        && metroidPrimeMappedPointer(playerValue, 0xa48);
+      const worldMapped = metroidPrimeMappedPointer(worldValue, 0x6c);
+      const cameraManagerMapped =
+        metroidPrimeMappedPointer(cameraManagerValue, 0x3cc);
+      const playerStateRefDataMapped =
+        metroidPrimeMappedPointer(playerStateRefDataValue, 8);
+      const playerStateValue = playerStateRefDataMapped
+        ? guestU32(playerStateRefDataValue)
+        : null;
+      const playerStateRefCount = playerStateRefDataMapped
+        ? guestS32(playerStateRefDataValue + 4)
+        : null;
+      const playerStateMapped = metroidPrimeMappedPointer(playerStateValue, 0x198);
+      const playerStateFlags = playerStateMapped ? guestU8(playerStateValue) : null;
+      const playerAlive = playerStateMapped
+        && playerStateRefCount > 0
+        && (playerStateFlags & 0x80) !== 0;
+
+      const worldAssetId = worldMapped ? guestU32(worldValue + 8) : null;
+      const worldArea = worldMapped ? guestS32(worldValue + 0x68) : null;
+      const managerArea = managerMapped
+        ? guestS32(managerAddress + 0x8cc)
+        : null;
+      const inputFrame = managerMapped
+        ? guestU32(managerAddress + 0x8d4)
+        : null;
+      const updateFrame = managerMapped
+        ? guestU32(managerAddress + 0x8d8)
+        : null;
+      const gameState = managerMapped
+        ? guestU32(managerAddress + 0x904)
+        : null;
+      const initPhase = managerMapped
+        ? guestU32(managerAddress + 0xb3c)
+        : null;
+
+      const currentCameraId = cameraManagerMapped
+        ? guestU16(cameraManagerValue)
+        : null;
+      const cinematicCameraCount = cameraManagerMapped
+        ? guestU32(cameraManagerValue + 8)
+        : null;
+      const firstPersonCameraPointerAddress = cameraManagerMapped
+        ? cameraManagerValue + 0x88
+        : null;
+      const firstPersonCameraValue = firstPersonCameraPointerAddress === null
+        ? null
+        : guestU32(firstPersonCameraPointerAddress);
+      const firstPersonCameraMapped =
+        metroidPrimeMappedPointer(firstPersonCameraValue, 0x198);
+      const firstPersonCameraId = firstPersonCameraMapped
+        ? guestU16(firstPersonCameraValue + 8)
+        : null;
+      const firstPersonCameraFlags = firstPersonCameraMapped
+        ? guestU8(firstPersonCameraValue + 0x180)
+        : null;
+      const cameraDisablesInput = firstPersonCameraMapped
+        ? (firstPersonCameraFlags & 0x40) !== 0
+        : null;
+      const firstPersonCameraActive = cameraManagerMapped
+        && firstPersonCameraMapped
+        && cinematicCameraCount === 0
+        && currentCameraId !== 0xffff
+        && currentCameraId === firstPersonCameraId;
+      const cameraInputEnabled = firstPersonCameraActive
+        && cameraDisablesInput === false;
+
+      const entityFlags = playerMapped
+        ? guestU8(expectedPlayerAddress + 0x30)
+        : null;
+      const playerArea = playerMapped
+        ? guestS32(expectedPlayerAddress + 4)
+        : null;
+      const playerUniqueId = playerMapped
+        ? guestU16(expectedPlayerAddress + 8)
+        : null;
+      const movementState = playerMapped
+        ? guestU32(expectedPlayerAddress + 0x268)
+        : null;
+      const surfaceRestraint = playerMapped
+        ? guestU32(expectedPlayerAddress + 0x2bc)
+        : null;
+      const playerCameraState = playerMapped
+        ? guestU32(expectedPlayerAddress + 0x304)
+        : null;
+      const morphState = playerMapped
+        ? guestU32(expectedPlayerAddress + 0x308)
+        : null;
+      const orbitState = playerMapped
+        ? guestU32(expectedPlayerAddress + 0x314)
+        : null;
+      const frozenTimeout = playerMapped
+        ? guestF32(expectedPlayerAddress + 0x760)
+        : null;
+      const controlsFrozen = playerMapped
+        ? guestU8(expectedPlayerAddress + 0x770)
+        : null;
+      const playerInputFlags = playerMapped
+        ? guestU8(expectedPlayerAddress + 0x9d6)
+        : null;
+      const playerDisablesInput = playerMapped
+        ? (playerInputFlags & 0x04) !== 0
+        : null;
+      const deathTime = playerMapped
+        ? guestF32(expectedPlayerAddress + 0xa04)
+        : null;
+
+      const transformAddress = playerMapped
+        ? expectedPlayerAddress + 0x34
+        : null;
+      const transformAddresses = transformAddress === null ? null : {
+        right: [
+          expectedPlayerAddress + 0x34,
+          expectedPlayerAddress + 0x44,
+          expectedPlayerAddress + 0x54,
+        ],
+        forward: [
+          expectedPlayerAddress + 0x38,
+          expectedPlayerAddress + 0x48,
+          expectedPlayerAddress + 0x58,
+        ],
+        up: [
+          expectedPlayerAddress + 0x3c,
+          expectedPlayerAddress + 0x4c,
+          expectedPlayerAddress + 0x5c,
+        ],
+        position: [
+          expectedPlayerAddress + 0x40,
+          expectedPlayerAddress + 0x50,
+          expectedPlayerAddress + 0x60,
+        ],
+      };
+      const right = transformAddresses === null
+        ? null
+        : inspectMetroidPrimeStridedVector(transformAddresses.right);
+      const forward = transformAddresses === null
+        ? null
+        : inspectMetroidPrimeStridedVector(transformAddresses.forward);
+      const up = transformAddresses === null
+        ? null
+        : inspectMetroidPrimeStridedVector(transformAddresses.up);
+      const position = transformAddresses === null
+        ? null
+        : inspectMetroidPrimeStridedVector(transformAddresses.position);
+      const velocityAddress = playerMapped
+        ? expectedPlayerAddress + 0x148
+        : null;
+      const angularVelocityAddress = playerMapped
+        ? expectedPlayerAddress + 0x154
+        : null;
+      const torqueAddress = playerMapped
+        ? expectedPlayerAddress + 0x184
+        : null;
+      const velocity = inspectMetroidPrimeVector(velocityAddress);
+      const angularVelocity = inspectMetroidPrimeVector(angularVelocityAddress);
+      const torque = inspectMetroidPrimeVector(torqueAddress);
+      const transformVectorsFinite = metroidPrimeFiniteVector(right)
+        && metroidPrimeFiniteVector(forward)
+        && metroidPrimeFiniteVector(up)
+        && metroidPrimeFiniteVector(position);
+      const rightLengthSq = transformVectorsFinite
+        ? metroidPrimeDot(right, right)
+        : null;
+      const forwardLengthSq = transformVectorsFinite
+        ? metroidPrimeDot(forward, forward)
+        : null;
+      const upLengthSq = transformVectorsFinite ? metroidPrimeDot(up, up) : null;
+      const transformOrthonormal = transformVectorsFinite
+        && rightLengthSq >= 0.9 && rightLengthSq <= 1.1
+        && forwardLengthSq >= 0.9 && forwardLengthSq <= 1.1
+        && upLengthSq >= 0.9 && upLengthSq <= 1.1
+        && Math.abs(metroidPrimeDot(right, forward)) <= 0.1
+        && Math.abs(metroidPrimeDot(right, up)) <= 0.1
+        && Math.abs(metroidPrimeDot(forward, up)) <= 0.1;
+      const angularVelocityAlongUp =
+        metroidPrimeFiniteVector(angularVelocity) && metroidPrimeFiniteVector(up)
+          ? metroidPrimeDot(angularVelocity, up)
+          : null;
+      const torqueAlongUp =
+        metroidPrimeFiniteVector(torque) && metroidPrimeFiniteVector(up)
+          ? metroidPrimeDot(torque, up)
+          : null;
+      const finalInput = managerMapped ? {
+        time: guestF32(finalInputAddress),
+        controllerIndex: guestU32(finalInputAddress + 4),
+        leftX: guestF32(finalInputAddress + 8),
+        leftY: guestF32(finalInputAddress + 0xc),
+        rightX: guestF32(finalInputAddress + 0x10),
+        rightY: guestF32(finalInputAddress + 0x14),
+        leftTrigger: guestF32(finalInputAddress + 0x18),
+        rightTrigger: guestF32(finalInputAddress + 0x1c),
+        analogEdgeLeftX: guestU8(finalInputAddress + 0x20),
+        analogEdgeLeftY: guestU8(finalInputAddress + 0x21),
+        analogEdgeRightX: guestU8(finalInputAddress + 0x22),
+        analogEdgeRightY: guestU8(finalInputAddress + 0x23),
+        previousLeftTrigger: guestF32(finalInputAddress + 0x24),
+        previousRightTrigger: guestF32(finalInputAddress + 0x28),
+        buttons1: guestU8(finalInputAddress + 0x2c),
+        buttons2: guestU8(finalInputAddress + 0x2d),
+        buttons3: guestU8(finalInputAddress + 0x2e),
+      } : null;
+      const finalInputFinite = finalInput !== null
+        && Number.isFinite(finalInput.time)
+        && finalInput.time > 0
+        && finalInput.time <= 1
+        && [
+          finalInput.leftX,
+          finalInput.leftY,
+          finalInput.rightX,
+          finalInput.rightY,
+        ].every(value => Number.isFinite(value) && value >= -1 && value <= 1)
+        && [
+          finalInput.leftTrigger,
+          finalInput.rightTrigger,
+          finalInput.previousLeftTrigger,
+          finalInput.previousRightTrigger,
+        ].every(value => Number.isFinite(value) && value >= 0 && value <= 1)
+        && [
+          finalInput.analogEdgeLeftX,
+          finalInput.analogEdgeLeftY,
+          finalInput.analogEdgeRightX,
+          finalInput.analogEdgeRightY,
+        ].every(value => value === 0 || value === 1);
+      const inputFrameValid = finalInputFinite
+        && finalInput.controllerIndex === 0;
+      const neutralInput = inputFrameValid
+        && finalInput.leftX === 0
+        && finalInput.leftY === 0
+        && finalInput.rightX === 0
+        && finalInput.rightY === 0
+        && finalInput.leftTrigger === 0
+        && finalInput.rightTrigger === 0
+        && finalInput.buttons1 === 0
+        && finalInput.buttons2 === 0
+        && finalInput.buttons3 === 0;
+      const hostLeftRetained = inputFrameValid
+        && finalInput.leftX >= -1
+        && finalInput.leftX <= -0.5
+        && Math.abs(finalInput.leftY) <= 0.125
+        && Math.abs(finalInput.rightX) <= 0.125
+        && Math.abs(finalInput.rightY) <= 0.125
+        && finalInput.leftTrigger === 0
+        && finalInput.rightTrigger === 0
+        && finalInput.previousLeftTrigger === 0
+        && finalInput.previousRightTrigger === 0
+        && finalInput.buttons1 === 0
+        && finalInput.buttons2 === 0x20
+        && (finalInput.buttons3 === 0 || finalInput.buttons3 === 0x02);
+
+      const firstArea = worldMapped
+        && worldAssetId === 0x158efe17
+        && worldArea === 0
+        && managerArea === 0
+        && playerArea === 0;
+      const playerEntityActive = playerMapped
+        && (entityFlags & 0xf0) === 0x80
+        && playerUniqueId !== 0xffff;
+      const lifecycleRunning = initPhase === 2
+        && gameState === 0
+        && playerAlive
+        && playerEntityActive
+        && Number.isFinite(deathTime)
+        && deathTime === 0;
+      const controlsEnabled = cameraInputEnabled
+        && playerCameraState === 0
+        && morphState === 0
+        && orbitState === 0
+        && Number.isFinite(frozenTimeout)
+        && frozenTimeout <= 0
+        && controlsFrozen === 0
+        && playerDisablesInput === false;
+      const playerEnumsValid = Number.isSafeInteger(movementState)
+        && movementState >= 0
+        && movementState <= 4
+        && Number.isSafeInteger(surfaceRestraint)
+        && surfaceRestraint >= 0
+        && surfaceRestraint <= 7;
+      const controllableFrigate = exactIdentity
+        && managerMapped
+        && playerMapped
+        && worldMapped
+        && playerStateMapped
+        && firstArea
+        && lifecycleRunning
+        && controlsEnabled
+        && playerEnumsValid
+        && transformOrthonormal
+        && inputFrameValid;
+      const guestConsumedHostLeft = controllableFrigate
+        && hostLeftRetained;
+
+      return {
+        identity: {
+          headerAddress: "0x80000000",
+          gameCode: hex32(headerGameCode),
+          makerCode: headerMakerCode,
+          discNumber: headerDiscNumber,
+          revision: headerRevision,
+          exact: exactIdentity,
+        },
+        manager: {
+          address: hex32(managerAddress),
+          mapped: managerMapped,
+          playerPointerAddress: hex32(playerPointerAddress),
+          player: metroidPrimeMappedPointer(playerValue, 1)
+            ? hex32(playerValue)
+            : null,
+          worldPointerAddress: hex32(worldPointerAddress),
+          world: worldMapped ? hex32(worldValue) : null,
+          cameraManagerPointerAddress: hex32(cameraManagerPointerAddress),
+          cameraManager: cameraManagerMapped
+            ? hex32(cameraManagerValue)
+            : null,
+          playerStateRefDataPointerAddress:
+            hex32(playerStateRefDataPointerAddress),
+          nextAreaAddress: hex32(managerAddress + 0x8cc),
+          nextArea: managerArea,
+          inputFrameAddress: hex32(managerAddress + 0x8d4),
+          inputFrame,
+          updateFrameAddress: hex32(managerAddress + 0x8d8),
+          updateFrame,
+          gameStateAddress: hex32(managerAddress + 0x904),
+          gameState,
+          initPhaseAddress: hex32(managerAddress + 0xb3c),
+          initPhase,
+        },
+        world: {
+          address: worldMapped ? hex32(worldValue) : null,
+          assetIdAddress: worldMapped ? hex32(worldValue + 8) : null,
+          assetId: worldAssetId,
+          areaAddress: worldMapped ? hex32(worldValue + 0x68) : null,
+          area: worldArea,
+          firstArea,
+        },
+        camera: {
+          manager: cameraManagerMapped ? hex32(cameraManagerValue) : null,
+          currentIdAddress: cameraManagerMapped
+            ? hex32(cameraManagerValue)
+            : null,
+          currentId: currentCameraId,
+          cinematicCountAddress: cameraManagerMapped
+            ? hex32(cameraManagerValue + 8)
+            : null,
+          cinematicCount: cinematicCameraCount,
+          firstPersonPointerAddress: hex32(firstPersonCameraPointerAddress),
+          firstPerson: firstPersonCameraMapped
+            ? hex32(firstPersonCameraValue)
+            : null,
+          firstPersonId: firstPersonCameraId,
+          flagsAddress: firstPersonCameraMapped
+            ? hex32(firstPersonCameraValue + 0x180)
+            : null,
+          flags: firstPersonCameraFlags,
+          disablesInput: cameraDisablesInput,
+          firstPersonActive: firstPersonCameraActive,
+          inputEnabled: cameraInputEnabled,
+        },
+        playerState: {
+          refData: playerStateRefDataMapped
+            ? hex32(playerStateRefDataValue)
+            : null,
+          refCount: playerStateRefCount,
+          address: playerStateMapped ? hex32(playerStateValue) : null,
+          flagsAddress: playerStateMapped ? hex32(playerStateValue) : null,
+          flags: playerStateFlags,
+          alive: playerAlive,
+        },
+        player: {
+          expectedAddress: hex32(expectedPlayerAddress),
+          address: playerMapped ? hex32(playerValue) : null,
+          valid: playerMapped,
+          areaAddress: playerMapped ? hex32(expectedPlayerAddress + 4) : null,
+          area: playerArea,
+          uniqueIdAddress: playerMapped ? hex32(expectedPlayerAddress + 8) : null,
+          uniqueId: playerUniqueId,
+          entityFlagsAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x30)
+            : null,
+          entityFlags,
+          entityActive: playerEntityActive,
+          transform: {
+            address: hex32(transformAddress),
+            rightAddresses: transformAddresses?.right.map(hex32) ?? null,
+            right,
+            forwardAddresses: transformAddresses?.forward.map(hex32) ?? null,
+            forward,
+            upAddresses: transformAddresses?.up.map(hex32) ?? null,
+            up,
+            positionAddresses: transformAddresses?.position.map(hex32) ?? null,
+            position,
+            orthonormal: transformOrthonormal,
+          },
+          velocityAddress: hex32(velocityAddress),
+          velocity,
+          angularVelocityAddress: hex32(angularVelocityAddress),
+          angularVelocity,
+          torqueAddress: hex32(torqueAddress),
+          torque,
+          movementStateAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x268)
+            : null,
+          movementState,
+          surfaceRestraintAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x2bc)
+            : null,
+          surfaceRestraint,
+          cameraStateAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x304)
+            : null,
+          cameraState: playerCameraState,
+          morphStateAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x308)
+            : null,
+          morphState,
+          orbitStateAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x314)
+            : null,
+          orbitState,
+          frozenTimeoutAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x760)
+            : null,
+          frozenTimeout,
+          controlsFrozenAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x770)
+            : null,
+          controlsFrozen,
+          inputFlagsAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0x9d6)
+            : null,
+          inputFlags: playerInputFlags,
+          disablesInput: playerDisablesInput,
+          deathTimeAddress: playerMapped
+            ? hex32(expectedPlayerAddress + 0xa04)
+            : null,
+          deathTime,
+        },
+        input: {
+          address: hex32(finalInputAddress),
+          ...finalInput,
+          valid: inputFrameValid,
+          neutral: neutralInput,
+          hostLeftRetained,
+        },
+        turn: {
+          angularVelocityAlongUp,
+          torqueAlongUp,
+        },
+        lifecycleRunning,
+        controlsEnabled,
+        controllableFrigate,
+        guestConsumedHostLeft,
+        lastActiveGameplayInput: metroidPrimeLastActiveGameplayInput,
+      };
+    }
+
+    function sampleMetroidPrimeGameplayInput(sampleCycle) {
+      if (
+        boot.identifier !== "GM8E01"
+        || boot.version !== 2
+        || metroidPrimeLastActiveGameplayInput !== null
+      ) return;
+      const publication = serialLastActiveHostPublication;
+      if (
+        !Number.isSafeInteger(sampleCycle)
+        || sampleCycle < 0
+        || publication === null
+        || publication.buttons !== 0x0001
+        || !Number.isSafeInteger(publication.sequence)
+        || publication.sequence <= 0
+        || !Number.isSafeInteger(publication.pollIndex)
+        || publication.pollIndex <= 0
+        || !Number.isSafeInteger(publication.scheduledCycle)
+        || publication.scheduledCycle < 0
+        || !Number.isSafeInteger(publication.observedCycle)
+        || publication.observedCycle < 0
+        || publication.scheduledCycle > publication.observedCycle
+        || publication.observedCycle > sampleCycle
+        || controllerAppliedSequence !== publication.sequence
+      ) return;
+      const state = inspectMetroidPrimeGameState();
+      if (
+        state?.controllableFrigate !== true
+        || state.guestConsumedHostLeft !== true
+      ) return;
+      metroidPrimeLastActiveGameplayInput = {
+        cycle: sampleCycle,
+        controllerAppliedSequence,
+        hostPublication: { ...publication },
+        manager: state.manager.address,
+        player: state.player.address,
+        world: state.world.address,
+        worldAssetId: state.world.assetId,
+        area: state.world.area,
+        inputFrame: state.manager.inputFrame,
+        updateFrame: state.manager.updateFrame,
+        position: { ...state.player.transform.position },
+        forward: { ...state.player.transform.forward },
+        up: { ...state.player.transform.up },
+        angularVelocity: { ...state.player.angularVelocity },
+        torque: { ...state.player.torque },
+        input: {
+          time: state.input.time,
+          controllerIndex: state.input.controllerIndex,
+          leftX: state.input.leftX,
+          leftY: state.input.leftY,
+          rightX: state.input.rightX,
+          rightY: state.input.rightY,
+          leftTrigger: state.input.leftTrigger,
+          rightTrigger: state.input.rightTrigger,
+          buttons1: state.input.buttons1,
+          buttons2: state.input.buttons2,
+          buttons3: state.input.buttons3,
+        },
+        turn: {
+          angularVelocityAlongUp: state.turn.angularVelocityAlongUp,
+          torqueAlongUp: state.turn.torqueAlongUp,
+        },
+        lifecycle: {
+          gameState: state.manager.gameState,
+          initPhase: state.manager.initPhase,
+          playerStateFlags: state.playerState.flags,
+          entityFlags: state.player.entityFlags,
+          cameraState: state.player.cameraState,
+          morphState: state.player.morphState,
+          orbitState: state.player.orbitState,
+          frozenTimeout: state.player.frozenTimeout,
+          controlsFrozen: state.player.controlsFrozen,
+          playerInputFlags: state.player.inputFlags,
+          deathTime: state.player.deathTime,
+        },
+        camera: {
+          manager: state.camera.manager,
+          firstPerson: state.camera.firstPerson,
+          currentId: state.camera.currentId,
+          firstPersonId: state.camera.firstPersonId,
+          cinematicCount: state.camera.cinematicCount,
+          flags: state.camera.flags,
+        },
+      };
+    }
+
     function inspectWarioWareGameState() {
       if (boot.identifier !== "GZWE01") return null;
 
@@ -16860,7 +17480,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         ?? inspectWindWakerGameState()
         ?? inspectMeleeGameState()
         ?? inspectFzeroGameState()
-        ?? inspectWarioWareGameState();
+        ?? inspectWarioWareGameState()
+        ?? (
+          boot.identifier === "GM8E01"
+            ? inspectMetroidPrimeGameState()
+            : null
+        );
     }
 
     function sampleGuestGameplayInput(sampleCycle) {
@@ -16869,6 +17494,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       sampleMeleeGameplayInput(sampleCycle);
       sampleFzeroGameplayInput(sampleCycle);
       sampleWarioWareGameplayInput(sampleCycle);
+      if (boot.identifier === "GM8E01") {
+        sampleMetroidPrimeGameplayInput(sampleCycle);
+      }
     }
 
     function hex32(value) {
