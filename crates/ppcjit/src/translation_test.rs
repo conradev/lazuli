@@ -169,6 +169,10 @@ fn lswx(rd: u8, ra: u8, rb: u8) -> Ins {
     )
 }
 
+fn dcbz_l(ra: u8, rb: u8) -> Ins {
+    instruction(0x1000_07ec | u32::from(ra) << 16 | u32::from(rb) << 11)
+}
+
 fn stwcx(rs: u8, ra: u8, rb: u8) -> Ins {
     instruction(
         31 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 150 << 1 | 1,
@@ -409,6 +413,359 @@ if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
             &Reg::PC.offset().to_string(),
             &SPR::SRR1.offset().to_string(),
             &(Exception::Program as u16).to_string(),
+            &ProgramExceptionCause::IllegalInstruction
+                .srr1_bits()
+                .to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_dcbz_l_certifies_locked_cache_fast_slow_and_exception_paths() {
+    let zero_base = dcbz_l(0, 3);
+    let corpus_indexed = dcbz_l(6, 3);
+    assert_eq!(zero_base.code, 0x1000_1fec);
+    assert_eq!(corpus_indexed.code, 0x1006_1fec);
+    assert_eq!(zero_base.op, GuestOpcode::DcbzL);
+    assert_eq!(corpus_indexed.op, GuestOpcode::DcbzL);
+
+    // addi r5,r5,1 verifies that an enabled dcbz_l is a continuing instruction.
+    let trailing = instruction(0x38a5_0001);
+    let zero_slow = translate_with_cycle_publication([zero_base, trailing]);
+    let indexed_slow = translate_with_cycle_publication([corpus_indexed, trailing]);
+    for (translated, expected) in [
+        (&zero_slow, [zero_base, trailing]),
+        (&indexed_slow, [corpus_indexed, trailing]),
+    ] {
+        verify_function(
+            &translated.function,
+            &settings::Flags::new(settings::builder()),
+        )
+        .unwrap();
+        assert_eq!(translated.sequence.0, expected);
+        assert_eq!(translated.cycles, 4);
+        assert_eq!(translated.exit, TranslationExit::Fallthrough);
+        assert_eq!(
+            user_hook_call_count(&translated.function, HookKind::WriteI32),
+            8
+        );
+        let write_cycles = hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET)
+            .into_iter()
+            .filter(|(namespace, index, _)| *namespace == 0 && *index == HookKind::WriteI32 as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(write_cycles, vec![(0, HookKind::WriteI32 as u32, 0); 8]);
+    }
+
+    let mut direct_translator = Translator::new(cycle_config(ExitMode::ReturnExecuted));
+    let indexed_direct = direct_translator
+        .translate([corpus_indexed, trailing].into_iter())
+        .unwrap();
+    verify_function(
+        &indexed_direct.function,
+        &settings::Flags::new(settings::builder()),
+    )
+    .unwrap();
+    assert_eq!(indexed_direct.sequence.0, [corpus_indexed, trailing]);
+    assert_eq!(indexed_direct.cycles, 4);
+    assert_eq!(indexed_direct.exit, TranslationExit::Fallthrough);
+    assert_eq!(
+        user_hook_call_count(&indexed_direct.function, HookKind::WriteI32),
+        0
+    );
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let zero_slow = lower_portable(&zero_slow.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let indexed_slow = lower_portable(&indexed_slow.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let indexed_direct = lower_portable(&indexed_direct.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let script = r#"
+const [
+  zeroSlowHex,
+  indexedSlowHex,
+  indexedDirectHex,
+  cycleOffset,
+  pcOffset,
+  r3Offset,
+  r5Offset,
+  r6Offset,
+  hid2Offset,
+  srr1Offset,
+  darOffset,
+  dsisrOffset,
+  writeI32Hook,
+  programException,
+  dsiException,
+  illegalCause,
+] = process.argv.slice(1).map((value, index) => index < 3 ? value : Number(value));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const lockedCachePage = 0x40000;
+const lockedCacheBase = 0xe0000000;
+const lockedCacheLine = 0x20;
+const hid2Lce = 0x10000000;
+const initialPc = 0x80006000;
+const guard = 0xa5;
+
+function createState() {
+  const memory = new WebAssembly.Memory({ initial: 8 });
+  const view = new DataView(memory.buffer);
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  return { memory, view };
+}
+
+function mapLockedCache(view) {
+  view.setUint32(fastmem + (lockedCacheBase >>> 17) * 4, lockedCachePage, true);
+}
+
+function guardedCache(memory, page = lockedCachePage) {
+  const bytes = new Uint8Array(memory.buffer, page, 0x60);
+  bytes.fill(guard);
+  return bytes;
+}
+
+function assertGuardedZeroLine(bytes, label) {
+  for (let index = 0; index < bytes.length; index++) {
+    const expected = index >= lockedCacheLine && index < lockedCacheLine + 32 ? 0 : guard;
+    if (bytes[index] !== expected) {
+      throw new Error(`${label} changed cache byte 0x${index.toString(16)} to 0x${bytes[index].toString(16)}`);
+    }
+  }
+}
+
+function assertGuardOnly(bytes, label) {
+  if (!bytes.every((byte) => byte === guard)) {
+    throw new Error(`${label} modified locked-cache backing`);
+  }
+}
+
+async function instantiate(hex, memory, hooks) {
+  return WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+}
+
+async function executeSlowSuccess() {
+  const { memory, view } = createState();
+  const cache = new Uint8Array(0x60).fill(guard);
+  const cacheView = new DataView(cache.buffer);
+  const events = [];
+  view.setUint32(cpu + hid2Offset, hid2Lce, true);
+  view.setUint32(cpu + r3Offset, lockedCacheBase + 0x3d, true);
+  view.setUint32(cpu + r5Offset, 0x1234, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`](hookContext, address, value) {
+      const unsignedAddress = address >>> 0;
+      events.push([
+        "write",
+        view.getUint32(hookContext + cycleOffset, true),
+        unsignedAddress,
+        value >>> 0,
+      ]);
+      const offset = unsignedAddress - lockedCacheBase;
+      cacheView.setInt32(offset, value, false);
+      return 1;
+    },
+    user_1_0() {
+      throw new Error("slow dcbz_l success raised an exception");
+    },
+  };
+  const { instance } = await instantiate(zeroSlowHex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00040002) {
+    throw new Error(`slow dcbz_l returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 8) {
+    throw new Error("slow dcbz_l did not continue through trailing addi");
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 0x1235) {
+    throw new Error("slow dcbz_l did not execute trailing addi");
+  }
+  const expected = Array.from({ length: 8 }, (_, index) => [
+    "write",
+    0,
+    lockedCacheBase + lockedCacheLine + index * 4,
+    0,
+  ]);
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`slow dcbz_l observed ${JSON.stringify(events)}`);
+  }
+  assertGuardedZeroLine(cache, "slow dcbz_l");
+}
+
+async function executeSlowFault() {
+  const { memory, view } = createState();
+  const cache = new Uint8Array(0x60).fill(guard);
+  const events = [];
+  view.setUint32(cpu + hid2Offset, hid2Lce, true);
+  view.setUint32(cpu + r3Offset, lockedCacheBase + 0x3d, true);
+  view.setUint32(cpu + r5Offset, 0x55aa, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`](hookContext, address, value) {
+      events.push([
+        "write",
+        view.getUint32(hookContext + cycleOffset, true),
+        address >>> 0,
+        value >>> 0,
+      ]);
+      view.setUint32(cpu + dsisrOffset, 0x42000000, true);
+      return 0;
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + darOffset, true),
+        view.getUint32(registers + dsisrOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await instantiate(zeroSlowHex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00020001) {
+    throw new Error(`faulting dcbz_l crossed its boundary: 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("faulting dcbz_l advanced PC");
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 0x55aa) {
+    throw new Error("faulting dcbz_l executed trailing addi");
+  }
+  const expectedAddress = lockedCacheBase + lockedCacheLine;
+  if (view.getUint32(cpu + darOffset, true) !== expectedAddress) {
+    throw new Error("faulting dcbz_l recorded an unaligned DAR");
+  }
+  const expected = [
+    ["write", 0, expectedAddress, 0],
+    ["exception", 0, cpu, dsiException, expectedAddress, 0x42000000],
+  ];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`faulting dcbz_l observed ${JSON.stringify(events)}`);
+  }
+  assertGuardOnly(cache, "faulting dcbz_l");
+}
+
+async function executeDisabled() {
+  const { memory, view } = createState();
+  const cache = new Uint8Array(0x60).fill(guard);
+  const events = [];
+  const postHookSrr1 = 0x80010042;
+  view.setUint32(cpu + r6Offset, lockedCacheBase + 0x20, true);
+  view.setUint32(cpu + r3Offset, 0x1d, true);
+  view.setUint32(cpu + r5Offset, 0x55aa, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`]() {
+      throw new Error("disabled dcbz_l reached memory");
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+      ]);
+      view.setUint32(registers + srr1Offset, postHookSrr1, true);
+    },
+  };
+  const { instance } = await instantiate(indexedSlowHex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00020001) {
+    throw new Error(`disabled dcbz_l returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("disabled dcbz_l advanced PC");
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 0x55aa) {
+    throw new Error("disabled dcbz_l executed trailing addi");
+  }
+  if (view.getUint32(cpu + srr1Offset, true) !== (postHookSrr1 | illegalCause) >>> 0) {
+    throw new Error("disabled dcbz_l did not record Illegal Instruction");
+  }
+  const expected = [[0, cpu, programException]];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`disabled dcbz_l observed ${JSON.stringify(events)}`);
+  }
+  assertGuardOnly(cache, "disabled dcbz_l");
+}
+
+async function executeFast(hex, label) {
+  const { memory, view } = createState();
+  mapLockedCache(view);
+  const cache = guardedCache(memory);
+  view.setUint32(cpu + hid2Offset, hid2Lce, true);
+  view.setUint32(cpu + r6Offset, lockedCacheBase + 0x20, true);
+  view.setUint32(cpu + r3Offset, 0x1d, true);
+  view.setUint32(cpu + r5Offset, 9, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`]() {
+      throw new Error(`${label} called the slow write hook`);
+    },
+    user_1_0() {
+      throw new Error(`${label} raised an exception`);
+    },
+  };
+  const { instance } = await instantiate(hex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00040002) {
+    throw new Error(`${label} returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 8) {
+    throw new Error(`${label} did not continue through trailing addi`);
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 10) {
+    throw new Error(`${label} did not execute trailing addi`);
+  }
+  assertGuardedZeroLine(cache, label);
+}
+
+await executeSlowSuccess();
+await executeSlowFault();
+await executeDisabled();
+await executeFast(indexedSlowHex, "slow-capable fastmem dcbz_l");
+await executeFast(indexedDirectHex, "direct fastmem dcbz_l");
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &zero_slow,
+            &indexed_slow,
+            &indexed_direct,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &GPR::R3.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &GPR::R6.offset().to_string(),
+            &SPR::HID2.offset().to_string(),
+            &SPR::SRR1.offset().to_string(),
+            &SPR::DAR.offset().to_string(),
+            &SPR::DSISR.offset().to_string(),
+            &(HookKind::WriteI32 as u32).to_string(),
+            &(Exception::Program as u16).to_string(),
+            &(Exception::DSI as u16).to_string(),
             &ProgramExceptionCause::IllegalInstruction
                 .srr1_bits()
                 .to_string(),
