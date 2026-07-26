@@ -28,6 +28,9 @@ import {
   projectMeleeGuestConsumption,
 } from "./browser_game_first_playable_melee.mjs";
 import {
+  projectFzeroGuestConsumption,
+} from "./browser_game_first_playable_fzero.mjs";
+import {
   projectWarioWareGuestConsumption,
 } from "./browser_game_first_playable_warioware.mjs";
 
@@ -41,6 +44,7 @@ function projectSupportedGuestConsumption(options) {
   return projectLuigisMansionGuestConsumption(options)
     ?? projectWindWakerGuestConsumption(options)
     ?? projectMeleeGuestConsumption(options)
+    ?? projectFzeroGuestConsumption(options)
     ?? projectWarioWareGuestConsumption(options);
 }
 
