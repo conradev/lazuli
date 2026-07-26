@@ -22,6 +22,9 @@ import {
   projectLuigisMansionGuestConsumption,
 } from "./browser_game_first_playable_luigi.mjs";
 import {
+  projectWindWakerGuestConsumption,
+} from "./browser_game_first_playable_wind_waker.mjs";
+import {
   projectWarioWareGuestConsumption,
 } from "./browser_game_first_playable_warioware.mjs";
 
@@ -33,6 +36,7 @@ export {
 
 function projectSupportedGuestConsumption(options) {
   return projectLuigisMansionGuestConsumption(options)
+    ?? projectWindWakerGuestConsumption(options)
     ?? projectWarioWareGuestConsumption(options);
 }
 
