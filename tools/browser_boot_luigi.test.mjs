@@ -43,9 +43,13 @@ function makeContext(identifier = "GLME01", version = 0) {
     inspectSuperMonkeyBallGameState() {
       return identifier === "GMBE8P" ? { game: "smb" } : null;
     },
+    inspectWindWakerGameState() {
+      return identifier === "GZLE01" ? { game: "wind" } : null;
+    },
     inspectWarioWareGameState() {
       return identifier === "GZWE01" ? { game: "wario" } : null;
     },
+    sampleWindWakerGameplayInput() {},
     sampleWarioWareGameplayInput() {},
   };
   vm.createContext(context);
@@ -296,10 +300,13 @@ test("guest diagnostics and VI sampling dispatch through exact retail identity",
     JSON.parse(JSON.stringify(makeContext("GZWE01").inspectGuestGameState())),
     { game: "wario" },
   );
-  assert.equal(makeContext("GZLE01").inspectGuestGameState(), null);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(makeContext("GZLE01").inspectGuestGameState())),
+    { game: "wind" },
+  );
   assert.match(
     source,
-    /function sampleGuestGameplayInput\(sampleCycle\) \{\s+sampleLuigisMansionGameplayInput\(sampleCycle\);\s+sampleWarioWareGameplayInput\(sampleCycle\);/,
+    /function sampleGuestGameplayInput\(sampleCycle\) \{\s+sampleLuigisMansionGameplayInput\(sampleCycle\);\s+sampleWindWakerGameplayInput\(sampleCycle\);\s+sampleWarioWareGameplayInput\(sampleCycle\);/,
   );
   assert.match(
     source,

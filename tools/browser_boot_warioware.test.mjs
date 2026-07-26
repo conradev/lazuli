@@ -60,6 +60,9 @@ function makeContext(identifier = "GZWE01") {
     inspectLuigisMansionGameState() {
       return null;
     },
+    inspectWindWakerGameState() {
+      return identifier === "GZLE01" ? { game: "wind" } : null;
+    },
   };
   vm.createContext(context);
   vm.runInContext([
@@ -1345,7 +1348,10 @@ test("WarioWare guest input latch requires live Repellion and a matching host A"
 });
 
 test("guest game diagnostics dispatch by exact retail identity", () => {
-  assert.equal(makeContext("GZLE01").inspectGuestGameState(), null);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(makeContext("GZLE01").inspectGuestGameState())),
+    { game: "wind" },
+  );
   assert.deepEqual(
     JSON.parse(JSON.stringify(makeContext("GMBE8P").inspectGuestGameState())),
     { game: "smb" },

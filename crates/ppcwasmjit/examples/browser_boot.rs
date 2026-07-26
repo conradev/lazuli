@@ -1055,6 +1055,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let smbReadyPlayAnchor = null;
     let wariowareLastActiveGameplayInput = null;
     let luigisMansionLastActiveGameplayInput = null;
+    let windWakerLastActiveGameplayInput = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -15659,6 +15660,237 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function windWakerMappedPointer(value, length = 1) {
+      return Number.isSafeInteger(value)
+        && Number.isSafeInteger(length)
+        && length > 0
+        && value >= 0x80000000
+        && value <= 0x81800000 - length
+        && ramPointer(value, length) !== null;
+    }
+
+    function inspectWindWakerPosition(address) {
+      if (!windWakerMappedPointer(address, 12)) return null;
+      return {
+        x: guestF32(address),
+        y: guestF32(address + 4),
+        z: guestF32(address + 8),
+      };
+    }
+
+    function inspectWindWakerGameState() {
+      if (boot.identifier !== "GZLE01" || boot.version !== 0) return null;
+
+      // These addresses and layouts are from retail GZLE01 revision zero.
+      // Outset Island is room 44 of the "sea" stage. The player pointers,
+      // stage/event state, controller interface, and PLAYER profile are all
+      // independently pinned so a menu or cutscene cannot masquerade as
+      // controllable island gameplay.
+      const currentStageAddress = 0x803c9d3c;
+      const stayRoomAddress = 0x803f6a78;
+      const eventModeAddress = 0x803c9ea2;
+      const menuPauseAddress = 0x803f7097;
+      const pauseTimerAddress = 0x803f72b0;
+      const playerPointerAddress = 0x803ca74c;
+      const linkPlayerPointerAddress = 0x803ca754;
+      const controllerAddress = 0x803a4df0;
+      const playerProfile = 0x8038fd8c;
+      const playerProcessName = 0x00a9;
+      const outsetRoom = 44;
+
+      const stageNameBytes = Array.from(
+        { length: 8 },
+        (_, index) => guestU8(currentStageAddress + index),
+      );
+      const stageNameTerminator = stageNameBytes.indexOf(0);
+      const stageName = stageNameBytes.every(Number.isSafeInteger)
+          && stageNameTerminator >= 0
+        ? String.fromCharCode(...stageNameBytes.slice(0, stageNameTerminator))
+        : null;
+      const currentStageRoom = guestU8(currentStageAddress + 0x0a);
+      const stayRoom = guestU8(stayRoomAddress);
+      const eventMode = guestU8(eventModeAddress);
+      const menuPause = guestU8(menuPauseAddress);
+      const pauseTimer = guestU8(pauseTimerAddress);
+
+      const playerValue = guestU32(playerPointerAddress);
+      const linkPlayerValue = guestU32(linkPlayerPointerAddress);
+      const playerMapped = windWakerMappedPointer(playerValue, 0x4c28);
+      const pointersMatch = playerMapped && playerValue === linkPlayerValue;
+      const actualProcessName = playerMapped ? guestU16(playerValue + 8) : null;
+      const actualProfile = playerMapped ? guestU32(playerValue + 0x10) : null;
+      const playerPauseFlag = playerMapped ? guestU8(playerValue + 0x0b) : null;
+      const playerValid = pointersMatch
+        && actualProcessName === playerProcessName
+        && actualProfile === playerProfile;
+      const playerPositionAddress = playerValid ? playerValue + 0x1f8 : null;
+      const playerHeadingAddress = playerValid ? playerValue + 0x206 : null;
+      const playerRoomAddress = playerValid ? playerValue + 0x20a : null;
+      const playerPosition = playerPositionAddress === null
+        ? null
+        : inspectWindWakerPosition(playerPositionAddress);
+      const playerHeading = playerHeadingAddress === null
+        ? null
+        : guestU16(playerHeadingAddress);
+      const playerRoom = playerRoomAddress === null
+        ? null
+        : guestU8(playerRoomAddress);
+
+      const controllerMapped = ramPointer(controllerAddress, 0x35) !== null;
+      const mainStickX = controllerMapped ? guestF32(controllerAddress) : null;
+      const mainStickY = controllerMapped
+        ? guestF32(controllerAddress + 4)
+        : null;
+      const mainStickValue = controllerMapped
+        ? guestF32(controllerAddress + 8)
+        : null;
+      const hold = controllerMapped ? guestU16(controllerAddress + 0x30) : null;
+      const trigger = controllerMapped
+        ? guestU16(controllerAddress + 0x32)
+        : null;
+      const controllerError = controllerMapped
+        ? guestU8(controllerAddress + 0x34)
+        : null;
+      const finitePosition = playerPosition !== null
+        && Number.isFinite(playerPosition.x)
+        && Number.isFinite(playerPosition.y)
+        && Number.isFinite(playerPosition.z);
+      const stageActive = stageName === "sea"
+        && currentStageRoom === outsetRoom
+        && stayRoom === outsetRoom
+        && playerRoom === outsetRoom;
+      const eventInactive = eventMode === 0;
+      const menuClosed = menuPause === 0 && pauseTimer === 0;
+      const controlsEnabled = playerValid
+        && controllerMapped
+        && controllerError === 0
+        && playerPauseFlag === 0;
+      const neutralInput = hold === 0
+        && trigger === 0
+        && mainStickX === 0
+        && mainStickY === 0
+        && mainStickValue === 0;
+      const controllableOutset = stageActive
+        && eventInactive
+        && menuClosed
+        && finitePosition
+        && controlsEnabled;
+
+      return {
+        currentStage: {
+          address: hex32(currentStageAddress),
+          name: stageName,
+          roomAddress: hex32(currentStageAddress + 0x0a),
+          room: currentStageRoom,
+        },
+        stayRoomAddress: hex32(stayRoomAddress),
+        stayRoom,
+        outsetRoom,
+        stageActive,
+        eventModeAddress: hex32(eventModeAddress),
+        eventMode,
+        eventInactive,
+        menuPauseAddress: hex32(menuPauseAddress),
+        menuPause,
+        pauseTimerAddress: hex32(pauseTimerAddress),
+        pauseTimer,
+        menuClosed,
+        playerLookup: {
+          playerPointerAddress: hex32(playerPointerAddress),
+          player: playerMapped ? hex32(playerValue) : null,
+          linkPlayerPointerAddress: hex32(linkPlayerPointerAddress),
+          linkPlayer: windWakerMappedPointer(linkPlayerValue, 0x4c28)
+            ? hex32(linkPlayerValue)
+            : null,
+          pointersMatch,
+        },
+        player: {
+          address: playerMapped ? hex32(playerValue) : null,
+          processNameAddress: playerMapped ? hex32(playerValue + 8) : null,
+          processName: actualProcessName,
+          profileAddress: playerMapped ? hex32(playerValue + 0x10) : null,
+          profile: hex32(actualProfile),
+          pauseFlagAddress: playerMapped ? hex32(playerValue + 0x0b) : null,
+          pauseFlag: playerPauseFlag,
+          valid: playerValid,
+          positionAddress: hex32(playerPositionAddress),
+          position: playerPosition,
+          headingAddress: hex32(playerHeadingAddress),
+          heading: playerHeading,
+          roomAddress: hex32(playerRoomAddress),
+          room: playerRoom,
+        },
+        pad: {
+          address: hex32(controllerAddress),
+          holdAddress: hex32(controllerAddress + 0x30),
+          hold,
+          triggerAddress: hex32(controllerAddress + 0x32),
+          trigger,
+          mainStickXAddress: hex32(controllerAddress),
+          mainStickX,
+          mainStickYAddress: hex32(controllerAddress + 4),
+          mainStickY,
+          mainStickValueAddress: hex32(controllerAddress + 8),
+          mainStickValue,
+          errorAddress: hex32(controllerAddress + 0x34),
+          error: controllerError,
+        },
+        controlsEnabled,
+        neutralInput,
+        controllableOutset,
+        lastActiveGameplayInput: windWakerLastActiveGameplayInput,
+      };
+    }
+
+    function sampleWindWakerGameplayInput(sampleCycle) {
+      if (boot.identifier !== "GZLE01" || boot.version !== 0) return;
+      const publication = serialLastActiveHostPublication;
+      if (
+        publication === null
+        || publication.buttons !== 0x0001
+        || !Number.isSafeInteger(publication.scheduledCycle)
+        || !Number.isSafeInteger(publication.observedCycle)
+        || publication.scheduledCycle > publication.observedCycle
+        || publication.observedCycle > sampleCycle
+        || controllerAppliedSequence !== publication.sequence
+      ) return;
+      const previousSequence =
+        windWakerLastActiveGameplayInput?.hostPublication?.sequence;
+      if (
+        Number.isSafeInteger(previousSequence)
+        && previousSequence >= publication.sequence
+      ) return;
+      const state = inspectWindWakerGameState();
+      if (
+        state === null
+        || state.controllableOutset !== true
+        || state.pad.hold !== 0x8000
+        || !Number.isFinite(state.pad.mainStickX)
+        || state.pad.mainStickX > -0.5
+        || !Number.isFinite(state.pad.mainStickY)
+        || Math.abs(state.pad.mainStickY) > 0.125
+        || !Number.isFinite(state.pad.mainStickValue)
+        || state.pad.mainStickValue < 0.5
+      ) return;
+      windWakerLastActiveGameplayInput = {
+        cycle: sampleCycle,
+        controllerAppliedSequence,
+        hostPublication: { ...publication },
+        player: state.player.address,
+        stage: state.currentStage.name,
+        room: state.player.room,
+        position: { ...state.player.position },
+        heading: state.player.heading,
+        pad: {
+          hold: state.pad.hold,
+          trigger: state.pad.trigger,
+          mainStickX: state.pad.mainStickX,
+          mainStickY: state.pad.mainStickY,
+          mainStickValue: state.pad.mainStickValue,
+        },
+      };
+    }
+
     function inspectWarioWareGameState() {
       if (boot.identifier !== "GZWE01") return null;
 
@@ -15775,11 +16007,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     function inspectGuestGameState() {
       return inspectSuperMonkeyBallGameState()
         ?? inspectLuigisMansionGameState()
+        ?? inspectWindWakerGameState()
         ?? inspectWarioWareGameState();
     }
 
     function sampleGuestGameplayInput(sampleCycle) {
       sampleLuigisMansionGameplayInput(sampleCycle);
+      sampleWindWakerGameplayInput(sampleCycle);
       sampleWarioWareGameplayInput(sampleCycle);
     }
 
