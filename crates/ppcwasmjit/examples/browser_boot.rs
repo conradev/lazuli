@@ -13703,8 +13703,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const current = view.getUint16(mmio + 0x500a, false);
       const written = value & 0xffff;
       const interruptStatuses = 0x00a8;
-      const status = (current & interruptStatuses) & ~(written & interruptStatuses);
-      let next = (written & ~interruptStatuses) | status;
+      const hardwareOwned = interruptStatuses | 0x0200;
+      const status = (current & hardwareOwned) & ~(written & interruptStatuses);
+      let next = (written & ~hardwareOwned) | status;
       if ((written & 1) !== 0) {
         resetDspMailbox();
         resetDspAudioDma();
@@ -13894,6 +13895,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if (physical === 0x0c005002 && size === 2) {
         writeDspMailboxLow(value);
+        return 1;
+      }
+      if (physical === 0x0c005008 && size === 4) {
+        // Retail code can use one aligned word store whose low half lands on
+        // DSPCSR. The high half occupies an unmapped register lane.
+        writeDspControl(value & 0xffff);
         return 1;
       }
       if (physical === 0x0c00500a && size === 2) {

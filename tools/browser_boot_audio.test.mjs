@@ -314,6 +314,118 @@ test("DSP level interrupt re-enters with overlapping sources until every source 
   assert.equal(context.view.getUint32(0x3000, false) & 0x40, 0);
 });
 
+test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned word writes", () => {
+  const memory = new ArrayBuffer(0x50000);
+  let interrupts = 0;
+  const mmio = 0x20000;
+  const cpu = 0x40000;
+  const context = {
+    aram: new Uint8Array(0x1000),
+    aramTransfer: null,
+    bytes: new Uint8Array(memory),
+    cpu,
+    cycles: 1_000,
+    deviceEvents: new Map(),
+    dspScheduledMail: null,
+    initializeDspAudioSystem() {},
+    invalidateDataReservationForExternalWrite() {},
+    mmio,
+    msrOffset: 0,
+    pushDspMail() {},
+    ramPointer(address, size) {
+      return address + size <= mmio ? address : null;
+    },
+    resetDspAudioDma() {},
+    resetDspMailbox() {},
+    serviceDspAudioDma() {},
+    traceDsp() {},
+    translateDataRange(address) {
+      return address >= 0xc0000000
+        ? (address - 0xc0000000) >>> 0
+        : address >>> 0;
+    },
+    view: new DataView(memory),
+  };
+  context.raiseException = registers => {
+    interrupts += 1;
+    const msr = context.view.getUint32(registers + context.msrOffset, true);
+    context.view.setUint32(
+      registers + context.msrOffset,
+      msr & ~0x00008000,
+      true,
+    );
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "startAramDma",
+      "serviceAramDma",
+      "serviceDsp",
+      "writeDspControl",
+      "writeInteger",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.aram-interrupt.js" },
+  );
+
+  for (let index = 0; index < 32; index += 1) {
+    context.bytes[0x100 + index] = index ^ 0x5a;
+  }
+  context.view.setUint32(mmio + 0x5020, 0x100, false);
+  context.view.setUint32(mmio + 0x5024, 0x200, false);
+  context.view.setUint32(mmio + 0x3004, 0x00000040, false);
+
+  context.writeDspControl(0x0200);
+  assert.equal(
+    context.view.getUint16(mmio + 0x500a, false),
+    0,
+    "software cannot manufacture hardware-owned DMAState",
+  );
+
+  context.startAramDma(0x20);
+  const completionCycle = context.aramTransfer.completionCycle;
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0200);
+
+  assert.equal(context.writeInteger(0xcc005008, 0xabcd0000, 4), 1);
+  assert.equal(
+    context.view.getUint16(mmio + 0x500a, false),
+    0x0200,
+    "a CSR write cannot clear in-flight DMAState",
+  );
+  assert.equal(
+    context.view.getUint16(mmio + 0x5008, false),
+    0,
+    "the reserved high half of the aligned word store is ignored",
+  );
+
+  context.serviceDsp(completionCycle);
+  assert.deepEqual(
+    [...context.aram.subarray(0x200, 0x220)],
+    [...context.bytes.subarray(0x100, 0x120)],
+  );
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0020);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
+  assert.equal(interrupts, 0, "a pending ARINT remains gated by its mask");
+
+  assert.equal(context.writeInteger(0xcc005008, 0xdead0040, 4), 1);
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0060);
+  context.view.setUint32(cpu, 0x00008000, true);
+  context.serviceDsp(completionCycle);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0x40);
+  assert.equal(interrupts, 1, "enabling ARINTMASK exposes the pending level");
+
+  assert.equal(context.writeInteger(0xcc005008, 0xbeef0060, 4), 1);
+  assert.equal(
+    context.view.getUint16(mmio + 0x500a, false),
+    0x0040,
+    "writing ARINT acknowledges only the status and preserves its mask",
+  );
+  context.view.setUint32(cpu, 0x00008000, true);
+  context.serviceDsp(completionCycle);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
+  assert.equal(interrupts, 1);
+});
+
 test("CPU mailbox commits raw payload only after the low-half write", () => {
   const delivered = [];
   const memory = new ArrayBuffer(0x6000);
