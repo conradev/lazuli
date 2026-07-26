@@ -6024,6 +6024,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let dspUcodeHash = null;
     let dspMode = "rom";
     let dspUcodeBooted = false;
+    let dspFirstUnsupported = null;
     let dspAxCommandState = emptyDspAxCommandState();
     let dspZeldaCommandState = emptyDspZeldaCommandState();
     let dspScheduledMail = null;
@@ -11934,6 +11935,39 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
 
+    function latchDspFirstUnsupported(stage, reason, code = null) {
+      if (dspFirstUnsupported !== null) return;
+      // Slow hooks publish the issuing instruction's cycle, while the cached
+      // PC is committed only at a dispatch boundary. Keep that distinction
+      // explicit instead of claiming instruction-precise PC provenance.
+      dspFirstUnsupported = {
+        instructionCycle: cycles,
+        dispatchPc: pc >>> 0,
+        stage,
+        mode: dspMode,
+        reason,
+        ucodeHash:
+          dspUcodeHash === null ? null : dspUcodeHash >>> 0,
+        code: code === null ? null : code >>> 0,
+      };
+    }
+
+    function snapshotDspFirstUnsupported() {
+      if (dspFirstUnsupported === null) return null;
+      return {
+        instructionCycle: dspFirstUnsupported.instructionCycle,
+        dispatchPc: hex32(dspFirstUnsupported.dispatchPc),
+        stage: dspFirstUnsupported.stage,
+        mode: dspFirstUnsupported.mode,
+        reason: dspFirstUnsupported.reason,
+        ucodeHash:
+          dspFirstUnsupported.ucodeHash === null
+            ? null
+            : hex32(dspFirstUnsupported.ucodeHash),
+        code: dspFirstUnsupported.code,
+      };
+    }
+
     function loadNextDspMail() {
       if (dspCurrentMail !== null || dspMailQueue.length === 0) return;
       const entry = dspMailQueue.shift();
@@ -12107,6 +12141,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function rejectDspUcodeBoot(reason, details = {}) {
+      latchDspFirstUnsupported("ucode", reason);
       dspMode = "rom";
       dspUcodeBooted = false;
       dspAxCommandState = emptyDspAxCommandState();
@@ -12184,6 +12219,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function rejectDspAxCommand(reason, details = {}) {
+      latchDspFirstUnsupported("protocol", reason);
       dspAxCommandState.phase = "halted";
       dspAxCommandState.rejected = true;
       dspAxCommandState.reason = reason;
@@ -12369,6 +12405,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           index += 1;
           const arity = dspAxCommandArity(command);
           if (arity === null) {
+            latchDspFirstUnsupported("command", "unknown-command", command);
             return dspAxParseFailure("unknown-command", {
               command,
               list: listCount - 1,
@@ -12376,6 +12413,11 @@ const TEMPLATE: &str = r##"<!doctype html>
             });
           }
           if (command === 0x12 && dspUcodeHash === 0x4e8a8b21) {
+            latchDspFirstUnsupported(
+              "command",
+              "unsupported-command-for-ucode",
+              command
+            );
             return dspAxParseFailure("unsupported-command-for-ucode", {
               command,
               hash: hex32(dspUcodeHash),
@@ -12562,6 +12604,11 @@ const TEMPLATE: &str = r##"<!doctype html>
             return true;
           }
           if (action === 0x0001) {
+            latchDspFirstUnsupported(
+              "task",
+              "unsupported-task-switch",
+              action
+            );
             return rejectDspAxCommand("unsupported-task-switch", {
               mail: hex32(payload),
               canonicalMail: hex32(canonicalMail),
@@ -12587,6 +12634,11 @@ const TEMPLATE: &str = r##"<!doctype html>
             );
             return true;
           }
+          latchDspFirstUnsupported(
+            "task",
+            "unsupported-task-mail",
+            action
+          );
           return rejectDspAxCommand("unsupported-task-mail", {
             mail: hex32(payload),
             canonicalMail: hex32(canonicalMail),
@@ -12604,6 +12656,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function rejectDspZeldaCommand(reason, details = {}) {
+      latchDspFirstUnsupported("protocol", reason);
       dspZeldaCommandState.phase = "halted";
       dspZeldaCommandState.expectedWords = 0;
       dspZeldaCommandState.commandWordCount = 0;
@@ -12720,6 +12773,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           return true;
         }
         if (payload === 0xcdd10001) {
+          latchDspFirstUnsupported(
+            "task",
+            "unsupported-task-switch",
+            payload & 0xffff
+          );
           return rejectDspZeldaCommand("unsupported-task-switch", {
             mail: hex32(payload),
           });
@@ -12729,6 +12787,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           return true;
         }
         if (payload !== 0xcdd10003) {
+          latchDspFirstUnsupported(
+            "task",
+            "unsupported-task-mail",
+            payload & 0xffff
+          );
           return rejectDspZeldaCommand("unsupported-task-mail", {
             mail: hex32(payload),
           });
@@ -12759,6 +12822,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           || group !== expectedGroup
           || group > 3
         ) {
+          latchDspFirstUnsupported(
+            "protocol",
+            "unsupported-render-sync",
+            group
+          );
           return rejectDspZeldaCommand("unsupported-render-sync", {
             sync: hex32(payload),
             group,
@@ -12799,6 +12867,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           });
         }
         if (payload !== 5 && payload !== 3) {
+          latchDspFirstUnsupported(
+            "protocol",
+            "unsupported-count",
+            payload
+          );
           return rejectDspZeldaCommand("unsupported-count", {
             count: hex32(payload),
           });
@@ -12837,6 +12910,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           ? 3
           : null;
       if (expectedCommandWords === null) {
+        latchDspFirstUnsupported(
+          "command",
+          "unsupported-command",
+          command
+        );
         return rejectDspZeldaCommand("unsupported-command", {
           command,
           commandMail: hex32(commandMail),
@@ -22164,6 +22242,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             ...diskAudioTiming(),
             output: "hardware-state-only",
           },
+        },
+        audioCompatibility: {
+          dspFirstUnsupported: snapshotDspFirstUnsupported(),
         },
         controller: {
           sequence: controllerSequence,

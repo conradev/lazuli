@@ -52,6 +52,8 @@ const dspFunctionNames = [
   "dspUcodeHashEctor",
   "classifyDspUcode",
   "traceDsp",
+  "latchDspFirstUnsupported",
+  "snapshotDspFirstUnsupported",
   "loadNextDspMail",
   "pushDspMail",
   "consumeDspMail",
@@ -89,6 +91,7 @@ function dspContext(payload = axHashFixture) {
     dspAxCommandState: null,
     dspCpuMailbox: 0,
     dspCurrentMail: null,
+    dspFirstUnsupported: null,
     dspMailQueue: [],
     dspMode: "rom",
     dspRomParameter: null,
@@ -209,6 +212,7 @@ test("AX upload hashes raw guest IRAM and emits only DSP_INIT", () => {
   assert.equal(context.deviceEvents.get("dspUcodeBoot"), 1);
   assert.equal(context.deviceEvents.get("dspUcodeBootRejected"), undefined);
   assert.equal(context.deviceEvents.get("dspMailProduced"), 1);
+  assert.equal(context.dspFirstUnsupported, null);
   assert.deepEqual(parameterTrace(context), [
     ["0x80f3a001", "0x80001000"],
     ["0x80f3c002", "0x00000000"],
@@ -249,6 +253,7 @@ test("Zelda upload emits DSP_INIT before its non-interrupt handshake", () => {
   assert.equal(context.deviceEvents.get("dspCpuMail"), 10);
   assert.equal(context.deviceEvents.get("dspUcodeBoot"), 1);
   assert.equal(context.deviceEvents.get("dspMailProduced"), 2);
+  assert.equal(context.dspFirstUnsupported, null);
   assert.deepEqual(producedMailTrace(context), [
     ["0xdcd10000", true, "zelda-ucode"],
     ["0xf3551111", false, "zelda-ucode-handshake"],
@@ -345,6 +350,53 @@ test("unknown ucode hash fails closed without a startup mail", () => {
   assert.equal(
     context.dspTrace.find(entry => entry.event === "ucode-boot-rejected")?.reason,
     "unknown-hash",
+  );
+  assert.deepEqual(
+    { ...context.dspFirstUnsupported },
+    {
+      instructionCycle: 10_000,
+      dispatchPc: 0x80001000,
+      stage: "ucode",
+      mode: "rom",
+      reason: "unknown-hash",
+      ucodeHash: 0,
+      code: null,
+    },
+  );
+  assert.deepEqual(
+    { ...context.snapshotDspFirstUnsupported() },
+    {
+      instructionCycle: 10_000,
+      dispatchPc: "0x80001000",
+      stage: "ucode",
+      mode: "rom",
+      reason: "unknown-hash",
+      ucodeHash: "0x00000000",
+      code: null,
+    },
+  );
+
+  const firstUnsupported = { ...context.dspFirstUnsupported };
+  context.cycles = 20_000;
+  context.pc = 0x80002000;
+  context.rejectDspUcodeBoot("empty-iram");
+  context.resetDspMailbox();
+  assert.deepEqual(
+    { ...context.dspFirstUnsupported },
+    firstUnsupported,
+    "later rejection and DSP reset replaced the first unsupported reason",
+  );
+  assert.deepEqual(
+    Object.keys(context.dspFirstUnsupported),
+    [
+      "instructionCycle",
+      "dispatchPc",
+      "stage",
+      "mode",
+      "reason",
+      "ucodeHash",
+      "code",
+    ],
   );
 });
 
@@ -454,6 +506,7 @@ test("DSP reset clears partial classification state before its ROM greeting", ()
   assert.equal(context.dspCurrentMail, 0x8071feed);
   assert.equal(context.dspMailQueue.length, 0);
   assert.equal(context.deviceEvents.get("dspReset"), 1);
+  assert.equal(context.dspFirstUnsupported, null);
 });
 
 test("release diagnostics retain the classified ucode hash", () => {
@@ -463,4 +516,8 @@ test("release diagnostics retain the classified ucode hash", () => {
     /dspUcodeHash: dspUcodeHash === null \? null : hex32\(dspUcodeHash\)/,
   );
   assert.match(source, /dspTrace,/);
+  assert.match(
+    source,
+    /audioCompatibility:\s*\{\s*dspFirstUnsupported: snapshotDspFirstUnsupported\(\),/,
+  );
 });

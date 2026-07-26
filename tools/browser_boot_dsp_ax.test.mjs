@@ -50,6 +50,8 @@ const dspFunctionNames = [
   "dspUcodeHashEctor",
   "classifyDspUcode",
   "traceDsp",
+  "latchDspFirstUnsupported",
+  "snapshotDspFirstUnsupported",
   "loadNextDspMail",
   "pushDspMail",
   "consumeDspMail",
@@ -88,6 +90,7 @@ function dspContext() {
     dspAudioDmaRemainingBlocks: 0,
     dspCpuMailbox: 0,
     dspCurrentMail: null,
+    dspFirstUnsupported: null,
     dspMailQueue: [],
     dspMode: "ax",
     dspRomParameter: null,
@@ -266,6 +269,7 @@ test("AX validates a full silent list before bounded writeback and delayed yield
   assert.equal(context.deviceEvents.get("dspAxSilentWrite"), 7);
   assert.equal(context.deviceEvents.get("dspAxSilentBytes"), 8960);
   assert.equal(context.invalidations.length, 7);
+  assert.equal(context.dspFirstUnsupported, null);
   for (const [address, size] of ranges) {
     assertClearedGuardedRange(context, address, size);
   }
@@ -452,6 +456,24 @@ test("malformed AX envelopes and lists fail closed without partial writes", () =
     assert.equal(context.dspAxCommandState.phase, "halted", fixture.name);
     assert.equal(context.dspScheduledMail, null, fixture.name);
     assert.equal(context.invalidations.length, 0, fixture.name);
+    const commandCode = fixture.reason === "unknown-command"
+      ? 0x14
+      : fixture.reason === "unsupported-command-for-ucode"
+        ? 0x12
+        : null;
+    assert.deepEqual(
+      { ...context.dspFirstUnsupported },
+      {
+        instructionCycle: 10_000,
+        dispatchPc: 0x80001000,
+        stage: commandCode === null ? "protocol" : "command",
+        mode: "ax",
+        reason: fixture.reason,
+        ucodeHash: 0x4e8a8b21,
+        code: commandCode,
+      },
+      fixture.name,
+    );
   }
 
   const transactional = dspContext();
@@ -517,6 +539,57 @@ test("AX task cadence distinguishes continue, resume, reset, and deferred switch
   assert.equal(switched.dspAxCommandState.phase, "halted");
   assert.equal(switched.dspAxCommandState.reason, "unsupported-task-switch");
   assert.equal(switched.dspScheduledMail, null);
+  assert.deepEqual(
+    { ...switched.dspFirstUnsupported },
+    {
+      instructionCycle: 10_000,
+      dispatchPc: 0x80001000,
+      stage: "task",
+      mode: "ax",
+      reason: "unsupported-task-switch",
+      ucodeHash: 0x4e8a8b21,
+      code: 1,
+    },
+  );
+  const firstUnsupported = { ...switched.dspFirstUnsupported };
+  switched.cycles = 20_000;
+  switched.pc = 0x80002000;
+  switched.rejectDspAxCommand("later-protocol-rejection");
+  switched.resetDspMailbox();
+  assert.deepEqual(
+    { ...switched.dspFirstUnsupported },
+    firstUnsupported,
+  );
+
+  const unsupported = dspContext();
+  sendAxList(unsupported, 0x80000100, simpleEndList());
+  unsupported.serviceDsp(12_500);
+  unsupported.consumeDspMail();
+  unsupported.handleDspCpuMail(0x12340004);
+  assert.deepEqual(
+    { ...unsupported.dspFirstUnsupported },
+    {
+      instructionCycle: 10_000,
+      dispatchPc: 0x80001000,
+      stage: "task",
+      mode: "ax",
+      reason: "unsupported-task-mail",
+      ucodeHash: 0x4e8a8b21,
+      code: 4,
+    },
+  );
+  assert.deepEqual(
+    Object.keys(unsupported.dspFirstUnsupported),
+    [
+      "instructionCycle",
+      "dispatchPc",
+      "stage",
+      "mode",
+      "reason",
+      "ucodeHash",
+      "code",
+    ],
+  );
 });
 
 test("AX rejects task actions until the delayed yield has been consumed", () => {
@@ -530,6 +603,18 @@ test("AX rejects task actions until the delayed yield has been consumed", () => 
     "task-before-yield-consumed",
   );
   assert.equal(beforeEmission.dspScheduledMail, null);
+  assert.deepEqual(
+    { ...beforeEmission.dspFirstUnsupported },
+    {
+      instructionCycle: 10_000,
+      dispatchPc: 0x80001000,
+      stage: "protocol",
+      mode: "ax",
+      reason: "task-before-yield-consumed",
+      ucodeHash: 0x4e8a8b21,
+      code: null,
+    },
+  );
   beforeEmission.serviceDsp(20_000);
   assert.equal(beforeEmission.dspCurrentMail, null);
 
@@ -549,6 +634,10 @@ test("AX rejects task actions until the delayed yield has been consumed", () => 
 
 test("release diagnostics retain bounded AX command state", () => {
   assert.match(source, /dspAxCommand: \{/);
+  assert.match(
+    source,
+    /dspFirstUnsupported: snapshotDspFirstUnsupported\(\)/,
+  );
   for (const field of [
     "phase",
     "sizeWords",

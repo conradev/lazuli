@@ -48,6 +48,8 @@ const dspFunctionNames = [
   "emptyDspZeldaRenderState",
   "emptyDspZeldaCommandState",
   "traceDsp",
+  "latchDspFirstUnsupported",
+  "snapshotDspFirstUnsupported",
   "loadNextDspMail",
   "pushDspMail",
   "consumeDspMail",
@@ -87,6 +89,7 @@ function dspContext(mode = "zelda") {
     dspAxCommandState: null,
     dspCpuMailbox: 0,
     dspCurrentMail: null,
+    dspFirstUnsupported: null,
     dspMailQueue: [],
     dspMode: mode,
     dspRomParameter: null,
@@ -260,6 +263,7 @@ test("Zelda command 01 waits for all five words and returns its ordered standard
   );
   assert.equal(context.dspZeldaCommandState.render.active, false);
   assert.equal(context.deviceEvents.get("dspZeldaSetup"), 1);
+  assert.equal(context.dspFirstUnsupported, null);
   assert.deepEqual(
     context.dspTrace
       .filter(entry => entry.event === "mail-produced")
@@ -519,6 +523,18 @@ test("malformed Zelda command counts fail closed without an ACK", () => {
       context.dspTrace.find(entry => entry.event === "zelda-command-rejected")?.reason,
       "unsupported-count",
     );
+    assert.deepEqual(
+      { ...context.dspFirstUnsupported },
+      {
+        instructionCycle: 10_000,
+        dispatchPc: 0x80001000,
+        stage: "protocol",
+        mode: "zelda",
+        reason: "unsupported-count",
+        ucodeHash: 0x2fcdf1ec,
+        code: count >>> 0,
+      },
+    );
   }
 });
 
@@ -559,6 +575,18 @@ test("malformed and unknown complete Zelda commands fail closed without an ACK",
     assert.equal(
       context.dspTrace.find(entry => entry.event === "zelda-command-rejected")?.reason,
       reason,
+    );
+    assert.deepEqual(
+      { ...context.dspFirstUnsupported },
+      {
+        instructionCycle: 10_000,
+        dispatchPc: 0x80001000,
+        stage: reason === "unsupported-command" ? "command" : "protocol",
+        mode: "zelda",
+        reason,
+        ucodeHash: 0x2fcdf1ec,
+        code: reason === "unsupported-command" ? 3 : null,
+      },
     );
   }
 });
@@ -644,6 +672,18 @@ test("Zelda render rejects an out-of-order voice group without a frame ACK", () 
   assert.equal(left.every(value => value === 0x71), true);
   assert.equal(right.every(value => value === 0x72), true);
   assert.deepEqual(producedMails(context), []);
+  assert.deepEqual(
+    { ...context.dspFirstUnsupported },
+    {
+      instructionCycle: 10_000,
+      dispatchPc: 0x80001000,
+      stage: "protocol",
+      mode: "zelda",
+      reason: "unsupported-render-sync",
+      ucodeHash: 0x2fcdf1ec,
+      code: 1,
+    },
+  );
 });
 
 test("Zelda render rejects a new command count while its voice syncs are active", () => {
@@ -683,7 +723,49 @@ test("Zelda frame-end task state fails closed on malformed and unsupported actio
     assert.equal(context.dspMailQueue.length, 0);
     assert.equal(context.deviceEvents.get("dspMailProduced"), producedBefore);
     assert.equal(context.deviceEvents.get("dspZeldaCommandRejected"), 1);
+    const action = mail >>> 0;
+    assert.deepEqual(
+      { ...context.dspFirstUnsupported },
+      {
+        instructionCycle: 10_000,
+        dispatchPc: 0x80001000,
+        stage: reason === "expected-task-mail" ? "protocol" : "task",
+        mode: "zelda",
+        reason,
+        ucodeHash: 0x2fcdf1ec,
+        code: reason === "expected-task-mail" ? null : action & 0xffff,
+      },
+    );
   }
+});
+
+test("Zelda first unsupported task reason survives later rejection and reset", () => {
+  const context = dspContext();
+  completeOneZeldaFrame(context);
+  sendDspMail(context, 0xcdd10004);
+  const firstUnsupported = { ...context.dspFirstUnsupported };
+
+  context.cycles = 20_000;
+  context.pc = 0x80002000;
+  context.rejectDspZeldaCommand("later-protocol-rejection");
+  context.resetDspMailbox();
+
+  assert.deepEqual(
+    { ...context.dspFirstUnsupported },
+    firstUnsupported,
+  );
+  assert.deepEqual(
+    Object.keys(context.dspFirstUnsupported),
+    [
+      "instructionCycle",
+      "dispatchPc",
+      "stage",
+      "mode",
+      "reason",
+      "ucodeHash",
+      "code",
+    ],
+  );
 });
 
 test("Zelda task actions distinguish halt, continue, and reset without fake resume mail", () => {
@@ -698,6 +780,7 @@ test("Zelda task actions distinguish halt, continue, and reset without fake resu
     assert.equal(context.deviceEvents.get("dspZeldaTaskHalt"), 1);
     assert.equal(context.dspCurrentMail, null);
     assert.equal(context.dspMailQueue.length, 0);
+    assert.equal(context.dspFirstUnsupported, null);
   }
 
   {
@@ -710,6 +793,7 @@ test("Zelda task actions distinguish halt, continue, and reset without fake resu
     assert.equal(context.deviceEvents.get("dspZeldaTaskContinue"), 1);
     assert.equal(context.dspCurrentMail, null);
     assert.equal(context.dspMailQueue.length, 0);
+    assert.equal(context.dspFirstUnsupported, null);
   }
 
   {
@@ -724,6 +808,7 @@ test("Zelda task actions distinguish halt, continue, and reset without fake resu
     assert.equal(context.dspCurrentMail, 0x8071feed);
     assert.equal(context.dspMailQueue.length, 0);
     assert.equal(context.deviceEvents.get("dspReset"), 1);
+    assert.equal(context.dspFirstUnsupported, null);
   }
 });
 
@@ -801,6 +886,10 @@ test("release diagnostics retain Zelda command telemetry and state", () => {
   assert.match(
     source,
     /render:\s*\{\s*active: dspZeldaCommandState\.render\.active,\s*awaitingTaskMail:/,
+  );
+  assert.match(
+    source,
+    /dspFirstUnsupported: snapshotDspFirstUnsupported\(\)/,
   );
   for (const event of [
     "dspZeldaSetup",
