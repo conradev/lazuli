@@ -1,4 +1,5 @@
 use std::alloc::Layout;
+use std::ptr::NonNull;
 
 use cranelift_codegen::isa;
 use gekko::disasm::{Extensions, Ins, Opcode};
@@ -84,6 +85,13 @@ fn compile_sequence(isa: isa::Builder, sequence: Sequence) -> (Artifact, Meta) {
 fn lswx(rd: u8, ra: u8, rb: u8) -> Ins {
     Ins::new(
         0x7c00_042a | u32::from(rd) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11,
+        Extensions::gekko_broadway(),
+    )
+}
+
+fn dcbz_l(ra: u8, rb: u8) -> Ins {
+    Ins::new(
+        0x1000_07ec | u32::from(ra) << 16 | u32::from(rb) << 11,
         Extensions::gekko_broadway(),
     )
 }
@@ -241,6 +249,39 @@ struct NativeLswxContext {
     exit_executed: Executed,
 }
 
+const LOCKED_CACHE_BASE: u32 = 0xe000_0000;
+const LOCKED_CACHE_PAGE_SIZE: usize = 1 << 17;
+const HID2_LCE: u32 = 0x1000_0000;
+
+struct NativeDcbzLContext {
+    cpu: Cpu,
+    fastmem: Box<FastmemLut>,
+    locked_cache_page: Box<[u8]>,
+    write_attempts: Vec<(u32, i32)>,
+    fail_at: Option<usize>,
+    exit_reason: Option<ExitReason>,
+    exit_executed: Executed,
+}
+
+impl NativeDcbzLContext {
+    fn new() -> Self {
+        Self {
+            cpu: Cpu::default(),
+            fastmem: Box::new([None; FASTMEM_LUT_COUNT]),
+            locked_cache_page: vec![0xa5; LOCKED_CACHE_PAGE_SIZE].into_boxed_slice(),
+            write_attempts: Vec::new(),
+            fail_at: None,
+            exit_reason: None,
+            exit_executed: Executed::default(),
+        }
+    }
+
+    fn map_locked_cache_fastmem(&mut self) {
+        let page = usize::try_from(LOCKED_CACHE_BASE >> 17).unwrap();
+        self.fastmem[page] = NonNull::new(self.locked_cache_page.as_mut_ptr());
+    }
+}
+
 extern "C-unwind" fn native_lswx_registers(ctx: *mut Context) -> *mut Cpu {
     let ctx = unsafe { &mut *ctx.cast::<NativeLswxContext>() };
     &raw mut ctx.cpu
@@ -276,6 +317,55 @@ extern "C-unwind" fn native_lswx_exit(
     executed: Executed,
 ) -> Option<BlockFn> {
     let ctx = unsafe { &mut *ctx.cast_mut().cast::<NativeLswxContext>() };
+    ctx.exit_executed = executed;
+    None
+}
+
+extern "C-unwind" fn native_dcbz_l_registers(ctx: *mut Context) -> *mut Cpu {
+    let ctx = unsafe { &mut *ctx.cast::<NativeDcbzLContext>() };
+    &raw mut ctx.cpu
+}
+
+extern "C-unwind" fn native_dcbz_l_fastmem(ctx: *mut Context) -> *mut FastmemLut {
+    let ctx = unsafe { &mut *ctx.cast::<NativeDcbzLContext>() };
+    &raw mut *ctx.fastmem
+}
+
+extern "C-unwind" fn native_dcbz_l_write_i32(
+    ctx: *mut Context,
+    address: Address,
+    value: i32,
+) -> bool {
+    let ctx = unsafe { &mut *ctx.cast::<NativeDcbzLContext>() };
+    let attempt = ctx.write_attempts.len();
+    ctx.write_attempts.push((address.value(), value));
+    if ctx.fail_at == Some(attempt) {
+        ctx.cpu.supervisor.exception.dsisr = 0x4200_0000;
+        return false;
+    }
+
+    let Some(offset) = address
+        .value()
+        .checked_sub(LOCKED_CACHE_BASE)
+        .and_then(|offset| usize::try_from(offset).ok())
+    else {
+        return false;
+    };
+    let Some(destination) = ctx.locked_cache_page.get_mut(offset..offset + 4) else {
+        return false;
+    };
+    destination.copy_from_slice(&value.to_be_bytes());
+    true
+}
+
+extern "C-unwind" fn native_dcbz_l_exit(
+    ctx: *const Context,
+    _: *mut ExitData,
+    reason: ExitReason,
+    executed: Executed,
+) -> Option<BlockFn> {
+    let ctx = unsafe { &mut *ctx.cast_mut().cast::<NativeDcbzLContext>() };
+    ctx.exit_reason = Some(reason);
     ctx.exit_executed = executed;
     None
 }
@@ -343,6 +433,142 @@ fn native_illegal_instruction_records_the_program_cause_before_exit() {
         ProgramExceptionCause::IllegalInstruction.srr1_bits()
     );
     assert_eq!(context.exit_srr1, context.cpu.supervisor.exception.srr[1]);
+}
+
+#[test]
+fn native_dcbz_l_covers_locked_cache_addressing_faults_and_continuation() {
+    let zero_base = dcbz_l(0, 3);
+    let corpus_indexed = dcbz_l(6, 3);
+    assert_eq!(zero_base.code, 0x1000_1fec);
+    assert_eq!(corpus_indexed.code, 0x1006_1fec);
+    assert_eq!(zero_base.op, Opcode::DcbzL);
+    assert_eq!(corpus_indexed.op, Opcode::DcbzL);
+
+    // addi r5,r5,1 must remain in the translation and execute after an enabled dcbz_l.
+    let trailing = Ins::new(0x38a5_0001, Extensions::gekko_broadway());
+    let mut hooks = unsafe { Hooks::stub() };
+    hooks.get_registers = native_dcbz_l_registers;
+    hooks.get_fastmem = native_dcbz_l_fastmem;
+    hooks.write_i32 = native_dcbz_l_write_i32;
+    hooks.exit = native_dcbz_l_exit;
+    let mut jit = Jit::new(
+        Settings {
+            codegen: CodegenSettings::default(),
+            cache_path: None,
+            exit_data_layout: Layout::new::<u8>(),
+        },
+        hooks,
+    );
+    let zero_base_block = jit.build([zero_base, trailing].into_iter()).unwrap();
+    let indexed_block = jit.build([corpus_indexed, trailing].into_iter()).unwrap();
+    assert_eq!(zero_base_block.meta().seq.0, [zero_base, trailing]);
+    assert_eq!(zero_base_block.meta().cycles, 4);
+    assert_eq!(indexed_block.meta().seq.0, [corpus_indexed, trailing]);
+    assert_eq!(indexed_block.meta().cycles, 4);
+
+    let initial_pc = 0x8000_6000;
+    let line_offset = 0x20usize;
+    let expected_slow_writes = (0..8)
+        .map(|index| (LOCKED_CACHE_BASE + 0x20 + index * 4, 0))
+        .collect::<Vec<_>>();
+    let assert_guarded_zero_line = |cache: &[u8]| {
+        assert!(cache[..line_offset].iter().all(|byte| *byte == 0xa5));
+        assert!(
+            cache[line_offset..line_offset + 32]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            cache[line_offset + 32..line_offset + 64]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+    };
+
+    // RA=0 takes RB directly, aligns the effective address down, and reaches slow backing hooks.
+    let mut slow = NativeDcbzLContext::new();
+    slow.cpu.pc = Address(initial_pc);
+    slow.cpu.supervisor.config.hid[2] = HID2_LCE;
+    slow.cpu.user.gpr[3] = LOCKED_CACHE_BASE + 0x3d;
+    slow.cpu.user.gpr[5] = 0x1234;
+    unsafe {
+        jit.call((&raw mut slow).cast::<Context>(), zero_base_block.as_ptr());
+    }
+    assert_eq!(slow.write_attempts, expected_slow_writes);
+    assert_guarded_zero_line(&slow.locked_cache_page);
+    assert_eq!(slow.cpu.user.gpr[5], 0x1235);
+    assert_eq!(slow.cpu.pc, Address(initial_pc + 8));
+    assert_eq!(slow.exit_reason, Some(ExitReason::SYNC));
+    assert_eq!(slow.exit_executed.instructions, 2);
+    assert_eq!(slow.exit_executed.cycles, 4);
+
+    // The SDK's exact RA+RB encoding reaches the same aligned line through native fastmem.
+    let mut fast = NativeDcbzLContext::new();
+    fast.map_locked_cache_fastmem();
+    fast.cpu.pc = Address(initial_pc);
+    fast.cpu.supervisor.config.hid[2] = HID2_LCE;
+    fast.cpu.user.gpr[6] = LOCKED_CACHE_BASE + 0x20;
+    fast.cpu.user.gpr[3] = 0x1d;
+    fast.cpu.user.gpr[5] = 9;
+    unsafe {
+        jit.call((&raw mut fast).cast::<Context>(), indexed_block.as_ptr());
+    }
+    assert!(fast.write_attempts.is_empty());
+    assert_guarded_zero_line(&fast.locked_cache_page);
+    assert_eq!(fast.cpu.user.gpr[5], 10);
+    assert_eq!(fast.cpu.pc, Address(initial_pc + 8));
+    assert_eq!(fast.exit_executed.instructions, 2);
+    assert_eq!(fast.exit_executed.cycles, 4);
+
+    // HID2[LCE]=0 is a Program/Illegal Instruction boundary: no memory access or trailing addi.
+    let mut disabled = NativeDcbzLContext::new();
+    disabled.cpu.pc = Address(initial_pc);
+    disabled.cpu.user.gpr[6] = LOCKED_CACHE_BASE + 0x20;
+    disabled.cpu.user.gpr[3] = 0x1d;
+    disabled.cpu.user.gpr[5] = 0x55aa;
+    unsafe {
+        jit.call(
+            (&raw mut disabled).cast::<Context>(),
+            indexed_block.as_ptr(),
+        );
+    }
+    assert!(disabled.write_attempts.is_empty());
+    assert!(disabled.locked_cache_page.iter().all(|byte| *byte == 0xa5));
+    assert_eq!(disabled.cpu.user.gpr[5], 0x55aa);
+    assert_eq!(disabled.cpu.supervisor.exception.srr[0], initial_pc);
+    assert_eq!(disabled.cpu.pc, Address(0xfff0_0700));
+    assert_eq!(
+        disabled.cpu.supervisor.exception.srr[1] & Exception::SPECIAL_SRR1_BITS_MASK,
+        ProgramExceptionCause::IllegalInstruction.srr1_bits()
+    );
+    assert_eq!(disabled.exit_executed.instructions, 1);
+    assert_eq!(disabled.exit_executed.cycles, 2);
+
+    // A failed first slow write reports the aligned line address and exits at this instruction.
+    let mut fault = NativeDcbzLContext::new();
+    fault.cpu.pc = Address(initial_pc);
+    fault.cpu.supervisor.config.hid[2] = HID2_LCE;
+    fault.cpu.user.gpr[3] = LOCKED_CACHE_BASE + 0x3d;
+    fault.cpu.user.gpr[5] = 0x55aa;
+    fault.fail_at = Some(0);
+    unsafe {
+        jit.call((&raw mut fault).cast::<Context>(), zero_base_block.as_ptr());
+    }
+    assert_eq!(
+        fault.write_attempts,
+        [(LOCKED_CACHE_BASE + line_offset as u32, 0)]
+    );
+    assert!(fault.locked_cache_page.iter().all(|byte| *byte == 0xa5));
+    assert_eq!(fault.cpu.user.gpr[5], 0x55aa);
+    assert_eq!(
+        fault.cpu.supervisor.exception.dar,
+        LOCKED_CACHE_BASE + line_offset as u32
+    );
+    assert_eq!(fault.cpu.supervisor.exception.dsisr, 0x4200_0000);
+    assert_eq!(fault.cpu.supervisor.exception.srr[0], initial_pc);
+    assert_eq!(fault.cpu.pc, Address(0xfff0_0300));
+    assert_eq!(fault.exit_executed.instructions, 1);
+    assert_eq!(fault.exit_executed.cycles, 2);
 }
 
 #[test]

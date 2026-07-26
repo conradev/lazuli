@@ -520,6 +520,15 @@ impl BlockBuilder<'_> {
         CR_INFO
     }
 
+    fn zero_data_cache_line(&mut self, addr: ir::Value) {
+        let zero = self.ir_value(0u32);
+        let block_start = self.bd.ins().band_imm(addr, !0b11111u64 as i64);
+        for i in 0..8 {
+            let current = self.bd.ins().iadd_imm(block_start, 4 * i);
+            self.mem_store::<i32>(current, zero);
+        }
+    }
+
     pub fn dcbz(&mut self, ins: Ins) -> InstructionInfo {
         let rb = self.get(ins.gpr_b());
         let addr = if ins.field_ra() == 0 {
@@ -529,12 +538,40 @@ impl BlockBuilder<'_> {
             self.bd.ins().iadd(ra, rb)
         };
 
-        let zero = self.ir_value(0u32);
-        let block_start = self.bd.ins().band_imm(addr, !0b11111u64 as i64);
-        for i in 0..8 {
-            let current = self.bd.ins().iadd_imm(block_start, 4 * i);
-            self.mem_store::<i32>(current, zero);
-        }
+        self.zero_data_cache_line(addr);
+
+        DCACHE_INFO
+    }
+
+    pub fn dcbz_l(&mut self, ins: Ins) -> InstructionInfo {
+        // Gekko makes dcbz_l illegal until HID2[LCE] partitions and enables the locked cache.
+        // Lazuli exposes that cache through the existing 16 KiB backing region, so an enabled
+        // instruction can share dcbz's observable 32-byte zero operation. Cache-tag hits,
+        // HID2[DCHERR], and W/I page attributes remain outside the current memory model.
+        let hid2 = self.get(SPR::HID2);
+        let locked_cache_enabled = self.get_bit(hid2, 28);
+        let illegal_block = self.bd.create_block();
+        let enabled_block = self.bd.create_block();
+        self.bd.set_cold_block(illegal_block);
+        self.bd
+            .ins()
+            .brif(locked_cache_enabled, enabled_block, &[], illegal_block, &[]);
+        self.bd.seal_block(illegal_block);
+        self.bd.seal_block(enabled_block);
+
+        self.switch_to_bb(illegal_block);
+        let exception = self.illegal(ins);
+        self.exit_with(exception);
+
+        self.switch_to_bb(enabled_block);
+        let rb = self.get(ins.gpr_b());
+        let addr = if ins.field_ra() == 0 {
+            rb
+        } else {
+            let ra = self.get(ins.gpr_a());
+            self.bd.ins().iadd(ra, rb)
+        };
+        self.zero_data_cache_line(addr);
 
         DCACHE_INFO
     }

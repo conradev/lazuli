@@ -648,7 +648,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Dcbt => self.nop(Action::Continue),
             Opcode::Dcbtst => self.nop(Action::Continue),
             Opcode::Dcbz => self.dcbz(ins),
-            Opcode::DcbzL => self.stub(ins),
+            Opcode::DcbzL => self.dcbz_l(ins),
             Opcode::Divw => self.divw(ins),
             Opcode::Divwu => self.divwu(ins),
             Opcode::Eqv => self.eqv(ins),
