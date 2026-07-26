@@ -31,6 +31,11 @@ const READY_PLAY_PREFIX = Object.freeze([
   "play-main",
   "post-play-presented",
 ]);
+const SUSTAINED_STEPS = Object.freeze([
+  ...READY_PLAY_PREFIX,
+  "sustained-main-stick-left",
+  "sustained-play-presented",
+]);
 
 export class SmbSustainedPlayValidationError extends Error {
   constructor(code, path, ordinal, expected, actual, previous = null) {
@@ -739,6 +744,128 @@ function verifyReadyPlayLowerLayer(anchor, transcript) {
   }
 }
 
+export function verifySmbSustainedPlayPrefix(report) {
+  requireObject(report, "$.");
+  exact(report.status, "running", "$.status");
+  if (report.error !== undefined) exact(report.error, null, "$.error");
+  exact(report.rendering?.backend, "wgpu-webgpu", "$.rendering.backend");
+  exact(report.rendering?.error ?? null, null, "$.rendering.error");
+  validateV2CompatibilityTelemetry(report);
+
+  exact(report.disc?.identifier, "GMBE8P", "$.disc.identifier");
+  exact(report.disc?.revision, 0, "$.disc.revision");
+  exact(report.disc?.source?.kind, "local-file", "$.disc.source.kind");
+
+  const scenario = requireObject(report.scenario, "$.scenario");
+  exact(scenario.id, "smb-sustained-play", "$.scenario.id");
+  exact(scenario.gameIdentifier, "GMBE8P", "$.scenario.gameIdentifier");
+  exact(scenario.status, "running", "$.scenario.status");
+  exact(scenario.hardCycleLimit, 32_000_000_000, "$.scenario.hardCycleLimit");
+  exact(scenario.startCycle, 0, "$.scenario.startCycle");
+  exact(scenario.completedCycle, null, "$.scenario.completedCycle");
+  exact(scenario.failure, null, "$.scenario.failure");
+  exact(scenario.stepIndex, 14, "$.scenario.stepIndex");
+  exact(
+    scenario.currentStep,
+    "sustained-play-presented",
+    "$.scenario.currentStep",
+  );
+  if (!Array.isArray(scenario.steps)) {
+    fail("envelope", "$.scenario.steps", null, "an array", scenario.steps);
+  }
+  exact(scenario.steps.length, 14, "$.scenario.steps.length");
+  for (let index = 0; index < scenario.steps.length; index += 1) {
+    exact(
+      scenario.steps[index]?.id,
+      SUSTAINED_STEPS[index],
+      `$.scenario.steps[${index}].id`,
+    );
+  }
+  validateInputWitness(scenario);
+
+  const sustained = exactKeys(
+    report.sustainedPlay,
+    [
+      "capacity",
+      "failure",
+      "oracle",
+      "pending",
+      "posted",
+      "readyPlayAnchor",
+      "receipts",
+      "schema",
+    ],
+    "$.sustainedPlay",
+  );
+  exact(
+    sustained.schema,
+    SMB_SUSTAINED_PLAY_SCHEMA_V2,
+    "$.sustainedPlay.schema",
+  );
+  exact(
+    sustained.capacity,
+    SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
+    "$.sustainedPlay.capacity",
+  );
+  const posted = nonNegativeInteger(
+    sustained.posted,
+    "$.sustainedPlay.posted",
+  );
+  if (posted >= SMB_SUSTAINED_VI_RECEIPT_CAPACITY) {
+    fail(
+      "invariant",
+      "$.sustainedPlay.posted",
+      null,
+      `less than ${SMB_SUSTAINED_VI_RECEIPT_CAPACITY}`,
+      posted,
+    );
+  }
+  const pending = nonNegativeInteger(
+    sustained.pending,
+    "$.sustainedPlay.pending",
+  );
+  exact(sustained.failure, null, "$.sustainedPlay.failure");
+  const readyPlayAnchor = requireObject(
+    sustained.readyPlayAnchor,
+    "$.sustainedPlay.readyPlayAnchor",
+  );
+  deriveReadyPlayAnchor(readyPlayAnchor);
+  requireObject(sustained.oracle, "$.sustainedPlay.oracle");
+  if (!Array.isArray(sustained.receipts)) {
+    fail("envelope", "$.sustainedPlay.receipts", null, "an array", sustained.receipts);
+  }
+  exact(
+    sustained.receipts.length + pending,
+    posted,
+    "$.sustainedPlay.posted",
+  );
+
+  const parityAddresses = { top: null, bottom: null };
+  const pairingState = { lastPresentedSerial: null };
+  let previous = null;
+  for (let index = 0; index < sustained.receipts.length; index += 1) {
+    previous = validateReceipt(
+      sustained.receipts[index],
+      index,
+      previous,
+      parityAddresses,
+      true,
+      pairingState,
+    );
+  }
+  exact(report.controller?.queueOverflows, 0, "$.controller.queueOverflows");
+  const cycles = positiveInteger(report.cycles, "$.cycles");
+  return {
+    acceptedReceipts: sustained.receipts.length,
+    lastPresentationSerial: pairingState.lastPresentedSerial,
+    lastReceiptOrdinal: previous?.ordinal ?? null,
+    lastRendererSequence: previous?.rendererSequence ?? null,
+    observedCycle: cycles,
+    pendingReceipts: pending,
+    postedReceipts: posted,
+  };
+}
+
 export function deriveSmbSustainedPlayOracle(report) {
   requireObject(report, "$.");
   exact(report.rendering?.backend, "wgpu-webgpu", "$.rendering.backend");
@@ -747,11 +874,7 @@ export function deriveSmbSustainedPlayOracle(report) {
   if (!Array.isArray(scenario.steps)) {
     fail("envelope", "$.scenario.steps", null, "an array", scenario.steps);
   }
-  const expectedSteps = [
-    ...READY_PLAY_PREFIX,
-    "sustained-main-stick-left",
-    "sustained-play-presented",
-  ];
+  const expectedSteps = SUSTAINED_STEPS;
   exact(scenario.steps.length, expectedSteps.length, "$.scenario.steps.length");
   for (let index = 0; index < expectedSteps.length; index += 1) {
     exact(

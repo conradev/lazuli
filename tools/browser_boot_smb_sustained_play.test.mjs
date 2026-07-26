@@ -10,6 +10,7 @@ import {
   SmbSustainedPlayValidationError,
   deriveSmbSustainedPlayOracle,
   verifySmbSustainedPlay,
+  verifySmbSustainedPlayPrefix,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   smbSustainedPlayReport,
@@ -26,6 +27,73 @@ function expectFailure(report, path, ordinal = null) {
       && Object.hasOwn(error, "previous"),
   );
 }
+
+function sustainedPrefixReport(receipts = 16, pending = 0) {
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V2);
+  report.status = "running";
+  report.stage = "execute";
+  report.scenario.status = "running";
+  report.scenario.completedCycle = null;
+  report.scenario.stepIndex = 14;
+  report.scenario.currentStep = "sustained-play-presented";
+  report.scenario.steps = report.scenario.steps.slice(0, 14);
+  report.sustainedPlay.receipts =
+    report.sustainedPlay.receipts.slice(0, receipts);
+  report.sustainedPlay.posted = receipts + pending;
+  report.sustainedPlay.pending = pending;
+  return report;
+}
+
+test("live v2 prefix validates exact partial pairing and chronology", () => {
+  const empty = sustainedPrefixReport(0, 0);
+  assert.deepEqual(verifySmbSustainedPlayPrefix(empty), {
+    acceptedReceipts: 0,
+    lastPresentationSerial: null,
+    lastReceiptOrdinal: null,
+    lastRendererSequence: null,
+    observedCycle: empty.cycles,
+    pendingReceipts: 0,
+    postedReceipts: 0,
+  });
+
+  const awaitingPair = sustainedPrefixReport(1, 1);
+  assert.deepEqual(verifySmbSustainedPlayPrefix(awaitingPair), {
+    acceptedReceipts: 1,
+    lastPresentationSerial: null,
+    lastReceiptOrdinal: 1,
+    lastRendererSequence: 1000,
+    observedCycle: awaitingPair.cycles,
+    pendingReceipts: 1,
+    postedReceipts: 2,
+  });
+
+  const report = sustainedPrefixReport(16, 2);
+  assert.deepEqual(verifySmbSustainedPlayPrefix(report), {
+    acceptedReceipts: 16,
+    lastPresentationSerial: 907,
+    lastReceiptOrdinal: 16,
+    lastRendererSequence: 1015,
+    observedCycle: report.cycles,
+    pendingReceipts: 2,
+    postedReceipts: 18,
+  });
+
+  const malformedReceipt = sustainedPrefixReport();
+  malformedReceipt.sustainedPlay.receipts[3].presentation.copyIndex = 1;
+  assert.throws(
+    () => verifySmbSustainedPlayPrefix(malformedReceipt),
+    error => error instanceof SmbSustainedPlayValidationError
+      && error.path === "$.sustainedPlay.receipts[3].presentation.copyIndex",
+  );
+
+  const pendingDrift = sustainedPrefixReport(16, 2);
+  pendingDrift.sustainedPlay.posted += 1;
+  assert.throws(
+    () => verifySmbSustainedPlayPrefix(pendingDrift),
+    error => error instanceof SmbSustainedPlayValidationError
+      && error.path === "$.sustainedPlay.posted",
+  );
+});
 
 test("legacy v1 receipts remain replayable", () => {
   const report = smbSustainedPlayReport();
