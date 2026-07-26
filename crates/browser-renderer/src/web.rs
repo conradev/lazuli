@@ -30,17 +30,18 @@ use crate::tev::{
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, ExactRequiredPreparationRejectionCounts,
     ExactRequiredPreparationRejectionReason, ExactRequiredRejectionInputs,
-    ExactRequiredRejectionReason, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
-    GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
-    GxDepthCompareLocation, GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding,
-    GxEfbFormat, GxFogState, GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor,
-    GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding, GxSamplerState, GxXfbCopyParameters,
-    GxZTextureFormat, GxZTextureOperation, GxZTextureState, RendererFailureState,
-    RendererHostTimings, RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture,
-    SurfacePixelOrder, SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory,
-    TextureAddressMode, TextureBindingIdentity, TextureMipmapFilter, ViFieldDescriptor,
-    ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField,
-    ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
+    ExactRequiredRejectionReason, ExactRequiredRejectionSnapshot, GX_DEPTH24_MAX,
+    GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
+    GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDepthCompareLocation,
+    GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding, GxEfbFormat, GxFogState,
+    GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor, GxRasterSetup,
+    GxRasterTriangle28_4, GxRasterWinding, GxSamplerState, GxXfbCopyParameters, GxZTextureFormat,
+    GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
+    RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
+    SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory, TextureAddressMode,
+    TextureBindingIdentity, TextureMipmapFilter, ViFieldDescriptor, ViFieldPairOutcome,
+    ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField, ViPresentationMode,
+    XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
     compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
     gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state, gx_early_depth_plan,
@@ -858,6 +859,11 @@ struct PresentedSurface {
     provenance: PresentedFrameProvenance,
 }
 
+struct SustainedPresentedSurface {
+    surface: PresentedSurface,
+    exact_required_rejection_interval: ExactRequiredRejectionSnapshot,
+}
+
 struct Pipelines {
     tev_shader: wgpu::ShaderModule,
     tev_legacy_layout: wgpu::PipelineLayout,
@@ -996,7 +1002,9 @@ pub struct WebGpuRenderer {
     vi_field_pairs: ViFieldPairState<CachedXfbSurface>,
     last_presented_xfb: Option<PresentedXfb>,
     last_presented_surface: Option<PresentedSurface>,
-    sustained_presented_surface_history: SustainedPresentedSurfaceHistory<PresentedSurface>,
+    sustained_presented_surface_history:
+        SustainedPresentedSurfaceHistory<SustainedPresentedSurface>,
+    last_presented_exact_required_rejection_snapshot: ExactRequiredRejectionSnapshot,
     presentation_serial: u64,
     next_xfb_surface_id: u64,
     pipelines: Pipelines,
@@ -1250,6 +1258,40 @@ fn renderer_metrics_object(
         &result,
         &JsValue::from_str("exactRequiredPreparationRejectionReasons"),
         &preparation_rejection_reasons,
+    )?;
+    Ok(result)
+}
+
+fn exact_required_rejection_snapshot_object(
+    snapshot: ExactRequiredRejectionSnapshot,
+) -> Result<Object, JsValue> {
+    let result = Object::new();
+    Reflect::set(
+        &result,
+        &JsValue::from_str("aggregate"),
+        &JsValue::from_f64(snapshot.aggregate() as f64),
+    )?;
+    let reasons = Object::new();
+    for reason in ExactRequiredRejectionReason::ALL {
+        Reflect::set(
+            &reasons,
+            &JsValue::from_str(reason.telemetry_code()),
+            &JsValue::from_f64(snapshot.reason(reason) as f64),
+        )?;
+    }
+    Reflect::set(&result, &JsValue::from_str("reasons"), &reasons)?;
+    let preparation_reasons = Object::new();
+    for reason in ExactRequiredPreparationRejectionReason::ALL {
+        Reflect::set(
+            &preparation_reasons,
+            &JsValue::from_str(reason.telemetry_code()),
+            &JsValue::from_f64(snapshot.preparation_reason(reason) as f64),
+        )?;
+    }
+    Reflect::set(
+        &result,
+        &JsValue::from_str("preparationReasons"),
+        &preparation_reasons,
     )?;
     Ok(result)
 }
@@ -1673,6 +1715,8 @@ impl WebGpuRenderer {
         self.last_presented_xfb = None;
         self.last_presented_surface = None;
         self.sustained_presented_surface_history.reset();
+        self.last_presented_exact_required_rejection_snapshot =
+            self.exact_required_rejection_snapshot();
         self.presentation_serial = 0;
         self.ensure_healthy()?;
         self.clear_segment();
@@ -1682,10 +1726,12 @@ impl WebGpuRenderer {
         self.reset_efb_inner()
     }
 
-    pub fn reset_diagnostics(&self) {
+    pub fn reset_diagnostics(&mut self) {
         self.metrics.set(RendererMetrics::default());
         self.exact_required_preparation_rejection_counts
             .set(ExactRequiredPreparationRejectionCounts::default());
+        self.last_presented_exact_required_rejection_snapshot =
+            ExactRequiredRejectionSnapshot::default();
         self.host_timings.set(RendererHostTimings::default());
         self.draw_timing_eligible_calls.set(0);
     }
@@ -1701,6 +1747,13 @@ impl WebGpuRenderer {
         renderer_host_timings_object(
             self.host_timings.get(),
             self.draw_timing_eligible_calls.get(),
+        )
+    }
+
+    fn exact_required_rejection_snapshot(&self) -> ExactRequiredRejectionSnapshot {
+        ExactRequiredRejectionSnapshot::capture(
+            self.metrics.get(),
+            self.exact_required_preparation_rejection_counts.get(),
         )
     }
 
@@ -2046,8 +2099,17 @@ impl WebGpuRenderer {
             QueueDrain::new(&queue).await;
             ensure_renderer_healthy(&failure_state)?;
             let result = Array::new();
-            for surface in presented {
-                let capture = finish_presented_surface_readback(surface, &failure_state).await?;
+            for presented in presented {
+                let capture =
+                    finish_presented_surface_readback(presented.surface, &failure_state).await?;
+                let interval = exact_required_rejection_snapshot_object(
+                    presented.exact_required_rejection_interval,
+                )?;
+                Reflect::set(
+                    &capture,
+                    &JsValue::from_str("exactRequiredRejectionInterval"),
+                    &interval,
+                )?;
                 result.push(&capture);
             }
             Ok(result.into())
@@ -3657,6 +3719,20 @@ impl WebGpuRenderer {
             output_height,
         )
         .map_err(|error| surface_readback_error(error, self.surface_config.format))?;
+        let exact_required_rejection_snapshot = self.exact_required_rejection_snapshot();
+        let exact_required_rejection_interval = if capture_sustained_surface_history {
+            Some(
+                exact_required_rejection_snapshot
+                    .checked_delta_since(self.last_presented_exact_required_rejection_snapshot)
+                    .ok_or_else(|| {
+                        JsValue::from_str(
+                            "required-exact rejection telemetry regressed or became incoherent",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let next_presentation_serial = self
             .presentation_serial
             .checked_add(1)
@@ -3740,17 +3816,21 @@ impl WebGpuRenderer {
         let sustained_surface_capture = capture_sustained_surface_history.then(|| {
             let (layout, pixel_order) =
                 capture_plan.expect("requested sustained surface capture has no readback plan");
-            encode_presented_surface_readback(
-                &self.device,
-                &mut encoder,
-                &output.texture,
-                layout,
-                pixel_order,
-                self.surface_config.format,
-                next_presentation_serial,
-                &provenance,
-                "browser sustained presented surface readback",
-            )
+            SustainedPresentedSurface {
+                surface: encode_presented_surface_readback(
+                    &self.device,
+                    &mut encoder,
+                    &output.texture,
+                    layout,
+                    pixel_order,
+                    self.surface_config.format,
+                    next_presentation_serial,
+                    &provenance,
+                    "browser sustained presented surface readback",
+                ),
+                exact_required_rejection_interval: exact_required_rejection_interval
+                    .expect("requested sustained surface capture has no rejection interval"),
+            }
         });
         if let Some(capture) = sustained_surface_capture {
             self.sustained_presented_surface_history
@@ -3764,6 +3844,7 @@ impl WebGpuRenderer {
         output.present();
         self.ensure_healthy()?;
         self.presentation_serial = next_presentation_serial;
+        self.last_presented_exact_required_rejection_snapshot = exact_required_rejection_snapshot;
         self.last_presented_surface = surface_capture;
         self.last_presented_xfb = Some(PresentedXfb {
             presentation_serial: next_presentation_serial,
@@ -4103,6 +4184,8 @@ impl WebGpuRenderer {
             last_presented_xfb: None,
             last_presented_surface: None,
             sustained_presented_surface_history: SustainedPresentedSurfaceHistory::default(),
+            last_presented_exact_required_rejection_snapshot:
+                ExactRequiredRejectionSnapshot::default(),
             presentation_serial: 0,
             next_xfb_surface_id: 1,
             pipelines,

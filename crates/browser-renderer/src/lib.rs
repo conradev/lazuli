@@ -272,6 +272,86 @@ impl ExactRequiredPreparationRejectionCounts {
     fn set(&mut self, reason: ExactRequiredPreparationRejectionReason, value: u64) {
         self.counts[reason.index()] = value;
     }
+
+    fn checked_delta_since(self, previous: Self) -> Option<Self> {
+        let mut delta = Self::default();
+        for reason in ExactRequiredPreparationRejectionReason::ALL {
+            delta.counts[reason.index()] = self.get(reason).checked_sub(previous.get(reason))?;
+        }
+        Some(delta)
+    }
+
+    fn saturated_total(self) -> u64 {
+        self.counts.into_iter().fold(0, u64::saturating_add)
+    }
+}
+
+/// One fixed, coherent sample of the cumulative required-exact rejection
+/// telemetry. Presentation histories retain checked interval deltas of this
+/// same shape, so no sparse allocation or second delta representation is
+/// needed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExactRequiredRejectionSnapshot {
+    aggregate: u64,
+    reasons: [u64; EXACT_REQUIRED_REJECTION_REASON_COUNT],
+    preparation_reasons: ExactRequiredPreparationRejectionCounts,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<ExactRequiredRejectionSnapshot>() == 55 * std::mem::size_of::<u64>()
+);
+
+impl ExactRequiredRejectionSnapshot {
+    pub(crate) fn capture(
+        metrics: RendererMetrics,
+        preparation_reasons: ExactRequiredPreparationRejectionCounts,
+    ) -> Self {
+        Self {
+            aggregate: metrics.exact_required_rejected_draws,
+            reasons: ExactRequiredRejectionReason::ALL
+                .map(|reason| metrics.exact_required_rejection_reason_draws(reason)),
+            preparation_reasons,
+        }
+    }
+
+    pub(crate) fn checked_delta_since(self, previous: Self) -> Option<Self> {
+        if !self.is_coherent() || !previous.is_coherent() {
+            return None;
+        }
+        let mut reasons = [0; EXACT_REQUIRED_REJECTION_REASON_COUNT];
+        for reason in ExactRequiredRejectionReason::ALL {
+            reasons[reason.index()] = self.reason(reason).checked_sub(previous.reason(reason))?;
+        }
+        let delta = Self {
+            aggregate: self.aggregate.checked_sub(previous.aggregate)?,
+            reasons,
+            preparation_reasons: self
+                .preparation_reasons
+                .checked_delta_since(previous.preparation_reasons)?,
+        };
+        delta.is_coherent().then_some(delta)
+    }
+
+    pub(crate) const fn aggregate(self) -> u64 {
+        self.aggregate
+    }
+
+    pub(crate) const fn reason(self, reason: ExactRequiredRejectionReason) -> u64 {
+        self.reasons[reason.index()]
+    }
+
+    pub(crate) const fn preparation_reason(
+        self,
+        reason: ExactRequiredPreparationRejectionReason,
+    ) -> u64 {
+        self.preparation_reasons.get(reason)
+    }
+
+    pub(crate) fn is_coherent(self) -> bool {
+        self.reasons.into_iter().fold(0, u64::saturating_add) == self.aggregate
+            && self.preparation_reasons.saturated_total()
+                == self.reason(ExactRequiredRejectionReason::ExactPreparation)
+    }
 }
 
 /// Side-effect-free facts used only to classify a draw already rejected by the
@@ -2998,8 +3078,8 @@ mod tests {
     use super::{
         EFB_HEIGHT, EFB_WIDTH, ExactRequiredPreparationRejectionCounts,
         ExactRequiredPreparationRejectionReason, ExactRequiredRejectionInputs,
-        ExactRequiredRejectionReason, GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX,
-        GX_MANUAL_SAMPLING_MODE0_FLAG, GX_NON_AA_RASTER_CENTER_EFB,
+        ExactRequiredRejectionReason, ExactRequiredRejectionSnapshot, GX_COPY_FILTER_DIVISOR,
+        GX_DEPTH16_MAX, GX_DEPTH24_MAX, GX_MANUAL_SAMPLING_MODE0_FLAG, GX_NON_AA_RASTER_CENTER_EFB,
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxAlphaTestOutcome, GxBlendFactor,
         GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxDepthCompression,
         GxEarlyDepthPlan, GxEfbDepthDecodeError, GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError,
@@ -3598,6 +3678,180 @@ mod tests {
                 .sum::<u64>(),
             preparation_count,
             "non-preparation suppression cannot change preparation details",
+        );
+    }
+
+    #[test]
+    fn exact_required_rejection_snapshots_produce_one_fixed_coherent_interval() {
+        let mut metrics = RendererMetrics::default();
+        let mut preparation_counts = ExactRequiredPreparationRejectionCounts::default();
+        for _ in 0..3 {
+            metrics.record_exact_required_rejection(ExactRequiredRejectionReason::Sampler, None);
+        }
+        for _ in 0..2 {
+            metrics.record_exact_required_rejection(
+                ExactRequiredRejectionReason::ExactPreparation,
+                Some((
+                    &mut preparation_counts,
+                    ExactRequiredPreparationRejectionReason::UnsupportedTopology5,
+                )),
+            );
+        }
+        let previous = ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts);
+
+        for reason in ExactRequiredPreparationRejectionReason::ALL {
+            metrics.record_exact_required_rejection(
+                ExactRequiredRejectionReason::ExactPreparation,
+                Some((&mut preparation_counts, reason)),
+            );
+        }
+        for reason in ExactRequiredRejectionReason::ALL {
+            if reason != ExactRequiredRejectionReason::ExactPreparation {
+                metrics.record_exact_required_rejection(reason, None);
+            }
+        }
+        let current = ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts);
+        let interval = current.checked_delta_since(previous).unwrap();
+
+        assert_eq!(
+            std::mem::size_of::<ExactRequiredRejectionSnapshot>(),
+            55 * 8
+        );
+        assert!(previous.is_coherent());
+        assert!(current.is_coherent());
+        assert!(interval.is_coherent());
+        assert_eq!(interval.aggregate(), 53);
+        assert_eq!(
+            interval.reason(ExactRequiredRejectionReason::ExactPreparation),
+            40,
+        );
+        for reason in ExactRequiredRejectionReason::ALL {
+            let expected = if reason == ExactRequiredRejectionReason::ExactPreparation {
+                40
+            } else {
+                1
+            };
+            assert_eq!(interval.reason(reason), expected, "{reason:?}");
+        }
+        for reason in ExactRequiredPreparationRejectionReason::ALL {
+            assert_eq!(interval.preparation_reason(reason), 1, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn exact_required_rejection_snapshot_delta_rejects_every_regression_and_incoherence() {
+        fn snapshot(
+            parent_reasons: &[(ExactRequiredRejectionReason, u64)],
+            preparation_reasons: &[(ExactRequiredPreparationRejectionReason, u64)],
+        ) -> ExactRequiredRejectionSnapshot {
+            let mut metrics = RendererMetrics::default();
+            let mut preparation_counts = ExactRequiredPreparationRejectionCounts::default();
+            for &(reason, count) in parent_reasons {
+                metrics.exact_required_rejection_reasons[reason.index()] = count;
+                metrics.exact_required_rejected_draws =
+                    metrics.exact_required_rejected_draws.saturating_add(count);
+            }
+            for &(reason, count) in preparation_reasons {
+                preparation_counts.set(reason, count);
+            }
+            ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts)
+        }
+
+        let zero = ExactRequiredRejectionSnapshot::default();
+        let one_sampler = snapshot(&[(ExactRequiredRejectionReason::Sampler, 1)], &[]);
+        assert!(one_sampler.is_coherent());
+        assert!(zero.checked_delta_since(one_sampler).is_none());
+
+        let previous_parent = snapshot(&[(ExactRequiredRejectionReason::Sampler, 1)], &[]);
+        let current_parent = snapshot(&[(ExactRequiredRejectionReason::Fog, 2)], &[]);
+        assert!(current_parent.is_coherent());
+        assert!(
+            current_parent
+                .checked_delta_since(previous_parent)
+                .is_none(),
+            "one regressing parent must not be hidden by another growing parent",
+        );
+
+        let previous_detail = snapshot(
+            &[(ExactRequiredRejectionReason::ExactPreparation, 1)],
+            &[(
+                ExactRequiredPreparationRejectionReason::UnsupportedTopology5,
+                1,
+            )],
+        );
+        let current_detail = snapshot(
+            &[(ExactRequiredRejectionReason::ExactPreparation, 2)],
+            &[(
+                ExactRequiredPreparationRejectionReason::UnsupportedTopology6,
+                2,
+            )],
+        );
+        assert!(previous_detail.is_coherent());
+        assert!(current_detail.is_coherent());
+        assert!(
+            current_detail
+                .checked_delta_since(previous_detail)
+                .is_none(),
+            "one regressing detail must not be hidden by another growing detail",
+        );
+
+        let aggregate_mismatch = ExactRequiredRejectionSnapshot::capture(
+            RendererMetrics {
+                exact_required_rejected_draws: 2,
+                ..RendererMetrics::default()
+            },
+            ExactRequiredPreparationRejectionCounts::default(),
+        );
+        assert!(!aggregate_mismatch.is_coherent());
+        assert!(
+            aggregate_mismatch
+                .checked_delta_since(ExactRequiredRejectionSnapshot::default())
+                .is_none(),
+        );
+
+        let mut preparation_parent_without_detail = RendererMetrics {
+            exact_required_rejected_draws: 1,
+            ..RendererMetrics::default()
+        };
+        preparation_parent_without_detail.exact_required_rejection_reasons
+            [ExactRequiredRejectionReason::ExactPreparation.index()] = 1;
+        let preparation_mismatch = ExactRequiredRejectionSnapshot::capture(
+            preparation_parent_without_detail,
+            ExactRequiredPreparationRejectionCounts::default(),
+        );
+        assert!(!preparation_mismatch.is_coherent());
+        assert!(
+            preparation_mismatch
+                .checked_delta_since(ExactRequiredRejectionSnapshot::default())
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn exact_required_rejection_snapshot_invariants_use_saturated_sums() {
+        let mut metrics = RendererMetrics {
+            exact_required_rejected_draws: u64::MAX,
+            ..RendererMetrics::default()
+        };
+        metrics.exact_required_rejection_reasons
+            [ExactRequiredRejectionReason::ExactPreparation.index()] = u64::MAX;
+        metrics.exact_required_rejection_reasons[ExactRequiredRejectionReason::Sampler.index()] = 1;
+        let mut preparation_counts = ExactRequiredPreparationRejectionCounts::default();
+        preparation_counts.set(
+            ExactRequiredPreparationRejectionReason::UnsupportedTopology5,
+            u64::MAX,
+        );
+        preparation_counts.set(
+            ExactRequiredPreparationRejectionReason::UnsupportedTopology6,
+            1,
+        );
+        let saturated = ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts);
+
+        assert!(saturated.is_coherent());
+        assert!(
+            saturated
+                .checked_delta_since(ExactRequiredRejectionSnapshot::default())
+                .is_some(),
         );
     }
 

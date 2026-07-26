@@ -760,6 +760,40 @@ test("sustained presented-surface history is exact, ordered, and terminal-only",
     rendererLibSource,
     /const SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY: usize = 60;/,
   );
+  const surfaceStart = rendererSource.indexOf("struct PresentedSurface {");
+  const sustainedSurfaceStart = rendererSource.indexOf(
+    "struct SustainedPresentedSurface {",
+    surfaceStart,
+  );
+  const sustainedSurfaceEnd = rendererSource.indexOf(
+    "\nstruct Pipelines",
+    sustainedSurfaceStart,
+  );
+  assert.notEqual(surfaceStart, -1);
+  assert.notEqual(sustainedSurfaceStart, -1);
+  assert.notEqual(sustainedSurfaceEnd, -1);
+  const ordinarySurface = rendererSource.slice(
+    surfaceStart,
+    sustainedSurfaceStart,
+  );
+  const sustainedSurface = rendererSource.slice(
+    sustainedSurfaceStart,
+    sustainedSurfaceEnd,
+  );
+  assert.doesNotMatch(
+    ordinarySurface,
+    /ExactRequiredRejectionSnapshot|exact_required_rejection/,
+    "ordinary and temporal captures must not retain sustained diagnostics",
+  );
+  assert.match(sustainedSurface, /surface:\s*PresentedSurface/);
+  assert.match(
+    sustainedSurface,
+    /exact_required_rejection_interval:\s*ExactRequiredRejectionSnapshot/,
+  );
+  assert.match(
+    rendererSource,
+    /SustainedPresentedSurfaceHistory<SustainedPresentedSurface>/,
+  );
   const terminalStart = source.indexOf("function captureRendererTerminal(");
   const terminalEnd = source.indexOf(
     "\n    const localIplImageBytes",
@@ -807,18 +841,38 @@ test("sustained presented-surface history is exact, ordered, and terminal-only",
     ".capture_requested(capture_sustained_surface_history)",
   );
   const acquire = present.indexOf("self.surface.get_current_texture()");
+  const snapshot = present.indexOf(
+    "let exact_required_rejection_snapshot = self.exact_required_rejection_snapshot()",
+  );
+  const checkedInterval = present.indexOf(".checked_delta_since(", snapshot);
   const capture = present.indexOf("let sustained_surface_capture");
   const label = present.indexOf("browser sustained presented surface readback", capture);
   const push = present.indexOf(".push(capture)", label);
   const submit = present.indexOf("self.queue.submit", push);
   const browserPresent = present.indexOf("output.present()", submit);
+  const healthyPresentation = present.indexOf(
+    "self.ensure_healthy()?",
+    browserPresent,
+  );
+  const rollingUpdate = present.indexOf(
+    "self.last_presented_exact_required_rejection_snapshot =",
+    healthyPresentation,
+  );
   assert.ok(
     request > -1 && request < acquire,
     "history continuity and overflow must fail before acquiring a presentation surface",
   );
   assert.ok(
+    request < snapshot && snapshot < checkedInterval && checkedInterval < acquire,
+    "a sustained interval must fail closed before acquiring a presentation surface",
+  );
+  assert.ok(
     capture > acquire && capture < label && label < push && push < submit && submit < browserPresent,
     "same-submit capture must be enqueued and recorded before presenting",
+  );
+  assert.ok(
+    browserPresent < healthyPresentation && healthyPresentation < rollingUpdate,
+    "the rolling baseline must advance only after a healthy completed presentation",
   );
   for (const forbidden of ["BufferMap::new", "QueueDrain::new", "future_to_promise", ".await"]) {
     assert.doesNotMatch(
@@ -838,14 +892,46 @@ test("sustained presented-surface history is exact, ordered, and terminal-only",
   const drain = rendererSource.slice(drainStart, drainEnd);
   const take = drain.indexOf("take_complete()");
   const queueDrain = drain.indexOf("QueueDrain::new(&queue).await");
-  const orderedLoop = drain.indexOf("for surface in presented");
+  const orderedLoop = drain.indexOf("for presented in presented");
   const finish = drain.indexOf(
-    "finish_presented_surface_readback(surface, &failure_state).await",
+    "finish_presented_surface_readback(presented.surface, &failure_state).await",
+  );
+  const interval = drain.indexOf(
+    "exact_required_rejection_snapshot_object(",
+    finish,
+  );
+  const publishInterval = drain.indexOf(
+    '"exactRequiredRejectionInterval"',
+    interval,
   );
   assert.ok(take > -1 && take < queueDrain);
   assert.ok(queueDrain < orderedLoop && orderedLoop < finish);
+  assert.ok(finish < interval && interval < publishInterval);
   assert.match(drain, /let result = Array::new\(\)/);
   assert.match(drain, /result\.push\(&capture\)/);
+
+  const intervalSerializerStart = rendererSource.indexOf(
+    "fn exact_required_rejection_snapshot_object",
+  );
+  const intervalSerializerEnd = rendererSource.indexOf(
+    "\nfn surface_pixel_order",
+    intervalSerializerStart,
+  );
+  const intervalSerializer = rendererSource.slice(
+    intervalSerializerStart,
+    intervalSerializerEnd,
+  );
+  for (const key of ["aggregate", "reasons", "preparationReasons"]) {
+    assert.match(intervalSerializer, new RegExp(`"${key}"`));
+  }
+  assert.match(
+    intervalSerializer,
+    /for reason in ExactRequiredRejectionReason::ALL/,
+  );
+  assert.match(
+    intervalSerializer,
+    /for reason in ExactRequiredPreparationRejectionReason::ALL/,
+  );
 
   const finishStart = rendererSource.indexOf("async fn finish_presented_surface_readback");
   const finishEnd = rendererSource.indexOf(
@@ -857,6 +943,31 @@ test("sustained presented-surface history is exact, ordered, and terminal-only",
   assert.match(finishReadback, /set_presented_frame_provenance/);
   assert.match(finishReadback, /"rgba"/);
   assert.match(finishReadback, /Uint8Array::from\(pixels\.as_slice\(\)\)/);
+
+  const resetStart = rendererSource.indexOf("pub fn reset(&mut self)");
+  const diagnosticsResetStart = rendererSource.indexOf(
+    "pub fn reset_diagnostics(&mut self)",
+    resetStart,
+  );
+  const diagnosticsResetEnd = rendererSource.indexOf(
+    "\n    pub fn diagnostics",
+    diagnosticsResetStart,
+  );
+  const reset = rendererSource.slice(resetStart, diagnosticsResetStart);
+  const diagnosticsReset = rendererSource.slice(
+    diagnosticsResetStart,
+    diagnosticsResetEnd,
+  );
+  assert.match(
+    reset,
+    /last_presented_exact_required_rejection_snapshot\s*=\s*self\.exact_required_rejection_snapshot\(\)/,
+    "gameplay reset must rebase to diagnostics that survive it",
+  );
+  assert.match(
+    diagnosticsReset,
+    /exact_required_preparation_rejection_counts[\s\S]*ExactRequiredPreparationRejectionCounts::default\(\)[\s\S]*last_presented_exact_required_rejection_snapshot\s*=\s*ExactRequiredRejectionSnapshot::default\(\)/,
+    "diagnostics reset must zero live details and the rolling baseline together",
+  );
 });
 
 test("wgpu WebSurface under-reporting cannot disable the required COPY_SRC usage", () => {

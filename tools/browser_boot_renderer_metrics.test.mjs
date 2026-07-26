@@ -591,7 +591,7 @@ test("required exact preparation failures expose one bounded subtype map", () =>
   );
   assert.match(
     rendererSource,
-    /reset_diagnostics\(&self\)[\s\S]{0,240}exact_required_preparation_rejection_counts[\s\S]{0,120}ExactRequiredPreparationRejectionCounts::default\(\)/,
+    /reset_diagnostics\(&mut self\)[\s\S]{0,240}exact_required_preparation_rejection_counts[\s\S]{0,120}ExactRequiredPreparationRejectionCounts::default\(\)/,
   );
   assert.match(
     rendererSource,
@@ -645,6 +645,44 @@ test("required exact preparation failures expose one bounded subtype map", () =>
   assert.match(
     rendererSource,
     /renderer_metrics_object\(\s*self\.metrics\.get\(\),\s*self\.exact_required_preparation_rejection_counts\.get\(\),\s*\)/,
+  );
+
+  const snapshotStart = rendererCoreSource.indexOf(
+    "pub(crate) struct ExactRequiredRejectionSnapshot",
+  );
+  const snapshotEnd = rendererCoreSource.indexOf(
+    "\n/// Side-effect-free facts",
+    snapshotStart,
+  );
+  assert.notEqual(snapshotStart, -1);
+  assert.notEqual(snapshotEnd, -1);
+  const snapshot = rendererCoreSource.slice(snapshotStart, snapshotEnd);
+  assert.match(snapshot, /aggregate:\s*u64/);
+  assert.match(
+    snapshot,
+    /reasons:\s*\[u64; EXACT_REQUIRED_REJECTION_REASON_COUNT\]/,
+  );
+  assert.match(
+    snapshot,
+    /preparation_reasons:\s*ExactRequiredPreparationRejectionCounts/,
+  );
+  assert.match(snapshot, /checked_delta_since/);
+  assert.equal(snapshot.match(/checked_sub\(/g)?.length, 2);
+  assert.match(
+    snapshot,
+    /delta\.is_coherent\(\)\.then_some\(delta\)/,
+  );
+  assert.match(
+    snapshot,
+    /fold\(0, u64::saturating_add\)\s*== self\.aggregate/,
+  );
+  assert.match(
+    snapshot,
+    /saturated_total\(\)\s*== self\.reason\(ExactRequiredRejectionReason::ExactPreparation\)/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /size_of::<ExactRequiredRejectionSnapshot>\(\),\s*55 \* 8/,
   );
 });
 
