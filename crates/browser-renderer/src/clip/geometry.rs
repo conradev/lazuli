@@ -11,7 +11,8 @@ use std::fmt;
 use super::project::{GxExactProjectionError, GxExactProjectionState};
 use super::{
     GxClipError, GxRasterClipVertex, gx_bypass_clip_raster_triangle, gx_clip_mask,
-    gx_post_clip_raster_triangle, gx_source_triangle_indices,
+    gx_guardband_clip_mask, gx_post_clip_raster_triangle, gx_post_guardband_clip_raster_triangle,
+    gx_source_triangle_indices,
 };
 use crate::packet::{GxDraw, GxExactClipState};
 use crate::raster::gx_normalized_raster_channel_u8;
@@ -32,7 +33,9 @@ const GX_CLIP_XY_MASK: u8 = 0x0f;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GxExactClipPath {
-    Clip,
+    LegacyClip,
+    GuardbandClip { disable_trivial_rejection: bool },
+    BypassGuardband { disable_trivial_rejection: bool },
     BypassDepth { disable_trivial_rejection: bool },
 }
 
@@ -352,12 +355,12 @@ fn gx_exact_raster_geometry(
     if state.bp_gen_mode & GX_GEN_MODE_Z_FREEZE != 0 {
         return Err(GxExactGeometryError::UnsupportedZFreeze);
     }
-    let clip_path = gx_exact_clip_path(state.xf_clip_disable, clip_positions);
+    let source_triangles = gx_source_triangle_indices(topology, vertex_count);
     let mut projection_state = state;
-    if clip_path.is_some() {
-        // Qualification remains deliberately fail-closed for raw nonzero
-        // state. Clear the field only after this draw has supplied enough
-        // geometry evidence to select a bounded exact path.
+    if state.xf_clip_disable & !GX_XF_CLIP_DISABLE_DEFINED_MASK == 0 {
+        // Projection still rejects undefined register values itself. Defined
+        // values are routed only after the viewport is available to prove the
+        // unsigned, in-EFB guardband subset.
         projection_state.xf_clip_disable = 0;
     }
     let projection = match GxExactProjectionState::qualify(projection_state) {
@@ -367,12 +370,18 @@ fn gx_exact_raster_geometry(
         }
         Err(error) => return Err(error.into()),
     };
-    let clip_path = clip_path.expect("qualified GX clip-disable path");
-
-    let source_triangles = gx_source_triangle_indices(topology, vertex_count);
     if source_triangles.is_empty() {
         return Err(GxClipError::NoSourceTriangles.into());
     }
+    let clip_path = gx_exact_clip_path(
+        state.xf_clip_disable,
+        clip_positions,
+        &source_triangles,
+        projection,
+    )?
+    .ok_or(GxExactProjectionError::UnsupportedClipDisable(
+        state.xf_clip_disable,
+    ))?;
     let mut vertices = Vec::new();
     let mut output_source_indices = Vec::new();
     for indices in source_triangles {
@@ -387,10 +396,21 @@ fn gx_exact_raster_geometry(
             GxRasterClipVertex::new(vertex, raster_channels)
         });
         let raster_triangles = match clip_path {
-            GxExactClipPath::Clip => {
+            GxExactClipPath::LegacyClip => {
                 gx_post_clip_raster_triangle(clip_triangle, cull_mode, projection.viewport()[1])?
             }
-            GxExactClipPath::BypassDepth {
+            GxExactClipPath::GuardbandClip {
+                disable_trivial_rejection,
+            } => gx_post_guardband_clip_raster_triangle(
+                clip_triangle,
+                cull_mode,
+                projection.viewport()[1],
+                disable_trivial_rejection,
+            )?,
+            GxExactClipPath::BypassGuardband {
+                disable_trivial_rejection,
+            }
+            | GxExactClipPath::BypassDepth {
                 disable_trivial_rejection,
             } => gx_bypass_clip_raster_triangle(
                 clip_triangle,
@@ -435,38 +455,83 @@ fn gx_exact_raster_geometry(
     })
 }
 
-fn gx_exact_clip_path(clip_disable: u32, clip_positions: &[[f32; 4]]) -> Option<GxExactClipPath> {
+fn gx_exact_clip_path(
+    clip_disable: u32,
+    clip_positions: &[[f32; 4]],
+    source_triangles: &[[usize; 3]],
+    projection: GxExactProjectionState,
+) -> Result<Option<GxExactClipPath>, GxClipError> {
     if clip_disable & !GX_XF_CLIP_DISABLE_DEFINED_MASK != 0 {
-        return None;
+        return Ok(None);
     }
+    let masks = clip_positions
+        .iter()
+        .map(gx_clip_mask)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mask = masks.iter().fold(0, |combined, mask| combined | mask);
+    let all_positive_w = clip_positions.iter().all(|position| position[3] > 0.0);
+    let all_raw_xy_in_efb = all_positive_w
+        && clip_positions.iter().all(|position| {
+            projection.project(*position).is_ok_and(|projected| {
+                (0.0..=EFB_WIDTH as f32).contains(&projected[0])
+                    && (0.0..=EFB_HEIGHT as f32).contains(&projected[1])
+            })
+        });
+    let disable_trivial_rejection = clip_disable & GX_XF_DISABLE_TRIVIAL_REJECTION != 0;
+
     if clip_disable & GX_XF_DISABLE_CLIPPING_DETECTION == 0 {
-        // Bits 1 and 2 only suppress an early rejection and a clipping
-        // acceleration. With clipping still enabled (and Z-freeze rejected
-        // above), neither can change the final geometry in this exact subset.
-        return Some(GxExactClipPath::Clip);
+        if mask & GX_CLIP_XY_MASK == 0 {
+            // The prior exact depth subset is already certified for all even
+            // modes. Guardband routing is an X/Y extension only.
+            return Ok(Some(GxExactClipPath::LegacyClip));
+        }
+        if all_raw_xy_in_efb {
+            return Ok(Some(GxExactClipPath::GuardbandClip {
+                disable_trivial_rejection,
+            }));
+        }
+        if !disable_trivial_rejection
+            || gx_trivial_rejection_bypass_is_noop(&masks, source_triangles)
+        {
+            // Keep the established full-viewport canonical subset when raw
+            // endpoints cannot be represented by the unsigned managed path.
+            return Ok(Some(GxExactClipPath::LegacyClip));
+        }
+        return Ok(None);
     }
 
-    let mut mask = 0;
-    for position in clip_positions {
-        if position[3] <= 0.0 {
-            return None;
-        }
-        mask |= gx_clip_mask(position).ok()?;
+    if !all_positive_w {
+        return Ok(None);
     }
     if mask == 0 {
         // In-frustum positive-W geometry remains on the normal clip path so
         // every f32 and u8 interpolation bit stays identical to mode zero.
-        return Some(GxExactClipPath::Clip);
+        return Ok(Some(GxExactClipPath::LegacyClip));
     }
-    if mask & GX_CLIP_XY_MASK != 0 {
-        // GX X/Y clipping uses a measured +/-2W guardband rather than the
-        // software clipper's +/-W planes. Keep that independent behavior
-        // fail-closed until the complete guardband path is certified.
-        return None;
+    let xy_mask = mask & GX_CLIP_XY_MASK;
+    let depth_mask = mask & !GX_CLIP_XY_MASK;
+    if xy_mask != 0 && depth_mask != 0 {
+        return Ok(None);
     }
-    Some(GxExactClipPath::BypassDepth {
-        disable_trivial_rejection: clip_disable & GX_XF_DISABLE_TRIVIAL_REJECTION != 0,
-    })
+    if xy_mask != 0 {
+        let all_inside_guardband = clip_positions.iter().all(|position| {
+            gx_guardband_clip_mask(position).is_ok_and(|mask| mask & GX_CLIP_XY_MASK == 0)
+        });
+        return Ok((all_inside_guardband && all_raw_xy_in_efb).then_some(
+            GxExactClipPath::BypassGuardband {
+                disable_trivial_rejection,
+            },
+        ));
+    }
+    Ok(Some(GxExactClipPath::BypassDepth {
+        disable_trivial_rejection,
+    }))
+}
+
+fn gx_trivial_rejection_bypass_is_noop(masks: &[u8], source_triangles: &[[usize; 3]]) -> bool {
+    source_triangles
+        .iter()
+        .all(|indices| masks[indices[0]] & masks[indices[1]] & masks[indices[2]] == 0)
 }
 
 fn gx_exact_empty_geometry() -> GxExactRasterGeometry {

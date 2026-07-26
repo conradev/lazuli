@@ -18,6 +18,64 @@ fn exact_state(cull_mode: u8) -> GxExactClipState {
     }
 }
 
+fn guardband_state(cull_mode: u8) -> GxExactClipState {
+    GxExactClipState {
+        bp_gen_mode: u32::from(cull_mode) << GX_GEN_MODE_CULL_SHIFT,
+        bp_scissor_top_left: (342 << 12) | 342,
+        bp_scissor_bottom_right: ((342 + 15) << 12) | (342 + 15),
+        bp_scissor_offset: 171 | (171 << 10),
+        xf_clip_disable: 0,
+        viewport_bits: [
+            2.0f32.to_bits(),
+            (-2.0f32).to_bits(),
+            16_777_215.0f32.to_bits(),
+            350.0f32.to_bits(),
+            350.0f32.to_bits(),
+            16_777_215.0f32.to_bits(),
+        ],
+    }
+}
+
+fn guardband_quad(axis: usize, minimum: f32, maximum: f32) -> [[f32; 4]; 4] {
+    match axis {
+        0 => [
+            [minimum, 0.75, -0.5, 1.0],
+            [maximum, 0.75, -0.5, 1.0],
+            [maximum, -0.75, -0.5, 1.0],
+            [minimum, -0.75, -0.5, 1.0],
+        ],
+        1 => [
+            [-0.75, -minimum, -0.5, 1.0],
+            [0.75, -minimum, -0.5, 1.0],
+            [0.75, -maximum, -0.5, 1.0],
+            [-0.75, -maximum, -0.5, 1.0],
+        ],
+        _ => panic!("guardband fixture axis must be X or Y"),
+    }
+}
+
+fn post_snap_triangle_counts(geometry: &GxExactRasterGeometry) -> (usize, usize) {
+    use crate::raster::{GxRasterPoint28_4, GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding};
+
+    let mut triangles = 0;
+    let mut degenerates = 0;
+    for vertices in vertex_slices(geometry.vertices()).chunks_exact(3) {
+        let points = std::array::from_fn(|index| {
+            GxRasterPoint28_4::from_efb(vertices[index][0], vertices[index][1], 0, 0)
+                .expect("bounded guardband fixture projects to unsigned 28.4")
+        });
+        match GxRasterTriangle28_4::setup_post_cull(
+            points,
+            GxRasterWinding::Negative,
+            geometry.raster_scissor(),
+        ) {
+            GxRasterSetup::Triangle(_) => triangles += 1,
+            GxRasterSetup::Degenerate { .. } => degenerates += 1,
+        }
+    }
+    (triangles, degenerates)
+}
+
 fn source_vertices(vertex_count: usize) -> Vec<f32> {
     let flat_rasters = [
         0.0,
@@ -376,12 +434,156 @@ fn proven_clip_disable_noops_preserve_exact_geometry_bit_for_bit() {
             &crossing_reference,
             &format!("clip-enabled mode {value} must retain the exact clip fan"),
         );
-        let outside_actual = gx_exact_raster_geometry(2, 0, &source, &outside, state).unwrap();
-        assert_geometry_bits_eq(
-            &outside_actual,
-            &outside_reference,
-            &format!("clip-enabled mode {value} must retain the final empty result"),
-        );
+        if value == 4 {
+            let outside_actual = gx_exact_raster_geometry(2, 0, &source, &outside, state).unwrap();
+            assert_geometry_bits_eq(
+                &outside_actual,
+                &outside_reference,
+                "mode 4 retains the canonical full-viewport fallback",
+            );
+        } else {
+            assert_eq!(
+                gx_exact_raster_geometry(2, 0, &source, &outside, state),
+                Err(GxExactGeometryError::Projection(
+                    GxExactProjectionError::UnsupportedClipDisable(value)
+                )),
+                "bit 1 cannot expose an out-of-EFB endpoint without exact evidence",
+            );
+        }
+    }
+}
+
+#[test]
+fn bounded_guardband_routes_x_and_y_for_all_clip_disable_modes() {
+    let source = source_vertices(4);
+    let adjacent_outward = f32::from_bits((-2.0f32).to_bits() + 1);
+    assert_eq!(adjacent_outward, -2.000_000_2);
+
+    for (axis, axis_name) in [(0, "X"), (1, "Y")] {
+        for (case_name, clip) in [
+            ("inside", guardband_quad(axis, -1.75, -0.5)),
+            ("exact boundary", guardband_quad(axis, -2.0, -0.5)),
+        ] {
+            for mode in 0..=7 {
+                let mut state = guardband_state(0);
+                state.xf_clip_disable = mode;
+                let geometry = gx_exact_raster_geometry(0, 0, &source, &clip, state).unwrap();
+                assert_eq!(
+                    geometry.triangle_count(),
+                    2,
+                    "{axis_name} {case_name}, mode {mode}",
+                );
+                assert_eq!(
+                    post_snap_triangle_counts(&geometry),
+                    (2, 0),
+                    "{axis_name} {case_name}, mode {mode}",
+                );
+                assert!(!geometry.bypasses_depth_clip());
+            }
+        }
+
+        let adjacent = guardband_quad(axis, adjacent_outward, -0.5);
+        for mode in 0..=7 {
+            let mut state = guardband_state(0);
+            state.xf_clip_disable = mode;
+            if mode & GX_XF_DISABLE_CLIPPING_DETECTION == 0 {
+                let geometry = gx_exact_raster_geometry(0, 0, &source, &adjacent, state).unwrap();
+                assert_eq!(
+                    geometry.triangle_count(),
+                    3,
+                    "{axis_name} adjacent-outward mode {mode} raw fan",
+                );
+                assert_eq!(
+                    post_snap_triangle_counts(&geometry),
+                    (2, 1),
+                    "{axis_name} adjacent-outward mode {mode} post-snap fan",
+                );
+                assert!(!geometry.bypasses_depth_clip());
+            } else {
+                assert_eq!(
+                    gx_exact_raster_geometry(0, 0, &source, &adjacent, state),
+                    Err(GxExactGeometryError::Projection(
+                        GxExactProjectionError::UnsupportedClipDisable(mode)
+                    )),
+                    "{axis_name} adjacent-outward mode {mode} must fail closed",
+                );
+            }
+        }
+
+        let bounded_outward = guardband_quad(axis, -2.25, -0.5);
+        for mode in [0, 2, 4, 6] {
+            let mut state = guardband_state(0);
+            state.xf_clip_disable = mode;
+            let geometry =
+                gx_exact_raster_geometry(0, 0, &source, &bounded_outward, state).unwrap();
+            assert_eq!(
+                geometry.triangle_count(),
+                3,
+                "{axis_name} bounded-outward mode {mode} raw fan",
+            );
+            assert_eq!(
+                post_snap_triangle_counts(&geometry),
+                (3, 0),
+                "{axis_name} bounded-outward mode {mode} post-snap fan",
+            );
+        }
+
+        let uniform = guardband_quad(axis, -1.875, -1.125);
+        let expected_triangles = [0, 0, 2, 2, 0, 0, 2, 2];
+        for (mode, expected) in expected_triangles.into_iter().enumerate() {
+            let mut state = guardband_state(0);
+            state.xf_clip_disable = mode as u32;
+            let geometry = gx_exact_raster_geometry(0, 0, &source, &uniform, state).unwrap();
+            assert_eq!(
+                geometry.triangle_count(),
+                expected,
+                "{axis_name} uniform mode {mode}",
+            );
+            assert_eq!(
+                post_snap_triangle_counts(&geometry),
+                (expected, 0),
+                "{axis_name} uniform mode {mode}",
+            );
+            assert!(!geometry.bypasses_depth_clip());
+        }
+    }
+}
+
+#[test]
+fn odd_guardband_boundaries_are_inclusive_and_combined_depth_stays_closed() {
+    let source = source_vertices(4);
+    let adjacent_outward = f32::from_bits((-2.0f32).to_bits() + 1);
+    for axis in 0..=1 {
+        let exact = guardband_quad(axis, -2.0, -0.5);
+        let outward = guardband_quad(axis, adjacent_outward, -0.5);
+        let beyond = guardband_quad(axis, -2.25, -0.5);
+        let mut combined = guardband_quad(axis, -1.75, -0.5);
+        combined[0][2] = -1.5;
+
+        for mode in [1, 3, 5, 7] {
+            let mut state = guardband_state(0);
+            state.xf_clip_disable = mode;
+            assert_eq!(
+                gx_exact_raster_geometry(0, 0, &source, &exact, state)
+                    .unwrap()
+                    .triangle_count(),
+                2,
+                "axis {axis}, exact ±2W mode {mode}",
+            );
+            for (name, clip) in [
+                ("adjacent outward", &outward),
+                ("beyond guardband", &beyond),
+                ("combined XY and depth", &combined),
+            ] {
+                assert_eq!(
+                    gx_exact_raster_geometry(0, 0, &source, clip, state),
+                    Err(GxExactGeometryError::Projection(
+                        GxExactProjectionError::UnsupportedClipDisable(mode)
+                    )),
+                    "axis {axis}, {name}, mode {mode}",
+                );
+            }
+        }
     }
 }
 

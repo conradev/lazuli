@@ -24,6 +24,16 @@ const GX_CLIP_PLANES: [(u8, [f32; 4]); 6] = [
     (0x10, [0.0, 0.0, 0.0, 1.0]),
     (0x20, [0.0, 0.0, 1.0, 1.0]),
 ];
+const GX_GUARDBAND_CLIP_PLANES: [(u8, [f32; 4]); 6] = [
+    (0x01, [-1.0, 0.0, 0.0, 2.0]),
+    (0x02, [1.0, 0.0, 0.0, 2.0]),
+    (0x04, [0.0, -1.0, 0.0, 2.0]),
+    (0x08, [0.0, 1.0, 0.0, 2.0]),
+    // Guardband clipping changes only X/Y. Preserve the established GX
+    // depth-plane walk, including Dolphin's intentional W >= 0 +Z plane.
+    (0x10, [0.0, 0.0, 0.0, 1.0]),
+    (0x20, [0.0, 0.0, 1.0, 1.0]),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GxClipError {
@@ -117,6 +127,40 @@ fn gx_clip_mask<const COMPONENTS: usize>(vertex: &[f32; COMPONENTS]) -> Result<u
         mask |= 0x04;
     }
     if gx_add(y, w) < 0.0 {
+        mask |= 0x08;
+    }
+    if gx_mul(w, z) > 0.0 {
+        mask |= 0x10;
+    }
+    if gx_add(z, w) < 0.0 {
+        mask |= 0x20;
+    }
+    Ok(mask)
+}
+
+fn gx_guardband_clip_mask<const COMPONENTS: usize>(
+    vertex: &[f32; COMPONENTS],
+) -> Result<u8, GxClipError> {
+    if !gx_clip_vertex_is_valid(vertex) {
+        return Err(if COMPONENTS < GX_CLIP_COMPONENTS {
+            GxClipError::InvalidComponentCount
+        } else {
+            GxClipError::NonFiniteVertex
+        });
+    }
+    let [x, y, z, w] = [vertex[0], vertex[1], vertex[2], vertex[3]];
+    let two_w = gx_mul(2.0, w);
+    let mut mask = 0;
+    if gx_sub(two_w, x) < 0.0 {
+        mask |= 0x01;
+    }
+    if gx_add(x, two_w) < 0.0 {
+        mask |= 0x02;
+    }
+    if gx_sub(two_w, y) < 0.0 {
+        mask |= 0x04;
+    }
+    if gx_add(y, two_w) < 0.0 {
         mask |= 0x08;
     }
     if gx_mul(w, z) > 0.0 {
@@ -227,11 +271,19 @@ fn gx_raster_clip_polygon<const COMPONENTS: usize>(
     vertices: [GxRasterClipVertex<COMPONENTS>; 3],
     mask: u8,
 ) -> Result<Vec<GxRasterClipVertex<COMPONENTS>>, GxClipError> {
+    gx_raster_clip_polygon_with_planes(vertices, mask, &GX_CLIP_PLANES)
+}
+
+fn gx_raster_clip_polygon_with_planes<const COMPONENTS: usize>(
+    vertices: [GxRasterClipVertex<COMPONENTS>; 3],
+    mask: u8,
+    planes: &[(u8, [f32; 4]); 6],
+) -> Result<Vec<GxRasterClipVertex<COMPONENTS>>, GxClipError> {
     if mask & !GX_CLIP_PLANE_MASK != 0 {
         return Err(GxClipError::ArithmeticOverflow);
     }
     let mut input = vertices.to_vec();
-    for (plane_bit, plane) in GX_CLIP_PLANES {
+    for &(plane_bit, plane) in planes {
         if mask & plane_bit == 0 {
             continue;
         }
@@ -296,6 +348,28 @@ pub(crate) fn gx_post_clip_raster_triangle<const COMPONENTS: usize>(
         return Ok(Vec::new());
     };
     let polygon = gx_raster_clip_polygon(ordered, mask)?;
+    Ok(gx_triangulate_raster_polygon(&polygon))
+}
+
+pub(crate) fn gx_post_guardband_clip_raster_triangle<const COMPONENTS: usize>(
+    triangle: [GxRasterClipVertex<COMPONENTS>; 3],
+    cull_mode: u8,
+    viewport_height: f32,
+    disable_trivial_rejection: bool,
+) -> Result<Vec<[GxRasterClipVertex<COMPONENTS>; 3]>, GxClipError> {
+    let Some((ordered, _canonical_mask)) = gx_post_cull_raster_triangle(
+        triangle,
+        cull_mode,
+        viewport_height,
+        disable_trivial_rejection,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    let mask = ordered.iter().try_fold(0, |mask, vertex| {
+        Ok::<_, GxClipError>(mask | gx_guardband_clip_mask(&vertex.components)?)
+    })?;
+    let polygon = gx_raster_clip_polygon_with_planes(ordered, mask, &GX_GUARDBAND_CLIP_PLANES)?;
     Ok(gx_triangulate_raster_polygon(&polygon))
 }
 
