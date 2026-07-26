@@ -60,10 +60,23 @@ const dspFunctionNames = [
   "dspAxCommandArity",
   "dspAxAddress",
   "dspAxParseFailure",
+  "emptyDspAxVoicePlan",
+  "markDspAxVoiceFallback",
+  "inspectDspAxZeroSetup",
+  "observeDspAxVoiceCommand",
+  "finalizeDspAxVoicePlan",
   "dspAxSilentWriteRange",
   "collectDspAxSilentWrites",
   "parseDspAxCommandLists",
   "applyDspAxSilentWrites",
+  "dspAxVoiceByteArray",
+  "dspAxVoiceReason",
+  "dspAxVoiceOutputHash",
+  "dspAxVoiceNonZeroSamples",
+  "dspAxVoiceRangesOverlap",
+  "dspAxVoiceFallback",
+  "prepareDspAxVoiceTransaction",
+  "applyDspAxVoiceTransaction",
   "beginDspAxCommandList",
   "executeDspAxCommandList",
   "handleDspAxMail",
@@ -129,6 +142,12 @@ function dspContext() {
       return ram + physical;
     },
     ramSize,
+    renderAxVoiceReference() {
+      return {
+        ok: false,
+        error: { reason: "legacy-test-reference-unavailable" },
+      };
+    },
     serviceAramDma() {},
     serviceDspAudioDma() {},
     view: new DataView(memory),
@@ -269,7 +288,18 @@ test("AX validates a full silent list before bounded writeback and delayed yield
   assert.equal(context.deviceEvents.get("dspAxSilentWrite"), 7);
   assert.equal(context.deviceEvents.get("dspAxSilentBytes"), 8960);
   assert.equal(context.invalidations.length, 7);
-  assert.equal(context.dspFirstUnsupported, null);
+  assert.deepEqual(
+    { ...context.dspFirstUnsupported },
+    {
+      instructionCycle: 10_000,
+      dispatchPc: 0x80001000,
+      stage: "voice",
+      mode: "ax",
+      reason: "unsupported-main-buffer-command",
+      ucodeHash: 0x4e8a8b21,
+      code: 0x04,
+    },
+  );
   for (const [address, size] of ranges) {
     assertClearedGuardedRange(context, address, size);
   }
