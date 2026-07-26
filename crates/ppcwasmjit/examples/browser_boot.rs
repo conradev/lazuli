@@ -6161,6 +6161,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let diskAudioNextStart = 0;
     let diskAudioNextLength = 0;
     let nextDiskAudioCycle = null;
+    let dtkFirstUnsupported = null;
     const diskCommandCounts = new Map();
     const diskCommandTrace = [];
     const diskDmaRejectionCounts = new Map();
@@ -22340,6 +22341,35 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (diskCommandTrace.length > 64) diskCommandTrace.shift();
     }
 
+    function latchDtkFirstUnsupported(
+      observedCycles,
+      reason,
+      opcode,
+      subcommand
+    ) {
+      if (dtkFirstUnsupported !== null) return;
+      // DI commands are decoded at the post-dispatch device-service boundary,
+      // so neither field below claims instruction-precise provenance.
+      dtkFirstUnsupported = {
+        serviceCycle: observedCycles,
+        dispatchPc: pc >>> 0,
+        reason,
+        opcode: opcode & 0xff,
+        subcommand: subcommand & 0xff,
+      };
+    }
+
+    function snapshotDtkFirstUnsupported() {
+      if (dtkFirstUnsupported === null) return null;
+      return {
+        serviceCycle: dtkFirstUnsupported.serviceCycle,
+        dispatchPc: hex32(dtkFirstUnsupported.dispatchPc),
+        reason: dtkFirstUnsupported.reason,
+        opcode: dtkFirstUnsupported.opcode,
+        subcommand: dtkFirstUnsupported.subcommand,
+      };
+    }
+
     function snapshotDiskTransfer() {
       if (diskTransfer === null) return null;
       return {
@@ -22869,6 +22899,12 @@ const TEMPLATE: &str = r##"<!doctype html>
                 (deviceEvents.get("diskAudioStreamStop") ?? 0) + 1
               );
             } else {
+              latchDtkFirstUnsupported(
+                observedCycles,
+                "invalid-audio-command",
+                opcode,
+                audioSubcommand
+              );
               diskLastError = diErrorInvalidAudioCommand;
               transfer.interruptStatus = diDeviceErrorInterrupt;
               details = { subcommand: audioSubcommand, reason: "invalid-audio-command" };
@@ -22892,6 +22928,12 @@ const TEMPLATE: &str = r##"<!doctype html>
             } else if (audioSubcommand === 0x03) {
               result = diskAudioLength >>> 0;
             } else {
+              latchDtkFirstUnsupported(
+                observedCycles,
+                "invalid-audio-status",
+                opcode,
+                audioSubcommand
+              );
               diskLastError = diErrorInvalidAudioCommand;
               transfer.interruptStatus = diDeviceErrorInterrupt;
               details = { subcommand: audioSubcommand, reason: "invalid-audio-status" };
@@ -24129,6 +24171,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
         audioCompatibility: {
           dspFirstUnsupported: snapshotDspFirstUnsupported(),
+          dtkFirstUnsupported: snapshotDtkFirstUnsupported(),
         },
         controller: {
           sequence: controllerSequence,

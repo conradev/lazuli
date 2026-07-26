@@ -133,7 +133,9 @@ function makeContext() {
     aiInterruptDelivered: false,
     diskCommandCounts: new Map(),
     diskCommandTrace: [],
+    dtkFirstUnsupported: null,
     interruptDeliveries: 0,
+    pc: 0x80001000,
     check(condition, message) {
       assert.ok(condition, message);
     },
@@ -151,10 +153,13 @@ function makeContext() {
   vm.createContext(context);
   vm.runInContext(
     [
+      "hex32",
       "recomputeDiskInterruptLevel",
       "writeDiskStatus",
       "diskCommandName",
       "recordDiskCommand",
+      "latchDtkFirstUnsupported",
+      "snapshotDtkFirstUnsupported",
       "audioCyclesPerSample",
       "updateAudioSampleCounter",
       "writeAudioControl",
@@ -256,6 +261,7 @@ test("DI streaming commands configure, start, query, and stop DTK state", () => 
   assert.equal(context.diskAudioEnabled, false);
   assert.equal(context.deviceEvents.get("diskAudioConfig"), 2);
   assert.equal(context.diskCommandCounts.get("audio-status"), 4);
+  assert.equal(context.dtkFirstUnsupported, null);
 });
 
 test("DTK advances in scheduler-visible GameCube audio batches", () => {
@@ -359,6 +365,22 @@ test("DTK diagnostics explicitly identify hardware-state-only output", () => {
   assert.match(source, /nextDiskAudioCycle,\n\s+serialTransfer/);
   assert.match(source, /nextCycle: nextDiskAudioCycle,\n\s+\.\.\.diskAudioTiming\(\),/);
   assert.match(source, /output: "hardware-state-only"/);
+  assert.match(
+    source,
+    /audioCompatibility:\s*\{\s*dspFirstUnsupported: snapshotDspFirstUnsupported\(\),\s*dtkFirstUnsupported: snapshotDtkFirstUnsupported\(\),/,
+  );
+});
+
+test("audio-disabled DTK commands are configuration failures, not unsupported", () => {
+  const context = makeContext();
+
+  const stream = runCommand(context, 0xe1000000, 0, 0, 1000);
+  const status = runCommand(context, 0xe2000000, 0, 0, 200000);
+
+  assert.equal(stream.interruptStatus, 0x04);
+  assert.equal(status.interruptStatus, 0x04);
+  assert.equal(context.diskLastError, 0x00052001);
+  assert.equal(context.dtkFirstUnsupported, null);
 });
 
 test("DI seek, stop-motor, and request-error commands complete without DMA", () => {
@@ -381,6 +403,10 @@ test("DI seek, stop-motor, and request-error commands complete without DMA", () 
 });
 
 test("invalid DI subcommands and unsupported opcodes terminate with DEINT", () => {
+  const genericOnly = makeContext();
+  runCommand(genericOnly, 0x99000000, 0, 0, 1000);
+  assert.equal(genericOnly.dtkFirstUnsupported, null);
+
   const context = makeContext();
   const { view } = context;
   context.diskAudioEnabled = true;
@@ -389,6 +415,26 @@ test("invalid DI subcommands and unsupported opcodes terminate with DEINT", () =
   assert.equal(invalidAudio.interruptStatus, 0x04);
   assert.equal(view.getUint32(0x6000, false) & 0x04, 0x04);
   assert.equal(context.diskLastError, 0x00052401);
+  assert.deepEqual(
+    { ...context.dtkFirstUnsupported },
+    {
+      serviceCycle: 1000,
+      dispatchPc: 0x80001000,
+      reason: "invalid-audio-status",
+      opcode: 0xe2,
+      subcommand: 4,
+    },
+  );
+  assert.deepEqual(
+    { ...context.snapshotDtkFirstUnsupported() },
+    {
+      serviceCycle: 1000,
+      dispatchPc: "0x80001000",
+      reason: "invalid-audio-status",
+      opcode: 0xe2,
+      subcommand: 4,
+    },
+  );
 
   runCommand(context, 0xe0000000, 0, 0, 200000);
   assert.equal(view.getUint32(0x6020, false), 0x00052401);
@@ -401,4 +447,44 @@ test("invalid DI subcommands and unsupported opcodes terminate with DEINT", () =
   assert.equal(context.deviceEvents.get("diskUnsupportedCommand"), 1);
   assert.equal(context.deviceEvents.get("diskDeviceError"), 2);
   assert.equal(context.diskCommandTrace.at(-1).outcome, "device-error");
+  assert.deepEqual(
+    { ...context.dtkFirstUnsupported },
+    {
+      serviceCycle: 1000,
+      dispatchPc: 0x80001000,
+      reason: "invalid-audio-status",
+      opcode: 0xe2,
+      subcommand: 4,
+    },
+    "generic unsupported DI opcode replaced the DTK-specific latch",
+  );
+});
+
+test("the first invalid DTK stream/status subcommand wins", () => {
+  const context = makeContext();
+  context.diskAudioEnabled = true;
+
+  runCommand(context, 0xe1020000, 0, 0, 1000);
+  assert.deepEqual(
+    { ...context.dtkFirstUnsupported },
+    {
+      serviceCycle: 1000,
+      dispatchPc: 0x80001000,
+      reason: "invalid-audio-command",
+      opcode: 0xe1,
+      subcommand: 2,
+    },
+  );
+
+  const firstUnsupported = { ...context.dtkFirstUnsupported };
+  context.pc = 0x80002000;
+  runCommand(context, 0xe2040000, 0, 0, 200000);
+  assert.deepEqual(
+    { ...context.dtkFirstUnsupported },
+    firstUnsupported,
+  );
+  assert.deepEqual(
+    Object.keys(context.dtkFirstUnsupported),
+    ["serviceCycle", "dispatchPc", "reason", "opcode", "subcommand"],
+  );
 });
