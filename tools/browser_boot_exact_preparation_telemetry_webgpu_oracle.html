@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli exact-preparation WebGPU telemetry oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli exact-preparation WebGPU telemetry oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      OPTIONAL_CLIP_DISABLE_7_PACKET_OPTIONS,
+      REQUIRED_CLIP_DISABLE_7_PACKET_OPTIONS,
+      evaluateExactRequiredTelemetryResetLifetime,
+      evaluateOptionalClipDisable7NativeRoute,
+      evaluateRequiredClipDisable7Suppression,
+    } from "./browser_boot_exact_preparation_telemetry_oracle.mjs";
+    import {
+      buildProjectionNullOraclePacket,
+      projectionNullOracleXfb,
+    } from "./browser_boot_projection_null_oracle.mjs";
+
+    const REQUIRED_GENERATION = 1;
+    const OPTIONAL_GENERATION = 2;
+
+    async function present(renderer, generation) {
+      const presentation = renderer.present_xfb(
+        projectionNullOracleXfb.destination,
+        generation,
+        0,
+        "progressive",
+        "top",
+        generation,
+        projectionNullOracleXfb.width,
+        projectionNullOracleXfb.height,
+        projectionNullOracleXfb.stride,
+        projectionNullOracleXfb.height,
+        1,
+        false,
+        false,
+      );
+      await renderer.drain();
+      const readback = await renderer.read_presented_xfb_rgba();
+      renderer.check_health();
+      return { presentation, readback };
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      try {
+        renderer.reset();
+        renderer.reset_diagnostics();
+        const requiredBefore = renderer.diagnostics();
+        renderer.submit_gx_frame(
+          buildProjectionNullOraclePacket(
+            REQUIRED_GENERATION,
+            REQUIRED_CLIP_DISABLE_7_PACKET_OPTIONS,
+          ),
+        );
+        const requiredSurface = await present(
+          renderer,
+          REQUIRED_GENERATION,
+        );
+        const requiredAfter = renderer.diagnostics();
+        const required = evaluateRequiredClipDisable7Suppression(
+          requiredBefore,
+          requiredAfter,
+          requiredSurface.readback,
+        );
+
+        renderer.reset();
+        const requiredAfterRendererReset = renderer.diagnostics();
+        renderer.reset_diagnostics();
+        const afterDiagnosticsReset = renderer.diagnostics();
+        const resetLifetime =
+          evaluateExactRequiredTelemetryResetLifetime(
+            requiredAfter,
+            requiredAfterRendererReset,
+            afterDiagnosticsReset,
+          );
+        renderer.submit_gx_frame(
+          buildProjectionNullOraclePacket(
+            OPTIONAL_GENERATION,
+            OPTIONAL_CLIP_DISABLE_7_PACKET_OPTIONS,
+          ),
+        );
+        const optionalSurface = await present(
+          renderer,
+          OPTIONAL_GENERATION,
+        );
+        const optionalDiagnostics = renderer.diagnostics();
+        const optional = evaluateOptionalClipDisable7NativeRoute(
+          optionalDiagnostics,
+          optionalSurface.readback,
+        );
+
+        const result = {
+          pass: required.pass && resetLifetime.pass && optional.pass,
+          strictWebGpu: true,
+          required,
+          resetLifetime,
+          optional: {
+            ...optional,
+            presentation: optionalSurface.presentation,
+          },
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliExactPreparationTelemetryOraclePromise =
+      run().catch(error => {
+        const result = {
+          pass: false,
+          error: error instanceof Error ? error.stack : String(error),
+        };
+        document.body.dataset.status = "error";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      });
+  </script>
+</body>
+</html>

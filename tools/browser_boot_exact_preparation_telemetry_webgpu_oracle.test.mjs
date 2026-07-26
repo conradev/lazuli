@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -18,6 +19,14 @@ import {
   projectionNullOracleCase,
   projectionNullOracleXfb,
 } from "./browser_boot_projection_null_oracle.mjs";
+
+const browserOracle = readFileSync(
+  new URL(
+    "./browser_boot_exact_preparation_telemetry_webgpu_oracle.html",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 function diagnostics({
   aggregate = 0,
@@ -297,4 +306,77 @@ test("telemetry model rejects missing, malformed, and regressing maps", () => {
     ),
     /keys changed/,
   );
+});
+
+test("local WebGPU oracle executes required suppression, reset lifetime, then optional native evidence", () => {
+  assert.match(
+    browserOracle,
+    /from "\.\.\/target\/gekko-web\/browser_renderer\.js"/,
+  );
+  assert.match(
+    browserOracle,
+    /from "\.\/browser_boot_exact_preparation_telemetry_oracle\.mjs"/,
+  );
+  assert.match(
+    browserOracle,
+    /from "\.\/browser_boot_projection_null_oracle\.mjs"/,
+  );
+  assert.match(browserOracle, /await WebGpuRenderer\.create\(canvas\)/);
+  assert.match(
+    browserOracle,
+    /renderer\.reset\(\);\s*renderer\.reset_diagnostics\(\);\s*const requiredBefore = renderer\.diagnostics\(\);/,
+  );
+  assert.match(
+    browserOracle,
+    /REQUIRED_GENERATION,\s*REQUIRED_CLIP_DISABLE_7_PACKET_OPTIONS/,
+  );
+  assert.match(
+    browserOracle,
+    /const requiredSurface = await present\(\s*renderer,\s*REQUIRED_GENERATION,\s*\);\s*const requiredAfter = renderer\.diagnostics\(\);\s*const required = evaluateRequiredClipDisable7Suppression\(\s*requiredBefore,\s*requiredAfter,\s*requiredSurface\.readback,/,
+  );
+  assert.match(
+    browserOracle,
+    /renderer\.reset\(\);\s*const requiredAfterRendererReset = renderer\.diagnostics\(\);\s*renderer\.reset_diagnostics\(\);\s*const afterDiagnosticsReset = renderer\.diagnostics\(\);/,
+  );
+  assert.match(
+    browserOracle,
+    /evaluateExactRequiredTelemetryResetLifetime\(\s*requiredAfter,\s*requiredAfterRendererReset,\s*afterDiagnosticsReset,/,
+  );
+  assert.match(
+    browserOracle,
+    /const resetLifetime[\s\S]*?renderer\.submit_gx_frame/,
+  );
+  assert.match(
+    browserOracle,
+    /OPTIONAL_GENERATION,\s*OPTIONAL_CLIP_DISABLE_7_PACKET_OPTIONS/,
+  );
+  assert.match(browserOracle, /renderer\.present_xfb\(/);
+  assert.match(browserOracle, /await renderer\.drain\(\)/);
+  assert.match(
+    browserOracle,
+    /await renderer\.read_presented_xfb_rgba\(\)/,
+  );
+  assert.match(
+    browserOracle,
+    /evaluateOptionalClipDisable7NativeRoute\(\s*optionalDiagnostics,\s*optionalSurface\.readback,/,
+  );
+  assert.match(
+    browserOracle,
+    /pass: required\.pass && resetLifetime\.pass && optional\.pass/,
+  );
+  assert.match(browserOracle, /strictWebGpu: true/);
+  assert.match(browserOracle, /health: "clean"/);
+  assert.match(
+    browserOracle,
+    /window\.__lazuliExactPreparationTelemetryOraclePromise/,
+  );
+  assert.equal(
+    browserOracle.match(/renderer\.reset_diagnostics\(\)/g)?.length,
+    2,
+  );
+  assert.equal(
+    browserOracle.match(/await present\(/g)?.length,
+    2,
+  );
+  assert.doesNotMatch(browserOracle, /fetch\(|gekko\.free|WebGL|webgl/);
 });
