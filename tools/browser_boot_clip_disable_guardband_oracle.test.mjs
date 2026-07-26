@@ -8,15 +8,20 @@ import {
   CLIP_DISABLE_GUARDBAND_MODES,
   CLIP_DISABLE_GUARDBAND_RUN_COUNT,
   CLIP_DISABLE_GUARDBAND_SCOPE,
+  buildClipDisableGuardbandOraclePacket,
   clipDisableGuardbandCases,
   clipDisableGuardbandCertificationMatrix,
   clipDisableGuardbandExactState,
   clipDisableGuardbandExpectation,
   clipDisableGuardbandMaskRows,
   clipDisableGuardbandOracleXfb,
+  clipDisableGuardbandPacketLayout,
   evaluateClipDisableGuardband,
   nextDownF32,
 } from "./browser_boot_clip_disable_guardband_oracle.mjs";
+import {
+  RASTER_BLEND_ADDITIVE_ONE_ONE,
+} from "./browser_boot_raster_center_oracle.mjs";
 
 const f32 = Math.fround;
 
@@ -160,6 +165,143 @@ test("oracle is explicitly bounded to positive-W, in-EFB unsigned payloads", () 
       assert.ok(projected[1] >= 0 && projected[1] <= 16);
     }
   }
+});
+
+test("packet builder carries one required-exact additive quad", () => {
+  const generation = 41;
+  const mode = 7;
+  const entry = caseById("negative-x-exact-boundary");
+  const packet = buildClipDisableGuardbandOraclePacket(
+    entry.id,
+    mode,
+    generation,
+  );
+  const view = new DataView(
+    packet.buffer,
+    packet.byteOffset,
+    packet.byteLength,
+  );
+  const layout = clipDisableGuardbandPacketLayout;
+  assert.equal(packet.length, layout.packetBytes);
+  assert.equal(view.getUint16(0x04, true), 6);
+  assert.equal(view.getUint32(0x08, true), packet.length);
+  assert.equal(view.getUint32(0x54, true), 16);
+  assert.equal(view.getUint32(0x58, true), 16);
+  assert.equal(view.getUint32(0x5c, true), 16);
+  assert.equal(view.getUint32(0x60, true), 16);
+  assert.equal(
+    view.getUint32(0x64, true),
+    clipDisableGuardbandOracleXfb.destination,
+  );
+  assert.equal(
+    view.getUint32(0x68, true),
+    clipDisableGuardbandOracleXfb.stride,
+  );
+  assert.equal(view.getUint32(0x6c, true), generation);
+
+  assert.equal(packet[layout.drawOffset], 0);
+  assert.equal(
+    view.getUint16(layout.drawOffset + 0x02, true),
+    layout.drawFlag,
+  );
+  assert.equal(
+    view.getUint32(layout.drawOffset + 0x04, true),
+    layout.vertexCount,
+  );
+  assert.equal(
+    view.getUint32(layout.drawOffset + 0x14, true),
+    RASTER_BLEND_ADDITIVE_ONE_ONE,
+  );
+  assert.deepEqual(
+    [0x1c, 0x20, 0x24, 0x28].map((offset) =>
+      view.getUint32(layout.drawOffset + offset, true)
+    ),
+    [0, 0, 16, 16],
+  );
+  assert.equal(
+    view.getFloat32(layout.drawOffset + 0xac, true),
+    clipDisableGuardbandExactState.viewport[0],
+  );
+
+  const exact = layout.exactChunkOffset;
+  assert.equal(view.getUint32(exact + 0x00, true), 1);
+  assert.equal(
+    view.getUint32(exact + 0x04, true),
+    clipDisableGuardbandExactState.bpGenMode,
+  );
+  assert.equal(
+    view.getUint32(exact + 0x08, true),
+    clipDisableGuardbandExactState.bpScissorTopLeft,
+  );
+  assert.equal(
+    view.getUint32(exact + 0x0c, true),
+    clipDisableGuardbandExactState.bpScissorBottomRight,
+  );
+  assert.equal(
+    view.getUint32(exact + 0x10, true),
+    clipDisableGuardbandExactState.bpScissorOffset,
+  );
+  assert.equal(view.getUint32(exact + 0x14, true), mode);
+  assert.deepEqual(
+    Array.from(
+      { length: clipDisableGuardbandExactState.viewport.length },
+      (_unused, index) =>
+        view.getFloat32(exact + 0x18 + index * 4, true),
+    ),
+    clipDisableGuardbandExactState.viewport,
+  );
+  assert.deepEqual(
+    Array.from(
+      { length: layout.vertexCount * 4 },
+      (_unused, index) =>
+        view.getFloat32(exact + 0x30 + index * 4, true),
+    ),
+    entry.exactClipPositions.flat(),
+  );
+
+  const vertexOffset = layout.vertexOffset;
+  assert.deepEqual(
+    [
+      view.getFloat32(vertexOffset, true),
+      view.getFloat32(vertexOffset + 4, true),
+    ],
+    [4, 6.5],
+  );
+  assert.equal(
+    view.getFloat32(vertexOffset + 2 * 4, true),
+    f32(0x00ffffff / 2),
+  );
+  assert.deepEqual(
+    Array.from({ length: 4 }, (_unused, index) =>
+      view.getFloat32(vertexOffset + (4 + index) * 4, true)
+    ),
+    [f32(64 / 255), 0, 0, 1],
+  );
+});
+
+test("packet builder rejects invalid matrix coordinates", () => {
+  assert.throws(
+    () => buildClipDisableGuardbandOraclePacket("missing", 0, 1),
+    /unknown clip-disable guardband case/,
+  );
+  assert.throws(
+    () =>
+      buildClipDisableGuardbandOraclePacket(
+        "negative-x-inside-guardband",
+        8,
+        1,
+      ),
+    /mode must be an integer/,
+  );
+  assert.throws(
+    () =>
+      buildClipDisableGuardbandOraclePacket(
+        "negative-x-inside-guardband",
+        0,
+        -1,
+      ),
+    /generation must be a non-negative safe integer/,
+  );
 });
 
 test("f32 projection and the GX 7/12 sample derive the pinned masks", () => {

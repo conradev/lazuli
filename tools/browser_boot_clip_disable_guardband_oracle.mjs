@@ -3,11 +3,31 @@
 import {
   snapshotExactRequiredTelemetry,
 } from "./browser_boot_exact_preparation_telemetry_oracle.mjs";
+import {
+  RASTER_ALWAYS_PASS,
+  RASTER_BLEND_ADDITIVE_ONE_ONE,
+  buildRasterCenterOraclePacket,
+} from "./browser_boot_raster_center_oracle.mjs";
 
 const CLIP_DISABLE_MASK = 0b111;
 const DISABLE_CLIPPING_DETECTION = 1 << 0;
 const DISABLE_TRIVIAL_REJECTION = 1 << 1;
 const DEPTH24_MAX = 0x00ffffff;
+const HEADER_BYTES = 160;
+const DRAW_BYTES = 176;
+const TEV_BYTES = 464;
+const VERTEX_FLOATS = 36;
+const VERTEX_BYTES = VERTEX_FLOATS * 4;
+const VERTEX_COUNT = 4;
+const DRAW_OFFSET = HEADER_BYTES;
+const BASE_PACKET_BYTES =
+  HEADER_BYTES +
+  DRAW_BYTES +
+  TEV_BYTES +
+  VERTEX_COUNT * VERTEX_BYTES;
+const EXACT_CHUNK_BYTES = 0x30 + VERTEX_COUNT * 4 * 4;
+const PACKET_BYTES = BASE_PACKET_BYTES + EXACT_CHUNK_BYTES;
+const DRAW_FLAG_EXACT_CLIP_REQUIRED = 6;
 const SCISSOR_ORIGIN = 342;
 const VIEWPORT_ORIGIN = 350;
 const SAMPLE_28_4_THIRDS = 28; // (7 / 12) * 16 * 3
@@ -73,6 +93,22 @@ export const clipDisableGuardbandExactState = Object.freeze({
     VIEWPORT_ORIGIN,
     DEPTH24_MAX,
   ]),
+});
+
+export const clipDisableGuardbandPacketLayout = Object.freeze({
+  headerBytes: HEADER_BYTES,
+  drawOffset: DRAW_OFFSET,
+  drawBytes: DRAW_BYTES,
+  tevBytes: TEV_BYTES,
+  vertexOffset: HEADER_BYTES + DRAW_BYTES + TEV_BYTES,
+  vertexFloats: VERTEX_FLOATS,
+  vertexBytes: VERTEX_BYTES,
+  vertexCount: VERTEX_COUNT,
+  basePacketBytes: BASE_PACKET_BYTES,
+  exactChunkOffset: BASE_PACKET_BYTES,
+  exactChunkBytes: EXACT_CHUNK_BYTES,
+  packetBytes: PACKET_BYTES,
+  drawFlag: DRAW_FLAG_EXACT_CLIP_REQUIRED,
 });
 
 function quadPositions(axis, minimum, maximum) {
@@ -356,7 +392,7 @@ function deriveTriangles(entry, mode) {
   };
 }
 
-function projectTo28_4(position) {
+function projectToEfb(position) {
   const [scaleX, scaleY, , originX, originY] =
     clipDisableGuardbandExactState.viewport;
   const reciprocalW = f32(1 / position[3]);
@@ -372,7 +408,115 @@ function projectTo28_4(position) {
         originY,
     ) - SCISSOR_ORIGIN,
   );
+  return [x, y];
+}
+
+function projectTo28_4(position) {
+  const [x, y] = projectToEfb(position);
   return [snap28_4(x), snap28_4(y)];
+}
+
+function guardbandCarrierVertex(position) {
+  const [x, y] = projectToEfb(position);
+  return {
+    x,
+    y,
+    depth24: f32(DEPTH24_MAX / 2),
+    rgba: RED64.map((channel) => f32(channel / 255)),
+  };
+}
+
+export function buildClipDisableGuardbandOraclePacket(
+  caseId,
+  inputMode,
+  generation = 1,
+) {
+  const entry = exactCase(caseId);
+  const mode = exactMode(inputMode);
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new RangeError("generation must be a non-negative safe integer");
+  }
+  const base = buildRasterCenterOraclePacket(
+    [
+      {
+        topology: 0,
+        vertices: entry.exactClipPositions.map(guardbandCarrierVertex),
+        zMode: 0,
+        blendMode: RASTER_BLEND_ADDITIVE_ONE_ONE,
+        alphaTest: RASTER_ALWAYS_PASS,
+        pixelControl: 0,
+        scissor: {
+          x: 0,
+          y: 0,
+          width: clipDisableGuardbandOracleXfb.width,
+          height: clipDisableGuardbandOracleXfb.height,
+        },
+      },
+    ],
+    generation,
+  );
+  if (base.length !== BASE_PACKET_BYTES) {
+    throw new Error(
+      `clip-disable guardband base packet is ${base.length}, expected ${BASE_PACKET_BYTES}`,
+    );
+  }
+
+  const packet = new Uint8Array(PACKET_BYTES);
+  packet.set(base);
+  const view = new DataView(
+    packet.buffer,
+    packet.byteOffset,
+    packet.byteLength,
+  );
+  view.setUint16(0x04, 6, true);
+  view.setUint32(0x08, packet.length, true);
+  view.setUint32(0x54, clipDisableGuardbandOracleXfb.width, true);
+  view.setUint32(0x58, clipDisableGuardbandOracleXfb.height, true);
+  view.setUint32(0x5c, clipDisableGuardbandOracleXfb.width, true);
+  view.setUint32(0x60, clipDisableGuardbandOracleXfb.height, true);
+  view.setUint32(0x64, clipDisableGuardbandOracleXfb.destination, true);
+  view.setUint32(0x68, clipDisableGuardbandOracleXfb.stride, true);
+  view.setUint16(
+    DRAW_OFFSET + 0x02,
+    DRAW_FLAG_EXACT_CLIP_REQUIRED,
+    true,
+  );
+  view.setFloat32(
+    DRAW_OFFSET + 0xac,
+    clipDisableGuardbandExactState.viewport[0],
+    true,
+  );
+
+  const exact = BASE_PACKET_BYTES;
+  view.setUint32(exact + 0x00, 1, true);
+  view.setUint32(
+    exact + 0x04,
+    clipDisableGuardbandExactState.bpGenMode,
+    true,
+  );
+  view.setUint32(
+    exact + 0x08,
+    clipDisableGuardbandExactState.bpScissorTopLeft,
+    true,
+  );
+  view.setUint32(
+    exact + 0x0c,
+    clipDisableGuardbandExactState.bpScissorBottomRight,
+    true,
+  );
+  view.setUint32(
+    exact + 0x10,
+    clipDisableGuardbandExactState.bpScissorOffset,
+    true,
+  );
+  view.setUint32(exact + 0x14, mode, true);
+  clipDisableGuardbandExactState.viewport.forEach((value, index) => {
+    view.setFloat32(exact + 0x18 + index * 4, value, true);
+  });
+  entry.exactClipPositions.flat().forEach((value, index) => {
+    view.setFloat32(exact + 0x30 + index * 4, value, true);
+  });
+  return packet;
 }
 
 function snap28_4(coordinate) {
