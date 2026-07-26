@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+import {
+  snapshotExactRequiredTelemetry,
+} from "./browser_boot_exact_preparation_telemetry_oracle.mjs";
 
 const CLIP_DISABLE_MASK = 0b111;
 const DISABLE_CLIPPING_DETECTION = 1 << 0;
@@ -594,4 +597,183 @@ export function clipDisableGuardbandCertificationMatrix() {
     }
   }
   return Object.freeze(matrix);
+}
+
+function requiredObject(value, name) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${name} must be an object`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function checkedDelta(before, after, name) {
+  const delta =
+    nonNegativeInteger(after, `after ${name}`) -
+    nonNegativeInteger(before, `before ${name}`);
+  if (!Number.isSafeInteger(delta) || delta < 0) {
+    throw new RangeError(`${name} regressed`);
+  }
+  return delta;
+}
+
+function counterMapDelta(before, after, name) {
+  const beforeKeys = Object.keys(before).sort();
+  const afterKeys = Object.keys(after).sort();
+  if (
+    beforeKeys.length !== afterKeys.length ||
+    beforeKeys.some((key, index) => key !== afterKeys[index])
+  ) {
+    throw new TypeError(`${name} keys changed during one delta`);
+  }
+  const counts = Object.fromEntries(
+    beforeKeys.map((key) => [
+      key,
+      checkedDelta(before[key], after[key], `${name}.${key}`),
+    ]),
+  );
+  return {
+    counts,
+    sum: Object.values(counts).reduce((sum, count) => sum + count, 0),
+  };
+}
+
+export function evaluateClipDisableGuardband(
+  caseId,
+  mode,
+  beforeDiagnostics,
+  afterDiagnostics,
+  inputReadback,
+) {
+  const expected = clipDisableGuardbandExpectation(caseId, mode);
+  const before = snapshotExactRequiredTelemetry(beforeDiagnostics);
+  const after = snapshotExactRequiredTelemetry(afterDiagnostics);
+  const aggregate = checkedDelta(
+    before.aggregate,
+    after.aggregate,
+    "exact required rejection aggregate",
+  );
+  const reasons = counterMapDelta(
+    before.reasons,
+    after.reasons,
+    "exact required rejection reasons",
+  );
+  const preparationReasons = counterMapDelta(
+    before.preparationReasons,
+    after.preparationReasons,
+    "exact required preparation rejection reasons",
+  );
+  const expectedRejection = expected.expectedRejection;
+  const expectedPreparationReason =
+    expectedRejection.preparationReason;
+  const rejectionExact =
+    aggregate === expectedRejection.aggregate &&
+    reasons.sum === expectedRejection.aggregate &&
+    (reasons.counts.exactPreparation ?? 0) ===
+      expectedRejection.exactPreparation &&
+    preparationReasons.sum === expectedRejection.aggregate &&
+    (
+      expectedPreparationReason === null ||
+      (preparationReasons.counts[expectedPreparationReason] ?? 0) === 1
+    );
+
+  const managedCoverage = {
+    draws: checkedDelta(
+      beforeDiagnostics.managedCoverageDraws,
+      afterDiagnostics.managedCoverageDraws,
+      "managed coverage draws",
+    ),
+    triangles: checkedDelta(
+      beforeDiagnostics.managedCoverageTriangles,
+      afterDiagnostics.managedCoverageTriangles,
+      "managed coverage triangles",
+    ),
+  };
+  const exactRasterEmptyDraws = checkedDelta(
+    beforeDiagnostics.exactRasterEmptyDraws,
+    afterDiagnostics.exactRasterEmptyDraws,
+    "exact raster-empty draws",
+  );
+  const pushTevDrawCalls = checkedDelta(
+    beforeDiagnostics.pushTevDrawCalls,
+    afterDiagnostics.pushTevDrawCalls,
+    "transported TEV draws",
+  );
+  const submitGxFrameCalls = checkedDelta(
+    beforeDiagnostics.submitGxFrameCalls,
+    afterDiagnostics.submitGxFrameCalls,
+    "submitted GX frames",
+  );
+  const managedCoverageExact =
+    managedCoverage.draws === expected.expectedManagedCoverage.draws &&
+    managedCoverage.triangles ===
+      expected.expectedManagedCoverage.triangles;
+  const exactRasterEmptyExact =
+    exactRasterEmptyDraws === expected.expectedExactRasterEmptyDraws;
+  const pushTevDrawCallsExact =
+    pushTevDrawCalls === expected.expectedPushTevDrawCalls;
+  const submitGxFrameCallsExact =
+    submitGxFrameCalls === expected.expectedSubmitGxFrameCalls;
+
+  const readback = requiredObject(inputReadback, "readback");
+  const width = nonNegativeInteger(readback.width, "readback.width");
+  const height = nonNegativeInteger(readback.height, "readback.height");
+  const rgba = Array.from(readback.rgba ?? []);
+  const dimensionsExact =
+    width === clipDisableGuardbandOracleXfb.width &&
+    height === clipDisableGuardbandOracleXfb.height;
+  const byteExact =
+    rgba.length === expected.expectedRgba.length &&
+    rgba.every(
+      (channel, index) => channel === expected.expectedRgba[index],
+    );
+  const actualMaskRows = clipDisableGuardbandMaskRows(rgba);
+  const maskExact = actualMaskRows.every(
+    (mask, index) => mask === expected.expectedMaskRows[index],
+  );
+  const actualRgbaFnv1a64 = fnv1a64Hex(rgba);
+  const hashExact =
+    actualRgbaFnv1a64 === expected.expectedRgbaFnv1a64;
+
+  return {
+    pass:
+      rejectionExact &&
+      dimensionsExact &&
+      byteExact &&
+      maskExact &&
+      hashExact &&
+      managedCoverageExact &&
+      exactRasterEmptyExact &&
+      pushTevDrawCallsExact &&
+      submitGxFrameCallsExact,
+    caseId,
+    mode,
+    path: expected.path,
+    rejectionExact,
+    aggregate,
+    reasonDelta: reasons.counts,
+    preparationReasonDelta: preparationReasons.counts,
+    dimensionsExact,
+    byteExact,
+    maskExact,
+    expectedMaskRows: expected.expectedMaskRows,
+    actualMaskRows,
+    hashExact,
+    expectedRgbaFnv1a64: expected.expectedRgbaFnv1a64,
+    actualRgbaFnv1a64,
+    managedCoverageExact,
+    managedCoverage,
+    exactRasterEmptyExact,
+    exactRasterEmptyDraws,
+    pushTevDrawCallsExact,
+    pushTevDrawCalls,
+    submitGxFrameCallsExact,
+    submitGxFrameCalls,
+  };
 }

@@ -14,6 +14,7 @@ import {
   clipDisableGuardbandExpectation,
   clipDisableGuardbandMaskRows,
   clipDisableGuardbandOracleXfb,
+  evaluateClipDisableGuardband,
   nextDownF32,
 } from "./browser_boot_clip_disable_guardband_oracle.mjs";
 
@@ -38,6 +39,63 @@ function expectedRows(entries) {
   const rows = new Array(16).fill(0);
   for (const [row, mask] of entries) rows[row] = mask;
   return rows;
+}
+
+function diagnostics() {
+  return {
+    exactRequiredRejectedDraws: 0,
+    exactRequiredRejectionReasons: {
+      exactPreparation: 0,
+      scissor: 0,
+      primitive: 0,
+    },
+    exactRequiredPreparationRejectionReasons: {
+      unsupportedClipDisable1: 0,
+      unsupportedClipDisable2: 0,
+      unsupportedClipDisable3: 0,
+      unsupportedClipDisable4: 0,
+      unsupportedClipDisable5: 0,
+      unsupportedClipDisable6: 0,
+      unsupportedClipDisable7: 0,
+      unsupportedClipDisableOther: 0,
+      invalidPreparedScissor: 0,
+    },
+    managedCoverageDraws: 0,
+    managedCoverageTriangles: 0,
+    exactRasterEmptyDraws: 0,
+    pushTevDrawCalls: 0,
+    submitGxFrameCalls: 0,
+  };
+}
+
+function afterForExpectation(expected) {
+  const after = structuredClone(diagnostics());
+  const rejection = expected.expectedRejection;
+  after.exactRequiredRejectedDraws = rejection.aggregate;
+  after.exactRequiredRejectionReasons.exactPreparation =
+    rejection.exactPreparation;
+  if (rejection.preparationReason !== null) {
+    after.exactRequiredPreparationRejectionReasons[
+      rejection.preparationReason
+    ] = 1;
+  }
+  after.managedCoverageDraws =
+    expected.expectedManagedCoverage.draws;
+  after.managedCoverageTriangles =
+    expected.expectedManagedCoverage.triangles;
+  after.exactRasterEmptyDraws =
+    expected.expectedExactRasterEmptyDraws;
+  after.pushTevDrawCalls = expected.expectedPushTevDrawCalls;
+  after.submitGxFrameCalls = expected.expectedSubmitGxFrameCalls;
+  return after;
+}
+
+function readbackForExpectation(expected) {
+  return {
+    width: clipDisableGuardbandOracleXfb.width,
+    height: clipDisableGuardbandOracleXfb.height,
+    rgba: expected.expectedRgba,
+  };
 }
 
 test("guardband boundary uses exact -2W and its adjacent outward f32", () => {
@@ -277,4 +335,117 @@ test("two-run certification matrix covers every case and mode twice", () => {
       );
     }
   }
+});
+
+test("synthetic readback and telemetry pass all 160 certification entries", () => {
+  const totals = {
+    draws: 0,
+    triangles: 0,
+    empty: 0,
+    rejected: 0,
+    push: 0,
+    submit: 0,
+  };
+  for (const { caseId, mode, expectation } of
+    clipDisableGuardbandCertificationMatrix()) {
+    const result = evaluateClipDisableGuardband(
+      caseId,
+      mode,
+      diagnostics(),
+      afterForExpectation(expectation),
+      readbackForExpectation(expectation),
+    );
+    assert.equal(result.pass, true, `${caseId} mode ${mode}`);
+    totals.draws += expectation.expectedManagedCoverage.draws;
+    totals.triangles += expectation.expectedManagedCoverage.triangles;
+    totals.empty += expectation.expectedExactRasterEmptyDraws;
+    totals.rejected += expectation.expectedRejection.aggregate;
+    totals.push += expectation.expectedPushTevDrawCalls;
+    totals.submit += expectation.expectedSubmitGxFrameCalls;
+  }
+  assert.deepEqual(totals, {
+    draws: 112,
+    triangles: 240,
+    empty: 16,
+    rejected: 32,
+    push: 160,
+    submit: 160,
+  });
+});
+
+test("evaluator rejects missing policy evidence and wrong preparation reason", () => {
+  const expected = clipDisableGuardbandExpectation(
+    "negative-x-adjacent-outward",
+    1,
+  );
+  const missing = afterForExpectation(expected);
+  missing.exactRequiredRejectedDraws = 0;
+  missing.exactRequiredRejectionReasons.exactPreparation = 0;
+  missing.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable1 = 0;
+  const missingResult = evaluateClipDisableGuardband(
+    expected.caseId,
+    expected.mode,
+    diagnostics(),
+    missing,
+    readbackForExpectation(expected),
+  );
+  assert.equal(missingResult.pass, false);
+  assert.equal(missingResult.rejectionExact, false);
+
+  const wrong = afterForExpectation(expected);
+  wrong.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable1 = 0;
+  wrong.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable7 = 1;
+  const wrongResult = evaluateClipDisableGuardband(
+    expected.caseId,
+    expected.mode,
+    diagnostics(),
+    wrong,
+    readbackForExpectation(expected),
+  );
+  assert.equal(wrongResult.pass, false);
+  assert.equal(wrongResult.rejectionExact, false);
+});
+
+test("evaluator rejects managed-coverage and pixel false positives", () => {
+  const suppressed = clipDisableGuardbandExpectation(
+    "top-y-adjacent-outward",
+    3,
+  );
+  const falseCoverage = afterForExpectation(suppressed);
+  falseCoverage.managedCoverageDraws = 1;
+  falseCoverage.managedCoverageTriangles = 2;
+  const coverageResult = evaluateClipDisableGuardband(
+    suppressed.caseId,
+    suppressed.mode,
+    diagnostics(),
+    falseCoverage,
+    readbackForExpectation(suppressed),
+  );
+  assert.equal(coverageResult.pass, false);
+  assert.equal(coverageResult.managedCoverageExact, false);
+
+  const visible = clipDisableGuardbandExpectation(
+    "negative-x-inside-guardband",
+    0,
+  );
+  const falsePixels = Array.from(visible.expectedRgba);
+  falsePixels[0] = 64;
+  const pixelResult = evaluateClipDisableGuardband(
+    visible.caseId,
+    visible.mode,
+    diagnostics(),
+    afterForExpectation(visible),
+    {
+      width: 16,
+      height: 16,
+      rgba: falsePixels,
+    },
+  );
+  assert.equal(pixelResult.pass, false);
+  assert.equal(pixelResult.byteExact, false);
+  assert.equal(pixelResult.maskExact, false);
+  assert.equal(pixelResult.hashExact, false);
 });
