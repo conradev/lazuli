@@ -26,6 +26,8 @@ const FASTMEM_PAGE_SHIFT: u32 = 17;
 const FASTMEM_LUT_COUNT: usize = 1 << 15;
 const DISC_BI2_OFFSET: u64 = 0x440;
 const DISC_BI2_SIZE: usize = 0x2000;
+const CISO_HEADER_SIZE: usize = 0x8000;
+const GAMECUBE_DISC_BYTES: u64 = 0x57058000;
 const DISC_SOURCE_RUNTIME: &str = include_str!("browser_disc_source.mjs");
 const DSP_AX_VOICE_REFERENCE_RUNTIME: &str =
     include_str!("../../../tools/browser_dsp_ax_voice_reference.mjs");
@@ -123,6 +125,22 @@ fn open_disc(path: &PathBuf) -> Box<dyn ReadSeek> {
     } else {
         Box::new(reader)
     }
+}
+
+fn logical_disc_size(path: &PathBuf) -> u64 {
+    let mut file = fs::File::open(path)
+        .unwrap_or_else(|error| panic!("failed to open disc {}: {error}", path.display()));
+    let mut header = [0; 8];
+    file.read_exact(&mut header)
+        .unwrap_or_else(|error| panic!("failed to read disc header {}: {error}", path.display()));
+    if &header[..4] != b"CISO" {
+        return file
+            .metadata()
+            .unwrap_or_else(|error| panic!("failed to inspect disc {}: {error}", path.display()))
+            .len();
+    }
+    let block_size = u64::from(u32::from_le_bytes(header[4..8].try_into().unwrap()));
+    GAMECUBE_DISC_BYTES.min(block_size * (CISO_HEADER_SIZE - header.len()) as u64)
 }
 
 fn read_disc_boot_info(path: &PathBuf) -> DiscBootInfo {
@@ -249,6 +267,7 @@ fn main() {
     let disc_path = arguments.next().map(PathBuf::from);
     let has_boot_asset = dol_path.is_some();
     let has_disc = disc_path.is_some();
+    let disc_logical_size = disc_path.as_ref().map_or(0, logical_disc_size);
     let disc = match (&disc_path, &dol_path) {
         (Some(path), _) => read_disc_boot_info(path),
         (None, Some(path)) => DiscBootInfo::standalone(path),
@@ -333,6 +352,7 @@ fn main() {
             if has_boot_asset { "true" } else { "false" },
         )
         .replace("__HAS_DISC__", if has_disc { "true" } else { "false" })
+        .replace("__DISC_LOGICAL_SIZE__", &disc_logical_size.to_string())
         .replace("__BI2__", &hex(&disc.bi2))
         .replace("__FST__", &hex(&disc.filesystem))
         .replace("__IPL_FONT_JAPANESE__", &hex(IPL_FONT_JAPANESE))
@@ -26781,6 +26801,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const defaultDiscSourceConfig = __HAS_DISC__
       ? {
           kind: "logical-range-endpoint",
+          logicalSize: __DISC_LOGICAL_SIZE__,
           url: new URL("/disc", location.href).href,
         }
       : __HAS_BOOT_ASSET__

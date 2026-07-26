@@ -27,6 +27,7 @@ const FONT_LICENSE_SOURCE_PATH = "licenses/Dolphin-fonts-Apache-2.0.txt";
 const GENERIC_DISC_SOURCE_CONFIG = `const defaultDiscSourceConfig = false
       ? {
           kind: "logical-range-endpoint",
+          logicalSize: 0,
           url: new URL("/disc", location.href).href,
         }
       : false
