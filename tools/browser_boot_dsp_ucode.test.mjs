@@ -518,6 +518,6 @@ test("release diagnostics retain the classified ucode hash", () => {
   assert.match(source, /dspTrace,/);
   assert.match(
     source,
-    /audioCompatibility:\s*\{\s*dspFirstUnsupported: snapshotDspFirstUnsupported\(\),/,
+    /audioCompatibility:\s*\{\s*dspFirstUnsupported: snapshotDspFirstUnsupported\(\),\s*dtkFirstUnsupported: snapshotDtkFirstUnsupported\(\),/,
   );
 });

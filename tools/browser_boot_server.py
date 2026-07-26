@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlsplit
 
 
 GAMECUBE_DISC_MAGIC = 0xC2339F3D
+GAMECUBE_DISC_BYTES = 0x57058000
+LOGICAL_DISC_SIZE_HEADER = "X-Lazuli-Disc-Size"
 MAX_RANGE_LENGTH = 64 * 1024 * 1024
 
 
@@ -29,6 +31,8 @@ def _pread_exact(file_descriptor: int, length: int, offset: int) -> bytes:
 
 
 class DiscReader(Protocol):
+    logical_size: int
+
     def read(self, offset: int, length: int) -> bytes: ...
 
 
@@ -36,6 +40,7 @@ class RawIsoReader:
     def __init__(self, path: Path) -> None:
         self.file = path.open("rb")
         self.size = path.stat().st_size
+        self.logical_size = self.size
         header = _pread_exact(self.file.fileno(), 0x20, 0)
         if struct.unpack_from(">I", header, 0x1C)[0] != GAMECUBE_DISC_MAGIC:
             self.file.close()
@@ -71,7 +76,7 @@ class CisoReader:
         if physical > path.stat().st_size:
             self.file.close()
             raise ValueError(f"truncated CISO: {path}")
-        self.logical_size = len(self.blocks) * self.block_size
+        self.logical_size = min(GAMECUBE_DISC_BYTES, len(self.blocks) * self.block_size)
 
     def read(self, offset: int, length: int) -> bytes:
         if offset < 0 or length < 0:
@@ -143,6 +148,7 @@ class BrowserBootHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header(LOGICAL_DISC_SIZE_HEADER, str(self.disc.logical_size))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 const CISO_HEADER_SIZE = 0x8000;
+export const GAMECUBE_DISC_BYTES = 0x57058000;
+export const LOGICAL_DISC_SIZE_HEADER = "X-Lazuli-Disc-Size";
 const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_CHUNK_BYTES = 64 * 1024;
 const NETWORK_CHUNK_BYTES = 256 * 1024;
@@ -128,9 +130,12 @@ export class HttpRangeByteSource {
 }
 
 export class QueryRangeByteSource {
-  constructor(url) {
+  constructor(url, logicalSize) {
+    if (!Number.isSafeInteger(logicalSize) || logicalSize <= 0) {
+      throw new RangeError("logical range endpoint requires a positive safe logical size");
+    }
     this.url = new URL(url).href;
-    this.size = null;
+    this.size = logicalSize;
     this.kind = "logical-range-endpoint";
     this.reads = 0;
     this.bytesRead = 0;
@@ -138,19 +143,45 @@ export class QueryRangeByteSource {
 
   async read(offset, length) {
     checkRange(offset, length);
+    if (this.size !== null && (offset > this.size || length > this.size - offset)) {
+      throw new RangeError("disc range exceeds logical image");
+    }
     const url = new URL(this.url);
     url.searchParams.set("offset", String(offset));
     url.searchParams.set("length", String(length));
     const response = await fetch(url, { cache: "no-store" });
     if (!response.ok) throw new Error(`disc range endpoint returned ${response.status}`);
+    const sizeText = response.headers.get(LOGICAL_DISC_SIZE_HEADER);
+    const size = sizeText === null ? NaN : Number(sizeText);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new Error(
+        `disc range endpoint returned invalid ${LOGICAL_DISC_SIZE_HEADER}: `
+        + `${sizeText ?? "missing"}`,
+      );
+    }
+    if (this.size !== null && size !== this.size) {
+      throw new Error(
+        `disc range endpoint changed logical size from ${this.size} to ${size}`,
+      );
+    }
+    if (offset > size || length > size - offset) {
+      throw new RangeError("disc range endpoint returned bytes beyond logical image");
+    }
     const bytes = exactBytes(await response.arrayBuffer(), length, "disc range endpoint");
+    this.size = size;
     this.reads += 1;
     this.bytesRead += bytes.length;
     return bytes;
   }
 
   describe() {
-    return { kind: this.kind, url: this.url, reads: this.reads, bytesRead: this.bytesRead };
+    return {
+      kind: this.kind,
+      url: this.url,
+      size: this.size,
+      reads: this.reads,
+      bytesRead: this.bytesRead,
+    };
   }
 }
 
@@ -278,7 +309,14 @@ export class CisoDiscSource {
     this.blockSize = parsed.blockSize;
     this.physicalOffsets = parsed.physicalOffsets;
     this.presentBlocks = parsed.presentBlocks;
-    this.size = this.blockSize * this.physicalOffsets.length;
+    // The fixed CISO bitmap has far more slots than a GameCube disc needs.
+    // Treating every padding slot as logical media makes common 2 MiB-block
+    // images appear to be about 68.7 GB and prevents DI from recognizing a
+    // read past the real optical-disc boundary.
+    this.size = Math.min(
+      GAMECUBE_DISC_BYTES,
+      this.blockSize * this.physicalOffsets.length,
+    );
     this.kind = "ciso";
     this.logicalReads = 0;
     this.logicalBytes = 0;
@@ -340,7 +378,9 @@ export async function openDiscSource(config, options = {}) {
   let raw;
   if (config.kind === "file") raw = new BlobByteSource(config.file);
   else if (config.kind === "http-range") raw = new HttpRangeByteSource(config.url);
-  else if (config.kind === "logical-range-endpoint") raw = new QueryRangeByteSource(config.url);
+  else if (config.kind === "logical-range-endpoint") {
+    raw = new QueryRangeByteSource(config.url, config.logicalSize);
+  }
   else throw new Error(`unsupported disc source kind ${config.kind}`);
 
   const chunkBytes = options.chunkBytes ?? (

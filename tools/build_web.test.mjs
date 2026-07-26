@@ -41,6 +41,7 @@ test("release markup retains one hidden terminal report sink", () => {
 const genericDiscSourceConfig = `const defaultDiscSourceConfig = false
       ? {
           kind: "logical-range-endpoint",
+          logicalSize: 0,
           url: new URL("/disc", location.href).href,
         }
       : false

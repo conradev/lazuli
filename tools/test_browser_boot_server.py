@@ -4,9 +4,17 @@
 import struct
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 
-from tools.browser_boot_server import CisoReader, RawIsoReader, open_disc
+from tools.browser_boot_server import (
+    LOGICAL_DISC_SIZE_HEADER,
+    BrowserBootHandler,
+    GAMECUBE_DISC_BYTES,
+    CisoReader,
+    RawIsoReader,
+    open_disc,
+)
 
 
 DISC_MAGIC = 0xC2339F3D
@@ -72,6 +80,44 @@ class BrowserBootServerTest(unittest.TestCase):
             self.assertEqual(reader.read(reader.logical_size, 0), b"")
             with self.assertRaisesRegex(ValueError, "exceeds logical image"):
                 reader.read(reader.logical_size, 1)
+        finally:
+            reader.file.close()
+
+    def test_ciso_logical_size_excludes_fixed_bitmap_padding(self) -> None:
+        header = bytearray(CisoReader.HEADER_SIZE)
+        header[:4] = b"CISO"
+        struct.pack_into("<I", header, 4, 2 * 1024 * 1024)
+        path = self.root / "sparse.ciso"
+        path.write_bytes(header)
+
+        reader = CisoReader(path)
+        try:
+            self.assertEqual(reader.logical_size, GAMECUBE_DISC_BYTES)
+            self.assertEqual(reader.read(GAMECUBE_DISC_BYTES - 16, 16), bytes(16))
+            with self.assertRaisesRegex(ValueError, "exceeds logical image"):
+                reader.read(GAMECUBE_DISC_BYTES, 1)
+        finally:
+            reader.file.close()
+
+    def test_range_endpoint_publishes_the_reader_logical_size(self) -> None:
+        image = gamecube_iso()
+        path = self.root / "game.iso"
+        path.write_bytes(image)
+        reader = RawIsoReader(path)
+        handler = object.__new__(BrowserBootHandler)
+        handler.disc = reader
+        handler.path = "/disc?offset=32&length=16"
+        handler.wfile = BytesIO()
+        statuses: list[int] = []
+        headers: dict[str, str] = {}
+        handler.send_response = statuses.append
+        handler.send_header = headers.__setitem__
+        handler.end_headers = lambda: None
+        try:
+            handler.do_GET()
+            self.assertEqual(statuses, [200])
+            self.assertEqual(headers[LOGICAL_DISC_SIZE_HEADER], str(len(image)))
+            self.assertEqual(handler.wfile.getvalue(), image[32:48])
         finally:
             reader.file.close()
 

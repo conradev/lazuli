@@ -26,6 +26,8 @@ const FASTMEM_PAGE_SHIFT: u32 = 17;
 const FASTMEM_LUT_COUNT: usize = 1 << 15;
 const DISC_BI2_OFFSET: u64 = 0x440;
 const DISC_BI2_SIZE: usize = 0x2000;
+const CISO_HEADER_SIZE: usize = 0x8000;
+const GAMECUBE_DISC_BYTES: u64 = 0x57058000;
 const DISC_SOURCE_RUNTIME: &str = include_str!("browser_disc_source.mjs");
 const IPL_IMAGE_SIZE: usize = 2 * 1024 * 1024;
 const IPL_FONT_JAPANESE_OFFSET: usize = 0x1a_ff00;
@@ -121,6 +123,22 @@ fn open_disc(path: &PathBuf) -> Box<dyn ReadSeek> {
     }
 }
 
+fn logical_disc_size(path: &PathBuf) -> u64 {
+    let mut file = fs::File::open(path)
+        .unwrap_or_else(|error| panic!("failed to open disc {}: {error}", path.display()));
+    let mut header = [0; 8];
+    file.read_exact(&mut header)
+        .unwrap_or_else(|error| panic!("failed to read disc header {}: {error}", path.display()));
+    if &header[..4] != b"CISO" {
+        return file
+            .metadata()
+            .unwrap_or_else(|error| panic!("failed to inspect disc {}: {error}", path.display()))
+            .len();
+    }
+    let block_size = u64::from(u32::from_le_bytes(header[4..8].try_into().unwrap()));
+    GAMECUBE_DISC_BYTES.min(block_size * (CISO_HEADER_SIZE - header.len()) as u64)
+}
+
 fn read_disc_boot_info(path: &PathBuf) -> DiscBootInfo {
     let mut reader = open_disc(path);
     let header = iso::Header::read_be(&mut reader)
@@ -212,6 +230,7 @@ fn main() {
     let disc_path = arguments.next().map(PathBuf::from);
     let has_boot_asset = dol_path.is_some();
     let has_disc = disc_path.is_some();
+    let disc_logical_size = disc_path.as_ref().map_or(0, logical_disc_size);
     let disc = match (&disc_path, &dol_path) {
         (Some(path), _) => read_disc_boot_info(path),
         (None, Some(path)) => DiscBootInfo::standalone(path),
@@ -278,6 +297,7 @@ fn main() {
             if has_boot_asset { "true" } else { "false" },
         )
         .replace("__HAS_DISC__", if has_disc { "true" } else { "false" })
+        .replace("__DISC_LOGICAL_SIZE__", &disc_logical_size.to_string())
         .replace("__BI2__", &hex(&disc.bi2))
         .replace("__FST__", &hex(&disc.filesystem))
         .replace("__IPL_FONT_JAPANESE__", &hex(IPL_FONT_JAPANESE))
@@ -1123,10 +1143,23 @@ const TEMPLATE: &str = r##"<!doctype html>
     const diInterruptStatuses = 0x00000054;
     const diDeviceErrorInterrupt = 0x00000004;
     const diTransferInterrupt = 0x00000010;
+    const diDmaAddressMask = 0x03ffffe0;
+    const diDmaLengthMask = 0xffffffe0;
+    const diDmaControlMask = 0x00000007;
     const diMinimumCommandLatencyCycles = 145800;
+    const diReadStartLatencyCycles = 291600;
+    const diBufferTransferBytesPerSecond = 32 * 1024 * 1024;
+    const diDvdEccBlockBytes = 0x8000;
+    const diErrorRead = 0x00031100;
     const diErrorInvalidCommand = 0x00052000;
+    const diErrorBlockOutOfBounds = 0x00052100;
     const diErrorNoAudioBuffer = 0x00052001;
     const diErrorInvalidAudioCommand = 0x00052401;
+    const diInquiryCompatibilityBytes = Object.freeze([
+      0x00, 0x00, 0x00, 0x02,
+      0x20, 0x06, 0x05, 0x26,
+      0x41, 0x00, 0x00, 0x00,
+    ]);
     const piDiskInterruptCause = 0x00000004;
     const piExternalInterfaceInterruptCause = 0x00000010;
     const piCommandProcessorInterruptCause = 0x00000800;
@@ -6059,8 +6092,15 @@ const TEMPLATE: &str = r##"<!doctype html>
     let diskAudioNextStart = 0;
     let diskAudioNextLength = 0;
     let nextDiskAudioCycle = null;
+    let dtkFirstUnsupported = null;
     const diskCommandCounts = new Map();
     const diskCommandTrace = [];
+    const diskDmaRejectionCounts = new Map();
+    const diskDmaRejectionTrace = [];
+    let diskDmaRejections = 0;
+    let diskDmaBusyRegisterWriteRejections = 0;
+    let diskDmaBusyControlWriteRejections = 0;
+    let diskDmaControlBeforeStart = 0;
     let regionRunning = false;
     let regionContinuableHookCalls = 0;
     const hookFunctions = {
@@ -13876,6 +13916,76 @@ const TEMPLATE: &str = r##"<!doctype html>
       recomputeDiskInterruptLevel();
     }
 
+    function recordDiskDmaRejection(reason, observedCycles, details) {
+      details ??= {};
+      diskDmaRejections += 1;
+      diskDmaRejectionCounts.set(
+        reason,
+        (diskDmaRejectionCounts.get(reason) ?? 0) + 1
+      );
+      const rejection = {
+        cycle: observedCycles,
+        reason,
+        ...details,
+      };
+      diskDmaRejectionTrace.push(rejection);
+      if (diskDmaRejectionTrace.length > 64) {
+        diskDmaRejectionTrace.shift();
+      }
+      deviceEvents.set(
+        "diskDmaRejected",
+        (deviceEvents.get("diskDmaRejected") ?? 0) + 1
+      );
+      return rejection;
+    }
+
+    function diskDmaBusy() {
+      return diskTransfer !== null
+        || (view.getUint32(mmio + 0x601c, false) & 1) !== 0;
+    }
+
+    function writeDiskDmaRegister(registerOffset, value, observedCycles) {
+      const written = value >>> 0;
+      if (diskDmaBusy()) {
+        const controlWrite = registerOffset === 0x1c;
+        if (controlWrite) {
+          diskDmaBusyControlWriteRejections += 1;
+        } else {
+          diskDmaBusyRegisterWriteRejections += 1;
+        }
+        recordDiskDmaRejection(
+          controlWrite ? "busy" : "busy-register-programming",
+          observedCycles,
+          {
+            registerOffset: "0x" + registerOffset.toString(16).padStart(2, "0"),
+            written: "0x" + written.toString(16).padStart(8, "0"),
+            completionCycle: diskTransfer?.completionCycle ?? null,
+          }
+        );
+        return false;
+      }
+
+      const mask = registerOffset === 0x14
+        ? diDmaAddressMask
+        : registerOffset === 0x18
+          ? diDmaLengthMask
+          : registerOffset === 0x1c
+            ? diDmaControlMask
+            : 0xffffffff;
+      const stored = (written & mask) >>> 0;
+      if (registerOffset === 0x1c && (stored & 1) !== 0) {
+        diskDmaControlBeforeStart = (
+          view.getUint32(mmio + 0x601c, false) & diDmaControlMask
+        ) >>> 0;
+      }
+      view.setUint32(
+        mmio + 0x6000 + registerOffset,
+        stored,
+        false
+      );
+      return true;
+    }
+
     function writePixelEngineControl(value) {
       const written = value & 0xffff;
       if ((written & 0x04) !== 0) {
@@ -14353,6 +14463,21 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (physical === 0x0c006000 && size === 4) {
         writeDiskStatus(value);
         return 1;
+      }
+      if (
+        physical < 0x0c006024
+        && physical + size > 0x0c006008
+      ) {
+        const registerOffset = physical - 0x0c006000;
+        if (
+          size === 4
+          && [0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20]
+            .includes(registerOffset)
+        ) {
+          writeDiskDmaRegister(registerOffset, value, cycles);
+          return 1;
+        }
+        return reject("device", "disk-interface-register-rejected");
       }
       if (physical === 0x0c00100a && size === 2) {
         writePixelEngineControl(value);
@@ -21189,6 +21314,51 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (diskCommandTrace.length > 64) diskCommandTrace.shift();
     }
 
+    function latchDtkFirstUnsupported(
+      observedCycles,
+      reason,
+      opcode,
+      subcommand
+    ) {
+      if (dtkFirstUnsupported !== null) return;
+      // DI commands are decoded at the post-dispatch device-service boundary,
+      // so neither field below claims instruction-precise provenance.
+      dtkFirstUnsupported = {
+        serviceCycle: observedCycles,
+        dispatchPc: pc >>> 0,
+        reason,
+        opcode: opcode & 0xff,
+        subcommand: subcommand & 0xff,
+      };
+    }
+
+    function snapshotDtkFirstUnsupported() {
+      if (dtkFirstUnsupported === null) return null;
+      return {
+        serviceCycle: dtkFirstUnsupported.serviceCycle,
+        dispatchPc: hex32(dtkFirstUnsupported.dispatchPc),
+        reason: dtkFirstUnsupported.reason,
+        opcode: dtkFirstUnsupported.opcode,
+        subcommand: dtkFirstUnsupported.subcommand,
+      };
+    }
+
+    function snapshotDiskTransfer() {
+      if (diskTransfer === null) return null;
+      return {
+        opcode: diskTransfer.opcode,
+        dma: diskTransfer.dma === true,
+        transaction: diskTransfer.transaction ?? null,
+        completionCycle: diskTransfer.completionCycle,
+        ready: diskTransfer.ready,
+        interruptStatus: diskTransfer.interruptStatus,
+        errorCode: diskTransfer.errorCode ?? null,
+        hostError: diskTransfer.hostError ?? null,
+        hostPayloadBytes: diskTransfer.data?.length ?? null,
+        waited: diskTransfer.waited ?? false,
+      };
+    }
+
     function diskAudioTiming() {
       const control = view.getUint32(mmio + 0x6c00, false);
       const streamingAt48KHz = (control & 2) !== 0;
@@ -21274,82 +21444,373 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function diBufferedReadLowerBoundCycles(length, discOffset) {
+      let remaining = length >>> 0;
+      let offset = discOffset;
+      let transferCycles = 0;
+      while (remaining !== 0) {
+        const offsetInBlock = offset % diDvdEccBlockBytes;
+        const chunkLength = Math.min(
+          remaining,
+          diDvdEccBlockBytes - offsetInBlock
+        );
+        transferCycles += Math.floor(
+          chunkLength * viCpuCyclesPerSecond
+          / diBufferTransferBytesPerSecond
+        );
+        offset += chunkLength;
+        remaining -= chunkLength;
+      }
+      return diReadStartLatencyCycles + transferCycles;
+    }
+
+    function bufferedLowerBoundDiskReadCompletionScheduler(request) {
+      // Keep the scheduler behind an explicit synchronous seam: seek,
+      // rotation, and buffer state may extend this deadline later, while
+      // browser wall time remains only a readiness gate for emulated time.
+      return request.minimumCompletionCycle;
+    }
+    const scheduleDiskReadCompletion =
+      bufferedLowerBoundDiskReadCompletionScheduler;
+
+    function rejectDiskDmaStart(
+      control,
+      observedCycles,
+      reason,
+      details
+    ) {
+      details ??= {};
+      recordDiskDmaRejection(reason, observedCycles, details);
+      view.setUint32(
+        mmio + 0x601c,
+        diskDmaControlBeforeStart & ~1,
+        false
+      );
+      return false;
+    }
+
     function beginDiskCommand(observedCycles) {
       const command0 = view.getUint32(mmio + 0x6008, false);
       const command1 = view.getUint32(mmio + 0x600c, false);
       const command2 = view.getUint32(mmio + 0x6010, false);
       const opcode = command0 >>> 24;
-      const dmaBase = view.getUint32(mmio + 0x6014, false);
-      const dmaLength = view.getUint32(mmio + 0x6018, false);
+      const dmaBase = (
+        view.getUint32(mmio + 0x6014, false) & diDmaAddressMask
+      ) >>> 0;
+      const dmaLength = (
+        view.getUint32(mmio + 0x6018, false) & diDmaLengthMask
+      ) >>> 0;
+      const control = (
+        view.getUint32(mmio + 0x601c, false) & diDmaControlMask
+      ) >>> 0;
+      view.setUint32(mmio + 0x6014, dmaBase, false);
+      view.setUint32(mmio + 0x6018, dmaLength, false);
+      view.setUint32(mmio + 0x601c, control, false);
       let details = {};
 
-      if (opcode !== 0xe0) diskLastError = 0;
+      const dmaCommand = opcode === 0x12 || opcode === 0xa8;
+      if (
+        dmaCommand
+        && ((control & 2) === 0 || (control & 4) !== 0)
+      ) {
+        rejectDiskDmaStart(
+          control,
+          observedCycles,
+          "uncertified-control-mode",
+          {
+            command0: "0x" + command0.toString(16).padStart(8, "0"),
+            writtenControl: "0x" + control.toString(16).padStart(8, "0"),
+          }
+        );
+        return false;
+      }
+      if (!dmaCommand && (control & 2) !== 0) {
+        rejectDiskDmaStart(
+          control,
+          observedCycles,
+          "uncertified-command",
+          {
+            command0: "0x" + command0.toString(16).padStart(8, "0"),
+          }
+        );
+        return false;
+      }
 
       if (opcode === 0x12) {
-        const target = ramPointer(dmaBase, dmaLength);
-        check(target !== null && dmaLength === 32, "invalid DI identify DMA target");
+        if (dmaLength !== 0x20) {
+          rejectDiskDmaStart(
+            control,
+            observedCycles,
+            "uncertified-inquiry-length",
+            { dmaLength }
+          );
+          return false;
+        }
+        if (dmaBase >= ramSize || dmaLength > ramSize - dmaBase) {
+          const validPrefixBytes = dmaBase >= ramSize
+            ? 0
+            : ramSize - dmaBase;
+          rejectDiskDmaStart(
+            control,
+            observedCycles,
+            "uncertified-mem1-range",
+            {
+              dmaAddress: dmaBase,
+              length: dmaLength,
+              validPrefixBytes,
+              invalidSuffixBytes: dmaLength - validPrefixBytes,
+            }
+          );
+          return false;
+        }
+        const target = ram + dmaBase;
+        diskLastError = 0;
         invalidateDataReservationForExternalWrite(
-          (target - ram) >>> 0,
-          dmaLength
+          dmaBase,
+          diInquiryCompatibilityBytes.length
         );
-        bytes.set([
-          0x00, 0x00, 0x00, 0x00,
-          0x20, 0x02, 0x04, 0x02,
-          0x61, 0x00, 0x00, 0x00,
-        ], target);
-        bytes.fill(0, target + 12, target + dmaLength);
+        bytes.set(diInquiryCompatibilityBytes, target);
+        const transaction = Object.freeze({
+          kind: "inquiry",
+          opcode,
+          command0,
+          command1,
+          command2,
+          dmaBase,
+          dmaLength,
+          transferLength: dmaLength,
+          control,
+          triggerCycle: observedCycles,
+          completionCycle:
+            observedCycles + diMinimumCommandLatencyCycles,
+        });
         diskTransfer = {
           opcode,
-          completionCycle: observedCycles + 10000,
+          transaction,
+          dma: true,
+          completionCycle: transaction.completionCycle,
           ready: true,
           interruptStatus: diTransferInterrupt,
+          errorCode: 0,
+          data: null,
+          hostError: null,
+          promise: null,
+          waited: false,
         };
         deviceEvents.set("diskIdentify", (deviceEvents.get("diskIdentify") ?? 0) + 1);
       } else if (opcode === 0xa8) {
-        const offset = command1 * 4;
-        const length = command2;
-        const target = ramPointer(dmaBase, dmaLength);
-        check(target !== null && dmaLength === length, "invalid DI read DMA target");
+        const subcommand = command0 & 0xff;
+        if (subcommand !== 0 && subcommand !== 0x40) {
+          rejectDiskDmaStart(
+            control,
+            observedCycles,
+            "uncertified-command",
+            {
+              command0: "0x" + command0.toString(16).padStart(8, "0"),
+            }
+          );
+          return false;
+        }
+        const kind = subcommand === 0x40
+          ? "read-disc-id"
+          : "read-sector";
+        const offset = kind === "read-disc-id" ? 0 : command1 * 4;
+        const length = kind === "read-disc-id" ? 0x20 : command2;
+        if (length === 0 || length !== dmaLength) {
+          rejectDiskDmaStart(
+            control,
+            observedCycles,
+            length === 0
+              ? "uncertified-zero-length"
+              : "uncertified-length-mismatch",
+            {
+              requestedLength: length,
+              dmaLength,
+              dolphinTransferLength: Math.min(length, dmaLength),
+            }
+          );
+          return false;
+        }
+        if (dmaBase >= ramSize || length > ramSize - dmaBase) {
+          const validPrefixBytes = dmaBase >= ramSize
+            ? 0
+            : ramSize - dmaBase;
+          rejectDiskDmaStart(
+            control,
+            observedCycles,
+            "uncertified-mem1-range",
+            {
+              dmaAddress: dmaBase,
+              length,
+              validPrefixBytes,
+              invalidSuffixBytes: length - validPrefixBytes,
+            }
+          );
+          return false;
+        }
+        const discEndOffset = discSource?.size;
+        if (
+          !Number.isSafeInteger(discEndOffset)
+          || discEndOffset < 0
+        ) {
+          rejectDiskDmaStart(
+            control,
+            observedCycles,
+            "disc-range-unknown",
+            { discOffset: offset, transferLength: length }
+          );
+          return false;
+        }
+        const discEnd = offset + length;
+        if (!Number.isSafeInteger(discEnd)) {
+          rejectDiskDmaStart(
+            control,
+            observedCycles,
+            "disc-range-overflow",
+            { discOffset: offset, transferLength: length }
+          );
+          return false;
+        }
+        const outOfBounds = discEnd > discEndOffset;
+        const minimumBufferedCompletionCycle =
+          observedCycles + diBufferedReadLowerBoundCycles(length, offset);
+        let completionCycle =
+          observedCycles + diMinimumCommandLatencyCycles;
+        if (!outOfBounds) {
+          completionCycle =
+            typeof scheduleDiskReadCompletion === "function"
+              ? scheduleDiskReadCompletion({
+                  triggerCycle: observedCycles,
+                  discOffset: offset,
+                  transferLength: length,
+                  minimumCompletionCycle:
+                    minimumBufferedCompletionCycle,
+                })
+              : null;
+          if (!Number.isSafeInteger(completionCycle)) {
+            rejectDiskDmaStart(
+              control,
+              observedCycles,
+              "completion-cycle-required",
+              { minimumCompletionCycle: minimumBufferedCompletionCycle }
+            );
+            return false;
+          }
+          if (completionCycle < minimumBufferedCompletionCycle) {
+            rejectDiskDmaStart(
+              control,
+              observedCycles,
+              "completion-before-buffered-lower-bound",
+              {
+                completionCycle,
+                minimumCompletionCycle: minimumBufferedCompletionCycle,
+              }
+            );
+            return false;
+          }
+        }
+        diskLastError = outOfBounds
+          ? diErrorBlockOutOfBounds
+          : 0;
+        const transaction = Object.freeze({
+          kind,
+          opcode,
+          subcommand,
+          command0,
+          command1,
+          command2,
+          discOffset: offset,
+          dmaBase,
+          dmaLength,
+          transferLength: length,
+          control,
+          triggerCycle: observedCycles,
+          completionCycle,
+          minimumBufferedCompletionCycle,
+          timingModel: outOfBounds
+            ? "dolphin-minimum-command-latency"
+            : "external-at-or-after-dolphin-buffered-lower-bound",
+        });
         const transfer = {
           opcode,
+          transaction,
+          dma: true,
           offset,
           length,
           dmaBase,
-          completionCycle: observedCycles + 10000,
-          ready: false,
-          interruptStatus: diTransferInterrupt,
-          error: null,
+          completionCycle,
+          ready: outOfBounds,
+          interruptStatus: outOfBounds
+            ? diDeviceErrorInterrupt
+            : diTransferInterrupt,
+          errorCode: outOfBounds
+            ? diErrorBlockOutOfBounds
+            : 0,
           data: null,
+          hostError: null,
           promise: null,
           waited: false,
         };
         diskTransfer = transfer;
-        details = { offset, length };
+        details = {
+          kind,
+          offset,
+          length,
+          discEndOffset,
+          timingModel: transaction.timingModel,
+        };
         deviceEvents.set("diskRead", (deviceEvents.get("diskRead") ?? 0) + 1);
-        transfer.promise = Promise.resolve()
-          .then(() => {
-            if (discSource === null) throw new Error("disc read requested without a disc source");
-            return discSource.read(offset, length);
-          })
-          .then(data => {
-            if (diskTransfer !== transfer) return;
-            if (data.length !== length) throw new Error("short browser disc read");
-            transfer.data = data;
-            transfer.ready = true;
-          })
-          .catch(error => {
-            transfer.error = String(error?.message ?? error);
-            transfer.ready = true;
-          });
+        if (!outOfBounds) {
+          transfer.promise = Promise.resolve()
+            .then(() => discSource.read(offset, length))
+            .then(data => {
+              if (diskTransfer !== transfer) return;
+              if (
+                Object.prototype.toString.call(data)
+                  !== "[object Uint8Array]"
+              ) {
+                throw new Error(
+                  "browser disc read returned a non-byte payload"
+                );
+              }
+              if (data.length !== length) {
+                const reason = data.length > length
+                  ? "uncertified-overlong-host-read"
+                  : "host-length-mismatch";
+                // The pure authority model can reject an overlong result and
+                // accept another result later. A browser source has one
+                // promise per transaction, so terminate that host contract
+                // violation as the same bounded read error as a short read.
+                throw new Error(
+                  `${reason}: returned ${data.length} bytes; expected ${length}`
+                );
+              }
+              transfer.data = data;
+              transfer.ready = true;
+            })
+            .catch(error => {
+              if (diskTransfer !== transfer) return;
+              transfer.hostError = String(
+                error?.message ?? error
+              ).slice(0, 256);
+              transfer.errorCode = diErrorRead;
+              transfer.interruptStatus = diDeviceErrorInterrupt;
+              transfer.ready = true;
+            });
+        }
       } else {
         const transfer = {
           opcode,
+          dmaBase,
+          dmaLength,
+          control,
           completionCycle: observedCycles + diMinimumCommandLatencyCycles,
           ready: true,
           interruptStatus: diTransferInterrupt,
         };
         const audioSubcommand = (command0 >>> 16) & 0xff;
 
+        if (opcode !== 0xe0) diskLastError = 0;
         switch (opcode) {
           case 0xab: {
             const offset = command1 * 4;
@@ -21411,6 +21872,12 @@ const TEMPLATE: &str = r##"<!doctype html>
                 (deviceEvents.get("diskAudioStreamStop") ?? 0) + 1
               );
             } else {
+              latchDtkFirstUnsupported(
+                observedCycles,
+                "invalid-audio-command",
+                opcode,
+                audioSubcommand
+              );
               diskLastError = diErrorInvalidAudioCommand;
               transfer.interruptStatus = diDeviceErrorInterrupt;
               details = { subcommand: audioSubcommand, reason: "invalid-audio-command" };
@@ -21434,6 +21901,12 @@ const TEMPLATE: &str = r##"<!doctype html>
             } else if (audioSubcommand === 0x03) {
               result = diskAudioLength >>> 0;
             } else {
+              latchDtkFirstUnsupported(
+                observedCycles,
+                "invalid-audio-status",
+                opcode,
+                audioSubcommand
+              );
               diskLastError = diErrorInvalidAudioCommand;
               transfer.interruptStatus = diDeviceErrorInterrupt;
               details = { subcommand: audioSubcommand, reason: "invalid-audio-status" };
@@ -21494,6 +21967,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         command2: "0x" + command2.toString(16).padStart(8, "0"),
         ...details,
       });
+      return true;
     }
 
     function serviceDisk(observedCycles) {
@@ -21508,18 +21982,37 @@ const TEMPLATE: &str = r##"<!doctype html>
         && diskTransfer.ready
         && observedCycles >= diskTransfer.completionCycle
       ) {
-        if (diskTransfer.error !== null && diskTransfer.error !== undefined) {
-          throw new Error(diskTransfer.error);
-        }
-        if (diskTransfer.opcode === 0xa8) {
-          const data = diskTransfer.data;
-          const target = ramPointer(diskTransfer.dmaBase, diskTransfer.length);
-          check(data !== null && target !== null, "missing browser disc DMA payload");
-          invalidateDataReservationForExternalWrite(
-            (target - ram) >>> 0,
-            diskTransfer.length
+        const transfer = diskTransfer;
+        if (
+          transfer.opcode === 0xa8
+          && transfer.interruptStatus === diTransferInterrupt
+        ) {
+          const transaction = transfer.transaction;
+          const data = transfer.data;
+          const validPayload = (
+            Object.prototype.toString.call(data) === "[object Uint8Array]"
+            && data.length === transaction.transferLength
+            && transaction.dmaBase < ramSize
+            && transaction.transferLength
+              <= ramSize - transaction.dmaBase
           );
-          bytes.set(data, target);
+          if (!validPayload) {
+            transfer.hostError ??= "invalid browser disc DMA completion payload";
+            transfer.errorCode = diErrorRead;
+            transfer.interruptStatus = diDeviceErrorInterrupt;
+          }
+        }
+        if (
+          transfer.opcode === 0xa8
+          && transfer.interruptStatus === diTransferInterrupt
+        ) {
+          const transaction = transfer.transaction;
+          const data = transfer.data;
+          invalidateDataReservationForExternalWrite(
+            transaction.dmaBase,
+            transaction.transferLength
+          );
+          bytes.set(data, ram + transaction.dmaBase);
           const hashLength = Math.min(data.length, 1024 * 1024 - diskHashedBytes);
           for (let index = 0; index < hashLength; index += 1) {
             diskReadHash = Math.imul(diskReadHash ^ data[index], 0x01000193) >>> 0;
@@ -21527,15 +22020,41 @@ const TEMPLATE: &str = r##"<!doctype html>
           diskHashedBytes += hashLength;
           diskReadBytes += data.length;
         }
-        control = view.getUint32(mmio + 0x601c, false) & ~1;
+        const successful =
+          transfer.interruptStatus === diTransferInterrupt;
+        if (successful) {
+          const dmaBase =
+            transfer.transaction?.dmaBase ?? transfer.dmaBase;
+          const dmaLength =
+            transfer.transaction?.dmaLength ?? transfer.dmaLength;
+          view.setUint32(
+            mmio + 0x6014,
+            (dmaBase + dmaLength) >>> 0,
+            false
+          );
+          view.setUint32(mmio + 0x6018, 0, false);
+        }
+        if (!successful && transfer.dma) {
+          diskLastError = transfer.errorCode ?? diErrorRead;
+          if (transfer.hostError != null) {
+            deviceEvents.set(
+              "diskHostReadError",
+              (deviceEvents.get("diskHostReadError") ?? 0) + 1
+            );
+          }
+        }
+        control = (
+          transfer.transaction?.control
+          ?? view.getUint32(mmio + 0x601c, false)
+        ) & ~1;
         view.setUint32(mmio + 0x601c, control, false);
-        view.setUint32(mmio + 0x6018, 0, false);
         view.setUint32(
           mmio + 0x6000,
-          view.getUint32(mmio + 0x6000, false) | diskTransfer.interruptStatus,
+          view.getUint32(mmio + 0x6000, false)
+            | transfer.interruptStatus,
           false
         );
-        if (diskTransfer.interruptStatus === diDeviceErrorInterrupt) {
+        if (transfer.interruptStatus === diDeviceErrorInterrupt) {
           deviceEvents.set(
             "diskDeviceError",
             (deviceEvents.get("diskDeviceError") ?? 0) + 1
@@ -22680,6 +23199,16 @@ const TEMPLATE: &str = r##"<!doctype html>
           lastError: "0x" + diskLastError.toString(16).padStart(8, "0"),
           driveState: diskDriveState,
           trace: diskCommandTrace,
+          dma: {
+            rejections: diskDmaRejections,
+            busyRegisterWriteRejections:
+              diskDmaBusyRegisterWriteRejections,
+            busyControlWriteRejections:
+              diskDmaBusyControlWriteRejections,
+            rejectionCounts: Object.fromEntries(diskDmaRejectionCounts),
+            rejectionTrace: diskDmaRejectionTrace,
+            pending: snapshotDiskTransfer(),
+          },
           audio: {
             enabled: diskAudioEnabled,
             bufferLength: diskAudioBufferLength,
@@ -22697,6 +23226,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
         audioCompatibility: {
           dspFirstUnsupported: snapshotDspFirstUnsupported(),
+          dtkFirstUnsupported: snapshotDtkFirstUnsupported(),
         },
         controller: {
           sequence: controllerSequence,
@@ -22886,7 +23416,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             "0x" + view.getUint32(mmio + 0x6000 + index * 4, false).toString(16).padStart(8, "0")
           ),
           externalInterface: snapshotExternalInterface(),
-          diskTransfer,
+          diskTransfer: snapshotDiskTransfer(),
           serialTransfer,
           peFinishCycle,
           peFinishSignal,
@@ -25817,6 +26347,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const defaultDiscSourceConfig = __HAS_DISC__
       ? {
           kind: "logical-range-endpoint",
+          logicalSize: __DISC_LOGICAL_SIZE__,
           url: new URL("/disc", location.href).href,
         }
       : __HAS_BOOT_ASSET__

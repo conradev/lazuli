@@ -7,9 +7,12 @@ import test from "node:test";
 import {
   CisoDiscSource,
   discBootMemoryLayout,
+  GAMECUBE_DISC_BYTES,
   HttpRangeByteSource,
+  LOGICAL_DISC_SIZE_HEADER,
   openDiscSource,
   parseCisoHeader,
+  QueryRangeByteSource,
   readDiscBoot,
 } from "../crates/ppcwasmjit/examples/browser_disc_source.mjs";
 
@@ -228,6 +231,35 @@ test("CISO reads synthesize sparse blocks and coalesce adjacent physical blocks"
   assert.equal(source.describe().logicalReads, 1);
 });
 
+test("CISO logical size excludes fixed bitmap padding beyond a GameCube disc", async () => {
+  const blockSize = 2 * 1024 * 1024;
+  const header = new Uint8Array(CISO_HEADER_SIZE);
+  const headerView = new DataView(header.buffer);
+  writeAscii(header, 0, "CISO");
+  headerView.setUint32(4, blockSize, true);
+  const physical = {
+    size: CISO_HEADER_SIZE,
+    async read() {
+      assert.fail("a sparse terminal CISO block must not read physical bytes");
+    },
+    describe() {
+      return { kind: "sparse-physical" };
+    },
+  };
+  const source = new CisoDiscSource(physical, parseCisoHeader(header));
+
+  assert.equal(source.size, GAMECUBE_DISC_BYTES);
+  assert.equal(source.describe().logicalSize, GAMECUBE_DISC_BYTES);
+  assert.deepEqual(
+    await source.read(GAMECUBE_DISC_BYTES - 16, 16),
+    new Uint8Array(16),
+  );
+  await assert.rejects(
+    source.read(GAMECUBE_DISC_BYTES, 1),
+    /exceeds logical image/,
+  );
+});
+
 test("openDiscSource recognizes a local CISO and preserves logical zero blocks", async () => {
   const blockSize = 0x800;
   const logicalBlocks = [0x11, 0x00, 0x33].map((value) =>
@@ -335,6 +367,80 @@ test("network cache fetches large ranges in bounded parallel batches", async (t)
   assert.equal(source.describe().cache.chunkBytes, 256 * 1024);
   assert.equal(source.describe().cache.parallelChunks, 4);
   assert.equal(maximumActive, 4);
+});
+
+test("logical range endpoints publish a stable trusted disc boundary", async (t) => {
+  const priorFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = priorFetch;
+  });
+  const remote = makeRawDisc().bytes;
+  const calls = [];
+  globalThis.fetch = async url => {
+    const request = new URL(url);
+    const offset = Number(request.searchParams.get("offset"));
+    const length = Number(request.searchParams.get("length"));
+    calls.push({ offset, length });
+    return new Response(remote.slice(offset, offset + length), {
+      headers: { [LOGICAL_DISC_SIZE_HEADER]: String(remote.length) },
+    });
+  };
+
+  const source = await openDiscSource(
+    {
+      kind: "logical-range-endpoint",
+      logicalSize: remote.length,
+      url: "https://example.test/disc",
+    },
+    { chunkBytes: 0x1000 },
+  );
+  assert.equal(source.size, remote.length);
+  assert.equal(source.describe().size, remote.length);
+  assert.deepEqual(await source.read(0x1800, 16), remote.slice(0x1800, 0x1810));
+  assert.deepEqual(calls, [
+    { offset: 0, length: 0x1000 },
+    { offset: 0x1000, length: 0x1000 },
+  ]);
+  await assert.rejects(
+    source.read(remote.length, 1),
+    /exceeds source size/,
+  );
+});
+
+test("logical range endpoints reject missing, invalid, or changing disc bounds", async (t) => {
+  const priorFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = priorFetch;
+  });
+  let responseIndex = 0;
+  globalThis.fetch = async () => {
+    const headers = [
+      {},
+      { [LOGICAL_DISC_SIZE_HEADER]: "not-a-size" },
+      { [LOGICAL_DISC_SIZE_HEADER]: "32" },
+      { [LOGICAL_DISC_SIZE_HEADER]: "64" },
+    ][responseIndex++];
+    return new Response(new Uint8Array(4), { headers });
+  };
+
+  await assert.rejects(
+    new QueryRangeByteSource("https://missing.test/disc", 32).read(0, 4),
+    /invalid X-Lazuli-Disc-Size: missing/,
+  );
+  await assert.rejects(
+    new QueryRangeByteSource("https://invalid.test/disc", 32).read(0, 4),
+    /invalid X-Lazuli-Disc-Size: not-a-size/,
+  );
+  const changing = new QueryRangeByteSource("https://changing.test/disc", 32);
+  await changing.read(0, 4);
+  await assert.rejects(
+    changing.read(4, 4),
+    /changed logical size from 32 to 64/,
+  );
+  assert.throws(
+    () => new QueryRangeByteSource("https://missing-size.test/disc"),
+    /requires a positive safe logical size/,
+  );
 });
 
 test("HTTP source rejects full responses, mismatched ranges, and short bodies", async (t) => {
