@@ -21,9 +21,6 @@ import {
   parseGameFirstPlayableArguments,
 } from "./browser_game_first_playable_transcript.mjs";
 import {
-  makeGameFirstPlayableReportPair,
-} from "./browser_game_first_playable_test_fixture.mjs";
-import {
   makeWarioWareFirstPlayableReportPair,
 } from "./browser_game_first_playable_warioware_test_fixture.mjs";
 
@@ -124,37 +121,35 @@ test("CLI wrapper reads reports and atomically writes the derived transcript", a
     );
     assert.equal(stdout, `${outputPath}\n`);
 
-    const unsupported = corpus.games.find(
-      candidate => candidate.key === "rogue-leader-usa",
-    );
-    const unsupportedReports = makeGameFirstPlayableReportPair(unsupported);
+    const rejectedReports = makeWarioWareFirstPlayableReportPair(game);
+    rejectedReports.postReport.guestGame.lastActiveGameplayInput = null;
     await Promise.all([
       writeFile(
         prePath,
-        `${JSON.stringify(unsupportedReports.preReport)}\n`,
+        `${JSON.stringify(rejectedReports.preReport)}\n`,
         "utf8",
       ),
       writeFile(
         postPath,
-        `${JSON.stringify(unsupportedReports.postReport)}\n`,
+        `${JSON.stringify(rejectedReports.postReport)}\n`,
         "utf8",
       ),
     ]);
     await assert.rejects(
       execFileAsync(process.execPath, [
         CLI_PATH,
-        "--game", unsupported.key,
+        "--game", game.key,
         "--pre", prePath,
         "--post", postPath,
         "--button", "a",
         "--output", outputPath,
       ]),
-      /no guest-consumption projector is available/,
+      /lastActiveGameplayInput.*expected an object/,
     );
-    assert.equal(
-      JSON.parse(await readFile(outputPath, "utf8")).game.key,
-      game.key,
-      "a rejected game must not replace the prior transcript",
+    assert.deepEqual(
+      JSON.parse(await readFile(outputPath, "utf8")),
+      transcript,
+      "rejected evidence must not replace the prior transcript",
     );
   } finally {
     await rm(directory, { force: true, recursive: true });

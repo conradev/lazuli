@@ -34,6 +34,9 @@ import {
   projectMetroidPrimeGuestConsumption,
 } from "./browser_game_first_playable_metroid_prime.mjs";
 import {
+  projectRogueLeaderGuestConsumption,
+} from "./browser_game_first_playable_rogue_leader.mjs";
+import {
   projectWarioWareGuestConsumption,
 } from "./browser_game_first_playable_warioware.mjs";
 
@@ -49,6 +52,7 @@ function projectSupportedGuestConsumption(options) {
     ?? projectMeleeGuestConsumption(options)
     ?? projectFzeroGuestConsumption(options)
     ?? projectMetroidPrimeGuestConsumption(options)
+    ?? projectRogueLeaderGuestConsumption(options)
     ?? projectWarioWareGuestConsumption(options);
 }
 
