@@ -821,6 +821,8 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Sync => self.nop(Action::Exit),
             Opcode::Tlbie => self.tlbie(ins),
             Opcode::Tlbsync => self.tlbsync(ins),
+            Opcode::Tw => self.tw(ins),
+            Opcode::Twi => self.twi(ins),
             Opcode::Xor => self.xor(ins),
             Opcode::Xori => self.xori(ins),
             Opcode::Xoris => self.xoris(ins),

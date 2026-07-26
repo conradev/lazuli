@@ -173,6 +173,18 @@ fn mtmsr(rs: u8) -> Ins {
     instruction(31 << 26 | u32::from(rs) << 21 | 146 << 1)
 }
 
+fn tw(to: u8, ra: u8, rb: u8) -> Ins {
+    instruction(
+        31 << 26 | u32::from(to & 0x1f) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 4 << 1,
+    )
+}
+
+fn twi(to: u8, ra: u8, immediate: i16) -> Ins {
+    instruction(
+        3 << 26 | u32::from(to & 0x1f) << 21 | u32::from(ra) << 16 | u32::from(immediate as u16),
+    )
+}
+
 fn tlbie(rb: u8) -> Ins {
     instruction(0x7c00_0264 | u32::from(rb) << 11)
 }
@@ -380,6 +392,222 @@ if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
         ])
         .output()
         .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_trap_word_predicates_preserve_the_exact_exception_boundary() {
+    let prefix = instruction(14 << 26 | 6 << 21 | 6 << 16); // addi r6,r6,0
+    let later = instruction(14 << 26 | 5 << 21 | 0x55aa); // addi r5,r0,0x55aa
+    let traps = [
+        ("tw_slt", tw(0x10, 3, 4)),
+        ("tw_sgt", tw(0x08, 3, 4)),
+        ("tw_eq", tw(0x04, 3, 4)),
+        ("tw_ult", tw(0x02, 3, 4)),
+        ("tw_ugt", tw(0x01, 3, 4)),
+        ("tw_combined", tw(0x14, 3, 4)),
+        ("tw_none", tw(0x00, 3, 4)),
+        ("twi_sgt_neg1", twi(0x08, 3, -1)),
+        ("twi_ult_neg1", twi(0x02, 3, -1)),
+        ("twi_eq_min", twi(0x04, 3, i16::MIN)),
+    ];
+    for (name, trap) in traps {
+        assert!(
+            matches!(trap.op, GuestOpcode::Tw | GuestOpcode::Twi),
+            "{name} decoded as {:?}",
+            trap.op
+        );
+    }
+
+    let modules = traps
+        .into_iter()
+        .map(|(name, trap)| {
+            let translated = translate_with_cycle_publication([prefix, trap, later]);
+            assert_eq!(translated.sequence.0, [prefix, trap, later]);
+            assert_eq!(translated.cycles, 6);
+            assert_eq!(translated.exit, TranslationExit::Fallthrough);
+            assert_eq!(
+                hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET),
+                [(1, 0, 2)]
+            );
+
+            let wasm = lower_portable(&translated.function)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("{name}:{wasm}")
+        })
+        .collect::<Vec<_>>();
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let script = r#"
+const [
+  cycleOffsetText,
+  pcOffsetText,
+  r3OffsetText,
+  r4OffsetText,
+  r5OffsetText,
+  srr0OffsetText,
+  srr1OffsetText,
+  programExceptionText,
+  trapCauseText,
+  ...moduleSpecs
+] = process.argv.slice(1);
+const [
+  cycleOffset,
+  pcOffset,
+  r3Offset,
+  r4Offset,
+  r5Offset,
+  srr0Offset,
+  srr1Offset,
+  programException,
+  trapCause,
+] = [
+  cycleOffsetText,
+  pcOffsetText,
+  r3OffsetText,
+  r4OffsetText,
+  r5OffsetText,
+  srr0OffsetText,
+  srr1OffsetText,
+  programExceptionText,
+  trapCauseText,
+].map(Number);
+const modules = new Map(moduleSpecs.map((spec) => {
+  const separator = spec.indexOf(":");
+  return [spec.slice(0, separator), spec.slice(separator + 1)];
+}));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const initialPc = 0x80003000;
+const initialSrr0 = 0xaabbccdd;
+const initialSrr1 = 0x13572468;
+const postHookSrr1 = 0x80010042;
+const exceptionVector = 0xfff00700;
+const untouchedR5 = 0xdeadbeef;
+
+async function execute(name, lhs, rhs, shouldTrap, label) {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r3Offset, lhs, true);
+  view.setUint32(cpu + r4Offset, rhs, true);
+  view.setUint32(cpu + r5Offset, untouchedR5, true);
+  view.setUint32(cpu + srr0Offset, initialSrr0, true);
+  view.setUint32(cpu + srr1Offset, initialSrr1, true);
+
+  const hooks = {
+    user_1_0(registers, exception) {
+      const trapPc = view.getUint32(registers + pcOffset, true);
+      events.push([
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        trapPc,
+      ]);
+      view.setUint32(registers + srr0Offset, trapPc, true);
+      view.setUint32(registers + srr1Offset, postHookSrr1, true);
+      view.setUint32(registers + pcOffset, exceptionVector, true);
+    },
+  };
+  const hex = modules.get(name);
+  if (hex === undefined) throw new Error(`missing module ${name}`);
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+
+  if (shouldTrap) {
+    if (executed !== 0x00040002) {
+      throw new Error(`${label} returned taken counters 0x${executed.toString(16)}`);
+    }
+    const expectedEvents = [[2, cpu, programException, initialPc + 4]];
+    if (JSON.stringify(events) !== JSON.stringify(expectedEvents)) {
+      throw new Error(`${label} observed ${JSON.stringify(events)}`);
+    }
+    if (view.getUint32(cpu + pcOffset, true) !== exceptionVector) {
+      throw new Error(`${label} did not retain the Program vector`);
+    }
+    if (view.getUint32(cpu + srr0Offset, true) !== initialPc + 4) {
+      throw new Error(`${label} did not retain the trapping PC in SRR0`);
+    }
+    if (view.getUint32(cpu + srr1Offset, true) !== (postHookSrr1 | trapCause) >>> 0) {
+      throw new Error(`${label} did not retain the Trap cause`);
+    }
+    if (view.getUint32(cpu + r5Offset, true) !== untouchedR5) {
+      throw new Error(`${label} executed beyond the taken trap`);
+    }
+  } else {
+    if (executed !== 0x00060003) {
+      throw new Error(`${label} returned untaken counters 0x${executed.toString(16)}`);
+    }
+    if (events.length !== 0) {
+      throw new Error(`${label} raised an untaken trap`);
+    }
+    if (view.getUint32(cpu + pcOffset, true) !== initialPc + 12) {
+      throw new Error(`${label} did not continue after an untaken trap`);
+    }
+    if (view.getUint32(cpu + srr0Offset, true) !== initialSrr0
+        || view.getUint32(cpu + srr1Offset, true) !== initialSrr1) {
+      throw new Error(`${label} changed exception state without trapping`);
+    }
+    if (view.getUint32(cpu + r5Offset, true) !== 0x55aa) {
+      throw new Error(`${label} did not execute after an untaken trap`);
+    }
+  }
+}
+
+await execute("tw_slt", 0x80000000, 0x7fffffff, true, "signed LT taken");
+await execute("tw_slt", 0x7fffffff, 0x80000000, false, "signed LT untaken");
+await execute("tw_sgt", 0x7fffffff, 0x80000000, true, "signed GT taken");
+await execute("tw_sgt", 0x80000000, 0x7fffffff, false, "signed GT untaken");
+await execute("tw_eq", 0x80000000, 0x80000000, true, "EQ taken");
+await execute("tw_eq", 1, 2, false, "EQ untaken");
+await execute("tw_ult", 0, 0xffffffff, true, "unsigned LT taken");
+await execute("tw_ult", 0xffffffff, 0, false, "unsigned LT untaken");
+await execute("tw_ugt", 0xffffffff, 0, true, "unsigned GT taken");
+await execute("tw_ugt", 0, 0xffffffff, false, "unsigned GT untaken");
+await execute("tw_combined", 0x12345678, 0x12345678, true, "combined EQ taken");
+await execute("tw_combined", 5, 4, false, "combined untaken");
+await execute("tw_none", 0x12345678, 0x12345678, false, "empty TO");
+await execute("twi_sgt_neg1", 0, 0, true, "twi signed sign extension");
+await execute("twi_sgt_neg1", 0xffffffff, 0, false, "twi signed equality");
+await execute("twi_ult_neg1", 0xfffffffe, 0, true, "twi unsigned sign extension");
+await execute("twi_ult_neg1", 0xffffffff, 0, false, "twi unsigned equality");
+await execute("twi_eq_min", 0xffff8000, 0, true, "twi minimum equality");
+await execute("twi_eq_min", 0x00008000, 0, false, "twi minimum mismatch");
+"#;
+    let mut command = Command::new("node");
+    command.args([
+        "--input-type=module",
+        "--eval",
+        script,
+        &TEST_HOOK_CYCLE_OFFSET.to_string(),
+        &Reg::PC.offset().to_string(),
+        &GPR::R3.offset().to_string(),
+        &GPR::R4.offset().to_string(),
+        &GPR::R5.offset().to_string(),
+        &SPR::SRR0.offset().to_string(),
+        &SPR::SRR1.offset().to_string(),
+        &(Exception::Program as u16).to_string(),
+        &ProgramExceptionCause::Trap.srr1_bits().to_string(),
+    ]);
+    command.args(&modules);
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "node failed:\nstdout:\n{}\nstderr:\n{}",

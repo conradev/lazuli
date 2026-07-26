@@ -1,8 +1,9 @@
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::isa::CallConv;
 use gekko::disasm::Ins;
-use gekko::{Exception, ProgramExceptionCause, Reg, SPR};
+use gekko::{Exception, InsExt, ProgramExceptionCause, Reg, SPR};
 
 use super::BlockBuilder;
 use crate::builder::{Action, InstructionInfo};
@@ -17,6 +18,12 @@ const EXCEPTION_INFO: InstructionInfo = InstructionInfo {
     cycles: 2,
     auto_pc: false,
     action: Action::ExitNoFlush,
+};
+
+const TRAP_INFO: InstructionInfo = InstructionInfo {
+    cycles: 2,
+    auto_pc: true,
+    action: Action::Continue,
 };
 
 pub fn raise_exception_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
@@ -60,6 +67,62 @@ impl BlockBuilder<'_> {
     pub fn illegal(&mut self, _: Ins) -> InstructionInfo {
         self.raise_program_exception(ProgramExceptionCause::IllegalInstruction);
         EXCEPTION_INFO
+    }
+
+    fn trap_word_condition(&mut self, lhs: ir::Value, rhs: ir::Value, to: u8) -> ir::Value {
+        let mut condition = None;
+        for (mask, comparison) in [
+            (0x10, IntCC::SignedLessThan),
+            (0x08, IntCC::SignedGreaterThan),
+            (0x04, IntCC::Equal),
+            (0x02, IntCC::UnsignedLessThan),
+            (0x01, IntCC::UnsignedGreaterThan),
+        ] {
+            if to & mask == 0 {
+                continue;
+            }
+
+            let comparison = self.bd.ins().icmp(comparison, lhs, rhs);
+            condition = Some(match condition {
+                Some(condition) => self.bd.ins().bor(condition, comparison),
+                None => comparison,
+            });
+        }
+
+        condition.unwrap_or_else(|| self.ir_value(false))
+    }
+
+    fn trap_word(&mut self, lhs: ir::Value, rhs: ir::Value, to: u8) -> InstructionInfo {
+        let should_trap = self.trap_word_condition(lhs, rhs, to);
+        let trap_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(trap_block);
+        self.bd
+            .ins()
+            .brif(should_trap, trap_block, &[], continue_block, &[]);
+        self.bd.seal_block(trap_block);
+        self.bd.seal_block(continue_block);
+
+        self.switch_to_bb(trap_block);
+        self.raise_program_exception(ProgramExceptionCause::Trap);
+        self.exit_with(TRAP_INFO);
+
+        self.switch_to_bb(continue_block);
+        self.current_bb = continue_block;
+
+        TRAP_INFO
+    }
+
+    pub fn tw(&mut self, ins: Ins) -> InstructionInfo {
+        let lhs = self.get(ins.gpr_a());
+        let rhs = self.get(ins.gpr_b());
+        self.trap_word(lhs, rhs, ins.field_to())
+    }
+
+    pub fn twi(&mut self, ins: Ins) -> InstructionInfo {
+        let lhs = self.get(ins.gpr_a());
+        let rhs = self.ir_value(ins.field_simm() as i32);
+        self.trap_word(lhs, rhs, ins.field_to())
     }
 
     /// Checks whether floating point operations are enabled in MSR and raises an exception if not.

@@ -220,6 +220,7 @@ struct NativeProgramExceptionContext {
     cpu: Cpu,
     fastmem: Box<FastmemLut>,
     exit_srr1: u32,
+    exit_executed: Executed,
 }
 
 extern "C-unwind" fn native_program_exception_registers(ctx: *mut Context) -> *mut Cpu {
@@ -236,10 +237,11 @@ extern "C-unwind" fn native_program_exception_exit(
     ctx: *const Context,
     _: *mut ExitData,
     _: ExitReason,
-    _: Executed,
+    executed: Executed,
 ) -> Option<BlockFn> {
     let ctx = unsafe { &mut *ctx.cast_mut().cast::<NativeProgramExceptionContext>() };
     ctx.exit_srr1 = ctx.cpu.supervisor.exception.srr[1];
+    ctx.exit_executed = executed;
     None
 }
 
@@ -269,6 +271,7 @@ fn native_illegal_instruction_records_the_program_cause_before_exit() {
         },
         fastmem: Box::new([None; FASTMEM_LUT_COUNT]),
         exit_srr1: 0,
+        exit_executed: Executed::default(),
     };
     context.cpu.supervisor.exception.srr[1] = Exception::SPECIAL_SRR1_BITS_MASK;
 
@@ -283,4 +286,99 @@ fn native_illegal_instruction_records_the_program_cause_before_exit() {
         ProgramExceptionCause::IllegalInstruction.srr1_bits()
     );
     assert_eq!(context.exit_srr1, context.cpu.supervisor.exception.srr[1]);
+}
+
+#[test]
+fn native_trap_word_preserves_the_taken_instruction_boundary() {
+    let twi_sequence = ppc! {
+        addi gpr(6) gpr(6) i(0);
+        twi u(0x02) gpr(3) i(-1);
+        addi gpr(5) gpr(0) i(0x55aa);
+    };
+    assert_eq!(twi_sequence.0[1].op, Opcode::Twi);
+    let tw_sequence = ppc! {
+        addi gpr(6) gpr(6) i(0);
+        tw u(0x14) gpr(3) gpr(4);
+        addi gpr(5) gpr(0) i(0x55aa);
+    };
+    assert_eq!(tw_sequence.0[1].op, Opcode::Tw);
+
+    let mut hooks = unsafe { Hooks::stub() };
+    hooks.get_registers = native_program_exception_registers;
+    hooks.get_fastmem = native_program_exception_fastmem;
+    hooks.exit = native_program_exception_exit;
+    let mut jit = Jit::new(
+        Settings {
+            codegen: CodegenSettings::default(),
+            cache_path: None,
+            exit_data_layout: Layout::new::<u8>(),
+        },
+        hooks,
+    );
+    let twi_block = jit.build(twi_sequence.0.into_iter()).unwrap();
+    let tw_block = jit.build(tw_sequence.0.into_iter()).unwrap();
+    let initial_pc = 0x8000_2000;
+    let untouched_r5 = 0xdead_beef;
+    let mut context = NativeProgramExceptionContext {
+        cpu: Cpu::default(),
+        fastmem: Box::new([None; FASTMEM_LUT_COUNT]),
+        exit_srr1: 0,
+        exit_executed: Executed::default(),
+    };
+
+    context.cpu.pc = Address(initial_pc);
+    context.cpu.user.gpr[3] = 0xffff_fffe;
+    context.cpu.user.gpr[5] = untouched_r5;
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), twi_block.as_ptr());
+    }
+    assert_eq!(context.cpu.pc, Address(0xfff0_0700));
+    assert_eq!(context.cpu.supervisor.exception.srr[0], initial_pc + 4);
+    assert_eq!(context.cpu.user.gpr[5], untouched_r5);
+    assert_eq!(
+        context.exit_srr1 & ProgramExceptionCause::SRR1_MASK,
+        ProgramExceptionCause::Trap.srr1_bits()
+    );
+    assert_eq!(context.exit_executed.instructions, 2);
+    assert_eq!(context.exit_executed.cycles, 4);
+
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.user.gpr[3] = 0xffff_ffff;
+    context.cpu.user.gpr[5] = untouched_r5;
+    context.exit_srr1 = 0;
+    context.exit_executed = Executed::default();
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), twi_block.as_ptr());
+    }
+    assert_eq!(context.cpu.pc, Address(initial_pc + 12));
+    assert_eq!(context.cpu.supervisor.exception.srr[0], 0);
+    assert_eq!(context.cpu.user.gpr[5], 0x55aa);
+    assert_eq!(context.exit_srr1 & ProgramExceptionCause::SRR1_MASK, 0);
+    assert_eq!(context.exit_executed.instructions, 3);
+    assert_eq!(context.exit_executed.cycles, 6);
+
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.user.gpr[3] = 0x8000_0000;
+    context.cpu.user.gpr[4] = 0x8000_0000;
+    context.cpu.user.gpr[5] = untouched_r5;
+    context.exit_srr1 = 0;
+    context.exit_executed = Executed::default();
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), tw_block.as_ptr());
+    }
+    assert_eq!(context.cpu.pc, Address(0xfff0_0700));
+    assert_eq!(context.cpu.supervisor.exception.srr[0], initial_pc + 4);
+    assert_eq!(context.cpu.user.gpr[5], untouched_r5);
+    assert_eq!(
+        context.exit_srr1 & ProgramExceptionCause::SRR1_MASK,
+        ProgramExceptionCause::Trap.srr1_bits()
+    );
+    assert_eq!(context.exit_executed.instructions, 2);
+    assert_eq!(context.exit_executed.cycles, 4);
 }
