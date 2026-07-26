@@ -359,13 +359,25 @@ test("CMD_MORE follows a bounded list chain and rejects physical alias cycles", 
   const firstAddress = 0x80000100;
   const secondAddress = 0xc0000200;
   const outputAddress = 0x80003000;
-  const second = [0x0006, ...splitAddress(outputAddress), 0x000f];
+  const unreachableAddress = 0x80005000;
+  const unreachableUpload = [
+    0x0006,
+    ...splitAddress(unreachableAddress),
+  ];
+  const second = [
+    0x0006,
+    ...splitAddress(outputAddress),
+    0x000f,
+    ...unreachableUpload,
+  ];
   const first = [
     0x000d,
     ...splitAddress(secondAddress),
     second.length,
+    ...unreachableUpload,
   ];
   seedGuardedRange(context, 0x3000, 1920);
+  ramBytes(context, 0x5000, 1920).fill(0xa5);
   writeWords(context, firstAddress, first);
   writeWords(context, secondAddress, second);
   context.handleDspCpuMail((0xbabe0000 | first.length) >>> 0);
@@ -373,11 +385,16 @@ test("CMD_MORE follows a bounded list chain and rejects physical alias cycles", 
 
   assert.equal(context.dspAxCommandState.listCount, 2);
   assert.equal(context.dspAxCommandState.wordCount, first.length + second.length);
+  assert.equal(context.dspAxCommandState.paddingWords, 6);
   assert.deepEqual(
     Array.from(context.dspAxCommandState.commandSample),
     [0x0d, 0x06, 0x0f],
   );
   assertClearedGuardedRange(context, 0x3000, 1920);
+  assert.ok(
+    ramBytes(context, 0x5000, 1920).every(value => value === 0xa5),
+    "commands after MORE or END must remain unreachable",
+  );
 
   const cycle = dspContext();
   writeWords(cycle, firstAddress, first);
@@ -688,10 +705,18 @@ test("release diagnostics retain bounded AX command state", () => {
     "sizeWords",
     "listCount",
     "wordCount",
+    "paddingWords",
     "commandCount",
     "commandSample",
     "writeCount",
     "clearedBytes",
+    "voiceRendered",
+    "mainBusOnly",
+    "mainBusUploadLrsCommands",
+    "mainBusMixAuxBNoWriteCommands",
+    "mainBusWriteCount",
+    "mainBusWriteBytes",
+    "mainBusTransactionHash",
     "rejected",
     "reason",
     "lastTaskMail",

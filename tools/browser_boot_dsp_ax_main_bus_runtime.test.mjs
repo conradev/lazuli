@@ -87,6 +87,7 @@ function runtimeContext({
   executeAxMainBusReference = executeCanonicalAxMainBusReference,
   renderAxVoiceReference,
   compressorPosition = 0,
+  ucodeHash = 0x07f88145,
 } = {}) {
   assert.equal(typeof renderAxVoiceReference, "function");
   const memory = new ArrayBuffer(0x50000);
@@ -105,7 +106,7 @@ function runtimeContext({
     dspMode: "ax",
     dspScheduledMail: null,
     dspTrace: [],
-    dspUcodeHash: 0x07f88145,
+    dspUcodeHash: ucodeHash,
     executeAxMainBusReference,
     invalidations,
     invalidateDataReservationForExternalWrite(physical, size) {
@@ -179,6 +180,23 @@ function writeMainInput(context, address, samples) {
   assert.notEqual(pointer, null);
   for (let frame = 0; frame < 160; frame += 1) {
     context.view.setInt32(pointer + frame * 4, samples[frame], false);
+  }
+}
+
+function writeMainLrs(context, address, { left, right, surround }) {
+  for (const samples of [left, right, surround]) {
+    assert.equal(samples.length, 160);
+  }
+  const pointer = context.ramPointer(address, 3 * 160 * 4);
+  assert.notEqual(pointer, null);
+  for (const [plane, samples] of [left, right, surround].entries()) {
+    for (let frame = 0; frame < 160; frame += 1) {
+      context.view.setInt32(
+        pointer + plane * 160 * 4 + frame * 4,
+        samples[frame],
+        false,
+      );
+    }
   }
 }
 
@@ -290,6 +308,18 @@ function writeBigEndianS16(bytes, offset, value) {
   bytes[offset + 1] = word & 0xff;
 }
 
+function writeBigEndianS32(bytes, offset, value) {
+  const word = value >>> 0;
+  bytes[offset] = word >>> 24;
+  bytes[offset + 1] = (word >>> 16) & 0xff;
+  bytes[offset + 2] = (word >>> 8) & 0xff;
+  bytes[offset + 3] = word & 0xff;
+}
+
+function clampSigned16(value) {
+  return Math.max(-0x8000, Math.min(0x7fff, value));
+}
+
 function multiplyQ15(sample, coefficient) {
   return Number(
     BigInt.asIntN(32, (BigInt(sample) * BigInt(coefficient)) >> 15n),
@@ -329,6 +359,193 @@ function fnv1a(parts) {
     }
   }
   return "0x" + hash.toString(16).padStart(8, "0");
+}
+
+function warioPostmixOutput(input, aux) {
+  const main = new Uint8Array(160 * 2 * 2);
+  const surround = new Uint8Array(160 * 4);
+  for (let frame = 0; frame < 160; frame += 1) {
+    const left = (
+      ((-input[frame]) | 0) + aux.left[frame]
+    ) | 0;
+    const right = (input[frame] + aux.right[frame]) | 0;
+    writeBigEndianS16(main, frame * 4, clampSigned16(right));
+    writeBigEndianS16(main, frame * 4 + 2, clampSigned16(left));
+    writeBigEndianS32(surround, frame * 4, aux.surround[frame]);
+  }
+  return { main, surround };
+}
+
+function warioPostmixCommands({
+  setupAddress,
+  uploadAddress,
+  inputAddress,
+  auxAddress,
+  surroundAddress,
+  lrAddress,
+}) {
+  return [
+    0x0000, ...splitAddress(setupAddress),
+    0x0006, ...splitAddress(uploadAddress),
+    0x0011, ...splitAddress(inputAddress),
+    0x0009, ...splitAddress(auxAddress),
+    0x000e,
+    ...splitAddress(surroundAddress),
+    ...splitAddress(lrAddress),
+    0x000f,
+  ];
+}
+
+function mutatingPostEndPadding({
+  fakeUploadAddress,
+  fakeSurroundAddress,
+  fakeLrAddress,
+}) {
+  const padding = [
+    0x0006, ...splitAddress(fakeUploadAddress),
+    0x000e,
+    ...splitAddress(fakeSurroundAddress),
+    ...splitAddress(fakeLrAddress),
+    ...Array(10).fill(0xffff),
+  ];
+  assert.equal(padding.length, 18);
+  return padding;
+}
+
+function warioFixture({
+  executeAxMainBusReference = executeCanonicalAxMainBusReference,
+  compressorPosition = 0,
+  ucodeHash = 0xe2136399,
+  setupAddress = 0x40001000,
+  uploadAddress = 0x80002000,
+  inputAddress = 0xc0004000,
+  auxAddress = 0x40006000,
+  surroundAddress = inputAddress,
+  lrAddress = 0x80008000,
+  fakeUploadAddress = 0xc000a000,
+  fakeSurroundAddress = 0x4000b000,
+  fakeLrAddress = 0x8000c000,
+} = {}) {
+  const calls = [];
+  const context = runtimeContext({
+    executeAxMainBusReference,
+    compressorPosition,
+    ucodeHash,
+    renderAxVoiceReference(input) {
+      calls.push(input);
+      throw new Error("Wario postmix must not invoke the AX voice model");
+    },
+  });
+  const input = Int32Array.from(
+    { length: 160 },
+    (_unused, frame) => ((frame - 80) * 1_000_003) | 0,
+  );
+  input[0] = -0x8000_0000;
+  input[1] = 0x7fff_ffff;
+  const aux = {
+    left: Int32Array.from(
+      { length: 160 },
+      (_unused, frame) => (frame * 101 - 8_000) | 0,
+    ),
+    right: Int32Array.from(
+      { length: 160 },
+      (_unused, frame) => (8_000 - frame * 103) | 0,
+    ),
+    surround: Int32Array.from(
+      { length: 160 },
+      (_unused, frame) => (0x1234_0000 + frame * 257) | 0,
+    ),
+  };
+  aux.left[0] = -1;
+  aux.right[0] = -1;
+  aux.left[1] = -2;
+  aux.right[1] = 1;
+
+  writeZeroSetup(context, setupAddress);
+  ramBytes(context, uploadAddress, 3 * 160 * 4).fill(0x7a);
+  writeMainInput(context, inputAddress, input);
+  writeMainLrs(context, auxAddress, aux);
+  ramBytes(context, lrAddress, 160 * 2 * 2).fill(0x64);
+  ramBytes(context, fakeUploadAddress, 3 * 160 * 4).fill(0xa1);
+  ramBytes(context, fakeSurroundAddress, 160 * 4).fill(0xb2);
+  ramBytes(context, fakeLrAddress, 160 * 2 * 2).fill(0xc3);
+
+  const commands = warioPostmixCommands({
+    setupAddress,
+    uploadAddress,
+    inputAddress,
+    auxAddress,
+    surroundAddress,
+    lrAddress,
+  });
+  assert.equal(commands.length, 18);
+  const padding = mutatingPostEndPadding({
+    fakeUploadAddress,
+    fakeSurroundAddress,
+    fakeLrAddress,
+  });
+  return {
+    aux,
+    auxAddress,
+    calls,
+    commands,
+    compressorPosition,
+    context,
+    fakeLrAddress,
+    fakeSurroundAddress,
+    fakeUploadAddress,
+    input,
+    inputAddress,
+    lrAddress,
+    padding,
+    setupAddress,
+    surroundAddress,
+    uploadAddress,
+    words: [...commands, ...padding],
+  };
+}
+
+function assertWarioMainBusFallback(
+  testFixture,
+  {
+    reason,
+    compressorPosition = testFixture.compressorPosition,
+    expectedCalls = 0,
+  },
+) {
+  const {
+    calls,
+    context,
+    lrAddress,
+    surroundAddress,
+    uploadAddress,
+  } = testFixture;
+  assert.equal(calls.length, expectedCalls);
+  assert.ok(
+    ramBytes(context, uploadAddress, 3 * 160 * 4)
+      .every(value => value === 0),
+  );
+  assert.ok(
+    ramBytes(context, surroundAddress, 160 * 4)
+      .every(value => value === 0),
+  );
+  assert.ok(
+    ramBytes(context, lrAddress, 160 * 2 * 2)
+      .every(value => value === 0),
+  );
+  assert.equal(context.dspAxCompressorPosition, compressorPosition);
+  assert.equal(context.dspAxCommandState.voiceMode, "silent-fallback");
+  assert.equal(context.dspAxCommandState.voiceRendered, false);
+  assert.equal(context.dspAxCommandState.mainBusOnly, true);
+  assert.equal(context.dspAxCommandState.voiceReason, reason);
+  assert.equal(context.dspAxCommandState.mainBusRendered, false);
+  assert.equal(context.deviceEvents.get("dspAxMainBusFallback"), 1);
+  assert.equal(context.deviceEvents.get("dspAxVoiceFallback"), undefined);
+  assert.equal(context.deviceEvents.get("dspAxMainBusRender"), undefined);
+  assert.equal(context.deviceEvents.get("dspAxSilentWrite"), 3);
+  assert.equal(context.deviceEvents.get("dspAxSilentBytes"), 3_200);
+  assert.equal(context.dspFirstUnsupported?.stage, "main-bus");
+  assert.equal(context.dspFirstUnsupported?.reason, reason);
 }
 
 function fixture({
@@ -459,6 +676,371 @@ test("canonical AX main-bus model is scoped directly inside the worker", () => {
     source,
     /"__DSP_AX_MAIN_BUS_REFERENCE_RUNTIME__",\s*&dsp_ax_main_bus_reference_runtime/,
   );
+});
+
+test("WarioWare postmix commits exact aliases and ignores its 18-word END tail", () => {
+  const testFixture = warioFixture();
+  const {
+    aux,
+    calls,
+    context,
+    fakeLrAddress,
+    fakeSurroundAddress,
+    fakeUploadAddress,
+    input,
+    lrAddress,
+    surroundAddress,
+    uploadAddress,
+    words,
+  } = testFixture;
+  const expected = warioPostmixOutput(input, aux);
+  const fakeUploadBefore = new Uint8Array(
+    ramBytes(context, fakeUploadAddress, 3 * 160 * 4),
+  );
+  const fakeSurroundBefore = new Uint8Array(
+    ramBytes(context, fakeSurroundAddress, 160 * 4),
+  );
+  const fakeLrBefore = new Uint8Array(
+    ramBytes(context, fakeLrAddress, 160 * 2 * 2),
+  );
+
+  assert.equal(words.length, 36);
+  assert.equal(executeList(context, 0xc0000100, words), true);
+  assert.equal(calls.length, 0);
+  assert.ok(
+    ramBytes(context, uploadAddress, 3 * 160 * 4)
+      .every(value => value === 0),
+    "zero SETUP must upload three exact zero accumulator planes",
+  );
+  assert.deepEqual(
+    ramBytes(context, surroundAddress, 160 * 4),
+    expected.surround,
+    "the live SET_OPPOSITE source aliases the later surround output",
+  );
+  assert.deepEqual(
+    ramBytes(context, lrAddress, 160 * 2 * 2),
+    expected.main,
+  );
+  assert.deepEqual(
+    ramBytes(context, fakeUploadAddress, 3 * 160 * 4),
+    fakeUploadBefore,
+    "a mutating UPLOAD_LRS encoded after END must remain unreachable",
+  );
+  assert.deepEqual(
+    ramBytes(context, fakeSurroundAddress, 160 * 4),
+    fakeSurroundBefore,
+  );
+  assert.deepEqual(
+    ramBytes(context, fakeLrAddress, 160 * 2 * 2),
+    fakeLrBefore,
+  );
+  assert.deepEqual(
+    context.invalidations,
+    [[0x2000, 1_920], [0x4000, 640], [0x8000, 640]],
+    "0x8 upload, 0xC input/output, and 0x8 LR aliases commit physically",
+  );
+
+  assert.equal(context.dspAxCommandState.wordCount, 36);
+  assert.equal(context.dspAxCommandState.paddingWords, 18);
+  assert.equal(context.dspAxCommandState.sizeWords, 36);
+  assert.equal(context.dspAxCommandState.listCount, 1);
+  assert.equal(context.dspAxCommandState.commandCount, 6);
+  assert.deepEqual(
+    Array.from(context.dspAxCommandState.commandSample),
+    [0x00, 0x06, 0x11, 0x09, 0x0e, 0x0f],
+  );
+  assert.equal(context.dspAxCommandState.voiceMode, "main-bus-only");
+  assert.equal(context.dspAxCommandState.voiceRendered, false);
+  assert.equal(context.dspAxCommandState.mainBusOnly, true);
+  assert.equal(context.dspAxCommandState.voiceParameterBlocks, 0);
+  assert.equal(context.dspAxCommandState.voiceParameterBlockBytes, 0);
+  assert.equal(context.dspAxCommandState.voiceOutputBytes, 0);
+  assert.equal(context.dspAxCommandState.voiceNonZeroSampleValues, 0);
+  assert.equal(context.dspAxCommandState.voiceOutputHash, null);
+  assert.equal(context.dspAxCommandState.writeCount, 3);
+  assert.equal(context.dspAxCommandState.clearedBytes, 0);
+  assert.equal(context.dspAxCommandState.mainBusRendered, true);
+  assert.equal(context.dspAxCommandState.mainBusCommands, 4);
+  assert.equal(context.dspAxCommandState.mainBusUploadLrsCommands, 1);
+  assert.equal(context.dspAxCommandState.mainBusSetLrCommands, 0);
+  assert.equal(context.dspAxCommandState.mainBusSetOppositeLrCommands, 1);
+  assert.equal(
+    context.dspAxCommandState.mainBusMixAuxBNoWriteCommands,
+    1,
+  );
+  assert.equal(context.dspAxCommandState.mainBusCompressorCommands, 0);
+  assert.equal(context.dspAxCommandState.mainBusWriteCount, 3);
+  assert.equal(context.dspAxCommandState.mainBusWriteBytes, 3_200);
+  assert.equal(
+    context.dspAxCommandState.mainBusCompressorPositionBefore,
+    0,
+  );
+  assert.equal(
+    context.dspAxCommandState.mainBusCompressorPositionAfter,
+    0,
+  );
+  assert.equal(
+    context.dspAxCommandState.mainBusOutputHash,
+    fnv1a([expected.surround, expected.main]),
+  );
+  assert.equal(
+    context.dspAxCommandState.mainBusTransactionHash,
+    fnv1a([
+      new Uint8Array(1_920),
+      expected.surround,
+      expected.main,
+    ]),
+  );
+  assert.equal(context.deviceEvents.get("dspAxVoiceRender"), undefined);
+  assert.equal(
+    context.deviceEvents.get("dspAxVoiceParameterBlockWrite"),
+    undefined,
+  );
+  assert.equal(context.deviceEvents.get("dspAxVoiceDataBytes"), undefined);
+  assert.equal(context.deviceEvents.get("dspAxMainBusRender"), 1);
+  assert.equal(context.deviceEvents.get("dspAxMainBusWrite"), 3);
+  assert.equal(context.deviceEvents.get("dspAxMainBusBytes"), 3_200);
+  assert.equal(context.deviceEvents.get("dspAxSilentWrite"), 0);
+  assert.equal(context.deviceEvents.get("dspAxSilentBytes"), 0);
+  assert.equal(context.dspFirstUnsupported, null);
+  assert.equal(
+    context.dspTrace.filter(
+      entry => entry.event === "ax-main-bus-write"
+    ).length,
+    3,
+  );
+  assert.equal(
+    context.dspTrace.some(entry => entry.event === "ax-voice-write"),
+    false,
+  );
+  assert.ok(
+    Object.values(context.dspAxCommandState).every(
+      value => !ArrayBuffer.isView(value) && !(value instanceof ArrayBuffer),
+    ),
+    "persistent Wario diagnostics must retain scalar evidence only",
+  );
+});
+
+test("WarioWare rejects forged write evidence and compressor drift atomically", () => {
+  const variants = [
+    {
+      name: "forged output hash",
+      reason: "invalid-main-bus-output-hash",
+      mutate(result) {
+        return {
+          ...result,
+          telemetry: {
+            ...result.telemetry,
+            outputHash: "0x00000000",
+          },
+        };
+      },
+    },
+    {
+      name: "forged transaction hash",
+      reason: "invalid-main-bus-transaction-hash",
+      mutate(result) {
+        return {
+          ...result,
+          telemetry: {
+            ...result.telemetry,
+            transactionHash: "0x00000000",
+          },
+        };
+      },
+    },
+    {
+      name: "forged upload payload",
+      reason: "invalid-main-bus-upload",
+      mutate(result) {
+        const upload = {
+          ...result.uploads[0],
+          data: new Uint8Array(1_920).fill(0xa5),
+        };
+        return {
+          ...result,
+          uploads: [upload],
+          writes: [upload, ...result.writes.slice(1)],
+          telemetry: {
+            ...result.telemetry,
+            transactionHash: fnv1a([
+              upload.data,
+              result.output.surround.bytes,
+              result.output.main.bytes,
+            ]),
+          },
+        };
+      },
+    },
+    {
+      name: "zero-compressor position drift",
+      reason: "invalid-main-bus-state",
+      mutate(result) {
+        return {
+          ...result,
+          compressorPosition: 1,
+          telemetry: {
+            ...result.telemetry,
+            compressorPositionAfter: 1,
+          },
+        };
+      },
+    },
+  ];
+
+  for (const variant of variants) {
+    const testFixture = warioFixture({
+      executeAxMainBusReference(input) {
+        const result = executeCanonicalAxMainBusReference(input);
+        assert.equal(result.ok, true);
+        return variant.mutate(result);
+      },
+    });
+    assert.equal(
+      executeList(testFixture.context, 0x0100, testFixture.words),
+      true,
+      variant.name,
+    );
+    assertWarioMainBusFallback(testFixture, {
+      reason: variant.reason,
+    });
+    assert.deepEqual(
+      testFixture.context.invalidations,
+      [[0x2000, 1_920], [0x4000, 640], [0x8000, 640]],
+      `${variant.name} must commit only the established silent fallback`,
+    );
+  }
+});
+
+test("WarioWare upload overlay feeds a later aliased main-bus read", () => {
+  const testFixture = warioFixture({
+    inputAddress: 0xc0002200,
+    surroundAddress: 0x40009000,
+  });
+  const {
+    aux,
+    context,
+    lrAddress,
+    surroundAddress,
+    uploadAddress,
+    words,
+  } = testFixture;
+  const expected = warioPostmixOutput(new Int32Array(160), aux);
+
+  assert.equal(executeList(context, 0x0100, words), true);
+  assert.ok(
+    ramBytes(context, uploadAddress, 3 * 160 * 4)
+      .every(value => value === 0),
+  );
+  assert.deepEqual(
+    ramBytes(context, surroundAddress, 160 * 4),
+    expected.surround,
+  );
+  assert.deepEqual(
+    ramBytes(context, lrAddress, 160 * 2 * 2),
+    expected.main,
+    "SET_OPPOSITE_LR must see the preceding zero UPLOAD_LRS overlay",
+  );
+  assert.deepEqual(
+    context.invalidations,
+    [[0x2000, 1_920], [0x9000, 640], [0x8000, 640]],
+  );
+  assert.equal(context.dspAxCommandState.mainBusRendered, true);
+  assert.equal(context.deviceEvents.get("dspAxMainBusRender"), 1);
+  assert.equal(context.dspFirstUnsupported, null);
+});
+
+test("WarioWare rejects a hidden voice callback before any model writes", () => {
+  const testFixture = warioFixture({
+    executeAxMainBusReference(input) {
+      try {
+        input.processMainBus(null);
+      } catch (_error) {
+        // A hostile wrapper can swallow the callback failure, but the runtime
+        // independently counts invocations against the parsed PROCESS plan.
+      }
+      return executeCanonicalAxMainBusReference(input);
+    },
+  });
+  assert.equal(
+    executeList(testFixture.context, 0x0100, testFixture.words),
+    true,
+  );
+  assert.equal(testFixture.calls.length, 1);
+  assertWarioMainBusFallback(testFixture, {
+    reason: "invalid-main-bus-process-count",
+    expectedCalls: 1,
+  });
+  assert.deepEqual(
+    testFixture.context.invalidations,
+    [[0x2000, 1_920], [0x4000, 640], [0x8000, 640]],
+  );
+});
+
+test("WarioWare uncertified topology and voice promotion fail before models", () => {
+  const reordered = warioFixture();
+  const reorderedCommands = [
+    0x0000, ...splitAddress(reordered.setupAddress),
+    0x0006, ...splitAddress(reordered.uploadAddress),
+    0x0009, ...splitAddress(reordered.auxAddress),
+    0x0011, ...splitAddress(reordered.inputAddress),
+    0x000e,
+    ...splitAddress(reordered.surroundAddress),
+    ...splitAddress(reordered.lrAddress),
+    0x000f,
+  ];
+  assert.equal(reorderedCommands.length, 18);
+  const reorderedWords = [...reorderedCommands, ...reordered.padding];
+  assert.equal(
+    executeList(reordered.context, 0x0100, reorderedWords),
+    true,
+  );
+  assertWarioMainBusFallback(reordered, {
+    reason: "uncertified-main-bus-only-sequence",
+  });
+
+  const promoted = warioFixture();
+  const parameterBlockAddress = 0x8000d000;
+  ramBytes(promoted.context, parameterBlockAddress, 244).fill(0xd4);
+  const promotedCommands = [
+    0x0000, ...splitAddress(promoted.setupAddress),
+    0x0006, ...splitAddress(promoted.uploadAddress),
+    0x0011, ...splitAddress(promoted.inputAddress),
+    0x0009, ...splitAddress(promoted.auxAddress),
+    0x0002, ...splitAddress(parameterBlockAddress),
+    0x0003,
+    0x000e,
+    ...splitAddress(promoted.surroundAddress),
+    ...splitAddress(promoted.lrAddress),
+    0x000f,
+  ];
+  assert.equal(promotedCommands.length, 22);
+  const promotedWords = [
+    ...promotedCommands,
+    ...Array(14).fill(0xffff),
+  ];
+  assert.equal(executeList(promoted.context, 0x0100, promotedWords), true);
+  assert.equal(promoted.calls.length, 0);
+  assert.equal(promoted.context.dspAxCommandState.voiceMode, "silent-fallback");
+  assert.equal(promoted.context.dspAxCommandState.voiceRendered, false);
+  assert.equal(promoted.context.dspAxCommandState.mainBusOnly, false);
+  assert.equal(
+    promoted.context.dspAxCommandState.voiceReason,
+    "uncertified-voice-ucode",
+  );
+  assert.ok(
+    ramBytes(promoted.context, parameterBlockAddress, 244)
+      .every(value => value === 0xd4),
+  );
+  assert.equal(promoted.context.dspAxCompressorPosition, 0);
+  assert.equal(promoted.context.deviceEvents.get("dspAxVoiceFallback"), 1);
+  assert.equal(
+    promoted.context.deviceEvents.get("dspAxMainBusFallback"),
+    undefined,
+  );
+  assert.equal(promoted.context.deviceEvents.get("dspAxSilentWrite"), 3);
+  assert.equal(promoted.context.deviceEvents.get("dspAxSilentBytes"), 3_200);
+  assert.equal(promoted.context.dspFirstUnsupported?.stage, "voice");
 });
 
 test("F-Zero SET_LR voice/compressor transaction commits exact aliased writes", () => {
@@ -657,18 +1239,72 @@ test("main-bus writes must be the exact fresh bytes certified by output", () => 
   }
 });
 
-test("overlapping main-bus output plan falls back as one transaction", () => {
+test("overlapping surround and R,L outputs commit in authority order", () => {
   const testFixture = fixture({
-    compressorPosition: 3,
     surroundAddress: 0x40006000,
     lrAddress: 0xc0006200,
   });
-  assert.equal(executeList(testFixture.context, 0x0100, testFixture.words), true);
-  assertAtomicFallback(testFixture, {
-    compressorPosition: 3,
-    reason: "overlapping-voice-writes",
-    expectedInvalidations: [[0x6000, 640], [0x6200, 640]],
+  const {
+    context,
+    parameterBlockAddress,
+    parameterBlockData,
+    samples,
+    words,
+  } = testFixture;
+  const expectedLr = expectedMainOutput(samples, 0x4000, 1_000, -1_000);
+  const expectedOverlap = new Uint8Array(640);
+  expectedOverlap.set(expectedLr.subarray(0, 128), 512);
+
+  assert.equal(executeList(context, 0x0100, words), true);
+  assert.deepEqual(
+    ramBytes(context, parameterBlockAddress, 244),
+    parameterBlockData,
+  );
+  assert.deepEqual(ramBytes(context, 0x6000, 640), expectedOverlap);
+  assert.deepEqual(ramBytes(context, 0x6200, 640), expectedLr);
+  assert.deepEqual(
+    context.invalidations,
+    [[0x2000, 244], [0x6000, 640], [0x6200, 640]],
+  );
+  assert.equal(context.dspAxCommandState.voiceMode, "rendered");
+  assert.equal(context.deviceEvents.get("dspAxMainBusRender"), 1);
+  assert.equal(context.dspFirstUnsupported, null);
+});
+
+test("WarioWare later output wins over an overlapping staged upload", () => {
+  const testFixture = warioFixture({
+    surroundAddress: 0x40002000,
   });
+  const {
+    aux,
+    context,
+    input,
+    lrAddress,
+    uploadAddress,
+    words,
+  } = testFixture;
+  const expected = warioPostmixOutput(input, aux);
+
+  assert.equal(executeList(context, 0x0100, words), true);
+  assert.deepEqual(
+    ramBytes(context, uploadAddress, 640),
+    expected.surround,
+  );
+  assert.ok(
+    ramBytes(context, uploadAddress + 640, 1_280)
+      .every(value => value === 0),
+  );
+  assert.deepEqual(
+    ramBytes(context, lrAddress, 640),
+    expected.main,
+  );
+  assert.deepEqual(
+    context.invalidations,
+    [[0x2000, 1_920], [0x2000, 640], [0x8000, 640]],
+  );
+  assert.equal(context.dspAxCommandState.voiceMode, "main-bus-only");
+  assert.equal(context.deviceEvents.get("dspAxMainBusRender"), 1);
+  assert.equal(context.dspFirstUnsupported, null);
 });
 
 test("selected compressor table OOB leaves the persistent scalar atomic", () => {
