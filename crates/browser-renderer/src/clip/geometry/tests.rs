@@ -50,6 +50,38 @@ fn vertex_slices(vertices: &[f32]) -> Vec<&[f32]> {
     vertices.chunks_exact(TEV_VERTEX_FLOATS).collect()
 }
 
+fn assert_geometry_bits_eq(
+    actual: &GxExactRasterGeometry,
+    expected: &GxExactRasterGeometry,
+    context: &str,
+) {
+    assert_eq!(
+        actual
+            .vertices()
+            .iter()
+            .copied()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        expected
+            .vertices()
+            .iter()
+            .copied()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        "{context}: vertex bits changed",
+    );
+    assert_eq!(
+        actual.source_indices(),
+        expected.source_indices(),
+        "{context}: source provenance changed",
+    );
+    assert_eq!(
+        actual.raster_scissor(),
+        expected.raster_scissor(),
+        "{context}: raster scissor changed",
+    );
+}
+
 #[test]
 fn partial_clip_composes_exact_fan_payload_and_source_provenance() {
     let source = source_vertices(3);
@@ -283,8 +315,10 @@ fn exact_state_activation_gates_reject_atomically() {
 
     let mut clip_disable = exact_state(0);
     clip_disable.xf_clip_disable = 1;
+    let mut unproved_clip_disable = clip;
+    unproved_clip_disable[0][0] = 2.0;
     assert_eq!(
-        gx_exact_raster_geometry(2, 0, &source, &clip, clip_disable),
+        gx_exact_raster_geometry(2, 0, &source, &unproved_clip_disable, clip_disable,),
         Err(GxExactGeometryError::Projection(
             GxExactProjectionError::UnsupportedClipDisable(1)
         ))
@@ -294,6 +328,106 @@ fn exact_state_activation_gates_reject_atomically() {
         gx_exact_raster_geometry(2, 1, &source, &clip, exact_state(0)),
         Err(GxExactGeometryError::CullModeStateMismatch)
     );
+}
+
+#[test]
+fn proven_clip_disable_noops_preserve_exact_geometry_bit_for_bit() {
+    let source = source_vertices(3);
+    let inside = [
+        [-0.5, -0.5, -0.5, 1.0],
+        [0.5, -0.5, -0.5, 1.0],
+        [-0.5, 0.5, -0.5, 1.0],
+    ];
+    let inside_reference =
+        gx_exact_raster_geometry(2, 0, &source, &inside, exact_state(0)).unwrap();
+    for value in 1..=7 {
+        let mut state = exact_state(0);
+        state.xf_clip_disable = value;
+        let actual = gx_exact_raster_geometry(2, 0, &source, &inside, state).unwrap();
+        assert_geometry_bits_eq(
+            &actual,
+            &inside_reference,
+            &format!("in-frustum mode {value} must be observationally inert"),
+        );
+    }
+
+    let crossing = [
+        [0.0, 0.0, -0.5, 1.0],
+        [2.0, 0.0, -0.5, 1.0],
+        [0.0, 1.0, -0.5, 1.0],
+    ];
+    let crossing_reference =
+        gx_exact_raster_geometry(2, 0, &source, &crossing, exact_state(0)).unwrap();
+    assert_eq!(crossing_reference.triangle_count(), 2);
+    let outside = [
+        [2.0, -0.5, -0.5, 1.0],
+        [2.0, 0.5, -0.5, 1.0],
+        [3.0, -0.5, -0.5, 1.0],
+    ];
+    let outside_reference =
+        gx_exact_raster_geometry(2, 0, &source, &outside, exact_state(0)).unwrap();
+    assert_eq!(outside_reference.triangle_count(), 0);
+    for value in [2, 4, 6] {
+        let mut state = exact_state(0);
+        state.xf_clip_disable = value;
+        let crossing_actual = gx_exact_raster_geometry(2, 0, &source, &crossing, state).unwrap();
+        assert_geometry_bits_eq(
+            &crossing_actual,
+            &crossing_reference,
+            &format!("clip-enabled mode {value} must retain the exact clip fan"),
+        );
+        let outside_actual = gx_exact_raster_geometry(2, 0, &source, &outside, state).unwrap();
+        assert_geometry_bits_eq(
+            &outside_actual,
+            &outside_reference,
+            &format!("clip-enabled mode {value} must retain the final empty result"),
+        );
+    }
+}
+
+#[test]
+fn clipping_detection_disable_requires_strict_positive_w_inside_endpoints() {
+    let source = source_vertices(3);
+    let base = [
+        [-0.5, -0.5, -0.5, 1.0],
+        [0.5, -0.5, -0.5, 1.0],
+        [-0.5, 0.5, -0.5, 1.0],
+    ];
+    let outside_endpoints = [
+        [2.0, 0.0, -0.5, 1.0],
+        [-2.0, 0.0, -0.5, 1.0],
+        [0.0, 2.0, -0.5, 1.0],
+        [0.0, -2.0, -0.5, 1.0],
+        [0.0, 0.0, 0.5, 1.0],
+        [0.0, 0.0, -2.0, 1.0],
+    ];
+    for value in [1, 3, 5, 7] {
+        let expected = Err(GxExactGeometryError::Projection(
+            GxExactProjectionError::UnsupportedClipDisable(value),
+        ));
+        for endpoint in outside_endpoints {
+            let mut clip = base;
+            clip[0] = endpoint;
+            let mut state = exact_state(0);
+            state.xf_clip_disable = value;
+            assert_eq!(
+                gx_exact_raster_geometry(2, 0, &source, &clip, state),
+                expected,
+                "mode {value} cannot bypass an unproved GX clip plane",
+            );
+        }
+        for w in [0.0, -0.0, -1.0] {
+            let mut clip = base;
+            clip[0][3] = w;
+            let mut state = exact_state(0);
+            state.xf_clip_disable = value;
+            assert_eq!(
+                gx_exact_raster_geometry(2, 0, &source, &clip, state),
+                expected,
+                "mode {value} cannot bypass an unproved W endpoint",
+            );
+        }
+    }
 }
 
 #[test]

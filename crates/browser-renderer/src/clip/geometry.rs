@@ -10,7 +10,8 @@ use std::fmt;
 
 use super::project::{GxExactProjectionError, GxExactProjectionState};
 use super::{
-    GxClipError, GxRasterClipVertex, gx_post_clip_raster_triangle, gx_source_triangle_indices,
+    GxClipError, GxRasterClipVertex, gx_clip_mask, gx_post_clip_raster_triangle,
+    gx_source_triangle_indices,
 };
 use crate::packet::{GxDraw, GxExactClipState};
 use crate::raster::gx_normalized_raster_channel_u8;
@@ -24,6 +25,8 @@ const GX_GEN_MODE_MULTISAMPLING: u32 = 1 << 9;
 const GX_GEN_MODE_CULL_SHIFT: u32 = 14;
 const GX_GEN_MODE_CULL_MASK: u32 = 3;
 const GX_GEN_MODE_Z_FREEZE: u32 = 1 << 19;
+const GX_XF_CLIP_DISABLE_DEFINED_MASK: u32 = 0b111;
+const GX_XF_DISABLE_CLIPPING_DETECTION: u32 = 1 << 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GxExactGeometryError {
@@ -330,7 +333,15 @@ fn gx_exact_raster_geometry(
     if state.bp_gen_mode & GX_GEN_MODE_Z_FREEZE != 0 {
         return Err(GxExactGeometryError::UnsupportedZFreeze);
     }
-    let projection = match GxExactProjectionState::qualify(state) {
+    let mut projection_state = state;
+    if gx_clip_disable_is_proven_noop(state.xf_clip_disable, clip_positions) {
+        // Qualification remains deliberately fail-closed for raw nonzero
+        // state. Clear the field only after this draw has supplied enough
+        // geometry evidence to prove that the enabled stages cannot change
+        // its observable result.
+        projection_state.xf_clip_disable = 0;
+    }
+    let projection = match GxExactProjectionState::qualify(projection_state) {
         Ok(projection) => projection,
         Err(GxExactProjectionError::NoVisibleScissor) => {
             return Ok(gx_exact_empty_geometry());
@@ -387,6 +398,26 @@ fn gx_exact_raster_geometry(
         source_indices: output_source_indices,
         raster_scissor: projection.raster_scissor(),
     })
+}
+
+fn gx_clip_disable_is_proven_noop(clip_disable: u32, clip_positions: &[[f32; 4]]) -> bool {
+    if clip_disable & !GX_XF_CLIP_DISABLE_DEFINED_MASK != 0 {
+        return false;
+    }
+    if clip_disable & GX_XF_DISABLE_CLIPPING_DETECTION == 0 {
+        // Bits 1 and 2 only suppress an early rejection and a clipping
+        // acceleration. With clipping still enabled (and Z-freeze rejected
+        // above), neither can change the final geometry in this exact subset.
+        return true;
+    }
+
+    // Disabling clipping detection is observationally inert only when every
+    // transported endpoint has positive W and is already on or inside every
+    // GX clip plane. In that case neither trivial rejection nor the polygon
+    // clip walk can alter any primitive, independent of bits 1 and 2.
+    clip_positions
+        .iter()
+        .all(|position| position[3] > 0.0 && matches!(gx_clip_mask(position), Ok(0)))
 }
 
 fn gx_exact_empty_geometry() -> GxExactRasterGeometry {
