@@ -31,6 +31,9 @@ import {
   projectFzeroGuestConsumption,
 } from "./browser_game_first_playable_fzero.mjs";
 import {
+  projectMetroidPrimeGuestConsumption,
+} from "./browser_game_first_playable_metroid_prime.mjs";
+import {
   projectWarioWareGuestConsumption,
 } from "./browser_game_first_playable_warioware.mjs";
 
@@ -45,6 +48,7 @@ function projectSupportedGuestConsumption(options) {
     ?? projectWindWakerGuestConsumption(options)
     ?? projectMeleeGuestConsumption(options)
     ?? projectFzeroGuestConsumption(options)
+    ?? projectMetroidPrimeGuestConsumption(options)
     ?? projectWarioWareGuestConsumption(options);
 }
 
