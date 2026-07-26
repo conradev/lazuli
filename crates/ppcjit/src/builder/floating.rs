@@ -14,6 +14,23 @@ const FLOAT_INFO: InstructionInfo = InstructionInfo {
 };
 
 impl BlockBuilder<'_> {
+    fn ps_set_sign(&mut self, value: ir::Value, negative: bool) -> ir::Value {
+        let bits = self
+            .bd
+            .ins()
+            .bitcast(ir::types::I64X2, ir::MemFlags::new(), value);
+        let sign = self.ir_value(0x8000_0000_0000_0000u64);
+        let sign = self.bd.ins().splat(ir::types::I64X2, sign);
+        let bits = if negative {
+            self.bd.ins().bor(bits, sign)
+        } else {
+            self.bd.ins().band_not(bits, sign)
+        };
+        self.bd
+            .ins()
+            .bitcast(ir::types::F64X2, ir::MemFlags::new(), bits)
+    }
+
     pub fn fmr(&mut self, ins: Ins) -> InstructionInfo {
         self.check_floats();
 
@@ -213,6 +230,34 @@ impl BlockBuilder<'_> {
 
         let fpr_b = self.get(ins.fpr_b());
         self.set(ins.fpr_d(), fpr_b);
+
+        FLOAT_INFO
+    }
+
+    pub fn ps_abs(&mut self, ins: Ins) -> InstructionInfo {
+        self.check_floats();
+
+        let fpr_b = self.get(ins.fpr_b());
+        let value = self.ps_set_sign(fpr_b, false);
+        self.set(ins.fpr_d(), value);
+
+        if ins.field_rc() {
+            self.update_cr1_float();
+        }
+
+        FLOAT_INFO
+    }
+
+    pub fn ps_nabs(&mut self, ins: Ins) -> InstructionInfo {
+        self.check_floats();
+
+        let fpr_b = self.get(ins.fpr_b());
+        let value = self.ps_set_sign(fpr_b, true);
+        self.set(ins.fpr_d(), value);
+
+        if ins.field_rc() {
+            self.update_cr1_float();
+        }
 
         FLOAT_INFO
     }

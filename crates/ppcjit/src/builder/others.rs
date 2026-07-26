@@ -252,6 +252,25 @@ impl BlockBuilder<'_> {
         CR_INFO
     }
 
+    pub fn mtfsfi(&mut self, ins: Ins) -> InstructionInfo {
+        self.check_floats();
+
+        let shift = 28 - 4 * u32::from(ins.field_crfd());
+        let mask = self.ir_value(0xfu32 << shift);
+        let immediate = self.ir_value(u32::from(ins.field_mtfsf_imm()) << shift);
+        let fpscr = self.get(Reg::FPSCR);
+        let value = self.bd.ins().bitselect(mask, immediate, fpscr);
+        self.set(Reg::FPSCR, value);
+
+        self.update_fpscr();
+
+        if ins.field_rc() {
+            self.update_cr1_float();
+        }
+
+        CR_INFO
+    }
+
     pub fn mftb(&mut self, ins: Ins) -> InstructionInfo {
         self.call_generic_hook(self.hooks.tb_read);
 

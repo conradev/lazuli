@@ -2,7 +2,7 @@ use std::alloc::Layout;
 
 use cranelift_codegen::isa;
 use gekko::disasm::{Extensions, Ins, Opcode};
-use gekko::{Address, Cpu, Exception, ProgramExceptionCause};
+use gekko::{Address, CondReg, Cpu, Exception, FloatControlReg, FloatPair, ProgramExceptionCause};
 
 use crate::block::{BlockFn, Executed, ExitReason, Meta};
 use crate::hooks::{Context, ExitData, Hooks};
@@ -381,4 +381,138 @@ fn native_trap_word_preserves_the_taken_instruction_boundary() {
     );
     assert_eq!(context.exit_executed.instructions, 2);
     assert_eq!(context.exit_executed.cycles, 4);
+}
+
+fn ps_abs(fd: u8, fb: u8, record: bool) -> Ins {
+    Ins::new(
+        0x1000_0210 | u32::from(fd) << 21 | u32::from(fb) << 11 | u32::from(record),
+        Extensions::gekko_broadway(),
+    )
+}
+
+fn ps_nabs(fd: u8, fb: u8, record: bool) -> Ins {
+    Ins::new(
+        0x1000_0110 | u32::from(fd) << 21 | u32::from(fb) << 11 | u32::from(record),
+        Extensions::gekko_broadway(),
+    )
+}
+
+fn mtfsfi(field: u8, immediate: u8, record: bool) -> Ins {
+    Ins::new(
+        0xfc00_010c
+            | u32::from(field & 7) << 23
+            | u32::from(immediate & 0xf) << 12
+            | u32::from(record),
+        Extensions::gekko_broadway(),
+    )
+}
+
+#[test]
+fn native_paired_sign_moves_and_mtfsfi_preserve_exact_state() {
+    let moves = [ps_abs(3, 1, false), ps_nabs(4, 2, true)];
+    assert_eq!(moves[0].op, Opcode::PsAbs);
+    assert_eq!(moves[1].op, Opcode::PsNabs);
+    let controls = [mtfsfi(3, 8, false), mtfsfi(7, 5, true)];
+    assert_eq!(controls[0].op, Opcode::Mtfsfi);
+    assert_eq!(controls[1].op, Opcode::Mtfsfi);
+    let disabled = [mtfsfi(3, 8, true)];
+
+    let mut hooks = unsafe { Hooks::stub() };
+    hooks.get_registers = native_program_exception_registers;
+    hooks.get_fastmem = native_program_exception_fastmem;
+    hooks.exit = native_program_exception_exit;
+    let mut jit = Jit::new(
+        Settings {
+            codegen: CodegenSettings::default(),
+            cache_path: None,
+            exit_data_layout: Layout::new::<u8>(),
+        },
+        hooks,
+    );
+    let moves = jit.build(moves.into_iter()).unwrap();
+    let controls = jit.build(controls.into_iter()).unwrap();
+    let disabled = jit.build(disabled.into_iter()).unwrap();
+    let initial_pc = 0x8000_4000;
+    let initial_cr = 0xa5ff_ffff;
+    let mut context = NativeProgramExceptionContext {
+        cpu: Cpu::default(),
+        fastmem: Box::new([None; FASTMEM_LUT_COUNT]),
+        exit_srr1: 0,
+        exit_executed: Executed::default(),
+    };
+
+    context.cpu.pc = Address(initial_pc);
+    context.cpu.supervisor.config.msr = context
+        .cpu
+        .supervisor
+        .config
+        .msr
+        .clone()
+        .with_float_available(true);
+    context.cpu.user.fpr[1] = FloatPair([
+        f64::from_bits(0x8000_0000_0000_0000),
+        f64::from_bits(0xfff8_1234_5678_9abc),
+    ]);
+    context.cpu.user.fpr[2] = FloatPair([
+        f64::from_bits(0x7ff0_0000_0000_0000),
+        f64::from_bits(0x7ff8_dead_beef_0042),
+    ]);
+    context.cpu.user.fpscr = FloatControlReg::from_bits(0x9000_0000);
+    context.cpu.user.cr = CondReg::from_bits(initial_cr);
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), moves.as_ptr());
+    }
+    assert_eq!(
+        context.cpu.user.fpr[3].map(f64::to_bits),
+        [0x0000_0000_0000_0000, 0x7ff8_1234_5678_9abc]
+    );
+    assert_eq!(
+        context.cpu.user.fpr[4].map(f64::to_bits),
+        [0xfff0_0000_0000_0000, 0xfff8_dead_beef_0042]
+    );
+    assert_eq!(context.cpu.user.fpscr.to_bits(), 0x9000_0000);
+    assert_eq!(context.cpu.user.cr.to_bits(), 0xa9ff_ffff);
+    assert_eq!(context.cpu.pc, Address(initial_pc + 8));
+    assert_eq!(context.exit_executed.instructions, 2);
+    assert_eq!(context.exit_executed.cycles, 4);
+
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.supervisor.config.msr = context
+        .cpu
+        .supervisor
+        .config
+        .msr
+        .clone()
+        .with_float_available(true);
+    context.cpu.user.fpscr = FloatControlReg::from_bits(0x8000_0080);
+    context.cpu.user.cr = CondReg::from_bits(initial_cr);
+    context.exit_executed = Executed::default();
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), controls.as_ptr());
+    }
+    assert_eq!(context.cpu.user.fpscr.to_bits(), 0xe008_0085);
+    assert_eq!(context.cpu.user.cr.to_bits(), 0xaeff_ffff);
+    assert_eq!(context.cpu.pc, Address(initial_pc + 8));
+    assert_eq!(context.exit_executed.instructions, 2);
+    assert_eq!(context.exit_executed.cycles, 2);
+
+    context.cpu = Cpu {
+        pc: Address(initial_pc),
+        ..Cpu::default()
+    };
+    context.cpu.user.fpscr = FloatControlReg::from_bits(0x1234_5678);
+    context.cpu.user.cr = CondReg::from_bits(initial_cr);
+    context.exit_executed = Executed::default();
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), disabled.as_ptr());
+    }
+    assert_eq!(context.cpu.pc, Address(0xfff0_0800));
+    assert_eq!(context.cpu.supervisor.exception.srr[0], initial_pc);
+    assert_eq!(context.cpu.user.fpscr.to_bits(), 0x1234_5678);
+    assert_eq!(context.cpu.user.cr.to_bits(), initial_cr);
+    assert_eq!(context.exit_executed.instructions, 1);
+    assert_eq!(context.exit_executed.cycles, 2);
 }

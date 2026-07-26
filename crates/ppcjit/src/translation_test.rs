@@ -185,6 +185,23 @@ fn twi(to: u8, ra: u8, immediate: i16) -> Ins {
     )
 }
 
+fn ps_abs(fd: u8, fb: u8, record: bool) -> Ins {
+    instruction(0x1000_0210 | u32::from(fd) << 21 | u32::from(fb) << 11 | u32::from(record))
+}
+
+fn ps_nabs(fd: u8, fb: u8, record: bool) -> Ins {
+    instruction(0x1000_0110 | u32::from(fd) << 21 | u32::from(fb) << 11 | u32::from(record))
+}
+
+fn mtfsfi(field: u8, immediate: u8, record: bool) -> Ins {
+    instruction(
+        0xfc00_010c
+            | u32::from(field & 7) << 23
+            | u32::from(immediate & 0xf) << 12
+            | u32::from(record),
+    )
+}
+
 fn tlbie(rb: u8) -> Ins {
     instruction(0x7c00_0264 | u32::from(rb) << 11)
 }
@@ -605,6 +622,273 @@ await execute("twi_eq_min", 0x00008000, 0, false, "twi minimum mismatch");
         &SPR::SRR1.offset().to_string(),
         &(Exception::Program as u16).to_string(),
         &ProgramExceptionCause::Trap.srr1_bits().to_string(),
+    ]);
+    command.args(&modules);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_paired_sign_moves_and_mtfsfi_preserve_exact_bits() {
+    let instructions = [
+        ("ps_abs_rc0", ps_abs(2, 1, false), 2u16),
+        ("ps_abs_rc1", ps_abs(2, 1, true), 2),
+        ("ps_nabs_rc0", ps_nabs(2, 1, false), 2),
+        ("ps_nabs_rc1", ps_nabs(2, 1, true), 2),
+        ("mtfs_bf0_rc0", mtfsfi(0, 0xf, false), 1),
+        ("mtfs_bf3_rc1", mtfsfi(3, 0x8, true), 1),
+        ("mtfs_bf6_rc0", mtfsfi(6, 0x4, false), 1),
+        ("mtfs_bf7_rc1", mtfsfi(7, 0x5, true), 1),
+    ];
+    let modules = instructions
+        .into_iter()
+        .map(|(name, instruction, cycles)| {
+            assert!(
+                matches!(
+                    instruction.op,
+                    GuestOpcode::PsAbs | GuestOpcode::PsNabs | GuestOpcode::Mtfsfi
+                ),
+                "{name} decoded as {:?}",
+                instruction.op
+            );
+            let translated = translate_with_cycle_publication([instruction]);
+            assert_eq!(translated.sequence.0, [instruction]);
+            assert_eq!(translated.cycles, cycles);
+            assert_eq!(translated.exit, TranslationExit::Fallthrough);
+            assert_eq!(
+                hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET),
+                [(1, 0, 0)]
+            );
+
+            let wasm = lower_portable(&translated.function)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("{name}:{wasm}")
+        })
+        .collect::<Vec<_>>();
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let script = r#"
+const [
+  cycleOffsetText,
+  pcOffsetText,
+  msrOffsetText,
+  crOffsetText,
+  fpscrOffsetText,
+  f1OffsetText,
+  f2OffsetText,
+  srr0OffsetText,
+  floatUnavailableText,
+  ...moduleSpecs
+] = process.argv.slice(1);
+const [
+  cycleOffset,
+  pcOffset,
+  msrOffset,
+  crOffset,
+  fpscrOffset,
+  f1Offset,
+  f2Offset,
+  srr0Offset,
+  floatUnavailable,
+] = [
+  cycleOffsetText,
+  pcOffsetText,
+  msrOffsetText,
+  crOffsetText,
+  fpscrOffsetText,
+  f1OffsetText,
+  f2OffsetText,
+  srr0OffsetText,
+  floatUnavailableText,
+].map(Number);
+const modules = new Map(moduleSpecs.map((spec) => {
+  const separator = spec.indexOf(":");
+  return [spec.slice(0, separator), spec.slice(separator + 1)];
+}));
+
+const context = 32;
+const cpu = 128;
+const initialPc = 0x80005000;
+const initialCr = 0xa5ffffff;
+const floatAvailable = 1 << 13;
+const cr1Mask = 0x0f000000;
+const derivedMask = 0x60000000;
+
+function normalizeFpscr(raw) {
+  let value = raw >>> 0;
+  const invalid = value & 0x01f80700;
+  value = invalid !== 0 ? (value | 0x20000000) >>> 0 : (value & ~0x20000000) >>> 0;
+  const exceptions = value >>> 22;
+  const enables = value & 0x000000f8;
+  value = (exceptions & enables) !== 0
+    ? (value | 0x40000000) >>> 0
+    : (value & ~0x40000000) >>> 0;
+  return value;
+}
+
+function expectedCr1(cr, fpscr) {
+  return ((cr & ~cr1Mask) | ((fpscr >>> 4) & cr1Mask)) >>> 0;
+}
+
+async function instantiate(name, setup, hook) {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const view = new DataView(memory.buffer);
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  setup(view);
+  const hex = modules.get(name);
+  if (hex === undefined) throw new Error(`missing module ${name}`);
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: { user_1_0: hook ?? (() => {
+      throw new Error(`${name} raised an unexpected floating-point exception`);
+    }) },
+  });
+  const executed = instance.exports.run(context, cpu, 0) >>> 0;
+  return { view, executed };
+}
+
+async function executeSignMove(name, input, expected, record) {
+  const initialFpscr = 0x90000000;
+  const { view, executed } = await instantiate(name, (view) => {
+    view.setUint32(cpu + msrOffset, floatAvailable, true);
+    view.setUint32(cpu + crOffset, initialCr, true);
+    view.setUint32(cpu + fpscrOffset, initialFpscr, true);
+    view.setBigUint64(cpu + f1Offset, input[0], true);
+    view.setBigUint64(cpu + f1Offset + 8, input[1], true);
+  });
+  if (executed !== 0x00020001) {
+    throw new Error(`${name} returned 0x${executed.toString(16)}`);
+  }
+  const actual = [
+    view.getBigUint64(cpu + f2Offset, true),
+    view.getBigUint64(cpu + f2Offset + 8, true),
+  ];
+  if (actual[0] !== expected[0] || actual[1] !== expected[1]) {
+    throw new Error(`${name} produced ${actual.map((bits) => bits.toString(16)).join(",")}`);
+  }
+  if (view.getUint32(cpu + fpscrOffset, true) !== initialFpscr) {
+    throw new Error(`${name} changed FPSCR`);
+  }
+  const expectedCr = record ? expectedCr1(initialCr, initialFpscr) : initialCr;
+  if (view.getUint32(cpu + crOffset, true) !== expectedCr) {
+    throw new Error(`${name} produced CR 0x${view.getUint32(cpu + crOffset, true).toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 4) {
+    throw new Error(`${name} did not advance PC once`);
+  }
+}
+
+const negativeZeroAndNan = [0x8000000000000000n, 0xfff8123456789abcn];
+const absoluteZeroAndNan = [0x0000000000000000n, 0x7ff8123456789abcn];
+const positiveInfinityAndNan = [0x7ff0000000000000n, 0x7ff8deadbeef0042n];
+const negativeInfinityAndNan = [0xfff0000000000000n, 0xfff8deadbeef0042n];
+await executeSignMove("ps_abs_rc0", negativeZeroAndNan, absoluteZeroAndNan, false);
+await executeSignMove("ps_abs_rc1", negativeZeroAndNan, absoluteZeroAndNan, true);
+await executeSignMove("ps_nabs_rc0", positiveInfinityAndNan, negativeInfinityAndNan, false);
+await executeSignMove("ps_nabs_rc1", positiveInfinityAndNan, negativeInfinityAndNan, true);
+
+async function executeMtfs(name, bf, immediate, record, initialFpscr) {
+  const { view, executed } = await instantiate(name, (view) => {
+    view.setUint32(cpu + msrOffset, floatAvailable, true);
+    view.setUint32(cpu + crOffset, initialCr, true);
+    view.setUint32(cpu + fpscrOffset, initialFpscr, true);
+  });
+  if (executed !== 0x00010001) {
+    throw new Error(`${name} returned 0x${executed.toString(16)}`);
+  }
+  const shift = 28 - 4 * bf;
+  const selectedMask = (0xf << shift) >>> 0;
+  const direct = ((initialFpscr & ~selectedMask) | ((immediate << shift) & selectedMask)) >>> 0;
+  const expected = normalizeFpscr(direct);
+  const actual = view.getUint32(cpu + fpscrOffset, true);
+  if (actual !== expected) {
+    throw new Error(`${name} produced FPSCR 0x${actual.toString(16)}, expected 0x${expected.toString(16)}`);
+  }
+  const preservedMask = ~(selectedMask | derivedMask) >>> 0;
+  if ((actual & preservedMask) !== (initialFpscr & preservedMask)) {
+    throw new Error(`${name} changed a non-selected, non-derived FPSCR bit`);
+  }
+  const selectedNonDerived = selectedMask & ~derivedMask;
+  if ((actual & selectedNonDerived) !== (direct & selectedNonDerived)) {
+    throw new Error(`${name} did not replace the selected FPSCR nibble`);
+  }
+  if ((actual & derivedMask) !== (expected & derivedMask)) {
+    throw new Error(`${name} did not normalize VX/FEX`);
+  }
+  const expectedCr = record ? expectedCr1(initialCr, expected) : initialCr;
+  if (view.getUint32(cpu + crOffset, true) !== expectedCr) {
+    throw new Error(`${name} produced CR 0x${view.getUint32(cpu + crOffset, true).toString(16)}`);
+  }
+}
+
+await executeMtfs("mtfs_bf0_rc0", 0, 0xf, false, 0x00010004);
+await executeMtfs("mtfs_bf3_rc1", 3, 0x8, true, 0x80000080);
+await executeMtfs("mtfs_bf6_rc0", 6, 0x4, false, 0x10000000);
+await executeMtfs("mtfs_bf7_rc1", 7, 0x5, true, 0x81a50780);
+
+const disabledFpscr = 0x12345678;
+const disabledCr = 0xa5ffffff;
+const disabledEvents = [];
+let disabledView;
+const disabled = await instantiate("mtfs_bf3_rc1", (view) => {
+  disabledView = view;
+  view.setUint32(cpu + msrOffset, 0, true);
+  view.setUint32(cpu + crOffset, disabledCr, true);
+  view.setUint32(cpu + fpscrOffset, disabledFpscr, true);
+  view.setUint32(cpu + srr0Offset, 0, true);
+}, (registers, exception) => {
+  const view = disabledView;
+  const faultPc = view.getUint32(registers + pcOffset, true);
+  disabledEvents.push([
+    view.getUint32(context + cycleOffset, true),
+    registers,
+    exception,
+    faultPc,
+  ]);
+  view.setUint32(registers + srr0Offset, faultPc, true);
+  view.setUint32(registers + pcOffset, 0xfff00800, true);
+});
+if (disabled.executed !== 0x00020001) {
+  throw new Error(`disabled mtfsfi returned 0x${disabled.executed.toString(16)}`);
+}
+const expectedDisabledEvents = [[0, cpu, floatUnavailable, initialPc]];
+if (JSON.stringify(disabledEvents) !== JSON.stringify(expectedDisabledEvents)) {
+  throw new Error(`disabled mtfsfi observed ${JSON.stringify(disabledEvents)}`);
+}
+if (disabledView.getUint32(cpu + pcOffset, true) !== 0xfff00800
+    || disabledView.getUint32(cpu + srr0Offset, true) !== initialPc) {
+  throw new Error("disabled mtfsfi lost its exception boundary");
+}
+if (disabledView.getUint32(cpu + fpscrOffset, true) !== disabledFpscr
+    || disabledView.getUint32(cpu + crOffset, true) !== disabledCr) {
+  throw new Error("disabled mtfsfi changed floating-point state");
+}
+"#;
+    let mut command = Command::new("node");
+    command.args([
+        "--input-type=module",
+        "--eval",
+        script,
+        &TEST_HOOK_CYCLE_OFFSET.to_string(),
+        &Reg::PC.offset().to_string(),
+        &Reg::MSR.offset().to_string(),
+        &Reg::CR.offset().to_string(),
+        &Reg::FPSCR.offset().to_string(),
+        &FPR::R1.offset().to_string(),
+        &FPR::R2.offset().to_string(),
+        &SPR::SRR0.offset().to_string(),
+        &(Exception::FloatUnavailable as u16).to_string(),
     ]);
     command.args(&modules);
     let output = command.output().unwrap();
