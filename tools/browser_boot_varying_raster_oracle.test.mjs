@@ -213,6 +213,55 @@ test("exact clip positions project back to the three source screen points", () =
   );
 });
 
+test("varying-raster packets can isolate every defined XF clip-disable mode", () => {
+  const exact = varyingRasterPacketLayout.exactChunkOffset;
+  const canonical = buildVaryingRasterOraclePacket(
+    "raster0",
+    VARYING_RASTER_HASH_GENERATION,
+  );
+  for (let xfClipDisable = 0; xfClipDisable <= 7; xfClipDisable += 1) {
+    const packet = buildVaryingRasterOraclePacket(
+      "raster0",
+      VARYING_RASTER_HASH_GENERATION,
+      { xfClipDisable },
+    );
+    assert.equal(
+      view(packet).getUint32(exact + 0x14, true),
+      xfClipDisable,
+    );
+    const restored = packet.slice();
+    view(restored).setUint32(
+      exact + 0x14,
+      varyingRasterExactState.xfClipDisable,
+      true,
+    );
+    assert.deepEqual(
+      restored,
+      canonical,
+      `mode ${xfClipDisable} changes only XF 0x1005`,
+    );
+  }
+  assert.deepEqual(
+    buildVaryingRasterOraclePacket(
+      "raster0",
+      VARYING_RASTER_HASH_GENERATION,
+      {},
+    ),
+    canonical,
+  );
+  for (const xfClipDisable of [-1, 8, 1.5, NaN]) {
+    assert.throws(
+      () =>
+        buildVaryingRasterOraclePacket(
+          "raster0",
+          VARYING_RASTER_HASH_GENERATION,
+          { xfClipDisable },
+        ),
+      /xfClipDisable must be an integer from 0 through 7/,
+    );
+  }
+});
+
 test("both GX raster channels and the soft-f32 byte boundary are pixel exact", () => {
   assert.deepEqual(varyingRasterOracleXfb, {
     destination: 0x00110000,
