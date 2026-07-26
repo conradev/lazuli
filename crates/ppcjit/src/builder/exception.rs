@@ -2,7 +2,7 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_codegen::isa::CallConv;
 use gekko::disasm::Ins;
-use gekko::{Exception, Reg, SPR};
+use gekko::{Exception, ProgramExceptionCause, Reg, SPR};
 
 use super::BlockBuilder;
 use crate::builder::{Action, InstructionInfo};
@@ -45,6 +45,21 @@ impl BlockBuilder<'_> {
             self.hooks.raise_exception,
             &[self.consts.regs_ptr, exception],
         );
+    }
+
+    /// Raises a Program exception, then records its cause in the SRR1 value produced by the
+    /// exception hook.
+    pub fn raise_program_exception(&mut self, cause: ProgramExceptionCause) {
+        self.raise_exception(Exception::Program);
+
+        let srr1 = self.load_reg(Reg::from(SPR::SRR1));
+        let srr1 = self.bd.ins().bor_imm(srr1, cause.srr1_bits() as i64);
+        self.store_reg(Reg::from(SPR::SRR1), srr1);
+    }
+
+    pub fn illegal(&mut self, _: Ins) -> InstructionInfo {
+        self.raise_program_exception(ProgramExceptionCause::IllegalInstruction);
+        EXCEPTION_INFO
     }
 
     /// Checks whether floating point operations are enabled in MSR and raises an exception if not.

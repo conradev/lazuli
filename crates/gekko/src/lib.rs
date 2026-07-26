@@ -451,8 +451,29 @@ pub enum Exception {
     Breakpoint         = 0x1300,
 }
 
+/// The reason a [`Exception::Program`] exception was raised, as recorded in SRR1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ProgramExceptionCause {
+    FloatingPoint      = 0x0010_0000,
+    IllegalInstruction = 0x0008_0000,
+    PrivilegedInstruction = 0x0004_0000,
+    Trap               = 0x0002_0000,
+}
+
+impl ProgramExceptionCause {
+    /// All Program-exception cause bits in SRR1.
+    pub const SRR1_MASK: u32 = 0x001e_0000;
+
+    /// Returns the exception-specific SRR1 bits for this cause.
+    #[inline(always)]
+    pub const fn srr1_bits(self) -> u32 {
+        self as u32
+    }
+}
+
 impl Exception {
-    #[rustfmt::skip]    pub const SPECIAL_SRR1_BITS_MASK: u32 = 0b0111_1000_0011_1100_0000_0000_0000_0000_u32;
+    #[rustfmt::skip]    pub const SPECIAL_SRR1_BITS_MASK: u32 = 0b0111_1000_0011_1110_0000_0000_0000_0000_u32;
     #[rustfmt::skip]    pub const MSR_TO_SRR1_MASK:       u32 = 0b0000_0111_1100_0000_1111_1111_1111_1111_u32;
     #[rustfmt::skip]    pub const SRR1_TO_MSR_MASK:       u32 = 0b1000_0111_1100_0000_1111_1111_0111_0011_u32;
 
@@ -1214,6 +1235,12 @@ impl Cpu {
 
         self.pc = Address(base | exception as u32);
     }
+
+    /// Takes a Program exception and records its architectural cause in SRR1.
+    pub fn raise_program_exception(&mut self, cause: ProgramExceptionCause) {
+        self.raise_exception(Exception::Program);
+        self.supervisor.exception.srr[1] |= cause.srr1_bits();
+    }
 }
 
 /// A General Purpose Register.
@@ -1619,7 +1646,7 @@ impl From<SPR> for Reg {
 
 #[cfg(test)]
 mod tests {
-    use super::{Address, Cpu, Exception, LoadStoreReservation};
+    use super::{Address, Cpu, Exception, LoadStoreReservation, ProgramExceptionCause};
 
     #[test]
     fn load_store_reservation_tracks_a_physical_cache_line() {
@@ -1684,5 +1711,51 @@ mod tests {
             Cpu::reservation_valid_offset(),
             Cpu::reservation_physical_offset() + std::mem::size_of::<Address>()
         );
+    }
+
+    #[test]
+    fn program_exception_causes_are_the_architectural_srr1_bits() {
+        assert_eq!(
+            ProgramExceptionCause::FloatingPoint.srr1_bits(),
+            0x0010_0000
+        );
+        assert_eq!(
+            ProgramExceptionCause::IllegalInstruction.srr1_bits(),
+            0x0008_0000
+        );
+        assert_eq!(
+            ProgramExceptionCause::PrivilegedInstruction.srr1_bits(),
+            0x0004_0000
+        );
+        assert_eq!(ProgramExceptionCause::Trap.srr1_bits(), 0x0002_0000);
+        assert_eq!(
+            Exception::SPECIAL_SRR1_BITS_MASK & ProgramExceptionCause::SRR1_MASK,
+            ProgramExceptionCause::SRR1_MASK
+        );
+    }
+
+    #[test]
+    fn program_exception_preserves_exactly_the_selected_cause() {
+        for cause in [
+            ProgramExceptionCause::FloatingPoint,
+            ProgramExceptionCause::IllegalInstruction,
+            ProgramExceptionCause::PrivilegedInstruction,
+            ProgramExceptionCause::Trap,
+        ] {
+            let mut cpu = Cpu {
+                pc: Address(0x8000_1234),
+                ..Cpu::default()
+            };
+            cpu.supervisor.exception.srr[1] = Exception::SPECIAL_SRR1_BITS_MASK;
+
+            cpu.raise_program_exception(cause);
+
+            assert_eq!(cpu.pc, Address(0xfff0_0700));
+            assert_eq!(cpu.supervisor.exception.srr[0], 0x8000_1234);
+            assert_eq!(
+                cpu.supervisor.exception.srr[1] & ProgramExceptionCause::SRR1_MASK,
+                cause.srr1_bits()
+            );
+        }
     }
 }

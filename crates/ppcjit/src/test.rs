@@ -1,10 +1,12 @@
 use std::alloc::Layout;
 
 use cranelift_codegen::isa;
+use gekko::disasm::{Extensions, Ins, Opcode};
+use gekko::{Address, Cpu, Exception, ProgramExceptionCause};
 
-use crate::block::Meta;
-use crate::hooks::Hooks;
-use crate::{Artifact, CodegenSettings, Jit, Sequence, Settings};
+use crate::block::{BlockFn, Executed, ExitReason, Meta};
+use crate::hooks::{Context, ExitData, Hooks};
+use crate::{Artifact, CodegenSettings, FASTMEM_LUT_COUNT, FastmemLut, Jit, Sequence, Settings};
 
 macro_rules! ppc {
     ($($mnemonic:ident $($arg:expr)*);* $(;)?) => {
@@ -212,4 +214,73 @@ fn gu_mtx_identity() {
             psq_st fpr(3) off(40) gpr(3) u(0) u(0);
         },
     );
+}
+
+struct NativeProgramExceptionContext {
+    cpu: Cpu,
+    fastmem: Box<FastmemLut>,
+    exit_srr1: u32,
+}
+
+extern "C-unwind" fn native_program_exception_registers(ctx: *mut Context) -> *mut Cpu {
+    let ctx = unsafe { &mut *ctx.cast::<NativeProgramExceptionContext>() };
+    &raw mut ctx.cpu
+}
+
+extern "C-unwind" fn native_program_exception_fastmem(ctx: *mut Context) -> *mut FastmemLut {
+    let ctx = unsafe { &mut *ctx.cast::<NativeProgramExceptionContext>() };
+    &raw mut *ctx.fastmem
+}
+
+extern "C-unwind" fn native_program_exception_exit(
+    ctx: *const Context,
+    _: *mut ExitData,
+    _: ExitReason,
+    _: Executed,
+) -> Option<BlockFn> {
+    let ctx = unsafe { &mut *ctx.cast_mut().cast::<NativeProgramExceptionContext>() };
+    ctx.exit_srr1 = ctx.cpu.supervisor.exception.srr[1];
+    None
+}
+
+#[test]
+fn native_illegal_instruction_records_the_program_cause_before_exit() {
+    let illegal = Ins::new(0, Extensions::gekko_broadway());
+    assert_eq!(illegal.op, Opcode::Illegal);
+
+    let mut hooks = unsafe { Hooks::stub() };
+    hooks.get_registers = native_program_exception_registers;
+    hooks.get_fastmem = native_program_exception_fastmem;
+    hooks.exit = native_program_exception_exit;
+
+    let mut jit = Jit::new(
+        Settings {
+            codegen: CodegenSettings::default(),
+            cache_path: None,
+            exit_data_layout: Layout::new::<u8>(),
+        },
+        hooks,
+    );
+    let block = jit.build([illegal].into_iter()).unwrap();
+    let mut context = NativeProgramExceptionContext {
+        cpu: Cpu {
+            pc: Address(0x8000_1234),
+            ..Cpu::default()
+        },
+        fastmem: Box::new([None; FASTMEM_LUT_COUNT]),
+        exit_srr1: 0,
+    };
+    context.cpu.supervisor.exception.srr[1] = Exception::SPECIAL_SRR1_BITS_MASK;
+
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), block.as_ptr());
+    }
+
+    assert_eq!(context.cpu.pc, Address(0xfff0_0700));
+    assert_eq!(context.cpu.supervisor.exception.srr[0], 0x8000_1234);
+    assert_eq!(
+        context.exit_srr1 & Exception::SPECIAL_SRR1_BITS_MASK,
+        ProgramExceptionCause::IllegalInstruction.srr1_bits()
+    );
+    assert_eq!(context.exit_srr1, context.cpu.supervisor.exception.srr[1]);
 }

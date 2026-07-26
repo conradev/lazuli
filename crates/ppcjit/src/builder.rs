@@ -78,8 +78,6 @@ fn is_cacheable(reg: Reg) -> bool {
 
 #[derive(Debug, Error)]
 pub enum BuilderError {
-    #[error("illegal instruction {f0:?}")]
-    Illegal(Ins),
     #[error("unimplemented instruction {f0:?}")]
     Unimplemented(Ins),
     #[error("hook cycle publication requires a portable exit mode")]
@@ -826,13 +824,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Xor => self.xor(ins),
             Opcode::Xori => self.xori(ins),
             Opcode::Xoris => self.xoris(ins),
-            Opcode::Illegal => {
-                if self.frontend.settings.ignore_unimplemented {
-                    self.stub(ins)
-                } else {
-                    return Err(BuilderError::Illegal(ins));
-                }
-            }
+            Opcode::Illegal => self.illegal(ins),
             _ => {
                 if self.frontend.settings.ignore_unimplemented {
                     self.stub(ins)

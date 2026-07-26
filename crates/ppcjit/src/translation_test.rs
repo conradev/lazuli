@@ -5,7 +5,7 @@ use cranelift_codegen::ir::{self, Endianness, ExternalName, InstructionData, Opc
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::{settings, verify_function};
 use gekko::disasm::{Extensions, Ins, Opcode as GuestOpcode};
-use gekko::{Exception, FPR, GPR, Reg, SPR};
+use gekko::{Exception, FPR, GPR, ProgramExceptionCause, Reg, SPR};
 
 use crate::builder::BuilderError;
 use crate::hooks::HookKind;
@@ -285,6 +285,107 @@ fn portable_fastmem_uses_configured_pointer_width() {
     let clif = translated.function.display().to_string();
     assert!(!clif.contains(" call "));
     assert!(!clif.contains("brif"));
+}
+
+#[test]
+fn illegal_instruction_raises_program_after_the_portable_exception_hook() {
+    let illegal = instruction(0);
+    assert_eq!(illegal.op, GuestOpcode::Illegal);
+
+    let translated = translate_with_cycle_publication([illegal]);
+    assert_eq!(translated.sequence.0, [illegal]);
+    assert_eq!(translated.cycles, 2);
+    assert_eq!(translated.exit, TranslationExit::Synchronous);
+    assert_eq!(
+        hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET),
+        [(1, 0, 0)]
+    );
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let wasm = lower_portable(&translated.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let script = r#"
+const [
+  wasmHex,
+  cycleOffset,
+  pcOffset,
+  srr1Offset,
+  programException,
+  illegalCause,
+] = process.argv.slice(1).map((value, index) => index === 0 ? value : Number(value));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const initialPc = 0x80001234;
+const initialSrr1 = 0x7ffc1234;
+const postHookSrr1 = 0x80010042;
+const memory = new WebAssembly.Memory({ initial: 2 });
+const view = new DataView(memory.buffer);
+const events = [];
+view.setUint32(cpu + pcOffset, initialPc, true);
+view.setUint32(cpu + srr1Offset, initialSrr1, true);
+
+const hooks = {
+  user_1_0(registers, exception) {
+    events.push([
+      view.getUint32(context + cycleOffset, true),
+      registers,
+      exception,
+      view.getUint32(registers + srr1Offset, true),
+    ]);
+    view.setUint32(registers + srr1Offset, postHookSrr1, true);
+  },
+};
+const { instance } = await WebAssembly.instantiate(Buffer.from(wasmHex, "hex"), {
+  lazuli: { memory },
+  lazuli_hooks: hooks,
+});
+const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+if (executed !== 0x00020001) {
+  throw new Error(`illegal instruction returned 0x${executed.toString(16)}`);
+}
+const expectedEvents = [[0, cpu, programException, initialSrr1]];
+if (JSON.stringify(events) !== JSON.stringify(expectedEvents)) {
+  throw new Error(`exception hook observed ${JSON.stringify(events)}`);
+}
+if (view.getUint32(cpu + srr1Offset, true) !== (postHookSrr1 | illegalCause) >>> 0) {
+  throw new Error(
+    `illegal cause did not modify post-hook SRR1: 0x${view.getUint32(cpu + srr1Offset, true).toString(16)}`,
+  );
+}
+if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+  throw new Error("illegal instruction advanced PC");
+}
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &wasm,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &SPR::SRR1.offset().to_string(),
+            &(Exception::Program as u16).to_string(),
+            &ProgramExceptionCause::IllegalInstruction
+                .srr1_bits()
+                .to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]
