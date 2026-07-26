@@ -15,7 +15,9 @@ use super::{
 use crate::packet::{GxDraw, GxExactClipState};
 use crate::raster::gx_normalized_raster_channel_u8;
 use crate::tev::TEV_VERTEX_FLOATS;
-use crate::{EFB_HEIGHT, EFB_WIDTH, GX_DEPTH24_MAX, GxRasterScissor};
+use crate::{
+    EFB_HEIGHT, EFB_WIDTH, ExactRequiredPreparationRejectionReason, GX_DEPTH24_MAX, GxRasterScissor,
+};
 
 const GX_EXACT_CLIP_PAYLOAD_FLOATS: usize = 4 + (TEV_VERTEX_FLOATS - 12);
 const GX_GEN_MODE_MULTISAMPLING: u32 = 1 << 9;
@@ -38,6 +40,143 @@ pub(crate) enum GxExactGeometryError {
     UnsupportedPostClipDepth,
     Clip(GxClipError),
     Projection(GxExactProjectionError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxExactPreparationFailure {
+    Geometry(GxExactGeometryError),
+    InvalidPreparedScissor,
+}
+
+impl GxExactPreparationFailure {
+    pub(crate) const fn telemetry_reason(self) -> ExactRequiredPreparationRejectionReason {
+        use ExactRequiredPreparationRejectionReason as Reason;
+
+        match self {
+            Self::Geometry(GxExactGeometryError::InvalidVertexLayout) => {
+                Reason::InvalidVertexLayout
+            }
+            Self::Geometry(GxExactGeometryError::MissingExactClipInput) => {
+                Reason::MissingExactClipInput
+            }
+            Self::Geometry(GxExactGeometryError::PositionCountMismatch) => {
+                Reason::PositionCountMismatch
+            }
+            Self::Geometry(GxExactGeometryError::NonFiniteSourceVertex) => {
+                Reason::NonFiniteSourceVertex
+            }
+            Self::Geometry(GxExactGeometryError::CullModeStateMismatch) => {
+                Reason::CullModeStateMismatch
+            }
+            Self::Geometry(GxExactGeometryError::UnsupportedMultisampling) => {
+                Reason::UnsupportedMultisampling
+            }
+            Self::Geometry(GxExactGeometryError::UnsupportedZFreeze) => Reason::UnsupportedZFreeze,
+            Self::Geometry(GxExactGeometryError::NonCanonicalSourceRaster) => {
+                Reason::NonCanonicalSourceRaster
+            }
+            Self::Geometry(GxExactGeometryError::UnsupportedPostClipW) => {
+                Reason::UnsupportedPostClipW
+            }
+            Self::Geometry(GxExactGeometryError::UnsupportedPostClipPosition) => {
+                Reason::UnsupportedPostClipPosition
+            }
+            Self::Geometry(GxExactGeometryError::UnsupportedPostClipDepth) => {
+                Reason::UnsupportedPostClipDepth
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::InvalidComponentCount)) => {
+                Reason::ClipInvalidComponentCount
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::UnsupportedTopology(5))) => {
+                Reason::UnsupportedTopology5
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::UnsupportedTopology(6))) => {
+                Reason::UnsupportedTopology6
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::UnsupportedTopology(7))) => {
+                Reason::UnsupportedTopology7
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::UnsupportedTopology(_))) => {
+                Reason::UnsupportedTopologyOther
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::NoSourceTriangles)) => {
+                Reason::ClipNoSourceTriangles
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::InvalidCullMode(_))) => {
+                Reason::ClipInvalidCullMode
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::InvalidViewportHeight)) => {
+                Reason::ClipInvalidViewportHeight
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::NonFiniteVertex)) => {
+                Reason::ClipNonFiniteVertex
+            }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::ArithmeticOverflow)) => {
+                Reason::ClipArithmeticOverflow
+            }
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::InvalidComponentCount,
+            )) => Reason::ProjectionInvalidComponentCount,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::InvalidBpState,
+            )) => Reason::ProjectionInvalidBpState,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::InvalidClipDisable(_),
+            )) => Reason::ProjectionInvalidClipDisable,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(1),
+            )) => Reason::UnsupportedClipDisable1,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(2),
+            )) => Reason::UnsupportedClipDisable2,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(3),
+            )) => Reason::UnsupportedClipDisable3,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(4),
+            )) => Reason::UnsupportedClipDisable4,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(5),
+            )) => Reason::UnsupportedClipDisable5,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(6),
+            )) => Reason::UnsupportedClipDisable6,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(7),
+            )) => Reason::UnsupportedClipDisable7,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::UnsupportedClipDisable(_),
+            )) => Reason::UnsupportedClipDisableOther,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::InvalidViewport,
+            )) => Reason::ProjectionInvalidViewport,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::InvalidScissor,
+            )) => Reason::ProjectionInvalidScissor,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::NoVisibleScissor,
+            )) => Reason::ProjectionNoVisibleScissor,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::WrappedScissor,
+            )) => Reason::ProjectionWrappedScissor,
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::NonFiniteVertex,
+            )) => Reason::ProjectionNonFiniteVertex,
+            Self::Geometry(GxExactGeometryError::Projection(GxExactProjectionError::ZeroClipW)) => {
+                Reason::ProjectionZeroClipW
+            }
+            Self::Geometry(GxExactGeometryError::Projection(
+                GxExactProjectionError::ArithmeticOverflow,
+            )) => Reason::ProjectionArithmeticOverflow,
+            Self::InvalidPreparedScissor => Reason::InvalidPreparedScissor,
+        }
+    }
+}
+
+impl From<GxExactGeometryError> for GxExactPreparationFailure {
+    fn from(error: GxExactGeometryError) -> Self {
+        Self::Geometry(error)
+    }
 }
 
 impl fmt::Display for GxExactGeometryError {

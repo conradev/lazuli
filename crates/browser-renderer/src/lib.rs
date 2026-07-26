@@ -24,6 +24,7 @@ pub(crate) const SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY: usize = 60;
 pub(crate) const GX_DEPTH16_MAX: u32 = 0x0000_ffff;
 pub(crate) const GX_DEPTH24_MAX: u32 = 0x00ff_ffff;
 pub(crate) const EXACT_REQUIRED_REJECTION_REASON_COUNT: usize = 14;
+pub(crate) const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT: usize = 40;
 /// Flipper's canonical single-sample raster point, in EFB pixel coordinates.
 #[cfg(test)]
 pub(crate) const GX_NON_AA_RASTER_CENTER_EFB: f32 = 7.0 / 12.0;
@@ -98,6 +99,178 @@ impl ExactRequiredRejectionReason {
             Self::ManagedPayload => "managedPayload",
             Self::Unclassified => "unclassified",
         }
+    }
+}
+
+/// Stable, bounded preparation-error details for required-exact no-ops.
+///
+/// These codes refine `exactPreparation` without changing admission. Append
+/// new entries rather than reordering or renaming existing telemetry.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactRequiredPreparationRejectionReason {
+    InvalidVertexLayout,
+    MissingExactClipInput,
+    PositionCountMismatch,
+    NonFiniteSourceVertex,
+    CullModeStateMismatch,
+    UnsupportedMultisampling,
+    UnsupportedZFreeze,
+    NonCanonicalSourceRaster,
+    UnsupportedPostClipW,
+    UnsupportedPostClipPosition,
+    UnsupportedPostClipDepth,
+    ClipInvalidComponentCount,
+    UnsupportedTopology5,
+    UnsupportedTopology6,
+    UnsupportedTopology7,
+    UnsupportedTopologyOther,
+    ClipNoSourceTriangles,
+    ClipInvalidCullMode,
+    ClipInvalidViewportHeight,
+    ClipNonFiniteVertex,
+    ClipArithmeticOverflow,
+    ProjectionInvalidComponentCount,
+    ProjectionInvalidBpState,
+    ProjectionInvalidClipDisable,
+    UnsupportedClipDisable1,
+    UnsupportedClipDisable2,
+    UnsupportedClipDisable3,
+    UnsupportedClipDisable4,
+    UnsupportedClipDisable5,
+    UnsupportedClipDisable6,
+    UnsupportedClipDisable7,
+    UnsupportedClipDisableOther,
+    ProjectionInvalidViewport,
+    ProjectionInvalidScissor,
+    ProjectionNoVisibleScissor,
+    ProjectionWrappedScissor,
+    ProjectionNonFiniteVertex,
+    ProjectionZeroClipW,
+    ProjectionArithmeticOverflow,
+    InvalidPreparedScissor,
+}
+
+impl ExactRequiredPreparationRejectionReason {
+    pub(crate) const ALL: [Self; EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT] = [
+        Self::InvalidVertexLayout,
+        Self::MissingExactClipInput,
+        Self::PositionCountMismatch,
+        Self::NonFiniteSourceVertex,
+        Self::CullModeStateMismatch,
+        Self::UnsupportedMultisampling,
+        Self::UnsupportedZFreeze,
+        Self::NonCanonicalSourceRaster,
+        Self::UnsupportedPostClipW,
+        Self::UnsupportedPostClipPosition,
+        Self::UnsupportedPostClipDepth,
+        Self::ClipInvalidComponentCount,
+        Self::UnsupportedTopology5,
+        Self::UnsupportedTopology6,
+        Self::UnsupportedTopology7,
+        Self::UnsupportedTopologyOther,
+        Self::ClipNoSourceTriangles,
+        Self::ClipInvalidCullMode,
+        Self::ClipInvalidViewportHeight,
+        Self::ClipNonFiniteVertex,
+        Self::ClipArithmeticOverflow,
+        Self::ProjectionInvalidComponentCount,
+        Self::ProjectionInvalidBpState,
+        Self::ProjectionInvalidClipDisable,
+        Self::UnsupportedClipDisable1,
+        Self::UnsupportedClipDisable2,
+        Self::UnsupportedClipDisable3,
+        Self::UnsupportedClipDisable4,
+        Self::UnsupportedClipDisable5,
+        Self::UnsupportedClipDisable6,
+        Self::UnsupportedClipDisable7,
+        Self::UnsupportedClipDisableOther,
+        Self::ProjectionInvalidViewport,
+        Self::ProjectionInvalidScissor,
+        Self::ProjectionNoVisibleScissor,
+        Self::ProjectionWrappedScissor,
+        Self::ProjectionNonFiniteVertex,
+        Self::ProjectionZeroClipW,
+        Self::ProjectionArithmeticOverflow,
+        Self::InvalidPreparedScissor,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn telemetry_code(self) -> &'static str {
+        match self {
+            Self::InvalidVertexLayout => "invalidVertexLayout",
+            Self::MissingExactClipInput => "missingExactClipInput",
+            Self::PositionCountMismatch => "positionCountMismatch",
+            Self::NonFiniteSourceVertex => "nonFiniteSourceVertex",
+            Self::CullModeStateMismatch => "cullModeStateMismatch",
+            Self::UnsupportedMultisampling => "unsupportedMultisampling",
+            Self::UnsupportedZFreeze => "unsupportedZFreeze",
+            Self::NonCanonicalSourceRaster => "nonCanonicalSourceRaster",
+            Self::UnsupportedPostClipW => "unsupportedPostClipW",
+            Self::UnsupportedPostClipPosition => "unsupportedPostClipPosition",
+            Self::UnsupportedPostClipDepth => "unsupportedPostClipDepth",
+            Self::ClipInvalidComponentCount => "clipInvalidComponentCount",
+            Self::UnsupportedTopology5 => "unsupportedTopology5",
+            Self::UnsupportedTopology6 => "unsupportedTopology6",
+            Self::UnsupportedTopology7 => "unsupportedTopology7",
+            Self::UnsupportedTopologyOther => "unsupportedTopologyOther",
+            Self::ClipNoSourceTriangles => "clipNoSourceTriangles",
+            Self::ClipInvalidCullMode => "clipInvalidCullMode",
+            Self::ClipInvalidViewportHeight => "clipInvalidViewportHeight",
+            Self::ClipNonFiniteVertex => "clipNonFiniteVertex",
+            Self::ClipArithmeticOverflow => "clipArithmeticOverflow",
+            Self::ProjectionInvalidComponentCount => "projectionInvalidComponentCount",
+            Self::ProjectionInvalidBpState => "projectionInvalidBpState",
+            Self::ProjectionInvalidClipDisable => "projectionInvalidClipDisable",
+            Self::UnsupportedClipDisable1 => "unsupportedClipDisable1",
+            Self::UnsupportedClipDisable2 => "unsupportedClipDisable2",
+            Self::UnsupportedClipDisable3 => "unsupportedClipDisable3",
+            Self::UnsupportedClipDisable4 => "unsupportedClipDisable4",
+            Self::UnsupportedClipDisable5 => "unsupportedClipDisable5",
+            Self::UnsupportedClipDisable6 => "unsupportedClipDisable6",
+            Self::UnsupportedClipDisable7 => "unsupportedClipDisable7",
+            Self::UnsupportedClipDisableOther => "unsupportedClipDisableOther",
+            Self::ProjectionInvalidViewport => "projectionInvalidViewport",
+            Self::ProjectionInvalidScissor => "projectionInvalidScissor",
+            Self::ProjectionNoVisibleScissor => "projectionNoVisibleScissor",
+            Self::ProjectionWrappedScissor => "projectionWrappedScissor",
+            Self::ProjectionNonFiniteVertex => "projectionNonFiniteVertex",
+            Self::ProjectionZeroClipW => "projectionZeroClipW",
+            Self::ProjectionArithmeticOverflow => "projectionArithmeticOverflow",
+            Self::InvalidPreparedScissor => "invalidPreparedScissor",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExactRequiredPreparationRejectionCounts {
+    counts: [u64; EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT],
+}
+
+impl Default for ExactRequiredPreparationRejectionCounts {
+    fn default() -> Self {
+        Self {
+            counts: [0; EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT],
+        }
+    }
+}
+
+impl ExactRequiredPreparationRejectionCounts {
+    pub(crate) fn record(&mut self, reason: ExactRequiredPreparationRejectionReason) {
+        let counter = &mut self.counts[reason.index()];
+        *counter = counter.saturating_add(1);
+    }
+
+    pub(crate) const fn get(&self, reason: ExactRequiredPreparationRejectionReason) -> u64 {
+        self.counts[reason.index()]
+    }
+
+    #[cfg(test)]
+    fn set(&mut self, reason: ExactRequiredPreparationRejectionReason, value: u64) {
+        self.counts[reason.index()] = value;
     }
 }
 
@@ -194,6 +367,25 @@ pub(crate) struct RendererMetrics {
 }
 
 impl RendererMetrics {
+    pub(crate) fn record_exact_required_rejection(
+        &mut self,
+        reason: ExactRequiredRejectionReason,
+        preparation_rejection: Option<(
+            &mut ExactRequiredPreparationRejectionCounts,
+            ExactRequiredPreparationRejectionReason,
+        )>,
+    ) {
+        debug_assert_eq!(
+            reason == ExactRequiredRejectionReason::ExactPreparation,
+            preparation_rejection.is_some(),
+        );
+        self.exact_required_rejected_draws = self.exact_required_rejected_draws.saturating_add(1);
+        self.record_exact_required_rejection_reason(reason);
+        if let Some((preparation_counts, preparation_reason)) = preparation_rejection {
+            preparation_counts.record(preparation_reason);
+        }
+    }
+
     pub(crate) fn record_exact_required_rejection_reason(
         &mut self,
         reason: ExactRequiredRejectionReason,
@@ -2804,29 +2996,30 @@ pub use web::WebGpuRenderer;
 #[cfg(test)]
 mod tests {
     use super::{
-        EFB_HEIGHT, EFB_WIDTH, ExactRequiredRejectionInputs, ExactRequiredRejectionReason,
-        GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX, GX_MANUAL_SAMPLING_MODE0_FLAG,
-        GX_NON_AA_RASTER_CENTER_EFB, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
-        GxAlphaTestOutcome, GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxCopyGamma,
-        GxDepthCompareLocation, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthDecodeError,
-        GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError, GxFogProjection, GxFogState, GxFogType,
-        GxRasterCenterEvidence, GxSamplerStateError, GxZTextureDecodeError, GxZTextureFormat,
-        GxZTextureOperation, RendererFailureState, RendererMetrics, RendererPhaseTiming,
-        SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY, SelectedTexture, SurfacePixelOrder,
-        SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory,
-        SustainedSurfaceHistoryError, TextureAddressMode, TextureMipmapFilter, ViFieldDescriptor,
-        ViFieldPairOutcome, ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame,
-        ViPresentationMode, WEBGPU_RASTER_CENTER_EFB, XfbCopyMetadata, alpha_compare,
-        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
-        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
-        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_alpha_test_outcome,
-        gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
-        gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_from_units,
-        gx_depth24_to_float, gx_destination_alpha_state, gx_early_depth_plan,
-        gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24, gx_fog_reference, gx_fog_state,
-        gx_raster_center_evidence, gx_sampler_state, gx_xfb_copy_parameters, gx_xfb_output_height,
-        gx_z_texture_reference, gx_z_texture_state, legacy_gx_sampler_identity,
-        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
+        EFB_HEIGHT, EFB_WIDTH, ExactRequiredPreparationRejectionCounts,
+        ExactRequiredPreparationRejectionReason, ExactRequiredRejectionInputs,
+        ExactRequiredRejectionReason, GX_COPY_FILTER_DIVISOR, GX_DEPTH16_MAX, GX_DEPTH24_MAX,
+        GX_MANUAL_SAMPLING_MODE0_FLAG, GX_NON_AA_RASTER_CENTER_EFB,
+        GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxAlphaTestOutcome, GxBlendFactor,
+        GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxDepthCompression,
+        GxEarlyDepthPlan, GxEfbDepthDecodeError, GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError,
+        GxFogProjection, GxFogState, GxFogType, GxRasterCenterEvidence, GxSamplerStateError,
+        GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
+        RendererMetrics, RendererPhaseTiming, SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY,
+        SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
+        SustainedPresentedSurfaceHistory, SustainedSurfaceHistoryError, TextureAddressMode,
+        TextureMipmapFilter, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
+        ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode, WEBGPU_RASTER_CENTER_EFB,
+        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
+        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
+        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
+        gx_alpha_test_outcome, gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask,
+        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
+        gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
+        gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
+        gx_fog_reference, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
+        gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
+        legacy_gx_sampler_identity, materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture, select_texture,
         valid_rgba8_mip_chain, valid_rgba8_texture, xfb_copy_matches_selection,
@@ -3308,6 +3501,150 @@ mod tests {
         assert_eq!(
             metrics.exact_required_rejection_reason_draws(ExactRequiredRejectionReason::Sampler),
             u64::MAX,
+        );
+    }
+
+    #[test]
+    fn exact_required_preparation_rejection_reasons_are_stable_and_bounded() {
+        use ExactRequiredPreparationRejectionReason as Reason;
+
+        assert_eq!(
+            Reason::ALL.map(Reason::telemetry_code),
+            [
+                "invalidVertexLayout",
+                "missingExactClipInput",
+                "positionCountMismatch",
+                "nonFiniteSourceVertex",
+                "cullModeStateMismatch",
+                "unsupportedMultisampling",
+                "unsupportedZFreeze",
+                "nonCanonicalSourceRaster",
+                "unsupportedPostClipW",
+                "unsupportedPostClipPosition",
+                "unsupportedPostClipDepth",
+                "clipInvalidComponentCount",
+                "unsupportedTopology5",
+                "unsupportedTopology6",
+                "unsupportedTopology7",
+                "unsupportedTopologyOther",
+                "clipNoSourceTriangles",
+                "clipInvalidCullMode",
+                "clipInvalidViewportHeight",
+                "clipNonFiniteVertex",
+                "clipArithmeticOverflow",
+                "projectionInvalidComponentCount",
+                "projectionInvalidBpState",
+                "projectionInvalidClipDisable",
+                "unsupportedClipDisable1",
+                "unsupportedClipDisable2",
+                "unsupportedClipDisable3",
+                "unsupportedClipDisable4",
+                "unsupportedClipDisable5",
+                "unsupportedClipDisable6",
+                "unsupportedClipDisable7",
+                "unsupportedClipDisableOther",
+                "projectionInvalidViewport",
+                "projectionInvalidScissor",
+                "projectionNoVisibleScissor",
+                "projectionWrappedScissor",
+                "projectionNonFiniteVertex",
+                "projectionZeroClipW",
+                "projectionArithmeticOverflow",
+                "invalidPreparedScissor",
+            ],
+        );
+        for (index, reason) in Reason::ALL.into_iter().enumerate() {
+            assert_eq!(reason.index(), index);
+        }
+    }
+
+    #[test]
+    fn renderer_metrics_keep_exact_preparation_parent_and_details_coherent() {
+        let mut metrics = RendererMetrics::default();
+        let mut preparation_counts = ExactRequiredPreparationRejectionCounts::default();
+        for reason in ExactRequiredPreparationRejectionReason::ALL {
+            metrics.record_exact_required_rejection(
+                ExactRequiredRejectionReason::ExactPreparation,
+                Some((&mut preparation_counts, reason)),
+            );
+        }
+
+        let preparation_count = ExactRequiredPreparationRejectionReason::ALL.len() as u64;
+        assert_eq!(metrics.exact_required_rejected_draws, preparation_count);
+        assert_eq!(
+            metrics.exact_required_rejection_reason_draws(
+                ExactRequiredRejectionReason::ExactPreparation,
+            ),
+            preparation_count,
+        );
+        assert_eq!(
+            ExactRequiredPreparationRejectionReason::ALL
+                .into_iter()
+                .map(|reason| preparation_counts.get(reason))
+                .sum::<u64>(),
+            preparation_count,
+        );
+
+        metrics.record_exact_required_rejection(ExactRequiredRejectionReason::Sampler, None);
+        assert_eq!(metrics.exact_required_rejected_draws, preparation_count + 1);
+        assert_eq!(
+            metrics.exact_required_rejection_reason_draws(ExactRequiredRejectionReason::Sampler),
+            1,
+        );
+        assert_eq!(
+            ExactRequiredPreparationRejectionReason::ALL
+                .into_iter()
+                .map(|reason| preparation_counts.get(reason))
+                .sum::<u64>(),
+            preparation_count,
+            "non-preparation suppression cannot change preparation details",
+        );
+    }
+
+    #[test]
+    fn renderer_metrics_saturate_exact_preparation_parent_and_detail() {
+        let mut metrics = RendererMetrics::default();
+        let mut preparation_counts = ExactRequiredPreparationRejectionCounts::default();
+        let detail = ExactRequiredPreparationRejectionReason::UnsupportedTopology5;
+        metrics.exact_required_rejected_draws = u64::MAX;
+        metrics.exact_required_rejection_reasons
+            [ExactRequiredRejectionReason::ExactPreparation.index()] = u64::MAX;
+        preparation_counts.set(detail, u64::MAX);
+
+        metrics.record_exact_required_rejection(
+            ExactRequiredRejectionReason::ExactPreparation,
+            Some((&mut preparation_counts, detail)),
+        );
+
+        assert_eq!(metrics.exact_required_rejected_draws, u64::MAX);
+        assert_eq!(
+            metrics.exact_required_rejection_reason_draws(
+                ExactRequiredRejectionReason::ExactPreparation,
+            ),
+            u64::MAX,
+        );
+        assert_eq!(preparation_counts.get(detail), u64::MAX,);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn exact_preparation_parent_requires_a_detail() {
+        RendererMetrics::default()
+            .record_exact_required_rejection(ExactRequiredRejectionReason::ExactPreparation, None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn exact_preparation_detail_requires_its_parent() {
+        let mut preparation_counts = ExactRequiredPreparationRejectionCounts::default();
+        RendererMetrics::default().record_exact_required_rejection(
+            ExactRequiredRejectionReason::Sampler,
+            Some((
+                &mut preparation_counts,
+                ExactRequiredPreparationRejectionReason::UnsupportedTopology5,
+            )),
         );
     }
 
