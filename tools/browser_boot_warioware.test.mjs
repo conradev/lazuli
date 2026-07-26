@@ -25,12 +25,12 @@ function extractFunction(name) {
   assert.fail(`unterminated ${name}`);
 }
 
-function makeContext(identifier = "GZWE01") {
+function makeContext(identifier = "GZWE01", version = 0) {
   const memory = new ArrayBuffer(0x1800000);
   const view = new DataView(memory);
   const context = {
     Number,
-    boot: { identifier, discId: 0, version: 0 },
+    boot: { identifier, discId: 0, version },
     controllerAppliedSequence: 0,
     serialLastActiveHostPublication: null,
     wariowareLastActiveGameplayInput: null,
@@ -65,6 +65,11 @@ function makeContext(identifier = "GZWE01") {
     },
     inspectMeleeGameState() {
       return null;
+    },
+    inspectFzeroGameState() {
+      return identifier === "GFZE01" && version === 0
+        ? { game: "fzero" }
+        : null;
     },
   };
   vm.createContext(context);
@@ -1359,6 +1364,11 @@ test("guest game diagnostics dispatch by exact retail identity", () => {
     JSON.parse(JSON.stringify(makeContext("GMBE8P").inspectGuestGameState())),
     { game: "smb" },
   );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(makeContext("GFZE01").inspectGuestGameState())),
+    { game: "fzero" },
+  );
+  assert.equal(makeContext("GFZE01", 1).inspectGuestGameState(), null);
   assert.notEqual(makeContext("GZWE01").inspectGuestGameState(), null);
   assert.match(source, /guestGame: inspectGuestGameState\(\)/);
 });

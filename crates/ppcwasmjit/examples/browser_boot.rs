@@ -1057,6 +1057,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let luigisMansionLastActiveGameplayInput = null;
     let windWakerLastActiveGameplayInput = null;
     let meleeLastActiveGameplayInput = null;
+    let fzeroLastActiveGameplayInput = null;
     let cycleLimit = Number.POSITIVE_INFINITY;
     let dispatchLimit = Number.POSITIVE_INFINITY;
     let cycles = 0;
@@ -16402,6 +16403,344 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function fzeroMappedPointer(value, length = 1) {
+      return Number.isSafeInteger(value)
+        && Number.isSafeInteger(length)
+        && length > 0
+        && (value & 3) === 0
+        && value >= 0x80000000
+        && value <= 0x81800000 - length
+        && ramPointer(value, length) !== null;
+    }
+
+    function inspectFzeroVector(address) {
+      if (!fzeroMappedPointer(address, 12)) return null;
+      return {
+        x: guestF32(address),
+        y: guestF32(address + 4),
+        z: guestF32(address + 8),
+      };
+    }
+
+    function inspectFzeroGameState() {
+      if (boot.identifier !== "GFZE01" || boot.version !== 0) return null;
+
+      // These pointer offsets and the 0x620 racer layout are from retail
+      // GFZE01 revision zero:
+      // https://github.com/JoselleAstrid/fzerogx-docs/tree/80167e449f390fc3141cdacfd2b6076a3e0c290c/addresses
+      // The racer allocation precedes the track camera pan, so it is only an
+      // active-race candidate. Static REL offsets 0x83974..0x83a50 prove the
+      // exact live-input path: general-state bit 0x80 must be clear, bit
+      // 0x04000000 must be clear (otherwise input comes from racer+0x484),
+      // and signed racer+0x474 selects the 20-byte player-input table. Slot
+      // zero is P1. The controller-state array is initialized to one for all
+      // four live slots and copied into +0x590; require that exact default
+      // state for the normal-race witness. Alternate states 2 through 4 also
+      // preserve steer, but are deliberately outside this proof.
+      const referencePointerAddress = 0x800030c8;
+      const racerPointerOffset = 0x227878;
+      const racerBlockSize = 0x620;
+      const referenceValue = guestU32(referencePointerAddress);
+      const referenceMapped = fzeroMappedPointer(referenceValue);
+      const racerPointerAddress = referenceMapped
+        && fzeroMappedPointer(referenceValue + racerPointerOffset, 4)
+        ? referenceValue + racerPointerOffset
+        : null;
+      const racerValue = racerPointerAddress === null
+        ? null
+        : guestU32(racerPointerAddress);
+      const raceAllocated = racerValue !== 0
+        && fzeroMappedPointer(racerValue, racerBlockSize);
+
+      const racerFieldAddress = offset =>
+        raceAllocated ? racerValue + offset : null;
+      const racerU32 = offset => {
+        const address = racerFieldAddress(offset);
+        return address === null ? null : guestU32(address);
+      };
+      const racerU16 = offset => {
+        const address = racerFieldAddress(offset);
+        return address === null ? null : guestU16(address);
+      };
+      const racerU8 = offset => {
+        const address = racerFieldAddress(offset);
+        return address === null ? null : guestU8(address);
+      };
+      const racerS8 = offset => {
+        const value = racerU8(offset);
+        return value === null ? null : (value << 24) >> 24;
+      };
+      const racerS32 = offset => {
+        const address = racerFieldAddress(offset);
+        return address === null ? null : guestS32(address);
+      };
+      const racerF32 = offset => {
+        const address = racerFieldAddress(offset);
+        return address === null ? null : guestF32(address);
+      };
+      const racerVector = offset => {
+        const address = racerFieldAddress(offset);
+        return address === null ? null : inspectFzeroVector(address);
+      };
+
+      const generalState = racerU32(0x000);
+      const entrantId = racerU16(0x004);
+      const machineId = racerU16(0x006);
+      const position = racerVector(0x07c);
+      const previousPosition = racerVector(0x088);
+      const worldVelocity = racerVector(0x094);
+      const localVelocity = racerVector(0x0b8);
+      const worldOrientation = racerVector(0x0ec);
+      const speedKph = racerF32(0x17c);
+      const energy = racerF32(0x184);
+      const crashToRestoreFrameCounter = racerU32(0x194);
+      const trackOrientation = racerVector(0x1bc);
+      const checkpoint = racerS32(0x1cc);
+      const checkpointFraction = racerF32(0x1d0);
+      const steerY = racerF32(0x1f4);
+      const strafe = racerF32(0x1f8);
+      const steerX = racerF32(0x1fc);
+      const accelerator = racerF32(0x200);
+      const brake = racerF32(0x204);
+      const duplicateSteerX = racerF32(0x20c);
+      const restoreCountdown = racerU16(0x214);
+      const controllerSlot = racerS8(0x474);
+      const frameCountSinceStartOrRestore = racerU32(0x47c);
+      const crashBit = racerU8(0x4b3);
+      const generalState2 = racerU8(0x58f);
+      const restoreCompletionFlag = racerU8(0x590);
+      const breakDownCountdown = racerU8(0x593);
+      const postRestoreCountdown = racerU8(0x5d8);
+      const groundAirFlag = racerU8(0x61c);
+
+      const finiteVector = value => value !== null
+        && Number.isFinite(value.x)
+        && Number.isFinite(value.y)
+        && Number.isFinite(value.z);
+      const finiteScalars = [
+        speedKph,
+        energy,
+        checkpointFraction,
+        steerY,
+        strafe,
+        steerX,
+        accelerator,
+        brake,
+        duplicateSteerX,
+      ].every(Number.isFinite);
+      const documentedInputRanges = [
+        steerY,
+        strafe,
+        steerX,
+        duplicateSteerX,
+      ].every(value => Number.isFinite(value) && Math.abs(value) <= 1);
+      const duplicateSteerMatches = Number.isFinite(steerX)
+        && steerX === duplicateSteerX;
+      const vehicleValid = raceAllocated
+        && [
+          generalState,
+          entrantId,
+          machineId,
+          checkpoint,
+          crashToRestoreFrameCounter,
+          restoreCountdown,
+          controllerSlot,
+          frameCountSinceStartOrRestore,
+          crashBit,
+          generalState2,
+          restoreCompletionFlag,
+          breakDownCountdown,
+          postRestoreCountdown,
+          groundAirFlag,
+        ].every(Number.isSafeInteger)
+        && [
+          position,
+          previousPosition,
+          worldVelocity,
+          localVelocity,
+          worldOrientation,
+          trackOrientation,
+        ].every(finiteVector)
+        && finiteScalars
+        && documentedInputRanges
+        && duplicateSteerMatches;
+      const activeRaceCandidate = raceAllocated && vehicleValid;
+      const livePlayerInputPath = vehicleValid
+        && (generalState & 0x00000080) === 0
+        && (generalState & 0x04000000) === 0
+        && controllerSlot === 0;
+      const defaultLivePlayerInputState = livePlayerInputPath
+        && restoreCompletionFlag === 1;
+
+      return {
+        reference: {
+          pointerAddress: hex32(referencePointerAddress),
+          value: referenceMapped ? hex32(referenceValue) : null,
+          rawValue: hex32(referenceValue),
+          mapped: referenceMapped,
+        },
+        racerLookup: {
+          pointerOffset: hex32(racerPointerOffset),
+          pointerAddress: hex32(racerPointerAddress),
+          rawValue: hex32(racerValue),
+          racer: raceAllocated ? hex32(racerValue) : null,
+          blockSize: racerBlockSize,
+        },
+        raceAllocated,
+        vehicle: {
+          address: raceAllocated ? hex32(racerValue) : null,
+          size: racerBlockSize,
+          generalStateAddress: hex32(racerFieldAddress(0x000)),
+          generalState,
+          entrantIdAddress: hex32(racerFieldAddress(0x004)),
+          entrantId,
+          machineIdAddress: hex32(racerFieldAddress(0x006)),
+          machineId,
+          positionAddress: hex32(racerFieldAddress(0x07c)),
+          position,
+          previousPositionAddress: hex32(racerFieldAddress(0x088)),
+          previousPosition,
+          worldVelocityAddress: hex32(racerFieldAddress(0x094)),
+          worldVelocity,
+          localVelocityAddress: hex32(racerFieldAddress(0x0b8)),
+          localVelocity,
+          worldOrientationAddress: hex32(racerFieldAddress(0x0ec)),
+          worldOrientation,
+          speedKphAddress: hex32(racerFieldAddress(0x17c)),
+          speedKph,
+          energyAddress: hex32(racerFieldAddress(0x184)),
+          energy,
+          crashToRestoreFrameCounterAddress:
+            hex32(racerFieldAddress(0x194)),
+          crashToRestoreFrameCounter,
+          trackOrientationAddress: hex32(racerFieldAddress(0x1bc)),
+          trackOrientation,
+          checkpointAddress: hex32(racerFieldAddress(0x1cc)),
+          checkpoint,
+          checkpointFractionAddress: hex32(racerFieldAddress(0x1d0)),
+          checkpointFraction,
+          input: {
+            steerYAddress: hex32(racerFieldAddress(0x1f4)),
+            steerY,
+            strafeAddress: hex32(racerFieldAddress(0x1f8)),
+            strafe,
+            steerXAddress: hex32(racerFieldAddress(0x1fc)),
+            steerX,
+            acceleratorAddress: hex32(racerFieldAddress(0x200)),
+            accelerator,
+            brakeAddress: hex32(racerFieldAddress(0x204)),
+            brake,
+            duplicateSteerXAddress: hex32(racerFieldAddress(0x20c)),
+            duplicateSteerX,
+            duplicateSteerMatches,
+            documentedRanges: documentedInputRanges,
+          },
+          lifecycle: {
+            restoreCountdownAddress: hex32(racerFieldAddress(0x214)),
+            restoreCountdown,
+            controllerSlotAddress: hex32(racerFieldAddress(0x474)),
+            controllerSlot,
+            frameCountSinceStartOrRestoreAddress:
+              hex32(racerFieldAddress(0x47c)),
+            frameCountSinceStartOrRestore,
+            crashBitAddress: hex32(racerFieldAddress(0x4b3)),
+            crashBit,
+            generalState2Address: hex32(racerFieldAddress(0x58f)),
+            generalState2,
+            restoreCompletionFlagAddress:
+              hex32(racerFieldAddress(0x590)),
+            restoreCompletionFlag,
+            breakDownCountdownAddress: hex32(racerFieldAddress(0x593)),
+            breakDownCountdown,
+            postRestoreCountdownAddress: hex32(racerFieldAddress(0x5d8)),
+            postRestoreCountdown,
+            groundAirFlagAddress: hex32(racerFieldAddress(0x61c)),
+            groundAirFlag,
+          },
+          valid: vehicleValid,
+        },
+        vehicleValid,
+        activeRaceCandidate,
+        livePlayerInputPath,
+        defaultLivePlayerInputState,
+        lastActiveGameplayInput: fzeroLastActiveGameplayInput,
+      };
+    }
+
+    function sampleFzeroGameplayInput(sampleCycle) {
+      if (
+        boot.identifier !== "GFZE01"
+        || boot.version !== 0
+        || fzeroLastActiveGameplayInput !== null
+      ) return;
+      const publication = serialLastActiveHostPublication;
+      if (
+        !Number.isSafeInteger(sampleCycle)
+        || sampleCycle < 0
+        || publication === null
+        || publication.buttons !== 0x0001
+        || !Number.isSafeInteger(publication.sequence)
+        || publication.sequence <= 0
+        || !Number.isSafeInteger(publication.scheduledCycle)
+        || !Number.isSafeInteger(publication.observedCycle)
+        || publication.scheduledCycle > publication.observedCycle
+        || publication.observedCycle > sampleCycle
+        || controllerAppliedSequence !== publication.sequence
+      ) return;
+      const state = inspectFzeroGameState();
+      const steerX = state?.vehicle?.input?.steerX;
+      const duplicateSteerX = state?.vehicle?.input?.duplicateSteerX;
+      if (
+        state?.activeRaceCandidate !== true
+        || state.livePlayerInputPath !== true
+        || state.defaultLivePlayerInputState !== true
+        || !Number.isFinite(steerX)
+        || steerX < -1
+        || steerX > -0.5
+        || duplicateSteerX !== steerX
+        || state.vehicle.input.steerY !== 0
+        || state.vehicle.input.strafe !== 0
+        || state.vehicle.lifecycle.crashBit !== 0
+        || state.vehicle.lifecycle.restoreCountdown !== 0
+        || state.vehicle.crashToRestoreFrameCounter !== 0
+        || state.vehicle.lifecycle.breakDownCountdown !== 0
+        || state.vehicle.lifecycle.postRestoreCountdown !== 0
+      ) return;
+      fzeroLastActiveGameplayInput = {
+        cycle: sampleCycle,
+        controllerAppliedSequence,
+        hostPublication: { ...publication },
+        reference: state.reference.value,
+        racer: state.vehicle.address,
+        entrantId: state.vehicle.entrantId,
+        machineId: state.vehicle.machineId,
+        generalState: state.vehicle.generalState,
+        controllerSlot: state.vehicle.lifecycle.controllerSlot,
+        frameCountSinceStartOrRestore:
+          state.vehicle.lifecycle.frameCountSinceStartOrRestore,
+        position: { ...state.vehicle.position },
+        worldVelocity: { ...state.vehicle.worldVelocity },
+        input: {
+          steerY: state.vehicle.input.steerY,
+          strafe: state.vehicle.input.strafe,
+          steerX,
+          duplicateSteerX,
+          accelerator: state.vehicle.input.accelerator,
+          brake: state.vehicle.input.brake,
+        },
+        lifecycle: {
+          crashBit: state.vehicle.lifecycle.crashBit,
+          restoreCountdown: state.vehicle.lifecycle.restoreCountdown,
+          crashToRestoreFrameCounter:
+            state.vehicle.crashToRestoreFrameCounter,
+          restoreCompletionFlag:
+            state.vehicle.lifecycle.restoreCompletionFlag,
+          breakDownCountdown: state.vehicle.lifecycle.breakDownCountdown,
+          postRestoreCountdown: state.vehicle.lifecycle.postRestoreCountdown,
+        },
+      };
+    }
+
     function inspectWarioWareGameState() {
       if (boot.identifier !== "GZWE01") return null;
 
@@ -16520,6 +16859,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         ?? inspectLuigisMansionGameState()
         ?? inspectWindWakerGameState()
         ?? inspectMeleeGameState()
+        ?? inspectFzeroGameState()
         ?? inspectWarioWareGameState();
     }
 
@@ -16527,6 +16867,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       sampleLuigisMansionGameplayInput(sampleCycle);
       sampleWindWakerGameplayInput(sampleCycle);
       sampleMeleeGameplayInput(sampleCycle);
+      sampleFzeroGameplayInput(sampleCycle);
       sampleWarioWareGameplayInput(sampleCycle);
     }
 

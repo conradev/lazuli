@@ -49,11 +49,17 @@ function makeContext(identifier = "GALE01", version = 2) {
     inspectWindWakerGameState() {
       return identifier === "GZLE01" ? { game: "wind" } : null;
     },
+    inspectFzeroGameState() {
+      return identifier === "GFZE01" && version === 0
+        ? { game: "fzero" }
+        : null;
+    },
     inspectWarioWareGameState() {
       return identifier === "GZWE01" ? { game: "wario" } : null;
     },
     sampleLuigisMansionGameplayInput() {},
     sampleWindWakerGameplayInput() {},
+    sampleFzeroGameplayInput() {},
     sampleWarioWareGameplayInput() {},
   };
   vm.createContext(context);
@@ -547,9 +553,13 @@ test("guest diagnostics dispatch Melee only through exact retail identity", () =
     JSON.parse(JSON.stringify(makeContext("GZWE01", 0).inspectGuestGameState())),
     { game: "wario" },
   );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(makeContext("GFZE01", 0).inspectGuestGameState())),
+    { game: "fzero" },
+  );
   assert.equal(makeContext("GALE01", 1).inspectGuestGameState(), null);
   assert.match(
     source,
-    /function sampleGuestGameplayInput\(sampleCycle\) \{\s+sampleLuigisMansionGameplayInput\(sampleCycle\);\s+sampleWindWakerGameplayInput\(sampleCycle\);\s+sampleMeleeGameplayInput\(sampleCycle\);\s+sampleWarioWareGameplayInput\(sampleCycle\);/,
+    /function sampleGuestGameplayInput\(sampleCycle\) \{\s+sampleLuigisMansionGameplayInput\(sampleCycle\);\s+sampleWindWakerGameplayInput\(sampleCycle\);\s+sampleMeleeGameplayInput\(sampleCycle\);\s+sampleFzeroGameplayInput\(sampleCycle\);\s+sampleWarioWareGameplayInput\(sampleCycle\);/,
   );
 });
