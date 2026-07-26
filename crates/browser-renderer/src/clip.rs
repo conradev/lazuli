@@ -11,7 +11,7 @@ mod geometry;
 mod project;
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use geometry::gx_exact_draw_raster_geometry;
+pub(crate) use geometry::{GxExactPreparationFailure, gx_exact_draw_raster_geometry};
 
 const GX_CLIP_COMPONENTS: usize = 4;
 const GX_CLIP_PLANE_MASK: u8 = 0x3f;

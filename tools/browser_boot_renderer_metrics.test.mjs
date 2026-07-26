@@ -18,6 +18,10 @@ const rendererCoreSource = readFileSync(
   new URL("../crates/browser-renderer/src/lib.rs", import.meta.url),
   "utf8",
 );
+const rendererGeometrySource = readFileSync(
+  new URL("../crates/browser-renderer/src/clip/geometry.rs", import.meta.url),
+  "utf8",
+);
 const headlessSource = readFileSync(
   new URL("./browser_boot_headless.mjs", import.meta.url),
   "utf8",
@@ -452,11 +456,15 @@ test("exact authoritative no-ops have distinct renderer compatibility counters",
       rendererSource,
       new RegExp(`"${publicField}"[\\s\\S]{0,80}metrics\\.${rustField}`),
     );
-    assert.match(
-      rendererSource,
-      new RegExp(`${rustField}\\s*=\\s*metrics\\.${rustField}\\.saturating_add\\(1\\)`),
-    );
   }
+  assert.match(
+    rendererSource,
+    /exact_raster_empty_draws\s*=\s*metrics\.exact_raster_empty_draws\.saturating_add\(1\)/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /self\.exact_required_rejected_draws\s*=\s*self\.exact_required_rejected_draws\.saturating_add\(1\)/,
+  );
   const classifierStart = rendererSource.indexOf(
     "fn authoritative_noop(&self) -> Option<ExactAuthoritativeNoop>",
   );
@@ -513,8 +521,130 @@ test("required exact no-ops expose one bounded compatibility-reason map", () => 
     /for reason in ExactRequiredRejectionReason::ALL[\s\S]*"exactRequiredRejectionReasons"/,
   );
   assert.match(
-    rendererSource,
+    rendererCoreSource,
     /fn record_exact_required_rejection[\s\S]*exact_required_rejected_draws[\s\S]*record_exact_required_rejection_reason\(reason\)/,
+  );
+  assert.match(
+    rendererSource,
+    /fn record_exact_required_rejection[\s\S]*current\.record_exact_required_rejection\(\s*reason,\s*Some\(\(&mut current_preparation_counts, preparation_reason\)\),\s*\)[\s\S]*current\.record_exact_required_rejection\(reason, None\)/,
+  );
+});
+
+test("required exact preparation failures expose one bounded subtype map", () => {
+  const reasonCodes = [
+    "invalidVertexLayout",
+    "missingExactClipInput",
+    "positionCountMismatch",
+    "nonFiniteSourceVertex",
+    "cullModeStateMismatch",
+    "unsupportedMultisampling",
+    "unsupportedZFreeze",
+    "nonCanonicalSourceRaster",
+    "unsupportedPostClipW",
+    "unsupportedPostClipPosition",
+    "unsupportedPostClipDepth",
+    "clipInvalidComponentCount",
+    "unsupportedTopology5",
+    "unsupportedTopology6",
+    "unsupportedTopology7",
+    "unsupportedTopologyOther",
+    "clipNoSourceTriangles",
+    "clipInvalidCullMode",
+    "clipInvalidViewportHeight",
+    "clipNonFiniteVertex",
+    "clipArithmeticOverflow",
+    "projectionInvalidComponentCount",
+    "projectionInvalidBpState",
+    "projectionInvalidClipDisable",
+    "unsupportedClipDisable1",
+    "unsupportedClipDisable2",
+    "unsupportedClipDisable3",
+    "unsupportedClipDisable4",
+    "unsupportedClipDisable5",
+    "unsupportedClipDisable6",
+    "unsupportedClipDisable7",
+    "unsupportedClipDisableOther",
+    "projectionInvalidViewport",
+    "projectionInvalidScissor",
+    "projectionNoVisibleScissor",
+    "projectionWrappedScissor",
+    "projectionNonFiniteVertex",
+    "projectionZeroClipW",
+    "projectionArithmeticOverflow",
+    "invalidPreparedScissor",
+  ];
+  assert.match(
+    rendererCoreSource,
+    /EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT: usize = 40/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /struct ExactRequiredPreparationRejectionCounts[\s\S]{0,160}counts:\s*\[u64; EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT\]/,
+  );
+  assert.doesNotMatch(
+    rendererCoreSource,
+    /exact_required_preparation_rejection_reasons:\s*ExactRequiredPreparationRejectionCounts/,
+  );
+  assert.match(
+    rendererSource,
+    /exact_required_preparation_rejection_counts:\s*Cell<ExactRequiredPreparationRejectionCounts>/,
+  );
+  assert.match(
+    rendererSource,
+    /reset_diagnostics\(&self\)[\s\S]{0,240}exact_required_preparation_rejection_counts[\s\S]{0,120}ExactRequiredPreparationRejectionCounts::default\(\)/,
+  );
+  assert.match(
+    rendererSource,
+    /exact_required_preparation_rejection_counts:\s*Cell::new\(\s*ExactRequiredPreparationRejectionCounts::default\(\),\s*\)/,
+  );
+  for (const code of reasonCodes) {
+    assert.match(
+      rendererCoreSource,
+      new RegExp(`=> "${code}"`),
+      `missing stable exact preparation rejection code ${code}`,
+    );
+  }
+  for (const topology of [5, 6, 7]) {
+    assert.match(
+      rendererGeometrySource,
+      new RegExp(
+        `GxClipError::UnsupportedTopology\\(${topology}\\)[\\s\\S]{0,100}`
+          + `Reason::UnsupportedTopology${topology}`,
+      ),
+    );
+  }
+  for (const mode of [1, 2, 3, 4, 5, 6, 7]) {
+    assert.match(
+      rendererGeometrySource,
+      new RegExp(
+        `GxExactProjectionError::UnsupportedClipDisable\\(${mode}\\)`
+          + `[\\s\\S]{0,100}Reason::UnsupportedClipDisable${mode}`,
+      ),
+    );
+  }
+  assert.match(
+    rendererSource,
+    /preparation_failure:\s*Option<GxExactPreparationFailure>/,
+  );
+  assert.match(
+    rendererSource,
+    /Err\(error\)[\s\S]{0,300}preparation_failure:\s*Some\(error\.into\(\)\)/,
+  );
+  assert.match(
+    rendererSource,
+    /preparation_failure:\s*Some\(GxExactPreparationFailure::InvalidPreparedScissor\)/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /debug_assert_eq!\([\s\S]{0,180}reason == ExactRequiredRejectionReason::ExactPreparation[\s\S]{0,120}preparation_rejection\.is_some\(\)/,
+  );
+  assert.match(
+    rendererSource,
+    /for reason in ExactRequiredPreparationRejectionReason::ALL[\s\S]*"exactRequiredPreparationRejectionReasons"/,
+  );
+  assert.match(
+    rendererSource,
+    /renderer_metrics_object\(\s*self\.metrics\.get\(\),\s*self\.exact_required_preparation_rejection_counts\.get\(\),\s*\)/,
   );
 });
 

@@ -93,7 +93,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.doesNotMatch(preparationTypes, /vertices: Vec<f32>|expanded: Vec<usize>/);
   assert.match(
     preparationTypes,
-    /struct PreparedExactDraw \{\s*required: bool,\s*required_managed_safe: bool,\s*qualified: Option<QualifiedExactDraw>,\s*\}/,
+    /struct PreparedExactDraw \{\s*required: bool,\s*required_managed_safe: bool,\s*qualified: Option<QualifiedExactDraw>,\s*preparation_failure: Option<GxExactPreparationFailure>,\s*\}/,
   );
   assert.match(
     preparationTypes,
@@ -151,7 +151,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.match(prepare, /let required = draw\.record\.exact_clip_required;/);
   assert.match(
     prepare,
-    /let Ok\(geometry\) = gx_exact_draw_raster_geometry\(draw, source_vertices\) else \{\s*return Some\(PreparedExactDraw \{\s*required,\s*required_managed_safe: false,\s*qualified: None,\s*\}\);/,
+    /let geometry = match gx_exact_draw_raster_geometry\(draw, source_vertices\) \{\s*Ok\(geometry\) => geometry,\s*Err\(error\) => \{\s*return Some\(PreparedExactDraw \{\s*required,\s*required_managed_safe: false,\s*qualified: None,\s*preparation_failure: Some\(error\.into\(\)\),\s*\}\);/,
   );
   assert.match(
     prepare,

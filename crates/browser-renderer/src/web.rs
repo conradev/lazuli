@@ -15,7 +15,7 @@ use wasm_bindgen_futures::future_to_promise;
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
-use crate::clip::gx_exact_draw_raster_geometry;
+use crate::clip::{GxExactPreparationFailure, gx_exact_draw_raster_geometry};
 use crate::packet::{GxCopyKind, GxCopyState, GxFramePacket, GxTriangleAction};
 use crate::raster::{
     GxRasterAttributePlaneF32, gx_non_aa_raster_color_rgba8, gx_normalized_raster_channel_u8,
@@ -28,8 +28,9 @@ use crate::tev::{
     shader_source as tev_shader_source, tev_pipeline_layout_kind, validate_draw_transport,
 };
 use crate::{
-    EFB_HEIGHT, EFB_WIDTH, ExactRequiredRejectionInputs, ExactRequiredRejectionReason,
-    GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
+    EFB_HEIGHT, EFB_WIDTH, ExactRequiredPreparationRejectionCounts,
+    ExactRequiredPreparationRejectionReason, ExactRequiredRejectionInputs,
+    ExactRequiredRejectionReason, GX_DEPTH24_MAX, GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION,
     GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxBlendFactor, GxBlendOperation, GxCopyClearMask,
     GxDepthCompareLocation, GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding,
     GxEfbFormat, GxFogState, GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor,
@@ -364,6 +365,7 @@ struct PreparedExactDraw {
     required: bool,
     required_managed_safe: bool,
     qualified: Option<QualifiedExactDraw>,
+    preparation_failure: Option<GxExactPreparationFailure>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -970,6 +972,8 @@ pub struct WebGpuRenderer {
     queue: wgpu::Queue,
     failure_state: RendererFailureState,
     metrics: Rc<Cell<RendererMetrics>>,
+    // This 40-entry observer is cold; do not make every hot metric update copy it.
+    exact_required_preparation_rejection_counts: Cell<ExactRequiredPreparationRejectionCounts>,
     host_timings: Rc<Cell<RendererHostTimings>>,
     draw_timing_eligible_calls: Cell<u64>,
     surface_config: wgpu::SurfaceConfiguration,
@@ -1058,13 +1062,23 @@ fn update_renderer_metrics(
 
 fn record_exact_required_rejection(
     metrics: &Cell<RendererMetrics>,
+    preparation_counts: &Cell<ExactRequiredPreparationRejectionCounts>,
     reason: ExactRequiredRejectionReason,
+    preparation_reason: Option<ExactRequiredPreparationRejectionReason>,
 ) {
-    update_renderer_metrics(metrics, |metrics| {
-        metrics.exact_required_rejected_draws =
-            metrics.exact_required_rejected_draws.saturating_add(1);
-        metrics.record_exact_required_rejection_reason(reason);
-    });
+    let mut current = metrics.get();
+    if let Some(preparation_reason) = preparation_reason {
+        let mut current_preparation_counts = preparation_counts.get();
+        current.record_exact_required_rejection(
+            reason,
+            Some((&mut current_preparation_counts, preparation_reason)),
+        );
+        metrics.set(current);
+        preparation_counts.set(current_preparation_counts);
+    } else {
+        current.record_exact_required_rejection(reason, None);
+        metrics.set(current);
+    }
 }
 
 fn renderer_phase_timing_object(timing: RendererPhaseTiming) -> Result<Object, JsValue> {
@@ -1146,7 +1160,10 @@ fn public_copy_clear_state(
     }))
 }
 
-fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> {
+fn renderer_metrics_object(
+    metrics: RendererMetrics,
+    preparation_counts: ExactRequiredPreparationRejectionCounts,
+) -> Result<Object, JsValue> {
     let result = Object::new();
     for (name, value) in [
         ("beginSegmentCalls", metrics.begin_segment_calls),
@@ -1220,6 +1237,19 @@ fn renderer_metrics_object(metrics: RendererMetrics) -> Result<Object, JsValue> 
         &result,
         &JsValue::from_str("exactRequiredRejectionReasons"),
         &rejection_reasons,
+    )?;
+    let preparation_rejection_reasons = Object::new();
+    for reason in ExactRequiredPreparationRejectionReason::ALL {
+        Reflect::set(
+            &preparation_rejection_reasons,
+            &JsValue::from_str(reason.telemetry_code()),
+            &JsValue::from_f64(preparation_counts.get(reason) as f64),
+        )?;
+    }
+    Reflect::set(
+        &result,
+        &JsValue::from_str("exactRequiredPreparationRejectionReasons"),
+        &preparation_rejection_reasons,
     )?;
     Ok(result)
 }
@@ -1654,12 +1684,17 @@ impl WebGpuRenderer {
 
     pub fn reset_diagnostics(&self) {
         self.metrics.set(RendererMetrics::default());
+        self.exact_required_preparation_rejection_counts
+            .set(ExactRequiredPreparationRejectionCounts::default());
         self.host_timings.set(RendererHostTimings::default());
         self.draw_timing_eligible_calls.set(0);
     }
 
     pub fn diagnostics(&self) -> Result<Object, JsValue> {
-        renderer_metrics_object(self.metrics.get())
+        renderer_metrics_object(
+            self.metrics.get(),
+            self.exact_required_preparation_rejection_counts.get(),
+        )
     }
 
     pub fn host_diagnostics(&self) -> Result<Object, JsValue> {
@@ -2425,8 +2460,10 @@ impl WebGpuRenderer {
                     });
                 }
                 ExactAuthoritativeNoop::RequiredRejected => {
+                    let prepared =
+                        prepared_exact.expect("required rejection has prepared exact input");
                     let reason = classify_exact_required_rejection(
-                        prepared_exact.expect("required rejection has prepared exact input"),
+                        prepared,
                         topology,
                         tev_state,
                         textures,
@@ -2443,7 +2480,15 @@ impl WebGpuRenderer {
                         viewport_half_width_bits,
                         cull_mode,
                     );
-                    record_exact_required_rejection(&self.metrics, reason);
+                    let preparation_reason = prepared
+                        .preparation_failure
+                        .map(GxExactPreparationFailure::telemetry_reason);
+                    record_exact_required_rejection(
+                        &self.metrics,
+                        &self.exact_required_preparation_rejection_counts,
+                        reason,
+                        preparation_reason,
+                    );
                 }
             }
             // Exact clipping/culling proves this draw contributes no fragments,
@@ -2469,7 +2514,9 @@ impl WebGpuRenderer {
             // or the native primitive-ordered path.
             record_exact_required_rejection(
                 &self.metrics,
+                &self.exact_required_preparation_rejection_counts,
                 ExactRequiredRejectionReason::EarlyDepth,
+                None,
             );
             return Ok(());
         }
@@ -2580,7 +2627,12 @@ impl WebGpuRenderer {
                     cull_mode,
                 )
             };
-            record_exact_required_rejection(&self.metrics, reason);
+            record_exact_required_rejection(
+                &self.metrics,
+                &self.exact_required_preparation_rejection_counts,
+                reason,
+                None,
+            );
             return Ok(());
         }
         let native_expanded = exact_managed.is_none().then(|| {
@@ -4025,6 +4077,9 @@ impl WebGpuRenderer {
             queue,
             failure_state,
             metrics: Rc::new(Cell::new(RendererMetrics::default())),
+            exact_required_preparation_rejection_counts: Cell::new(
+                ExactRequiredPreparationRejectionCounts::default(),
+            ),
             host_timings: Rc::new(Cell::new(RendererHostTimings::default())),
             draw_timing_eligible_calls: Cell::new(0),
             surface_config,
@@ -5581,12 +5636,16 @@ fn prepare_exact_draw(
 ) -> Option<PreparedExactDraw> {
     draw.exact_clip_input?;
     let required = draw.record.exact_clip_required;
-    let Ok(geometry) = gx_exact_draw_raster_geometry(draw, source_vertices) else {
-        return Some(PreparedExactDraw {
-            required,
-            required_managed_safe: false,
-            qualified: None,
-        });
+    let geometry = match gx_exact_draw_raster_geometry(draw, source_vertices) {
+        Ok(geometry) => geometry,
+        Err(error) => {
+            return Some(PreparedExactDraw {
+                required,
+                required_managed_safe: false,
+                qualified: None,
+                preparation_failure: Some(error.into()),
+            });
+        }
     };
     debug_assert_eq!(geometry.triangle_count(), geometry.source_indices().len());
     let expanded = (0..geometry.triangle_count() * 3).collect::<Vec<_>>();
@@ -5602,6 +5661,7 @@ fn prepare_exact_draw(
             required,
             required_managed_safe: false,
             qualified: None,
+            preparation_failure: Some(GxExactPreparationFailure::InvalidPreparedScissor),
         });
     }
     let exact_vertices = geometry.into_vertices();
@@ -5629,6 +5689,7 @@ fn prepare_exact_draw(
         required,
         required_managed_safe,
         qualified: Some(qualified),
+        preparation_failure: None,
     })
 }
 
@@ -6571,6 +6632,7 @@ mod tests {
             required: false,
             required_managed_safe: false,
             qualified: None,
+            preparation_failure: Some(GxExactPreparationFailure::InvalidPreparedScissor),
         };
         assert!(!optional_unqualified.is_required());
         assert_eq!(
@@ -6583,6 +6645,7 @@ mod tests {
             required: true,
             required_managed_safe: false,
             qualified: None,
+            preparation_failure: Some(GxExactPreparationFailure::InvalidPreparedScissor),
         };
         assert!(required_unqualified.is_required());
         assert_eq!(
@@ -6595,6 +6658,7 @@ mod tests {
             required: true,
             required_managed_safe: true,
             qualified: Some(qualified()),
+            preparation_failure: None,
         };
         assert_eq!(required_qualified.authoritative_noop(), None);
 
@@ -6602,6 +6666,7 @@ mod tests {
             required: true,
             required_managed_safe: false,
             qualified: Some(qualified()),
+            preparation_failure: None,
         };
         assert_eq!(
             required_unsafe.authoritative_noop(),
@@ -6613,6 +6678,7 @@ mod tests {
             required: false,
             required_managed_safe: false,
             qualified: Some(qualified()),
+            preparation_failure: None,
         };
         assert_eq!(
             optional_unsafe.authoritative_noop(),
@@ -6629,6 +6695,7 @@ mod tests {
                 managed_tex_coord_sidecar: None,
                 exact_empty: true,
             }),
+            preparation_failure: None,
         };
         assert_eq!(
             optional_empty.authoritative_noop(),
@@ -6663,6 +6730,7 @@ mod tests {
                     managed_tex_coord_sidecar: None,
                     exact_empty: true,
                 }),
+                preparation_failure: None,
             };
             assert_eq!(
                 snapped_empty.authoritative_noop(),
