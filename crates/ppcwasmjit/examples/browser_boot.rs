@@ -4619,7 +4619,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function snapshotSmbSustainedPlay(scenario = controllerScenario) {
       if (scenario?.id !== "smb-sustained-play") return null;
       return {
-        schema: "lazuli-smb-sustained-play-v3",
+        schema: "lazuli-smb-sustained-play-v4",
         capacity: smbSustainedViReceiptCapacity,
         posted: smbSustainedViReceiptsPosted,
         pending: smbSustainedViPending.size,
@@ -24035,16 +24035,311 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
     const smbSustainedPresentedSurfaceCapacity = 60;
-    const smbSustainedPresentedSurfaceSchema =
+    const smbSustainedPresentedSurfaceSchemaV1 =
       "lazuli-smb-sustained-presented-surfaces-v1";
+    const smbSustainedPresentedSurfaceSchemaV2 =
+      "lazuli-smb-sustained-presented-surfaces-v2";
+    const smbSustainedPresentedSurfaceSchema =
+      smbSustainedPresentedSurfaceSchemaV2;
+    const smbSustainedExactRequiredRejectionReasonKeys = Object.freeze([
+      "exactPreparation",
+      "scissor",
+      "primitive",
+      "earlyDepth",
+      "rasterCenter",
+      "depthEncoding",
+      "tevState",
+      "textureCoordinates",
+      "sampler",
+      "zTexture",
+      "fog",
+      "fullyCulled",
+      "managedPayload",
+      "unclassified",
+    ]);
+    const smbSustainedExactRequiredPreparationRejectionReasonKeys =
+      Object.freeze([
+        "invalidVertexLayout",
+        "missingExactClipInput",
+        "positionCountMismatch",
+        "nonFiniteSourceVertex",
+        "cullModeStateMismatch",
+        "unsupportedMultisampling",
+        "unsupportedZFreeze",
+        "nonCanonicalSourceRaster",
+        "unsupportedPostClipW",
+        "unsupportedPostClipPosition",
+        "unsupportedPostClipDepth",
+        "clipInvalidComponentCount",
+        "unsupportedTopology5",
+        "unsupportedTopology6",
+        "unsupportedTopology7",
+        "unsupportedTopologyOther",
+        "clipNoSourceTriangles",
+        "clipInvalidCullMode",
+        "clipInvalidViewportHeight",
+        "clipNonFiniteVertex",
+        "clipArithmeticOverflow",
+        "projectionInvalidComponentCount",
+        "projectionInvalidBpState",
+        "projectionInvalidClipDisable",
+        "unsupportedClipDisable1",
+        "unsupportedClipDisable2",
+        "unsupportedClipDisable3",
+        "unsupportedClipDisable4",
+        "unsupportedClipDisable5",
+        "unsupportedClipDisable6",
+        "unsupportedClipDisable7",
+        "unsupportedClipDisableOther",
+        "projectionInvalidViewport",
+        "projectionInvalidScissor",
+        "projectionNoVisibleScissor",
+        "projectionWrappedScissor",
+        "projectionNonFiniteVertex",
+        "projectionZeroClipW",
+        "projectionArithmeticOverflow",
+        "invalidPreparedScissor",
+      ]);
+    const smbSustainedExactRequiredRejectionKeys = Object.freeze([
+      "exactRequiredRejectedDraws",
+      "exactRequiredRejectionReasons",
+      "exactRequiredPreparationRejectionReasons",
+    ]);
+    const smbSustainedRawExactRequiredRejectionIntervalKeys = Object.freeze([
+      "aggregate",
+      "reasons",
+      "preparationReasons",
+    ]);
     const smbSustainedPresentedSurfaceExtremePpm = 850_000;
     const smbSustainedPresentedSurfaceDarkChannelMaximum = 8;
     const smbSustainedPresentedSurfaceLightChannelMinimum = 247;
+    function smbSustainedRequireExactObjectKeys(value, keys, context) {
+      if (
+        value === null
+        || typeof value !== "object"
+        || Array.isArray(value)
+      ) {
+        throw new Error(`${context} must be an object`);
+      }
+      const actualKeys = Object.keys(value);
+      if (
+        actualKeys.length !== keys.length
+        || keys.some(key => !Object.hasOwn(value, key))
+      ) {
+        throw new Error(
+          `${context} must contain exactly ${keys.join(", ")}`
+        );
+      }
+      return value;
+    }
+    function smbSustainedExactRequiredCount(value, context) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`${context} must be a non-negative safe integer`);
+      }
+      return value;
+    }
+    function smbSustainedExactRequiredSafeSum(values, context) {
+      let total = 0;
+      for (const value of values) {
+        const next = total + value;
+        if (!Number.isSafeInteger(next)) {
+          throw new Error(`${context} exceeds the safe-integer envelope`);
+        }
+        total = next;
+      }
+      return total;
+    }
+    function smbSustainedExactRequiredCountMap(value, keys, context) {
+      smbSustainedRequireExactObjectKeys(value, keys, context);
+      return Object.fromEntries(keys.map(key => [
+        key,
+        smbSustainedExactRequiredCount(value[key], `${context}.${key}`),
+      ]));
+    }
+    function validateSmbSustainedExactRequiredRejections(value, context) {
+      smbSustainedRequireExactObjectKeys(
+        value,
+        smbSustainedExactRequiredRejectionKeys,
+        context
+      );
+      const exactRequiredRejectedDraws = smbSustainedExactRequiredCount(
+        value.exactRequiredRejectedDraws,
+        `${context}.exactRequiredRejectedDraws`
+      );
+      const exactRequiredRejectionReasons =
+        smbSustainedExactRequiredCountMap(
+          value.exactRequiredRejectionReasons,
+          smbSustainedExactRequiredRejectionReasonKeys,
+          `${context}.exactRequiredRejectionReasons`
+        );
+      const exactRequiredPreparationRejectionReasons =
+        smbSustainedExactRequiredCountMap(
+          value.exactRequiredPreparationRejectionReasons,
+          smbSustainedExactRequiredPreparationRejectionReasonKeys,
+          `${context}.exactRequiredPreparationRejectionReasons`
+        );
+      const parentTotal = smbSustainedExactRequiredSafeSum(
+        Object.values(exactRequiredRejectionReasons),
+        `${context}.exactRequiredRejectionReasons`
+      );
+      if (exactRequiredRejectedDraws !== parentTotal) {
+        throw new Error(
+          `${context}.exactRequiredRejectedDraws must equal the parent-reason sum`
+        );
+      }
+      const preparationTotal = smbSustainedExactRequiredSafeSum(
+        Object.values(exactRequiredPreparationRejectionReasons),
+        `${context}.exactRequiredPreparationRejectionReasons`
+      );
+      if (
+        exactRequiredRejectionReasons.exactPreparation
+        !== preparationTotal
+      ) {
+        throw new Error(
+          `${context}.exactRequiredRejectionReasons.exactPreparation `
+          + "must equal the preparation-reason sum"
+        );
+      }
+      return {
+        exactRequiredRejectedDraws,
+        exactRequiredRejectionReasons,
+        exactRequiredPreparationRejectionReasons,
+      };
+    }
+    function projectSmbSustainedExactRequiredRejectionInterval(
+      interval,
+      context
+    ) {
+      smbSustainedRequireExactObjectKeys(
+        interval,
+        smbSustainedRawExactRequiredRejectionIntervalKeys,
+        context
+      );
+      return validateSmbSustainedExactRequiredRejections(
+        {
+          exactRequiredRejectedDraws: interval.aggregate,
+          exactRequiredRejectionReasons: interval.reasons,
+          exactRequiredPreparationRejectionReasons:
+            interval.preparationReasons,
+        },
+        context
+      );
+    }
+    function zeroSmbSustainedExactRequiredRejections() {
+      return {
+        exactRequiredRejectedDraws: 0,
+        exactRequiredRejectionReasons: Object.fromEntries(
+          smbSustainedExactRequiredRejectionReasonKeys
+            .map(key => [key, 0])
+        ),
+        exactRequiredPreparationRejectionReasons: Object.fromEntries(
+          smbSustainedExactRequiredPreparationRejectionReasonKeys
+            .map(key => [key, 0])
+        ),
+      };
+    }
+    function summarizeSmbSustainedExactRequiredRejections(frames) {
+      const capturedTotals = zeroSmbSustainedExactRequiredRejections();
+      const rejectedOrdinals = [];
+      const exactPreparationOrdinals = [];
+      const reasonOrdinals = Object.fromEntries(
+        smbSustainedExactRequiredRejectionReasonKeys
+          .map(key => [key, []])
+      );
+      const preparationReasonOrdinals = Object.fromEntries(
+        smbSustainedExactRequiredPreparationRejectionReasonKeys
+          .map(key => [key, []])
+      );
+      for (let index = 0; index < frames.length; index += 1) {
+        const frame = frames[index];
+        const ordinal = index + 1;
+        if (frame?.ordinal !== ordinal) {
+          throw new Error(
+            `WebGPU sustained surface frame ${ordinal} has invalid ordinal`
+          );
+        }
+        const delta = validateSmbSustainedExactRequiredRejections(
+          frame.exactRequiredRejectionsSincePreviousPresentation,
+          `WebGPU sustained surface frame ${ordinal} exact rejection interval`
+        );
+        capturedTotals.exactRequiredRejectedDraws =
+          smbSustainedExactRequiredSafeSum(
+            [
+              capturedTotals.exactRequiredRejectedDraws,
+              delta.exactRequiredRejectedDraws,
+            ],
+            "WebGPU sustained exact rejection aggregate"
+          );
+        if (delta.exactRequiredRejectedDraws !== 0) {
+          rejectedOrdinals.push(ordinal);
+        }
+        for (
+          const key
+          of smbSustainedExactRequiredRejectionReasonKeys
+        ) {
+          capturedTotals.exactRequiredRejectionReasons[key] =
+            smbSustainedExactRequiredSafeSum(
+              [
+                capturedTotals.exactRequiredRejectionReasons[key],
+                delta.exactRequiredRejectionReasons[key],
+              ],
+              `WebGPU sustained exact rejection reason ${key}`
+            );
+          if (delta.exactRequiredRejectionReasons[key] !== 0) {
+            reasonOrdinals[key].push(ordinal);
+          }
+        }
+        if (delta.exactRequiredRejectionReasons.exactPreparation !== 0) {
+          exactPreparationOrdinals.push(ordinal);
+        }
+        for (
+          const key
+          of smbSustainedExactRequiredPreparationRejectionReasonKeys
+        ) {
+          capturedTotals.exactRequiredPreparationRejectionReasons[key] =
+            smbSustainedExactRequiredSafeSum(
+              [
+                capturedTotals
+                  .exactRequiredPreparationRejectionReasons[key],
+                delta.exactRequiredPreparationRejectionReasons[key],
+              ],
+              `WebGPU sustained exact preparation rejection reason ${key}`
+            );
+          if (
+            delta.exactRequiredPreparationRejectionReasons[key] !== 0
+          ) {
+            preparationReasonOrdinals[key].push(ordinal);
+          }
+        }
+      }
+      const validatedTotals =
+        validateSmbSustainedExactRequiredRejections(
+          capturedTotals,
+          "WebGPU sustained exact rejection captured totals"
+        );
+      return {
+        clean: validatedTotals.exactRequiredRejectedDraws === 0,
+        capturedTotals: validatedTotals,
+        rejectedOrdinals,
+        exactPreparationOrdinals,
+        reasonOrdinals,
+        preparationReasonOrdinals,
+      };
+    }
     function smbSustainedPresentedSurfaceNearExtreme(count, pixels) {
       return count * 1_000_000
         >= pixels * smbSustainedPresentedSurfaceExtremePpm;
     }
-    function summarizeSmbSustainedPresentedSurfaces(frames) {
+    function summarizeSmbSustainedPresentedSurfaces(
+      frames,
+      schema = "lazuli-smb-sustained-presented-surfaces-v1"
+    ) {
+      if (
+        schema !== "lazuli-smb-sustained-presented-surfaces-v1"
+        && schema !== "lazuli-smb-sustained-presented-surfaces-v2"
+      ) {
+        throw new Error(`unsupported sustained surface schema ${schema}`);
+      }
       const classified = frames.map(frame => {
         const surface = frame.presentedSurface;
         const pixels = surface.width * surface.height;
@@ -24119,7 +24414,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             || (previous.nearWhite && frame.nearBlack);
         })
         .map(frame => frame.ordinal);
-      return {
+      const oracle = {
         capacity: smbSustainedPresentedSurfaceCapacity,
         captured: classified.length,
         complete: classified.length === smbSustainedPresentedSurfaceCapacity,
@@ -24182,6 +24477,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           .map(frame => frame.ordinal),
         frames: classified,
       };
+      if (schema === "lazuli-smb-sustained-presented-surfaces-v1") {
+        return oracle;
+      }
+      return {
+        ...oracle,
+        exactRequiredRejections:
+          summarizeSmbSustainedExactRequiredRejections(frames),
+      };
     }
     async function readSmbSustainedPresentedSurfaceHistory() {
       const captures =
@@ -24198,11 +24501,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       for (let index = 0; index < captures.length; index += 1) {
         const capture = captures[index];
         captures[index] = null;
+        const context = `WebGPU sustained surface readback ${index + 1}`;
         frames.push({
           ordinal: index + 1,
+          exactRequiredRejectionsSincePreviousPresentation:
+            projectSmbSustainedExactRequiredRejectionInterval(
+              capture?.exactRequiredRejectionInterval,
+              `${context} exact rejection interval`
+            ),
           presentedSurface: await summarizePresentedSurfaceCapture(
             capture,
-            `WebGPU sustained surface readback ${index + 1}`,
+            context,
             false
           ),
         });
@@ -24211,7 +24520,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         schema: smbSustainedPresentedSurfaceSchema,
         capacity: smbSustainedPresentedSurfaceCapacity,
         frames,
-        oracle: summarizeSmbSustainedPresentedSurfaces(frames),
+        oracle: summarizeSmbSustainedPresentedSurfaces(
+          frames,
+          smbSustainedPresentedSurfaceSchema
+        ),
       };
     }
     function expectedViPairField(value) {
@@ -24765,7 +25077,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           && terminalReport?.stage === "scenario-complete"
           && terminalReport?.scenario?.status === "complete"
           && terminalReport?.sustainedPlay?.schema
-            === "lazuli-smb-sustained-play-v3";
+            === "lazuli-smb-sustained-play-v4";
         const sustainedPresentedSurfaces =
           sustainedPlayTerminal
             ? await readSmbSustainedPresentedSurfaceHistory()

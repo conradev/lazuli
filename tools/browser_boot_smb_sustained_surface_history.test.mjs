@@ -44,9 +44,22 @@ function extractFunction(name) {
   assert.fail(`unterminated ${name}`);
 }
 
-function deriveBrowserSmbSustainedSurfaceOracle(frames) {
+function deriveBrowserSmbSustainedSurfaceOracle(frames, schema) {
   const context = {
     smbSustainedPresentedSurfaceCapacity: 60,
+    smbSustainedPresentedSurfaceSchemaV1:
+      SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+    smbSustainedPresentedSurfaceSchemaV2:
+      SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
+    smbSustainedExactRequiredRejectionReasonKeys:
+      SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS,
+    smbSustainedExactRequiredPreparationRejectionReasonKeys:
+      SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS,
+    smbSustainedExactRequiredRejectionKeys: [
+      "exactRequiredRejectedDraws",
+      "exactRequiredRejectionReasons",
+      "exactRequiredPreparationRejectionReasons",
+    ],
     smbSustainedPresentedSurfaceExtremePpm:
       SMB_SUSTAINED_PRESENTED_SURFACE_EXTREME_PPM,
     smbSustainedPresentedSurfaceDarkChannelMaximum:
@@ -57,6 +70,13 @@ function deriveBrowserSmbSustainedSurfaceOracle(frames) {
   vm.createContext(context);
   vm.runInContext(
     [
+      extractFunction("smbSustainedRequireExactObjectKeys"),
+      extractFunction("smbSustainedExactRequiredCount"),
+      extractFunction("smbSustainedExactRequiredSafeSum"),
+      extractFunction("smbSustainedExactRequiredCountMap"),
+      extractFunction("validateSmbSustainedExactRequiredRejections"),
+      extractFunction("zeroSmbSustainedExactRequiredRejections"),
+      extractFunction("summarizeSmbSustainedExactRequiredRejections"),
       extractFunction("smbSustainedPresentedSurfaceNearExtreme"),
       extractFunction("summarizeSmbSustainedPresentedSurfaces"),
     ].join("\n\n"),
@@ -66,6 +86,7 @@ function deriveBrowserSmbSustainedSurfaceOracle(frames) {
   return JSON.parse(JSON.stringify(
     context.summarizeSmbSustainedPresentedSurfaces(
       structuredClone(frames),
+      schema,
     ),
   ));
 }
@@ -73,7 +94,10 @@ function deriveBrowserSmbSustainedSurfaceOracle(frames) {
 test("browser and independent model derive identical sustained surface oracles", () => {
   const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
   const frames = report.rendering.sustainedPresentedSurfaces.frames;
-  const browser = deriveBrowserSmbSustainedSurfaceOracle(frames);
+  const browser = deriveBrowserSmbSustainedSurfaceOracle(
+    frames,
+    SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+  );
   const independent =
     deriveSmbSustainedPresentedSurfaceHistoryOracle(structuredClone(frames));
   assert.deepEqual(browser, independent);
@@ -104,6 +128,10 @@ test("v2 derives exact parent and preparation rejection correlations", () => {
   const oracle = deriveSmbSustainedPresentedSurfaceHistoryOracle(
     history.frames,
     history.schema,
+  );
+  assert.deepEqual(
+    deriveBrowserSmbSustainedSurfaceOracle(history.frames, history.schema),
+    oracle,
   );
   assert.equal(
     oracle.exactRequiredRejections.capturedTotals
