@@ -7,13 +7,16 @@ import {
   SMB_SUSTAINED_PLAY_SCHEMA_V1,
   SMB_SUSTAINED_PLAY_SCHEMA_V2,
   SMB_SUSTAINED_PLAY_SCHEMA_V3,
+  SMB_SUSTAINED_PLAY_SCHEMA_V4,
   SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
   deriveSmbSustainedPlayOracle,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   SMB_SUSTAINED_PRESENTED_SURFACE_CAPACITY,
   SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+  SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
   deriveSmbSustainedPresentedSurfaceHistoryOracle,
+  zeroSmbSustainedExactRequiredRejections,
 } from "./browser_boot_smb_sustained_surface_history.mjs";
 import {
   deriveTemporalPresentedSurfaceOracle,
@@ -169,7 +172,7 @@ function sustainedFieldEvidence(presentation, seed) {
   };
 }
 
-function addSustainedPresentedSurfaceHistory(report) {
+function addSustainedPresentedSurfaceHistory(report, schema) {
   const frames = Array.from(
     { length: SMB_SUSTAINED_PRESENTED_SURFACE_CAPACITY },
     (_unused, index) => {
@@ -188,6 +191,12 @@ function addSustainedPresentedSurfaceHistory(report) {
       const pixels = completion.presentation.width * completion.presentation.height;
       return {
         ordinal: index + 1,
+        ...(schema === SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2
+          ? {
+            exactRequiredRejectionsSincePreviousPresentation:
+              zeroSmbSustainedExactRequiredRejections(),
+          }
+          : {}),
         presentedSurface: {
           pairEpoch: completion.pairEpoch,
           presentationMode: "interlaced",
@@ -220,10 +229,10 @@ function addSustainedPresentedSurfaceHistory(report) {
     },
   );
   report.rendering.sustainedPresentedSurfaces = {
-    schema: SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+    schema,
     capacity: SMB_SUSTAINED_PRESENTED_SURFACE_CAPACITY,
     frames,
-    oracle: deriveSmbSustainedPresentedSurfaceHistoryOracle(frames),
+    oracle: deriveSmbSustainedPresentedSurfaceHistoryOracle(frames, schema),
   };
 }
 
@@ -277,6 +286,7 @@ export function smbSustainedPlayReport(
       (_unused, index) => (
         schema === SMB_SUSTAINED_PLAY_SCHEMA_V2
         || schema === SMB_SUSTAINED_PLAY_SCHEMA_V3
+        || schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
       )
         ? pairedReceipt(index)
         : receipt(index),
@@ -286,7 +296,15 @@ export function smbSustainedPlayReport(
     oracle: null,
   };
   if (schema === SMB_SUSTAINED_PLAY_SCHEMA_V3) {
-    addSustainedPresentedSurfaceHistory(report);
+    addSustainedPresentedSurfaceHistory(
+      report,
+      SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+    );
+  } else if (schema === SMB_SUSTAINED_PLAY_SCHEMA_V4) {
+    addSustainedPresentedSurfaceHistory(
+      report,
+      SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
+    );
   }
   report.sustainedPlay.oracle = deriveSmbSustainedPlayOracle(report);
   return report;

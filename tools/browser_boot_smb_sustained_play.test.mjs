@@ -8,12 +8,17 @@ import {
   SMB_SUSTAINED_PLAY_SCHEMA_V1,
   SMB_SUSTAINED_PLAY_SCHEMA_V2,
   SMB_SUSTAINED_PLAY_SCHEMA_V3,
+  SMB_SUSTAINED_PLAY_SCHEMA_V4,
   SmbSustainedPlayValidationError,
   deriveSmbSustainedPlayOracle,
   verifySmbSustainedPlay,
   verifySmbSustainedPlayPrefix,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
+  SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS,
+  SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS,
+  SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+  SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
   SmbSustainedSurfaceHistoryValidationError,
   deriveSmbSustainedPresentedSurfaceHistoryOracle,
 } from "./browser_boot_smb_sustained_surface_history.mjs";
@@ -45,8 +50,12 @@ function syncSurfacePopulations(surface) {
   }
 }
 
-function sustainedPrefixReport(receipts = 16, pending = 0) {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+function sustainedPrefixReport(
+  receipts = 16,
+  pending = 0,
+  schema = SMB_SUSTAINED_PLAY_SCHEMA_V4,
+) {
+  const report = smbSustainedPlayReport(schema);
   report.status = "running";
   report.stage = "execute";
   report.scenario.status = "running";
@@ -62,7 +71,7 @@ function sustainedPrefixReport(receipts = 16, pending = 0) {
   return report;
 }
 
-test("live v3 prefix validates exact partial pairing and chronology", () => {
+test("live v3 and v4 prefixes validate exact partial pairing and chronology", () => {
   const empty = sustainedPrefixReport(0, 0);
   assert.deepEqual(verifySmbSustainedPlayPrefix(empty), {
     acceptedReceipts: 0,
@@ -95,6 +104,15 @@ test("live v3 prefix validates exact partial pairing and chronology", () => {
     pendingReceipts: 2,
     postedReceipts: 18,
   });
+  const replayedV3 = sustainedPrefixReport(
+    16,
+    2,
+    SMB_SUSTAINED_PLAY_SCHEMA_V3,
+  );
+  assert.equal(
+    verifySmbSustainedPlayPrefix(replayedV3).lastPresentationSerial,
+    907,
+  );
 
   const malformedReceipt = sustainedPrefixReport();
   malformedReceipt.sustainedPlay.receipts[3].presentation.copyIndex = 1;
@@ -114,7 +132,7 @@ test("live v3 prefix validates exact partial pairing and chronology", () => {
 
   const prematureHistory = sustainedPrefixReport();
   prematureHistory.rendering.sustainedPresentedSurfaces =
-    smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3)
+    smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4)
       .rendering.sustainedPresentedSurfaces;
   assert.throws(
     () => verifySmbSustainedPlayPrefix(prematureHistory),
@@ -213,6 +231,156 @@ test("v3 binds all 60 retained WebGPU surfaces to exact completed VI pairs", () 
   assert.equal(surfaces.oracle.bottomFieldNearWhiteOrdinals.length, 0);
   assert.equal(surfaces.oracle.sourceBlackWhiteSplitOrdinals.length, 0);
   assert.equal(surfaces.oracle.sourceNearBlackWhiteSplitOrdinals.length, 0);
+});
+
+test("v4 binds zero exact-required rejection deltas to all 60 surfaces", () => {
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const oracle = verifySmbSustainedPlay(report);
+  const surfaces = report.rendering.sustainedPresentedSurfaces;
+  const exactRequired = surfaces.oracle.exactRequiredRejections;
+  assert.equal(
+    surfaces.schema,
+    SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
+  );
+  assert.equal(oracle.presented, 60);
+  assert.equal(surfaces.frames.length, 60);
+  assert.ok(surfaces.frames.every(frame =>
+    frame.exactRequiredRejectionsSincePreviousPresentation
+      .exactRequiredRejectedDraws === 0
+  ));
+  assert.equal(
+    exactRequired.capturedTotals.exactRequiredRejectedDraws,
+    0,
+  );
+  assert.equal(exactRequired.clean, true);
+  assert.deepEqual(exactRequired.rejectedOrdinals, []);
+  assert.deepEqual(exactRequired.exactPreparationOrdinals, []);
+  assert.deepEqual(
+    Object.keys(exactRequired.reasonOrdinals),
+    [...SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS],
+  );
+  assert.deepEqual(
+    Object.keys(exactRequired.preparationReasonOrdinals),
+    [...SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS],
+  );
+  assert.ok(Object.values(exactRequired.reasonOrdinals)
+    .every(ordinals => ordinals.length === 0));
+  assert.ok(Object.values(exactRequired.preparationReasonOrdinals)
+    .every(ordinals => ordinals.length === 0));
+});
+
+test("v4 rejects forged exact-required sums, maps, and count types", () => {
+  const expectExactFailure = (mutate, path) => {
+    const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+    mutate(report.rendering.sustainedPresentedSurfaces.frames[6]);
+    assert.throws(
+      () => verifySmbSustainedPlay(report),
+      error => error instanceof SmbSustainedSurfaceHistoryValidationError
+        && error.path === path,
+    );
+  };
+  const basePath = "$.rendering.sustainedPresentedSurfaces.frames[6]";
+  const deltaPath =
+    `${basePath}.exactRequiredRejectionsSincePreviousPresentation`;
+  expectExactFailure(
+    frame => {
+      delete frame.exactRequiredRejectionsSincePreviousPresentation;
+    },
+    `${basePath}.[keys]`,
+  );
+  expectExactFailure(
+    frame => {
+      frame.exactRequiredRejectionsSincePreviousPresentation
+        .exactRequiredRejectedDraws = 1;
+    },
+    `${deltaPath}.exactRequiredRejectedDraws`,
+  );
+  expectExactFailure(
+    frame => {
+      frame.exactRequiredRejectionsSincePreviousPresentation
+        .exactRequiredRejectionReasons.scissor = -1;
+    },
+    `${deltaPath}.exactRequiredRejectionReasons.scissor`,
+  );
+  expectExactFailure(
+    frame => {
+      frame.exactRequiredRejectionsSincePreviousPresentation
+        .exactRequiredRejectionReasons.futureReason = 0;
+    },
+    `${deltaPath}.exactRequiredRejectionReasons.[keys]`,
+  );
+  expectExactFailure(
+    frame => {
+      const delta =
+        frame.exactRequiredRejectionsSincePreviousPresentation;
+      delta.exactRequiredRejectedDraws = 1;
+      delta.exactRequiredRejectionReasons.exactPreparation = 1;
+    },
+    `${deltaPath}.exactRequiredRejectionReasons.exactPreparation`,
+  );
+  expectExactFailure(
+    frame => {
+      frame.exactRequiredRejectionsSincePreviousPresentation
+        .exactRequiredPreparationRejectionReasons
+        .unsupportedClipDisable7 = 0.5;
+    },
+    `${deltaPath}.exactRequiredPreparationRejectionReasons`
+      + ".unsupportedClipDisable7",
+  );
+  expectExactFailure(
+    frame => {
+      frame.exactRequiredRejectionsSincePreviousPresentation
+        .exactRequiredPreparationRejectionReasons.futureReason = 0;
+    },
+    `${deltaPath}.exactRequiredPreparationRejectionReasons.[keys]`,
+  );
+});
+
+test("v4 reports correlated rejections before enforcing terminal cleanliness", () => {
+  const correlated = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const history = correlated.rendering.sustainedPresentedSurfaces;
+  const delta = history.frames[18]
+    .exactRequiredRejectionsSincePreviousPresentation;
+  delta.exactRequiredRejectedDraws = 1;
+  delta.exactRequiredRejectionReasons.scissor = 1;
+  history.oracle = deriveSmbSustainedPresentedSurfaceHistoryOracle(
+    history.frames,
+    history.schema,
+  );
+  correlated.rendering.metrics.webgpu.exactRequiredRejectedDraws = 1;
+  assert.throws(
+    () => verifySmbSustainedPlay(correlated),
+    error => error instanceof SmbSustainedSurfaceHistoryValidationError
+      && error.code === "exact-required-rejection"
+      && error.path === "$.rendering.sustainedPresentedSurfaces.oracle"
+        + ".exactRequiredRejections.rejectedOrdinals"
+      && JSON.stringify(error.actual) === JSON.stringify([19]),
+  );
+
+  const uncorrelated = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  uncorrelated.rendering.metrics.webgpu.exactRequiredRejectedDraws = 1;
+  expectFailure(
+    uncorrelated,
+    "$.rendering.metrics.webgpu.exactRequiredRejectedDraws",
+  );
+});
+
+test("v4 mandates surface-history v2 while v3 remains replayable with v1", () => {
+  const v3 = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+  assert.equal(
+    v3.rendering.sustainedPresentedSurfaces.schema,
+    SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+  );
+  assert.equal(verifySmbSustainedPlay(v3).complete, true);
+
+  const v4 = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  v4.rendering.sustainedPresentedSurfaces.schema =
+    SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1;
+  expectFailure(v4, "$.rendering.sustainedPresentedSurfaces.schema");
+
+  v3.rendering.sustainedPresentedSurfaces.schema =
+    SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2;
+  expectFailure(v3, "$.rendering.sustainedPresentedSurfaces.schema");
 });
 
 test("v3 rejects missing, mismatched, extreme, split, and static surfaces", () => {

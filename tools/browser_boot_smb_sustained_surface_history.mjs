@@ -2,10 +2,78 @@
 
 export const SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1 =
   "lazuli-smb-sustained-presented-surfaces-v1";
+export const SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2 =
+  "lazuli-smb-sustained-presented-surfaces-v2";
 export const SMB_SUSTAINED_PRESENTED_SURFACE_CAPACITY = 60;
 export const SMB_SUSTAINED_PRESENTED_SURFACE_EXTREME_PPM = 850_000;
 export const SMB_SUSTAINED_PRESENTED_SURFACE_DARK_CHANNEL_MAXIMUM = 8;
 export const SMB_SUSTAINED_PRESENTED_SURFACE_LIGHT_CHANNEL_MINIMUM = 247;
+export const SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS =
+  Object.freeze([
+    "exactPreparation",
+    "scissor",
+    "primitive",
+    "earlyDepth",
+    "rasterCenter",
+    "depthEncoding",
+    "tevState",
+    "textureCoordinates",
+    "sampler",
+    "zTexture",
+    "fog",
+    "fullyCulled",
+    "managedPayload",
+    "unclassified",
+  ]);
+export const SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS =
+  Object.freeze([
+    "invalidVertexLayout",
+    "missingExactClipInput",
+    "positionCountMismatch",
+    "nonFiniteSourceVertex",
+    "cullModeStateMismatch",
+    "unsupportedMultisampling",
+    "unsupportedZFreeze",
+    "nonCanonicalSourceRaster",
+    "unsupportedPostClipW",
+    "unsupportedPostClipPosition",
+    "unsupportedPostClipDepth",
+    "clipInvalidComponentCount",
+    "unsupportedTopology5",
+    "unsupportedTopology6",
+    "unsupportedTopology7",
+    "unsupportedTopologyOther",
+    "clipNoSourceTriangles",
+    "clipInvalidCullMode",
+    "clipInvalidViewportHeight",
+    "clipNonFiniteVertex",
+    "clipArithmeticOverflow",
+    "projectionInvalidComponentCount",
+    "projectionInvalidBpState",
+    "projectionInvalidClipDisable",
+    "unsupportedClipDisable1",
+    "unsupportedClipDisable2",
+    "unsupportedClipDisable3",
+    "unsupportedClipDisable4",
+    "unsupportedClipDisable5",
+    "unsupportedClipDisable6",
+    "unsupportedClipDisable7",
+    "unsupportedClipDisableOther",
+    "projectionInvalidViewport",
+    "projectionInvalidScissor",
+    "projectionNoVisibleScissor",
+    "projectionWrappedScissor",
+    "projectionNonFiniteVertex",
+    "projectionZeroClipW",
+    "projectionArithmeticOverflow",
+    "invalidPreparedScissor",
+  ]);
+
+const EXACT_REQUIRED_REJECTION_KEYS = [
+  "exactRequiredPreparationRejectionReasons",
+  "exactRequiredRejectedDraws",
+  "exactRequiredRejectionReasons",
+];
 
 const HEX_32 = /^0x[0-9a-f]{8}$/;
 const SHA_256 = /^[0-9a-f]{64}$/;
@@ -120,6 +188,81 @@ function nonNegativeInteger(value, path) {
     fail("envelope", path, "a non-negative safe integer", value);
   }
   return value;
+}
+
+function safeSum(values, path) {
+  let total = 0;
+  for (const value of values) {
+    const next = total + value;
+    if (!Number.isSafeInteger(next)) {
+      fail("envelope", path, "a non-negative safe integer sum", next);
+    }
+    total = next;
+  }
+  return total;
+}
+
+function exactCountMap(value, keys, path) {
+  exactKeys(value, keys, path);
+  return Object.fromEntries(keys.map(key => [
+    key,
+    nonNegativeInteger(value[key], `${path}.${key}`),
+  ]));
+}
+
+function validateExactRequiredRejections(value, path) {
+  exactKeys(value, EXACT_REQUIRED_REJECTION_KEYS, path);
+  const exactRequiredRejectedDraws = nonNegativeInteger(
+    value.exactRequiredRejectedDraws,
+    `${path}.exactRequiredRejectedDraws`,
+  );
+  const exactRequiredRejectionReasons = exactCountMap(
+    value.exactRequiredRejectionReasons,
+    SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS,
+    `${path}.exactRequiredRejectionReasons`,
+  );
+  const exactRequiredPreparationRejectionReasons = exactCountMap(
+    value.exactRequiredPreparationRejectionReasons,
+    SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS,
+    `${path}.exactRequiredPreparationRejectionReasons`,
+  );
+  exact(
+    exactRequiredRejectedDraws,
+    safeSum(
+      Object.values(exactRequiredRejectionReasons),
+      `${path}.exactRequiredRejectionReasons.[sum]`,
+    ),
+    `${path}.exactRequiredRejectedDraws`,
+  );
+  exact(
+    exactRequiredRejectionReasons.exactPreparation,
+    safeSum(
+      Object.values(exactRequiredPreparationRejectionReasons),
+      `${path}.exactRequiredPreparationRejectionReasons.[sum]`,
+    ),
+    `${path}.exactRequiredRejectionReasons.exactPreparation`,
+  );
+  return {
+    exactRequiredRejectedDraws,
+    exactRequiredRejectionReasons,
+    exactRequiredPreparationRejectionReasons,
+  };
+}
+
+function zeroCountMap(keys) {
+  return Object.fromEntries(keys.map(key => [key, 0]));
+}
+
+export function zeroSmbSustainedExactRequiredRejections() {
+  return {
+    exactRequiredRejectedDraws: 0,
+    exactRequiredRejectionReasons: zeroCountMap(
+      SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS,
+    ),
+    exactRequiredPreparationRejectionReasons: zeroCountMap(
+      SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS,
+    ),
+  };
 }
 
 function sha256(value, path) {
@@ -472,9 +615,26 @@ function validateSurface(surface, frameIndex, receipts, previous) {
   };
 }
 
-export function deriveSmbSustainedPresentedSurfaceHistoryOracle(frames) {
+export function deriveSmbSustainedPresentedSurfaceHistoryOracle(
+  frames,
+  schema = SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+) {
   if (!Array.isArray(frames)) {
     fail("envelope", "$.rendering.sustainedPresentedSurfaces.frames", "an array", frames);
+  }
+  if (
+    schema !== SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1
+    && schema !== SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2
+  ) {
+    fail(
+      "invariant",
+      "$.rendering.sustainedPresentedSurfaces.schema",
+      [
+        SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+        SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
+      ],
+      schema,
+    );
   }
   const classified = frames.map(frame => {
     const surface = frame.presentedSurface;
@@ -535,7 +695,7 @@ export function deriveSmbSustainedPresentedSurfaceHistoryOracle(frames) {
         || (previous.nearWhite && frame.nearBlack);
     })
     .map(frame => frame.ordinal);
-  return {
+  const oracle = {
     capacity: SMB_SUSTAINED_PRESENTED_SURFACE_CAPACITY,
     captured: classified.length,
     complete: classified.length === SMB_SUSTAINED_PRESENTED_SURFACE_CAPACITY,
@@ -600,6 +760,86 @@ export function deriveSmbSustainedPresentedSurfaceHistoryOracle(frames) {
       .map(frame => frame.ordinal),
     frames: classified,
   };
+  if (schema === SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1) {
+    return oracle;
+  }
+
+  const capturedTotals = zeroSmbSustainedExactRequiredRejections();
+  const rejectedOrdinals = [];
+  const exactPreparationOrdinals = [];
+  const reasonOrdinals = Object.fromEntries(
+    SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS
+      .map(key => [key, []]),
+  );
+  const preparationReasonOrdinals = Object.fromEntries(
+    SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS
+      .map(key => [key, []]),
+  );
+  for (let index = 0; index < frames.length; index += 1) {
+    const frame = frames[index];
+    const path = `$.rendering.sustainedPresentedSurfaces.frames[${index}]`
+      + ".exactRequiredRejectionsSincePreviousPresentation";
+    const delta = validateExactRequiredRejections(
+      frame.exactRequiredRejectionsSincePreviousPresentation,
+      path,
+    );
+    const ordinal = frame.ordinal;
+    capturedTotals.exactRequiredRejectedDraws = safeSum(
+      [
+        capturedTotals.exactRequiredRejectedDraws,
+        delta.exactRequiredRejectedDraws,
+      ],
+      "$.rendering.sustainedPresentedSurfaces.oracle"
+        + ".exactRequiredRejections.capturedTotals.exactRequiredRejectedDraws",
+    );
+    if (delta.exactRequiredRejectedDraws !== 0) {
+      rejectedOrdinals.push(ordinal);
+    }
+    for (const key of SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS) {
+      capturedTotals.exactRequiredRejectionReasons[key] = safeSum(
+        [
+          capturedTotals.exactRequiredRejectionReasons[key],
+          delta.exactRequiredRejectionReasons[key],
+        ],
+        "$.rendering.sustainedPresentedSurfaces.oracle"
+          + `.exactRequiredRejections.capturedTotals.exactRequiredRejectionReasons.${key}`,
+      );
+      if (delta.exactRequiredRejectionReasons[key] !== 0) {
+        reasonOrdinals[key].push(ordinal);
+      }
+    }
+    if (delta.exactRequiredRejectionReasons.exactPreparation !== 0) {
+      exactPreparationOrdinals.push(ordinal);
+    }
+    for (
+      const key
+      of SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS
+    ) {
+      capturedTotals.exactRequiredPreparationRejectionReasons[key] = safeSum(
+        [
+          capturedTotals.exactRequiredPreparationRejectionReasons[key],
+          delta.exactRequiredPreparationRejectionReasons[key],
+        ],
+        "$.rendering.sustainedPresentedSurfaces.oracle"
+          + ".exactRequiredRejections.capturedTotals"
+          + `.exactRequiredPreparationRejectionReasons.${key}`,
+      );
+      if (delta.exactRequiredPreparationRejectionReasons[key] !== 0) {
+        preparationReasonOrdinals[key].push(ordinal);
+      }
+    }
+  }
+  return {
+    ...oracle,
+    exactRequiredRejections: {
+      clean: rejectedOrdinals.length === 0,
+      capturedTotals,
+      rejectedOrdinals,
+      exactPreparationOrdinals,
+      reasonOrdinals,
+      preparationReasonOrdinals,
+    },
+  };
 }
 
 function firstDifference(expected, actual, path) {
@@ -649,11 +889,22 @@ export function verifySmbSustainedPresentedSurfaceHistory(history, receipts) {
     ["capacity", "frames", "oracle", "schema"],
     "$.rendering.sustainedPresentedSurfaces",
   );
-  exact(
-    history.schema,
-    SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
-    "$.rendering.sustainedPresentedSurfaces.schema",
-  );
+  if (
+    history.schema !== SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1
+    && history.schema !== SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2
+  ) {
+    fail(
+      "invariant",
+      "$.rendering.sustainedPresentedSurfaces.schema",
+      [
+        SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+        SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
+      ],
+      history.schema,
+    );
+  }
+  const exactRequiredRejectionHistory =
+    history.schema === SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2;
   exact(
     history.capacity,
     SMB_SUSTAINED_PRESENTED_SURFACE_CAPACITY,
@@ -678,10 +929,22 @@ export function verifySmbSustainedPresentedSurfaceHistory(history, receipts) {
     const path = `$.rendering.sustainedPresentedSurfaces.frames[${index}]`;
     const frame = exactKeys(
       history.frames[index],
-      ["ordinal", "presentedSurface"],
+      exactRequiredRejectionHistory
+        ? [
+          "exactRequiredRejectionsSincePreviousPresentation",
+          "ordinal",
+          "presentedSurface",
+        ]
+        : ["ordinal", "presentedSurface"],
       path,
     );
     exact(frame.ordinal, index + 1, `${path}.ordinal`);
+    if (exactRequiredRejectionHistory) {
+      validateExactRequiredRejections(
+        frame.exactRequiredRejectionsSincePreviousPresentation,
+        `${path}.exactRequiredRejectionsSincePreviousPresentation`,
+      );
+    }
     previous = validateSurface(
       frame.presentedSurface,
       index,
@@ -689,7 +952,10 @@ export function verifySmbSustainedPresentedSurfaceHistory(history, receipts) {
       previous,
     );
   }
-  const derived = deriveSmbSustainedPresentedSurfaceHistoryOracle(history.frames);
+  const derived = deriveSmbSustainedPresentedSurfaceHistoryOracle(
+    history.frames,
+    history.schema,
+  );
   const difference = firstDifference(
     derived,
     history.oracle,
@@ -697,6 +963,61 @@ export function verifySmbSustainedPresentedSurfaceHistory(history, receipts) {
   );
   if (difference !== null) {
     fail("oracle-mismatch", difference.path, difference.expected, difference.actual);
+  }
+  if (exactRequiredRejectionHistory) {
+    const exactRequired = derived.exactRequiredRejections;
+    for (const [path, values] of [
+      ["rejectedOrdinals", exactRequired.rejectedOrdinals],
+      ["exactPreparationOrdinals", exactRequired.exactPreparationOrdinals],
+      ...SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS.map(key => [
+        `reasonOrdinals.${key}`,
+        exactRequired.reasonOrdinals[key],
+      ]),
+      ...SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS
+        .map(key => [
+          `preparationReasonOrdinals.${key}`,
+          exactRequired.preparationReasonOrdinals[key],
+        ]),
+    ]) {
+      if (values.length !== 0) {
+        fail(
+          "exact-required-rejection",
+          "$.rendering.sustainedPresentedSurfaces.oracle"
+            + `.exactRequiredRejections.${path}`,
+          [],
+          values,
+        );
+      }
+    }
+    for (const [path, count] of [
+      [
+        "exactRequiredRejectedDraws",
+        exactRequired.capturedTotals.exactRequiredRejectedDraws,
+      ],
+      ...SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS.map(key => [
+        `exactRequiredRejectionReasons.${key}`,
+        exactRequired.capturedTotals.exactRequiredRejectionReasons[key],
+      ]),
+      ...SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS
+        .map(key => [
+          `exactRequiredPreparationRejectionReasons.${key}`,
+          exactRequired.capturedTotals
+            .exactRequiredPreparationRejectionReasons[key],
+        ]),
+    ]) {
+      exact(
+        count,
+        0,
+        "$.rendering.sustainedPresentedSurfaces.oracle"
+          + `.exactRequiredRejections.capturedTotals.${path}`,
+      );
+    }
+    exact(
+      exactRequired.clean,
+      true,
+      "$.rendering.sustainedPresentedSurfaces.oracle"
+        + ".exactRequiredRejections.clean",
+    );
   }
   for (const [path, values] of [
     ["pairEpochRegressions", derived.pairEpochRegressions],

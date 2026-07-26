@@ -8,12 +8,18 @@ import vm from "node:vm";
 
 import {
   SMB_SUSTAINED_PLAY_SCHEMA_V3,
+  SMB_SUSTAINED_PLAY_SCHEMA_V4,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
+  SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS,
+  SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS,
   SMB_SUSTAINED_PRESENTED_SURFACE_DARK_CHANNEL_MAXIMUM,
   SMB_SUSTAINED_PRESENTED_SURFACE_EXTREME_PPM,
   SMB_SUSTAINED_PRESENTED_SURFACE_LIGHT_CHANNEL_MINIMUM,
+  SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+  SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
   deriveSmbSustainedPresentedSurfaceHistoryOracle,
+  verifySmbSustainedPresentedSurfaceHistory,
 } from "./browser_boot_smb_sustained_surface_history.mjs";
 import {
   smbSustainedPlayReport,
@@ -38,9 +44,7 @@ function extractFunction(name) {
   assert.fail(`unterminated ${name}`);
 }
 
-test("browser and independent model derive identical sustained surface oracles", () => {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
-  const frames = report.rendering.sustainedPresentedSurfaces.frames;
+function deriveBrowserSmbSustainedSurfaceOracle(frames) {
   const context = {
     smbSustainedPresentedSurfaceCapacity: 60,
     smbSustainedPresentedSurfaceExtremePpm:
@@ -59,14 +63,103 @@ test("browser and independent model derive identical sustained surface oracles",
     context,
     { filename: "browser_boot.smb-sustained-surface-history.js" },
   );
-  const browser = context.summarizeSmbSustainedPresentedSurfaces(
-    structuredClone(frames),
-  );
+  return JSON.parse(JSON.stringify(
+    context.summarizeSmbSustainedPresentedSurfaces(
+      structuredClone(frames),
+    ),
+  ));
+}
+
+test("browser and independent model derive identical sustained surface oracles", () => {
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+  const frames = report.rendering.sustainedPresentedSurfaces.frames;
+  const browser = deriveBrowserSmbSustainedSurfaceOracle(frames);
   const independent =
     deriveSmbSustainedPresentedSurfaceHistoryOracle(structuredClone(frames));
+  assert.deepEqual(browser, independent);
+  assert.equal(
+    report.rendering.sustainedPresentedSurfaces.schema,
+    SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+  );
+  assert.equal(Object.hasOwn(independent, "exactRequiredRejections"), false);
+});
+
+test("v2 derives exact parent and preparation rejection correlations", () => {
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const history = report.rendering.sustainedPresentedSurfaces;
+  assert.equal(history.schema, SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2);
+  const scissor = history.frames[3]
+    .exactRequiredRejectionsSincePreviousPresentation;
+  scissor.exactRequiredRejectedDraws = 2;
+  scissor.exactRequiredRejectionReasons.scissor = 2;
+  const preparation = history.frames[10]
+    .exactRequiredRejectionsSincePreviousPresentation;
+  preparation.exactRequiredRejectedDraws = 3;
+  preparation.exactRequiredRejectionReasons.exactPreparation = 3;
+  preparation.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable7 = 2;
+  preparation.exactRequiredPreparationRejectionReasons
+    .projectionZeroClipW = 1;
+
+  const oracle = deriveSmbSustainedPresentedSurfaceHistoryOracle(
+    history.frames,
+    history.schema,
+  );
+  assert.equal(
+    oracle.exactRequiredRejections.capturedTotals
+      .exactRequiredRejectedDraws,
+    5,
+  );
+  assert.equal(
+    oracle.exactRequiredRejections.capturedTotals
+      .exactRequiredRejectionReasons.scissor,
+    2,
+  );
+  assert.equal(
+    oracle.exactRequiredRejections.capturedTotals
+      .exactRequiredRejectionReasons.exactPreparation,
+    3,
+  );
+  assert.equal(
+    oracle.exactRequiredRejections.capturedTotals
+      .exactRequiredPreparationRejectionReasons.unsupportedClipDisable7,
+    2,
+  );
   assert.deepEqual(
-    JSON.parse(JSON.stringify(browser)),
-    independent,
+    oracle.exactRequiredRejections.rejectedOrdinals,
+    [4, 11],
+  );
+  assert.deepEqual(
+    oracle.exactRequiredRejections.exactPreparationOrdinals,
+    [11],
+  );
+  assert.deepEqual(
+    oracle.exactRequiredRejections.reasonOrdinals.scissor,
+    [4],
+  );
+  assert.deepEqual(
+    oracle.exactRequiredRejections
+      .preparationReasonOrdinals.unsupportedClipDisable7,
+    [11],
+  );
+  assert.deepEqual(
+    Object.keys(oracle.exactRequiredRejections.reasonOrdinals),
+    [...SMB_SUSTAINED_EXACT_REQUIRED_REJECTION_REASON_KEYS],
+  );
+  assert.deepEqual(
+    Object.keys(oracle.exactRequiredRejections.preparationReasonOrdinals),
+    [...SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS],
+  );
+  history.oracle = oracle;
+  assert.throws(
+    () => verifySmbSustainedPresentedSurfaceHistory(
+      history,
+      report.sustainedPlay.receipts,
+    ),
+    error => error.code === "exact-required-rejection"
+      && error.path === "$.rendering.sustainedPresentedSurfaces.oracle"
+        + ".exactRequiredRejections.rejectedOrdinals"
+      && JSON.stringify(error.actual) === JSON.stringify([4, 11]),
   );
 });
 

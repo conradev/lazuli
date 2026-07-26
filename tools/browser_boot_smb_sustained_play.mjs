@@ -11,12 +11,15 @@ import {
   verifySmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
 import {
+  SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+  SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
   verifySmbSustainedPresentedSurfaceHistory,
 } from "./browser_boot_smb_sustained_surface_history.mjs";
 
 export const SMB_SUSTAINED_PLAY_SCHEMA_V1 = "lazuli-smb-sustained-play-v1";
 export const SMB_SUSTAINED_PLAY_SCHEMA_V2 = "lazuli-smb-sustained-play-v2";
 export const SMB_SUSTAINED_PLAY_SCHEMA_V3 = "lazuli-smb-sustained-play-v3";
+export const SMB_SUSTAINED_PLAY_SCHEMA_V4 = "lazuli-smb-sustained-play-v4";
 export const SMB_SUSTAINED_VI_RECEIPT_CAPACITY = 120;
 
 const HEX_32 = /^0x[0-9a-f]{8}$/;
@@ -648,7 +651,10 @@ function compareDerived(expected, actual, path = "$.sustainedPlay.oracle") {
   }
 }
 
-function validateV2CompatibilityTelemetry(report) {
+function validateV2CompatibilityTelemetry(
+  report,
+  requireCleanExactRequiredRejections = true,
+) {
   const metrics = requireObject(
     report.rendering?.metrics,
     "$.rendering.metrics",
@@ -662,11 +668,18 @@ function validateV2CompatibilityTelemetry(report) {
     webgpu.exactRasterEmptyDraws,
     "$.rendering.metrics.webgpu.exactRasterEmptyDraws",
   );
-  exact(
-    webgpu.exactRequiredRejectedDraws,
-    0,
-    "$.rendering.metrics.webgpu.exactRequiredRejectedDraws",
-  );
+  if (requireCleanExactRequiredRejections) {
+    exact(
+      webgpu.exactRequiredRejectedDraws,
+      0,
+      "$.rendering.metrics.webgpu.exactRequiredRejectedDraws",
+    );
+  } else {
+    nonNegativeInteger(
+      webgpu.exactRequiredRejectedDraws,
+      "$.rendering.metrics.webgpu.exactRequiredRejectedDraws",
+    );
+  }
 
   const decoder = requireObject(
     report.gxFifo?.decoder,
@@ -811,11 +824,21 @@ export function verifySmbSustainedPlayPrefix(report) {
     ],
     "$.sustainedPlay",
   );
-  exact(
-    sustained.schema,
-    SMB_SUSTAINED_PLAY_SCHEMA_V3,
-    "$.sustainedPlay.schema",
-  );
+  if (
+    sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V3
+    && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4
+  ) {
+    fail(
+      "invariant",
+      "$.sustainedPlay.schema",
+      null,
+      [
+        SMB_SUSTAINED_PLAY_SCHEMA_V3,
+        SMB_SUSTAINED_PLAY_SCHEMA_V4,
+      ],
+      sustained.schema,
+    );
+  }
   exact(
     sustained.capacity,
     SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
@@ -901,7 +924,8 @@ export function deriveSmbSustainedPlayOracle(report) {
 
   const sustained = requireObject(report.sustainedPlay, "$.sustainedPlay");
   const pairedReceipts = sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V2
-    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3;
+    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3
+    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4;
   if (!pairedReceipts && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V1) {
     fail(
       "invariant",
@@ -911,11 +935,17 @@ export function deriveSmbSustainedPlayOracle(report) {
         SMB_SUSTAINED_PLAY_SCHEMA_V1,
         SMB_SUSTAINED_PLAY_SCHEMA_V2,
         SMB_SUSTAINED_PLAY_SCHEMA_V3,
+        SMB_SUSTAINED_PLAY_SCHEMA_V4,
       ],
       sustained.schema,
     );
   }
-  if (pairedReceipts) validateV2CompatibilityTelemetry(report);
+  if (pairedReceipts) {
+    validateV2CompatibilityTelemetry(
+      report,
+      sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4,
+    );
+  }
   const readyPlayAnchor = requireObject(
     sustained.readyPlayAnchor,
     "$.sustainedPlay.readyPlayAnchor",
@@ -975,11 +1005,28 @@ export function deriveSmbSustainedPlayOracle(report) {
   exact(report.rendering?.error ?? null, null, "$.rendering.error");
   exact(report.rendering?.metrics?.operations?.pending, 0, "$.rendering.metrics.operations.pending");
   exact(report.controller?.queueOverflows, 0, "$.controller.queueOverflows");
-  if (sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3) {
+  if (
+    sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3
+    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+  ) {
+    exact(
+      report.rendering?.sustainedPresentedSurfaces?.schema,
+      sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+        ? SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2
+        : SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
+      "$.rendering.sustainedPresentedSurfaces.schema",
+    );
     verifySmbSustainedPresentedSurfaceHistory(
       report.rendering?.sustainedPresentedSurfaces,
       sustained.receipts,
     );
+    if (sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4) {
+      exact(
+        report.rendering.metrics.webgpu.exactRequiredRejectedDraws,
+        0,
+        "$.rendering.metrics.webgpu.exactRequiredRejectedDraws",
+      );
+    }
   }
 
   const drained = sustained.receipts.filter(receipt => receipt.drained === true).length;
