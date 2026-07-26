@@ -1,0 +1,145 @@
+{
+  "schema": "lazuli.gx-w-clipdisable-oracle/v1",
+  "authority": "unmeasured-real-console-fixture",
+  "mailbox": {
+    "logicalAddress": "0x81700000",
+    "physicalAddress": "0x01700000",
+    "magic": "GXW1",
+    "endianTag": "0x01020304",
+    "headerBytes": 64,
+    "entryBytes": 1184,
+    "mailboxBytes": 94784,
+    "statusComplete": 2
+  },
+  "surface": {
+    "width": 16,
+    "height": 16,
+    "copyFormat": "GX_TF_RGBA8",
+    "clearRgba": "000000ff",
+    "drawRgba": "ff0000ff"
+  },
+  "fixedState": {
+    "topology": "GX_TRIANGLES",
+    "cull": "GX_CULL_NONE",
+    "viewport": [0, 0, 16, 16, 0, 1],
+    "scissor": [0, 0, 16, 16],
+    "scissorBoxOffset": [0, 0],
+    "depthTest": false,
+    "blend": false,
+    "dither": false,
+    "projection": {
+      "type": "GX_PERSPECTIVE",
+      "clipX": "viewX",
+      "clipY": "viewY",
+      "clipZ": "0.5 * viewZ",
+      "clipW": "-viewZ"
+    }
+  },
+  "clipDisableModes": [
+    {"value": 0, "bits": "000"},
+    {"value": 1, "bits": "001"},
+    {"value": 2, "bits": "010"},
+    {"value": 3, "bits": "011"},
+    {"value": 4, "bits": "100"},
+    {"value": 5, "bits": "101"},
+    {"value": 6, "bits": "110"},
+    {"value": 7, "bits": "111"}
+  ],
+  "clipDisableBits": {
+    "0": "disable_clipping_detection",
+    "1": "disable_trivial_rejection",
+    "2": "disable_cpoly_clipping_acceleration"
+  },
+  "cases": [
+    {
+      "id": 0,
+      "name": "positive-unit-control",
+      "clipBits": [
+        ["0xbf200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x00000000", "0x3f200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 1,
+      "name": "positive-tiny-apex",
+      "clipBits": [
+        ["0x00000000", "0x00000000", "0xb5000000", "0x35800000"],
+        ["0xbf200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 2,
+      "name": "positive-zero-apex",
+      "clipBits": [
+        ["0x00000000", "0x3e800000", "0x80000000", "0x00000000"],
+        ["0xbf200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 3,
+      "name": "negative-zero-apex",
+      "clipBits": [
+        ["0x00000000", "0x3e800000", "0x00000000", "0x80000000"],
+        ["0xbf200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 4,
+      "name": "negative-tiny-apex",
+      "clipBits": [
+        ["0x00000000", "0x00000000", "0x35000000", "0xb5800000"],
+        ["0xbf200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 5,
+      "name": "negative-unit-apex",
+      "clipBits": [
+        ["0x00000000", "0x00000000", "0x3f000000", "0xbf800000"],
+        ["0xbf200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 6,
+      "name": "negative-unit-offset-apex",
+      "clipBits": [
+        ["0xbe800000", "0x3e800000", "0x3f000000", "0xbf800000"],
+        ["0xbf200000", "0xbf200000", "0xbf000000", "0x3f800000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 7,
+      "name": "two-negative-one-positive",
+      "clipBits": [
+        ["0xbe800000", "0xbe800000", "0x3f000000", "0xbf800000"],
+        ["0x3e800000", "0xbe800000", "0x3f000000", "0xbf800000"],
+        ["0x00000000", "0x3f200000", "0xbf000000", "0x3f800000"]
+      ]
+    },
+    {
+      "id": 8,
+      "name": "all-negative",
+      "clipBits": [
+        ["0xbf200000", "0xbf200000", "0x3f000000", "0xbf800000"],
+        ["0x3f200000", "0xbf200000", "0x3f000000", "0xbf800000"],
+        ["0x00000000", "0x3f200000", "0x3f000000", "0xbf800000"]
+      ]
+    },
+    {
+      "id": 9,
+      "name": "negative-zero-positive",
+      "clipBits": [
+        ["0xbe800000", "0xbe800000", "0x3f000000", "0xbf800000"],
+        ["0x00000000", "0x3e800000", "0x80000000", "0x00000000"],
+        ["0x3f200000", "0xbf200000", "0xbf000000", "0x3f800000"]
+      ]
+    }
+  ]
+}
