@@ -4619,7 +4619,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function snapshotSmbSustainedPlay(scenario = controllerScenario) {
       if (scenario?.id !== "smb-sustained-play") return null;
       return {
-        schema: "lazuli-smb-sustained-play-v2",
+        schema: "lazuli-smb-sustained-play-v3",
         capacity: smbSustainedViReceiptCapacity,
         posted: smbSustainedViReceiptsPosted,
         pending: smbSustainedViPending.size,
@@ -23581,6 +23581,45 @@ const TEMPLATE: &str = r##"<!doctype html>
         unique: colors.size,
       };
     }
+    function summarizePresentedXfbVisualExtremes(rgba, width, height) {
+      if (
+        !(rgba instanceof Uint8Array)
+        || !Number.isSafeInteger(width)
+        || !Number.isSafeInteger(height)
+        || width <= 0
+        || height <= 0
+        || rgba.byteLength !== width * height * 4
+      ) {
+        throw new Error("WebGPU XFB readback has an invalid tight RGBA8 layout");
+      }
+      const darkChannelMaximum = 8;
+      const lightChannelMinimum = 247;
+      let dark = 0;
+      let light = 0;
+      for (let offset = 0; offset < rgba.byteLength; offset += 4) {
+        const red = rgba[offset];
+        const green = rgba[offset + 1];
+        const blue = rgba[offset + 2];
+        if (
+          red <= darkChannelMaximum
+          && green <= darkChannelMaximum
+          && blue <= darkChannelMaximum
+        ) {
+          dark += 1;
+        } else if (
+          red >= lightChannelMinimum
+          && green >= lightChannelMinimum
+          && blue >= lightChannelMinimum
+        ) {
+          light += 1;
+        }
+      }
+      return {
+        dark,
+        light,
+        other: width * height - dark - light,
+      };
+    }
     function viScanoutProvenance(value) {
       const scanoutPolicy = String(value?.scanoutPolicy);
       const fieldStrideBytes = Number(value?.fieldStrideBytes);
@@ -23781,7 +23820,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       return { width, height: fieldHeight, rgba: rows };
     }
-    async function summarizePresentedFieldRows(rgba, width, height, parity) {
+    async function summarizePresentedFieldRows(
+      rgba,
+      width,
+      height,
+      parity,
+      includeVisualExtremes = false
+    ) {
       const field = presentedFieldRows(rgba, width, height, parity);
       const [rgbaSha256, rgbSha256] = await Promise.all([
         sha256Hex(field.rgba),
@@ -23794,13 +23839,34 @@ const TEMPLATE: &str = r##"<!doctype html>
         rgbaSha256,
         rgbSha256,
         rgb: summarizePresentedXfbRgba(field.rgba, field.width, field.height),
+        ...(includeVisualExtremes
+          ? {
+            visualRgb: summarizePresentedXfbVisualExtremes(
+              field.rgba,
+              field.width,
+              field.height
+            ),
+          }
+          : {}),
       };
     }
-    async function attachPresentedFieldEvidence(provenance, rgba, width, height) {
+    async function attachPresentedFieldEvidence(
+      provenance,
+      rgba,
+      width,
+      height,
+      includeVisualExtremes = false
+    ) {
       const fields = {};
       for (const parity of Object.keys(provenance.fields)) {
         const evidence = provenance.presentationMode === "interlaced"
-          ? await summarizePresentedFieldRows(rgba, width, height, parity)
+          ? await summarizePresentedFieldRows(
+            rgba,
+            width,
+            height,
+            parity,
+            includeVisualExtremes
+          )
           : {
             width,
             height,
@@ -23808,6 +23874,15 @@ const TEMPLATE: &str = r##"<!doctype html>
             rgbaSha256: await sha256Hex(rgba),
             rgbSha256: await sha256Hex(presentedXfbRgbBytes(rgba, width, height)),
             rgb: summarizePresentedXfbRgba(rgba, width, height),
+            ...(includeVisualExtremes
+              ? {
+                visualRgb: summarizePresentedXfbVisualExtremes(
+                  rgba,
+                  width,
+                  height
+                ),
+              }
+              : {}),
           };
         fields[parity] = { ...provenance.fields[parity], ...evidence };
       }
@@ -23884,25 +23959,29 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       return result;
     }
-    async function readPresentedSurface() {
-      if (!webGpuRenderer.has_presented_surface()) return null;
-      const capture = await webGpuRenderer.read_presented_surface_rgba();
+    async function summarizePresentedSurfaceCapture(
+      capture,
+      context,
+      includeLegacyProjection = true
+    ) {
       const rgba = capture.rgba instanceof Uint8Array
         ? capture.rgba
         : new Uint8Array(capture.rgba);
       const width = Number(capture.width);
       const height = Number(capture.height);
+      const sustainedEvidence = !includeLegacyProjection;
       const provenance = await attachPresentedFieldEvidence(
         readPresentedFrameProvenance(capture),
         rgba,
         width,
-        height
+        height,
+        sustainedEvidence
       );
       if (
         width !== provenance.displayWidth
         || height !== provenance.displayHeight
       ) {
-        throw new Error("WebGPU surface dimensions do not match provenance");
+        throw new Error(`${context} dimensions do not match provenance`);
       }
       const surfaceFormat = String(capture.surfaceFormat);
       if (![
@@ -23911,7 +23990,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         "bgra8unorm",
         "bgra8unorm-srgb",
       ].includes(surfaceFormat)) {
-        throw new Error(`WebGPU surface readback has unsupported format ${surfaceFormat}`);
+        throw new Error(`${context} has unsupported format ${surfaceFormat}`);
+      }
+      const presentationSerial = Number(capture.presentationSerial);
+      if (!Number.isSafeInteger(presentationSerial) || presentationSerial < 1) {
+        throw new Error(`${context} presentation serial is invalid`);
       }
       const rgb = summarizePresentedXfbRgba(rgba, width, height);
       const [rgbaSha256, rgbSha256] = await Promise.all([
@@ -23920,8 +24003,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       ]);
       return {
         ...provenance,
-        ...legacyPresentedXfbProjection(provenance),
-        presentationSerial: Number(capture.presentationSerial),
+        ...(includeLegacyProjection
+          ? legacyPresentedXfbProjection(provenance)
+          : {}),
+        presentationSerial,
         surfaceFormat,
         format: String(capture.format),
         layout: String(capture.layout),
@@ -23931,6 +24016,202 @@ const TEMPLATE: &str = r##"<!doctype html>
         rgbaSha256,
         rgbSha256,
         rgb,
+        ...(sustainedEvidence
+          ? {
+            visualRgb: summarizePresentedXfbVisualExtremes(
+              rgba,
+              width,
+              height
+            ),
+          }
+          : {}),
+      };
+    }
+    async function readPresentedSurface() {
+      if (!webGpuRenderer.has_presented_surface()) return null;
+      return summarizePresentedSurfaceCapture(
+        await webGpuRenderer.read_presented_surface_rgba(),
+        "WebGPU surface readback"
+      );
+    }
+    const smbSustainedPresentedSurfaceCapacity = 60;
+    const smbSustainedPresentedSurfaceSchema =
+      "lazuli-smb-sustained-presented-surfaces-v1";
+    const smbSustainedPresentedSurfaceExtremePpm = 850_000;
+    const smbSustainedPresentedSurfaceDarkChannelMaximum = 8;
+    const smbSustainedPresentedSurfaceLightChannelMinimum = 247;
+    function smbSustainedPresentedSurfaceNearExtreme(count, pixels) {
+      return count * 1_000_000
+        >= pixels * smbSustainedPresentedSurfaceExtremePpm;
+    }
+    function summarizeSmbSustainedPresentedSurfaces(frames) {
+      const classified = frames.map(frame => {
+        const surface = frame.presentedSurface;
+        const pixels = surface.width * surface.height;
+        const summarizeField = parity => {
+          const field = surface.fields?.[parity] ?? null;
+          const fieldPixels = field === null ? 0 : field.width * field.height;
+          return {
+            address: field?.address ?? null,
+            generation: field?.generation ?? null,
+            rgbaSha256: field?.rgbaSha256 ?? null,
+            rgbSha256: field?.rgbSha256 ?? null,
+            monochrome: field !== null && field.rgb.unique === 1,
+            allBlack: field !== null && field.rgb.black === fieldPixels,
+            allWhite: field !== null && field.rgb.white === fieldPixels,
+            nearBlack: field !== null
+              && smbSustainedPresentedSurfaceNearExtreme(
+                field.visualRgb.dark,
+                fieldPixels
+              ),
+            nearWhite: field !== null
+              && smbSustainedPresentedSurfaceNearExtreme(
+                field.visualRgb.light,
+                fieldPixels
+              ),
+          };
+        };
+        const top = summarizeField("top");
+        const bottom = summarizeField("bottom");
+        return {
+          ordinal: frame.ordinal,
+          pairEpoch: surface.pairEpoch,
+          presentationSerial: surface.presentationSerial,
+          rgbaSha256: surface.rgbaSha256,
+          rgbSha256: surface.rgbSha256,
+          monochrome: surface.rgb.unique === 1,
+          allBlack: surface.rgb.black === pixels,
+          allWhite: surface.rgb.white === pixels,
+          nearBlack: smbSustainedPresentedSurfaceNearExtreme(
+            surface.visualRgb.dark,
+            pixels
+          ),
+          nearWhite: smbSustainedPresentedSurfaceNearExtreme(
+            surface.visualRgb.light,
+            pixels
+          ),
+          sourceBlackWhiteSplit:
+            (top.allBlack && bottom.allWhite)
+            || (top.allWhite && bottom.allBlack),
+          sourceNearBlackWhiteSplit:
+            (top.nearBlack && bottom.nearWhite)
+            || (top.nearWhite && bottom.nearBlack),
+          fields: { top, bottom },
+        };
+      });
+      const monochrome = classified.filter(frame => frame.monochrome);
+      const blackWhite = classified.filter(frame => frame.allBlack || frame.allWhite);
+      const nearBlackWhite =
+        classified.filter(frame => frame.nearBlack || frame.nearWhite);
+      const blackWhiteTransitions = classified
+        .slice(1)
+        .filter((frame, index) => {
+          const previous = classified[index];
+          return (previous.allBlack && frame.allWhite)
+            || (previous.allWhite && frame.allBlack);
+        })
+        .map(frame => frame.ordinal);
+      const nearBlackWhiteTransitions = classified
+        .slice(1)
+        .filter((frame, index) => {
+          const previous = classified[index];
+          return (previous.nearBlack && frame.nearWhite)
+            || (previous.nearWhite && frame.nearBlack);
+        })
+        .map(frame => frame.ordinal);
+      return {
+        capacity: smbSustainedPresentedSurfaceCapacity,
+        captured: classified.length,
+        complete: classified.length === smbSustainedPresentedSurfaceCapacity,
+        extremeThresholdPpm: smbSustainedPresentedSurfaceExtremePpm,
+        darkChannelMaximum: smbSustainedPresentedSurfaceDarkChannelMaximum,
+        lightChannelMinimum: smbSustainedPresentedSurfaceLightChannelMinimum,
+        distinctPairEpochs: new Set(classified.map(frame => frame.pairEpoch)).size,
+        distinctPresentationSerials:
+          new Set(classified.map(frame => frame.presentationSerial)).size,
+        distinctRgbaHashes:
+          new Set(classified.map(frame => frame.rgbaSha256)).size,
+        distinctRgbHashes:
+          new Set(classified.map(frame => frame.rgbSha256)).size,
+        pairEpochRegressions: classified
+          .filter((frame, index) => index !== 0
+            && frame.pairEpoch <= classified[index - 1].pairEpoch)
+          .map(frame => frame.ordinal),
+        presentationSerialRegressions: classified
+          .filter((frame, index) => index !== 0
+            && frame.presentationSerial <= classified[index - 1].presentationSerial)
+          .map(frame => frame.ordinal),
+        monochromeOrdinals: monochrome.map(frame => frame.ordinal),
+        blackOrdinals: classified.filter(frame => frame.allBlack)
+          .map(frame => frame.ordinal),
+        whiteOrdinals: classified.filter(frame => frame.allWhite)
+          .map(frame => frame.ordinal),
+        nearBlackOrdinals: classified.filter(frame => frame.nearBlack)
+          .map(frame => frame.ordinal),
+        nearWhiteOrdinals: classified.filter(frame => frame.nearWhite)
+          .map(frame => frame.ordinal),
+        topFieldMonochromeOrdinals: classified
+          .filter(frame => frame.fields.top.monochrome)
+          .map(frame => frame.ordinal),
+        bottomFieldMonochromeOrdinals: classified
+          .filter(frame => frame.fields.bottom.monochrome)
+          .map(frame => frame.ordinal),
+        topFieldNearBlackOrdinals: classified
+          .filter(frame => frame.fields.top.nearBlack)
+          .map(frame => frame.ordinal),
+        topFieldNearWhiteOrdinals: classified
+          .filter(frame => frame.fields.top.nearWhite)
+          .map(frame => frame.ordinal),
+        bottomFieldNearBlackOrdinals: classified
+          .filter(frame => frame.fields.bottom.nearBlack)
+          .map(frame => frame.ordinal),
+        bottomFieldNearWhiteOrdinals: classified
+          .filter(frame => frame.fields.bottom.nearWhite)
+          .map(frame => frame.ordinal),
+        blackWhiteTransitionOrdinals: blackWhiteTransitions,
+        blackWhiteAlternating: blackWhite.length === classified.length
+          && blackWhiteTransitions.length === Math.max(0, classified.length - 1),
+        nearBlackWhiteTransitionOrdinals: nearBlackWhiteTransitions,
+        nearBlackWhiteAlternating: nearBlackWhite.length === classified.length
+          && nearBlackWhiteTransitions.length === Math.max(0, classified.length - 1),
+        sourceBlackWhiteSplitOrdinals: classified
+          .filter(frame => frame.sourceBlackWhiteSplit)
+          .map(frame => frame.ordinal),
+        sourceNearBlackWhiteSplitOrdinals: classified
+          .filter(frame => frame.sourceNearBlackWhiteSplit)
+          .map(frame => frame.ordinal),
+        frames: classified,
+      };
+    }
+    async function readSmbSustainedPresentedSurfaceHistory() {
+      const captures =
+        await webGpuRenderer.drain_sustained_presented_surface_history_rgba();
+      if (
+        !Array.isArray(captures)
+        || captures.length !== smbSustainedPresentedSurfaceCapacity
+      ) {
+        throw new Error(
+          "WebGPU sustained surface history did not return exactly 60 captures"
+        );
+      }
+      const frames = [];
+      for (let index = 0; index < captures.length; index += 1) {
+        const capture = captures[index];
+        captures[index] = null;
+        frames.push({
+          ordinal: index + 1,
+          presentedSurface: await summarizePresentedSurfaceCapture(
+            capture,
+            `WebGPU sustained surface readback ${index + 1}`,
+            false
+          ),
+        });
+      }
+      return {
+        schema: smbSustainedPresentedSurfaceSchema,
+        capacity: smbSustainedPresentedSurfaceCapacity,
+        frames,
+        oracle: summarizeSmbSustainedPresentedSurfaces(frames),
       };
     }
     function expectedViPairField(value) {
@@ -24473,11 +24754,22 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     function captureRendererTerminal(
       hostMetrics = rendererHostMetrics,
-      temporalFrames = temporalSelectedXfbFrames
+      temporalFrames = temporalSelectedXfbFrames,
+      terminalReport = null
     ) {
       return appendRendererOperation(async () => {
         const metrics = snapshotRendererPerformance(hostMetrics);
         const selectedXfb = await readSelectedXfb();
+        const sustainedPlayTerminal =
+          terminalReport?.status === "paused"
+          && terminalReport?.stage === "scenario-complete"
+          && terminalReport?.scenario?.status === "complete"
+          && terminalReport?.sustainedPlay?.schema
+            === "lazuli-smb-sustained-play-v3";
+        const sustainedPresentedSurfaces =
+          sustainedPlayTerminal
+            ? await readSmbSustainedPresentedSurfaceHistory()
+            : null;
         const temporalSelectedXfb = {
           scanoutEvidenceVersion: 3,
           capacity: temporalSelectedXfbCapacity,
@@ -24514,7 +24806,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           oracle: summarizeTemporalSelectedXfb(temporalFrames),
           surfaceOracle: summarizeTemporalPresentedSurfaces(temporalFrames),
         };
-        return { metrics, selectedXfb, temporalSelectedXfb };
+        return {
+          metrics,
+          selectedXfb,
+          temporalSelectedXfb,
+          ...(sustainedPresentedSurfaces === null
+            ? {}
+            : { sustainedPresentedSurfaces }),
+        };
       });
     }
     const localIplImageBytes = 2 * 1024 * 1024;
@@ -25478,7 +25777,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       output.textContent = "CAPTURING";
       try {
-        const capture = await captureRendererTerminal(hostMetrics, temporalFrames);
+        const capture = await captureRendererTerminal(
+          hostMetrics,
+          temporalFrames,
+          report
+        );
         if (!isCurrentPublication()) return false;
         report.rendering = { ...capture, backend };
         output.textContent = JSON.stringify(report, null, 2);
@@ -25520,7 +25823,8 @@ const TEMPLATE: &str = r##"<!doctype html>
             frame.fieldStrideBytes,
             frame.fieldHeight,
             frame.rowRepeat,
-            frame.temporalXfbCapture !== undefined
+            frame.temporalXfbCapture !== undefined,
+            frame.sustainedPlayReceipt !== undefined
           )
         ),
           sourceWorker

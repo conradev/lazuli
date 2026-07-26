@@ -1138,6 +1138,11 @@ test("guest execution waits for renderer completion before another block", () =>
     source,
     /for \(;;\) \{[\s\S]*?while \(rendererFramesInFlight\.size !== 0 \|\| rendererFailure !== null\) \{\s*await honorRendererBackpressure\(\);\s*if \(runnerStopRequested\) break;\s*serviceVideoPresentation\(cycles\);\s*\}[\s\S]*?stage = "compile";/,
   );
+  assert.match(
+    source,
+    /while \(rendererFramesInFlight\.size !== 0 \|\| rendererFailure !== null\) \{\s*await honorRendererBackpressure\(\);\s*if \(runnerStopRequested\) break;\s*serviceVideoPresentation\(cycles\);\s*\}\s*if \(runnerPaused \|\| runnerStopRequested\) await honorRunnerControl\(\);\s*await finishTerminalControllerScenario\(\);/,
+    "a final renderer acknowledgement may service an unrequested VI pair before terminal drain",
+  );
   assert.match(source, /postGxFrame\(2, frame\)/);
   assert.match(source, /postGxFrame\(1, frame\)/);
   assert.match(
@@ -1148,7 +1153,7 @@ test("guest execution waits for renderer completion before another block", () =>
   assert.match(source, /postRendererFrame\("vi-present", \{/);
   assert.match(
     source,
-    /webGpuRenderer\.present_xfb\([\s\S]*?frame\.temporalXfbCapture !== undefined\s*\)/,
+    /webGpuRenderer\.present_xfb\([\s\S]*?frame\.temporalXfbCapture !== undefined,\s*frame\.sustainedPlayReceipt !== undefined\s*\)/,
   );
   assert.match(source, /await finishAfterRendererDrain\("stopped", \{\s*stage: "terminal-pc"/);
 });

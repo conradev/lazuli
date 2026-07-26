@@ -7,11 +7,11 @@ import {
   validateSmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V2,
+  SMB_SUSTAINED_PLAY_SCHEMA_V3,
   verifySmbSustainedPlay,
 } from "./browser_boot_smb_sustained_play.mjs";
 
-const REPORT_SCHEMA = "lazuli-public-smb-screencast-v2";
+const REPORT_SCHEMA = "lazuli-public-smb-screencast-v3";
 const FRAME_COUNT = 64;
 const MIN_WINDOW_VI_RECEIPTS = 64;
 const WIDTH = 1024;
@@ -651,7 +651,7 @@ function terminalProof(value, path) {
   );
   exact(
     report.sustainedPlay?.schema,
-    SMB_SUSTAINED_PLAY_SCHEMA_V2,
+    SMB_SUSTAINED_PLAY_SCHEMA_V3,
     `${path}.report.sustainedPlay.schema`,
   );
   let sustainedPlay;

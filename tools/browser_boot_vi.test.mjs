@@ -630,6 +630,7 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
     240,
     2,
     false,
+    false,
   ]);
   assert.deepEqual(calls.map(([name]) => name), ["gx-frame", "vi-present"]);
   assert.equal(context.document.body.dataset.viField, "bottom");

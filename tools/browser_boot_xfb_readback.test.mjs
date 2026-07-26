@@ -14,6 +14,10 @@ const rendererSource = readFileSync(
   new URL("../crates/browser-renderer/src/web.rs", import.meta.url),
   "utf8",
 );
+const rendererLibSource = readFileSync(
+  new URL("../crates/browser-renderer/src/lib.rs", import.meta.url),
+  "utf8",
+);
 
 function extractFunction(name) {
   const functionStart = source.indexOf(`function ${name}(`);
@@ -271,6 +275,7 @@ test("presented surface capture returns canonical tight RGBA evidence", async ()
       "summarizePresentedFieldRows",
       "attachPresentedFieldEvidence",
       "legacyPresentedXfbProjection",
+      "summarizePresentedSurfaceCapture",
       "readPresentedSurface",
     ],
     {
@@ -744,6 +749,114 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
     source.slice(viPresentStart, viPresentEnd),
     /frame\.temporalXfbCapture !== undefined/,
   );
+  assert.match(
+    source.slice(viPresentStart, viPresentEnd),
+    /frame\.sustainedPlayReceipt !== undefined/,
+  );
+});
+
+test("sustained presented-surface history is exact, ordered, and terminal-only", () => {
+  assert.match(
+    rendererLibSource,
+    /const SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY: usize = 60;/,
+  );
+  const terminalStart = source.indexOf("function captureRendererTerminal(");
+  const terminalEnd = source.indexOf(
+    "\n    const localIplImageBytes",
+    terminalStart,
+  );
+  const terminal = source.slice(terminalStart, terminalEnd);
+  assert.match(
+    terminal,
+    /terminalReport\?\.status === "paused"[\s\S]*terminalReport\?\.stage === "scenario-complete"[\s\S]*terminalReport\?\.scenario\?\.status === "complete"/,
+    "live prefix snapshots must not drain an incomplete sustained history",
+  );
+  assert.ok(
+    terminal.indexOf("const sustainedPlayTerminal")
+      < terminal.indexOf("readSmbSustainedPresentedSurfaceHistory()"),
+  );
+  const publishStart = source.indexOf("async function publishWorkerTerminalReport(");
+  const publishEnd = source.indexOf("\n    function handleWorkerMessage", publishStart);
+  assert.match(
+    source.slice(publishStart, publishEnd),
+    /captureRendererTerminal\(\s*hostMetrics,\s*temporalFrames,\s*report\s*\)/,
+  );
+  const stateStart = rendererLibSource.indexOf(
+    "pub(crate) enum SustainedPresentedSurfaceHistory",
+  );
+  const stateEnd = rendererLibSource.indexOf("\n#[cfg(test)]", stateStart);
+  const state = rendererLibSource.slice(stateStart, stateEnd);
+  assert.match(
+    state,
+    /Self::Recording\(Vec::with_capacity\(\s*SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY,/,
+  );
+  assert.match(
+    state,
+    /captures\.len\(\) < SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY/,
+  );
+  assert.match(
+    state,
+    /captures\.len\(\) == SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY/,
+  );
+  assert.match(state, /\*self = Self::Failed;/);
+
+  const presentStart = rendererSource.indexOf("fn present_host_xfb_frame");
+  const presentEnd = rendererSource.indexOf("\n    fn xfb_present_bind_group", presentStart);
+  const present = rendererSource.slice(presentStart, presentEnd);
+  const request = present.indexOf(
+    ".capture_requested(capture_sustained_surface_history)",
+  );
+  const acquire = present.indexOf("self.surface.get_current_texture()");
+  const capture = present.indexOf("let sustained_surface_capture");
+  const label = present.indexOf("browser sustained presented surface readback", capture);
+  const push = present.indexOf(".push(capture)", label);
+  const submit = present.indexOf("self.queue.submit", push);
+  const browserPresent = present.indexOf("output.present()", submit);
+  assert.ok(
+    request > -1 && request < acquire,
+    "history continuity and overflow must fail before acquiring a presentation surface",
+  );
+  assert.ok(
+    capture > acquire && capture < label && label < push && push < submit && submit < browserPresent,
+    "same-submit capture must be enqueued and recorded before presenting",
+  );
+  for (const forbidden of ["BufferMap::new", "QueueDrain::new", "future_to_promise", ".await"]) {
+    assert.doesNotMatch(
+      present,
+      new RegExp(forbidden.replaceAll(".", "\\.")),
+      `live presentation must not contain ${forbidden}`,
+    );
+  }
+
+  const drainStart = rendererSource.indexOf(
+    "pub fn drain_sustained_presented_surface_history_rgba",
+  );
+  const drainEnd = rendererSource.indexOf(
+    "\n    #[allow(clippy::too_many_arguments)]\n    pub fn push_tev_draw",
+    drainStart,
+  );
+  const drain = rendererSource.slice(drainStart, drainEnd);
+  const take = drain.indexOf("take_complete()");
+  const queueDrain = drain.indexOf("QueueDrain::new(&queue).await");
+  const orderedLoop = drain.indexOf("for surface in presented");
+  const finish = drain.indexOf(
+    "finish_presented_surface_readback(surface, &failure_state).await",
+  );
+  assert.ok(take > -1 && take < queueDrain);
+  assert.ok(queueDrain < orderedLoop && orderedLoop < finish);
+  assert.match(drain, /let result = Array::new\(\)/);
+  assert.match(drain, /result\.push\(&capture\)/);
+
+  const finishStart = rendererSource.indexOf("async fn finish_presented_surface_readback");
+  const finishEnd = rendererSource.indexOf(
+    "\nstruct EncodedXfbReadback",
+    finishStart,
+  );
+  const finishReadback = rendererSource.slice(finishStart, finishEnd);
+  assert.match(finishReadback, /"presentationSerial"/);
+  assert.match(finishReadback, /set_presented_frame_provenance/);
+  assert.match(finishReadback, /"rgba"/);
+  assert.match(finishReadback, /Uint8Array::from\(pixels\.as_slice\(\)\)/);
 });
 
 test("wgpu WebSurface under-reporting cannot disable the required COPY_SRC usage", () => {

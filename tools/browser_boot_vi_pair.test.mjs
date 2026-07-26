@@ -174,6 +174,7 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
       240,
       2,
       false,
+      false,
     ],
     [
       0x01200500,
@@ -188,6 +189,7 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
       240,
       2,
       true,
+      false,
     ],
   ]);
   assert.equal(context.document.body.dataset.viFields, "2");
@@ -463,6 +465,6 @@ test("VI browser protocol resets ownership across timing changes", () => {
   assert.match(host, /frame\.pairEpoch/);
   assert.match(
     host,
-    /present_xfb\(\s*frame\.address,\s*frame\.copyIndex,\s*frame\.copyRow,\s*frame\.presentationMode,\s*frame\.field,\s*frame\.pairEpoch,\s*frame\.width,\s*frame\.height,\s*frame\.fieldStrideBytes,\s*frame\.fieldHeight,\s*frame\.rowRepeat,\s*frame\.temporalXfbCapture !== undefined\s*\)/,
+    /present_xfb\(\s*frame\.address,\s*frame\.copyIndex,\s*frame\.copyRow,\s*frame\.presentationMode,\s*frame\.field,\s*frame\.pairEpoch,\s*frame\.width,\s*frame\.height,\s*frame\.fieldStrideBytes,\s*frame\.fieldHeight,\s*frame\.rowRepeat,\s*frame\.temporalXfbCapture !== undefined,\s*frame\.sustainedPlayReceipt !== undefined\s*\)/,
   );
 });

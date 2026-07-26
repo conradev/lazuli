@@ -752,8 +752,18 @@ export function verifySmbSustainedPlayPrefix(report) {
   requireObject(report, "$.");
   exact(report.status, "running", "$.status");
   if (report.error !== undefined) exact(report.error, null, "$.error");
-  exact(report.rendering?.backend, "wgpu-webgpu", "$.rendering.backend");
-  exact(report.rendering?.error ?? null, null, "$.rendering.error");
+  const rendering = requireObject(report.rendering, "$.rendering");
+  exact(rendering.backend, "wgpu-webgpu", "$.rendering.backend");
+  exact(rendering.error ?? null, null, "$.rendering.error");
+  if (Object.hasOwn(rendering, "sustainedPresentedSurfaces")) {
+    fail(
+      "terminal-only",
+      "$.rendering.sustainedPresentedSurfaces",
+      null,
+      "absent before scenario completion",
+      rendering.sustainedPresentedSurfaces,
+    );
+  }
   validateV2CompatibilityTelemetry(report);
 
   exact(report.disc?.identifier, "GMBE8P", "$.disc.identifier");
@@ -803,7 +813,7 @@ export function verifySmbSustainedPlayPrefix(report) {
   );
   exact(
     sustained.schema,
-    SMB_SUSTAINED_PLAY_SCHEMA_V2,
+    SMB_SUSTAINED_PLAY_SCHEMA_V3,
     "$.sustainedPlay.schema",
   );
   exact(

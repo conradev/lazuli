@@ -46,7 +46,7 @@ function syncSurfacePopulations(surface) {
 }
 
 function sustainedPrefixReport(receipts = 16, pending = 0) {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V2);
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
   report.status = "running";
   report.stage = "execute";
   report.scenario.status = "running";
@@ -58,10 +58,11 @@ function sustainedPrefixReport(receipts = 16, pending = 0) {
     report.sustainedPlay.receipts.slice(0, receipts);
   report.sustainedPlay.posted = receipts + pending;
   report.sustainedPlay.pending = pending;
+  delete report.rendering.sustainedPresentedSurfaces;
   return report;
 }
 
-test("live v2 prefix validates exact partial pairing and chronology", () => {
+test("live v3 prefix validates exact partial pairing and chronology", () => {
   const empty = sustainedPrefixReport(0, 0);
   assert.deepEqual(verifySmbSustainedPlayPrefix(empty), {
     acceptedReceipts: 0,
@@ -109,6 +110,17 @@ test("live v2 prefix validates exact partial pairing and chronology", () => {
     () => verifySmbSustainedPlayPrefix(pendingDrift),
     error => error instanceof SmbSustainedPlayValidationError
       && error.path === "$.sustainedPlay.posted",
+  );
+
+  const prematureHistory = sustainedPrefixReport();
+  prematureHistory.rendering.sustainedPresentedSurfaces =
+    smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3)
+      .rendering.sustainedPresentedSurfaces;
+  assert.throws(
+    () => verifySmbSustainedPlayPrefix(prematureHistory),
+    error => error instanceof SmbSustainedPlayValidationError
+      && error.code === "terminal-only"
+      && error.path === "$.rendering.sustainedPresentedSurfaces",
   );
 });
 
