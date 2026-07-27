@@ -29,7 +29,12 @@ function extractFunction(name) {
 }
 
 const audioFunctionNames = [
+  "audioCyclesPerSample",
+  "nextAudioSampleCycle",
+  "nextAudioInterruptCycle",
+  "updateAudioSampleCounter",
   "dspAudioDmaCyclesPerBlock",
+  "nextDspAudioDmaCompletionCycle",
   "dspAudioDmaBlocksLeft",
   "publishDspAudioDmaBlocksLeft",
   "assertDspAudioDmaInterrupt",
@@ -43,6 +48,8 @@ const audioFunctionNames = [
 function audioContext() {
   const memory = new ArrayBuffer(0x10000);
   const context = {
+    aiLastCycle: 1_000,
+    aiSampleCounter: 0,
     cycles: 1_000,
     deviceEvents: new Map(),
     dspAudioDmaEnableInterruptLatencyCycles: 200,
@@ -58,6 +65,116 @@ function audioContext() {
   });
   return context;
 }
+
+function aiState(context) {
+  return {
+    aiLastCycle: context.aiLastCycle,
+    aiSampleCounter: context.aiSampleCounter,
+    control: context.view.getUint32(0x6c00, false),
+    counter: context.view.getUint32(0x6c08, false),
+    events: Object.fromEntries([...context.deviceEvents].sort()),
+    nextInterruptCycle: context.nextAudioInterruptCycle(),
+    nextSampleCycle: context.nextAudioSampleCycle(),
+  };
+}
+
+function dspAudioDmaState(context) {
+  return {
+    blocksLeft: context.view.getUint16(0x503a, false),
+    control: context.view.getUint16(0x5036, false),
+    dspStatus: context.view.getUint16(0x500a, false),
+    events: Object.fromEntries([...context.deviceEvents].sort()),
+    nextCompletionCycle: context.nextDspAudioDmaCompletionCycle(),
+    nextCycle: context.nextDspAudioDmaCycle,
+    nextInterruptCycle: context.nextDspAudioDmaInterruptCycle,
+    remainingBlocks: context.dspAudioDmaRemainingBlocks,
+  };
+}
+
+test("AI interrupt projection preserves exact stepwise sample-counter state", () => {
+  const stepwise = audioContext();
+  const batched = audioContext();
+
+  for (const context of [stepwise, batched]) {
+    context.aiLastCycle = context.cycles;
+    context.aiSampleCounter = 0xffff_fffd;
+    context.view.setUint32(0x6c00, 0x0000_0007, false);
+    context.view.setUint32(0x6c08, context.aiSampleCounter, false);
+    context.view.setUint32(0x6c0c, 1, false);
+  }
+
+  const cyclesPerSample = stepwise.audioCyclesPerSample(0x0000_0007);
+  const interruptCycle = stepwise.nextAudioInterruptCycle();
+  assert.equal(
+    interruptCycle,
+    Math.ceil(stepwise.aiLastCycle + 4 * cyclesPerSample),
+    "the wrapped AIIT target is four samples away",
+  );
+  assert.equal(batched.nextAudioInterruptCycle(), interruptCycle);
+
+  while (stepwise.nextAudioSampleCycle() <= interruptCycle) {
+    stepwise.updateAudioSampleCounter(stepwise.nextAudioSampleCycle());
+  }
+  batched.updateAudioSampleCounter(interruptCycle);
+
+  assert.deepEqual(aiState(batched), aiState(stepwise));
+  assert.equal(batched.aiSampleCounter, 1);
+  assert.equal(batched.deviceEvents.get("aiSamples"), 4);
+  assert.equal(batched.deviceEvents.get("aiInterrupt"), 1);
+  assert.equal(batched.view.getUint32(0x6c00, false) & 0x08, 0x08);
+  assert.equal(
+    batched.nextAudioInterruptCycle(),
+    null,
+    "an already-latched AI interrupt has no further interrupt deadline",
+  );
+});
+
+test("AI interrupt projection treats the current target as the next full wrap", () => {
+  const context = audioContext();
+  context.aiSampleCounter = 0x1234_5678;
+  context.view.setUint32(0x6c00, 0x0000_0007, false);
+  context.view.setUint32(0x6c08, context.aiSampleCounter, false);
+  context.view.setUint32(0x6c0c, context.aiSampleCounter, false);
+
+  assert.equal(
+    context.nextAudioInterruptCycle(),
+    Math.ceil(
+      context.aiLastCycle
+        + 0x1_0000_0000 * context.audioCyclesPerSample(0x0000_0007),
+    ),
+  );
+});
+
+test("DSP audio completion projection preserves exact stepwise block state", () => {
+  const stepwise = audioContext();
+  const batched = audioContext();
+
+  for (const context of [stepwise, batched]) {
+    context.view.setUint32(0x6c00, 0, false);
+    context.writeDspAudioDmaControl(0x8003);
+  }
+
+  const blockPeriod = stepwise.dspAudioDmaCyclesPerBlock();
+  const completionCycle = stepwise.nextDspAudioDmaCompletionCycle();
+  assert.equal(
+    completionCycle,
+    stepwise.nextDspAudioDmaCycle + 2 * blockPeriod,
+  );
+  assert.equal(batched.nextDspAudioDmaCompletionCycle(), completionCycle);
+
+  stepwise.serviceDspAudioDma(stepwise.nextDspAudioDmaInterruptCycle);
+  while (stepwise.nextDspAudioDmaCycle <= completionCycle) {
+    stepwise.serviceDspAudioDma(stepwise.nextDspAudioDmaCycle);
+  }
+  batched.serviceDspAudioDma(completionCycle);
+
+  assert.deepEqual(dspAudioDmaState(batched), dspAudioDmaState(stepwise));
+  assert.equal(batched.dspAudioDmaRemainingBlocks, 3);
+  assert.equal(batched.view.getUint16(0x503a, false), 2);
+  assert.equal(batched.deviceEvents.get("dspAudioDmaBlock"), 3);
+  assert.equal(batched.deviceEvents.get("dspAudioDmaComplete"), 1);
+  assert.equal(batched.deviceEvents.get("dspAudioDmaInitialInterrupt"), 1);
+});
 
 test("DSP audio DMA raises its initial AID and exposes zero-based blocks left", () => {
   const context = audioContext();
