@@ -5642,6 +5642,15 @@ const TEMPLATE: &str = r##"<!doctype html>
     const runnerBlockChunk = Number.isFinite(requestedBlockChunk)
       ? Math.max(1, Math.min(8192, Math.floor(requestedBlockChunk)))
       : 1024;
+    const runnerStatusDispatchStride = 4096;
+    let runnerStatusDispatchDeadline = runnerStatusDispatchStride;
+    function claimRunnerStatusPublication(observedDispatches) {
+      if (observedDispatches < runnerStatusDispatchDeadline) return false;
+      runnerStatusDispatchDeadline = (
+        Math.floor(observedDispatches / runnerStatusDispatchStride) + 1
+      ) * runnerStatusDispatchStride;
+      return true;
+    }
     const stopOnFirstDsi = searchParams.get("stopOnFirstDsi") === "1";
     registerControllerScenario(createSuperMonkeyBallControllerScenarioDefinition());
     registerControllerScenario(createSuperMonkeyBallSustainedPlayScenarioDefinition());
@@ -15275,6 +15284,26 @@ const TEMPLATE: &str = r##"<!doctype html>
       return signature >>> 0;
     }
 
+    function updateStablePcWitness(
+      nextPc,
+      readCpuSignature = cpuSignature
+    ) {
+      if (nextPc !== lastPc) {
+        lastPc = nextPc;
+        lastCpuSignature = null;
+        samePcCount = 0;
+        return samePcCount;
+      }
+
+      const nextCpuSignature = readCpuSignature();
+      samePcCount = lastCpuSignature !== null
+        && nextCpuSignature === lastCpuSignature
+          ? samePcCount + 1
+          : 0;
+      lastCpuSignature = nextCpuSignature;
+      return samePcCount;
+    }
+
     function inspectMmio(address) {
       const logical = address >>> 0;
       const offset = logical - 0xcc000000;
@@ -21814,10 +21843,140 @@ const TEMPLATE: &str = r##"<!doctype html>
       return [blockPattern.idleBasic, blockPattern.idleVolatileRead].includes(pattern);
     }
 
+    function isMusyxAramQueueFullWaitBackedge(candidatePc) {
+      return probeInstructionWord(candidatePc) === 0x4bfffe90;
+    }
+
+    function isAiSrcInitSampleCounterWaitCandidate(candidatePc) {
+      return probeInstructionWord(candidatePc) === 0x801e0000
+        && probeInstructionWord((candidatePc + 4) >>> 0) === 0x7c030040
+        && probeInstructionWord((candidatePc + 8) >>> 0) === 0x4182fff8;
+    }
+
     function isRecognizedLoopPc(candidatePc) {
       return isSemanticIdlePattern(compiledBlock(candidatePc)?.pattern)
         || isCacheLineLoop(candidatePc)
-        || decodeMemset32ByteLoop(candidatePc) !== null;
+        || decodeMemset32ByteLoop(candidatePc) !== null
+        || isMusyxAramQueueFullWaitBackedge(candidatePc)
+        || isAiSrcInitSampleCounterWaitCandidate(candidatePc);
+    }
+
+    function decodeRelativeBranchTarget(address, instruction, link) {
+      if (
+        instruction === null
+        || (instruction >>> 26) !== 18
+        || ((instruction >>> 1) & 1) !== 0
+        || (instruction & 1) !== (link ? 1 : 0)
+      ) return null;
+      let displacement = instruction & 0x03fffffc;
+      if ((displacement & 0x02000000) !== 0) displacement -= 0x04000000;
+      return (address + displacement) >>> 0;
+    }
+
+    function decodeRelativeBgeTarget(address, instruction) {
+      if (
+        instruction === null
+        || (instruction & 0xffff0003) !== 0x40800000
+      ) return null;
+      let displacement = instruction & 0xfffc;
+      if ((displacement & 0x8000) !== 0) displacement -= 0x10000;
+      return (address + displacement) >>> 0;
+    }
+
+    function instructionWordsMatch(address, expectedWords) {
+      return expectedWords.every((word, index) =>
+        probeInstructionWord((address + index * 4) >>> 0) === word
+      );
+    }
+
+    function decodeAiSrcInitSampleCounterWait(currentPc) {
+      const setupAddress = (currentPc - 12) >>> 0;
+      const baselineLoad = probeInstructionWord(setupAddress);
+      const firstPad = probeInstructionWord((setupAddress + 4) >>> 0);
+      const secondPad = probeInstructionWord((setupAddress + 8) >>> 0);
+      const load = probeInstructionWord(currentPc);
+      const compare = probeInstructionWord((currentPc + 4) >>> 0);
+      const backedge = probeInstructionWord((currentPc + 8) >>> 0);
+      if (
+        baselineLoad !== 0x807e0000
+        || firstPad !== 0x48000004
+        || secondPad !== 0x48000004
+        || load !== 0x801e0000
+        || compare !== 0x7c030040
+        || backedge !== 0x4182fff8
+      ) return null;
+      return {
+        setupAddress,
+        counterAddressRegister: (load >>> 16) & 31,
+        loadedCounterRegister: (load >>> 21) & 31,
+        initialCounterRegister: (compare >>> 16) & 31,
+      };
+    }
+
+    function decodeMusyxAramQueueFullWait(currentPc) {
+      // This is the instruction after MusyX has restored EE. Relative branch
+      // decoding keeps the proof relocatable; the local body and both OS
+      // interrupt callees must still match the retail code byte-for-byte.
+      const backedge = probeInstructionWord(currentPc);
+      const loopStart = decodeRelativeBranchTarget(currentPc, backedge, false);
+      if (loopStart === null) return null;
+
+      const disableCall = probeInstructionWord(loopStart);
+      const disableAddress = decodeRelativeBranchTarget(
+        loopStart,
+        disableCall,
+        true
+      );
+      const queueLoad = probeInstructionWord((loopStart + 4) >>> 0);
+      if (
+        disableAddress === null
+        || queueLoad !== 0x881d0281
+        || probeInstructionWord((loopStart + 8) >>> 0) !== 0x7c7e1b78
+        || probeInstructionWord((loopStart + 12) >>> 0) !== 0x28000010
+      ) return null;
+
+      const restoreCallAddress = (currentPc - 4) >>> 0;
+      const fullPath = decodeRelativeBgeTarget(
+        (loopStart + 16) >>> 0,
+        probeInstructionWord((loopStart + 16) >>> 0)
+      );
+      if (fullPath !== restoreCallAddress) return null;
+      const restoreAddress = decodeRelativeBranchTarget(
+        restoreCallAddress,
+        probeInstructionWord(restoreCallAddress),
+        true
+      );
+      if (restoreAddress === null) return null;
+
+      if (!instructionWordsMatch(disableAddress, [
+        0x7c6000a6,
+        0x5464045e,
+        0x7c800124,
+        0x54638ffe,
+        0x4e800020,
+      ])) return null;
+      if (!instructionWordsMatch(restoreAddress, [
+        0x2c030000,
+        0x7c8000a6,
+        0x4182000c,
+        0x60858000,
+        0x48000008,
+        0x5485045e,
+        0x7ca00124,
+        0x54838ffe,
+        0x4e800020,
+      ])) return null;
+
+      const queueBaseRegister = (queueLoad >>> 16) & 31;
+      let queueDisplacement = queueLoad & 0xffff;
+      if ((queueDisplacement & 0x8000) !== 0) queueDisplacement -= 0x10000;
+      return {
+        loopStart,
+        disableAddress,
+        restoreAddress,
+        queueBaseRegister,
+        queueDisplacement,
+      };
     }
 
     function runtimeEventCycleCandidates(observedCycles, includeCycleLimit = true) {
@@ -21854,10 +22013,131 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function nextStableWaitEventCycle(semanticIdle, repeatedBoundaryCount) {
-      const stableWait = semanticIdle
-        ? repeatedBoundaryCount >= 2
-        : repeatedBoundaryCount >= 128;
-      return stableWait ? nextRuntimeEventCycle(false) : null;
+      return semanticIdle && repeatedBoundaryCount >= 2
+        ? nextRuntimeEventCycle(false)
+        : null;
+    }
+
+    function musyxAramQueueFullWaitWakeCycle(currentPc) {
+      if (
+        aramTransfer === null
+        || aramTransfer.completionCycle <= cycles
+      ) return null;
+      if ((view.getUint32(cpu + msrOffset, true) & 0x00008000) === 0) {
+        return null;
+      }
+      if (interruptDeliveryPendingAtCycle(cycles)) return null;
+      if (
+        cpFifoState.distance !== 0
+        && (cpFifoState.control & cpControlReadEnable) !== 0
+      ) return null;
+      if (
+        view.getUint32(cpu + pcOffset, true) !== currentPc
+        || readLr() !== currentPc
+        || readGpr(30) !== 1
+        || readGpr(3) !== 0
+      ) return null;
+      const decoded = decodeMusyxAramQueueFullWait(currentPc);
+      if (decoded === null) return null;
+      const queueAddress = (
+        readGpr(decoded.queueBaseRegister) + decoded.queueDisplacement
+      ) >>> 0;
+      const queueDepth = guestEffectiveU8(queueAddress);
+      if (queueDepth === null || queueDepth < 16) return null;
+      const eventCycle = nextRuntimeEventCycle(false);
+      if (eventCycle === null) return null;
+      const wakeCycle = Number.isFinite(cycleLimit)
+        ? Math.min(eventCycle, cycleLimit)
+        : eventCycle;
+      return wakeCycle > cycles ? { eventCycle, wakeCycle } : null;
+    }
+
+    function aiSrcInitSampleCounterWaitWakeCycle(currentPc) {
+      const audioControl = view.getUint32(mmio + 0x6c00, false);
+      if ((audioControl & 1) === 0) return null;
+      const audioSampleCycle = nextAudioSampleCycle();
+      if (audioSampleCycle === null || audioSampleCycle <= cycles) return null;
+      if (runtimeEventDueAtOrBefore(cycles)) return null;
+      if (
+        cpFifoState.distance !== 0
+        && (cpFifoState.control & cpControlReadEnable) !== 0
+      ) return null;
+      if (
+        view.getUint32(cpu + pcOffset, true) !== currentPc
+        || (view.getUint32(cpu + msrOffset, true) & 0x00008000) !== 0
+        || readGpr(30) !== 0xcc006c08
+      ) return null;
+      const decoded = decodeAiSrcInitSampleCounterWait(currentPc);
+      if (decoded === null) return null;
+      const counterAddress = readGpr(decoded.counterAddressRegister);
+      const currentCounter = view.getUint32(mmio + 0x6c08, false);
+      if (
+        counterAddress !== 0xcc006c08
+        || currentCounter !== readGpr(decoded.loadedCounterRegister)
+        || currentCounter !== readGpr(decoded.initialCounterRegister)
+      ) return null;
+      const eventCycle = nextRuntimeEventCycle(false);
+      if (eventCycle === null || eventCycle > audioSampleCycle) return null;
+      const wakeCycle = Number.isFinite(cycleLimit)
+        ? Math.min(eventCycle, cycleLimit)
+        : eventCycle;
+      return wakeCycle > cycles
+        ? { audioSampleCycle, eventCycle, wakeCycle }
+        : null;
+    }
+
+    async function accelerateMusyxAramQueueFullWait(currentPc) {
+      const wait = musyxAramQueueFullWaitWakeCycle(currentPc);
+      if (wait === null) return false;
+      const { eventCycle, wakeCycle } = wait;
+      const skipped = wakeCycle - cycles;
+      cycles = wakeCycle;
+      accelerations.set(
+        "musyxAramQueueFullWaitCycles",
+        (accelerations.get("musyxAramQueueFullWaitCycles") ?? 0) + skipped
+      );
+      accelerations.set(
+        "musyxAramQueueFullWaitJumps",
+        (accelerations.get("musyxAramQueueFullWaitJumps") ?? 0) + 1
+      );
+      if (wakeCycle >= eventCycle) {
+        const diskWait = dueDiskTransferPromise(cycles);
+        if (diskWait !== null) await diskWait;
+        // ARAM completion and the ordinary external-interrupt path own queue
+        // progress. Never synthesize __ARQ state or invoke its callback here.
+        serviceMmio(cycles);
+        pc = view.getUint32(cpu + pcOffset, true);
+      }
+      lastPc = null;
+      lastCpuSignature = null;
+      samePcCount = 0;
+      return true;
+    }
+
+    async function accelerateAiSrcInitSampleCounterWait(currentPc) {
+      const wait = aiSrcInitSampleCounterWaitWakeCycle(currentPc);
+      if (wait === null) return false;
+      const { eventCycle, wakeCycle } = wait;
+      const skipped = wakeCycle - cycles;
+      cycles = wakeCycle;
+      accelerations.set(
+        "aiSrcInitSampleCounterWaitCycles",
+        (accelerations.get("aiSrcInitSampleCounterWaitCycles") ?? 0) + skipped
+      );
+      accelerations.set(
+        "aiSrcInitSampleCounterWaitJumps",
+        (accelerations.get("aiSrcInitSampleCounterWaitJumps") ?? 0) + 1
+      );
+      if (wakeCycle >= eventCycle) {
+        const diskWait = dueDiskTransferPromise(cycles);
+        if (diskWait !== null) await diskWait;
+        serviceMmio(cycles);
+        pc = view.getUint32(cpu + pcOffset, true);
+      }
+      lastPc = null;
+      lastCpuSignature = null;
+      samePcCount = 0;
+      return true;
     }
 
     function stageInstructionBlock(compilerView, inputPointer, pc, maximumWords = 64) {
@@ -22864,6 +23144,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           await honorRunnerControl();
           continue;
         }
+        if (await accelerateMusyxAramQueueFullWait(pc)) {
+          await finishTerminalControllerScenario();
+          continue;
+        }
+        if (await accelerateAiSrcInitSampleCounterWait(pc)) {
+          await finishTerminalControllerScenario();
+          continue;
+        }
         observeWarioWareNextMicrogameSelection(pc);
         applyWarioWareNextMicrogameOverride(pc);
         stage = "compile";
@@ -23084,12 +23372,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           );
           if (pendingFusion !== null) await pendingFusion;
         }
-        const nextCpuSignature = cpuSignature();
-        samePcCount = nextPc === lastPc && nextCpuSignature === lastCpuSignature
-          ? samePcCount + 1
-          : 0;
-        lastPc = nextPc;
-        lastCpuSignature = nextCpuSignature;
+        updateStablePcWitness(nextPc);
         pc = nextPc;
 
         await finishTerminalControllerScenario();
@@ -23148,7 +23431,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           });
           throw Symbol.for("reported");
         }
-        if (executedBlocks > 1 || (dispatches & 4095) === 0) {
+        if (claimRunnerStatusPublication(dispatches)) {
           statusDataset.dispatches = String(dispatches);
           statusDataset.cycles = String(cycles);
           statusDataset.idleJumps = String(
