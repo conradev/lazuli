@@ -31,6 +31,8 @@ function schedulerContext() {
     blocks: new Map(),
     isCacheLineLoop: () => false,
     decodeMemset32ByteLoop: () => null,
+    isMusyxAramQueueFullWaitBackedge: () => false,
+    isAiSrcInitSampleCounterWaitCandidate: () => false,
   };
   context.compiledBlock = pc => context.blocks.get(pc);
   vm.createContext(context);
@@ -40,6 +42,38 @@ function schedulerContext() {
       .join("\n\n"),
     context,
     { filename: "browser_boot.scheduler.js" },
+  );
+  return context;
+}
+
+function stabilityContext() {
+  const context = {
+    lastCpuSignature: null,
+    lastPc: null,
+    samePcCount: 0,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "updateStablePcWitness",
+      "nextStableWaitEventCycle",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    { filename: "browser_boot.scheduler-stability.js" },
+  );
+  return context;
+}
+
+function statusPublicationContext() {
+  const context = {
+    runnerStatusDispatchDeadline: 4_096,
+    runnerStatusDispatchStride: 4_096,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    extractFunction("claimRunnerStatusPublication"),
+    context,
+    { filename: "browser_boot.scheduler-status-publication.js" },
   );
   return context;
 }
@@ -59,13 +93,152 @@ test("structural loop recognition remains available before compilation", () => {
   const context = schedulerContext();
   context.isCacheLineLoop = pc => pc === 0x4000;
   context.decodeMemset32ByteLoop = pc => pc === 0x5000 ? {} : null;
+  context.isMusyxAramQueueFullWaitBackedge = pc => pc === 0x6000;
+  context.isAiSrcInitSampleCounterWaitCandidate = pc => pc === 0x7000;
 
   assert.equal(context.isRecognizedLoopPc(0x4000), true);
   assert.equal(context.isRecognizedLoopPc(0x5000), true);
-  assert.equal(context.isRecognizedLoopPc(0x6000), false);
+  assert.equal(context.isRecognizedLoopPc(0x6000), true);
+  assert.equal(context.isRecognizedLoopPc(0x7000), true);
+  assert.equal(context.isRecognizedLoopPc(0x8000), false);
 });
 
-test("WarioWare queue-full waits wake only for a pending runtime event", () => {
+test("lazy CPU stability witnesses do not hash across changing PCs", () => {
+  const context = stabilityContext();
+  let hashes = 0;
+  const readSignature = () => {
+    hashes += 1;
+    return 0x12345678;
+  };
+
+  for (const pc of [0x1000, 0x2000, 0x3000, 0x1000]) {
+    assert.equal(context.updateStablePcWitness(pc, readSignature), 0);
+  }
+  assert.equal(hashes, 0);
+  assert.equal(context.lastPc, 0x1000);
+  assert.equal(context.lastCpuSignature, null);
+});
+
+test("lazy CPU stability requires a recorded witness and two unchanged intervals", () => {
+  const context = stabilityContext();
+  let hashes = 0;
+  const readSignature = () => {
+    hashes += 1;
+    return 0x89abcdef;
+  };
+
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 0);
+  assert.equal(hashes, 0, "the first PC observation does not hash");
+
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 0);
+  assert.equal(hashes, 1, "the first repeat records the witness");
+  assert.equal(context.lastCpuSignature, 0x89abcdef);
+
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 1);
+  assert.equal(
+    context.nextStableWaitEventCycle(true, context.samePcCount),
+    null,
+    "one identical interval is not enough to accelerate",
+  );
+
+  context.nextRuntimeEventCycle = includeCycleLimit => {
+    assert.equal(includeCycleLimit, false);
+    return 50_000;
+  };
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 2);
+  assert.equal(
+    context.nextStableWaitEventCycle(true, context.samePcCount),
+    50_000,
+    "a second identical interval may advance to the exact pending event",
+  );
+  assert.equal(hashes, 3);
+});
+
+test("CPU state changes reset the lazy stability witness", () => {
+  const context = stabilityContext();
+  const signatures = [0x11111111, 0x22222222, 0x22222222, 0x22222222];
+  const readSignature = () => signatures.shift();
+
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 0);
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 0);
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 0);
+  assert.equal(
+    context.lastCpuSignature,
+    0x22222222,
+    "the changed state becomes the next conservative witness",
+  );
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 1);
+  assert.equal(context.updateStablePcWitness(0x1000, readSignature), 2);
+  assert.deepEqual(signatures, []);
+});
+
+test("linked multi-block regions below the status deadline publish nothing", () => {
+  const context = statusPublicationContext();
+  let dispatches = 0;
+  for (const executedBlocks of [96, 96, 1_024, 2_048, 831]) {
+    dispatches += executedBlocks;
+    assert.equal(dispatches < 4_096, true);
+    assert.equal(context.claimRunnerStatusPublication(dispatches), false);
+  }
+  assert.equal(context.runnerStatusDispatchDeadline, 4_096);
+});
+
+test("crossing a status deadline publishes exactly once", () => {
+  const context = statusPublicationContext();
+
+  assert.equal(context.claimRunnerStatusPublication(4_095), false);
+  assert.equal(context.claimRunnerStatusPublication(4_096), true);
+  assert.equal(context.runnerStatusDispatchDeadline, 8_192);
+  assert.equal(context.claimRunnerStatusPublication(4_096), false);
+  assert.equal(context.claimRunnerStatusPublication(8_191), false);
+});
+
+test("large dispatch leaps advance the status deadline without catch-up bursts", () => {
+  const context = statusPublicationContext();
+  const observedDispatches = 10 * 4_096 + 123;
+
+  assert.equal(context.claimRunnerStatusPublication(observedDispatches), true);
+  assert.equal(context.runnerStatusDispatchDeadline, 11 * 4_096);
+  assert.equal(
+    context.claimRunnerStatusPublication(observedDispatches),
+    false,
+    "the same observation must not replay skipped status publications",
+  );
+  assert.equal(context.claimRunnerStatusPublication(11 * 4_096), true);
+  assert.equal(context.runnerStatusDispatchDeadline, 12 * 4_096);
+});
+
+test("runner live status has no bitmask or every-region publication trigger", () => {
+  assert.doesNotMatch(source, /executedBlocks\s*>\s*1\s*\|\|/);
+  assert.doesNotMatch(source, /dispatches\s*&\s*4095/);
+  assert.match(
+    source,
+    /if \(claimRunnerStatusPublication\(dispatches\)\) \{\s*statusDataset\.dispatches = String\(dispatches\);\s*statusDataset\.cycles = String\(cycles\);\s*statusDataset\.idleJumps = String\(/,
+  );
+});
+
+test("lazy stability retains the pending event's exact wake cycle", () => {
+  const context = stabilityContext();
+  context.nextRuntimeEventCycle = () => 1_000;
+  const readSignature = () => 0x55aa55aa;
+  let cycles = 100;
+
+  for (let execution = 0; execution < 4; execution += 1) {
+    cycles += 6;
+    context.updateStablePcWitness(0x1000, readSignature);
+  }
+  const wakeCycle = context.nextStableWaitEventCycle(
+    true,
+    context.samePcCount,
+  );
+  assert.equal(wakeCycle, 1_000);
+  const skipped = wakeCycle - cycles;
+  cycles = wakeCycle;
+  assert.equal(skipped, 876);
+  assert.equal(cycles, 1_000);
+});
+
+test("non-semantic stable boundaries cannot use the generic idle accelerator", () => {
   const context = {
     pendingEventCycle: null,
     nextRuntimeEventCycle(includeCycleLimit) {
@@ -80,21 +253,26 @@ test("WarioWare queue-full waits wake only for a pending runtime event", () => {
 
   context.pendingEventCycle = 182_519_381;
   assert.equal(
-    context.nextStableWaitEventCycle(false, 127),
+    context.nextStableWaitEventCycle(false, 128),
     null,
-    "the interrupt-guarded multi-block wait retains its conservative threshold",
+    "device waits need their own structurally and dynamically certified path",
   );
   assert.equal(
-    context.nextStableWaitEventCycle(false, 128),
+    context.nextStableWaitEventCycle(true, 1),
+    null,
+    "semantic idle still requires two unchanged witnesses",
+  );
+  assert.equal(
+    context.nextStableWaitEventCycle(true, 2),
     182_519_381,
-    "a stable restore boundary may advance to the pending ARAM event",
+    "a certified semantic idle may advance to the pending event",
   );
 
   context.pendingEventCycle = null;
   assert.equal(
-    context.nextStableWaitEventCycle(false, 128),
+    context.nextStableWaitEventCycle(true, 2),
     null,
-    "a repeated boundary without a device event must keep executing the guest",
+    "semantic idle without a device event must keep executing the guest",
   );
 });
 
