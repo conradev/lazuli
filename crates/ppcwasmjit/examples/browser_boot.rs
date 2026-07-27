@@ -12165,6 +12165,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         mainBusRendered: false,
         mainBusCommands: 0,
         mainBusUploadLrsCommands: 0,
+        mainBusMixAuxACommands: 0,
+        mainBusMixAuxBCommands: 0,
+        mainBusAuxMixCommands: 0,
+        mainBusAuxUploadCommands: 0,
+        mainBusAuxUploadWriteBytes: 0,
+        mainBusAuxReturnReadBytes: 0,
+        mainBusAuxMixSelections: [],
         mainBusSetLrCommands: 0,
         mainBusSetOppositeLrCommands: 0,
         mainBusMixAuxBNoWriteCommands: 0,
@@ -12442,6 +12449,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         outputLrAddress: null,
         mainBusActive: false,
         mainBusCommands: [],
+        auxCommands: [],
         commandCodes: [],
         fallbackReason: null,
         fallbackCommand: null,
@@ -12591,6 +12599,34 @@ const TEMPLATE: &str = r##"<!doctype html>
             address: dspAxAddress(arguments_[0], arguments_[1]),
           });
           return;
+        case 0x04:
+        case 0x05: {
+          plan.active = true;
+          plan.mainBusActive = true;
+          if (
+            dspUcodeHash !== 0xe2136399
+            || !plan.setupZero
+            || plan.processSequence !== null
+          ) {
+            markDspAxVoiceFallback(
+              plan,
+              dspUcodeHash === 0xe2136399
+                ? "unsupported-main-bus-order"
+                : "unsupported-main-buffer-command",
+              command
+            );
+            return;
+          }
+          const auxCommand = {
+            code: command,
+            sequence,
+            writeAddress: dspAxAddress(arguments_[0], arguments_[1]),
+            readAddress: dspAxAddress(arguments_[2], arguments_[3]),
+          };
+          plan.mainBusCommands.push(auxCommand);
+          plan.auxCommands.push(auxCommand);
+          return;
+        }
         case 0x06:
         case 0x09:
           plan.active = true;
@@ -12661,12 +12697,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           return;
 
         // These commands can replace, mix into, or otherwise mutate main L/R,
-        // or have semantics Dolphin itself does not implement exactly. In
-        // particular, AUX commands 0x04 and 0x05 add their CPU effect-return
-        // buffers back into main L/R/S.
+        // or have semantics Dolphin itself does not implement exactly.
         case 0x01:
-        case 0x04:
-        case 0x05:
         case 0x08:
         case 0x10:
         case 0x13:
@@ -12693,7 +12725,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           && plan.mainBusActive
           && !plan.parameterBlockSeen
         ) {
-          const expectedCommands = [0x00, 0x06, 0x11, 0x09, 0x0e, 0x0f];
+          const expectedCommands = [0x00];
+          if (plan.auxCommands.some(command => command.code === 0x04)) {
+            expectedCommands.push(0x04);
+          }
+          if (plan.auxCommands.some(command => command.code === 0x05)) {
+            expectedCommands.push(0x05);
+          }
+          expectedCommands.push(0x06, 0x11, 0x09, 0x0e, 0x0f);
           if (
             plan.commandCodes.length !== expectedCommands.length
             || plan.commandCodes.some(
@@ -12772,6 +12811,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 0x04:
         case 0x05: {
           const address = dspAxAddress(arguments_[0], arguments_[1]);
+          const readAddress = dspAxAddress(arguments_[2], arguments_[3]);
+          if (dspAxMramRange(readAddress, 3 * 5 * 32 * 4) === null) {
+            return dspAxParseFailure("read-out-of-bounds", {
+              command,
+              address: hex32(readAddress),
+              size: 3 * 5 * 32 * 4,
+            });
+          }
           if (address !== 0) {
             ranges.push([address, 3 * 5 * 32 * 4, "aux-zero"]);
           }
@@ -13078,6 +13125,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         mainBusRendered: false,
         mainBusCommands: 0,
         mainBusUploadLrsCommands: 0,
+        mainBusMixAuxACommands: 0,
+        mainBusMixAuxBCommands: 0,
+        mainBusAuxMixCommands: 0,
+        mainBusAuxUploadCommands: 0,
+        mainBusAuxUploadWriteBytes: 0,
+        mainBusAuxReturnReadBytes: 0,
+        mainBusAuxMixSelections: [],
         mainBusSetLrCommands: 0,
         mainBusSetOppositeLrCommands: 0,
         mainBusMixAuxBNoWriteCommands: 0,
@@ -13107,6 +13161,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       let model = null;
       let mainBusModel = null;
       let mainBusTelemetry = null;
+      let mainBusAuxMixSelections = [];
+      let mainBusAuxReturnReadBytes = 0;
       let voiceFailureReason = null;
       let voiceModelCalls = 0;
       const renderVoice = initialMainBus => {
@@ -13190,6 +13246,20 @@ const TEMPLATE: &str = r##"<!doctype html>
           uploadLrsCommands: plan.mainBusCommands.filter(
             command => command.code === 0x06
           ).length,
+          mixAuxACommands: plan.mainBusCommands.filter(
+            command => command.code === 0x04
+          ).length,
+          mixAuxBCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x05
+          ).length,
+          auxMixCommands: plan.mainBusCommands.filter(
+            command => command.code === 0x04 || command.code === 0x05
+          ).length,
+          auxUploadCommands: plan.mainBusCommands.filter(
+            command =>
+              (command.code === 0x04 || command.code === 0x05)
+              && command.writeAddress !== 0
+          ).length,
           setLrCommands: plan.mainBusCommands.filter(
             command => command.code === 0x07
           ).length,
@@ -13221,14 +13291,27 @@ const TEMPLATE: &str = r##"<!doctype html>
           || Object.entries(expectedMainBusCounts).some(
             ([name, count]) => mainBusTelemetry[name] !== count
           )
+          || mainBusTelemetry.initialAuxBuses !== "zero"
           || !/^0x[0-9a-f]{8}$/.test(
             mainBusTelemetry.outputHash ?? ""
           )
           || !/^0x[0-9a-f]{8}$/.test(
             mainBusTelemetry.transactionHash ?? ""
           )
-          || mainBusTelemetry.uploadWriteBytes
+          || mainBusTelemetry.mainUploadWriteBytes
             !== expectedMainBusCounts.uploadLrsCommands * 5 * 32 * 3 * 4
+          || mainBusTelemetry.auxUploadWriteBytes
+            !== expectedMainBusCounts.auxUploadCommands * 5 * 32 * 3 * 4
+          || mainBusTelemetry.uploadWriteBytes
+            !== (
+              mainBusTelemetry.mainUploadWriteBytes
+              + mainBusTelemetry.auxUploadWriteBytes
+            )
+          || mainBusTelemetry.auxReturnReadBytes
+            !== (
+              expectedMainBusCounts.auxMixCommands
+              + expectedMainBusCounts.mixAuxBNoWriteCommands
+            ) * 5 * 32 * 3 * 4
           || mainBusTelemetry.outputWriteBytes !== 5 * 32 * (4 + 2 * 2)
           || mainBusTelemetry.transactionWriteBytes
             !== (
@@ -13237,6 +13320,72 @@ const TEMPLATE: &str = r##"<!doctype html>
             )
         ) {
           return dspAxVoiceFallback(plan, "invalid-main-bus-state");
+        }
+        mainBusAuxReturnReadBytes = mainBusTelemetry.auxReturnReadBytes;
+        const auxCommands = plan.mainBusCommands
+          .map((command, commandIndex) => ({ command, commandIndex }))
+          .filter(
+            entry =>
+              entry.command.code === 0x04
+              || entry.command.code === 0x05
+          );
+        if (
+          !Array.isArray(mainBusTelemetry.auxMixSelections)
+          || mainBusTelemetry.auxMixSelections.length
+            !== auxCommands.length
+        ) {
+          return dspAxVoiceFallback(
+            plan,
+            "invalid-main-bus-aux-telemetry"
+          );
+        }
+        mainBusAuxMixSelections = [];
+        for (let index = 0; index < auxCommands.length; index += 1) {
+          const { command, commandIndex } = auxCommands[index];
+          const selection = mainBusTelemetry.auxMixSelections[index];
+          const writeRange = command.writeAddress === 0
+            ? null
+            : dspAxMramRange(
+                command.writeAddress,
+                5 * 32 * 3 * 4
+              );
+          const readRange = dspAxMramRange(
+            command.readAddress,
+            5 * 32 * 3 * 4
+          );
+          const uploaded = command.writeAddress !== 0;
+          if (
+            selection === null
+            || typeof selection !== "object"
+            || readRange === null
+            || (uploaded && writeRange === null)
+            || selection.commandIndex !== commandIndex
+            || selection.code !== command.code
+            || selection.bus !== (command.code === 0x04 ? "A" : "B")
+            || selection.uploaded !== uploaded
+            || selection.writeLogicalAddress !== command.writeAddress
+            || selection.writePhysicalAddress
+              !== (writeRange?.physical ?? null)
+            || selection.writeBytes
+              !== (uploaded ? 5 * 32 * 3 * 4 : 0)
+            || selection.readLogicalAddress !== command.readAddress
+            || selection.readPhysicalAddress !== readRange.physical
+            || selection.readBytes !== 5 * 32 * 3 * 4
+          ) {
+            return dspAxVoiceFallback(
+              plan,
+              "invalid-main-bus-aux-telemetry"
+            );
+          }
+          mainBusAuxMixSelections.push({
+            bus: selection.bus,
+            command: selection.code,
+            uploaded,
+            writeAddress: command.writeAddress,
+            writePhysical: writeRange?.physical ?? null,
+            readAddress: command.readAddress,
+            readPhysical: readRange.physical,
+          });
         }
         if (voiceModelRequired && model === null) {
           return dspAxVoiceFallback(plan, "main-bus-missing-process");
@@ -13378,7 +13527,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (plan.mainBusActive) {
         const uploadCommands = plan.mainBusCommands
           .map((command, commandIndex) => ({ command, commandIndex }))
-          .filter(entry => entry.command.code === 0x06);
+          .filter(
+            entry =>
+              entry.command.code === 0x06
+              || (
+                (
+                  entry.command.code === 0x04
+                  || entry.command.code === 0x05
+                )
+                && entry.command.writeAddress !== 0
+              )
+          );
         if (
           !Array.isArray(mainBusModel.writes)
           || mainBusModel.writes.length !== uploadCommands.length + 2
@@ -13413,6 +13572,22 @@ const TEMPLATE: &str = r##"<!doctype html>
         const expectedWrites = [
           ...uploadCommands.map((entry, uploadIndex) => {
             const upload = mainBusModel.uploads[uploadIndex];
+            const auxUpload =
+              entry.command.code === 0x04
+              || entry.command.code === 0x05;
+            const expectedKind = entry.command.code === 0x04
+              ? "aux-a-lrs-s32-be"
+              : entry.command.code === 0x05
+                ? "aux-b-lrs-s32-be"
+                : "main-lrs-s32-be";
+            const expectedRole = entry.command.code === 0x04
+              ? "aux-a-upload-lrs"
+              : entry.command.code === 0x05
+                ? "aux-b-upload-lrs"
+                : "main-upload-lrs";
+            const expectedAddress = auxUpload
+              ? entry.command.writeAddress
+              : entry.command.address;
             if (
               upload === null
               || typeof upload !== "object"
@@ -13421,8 +13596,11 @@ const TEMPLATE: &str = r##"<!doctype html>
                 5 * 32 * 3 * 4,
                 transactionDataBuffers
               )
+              || (auxUpload && upload.data.some(value => value !== 0))
               || (
-                !voiceModelRequired
+                !auxUpload
+                && !voiceModelRequired
+                && plan.auxCommands.length === 0
                 && upload.data.some(value => value !== 0)
               )
             ) {
@@ -13430,12 +13608,12 @@ const TEMPLATE: &str = r##"<!doctype html>
             }
             transactionDataBuffers.add(upload.data.buffer);
             return {
-              command: 0x06,
+              command: entry.command.code,
               commandIndex: entry.commandIndex,
-              kind: "main-lrs-s32-be",
-              role: "main-upload-lrs",
+              kind: expectedKind,
+              role: expectedRole,
               sequence: entry.command.sequence,
-              address: entry.command.address,
+              address: expectedAddress,
               size: 5 * 32 * 3 * 4,
               data: upload.data,
               upload,
@@ -13564,7 +13742,15 @@ const TEMPLATE: &str = r##"<!doctype html>
         for (const command of plan.mainBusCommands) {
           let range = null;
           let role = null;
-          if (command.code === 0x07 || command.code === 0x11) {
+          if (command.code === 0x04 || command.code === 0x05) {
+            range = dspAxMramRange(
+              command.readAddress,
+              5 * 32 * 3 * 4
+            );
+            role = command.code === 0x04
+              ? "aux-a-return"
+              : "aux-b-return";
+          } else if (command.code === 0x07 || command.code === 0x11) {
             range = dspAxMramRange(command.address, 5 * 32 * 4);
             role = "main-bus-input";
           } else if (command.code === 0x09) {
@@ -13614,7 +13800,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           for (const read of reads) {
             if (
               operation.sequence < read.sequence
-              && operation.role !== "main-upload-lrs"
+              && !operation.role.endsWith("-upload-lrs")
               && dspAxVoiceRangesOverlap(operation, read)
             ) {
               return dspAxVoiceFallback(
@@ -13664,6 +13850,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         mainBusCommands: mainBusTelemetry?.commands ?? 0,
         mainBusUploadLrsCommands:
           mainBusTelemetry?.uploadLrsCommands ?? 0,
+        mainBusMixAuxACommands:
+          mainBusTelemetry?.mixAuxACommands ?? 0,
+        mainBusMixAuxBCommands:
+          mainBusTelemetry?.mixAuxBCommands ?? 0,
+        mainBusAuxMixCommands:
+          mainBusTelemetry?.auxMixCommands ?? 0,
+        mainBusAuxUploadCommands:
+          mainBusTelemetry?.auxUploadCommands ?? 0,
+        mainBusAuxUploadWriteBytes:
+          mainBusTelemetry?.auxUploadWriteBytes ?? 0,
+        mainBusAuxReturnReadBytes,
+        mainBusAuxMixSelections,
         mainBusSetLrCommands: mainBusTelemetry?.setLrCommands ?? 0,
         mainBusSetOppositeLrCommands:
           mainBusTelemetry?.setOppositeLrCommands ?? 0,
@@ -13810,6 +14008,32 @@ const TEMPLATE: &str = r##"<!doctype html>
             (deviceEvents.get("dspAxMainBusBytes") ?? 0)
               + voiceTransaction.mainBusWriteBytes
           );
+          if (voiceTransaction.mainBusAuxMixCommands !== 0) {
+            deviceEvents.set(
+              "dspAxMainBusAuxMix",
+              (deviceEvents.get("dspAxMainBusAuxMix") ?? 0)
+                + voiceTransaction.mainBusAuxMixCommands
+            );
+          }
+          if (voiceTransaction.mainBusAuxReturnReadBytes !== 0) {
+            deviceEvents.set(
+              "dspAxMainBusAuxReturnBytes",
+              (deviceEvents.get("dspAxMainBusAuxReturnBytes") ?? 0)
+                + voiceTransaction.mainBusAuxReturnReadBytes
+            );
+          }
+          if (voiceTransaction.mainBusAuxUploadCommands !== 0) {
+            deviceEvents.set(
+              "dspAxMainBusAuxUpload",
+              (deviceEvents.get("dspAxMainBusAuxUpload") ?? 0)
+                + voiceTransaction.mainBusAuxUploadCommands
+            );
+            deviceEvents.set(
+              "dspAxMainBusAuxBytes",
+              (deviceEvents.get("dspAxMainBusAuxBytes") ?? 0)
+                + voiceTransaction.mainBusAuxUploadWriteBytes
+            );
+          }
         }
       } else {
         clearedBytes = applyDspAxSilentWrites(result.writes);
@@ -13875,6 +14099,20 @@ const TEMPLATE: &str = r##"<!doctype html>
         voiceTransaction.mainBusCommands;
       dspAxCommandState.mainBusUploadLrsCommands =
         voiceTransaction.mainBusUploadLrsCommands;
+      dspAxCommandState.mainBusMixAuxACommands =
+        voiceTransaction.mainBusMixAuxACommands;
+      dspAxCommandState.mainBusMixAuxBCommands =
+        voiceTransaction.mainBusMixAuxBCommands;
+      dspAxCommandState.mainBusAuxMixCommands =
+        voiceTransaction.mainBusAuxMixCommands;
+      dspAxCommandState.mainBusAuxUploadCommands =
+        voiceTransaction.mainBusAuxUploadCommands;
+      dspAxCommandState.mainBusAuxUploadWriteBytes =
+        voiceTransaction.mainBusAuxUploadWriteBytes;
+      dspAxCommandState.mainBusAuxReturnReadBytes =
+        voiceTransaction.mainBusAuxReturnReadBytes;
+      dspAxCommandState.mainBusAuxMixSelections =
+        voiceTransaction.mainBusAuxMixSelections;
       dspAxCommandState.mainBusSetLrCommands =
         voiceTransaction.mainBusSetLrCommands;
       dspAxCommandState.mainBusSetOppositeLrCommands =
@@ -13921,6 +14159,20 @@ const TEMPLATE: &str = r##"<!doctype html>
         mainBusCommands: voiceTransaction.mainBusCommands,
         mainBusUploadLrsCommands:
           voiceTransaction.mainBusUploadLrsCommands,
+        mainBusMixAuxACommands:
+          voiceTransaction.mainBusMixAuxACommands,
+        mainBusMixAuxBCommands:
+          voiceTransaction.mainBusMixAuxBCommands,
+        mainBusAuxMixCommands:
+          voiceTransaction.mainBusAuxMixCommands,
+        mainBusAuxUploadCommands:
+          voiceTransaction.mainBusAuxUploadCommands,
+        mainBusAuxUploadWriteBytes:
+          voiceTransaction.mainBusAuxUploadWriteBytes,
+        mainBusAuxReturnReadBytes:
+          voiceTransaction.mainBusAuxReturnReadBytes,
+        mainBusAuxMixSelections:
+          voiceTransaction.mainBusAuxMixSelections,
         mainBusMixAuxBNoWriteCommands:
           voiceTransaction.mainBusMixAuxBNoWriteCommands,
         mainBusWriteCount: voiceTransaction.mainBusWriteCount,
@@ -24700,6 +24952,31 @@ const TEMPLATE: &str = r##"<!doctype html>
             mainBusCommands: dspAxCommandState.mainBusCommands,
             mainBusUploadLrsCommands:
               dspAxCommandState.mainBusUploadLrsCommands,
+            mainBusMixAuxACommands:
+              dspAxCommandState.mainBusMixAuxACommands,
+            mainBusMixAuxBCommands:
+              dspAxCommandState.mainBusMixAuxBCommands,
+            mainBusAuxMixCommands:
+              dspAxCommandState.mainBusAuxMixCommands,
+            mainBusAuxUploadCommands:
+              dspAxCommandState.mainBusAuxUploadCommands,
+            mainBusAuxUploadWriteBytes:
+              dspAxCommandState.mainBusAuxUploadWriteBytes,
+            mainBusAuxReturnReadBytes:
+              dspAxCommandState.mainBusAuxReturnReadBytes,
+            mainBusAuxMixSelections:
+              dspAxCommandState.mainBusAuxMixSelections.map(
+                selection => ({
+                  ...selection,
+                  writeAddress: hex32(selection.writeAddress),
+                  writePhysical:
+                    selection.writePhysical === null
+                      ? null
+                      : hex32(selection.writePhysical),
+                  readAddress: hex32(selection.readAddress),
+                  readPhysical: hex32(selection.readPhysical),
+                })
+              ),
             mainBusSetLrCommands:
               dspAxCommandState.mainBusSetLrCommands,
             mainBusSetOppositeLrCommands:
