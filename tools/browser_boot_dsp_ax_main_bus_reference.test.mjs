@@ -73,6 +73,22 @@ function setLr(address) {
   return { code: AX_MAIN_BUS_COMMAND.SET_LR, address };
 }
 
+function mixAuxA(writeAddress, readAddress) {
+  return {
+    code: AX_MAIN_BUS_COMMAND.MIX_AUXA,
+    writeAddress,
+    readAddress,
+  };
+}
+
+function mixAuxB(writeAddress, readAddress) {
+  return {
+    code: AX_MAIN_BUS_COMMAND.MIX_AUXB,
+    writeAddress,
+    readAddress,
+  };
+}
+
 function uploadLrs(address) {
   return { code: AX_MAIN_BUS_COMMAND.UPLOAD_LRS, address };
 }
@@ -180,6 +196,8 @@ function patternedSamples() {
 test("pins GameCube AX command IDs and the five-millisecond envelope", () => {
   assert.deepEqual(AX_MAIN_BUS_COMMAND, {
     PROCESS: 0x03,
+    MIX_AUXA: 0x04,
+    MIX_AUXB: 0x05,
     UPLOAD_LRS: 0x06,
     SET_LR: 0x07,
     MIX_AUXB_NOWRITE: 0x09,
@@ -194,6 +212,363 @@ test("pins GameCube AX command IDs and the five-millisecond envelope", () => {
   assert.equal(AX_MAIN_BUS_LIMITS.attackEntryCount, 11);
   assert.equal(AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes, 640);
   assert.equal(AX_MAIN_BUS_LIMITS.accumulatorLrsBytes, 1_920);
+});
+
+test("CMD_MIX_AUXA/B upload planar s32-BE and wrap returns into MAIN", () => {
+  const mram = new Uint8Array(0x12_000);
+  const mainLeft = new Int32Array(AX_MAIN_BUS_LIMITS.frames);
+  const mainRight = new Int32Array(AX_MAIN_BUS_LIMITS.frames);
+  const mainSurround = new Int32Array(AX_MAIN_BUS_LIMITS.frames);
+  mainLeft.fill(0x7fff_ffff);
+  mainRight.fill(-0x8000_0000);
+
+  const auxA = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (0x1020_3040 + frame * 0x0102_0304) | 0,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (-0x1020_3040 - frame * 0x0002_0305) | 0,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (0x5060_7080 - frame * 0x0001_0203) | 0,
+    ),
+  };
+  const auxB = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (0x3141_5926 - frame * 65_537) | 0,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (-0x2718_2818 + frame * 131_071) | 0,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (frame * 0x0011_2233) | 0,
+    ),
+  };
+  const returnA = {
+    left: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(1),
+    right: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(-1),
+    surround: new Int32Array(
+      AX_MAIN_BUS_LIMITS.frames,
+    ).fill(0x3f80_0000),
+  };
+  const returnB = {
+    left: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(-1),
+    right: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(1),
+    surround: new Int32Array(AX_MAIN_BUS_LIMITS.frames).fill(2),
+  };
+  writeLrsInput(mram, 0x4000, returnA);
+  writeLrsInput(mram, 0x5000, returnB);
+  const before = new Uint8Array(mram);
+
+  const result = executeAxMainBusReference({
+    mram,
+    initialMainBus: {
+      left: mainLeft,
+      right: mainRight,
+      surround: mainSurround,
+    },
+    initialAuxBuses: { auxA, auxB },
+    commands: [
+      mixAuxA(0x8000_1000, 0x4000_4000),
+      mixAuxB(0xc000_2000, 0x8000_5000),
+      output(0x8000, 0x9000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  assert.equal(result.uploads.length, 2);
+  assert.deepEqual(
+    result.uploads.map(upload => [
+      upload.sequence,
+      upload.commandIndex,
+      upload.kind,
+      upload.logicalAddress,
+      upload.physicalAddress,
+      upload.byteLength,
+    ]),
+    [
+      [0, 0, "aux-a-lrs-s32-be", 0x8000_1000, 0x1000, 1_920],
+      [1, 1, "aux-b-lrs-s32-be", 0xc000_2000, 0x2000, 1_920],
+    ],
+  );
+  for (const [uploadIndex, bus] of [[0, auxA], [1, auxB]]) {
+    const uploadView = new DataView(result.uploads[uploadIndex].data.buffer);
+    for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+      assert.equal(uploadView.getInt32(frame * 4, false), bus.left[frame]);
+      assert.equal(
+        uploadView.getInt32(
+          AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes + frame * 4,
+          false,
+        ),
+        bus.right[frame],
+      );
+      assert.equal(
+        uploadView.getInt32(
+          2 * AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes + frame * 4,
+          false,
+        ),
+        bus.surround[frame],
+      );
+    }
+  }
+
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(
+      result.output.main.samples[frame * 2],
+      -0x8000,
+      "right wraps through INT32_MAX then back to INT32_MIN",
+    );
+    assert.equal(
+      result.output.main.samples[frame * 2 + 1],
+      0x7fff,
+      "left wraps through INT32_MIN then back to INT32_MAX",
+    );
+    assert.equal(
+      result.output.surround.samples[frame],
+      0x3f80_0002,
+      "0x3f800000 is an integer accumulator word, not float 1.0",
+    );
+  }
+  assert.equal(result.telemetry.initialAuxBuses, "provided");
+  assert.equal(result.telemetry.mixAuxACommands, 1);
+  assert.equal(result.telemetry.mixAuxBCommands, 1);
+  assert.equal(result.telemetry.auxMixCommands, 2);
+  assert.equal(result.telemetry.auxUploadCommands, 2);
+  assert.equal(result.telemetry.auxUploadWriteBytes, 3_840);
+  assert.equal(result.telemetry.mainUploadWriteBytes, 0);
+  assert.equal(result.telemetry.uploadWriteBytes, 3_840);
+  assert.equal(result.telemetry.auxReturnReadBytes, 3_840);
+  assert.equal(result.telemetry.transactionWriteBytes, 5_120);
+  assert.deepEqual(result.telemetry.auxMixSelections, [
+    {
+      commandIndex: 0,
+      code: AX_MAIN_BUS_COMMAND.MIX_AUXA,
+      bus: "A",
+      uploaded: true,
+      writeLogicalAddress: 0x8000_1000,
+      writePhysicalAddress: 0x1000,
+      writeBytes: 1_920,
+      readLogicalAddress: 0x4000_4000,
+      readPhysicalAddress: 0x4000,
+      readBytes: 1_920,
+    },
+    {
+      commandIndex: 1,
+      code: AX_MAIN_BUS_COMMAND.MIX_AUXB,
+      bus: "B",
+      uploaded: true,
+      writeLogicalAddress: 0xc000_2000,
+      writePhysicalAddress: 0x2000,
+      writeBytes: 1_920,
+      readLogicalAddress: 0x8000_5000,
+      readPhysicalAddress: 0x5000,
+      readBytes: 1_920,
+    },
+  ]);
+  assertExactOwnedResultBuffers(result, mram);
+});
+
+test("AUX uploads feed their own exact and partial aliased returns", () => {
+  const mram = new Uint8Array(0x10_000);
+  for (let address = 0; address < mram.length; address += 1) {
+    mram[address] = (address * 37 + 11) & 0xff;
+  }
+  const auxA = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame * 7 - 500,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 700 - frame * 11,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame * 13 - 900,
+    ),
+  };
+  const auxB = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (0x1020_3040 + frame * 0x0101_0101) | 0,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (-0x2030_4050 - frame * 0x0002_0305) | 0,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (0x5060_7080 - frame * 0x0001_0203) | 0,
+    ),
+  };
+  const before = new Uint8Array(mram);
+
+  const result = executeAxMainBusReference({
+    mram,
+    initialAuxBuses: { auxA, auxB },
+    commands: [
+      mixAuxA(0x8000_1000, 0xc000_1000),
+      mixAuxB(0x4000_2000, 0x8000_2202),
+      output(0x6000, 0x7000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(mram, before);
+  const stagedImage = applyWrites(mram, result.uploads);
+  const stagedView = new DataView(stagedImage.buffer);
+  const originalView = new DataView(mram.buffer);
+  assert.notEqual(
+    stagedView.getInt32(0x2202, false),
+    originalView.getInt32(0x2202, false),
+    "the partially aliased return starts in the staged AUX-B upload",
+  );
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    const returnedLeft = stagedView.getInt32(
+      0x2202 + frame * 4,
+      false,
+    );
+    const returnedRight = stagedView.getInt32(
+      0x2202
+      + AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes
+      + frame * 4,
+      false,
+    );
+    const returnedSurround = stagedView.getInt32(
+      0x2202
+      + 2 * AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes
+      + frame * 4,
+      false,
+    );
+    assert.equal(
+      result.output.main.samples[frame * 2],
+      clampSigned16((auxA.right[frame] + returnedRight) | 0),
+    );
+    assert.equal(
+      result.output.main.samples[frame * 2 + 1],
+      clampSigned16((auxA.left[frame] + returnedLeft) | 0),
+    );
+    assert.equal(
+      result.output.surround.samples[frame],
+      (auxA.surround[frame] + returnedSurround) | 0,
+    );
+  }
+});
+
+test("AUX write address zero skips, while cached physical zero uploads", () => {
+  const mram = new Uint8Array(0x10_000);
+  const returned = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame - 1_000,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 2_000 - frame * 3,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame * 5 - 3_000,
+    ),
+  };
+  const outgoing = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 4_000 + frame * 7,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => -5_000 - frame * 11,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 6_000 + frame * 13,
+    ),
+  };
+  const zeroAux = {
+    left: new Int32Array(AX_MAIN_BUS_LIMITS.frames),
+    right: new Int32Array(AX_MAIN_BUS_LIMITS.frames),
+    surround: new Int32Array(AX_MAIN_BUS_LIMITS.frames),
+  };
+  writeLrsInput(mram, 0, returned);
+  const before = new Uint8Array(mram);
+  const initialAuxBuses = { auxA: outgoing, auxB: zeroAux };
+
+  const skipped = executeAxMainBusReference({
+    mram,
+    initialAuxBuses,
+    commands: [
+      mixAuxA(0, 0),
+      output(0x5000, 0x6000),
+    ],
+  });
+  assert.equal(skipped.ok, true);
+  assert.equal(skipped.uploads.length, 0);
+  assert.equal(skipped.telemetry.auxUploadCommands, 0);
+  assert.equal(skipped.telemetry.uploadWriteBytes, 0);
+  assert.deepEqual(skipped.telemetry.auxMixSelections, [
+    {
+      commandIndex: 0,
+      code: AX_MAIN_BUS_COMMAND.MIX_AUXA,
+      bus: "A",
+      uploaded: false,
+      writeLogicalAddress: 0,
+      writePhysicalAddress: null,
+      writeBytes: 0,
+      readLogicalAddress: 0,
+      readPhysicalAddress: 0,
+      readBytes: 1_920,
+    },
+  ]);
+
+  const aliased = executeAxMainBusReference({
+    mram,
+    initialAuxBuses,
+    commands: [
+      mixAuxA(0x8000_0000, 0),
+      output(0x5000, 0x6000),
+    ],
+  });
+  assert.equal(aliased.ok, true);
+  assert.equal(aliased.uploads.length, 1);
+  assert.equal(aliased.uploads[0].logicalAddress, 0x8000_0000);
+  assert.equal(aliased.uploads[0].physicalAddress, 0);
+  assert.equal(aliased.telemetry.auxUploadCommands, 1);
+  assert.equal(aliased.telemetry.uploadWriteBytes, 1_920);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(
+      skipped.output.main.samples[frame * 2],
+      returned.right[frame],
+    );
+    assert.equal(
+      skipped.output.main.samples[frame * 2 + 1],
+      returned.left[frame],
+    );
+    assert.equal(
+      skipped.output.surround.samples[frame],
+      returned.surround[frame],
+    );
+    assert.equal(
+      aliased.output.main.samples[frame * 2],
+      outgoing.right[frame],
+    );
+    assert.equal(
+      aliased.output.main.samples[frame * 2 + 1],
+      outgoing.left[frame],
+    );
+    assert.equal(
+      aliased.output.surround.samples[frame],
+      outgoing.surround[frame],
+    );
+  }
+  assert.deepEqual(mram, before);
 });
 
 test("CMD_SET_LR reads cached big-endian s32 and emits exact R,L s16", () => {
@@ -490,6 +865,8 @@ test("PROCESS then UPLOAD_LRS snapshots post-voice accumulators in order", () =>
   assert.equal(result.telemetry.uploadLrsCommands, 1);
   assert.equal(result.telemetry.setOppositeLrCommands, 1);
   assert.equal(result.telemetry.mixAuxBNoWriteCommands, 1);
+  assert.equal(result.telemetry.auxMixCommands, 0);
+  assert.equal(result.telemetry.auxReturnReadBytes, 1_920);
   assert.equal(result.telemetry.processCommands, 1);
   assert.equal(result.telemetry.uploadWriteBytes, 1_920);
   assert.equal(result.telemetry.outputWriteBytes, 1_280);
@@ -549,6 +926,9 @@ test("WarioWare main-bus-only postmix uploads zero initial accumulators", () => 
   assert.deepEqual(mram, before);
   assert.equal(result.telemetry.processCommands, 0);
   assert.equal(result.telemetry.commands, 4);
+  assert.equal(result.telemetry.auxMixCommands, 0);
+  assert.equal(result.telemetry.mixAuxBNoWriteCommands, 1);
+  assert.equal(result.telemetry.auxReturnReadBytes, 1_920);
   assert.equal(result.uploads.length, 1);
   assert.ok(result.uploads[0].data.every(value => value === 0));
   assert.deepEqual(
@@ -594,6 +974,156 @@ test("WarioWare main-bus-only postmix uploads zero initial accumulators", () => 
     result.telemetry.transactionHash,
     result.telemetry.outputHash,
     "the transaction hash includes the 1,920-byte upload",
+  );
+});
+
+test("full WarioWare 04/05 main-bus body stages three uploads", () => {
+  // Runtime owns the surrounding zero SETUP (00) and END (0f). This is the
+  // complete authority-model body: 04,05,06,11,09,0e.
+  const mram = new Uint8Array(0x12_000);
+  const auxAReturn = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame * 101 - 8_000,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 9_000 - frame * 103,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 0x1234_0000 + frame * 257,
+    ),
+  };
+  const auxBReturn = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 5_000 - frame * 107,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame * 109 - 6_000,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => (-0x0123_0000 - frame * 263) | 0,
+    ),
+  };
+  const opposite = Int32Array.from(
+    { length: AX_MAIN_BUS_LIMITS.frames },
+    (_unused, frame) => frame * 10_003 - 800_000,
+  );
+  const postmix = {
+    left: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame * 3 - 200,
+    ),
+    right: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => 300 - frame * 5,
+    ),
+    surround: Int32Array.from(
+      { length: AX_MAIN_BUS_LIMITS.frames },
+      (_unused, frame) => frame * 7 - 400,
+    ),
+  };
+  writeLrsInput(mram, 0x3000, auxAReturn);
+  writeLrsInput(mram, 0x4000, auxBReturn);
+  writeMainInput(mram, 0x6000, opposite);
+  writeLrsInput(mram, 0x7000, postmix);
+  const before = new Uint8Array(mram);
+  let processCalls = 0;
+
+  const result = executeAxMainBusReference({
+    mram,
+    processMainBus: () => {
+      processCalls += 1;
+      throw new Error("WarioWare main-bus-only path must not process voices");
+    },
+    commands: [
+      mixAuxA(0x8000_1000, 0x4000_3000),
+      mixAuxB(0xc000_2000, 0x8000_4000),
+      uploadLrs(0x4000_5000),
+      setOppositeLr(0xc000_6000),
+      mixAuxBNoWrite(0x8000_7000),
+      output(0xa000, 0x9000),
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(processCalls, 0);
+  assert.deepEqual(mram, before);
+  assert.deepEqual(
+    result.writes.map(write => [
+      write.sequence,
+      write.commandIndex,
+      write.kind,
+      write.physicalAddress,
+      write.byteLength,
+    ]),
+    [
+      [0, 0, "aux-a-lrs-s32-be", 0x1000, 1_920],
+      [1, 1, "aux-b-lrs-s32-be", 0x2000, 1_920],
+      [2, 2, "main-lrs-s32-be", 0x5000, 1_920],
+      [3, 5, "surround-s32-be", 0x9000, 640],
+      [4, 5, "main-rl-s16-be", 0xa000, 640],
+    ],
+  );
+  assert.ok(result.uploads[0].data.every(value => value === 0));
+  assert.ok(result.uploads[1].data.every(value => value === 0));
+  const mainUploadView = new DataView(result.uploads[2].data.buffer);
+  for (let frame = 0; frame < AX_MAIN_BUS_LIMITS.frames; frame += 1) {
+    assert.equal(
+      mainUploadView.getInt32(frame * 4, false),
+      (auxAReturn.left[frame] + auxBReturn.left[frame]) | 0,
+    );
+    assert.equal(
+      mainUploadView.getInt32(
+        AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes + frame * 4,
+        false,
+      ),
+      (auxAReturn.right[frame] + auxBReturn.right[frame]) | 0,
+    );
+    assert.equal(
+      mainUploadView.getInt32(
+        2 * AX_MAIN_BUS_LIMITS.accumulatorPlaneBytes + frame * 4,
+        false,
+      ),
+      (auxAReturn.surround[frame] + auxBReturn.surround[frame]) | 0,
+    );
+    assert.equal(
+      result.output.main.samples[frame * 2],
+      clampSigned16((opposite[frame] + postmix.right[frame]) | 0),
+    );
+    assert.equal(
+      result.output.main.samples[frame * 2 + 1],
+      clampSigned16(
+        (((-opposite[frame]) | 0) + postmix.left[frame]) | 0,
+      ),
+    );
+    assert.equal(
+      result.output.surround.samples[frame],
+      postmix.surround[frame],
+    );
+  }
+  assert.equal(result.telemetry.initialAuxBuses, "zero");
+  assert.equal(result.telemetry.commands, 6);
+  assert.equal(result.telemetry.processCommands, 0);
+  assert.equal(result.telemetry.mixAuxACommands, 1);
+  assert.equal(result.telemetry.mixAuxBCommands, 1);
+  assert.equal(result.telemetry.auxMixCommands, 2);
+  assert.equal(result.telemetry.auxUploadCommands, 2);
+  assert.equal(result.telemetry.uploadLrsCommands, 1);
+  assert.equal(result.telemetry.mixAuxBNoWriteCommands, 1);
+  assert.equal(result.telemetry.auxReturnReadBytes, 5_760);
+  assert.equal(result.telemetry.auxUploadWriteBytes, 3_840);
+  assert.equal(result.telemetry.mainUploadWriteBytes, 1_920);
+  assert.equal(result.telemetry.uploadWriteBytes, 5_760);
+  assert.equal(result.telemetry.outputWriteBytes, 1_280);
+  assert.equal(result.telemetry.transactionWriteBytes, 7_040);
+  assert.equal(
+    result.telemetry.transactionHash,
+    fnv1a(result.writes.map(write => write.data)),
   );
 });
 
@@ -1140,6 +1670,39 @@ test("PROCESS callback contracts fail closed and permit at most one event", () =
   assert.deepEqual(mram, before);
 });
 
+test("PROCESS plus AUX commands rejects before invoking an incomplete model", () => {
+  const mram = new Uint8Array(0x4000);
+  const before = new Uint8Array(mram);
+  let processCalls = 0;
+  const result = executeAxMainBusReference({
+    mram,
+    commands: [
+      processCommand(),
+      mixAuxA(0, 0x100),
+      output(0x1000, 0x1800),
+    ],
+    processMainBus: () => {
+      processCalls += 1;
+      return {
+        left: new Int32Array(AX_MAIN_BUS_LIMITS.frames),
+        right: new Int32Array(AX_MAIN_BUS_LIMITS.frames),
+      };
+    },
+  });
+
+  assert.deepEqual(result, {
+    ok: false,
+    error: {
+      reason: "process-aux-accumulators-unmodeled",
+      processCommandIndex: 0,
+      auxCommandIndex: 1,
+      auxCommand: AX_MAIN_BUS_COMMAND.MIX_AUXA,
+    },
+  });
+  assert.equal(processCalls, 0);
+  assert.deepEqual(mram, before);
+});
+
 test("compressor persists only its position across attack and release frames", () => {
   const mram = new Uint8Array(0x10_000);
   const inputPhysicalAddress = 0x1000;
@@ -1352,7 +1915,31 @@ test("invalid commands and MRAM ranges fail closed at bounded envelopes", () => 
       reason: "mram-range-out-of-bounds",
     },
     {
+      name: "AUX-A upload range",
+      commands: [
+        mixAuxA(0x8000_3f00, 0x100),
+        validOutput,
+      ],
+      reason: "mram-range-out-of-bounds",
+    },
+    {
+      name: "AUX-A return range after valid upload",
+      commands: [
+        mixAuxA(0x8000_0100, 0xc000_3f00),
+        validOutput,
+      ],
+      reason: "mram-range-out-of-bounds",
+    },
+    {
       name: "AUX-B return range",
+      commands: [
+        mixAuxB(0, 0x4000_3f00),
+        validOutput,
+      ],
+      reason: "mram-range-out-of-bounds",
+    },
+    {
+      name: "AUX-B no-write return range",
       commands: [mixAuxBNoWrite(0x8000_3f00), validOutput],
       reason: "mram-range-out-of-bounds",
     },
