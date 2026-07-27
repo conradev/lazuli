@@ -505,6 +505,191 @@ function warioFixture({
   };
 }
 
+function serializeLrs({ left, right, surround }) {
+  const output = new Uint8Array(3 * 160 * 4);
+  for (const [plane, samples] of [left, right, surround].entries()) {
+    assert.equal(samples.length, 160);
+    for (let frame = 0; frame < 160; frame += 1) {
+      writeBigEndianS32(
+        output,
+        plane * 160 * 4 + frame * 4,
+        samples[frame],
+      );
+    }
+  }
+  return output;
+}
+
+function addLrsWrapping(left, right) {
+  return {
+    left: Int32Array.from(
+      left.left,
+      (sample, frame) => (sample + right.left[frame]) | 0,
+    ),
+    right: Int32Array.from(
+      left.right,
+      (sample, frame) => (sample + right.right[frame]) | 0,
+    ),
+    surround: Int32Array.from(
+      left.surround,
+      (sample, frame) => (sample + right.surround[frame]) | 0,
+    ),
+  };
+}
+
+function warioAuxCommands({
+  setupAddress,
+  auxA,
+  auxB,
+  uploadAddress,
+  inputAddress,
+  postmixAddress,
+  surroundAddress,
+  lrAddress,
+}) {
+  const commands = [
+    0x0000, ...splitAddress(setupAddress),
+  ];
+  if (auxA !== null) {
+    commands.push(
+      0x0004,
+      ...splitAddress(auxA.writeAddress),
+      ...splitAddress(auxA.readAddress),
+    );
+  }
+  if (auxB !== null) {
+    commands.push(
+      0x0005,
+      ...splitAddress(auxB.writeAddress),
+      ...splitAddress(auxB.readAddress),
+    );
+  }
+  commands.push(
+    0x0006, ...splitAddress(uploadAddress),
+    0x0011, ...splitAddress(inputAddress),
+    0x0009, ...splitAddress(postmixAddress),
+    0x000e,
+    ...splitAddress(surroundAddress),
+    ...splitAddress(lrAddress),
+    0x000f,
+  );
+  return commands;
+}
+
+function patternedLrs(seed) {
+  const make = (multiplier, offset) => Int32Array.from(
+    { length: 160 },
+    (_unused, frame) =>
+      (seed + frame * multiplier + offset) | 0,
+  );
+  return {
+    left: make(0x0102_0305, -0x1234_567),
+    right: make(-0x000f_0103, 0x1020_3040),
+    surround: make(0x0001_0101, -0x3141_5926),
+  };
+}
+
+function warioAuxFixture({
+  executeAxMainBusReference = executeCanonicalAxMainBusReference,
+  auxAWriteAddress = 0x80002000,
+  auxAReadAddress = 0xc0003000,
+  auxBWriteAddress = 0x40004000,
+  auxBReadAddress = 0x80005000,
+  includeAuxA = true,
+  includeAuxB = true,
+  setupAddress = 0x40001000,
+  uploadAddress = 0xc0006000,
+  inputAddress = 0x80007000,
+  postmixAddress = 0x40008000,
+  surroundAddress = 0xc0009000,
+  lrAddress = 0x8000a000,
+  ucodeHash = 0xe2136399,
+} = {}) {
+  const calls = [];
+  const context = runtimeContext({
+    executeAxMainBusReference,
+    ucodeHash,
+    renderAxVoiceReference(input) {
+      calls.push(input);
+      throw new Error("Wario AUX main-bus path must not invoke voice");
+    },
+  });
+  const auxA = patternedLrs(0x1020_3040);
+  const auxB = patternedLrs(-0x2030_4050);
+  auxA.left[0] = 0x3f80_0000;
+  auxA.right[0] = 0x7fff_ffff;
+  auxA.surround[0] = -0x8000_0000;
+  auxB.left[0] = 1;
+  auxB.right[0] = 1;
+  auxB.surround[0] = -1;
+  const input = Int32Array.from(
+    { length: 160 },
+    (_unused, frame) => ((frame - 80) * 1_000_003) | 0,
+  );
+  const postmix = patternedLrs(0x0102_0304);
+  writeZeroSetup(context, setupAddress);
+  ramBytes(context, auxAWriteAddress, 1_920).fill(0xa4);
+  ramBytes(context, auxBWriteAddress, 1_920).fill(0xb5);
+  writeMainLrs(context, auxAReadAddress, auxA);
+  writeMainLrs(context, auxBReadAddress, auxB);
+  ramBytes(context, uploadAddress, 1_920).fill(0xc6);
+  writeMainInput(context, inputAddress, input);
+  writeMainLrs(context, postmixAddress, postmix);
+  ramBytes(context, surroundAddress, 640).fill(0xd7);
+  ramBytes(context, lrAddress, 640).fill(0xe8);
+
+  const auxACommand = includeAuxA
+    ? {
+        writeAddress: auxAWriteAddress >>> 0,
+        readAddress: auxAReadAddress >>> 0,
+      }
+    : null;
+  const auxBCommand = includeAuxB
+    ? {
+        writeAddress: auxBWriteAddress >>> 0,
+        readAddress: auxBReadAddress >>> 0,
+      }
+    : null;
+  const words = warioAuxCommands({
+    setupAddress,
+    auxA: auxACommand,
+    auxB: auxBCommand,
+    uploadAddress,
+    inputAddress,
+    postmixAddress,
+    surroundAddress,
+    lrAddress,
+  });
+  return {
+    auxA,
+    auxACommand,
+    auxAReadAddress,
+    auxAWriteAddress,
+    auxB,
+    auxBCommand,
+    auxBReadAddress,
+    auxBWriteAddress,
+    calls,
+    context,
+    input,
+    inputAddress,
+    lrAddress,
+    postmix,
+    postmixAddress,
+    setupAddress,
+    surroundAddress,
+    uploadAddress,
+    words,
+  };
+}
+
+function hostAuxSelections(context) {
+  return Array.from(
+    context.dspAxCommandState.mainBusAuxMixSelections,
+    selection => ({ ...selection }),
+  );
+}
+
 function assertWarioMainBusFallback(
   testFixture,
   {
@@ -764,9 +949,16 @@ test("WarioWare postmix commits exact aliases and ignores its 18-word END tail",
   assert.equal(context.dspAxCommandState.mainBusUploadLrsCommands, 1);
   assert.equal(context.dspAxCommandState.mainBusSetLrCommands, 0);
   assert.equal(context.dspAxCommandState.mainBusSetOppositeLrCommands, 1);
+  assert.equal(context.dspAxCommandState.mainBusMixAuxACommands, 0);
+  assert.equal(context.dspAxCommandState.mainBusMixAuxBCommands, 0);
+  assert.equal(context.dspAxCommandState.mainBusAuxMixCommands, 0);
   assert.equal(
     context.dspAxCommandState.mainBusMixAuxBNoWriteCommands,
     1,
+  );
+  assert.equal(
+    context.dspAxCommandState.mainBusAuxReturnReadBytes,
+    1_920,
   );
   assert.equal(context.dspAxCommandState.mainBusCompressorCommands, 0);
   assert.equal(context.dspAxCommandState.mainBusWriteCount, 3);
@@ -800,9 +992,18 @@ test("WarioWare postmix commits exact aliases and ignores its 18-word END tail",
   assert.equal(context.deviceEvents.get("dspAxMainBusRender"), 1);
   assert.equal(context.deviceEvents.get("dspAxMainBusWrite"), 3);
   assert.equal(context.deviceEvents.get("dspAxMainBusBytes"), 3_200);
+  assert.equal(context.deviceEvents.get("dspAxMainBusAuxMix"), undefined);
+  assert.equal(
+    context.deviceEvents.get("dspAxMainBusAuxReturnBytes"),
+    1_920,
+  );
   assert.equal(context.deviceEvents.get("dspAxSilentWrite"), 0);
   assert.equal(context.deviceEvents.get("dspAxSilentBytes"), 0);
   assert.equal(context.dspFirstUnsupported, null);
+  const commandTrace = context.dspTrace.find(
+    entry => entry.event === "ax-command-list",
+  );
+  assert.equal(commandTrace.mainBusAuxReturnReadBytes, 1_920);
   assert.equal(
     context.dspTrace.filter(
       entry => entry.event === "ax-main-bus-write"
@@ -819,6 +1020,655 @@ test("WarioWare postmix commits exact aliases and ignores its 18-word END tail",
     ),
     "persistent Wario diagnostics must retain scalar evidence only",
   );
+});
+
+test("WarioWare AUXA/AUXB uploads precede returns and commit exact diagnostics", () => {
+  const testFixture = warioAuxFixture();
+  const {
+    auxA,
+    auxAWriteAddress,
+    auxB,
+    auxBWriteAddress,
+    calls,
+    context,
+    input,
+    lrAddress,
+    postmix,
+    surroundAddress,
+    uploadAddress,
+    words,
+  } = testFixture;
+  const expectedUpload = serializeLrs(addLrsWrapping(auxA, auxB));
+  const expectedOutput = warioPostmixOutput(input, postmix);
+
+  assert.equal(words.length, 28, "the certified list remains short");
+  assert.equal(executeList(context, 0xc0000100, words), true);
+  assert.equal(calls.length, 0);
+  assert.ok(
+    ramBytes(context, auxAWriteAddress, 1_920)
+      .every(value => value === 0),
+    "zero SETUP exposes an exact zero AUXA upload",
+  );
+  assert.ok(
+    ramBytes(context, auxBWriteAddress, 1_920)
+      .every(value => value === 0),
+    "zero SETUP exposes an exact zero AUXB upload",
+  );
+  assert.deepEqual(
+    ramBytes(context, uploadAddress, 1_920),
+    expectedUpload,
+    "CMD06 may upload nonzero MAIN after AUX returns",
+  );
+  const uploadBytes = ramBytes(context, uploadAddress, 1_920);
+  const uploadView = new DataView(
+    uploadBytes.buffer,
+    uploadBytes.byteOffset,
+    uploadBytes.byteLength,
+  );
+  assert.equal(
+    uploadView.getInt32(0, false),
+    0x3f80_0001,
+    "0x3f800000 is a signed integer accumulator value, not float 1.0",
+  );
+  assert.equal(
+    uploadView.getInt32(640, false),
+    -0x8000_0000,
+    "AUX return addition wraps signed 32-bit at the right plane",
+  );
+  assert.equal(
+    uploadView.getInt32(1_280, false),
+    0x7fff_ffff,
+    "planar surround addition wraps independently",
+  );
+  assert.deepEqual(
+    ramBytes(context, surroundAddress, 640),
+    expectedOutput.surround,
+  );
+  assert.deepEqual(
+    ramBytes(context, lrAddress, 640),
+    expectedOutput.main,
+  );
+  assert.deepEqual(
+    context.invalidations,
+    [
+      [0x2000, 1_920],
+      [0x4000, 1_920],
+      [0x6000, 1_920],
+      [0x9000, 640],
+      [0xa000, 640],
+    ],
+  );
+
+  assert.equal(context.dspAxCommandState.wordCount, 28);
+  assert.equal(context.dspAxCommandState.paddingWords, 0);
+  assert.equal(context.dspAxCommandState.commandCount, 8);
+  assert.deepEqual(
+    Array.from(context.dspAxCommandState.commandSample),
+    [0x00, 0x04, 0x05, 0x06, 0x11, 0x09, 0x0e, 0x0f],
+  );
+  assert.equal(context.dspAxCommandState.voiceMode, "main-bus-only");
+  assert.equal(context.dspAxCommandState.mainBusCommands, 6);
+  assert.equal(context.dspAxCommandState.mainBusMixAuxACommands, 1);
+  assert.equal(context.dspAxCommandState.mainBusMixAuxBCommands, 1);
+  assert.equal(context.dspAxCommandState.mainBusAuxMixCommands, 2);
+  assert.equal(
+    context.dspAxCommandState.mainBusMixAuxBNoWriteCommands,
+    1,
+  );
+  assert.equal(context.dspAxCommandState.mainBusAuxUploadCommands, 2);
+  assert.equal(context.dspAxCommandState.mainBusAuxUploadWriteBytes, 3_840);
+  assert.equal(context.dspAxCommandState.mainBusAuxReturnReadBytes, 5_760);
+  assert.deepEqual(
+    hostAuxSelections(context),
+    [
+      {
+        bus: "A",
+        command: 0x04,
+        uploaded: true,
+        writeAddress: 0x80002000,
+        writePhysical: 0x2000,
+        readAddress: 0xc0003000,
+        readPhysical: 0x3000,
+      },
+      {
+        bus: "B",
+        command: 0x05,
+        uploaded: true,
+        writeAddress: 0x40004000,
+        writePhysical: 0x4000,
+        readAddress: 0x80005000,
+        readPhysical: 0x5000,
+      },
+    ],
+  );
+  assert.equal(context.dspAxCommandState.mainBusUploadLrsCommands, 1);
+  assert.equal(context.dspAxCommandState.mainBusWriteCount, 5);
+  assert.equal(context.dspAxCommandState.mainBusWriteBytes, 7_040);
+  assert.equal(
+    context.dspAxCommandState.mainBusOutputHash,
+    fnv1a([expectedOutput.surround, expectedOutput.main]),
+  );
+  assert.equal(
+    context.dspAxCommandState.mainBusTransactionHash,
+    fnv1a([
+      new Uint8Array(1_920),
+      new Uint8Array(1_920),
+      expectedUpload,
+      expectedOutput.surround,
+      expectedOutput.main,
+    ]),
+  );
+  assert.equal(context.deviceEvents.get("dspAxMainBusAuxMix"), 2);
+  assert.equal(context.deviceEvents.get("dspAxMainBusAuxReturnBytes"), 5_760);
+  assert.equal(context.deviceEvents.get("dspAxMainBusAuxUpload"), 2);
+  assert.equal(context.deviceEvents.get("dspAxMainBusAuxBytes"), 3_840);
+  assert.equal(context.deviceEvents.get("dspAxMainBusWrite"), 5);
+  assert.equal(context.deviceEvents.get("dspAxMainBusBytes"), 7_040);
+  assert.equal(context.deviceEvents.get("dspAxSilentWrite"), 0);
+  assert.equal(context.dspFirstUnsupported, null);
+  const commandTrace = context.dspTrace.find(
+    entry => entry.event === "ax-command-list",
+  );
+  assert.equal(commandTrace.mainBusAuxMixCommands, 2);
+  assert.equal(commandTrace.mainBusAuxUploadCommands, 2);
+  assert.equal(commandTrace.mainBusAuxUploadWriteBytes, 3_840);
+  assert.equal(commandTrace.mainBusAuxReturnReadBytes, 5_760);
+  assert.equal(commandTrace.mainBusAuxMixSelections.length, 2);
+});
+
+test("release diagnostics publish bounded AUX command evidence", () => {
+  for (const field of [
+    "mainBusMixAuxACommands",
+    "mainBusMixAuxBCommands",
+    "mainBusAuxMixCommands",
+    "mainBusAuxUploadCommands",
+    "mainBusAuxUploadWriteBytes",
+    "mainBusAuxReturnReadBytes",
+  ]) {
+    assert.match(
+      source,
+      new RegExp(`${field}:\\s*dspAxCommandState\\.${field}`),
+    );
+  }
+  assert.match(
+    source,
+    /mainBusAuxMixSelections:\s*dspAxCommandState\.mainBusAuxMixSelections\.map\(/,
+  );
+  assert.match(source, /writeAddress: hex32\(selection\.writeAddress\)/);
+  assert.match(source, /readAddress: hex32\(selection\.readAddress\)/);
+});
+
+test("WarioWare accepts independently optional AUXA and AUXB callbacks", () => {
+  for (const variant of [
+    {
+      name: "AUXA only",
+      includeAuxA: true,
+      includeAuxB: false,
+      expectedBus: "A",
+      expectedCode: 0x04,
+      expectedReturn: "auxA",
+    },
+    {
+      name: "AUXB only",
+      includeAuxA: false,
+      includeAuxB: true,
+      expectedBus: "B",
+      expectedCode: 0x05,
+      expectedReturn: "auxB",
+    },
+  ]) {
+    const testFixture = warioAuxFixture(variant);
+    const expectedUpload = serializeLrs(
+      testFixture[variant.expectedReturn],
+    );
+    assert.equal(testFixture.words.length, 23, variant.name);
+    assert.equal(
+      executeList(
+        testFixture.context,
+        0x0100,
+        testFixture.words,
+      ),
+      true,
+      variant.name,
+    );
+    assert.deepEqual(
+      ramBytes(testFixture.context, testFixture.uploadAddress, 1_920),
+      expectedUpload,
+      variant.name,
+    );
+    assert.equal(
+      testFixture.context.dspAxCommandState.mainBusMixAuxACommands,
+      variant.includeAuxA ? 1 : 0,
+    );
+    assert.equal(
+      testFixture.context.dspAxCommandState.mainBusMixAuxBCommands,
+      variant.includeAuxB ? 1 : 0,
+    );
+    assert.equal(
+      testFixture.context.dspAxCommandState.mainBusAuxUploadCommands,
+      1,
+    );
+    assert.equal(
+      testFixture.context.dspAxCommandState.mainBusAuxMixCommands,
+      1,
+    );
+    assert.equal(
+      testFixture.context.dspAxCommandState.mainBusMixAuxBNoWriteCommands,
+      1,
+    );
+    assert.equal(
+      testFixture.context.dspAxCommandState.mainBusAuxReturnReadBytes,
+      3_840,
+    );
+    assert.equal(
+      testFixture.context.deviceEvents.get("dspAxMainBusAuxReturnBytes"),
+      3_840,
+    );
+    assert.deepEqual(
+      Array.from(
+        testFixture.context.dspAxCommandState.mainBusAuxMixSelections,
+        selection => [selection.bus, selection.command],
+      ),
+      [[variant.expectedBus, variant.expectedCode]],
+    );
+    assert.equal(
+      testFixture.context.dspAxCommandState.mainBusWriteBytes,
+      5_120,
+    );
+    assert.equal(testFixture.context.dspFirstUnsupported, null);
+  }
+});
+
+test("WarioWare rejects uncertified AUX topology before either model runs", () => {
+  const variants = [
+    {
+      name: "duplicate AUXA",
+      reason: "uncertified-main-bus-only-sequence",
+      alter(fixture) {
+        const setup = fixture.words.slice(0, 3);
+        const auxA = fixture.words.slice(3, 8);
+        const auxB = fixture.words.slice(8, 13);
+        const tail = fixture.words.slice(13);
+        return [...setup, ...auxA, ...auxA, ...auxB, ...tail];
+      },
+    },
+    {
+      name: "AUXB before AUXA",
+      reason: "uncertified-main-bus-only-sequence",
+      alter(fixture) {
+        const setup = fixture.words.slice(0, 3);
+        const auxA = fixture.words.slice(3, 8);
+        const auxB = fixture.words.slice(8, 13);
+        const tail = fixture.words.slice(13);
+        return [...setup, ...auxB, ...auxA, ...tail];
+      },
+    },
+    {
+      name: "wrong ucode hash",
+      reason: "unsupported-main-buffer-command",
+      fixture: { ucodeHash: 0x07f88145 },
+      alter(fixture) {
+        return fixture.words;
+      },
+    },
+    {
+      name: "nonzero setup",
+      reason: "nonzero-setup-buffer",
+      prepare(fixture) {
+        const pointer = fixture.context.ramPointer(
+          fixture.setupAddress,
+          2,
+        );
+        fixture.context.view.setUint16(pointer, 1, false);
+      },
+      alter(fixture) {
+        return fixture.words;
+      },
+    },
+    {
+      name: "PB and PROCESS insertion",
+      reason: "uncertified-voice-ucode",
+      prepare(fixture) {
+        ramBytes(fixture.context, 0xb000, 244).fill(0x5a);
+      },
+      alter(fixture) {
+        return [
+          ...fixture.words.slice(0, 13),
+          0x0002, ...splitAddress(0x8000b000),
+          0x0003,
+          ...fixture.words.slice(13),
+        ];
+      },
+    },
+  ];
+
+  for (const variant of variants) {
+    let authorityCalls = 0;
+    const fixture = warioAuxFixture({
+      ...variant.fixture,
+      executeAxMainBusReference(input) {
+        authorityCalls += 1;
+        return executeCanonicalAxMainBusReference(input);
+      },
+    });
+    variant.prepare?.(fixture);
+    assert.equal(
+      executeList(fixture.context, 0x0100, variant.alter(fixture)),
+      true,
+      variant.name,
+    );
+    assert.equal(authorityCalls, 0, variant.name);
+    assert.equal(fixture.calls.length, 0, variant.name);
+    assert.equal(
+      fixture.context.dspAxCommandState.voiceMode,
+      "silent-fallback",
+      variant.name,
+    );
+    assert.equal(
+      fixture.context.dspAxCommandState.voiceReason,
+      variant.reason,
+      variant.name,
+    );
+    assert.equal(
+      fixture.context.deviceEvents.get("dspAxMainBusRender"),
+      undefined,
+      variant.name,
+    );
+  }
+});
+
+test("WarioWare distinguishes skipped AUX write zero from cached physical zero", () => {
+  const skipped = warioAuxFixture({
+    includeAuxB: false,
+    auxAWriteAddress: 0,
+  });
+  assert.equal(executeList(skipped.context, 0x0100, skipped.words), true);
+  assert.deepEqual(
+    ramBytes(skipped.context, skipped.uploadAddress, 1_920),
+    serializeLrs(skipped.auxA),
+  );
+  assert.deepEqual(
+    hostAuxSelections(skipped.context),
+    [{
+      bus: "A",
+      command: 0x04,
+      uploaded: false,
+      writeAddress: 0,
+      writePhysical: null,
+      readAddress: 0xc0003000,
+      readPhysical: 0x3000,
+    }],
+  );
+  assert.equal(
+    skipped.context.dspAxCommandState.mainBusAuxUploadCommands,
+    0,
+  );
+  assert.equal(skipped.context.dspAxCommandState.mainBusWriteBytes, 3_200);
+
+  const cachedZero = warioAuxFixture({
+    includeAuxB: false,
+    auxAWriteAddress: 0x80000000,
+    auxAReadAddress: 0,
+  });
+  assert.equal(
+    executeList(cachedZero.context, 0x80000100, cachedZero.words),
+    true,
+  );
+  assert.ok(
+    ramBytes(cachedZero.context, cachedZero.uploadAddress, 1_920)
+      .every(value => value === 0),
+    "the current cached-zero upload must feed the same-command read at zero",
+  );
+  assert.deepEqual(
+    hostAuxSelections(cachedZero.context),
+    [{
+      bus: "A",
+      command: 0x04,
+      uploaded: true,
+      writeAddress: 0x80000000,
+      writePhysical: 0,
+      readAddress: 0,
+      readPhysical: 0,
+    }],
+  );
+  assert.deepEqual(
+    cachedZero.context.invalidations,
+    [
+      [0, 1_920],
+      [0x6000, 1_920],
+      [0x9000, 640],
+      [0xa000, 640],
+    ],
+  );
+  assert.equal(cachedZero.context.dspFirstUnsupported, null);
+});
+
+test("WarioWare AUX prior uploads feed aliases and OOB ranges reject atomically", () => {
+  const aliased = warioAuxFixture({
+    auxBWriteAddress: 0,
+    auxBReadAddress: 0x40002000,
+  });
+  assert.equal(executeList(aliased.context, 0x0100, aliased.words), true);
+  assert.deepEqual(
+    ramBytes(aliased.context, aliased.uploadAddress, 1_920),
+    serializeLrs(aliased.auxA),
+    "the earlier AUXA zero upload replaces the later aliased AUXB return",
+  );
+  assert.equal(aliased.context.dspFirstUnsupported, null);
+
+  const partial = warioAuxFixture({
+    includeAuxB: false,
+    auxAWriteAddress: 0x80002000,
+    auxAReadAddress: 0xc0002100,
+  });
+  const expectedPartial = new Uint8Array(1_920);
+  expectedPartial.set(
+    serializeLrs(partial.auxA).subarray(1_664),
+    1_664,
+  );
+  assert.equal(executeList(partial.context, 0x0100, partial.words), true);
+  assert.deepEqual(
+    ramBytes(partial.context, partial.uploadAddress, 1_920),
+    expectedPartial,
+    "a partial return alias sees staged zero bytes and the untouched tail",
+  );
+  assert.equal(partial.context.dspFirstUnsupported, null);
+
+  for (const variant of [
+    {
+      name: "upload",
+      words(fixture) {
+        return warioAuxCommands({
+          setupAddress: fixture.setupAddress,
+          auxA: {
+            writeAddress: 0xc002ff00,
+            readAddress: fixture.auxAReadAddress,
+          },
+          auxB: null,
+          uploadAddress: fixture.uploadAddress,
+          inputAddress: fixture.inputAddress,
+          postmixAddress: fixture.postmixAddress,
+          surroundAddress: fixture.surroundAddress,
+          lrAddress: fixture.lrAddress,
+        });
+      },
+      reason: "write-out-of-bounds",
+    },
+    {
+      name: "return",
+      words(fixture) {
+        return warioAuxCommands({
+          setupAddress: fixture.setupAddress,
+          auxA: {
+            writeAddress: fixture.auxAWriteAddress,
+            readAddress: 0x8002ff00,
+          },
+          auxB: null,
+          uploadAddress: fixture.uploadAddress,
+          inputAddress: fixture.inputAddress,
+          postmixAddress: fixture.postmixAddress,
+          surroundAddress: fixture.surroundAddress,
+          lrAddress: fixture.lrAddress,
+        });
+      },
+      reason: "read-out-of-bounds",
+    },
+  ]) {
+    const fixture = warioAuxFixture({
+      includeAuxB: false,
+    });
+    const words = variant.words(fixture);
+    writeWords(fixture.context, 0x0100, words);
+    fixture.context.dspAxCommandState.sizeWords = words.length;
+    const before = new Uint8Array(fixture.context.bytes);
+    assert.equal(
+      fixture.context.executeDspAxCommandList(0x0100),
+      false,
+    );
+    assert.deepEqual(
+      fixture.context.bytes,
+      before,
+      `${variant.name} OOB must commit no partial upload or output`,
+    );
+    assert.deepEqual(fixture.context.invalidations, []);
+    assert.equal(fixture.context.dspAxCommandState.phase, "halted");
+    assert.equal(fixture.context.dspAxCommandState.reason, variant.reason);
+  }
+});
+
+test("WarioWare rejects forged AUX evidence before model writes commit", () => {
+  const variants = [
+    {
+      name: "forged AUX selection",
+      reason: "invalid-main-bus-aux-telemetry",
+      mutate(result) {
+        return {
+          ...result,
+          telemetry: {
+            ...result.telemetry,
+            auxMixSelections: [
+              {
+                ...result.telemetry.auxMixSelections[0],
+                readPhysicalAddress:
+                  result.telemetry.auxMixSelections[0].readPhysicalAddress
+                  + 4,
+              },
+              result.telemetry.auxMixSelections[1],
+            ],
+          },
+        };
+      },
+    },
+    {
+      name: "nonzero AUX upload",
+      reason: "invalid-main-bus-upload",
+      mutate(result) {
+        const upload = {
+          ...result.uploads[0],
+          data: new Uint8Array(1_920).fill(1),
+        };
+        const writes = [upload, ...result.writes.slice(1)];
+        return {
+          ...result,
+          uploads: [upload, ...result.uploads.slice(1)],
+          writes,
+          telemetry: {
+            ...result.telemetry,
+            transactionHash: fnv1a(writes.map(write => write.data)),
+          },
+        };
+      },
+    },
+    {
+      name: "forged AUX upload kind",
+      reason: "invalid-main-bus-output-write",
+      mutate(result) {
+        const upload = {
+          ...result.uploads[0],
+          kind: "main-lrs-s32-be",
+        };
+        return {
+          ...result,
+          uploads: [upload, ...result.uploads.slice(1)],
+          writes: [upload, ...result.writes.slice(1)],
+        };
+      },
+    },
+    {
+      name: "AUX upload aliases live MRAM",
+      reason: "invalid-main-bus-upload",
+      mutate(result, input) {
+        const upload = {
+          ...result.uploads[0],
+          data: input.mram.subarray(0x2000, 0x2000 + 1_920),
+        };
+        const writes = [upload, ...result.writes.slice(1)];
+        return {
+          ...result,
+          uploads: [upload, ...result.uploads.slice(1)],
+          writes,
+          telemetry: {
+            ...result.telemetry,
+            transactionHash: fnv1a(writes.map(write => write.data)),
+          },
+        };
+      },
+    },
+    {
+      name: "forged transaction hash",
+      reason: "invalid-main-bus-transaction-hash",
+      mutate(result) {
+        return {
+          ...result,
+          telemetry: {
+            ...result.telemetry,
+            transactionHash: "0x00000000",
+          },
+        };
+      },
+    },
+  ];
+
+  for (const variant of variants) {
+    const fixture = warioAuxFixture({
+      executeAxMainBusReference(input) {
+        const result = executeCanonicalAxMainBusReference(input);
+        assert.equal(result.ok, true);
+        return variant.mutate(result, input);
+      },
+    });
+    assert.equal(
+      executeList(fixture.context, 0x0100, fixture.words),
+      true,
+      variant.name,
+    );
+    assert.equal(
+      fixture.context.dspAxCommandState.voiceReason,
+      variant.reason,
+      variant.name,
+    );
+    assert.equal(
+      fixture.context.dspAxCommandState.mainBusRendered,
+      false,
+      variant.name,
+    );
+    for (const [address, size] of [
+      [fixture.auxAWriteAddress, 1_920],
+      [fixture.auxBWriteAddress, 1_920],
+      [fixture.uploadAddress, 1_920],
+      [fixture.surroundAddress, 640],
+      [fixture.lrAddress, 640],
+    ]) {
+      assert.ok(
+        ramBytes(fixture.context, address, size)
+          .every(value => value === 0),
+        `${variant.name} must expose only the established silent fallback`,
+      );
+    }
+    assert.equal(fixture.context.dspAxCommandState.clearedBytes, 7_040);
+    assert.equal(fixture.context.deviceEvents.get("dspAxMainBusRender"), undefined);
+    assert.equal(fixture.context.deviceEvents.get("dspAxMainBusFallback"), 1);
+  }
 });
 
 test("WarioWare rejects forged write evidence and compressor drift atomically", () => {
