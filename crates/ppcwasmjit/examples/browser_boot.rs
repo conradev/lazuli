@@ -6547,10 +6547,39 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxProjectedVertices = 0;
     let gxDroppedVertices = 0;
     let gxLightingRejectedVertices = 0;
+    let gxPositionIndexSkips = 0;
+    // GX retains the final normal attributes supplied by a primitive and
+    // exposes them to later vertex formats that omit the corresponding
+    // attribute. These start at zero just like Dolphin's static caches.
+    let gxCachedNormal = [0, 0, 0];
+    let gxCachedTangent = [0, 0, 0];
+    let gxCachedBinormal = [0, 0, 0];
+    let gxNormalCacheCommits = 0;
+    let gxCachedNormalUses = 0;
+    let gxCachedTangentUses = 0;
+    let gxCachedBinormalUses = 0;
     let gxLegacyProjectionNullVertices = 0;
     let gxExactRequiredDraws = 0;
     let gxExactRequiredVertices = 0;
     let gxExactRequiredCaptureMisses = 0;
+    const gxExactRequiredCaptureFailureReasons = Object.freeze([
+      "source-geometry",
+      "bp-state",
+      "clip-disable",
+      "viewport",
+      "projection-state",
+      "position",
+      "position-matrix-index",
+      "position-matrix",
+      "view-nonfinite",
+      "clip-nonfinite",
+      "carrier-nonfinite",
+      "unknown",
+    ]);
+    const gxExactRequiredCaptureFailureCounts = new Uint32Array(
+      gxExactRequiredCaptureFailureReasons.length
+    );
+    let gxFirstExactRequiredCaptureFailure = null;
     let gxDisplayListErrors = 0;
     let gxVertexDecodeErrors = 0;
     let gxUnknownOpcodes = 0;
@@ -6584,6 +6613,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxTextureDecodeErrors = 0;
     let gxTevTextureCacheHits = 0;
     let gxTexgenTransforms = 0;
+    let gxTexgenEmbossTransforms = 0;
     let gxTexgenNonFiniteTransforms = 0;
     let gxTexgenFallbacks = 0;
     let gxTexturedDraws = 0;
@@ -8353,7 +8383,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (
         matrix === null
         || matrix.some(value => !Number.isFinite(value))
-        || matrix.every(value => value === 0)
       ) return null;
       const x = Math.fround(position[0]);
       const y = Math.fround(position[1]);
@@ -8450,10 +8479,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const matrix = Array.from({ length: 12 }, (_unused, index) =>
         gxXfFloat(matrixIndex * 4 + index)
       );
-      const valid = (
-        matrix.every(Number.isFinite)
-        && matrix.some(value => value !== 0)
-      );
+      // XF has no uninitialized-matrix sentinel. An all-zero 3x4 matrix is
+      // valid and must reach projection, including its perspective -0 clip W.
+      const valid = matrix.every(Number.isFinite);
       state.positionMatrices[matrixIndex] = valid ? matrix : null;
       return state.positionMatrices[matrixIndex];
     }
@@ -8485,10 +8513,11 @@ const TEMPLATE: &str = r##"<!doctype html>
             gxXfFloat(base + index)
           )
         : gxVertexTransformNormalMatrix(context, matrixIndex);
+      // XF normal matrices have no uninitialized-state sentinel either.
+      // A zero 3x3 reaches normalization just like every other finite matrix.
       if (
         matrix === null
         || matrix.some(value => !Number.isFinite(value))
-        || matrix.every(value => value === 0)
       ) return null;
       const x = Math.fround(vector[0]);
       const y = Math.fround(vector[1]);
@@ -8527,33 +8556,154 @@ const TEMPLATE: &str = r##"<!doctype html>
       return transformed.map(value => Math.fround(value / length));
     }
 
-    function gxTransformTexCoord(
+    function gxTexgenCount(context = null) {
+      return context === null
+        ? gxXfRegisters[0x103f] & 0xf
+        : context.texgenCount;
+    }
+
+    function gxTexgenInfo(texgenIndex, context = null) {
+      return context === null
+        ? gxXfRegisters[0x1040 + texgenIndex] >>> 0
+        : context.texgenInfo[texgenIndex];
+    }
+
+    function gxScaleTexCoord(result, texgenIndex, context = null) {
+      const scaleRegister = 0x30 + texgenIndex * 2;
+      const scaleS = context === null
+        ? (gxBpRegisters[scaleRegister] & 0xffff) + 1
+        : context.texgenScales[texgenIndex][0];
+      const scaleT = context === null
+        ? (gxBpRegisters[scaleRegister + 1] & 0xffff) + 1
+        : context.texgenScales[texgenIndex][1];
+      const scaled = [
+        Math.fround(
+          Math.fround(result[0]) * scaleS
+        ),
+        Math.fround(
+          Math.fround(result[1]) * scaleT
+        ),
+        result[2],
+      ];
+      if (!scaled.every(Number.isFinite)) gxTexgenNonFiniteTransforms += 1;
+      gxTexgenTransforms += 1;
+      return scaled;
+    }
+
+    function gxPrepareEmbossTexgenState(
+      attributes,
+      normalMatrixIndex,
+      context = null
+    ) {
+      const tangent = gxTransformNormalVector(
+        attributes.embossTangent ?? attributes.tangent,
+        normalMatrixIndex,
+        context
+      );
+      const binormal = gxTransformNormalVector(
+        attributes.embossBinormal ?? attributes.binormal,
+        normalMatrixIndex,
+        context
+      );
+      const viewPosition = attributes.viewPosition
+        ?? gxTransformPosition(attributes.position, normalMatrixIndex, context);
+      return {
+        tangent,
+        binormal,
+        viewPosition,
+        lightDirections: Array(8),
+      };
+    }
+
+    function gxEmbossLightDirection(
+      embossState,
+      lightIndex,
+      context = null
+    ) {
+      const cached = embossState.lightDirections[lightIndex];
+      if (cached !== undefined) return cached;
+      const lightPosition = context === null
+        ? gxXfLightPosition(lightIndex)
+        : gxVertexTransformEmbossLightPosition(context, lightIndex);
+      const direction = lightPosition === null
+        || embossState.viewPosition === null
+        || embossState.viewPosition === undefined
+        ? null
+        : gxLightNormalize3(
+            gxVectorSubtract(lightPosition, embossState.viewPosition)
+          );
+      embossState.lightDirections[lightIndex] = direction;
+      return direction;
+    }
+
+    function gxGenerateTexCoord(
       attributes,
       matrixIndex,
       texgenIndex,
+      generatedTexCoords,
+      embossState,
       context = null
     ) {
       if (texgenIndex < 0 || texgenIndex >= 8) return null;
-      const texgenCount = context === null
-        ? gxXfRegisters[0x103f] & 0xf
-        : context.texgenCount;
-      if (texgenIndex >= texgenCount) return null;
-      const info = context === null
-        ? gxXfRegisters[0x1040 + texgenIndex] >>> 0
-        : context.texgenInfo[texgenIndex];
+      if (texgenIndex >= gxTexgenCount(context)) return null;
+      const info = gxTexgenInfo(texgenIndex, context);
       const projection = (info >>> 1) & 1;
       const inputForm = (info >>> 2) & 1;
-      const texgenType = (info >>> 4) & 3;
+      const texgenType = (info >>> 4) & 7;
       const sourceRow = (info >>> 7) & 0x1f;
+
+      if (texgenType === 1) {
+        if (
+          embossState === null
+          || embossState.tangent === null
+          || embossState.binormal === null
+        ) {
+          gxTexgenFallbacks += 1;
+          return null;
+        }
+        const embossSource = (info >>> 12) & 7;
+        const embossLight = (info >>> 15) & 7;
+        const source = generatedTexCoords[embossSource] ?? [0, 0, 0];
+        const lightDirection = gxEmbossLightDirection(
+          embossState,
+          embossLight,
+          context
+        );
+        if (lightDirection === null) {
+          gxTexgenFallbacks += 1;
+          return null;
+        }
+        gxTexgenEmbossTransforms += 1;
+        return [
+          gxCullAdd(
+            source[0] ?? 0,
+            gxDot3(lightDirection, embossState.tangent)
+          ),
+          gxCullAdd(
+            source[1] ?? 0,
+            gxDot3(lightDirection, embossState.binormal)
+          ),
+          source[2] ?? 0,
+        ];
+      }
+
+      if (texgenType === 2 || texgenType === 3) {
+        const color = attributes.colors[texgenType - 2] ?? [0, 0, 0, 0];
+        return [color[0] ?? 0, color[1] ?? 0, 1];
+      }
+
+      if (texgenType !== 0) {
+        gxTexgenFallbacks += 1;
+        return null;
+      }
+
       // Flipper starts each source row at AB11's default coordinate. Missing
       // optional vertex attributes leave that value intact; they are not a
       // renderer fallback or a malformed texgen.
       let source = [0, 0, 1];
       if (sourceRow === 0) source = attributes.position;
       if (sourceRow === 1) source = attributes.normal;
-      if (sourceRow === 2) {
-        source = attributes.colors[texgenType === 3 ? 1 : 0];
-      }
+      if (sourceRow === 2) source = attributes.colors[0];
       if (sourceRow === 3) source = attributes.tangent;
       if (sourceRow === 4) source = attributes.binormal;
       if (sourceRow >= 5 && sourceRow <= 12) {
@@ -8564,26 +8714,21 @@ const TEMPLATE: &str = r##"<!doctype html>
       const input = inputForm === 0
         ? [source[0] ?? 0, source[1] ?? 0, 1, 1]
         : [source[0] ?? 0, source[1] ?? 0, source[2] ?? 0, 1];
-      let transformed;
-      if (texgenType === 0) {
-        const row0 = context === null
-          ? gxXfMatrixRow(0, matrixIndex, true)
-          : gxVertexTransformTexgenRow(context, matrixIndex, false);
-        const row1 = context === null
-          ? gxXfMatrixRow(0, matrixIndex + 1, true)
-          : gxVertexTransformTexgenRow(context, matrixIndex + 1, false);
-        const row2 = context === null
-          ? gxXfMatrixRow(0, matrixIndex + 2, true)
-          : gxVertexTransformTexgenRow(context, matrixIndex + 2, false);
-        if (row0 === null || row1 === null || row2 === null) return null;
-        transformed = [gxDot4(row0, input), gxDot4(row1, input), gxDot4(row2, input)];
-      } else if (texgenType === 1) {
-        // Emboss texgen is not used by either browser bring-up title yet. GX's
-        // base operation leaves its selected source available to the post matrix.
-        transformed = input.slice(0, 3);
-      } else {
-        transformed = [source[0] ?? 0, source[1] ?? 0, 1];
-      }
+      const row0 = context === null
+        ? gxXfMatrixRow(0, matrixIndex, true)
+        : gxVertexTransformTexgenRow(context, matrixIndex, false);
+      const row1 = context === null
+        ? gxXfMatrixRow(0, matrixIndex + 1, true)
+        : gxVertexTransformTexgenRow(context, matrixIndex + 1, false);
+      const row2 = context === null
+        ? gxXfMatrixRow(0, matrixIndex + 2, true)
+        : gxVertexTransformTexgenRow(context, matrixIndex + 2, false);
+      if (row0 === null || row1 === null || row2 === null) return null;
+      const transformed = [
+        gxDot4(row0, input),
+        gxDot4(row1, input),
+        gxDot4(row2, input),
+      ];
       let result = projection === 0
         ? [transformed[0], transformed[1], 1]
         : transformed;
@@ -8619,25 +8764,90 @@ const TEMPLATE: &str = r##"<!doctype html>
             + post2[2] * result[2] + post2[3],
         ];
       }
-      const scaleRegister = 0x30 + texgenIndex * 2;
-      const scaleS = context === null
-        ? (gxBpRegisters[scaleRegister] & 0xffff) + 1
-        : context.texgenScales[texgenIndex][0];
-      const scaleT = context === null
-        ? (gxBpRegisters[scaleRegister + 1] & 0xffff) + 1
-        : context.texgenScales[texgenIndex][1];
-      result = [
-        Math.fround(
-          Math.fround(result[0]) * scaleS
-        ),
-        Math.fround(
-          Math.fround(result[1]) * scaleT
-        ),
-        result[2],
-      ];
-      if (!result.every(Number.isFinite)) gxTexgenNonFiniteTransforms += 1;
-      gxTexgenTransforms += 1;
       return result;
+    }
+
+    function gxTransformTexCoord(
+      attributes,
+      matrixIndex,
+      texgenIndex,
+      context = null
+    ) {
+      const generatedTexCoords = Array.from(
+        { length: 8 },
+        () => [0, 0, 0]
+      );
+      const info = texgenIndex >= 0 && texgenIndex < 8
+        ? gxTexgenInfo(texgenIndex, context)
+        : 0;
+      const embossState = ((info >>> 4) & 7) === 1
+        && Number.isInteger(attributes.normalMatrixIndex)
+        ? gxPrepareEmbossTexgenState(
+            attributes,
+            attributes.normalMatrixIndex,
+            context
+          )
+        : null;
+      const result = gxGenerateTexCoord(
+        attributes,
+        matrixIndex,
+        texgenIndex,
+        generatedTexCoords,
+        embossState,
+        context
+      );
+      return result === null
+        ? null
+        : gxScaleTexCoord(result, texgenIndex, context);
+    }
+
+    function gxTransformTexCoords(
+      attributes,
+      matrixIndices,
+      normalMatrixIndex,
+      context = null
+    ) {
+      const generatedTexCoords = Array.from(
+        { length: 8 },
+        () => [0, 0, 0]
+      );
+      const results = Array(8).fill(null);
+      const texgenCount = Math.min(8, gxTexgenCount(context));
+      let embossState = null;
+      for (let texgenIndex = 0; texgenIndex < texgenCount; texgenIndex += 1) {
+        if (((gxTexgenInfo(texgenIndex, context) >>> 4) & 7) !== 1) continue;
+        embossState = gxPrepareEmbossTexgenState(
+          attributes,
+          normalMatrixIndex,
+          context
+        );
+        break;
+      }
+      // XF generates every stage in order because emboss can read a preceding
+      // stage. BP SU_SSIZE/SU_TSIZE scaling happens only after those unscaled
+      // dependencies have all been consumed.
+      for (let texgenIndex = 0; texgenIndex < texgenCount; texgenIndex += 1) {
+        const result = gxGenerateTexCoord(
+          attributes,
+          matrixIndices[texgenIndex] ?? 0,
+          texgenIndex,
+          generatedTexCoords,
+          embossState,
+          context
+        );
+        if (result === null) continue;
+        generatedTexCoords[texgenIndex] = result;
+        results[texgenIndex] = result;
+      }
+      for (let texgenIndex = 0; texgenIndex < texgenCount; texgenIndex += 1) {
+        if (results[texgenIndex] === null) continue;
+        results[texgenIndex] = gxScaleTexCoord(
+          results[texgenIndex],
+          texgenIndex,
+          context
+        );
+      }
+      return results;
     }
 
     function gxAttributeStatus(index) {
@@ -8810,11 +9020,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
       if (status === 0) return empty(cursor);
       const componentBytes = gxComponentBytes(format);
-      const scale = format <= 1 ? 2 ** -6 : format <= 3 ? 2 ** -14 : 1;
+      const scale = [2 ** -7, 2 ** -6, 2 ** -15, 2 ** -14, 1][format] ?? 1;
       const vectorCount = elements === 0 ? 1 : 3;
       const readVector = (data, offset) => {
+        const readFormat = format >= 4 ? 4 : format;
         const vector = Array.from({ length: 3 }, (_unused, component) =>
-          gxReadComponent(data, offset + component * componentBytes, format) * scale
+          gxReadComponent(data, offset + component * componentBytes, readFormat) * scale
         );
         return vector.every(Number.isFinite) ? vector : null;
       };
@@ -8833,15 +9044,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           next += indexBytes;
           return index;
         });
-        const sentinel = indexBytes === 1 ? 0xff : 0xffff;
-        if (indexes.some(index => index === sentinel)) {
-          return { ...empty(next), skipped: true };
-        }
         const base = gxCpRegisters[0xa1] >>> 0;
         const stride = gxCpRegisters[0xb1] & 0xff;
         if (indexCount === 3) {
-          vectors = indexes.map(index => {
-            const pointer = ramPointer((base + index * stride) >>> 0, 3 * componentBytes);
+          vectors = indexes.map((index, vector) => {
+            const pointer = ramPointer(
+              (base + index * stride + vector * 3 * componentBytes) >>> 0,
+              3 * componentBytes
+            );
             return pointer === null ? null : readVector(bytes, pointer);
           });
         } else {
@@ -8862,10 +9072,32 @@ const TEMPLATE: &str = r##"<!doctype html>
       return {
         cursor: next,
         normal: vectors[0],
-        binormal: vectors[1] ?? null,
-        tangent: vectors[2] ?? null,
+        tangent: vectors[1] ?? null,
+        binormal: vectors[2] ?? null,
         skipped: false,
       };
+    }
+
+    function gxResolveNormalAttribute(attribute, commit) {
+      if (attribute.normal === null) gxCachedNormalUses += 1;
+      if (attribute.tangent === null) gxCachedTangentUses += 1;
+      if (attribute.binormal === null) gxCachedBinormalUses += 1;
+      if (!commit) return attribute;
+      let committed = false;
+      if (attribute.normal !== null) {
+        gxCachedNormal = attribute.normal;
+        committed = true;
+      }
+      if (attribute.tangent !== null) {
+        gxCachedTangent = attribute.tangent;
+        committed = true;
+      }
+      if (attribute.binormal !== null) {
+        gxCachedBinormal = attribute.binormal;
+        committed = true;
+      }
+      if (committed) gxNormalCacheCommits += 1;
+      return attribute;
     }
 
     function gxXfColorU8(address) {
@@ -8897,6 +9129,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         ),
       };
       return Object.values(light).flat().every(Number.isFinite) ? light : null;
+    }
+
+    function gxXfLightPosition(index) {
+      if (!Number.isInteger(index) || index < 0 || index >= 8) return null;
+      const base = 0x603 + index * 0x10 + 7;
+      if (base + 2 >= gxXfRegisters.length) return null;
+      // Emboss consumes only the light position. Preserve non-finite position
+      // values for normal STQ transport, and do not let unrelated light fields
+      // turn a valid emboss input into a renderer fallback.
+      return Array.from({ length: 3 }, (_unused, component) =>
+        gxXfFloat(base + component)
+      );
     }
 
     function gxPrepareVertexTransformContext() {
@@ -8945,6 +9189,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           (_unused, channel) => gxXfRegisters[0x1010 + channel] >>> 0
         ),
         lights: Array(8),
+        embossLightPositions: Array(8),
       };
     }
 
@@ -8957,10 +9202,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const matrix = Array.from({ length: 12 }, (_unused, index) =>
         gxXfFloat(matrixIndex * 4 + index)
       );
-      context.positionMatrices[matrixIndex] = (
-        matrix.every(Number.isFinite)
-        && matrix.some(value => value !== 0)
-      ) ? matrix : null;
+      context.positionMatrices[matrixIndex] = matrix.every(Number.isFinite)
+        ? matrix
+        : null;
       gxVertexTransformCacheSnapshots += 1;
       return context.positionMatrices[matrixIndex];
     }
@@ -8976,10 +9220,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const matrix = Array.from({ length: 9 }, (_unused, index) =>
         gxXfFloat(base + index)
       );
-      context.normalMatrices[cacheIndex] = (
-        matrix.every(Number.isFinite)
-        && matrix.some(value => value !== 0)
-      ) ? matrix : null;
+      context.normalMatrices[cacheIndex] = matrix.every(Number.isFinite)
+        ? matrix
+        : null;
       gxVertexTransformCacheSnapshots += 1;
       return context.normalMatrices[cacheIndex];
     }
@@ -9005,6 +9248,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       context.lights[lightIndex] = gxXfLight(lightIndex);
       gxVertexTransformCacheSnapshots += 1;
       return context.lights[lightIndex];
+    }
+
+    function gxVertexTransformEmbossLightPosition(context, lightIndex) {
+      const cached = context.embossLightPositions[lightIndex];
+      if (cached !== undefined) {
+        gxVertexTransformCacheMemoHits += 1;
+        return cached;
+      }
+      context.embossLightPositions[lightIndex] = gxXfLightPosition(lightIndex);
+      gxVertexTransformCacheSnapshots += 1;
+      return context.embossLightPositions[lightIndex];
     }
 
     function gxDot3(left, right) {
@@ -11588,8 +11842,21 @@ const TEMPLATE: &str = r##"<!doctype html>
       topology,
       cullMode,
       positions,
-      matrixIndices
+      matrixIndices,
+      failure = null
     ) {
+      const reject = (reason, vertex = null, matrixIndex = null) => {
+        if (
+          failure !== null
+          && typeof failure === "object"
+          && failure.reason === undefined
+        ) {
+          failure.reason = reason;
+          failure.vertex = vertex;
+          failure.matrixIndex = matrixIndex;
+        }
+        return null;
+      };
       if (
         !Number.isInteger(topology)
         || topology < 0
@@ -11602,7 +11869,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         || positions.length !== matrixIndices.length
         || gxSourceTriangleCount(topology, positions.length) === 0
       ) {
-        return null;
+        return reject("source-geometry");
       }
       const bpGenMode = gxBpRegisters[0x00] >>> 0;
       const bpScissorTopLeft = gxBpRegisters[0x20] >>> 0;
@@ -11615,10 +11882,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         || bpScissorOffset > 0x00ffffff
         || ((bpGenMode >>> 14) & 3) !== cullMode
       ) {
-        return null;
+        return reject("bp-state");
       }
       const xfClipDisable = gxXfRegisters[0x1005] >>> 0;
-      if (xfClipDisable > 7) return null;
+      if (xfClipDisable > 7) return reject("clip-disable");
 
       const viewport = new Float32Array(6);
       const viewportBits = new Uint32Array(viewport.buffer);
@@ -11630,11 +11897,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         || viewport[0] === 0
         || viewport[1] === 0
       ) {
-        return null;
+        return reject("viewport");
       }
 
       const state = gxCullTransformState();
-      if (state === null) return null;
+      if (state === null) return reject("projection-state");
       const clipPositions = new Float32Array(positions.length * 4);
       for (let vertex = 0; vertex < positions.length; vertex += 1) {
         const clip = gxExactClipPosition(
@@ -11642,7 +11909,31 @@ const TEMPLATE: &str = r##"<!doctype html>
           matrixIndices[vertex],
           state
         );
-        if (clip === null) return null;
+        if (clip === null) {
+          const position = positions[vertex];
+          const matrixIndex = matrixIndices[vertex];
+          if (
+            !Array.isArray(position)
+            || position.length !== 3
+            || position.some(value => !Number.isFinite(value))
+          ) {
+            return reject("position", vertex, matrixIndex);
+          }
+          if (
+            !Number.isInteger(matrixIndex)
+            || matrixIndex < 0
+            || (matrixIndex + 2) * 4 + 3 >= 0x100
+          ) {
+            return reject("position-matrix-index", vertex, matrixIndex);
+          }
+          if (gxCullPositionMatrix(state, matrixIndex) === null) {
+            return reject("position-matrix", vertex, matrixIndex);
+          }
+          if (gxCullViewPosition(position, matrixIndex, state) === null) {
+            return reject("view-nonfinite", vertex, matrixIndex);
+          }
+          return reject("clip-nonfinite", vertex, matrixIndex);
+        }
         clipPositions.set(clip, vertex * 4);
       }
       return {
@@ -11660,7 +11951,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       source,
       cursor,
       vatIndex,
-      transformContext = null
+      transformContext = null,
+      commitNormalCache = false
     ) {
       const descriptorLow = gxCpRegisters[0x50];
       const vat0 = gxCpRegisters[0x70 + vatIndex];
@@ -11694,15 +11986,20 @@ const TEMPLATE: &str = r##"<!doctype html>
         source, cursor, positionStatus, 0, positionBytes
       );
       cursor = positionSource.cursor;
-      if (positionSource.source === null) return { cursor, skipped: true };
+      const positionIndexSkipped = positionSource.skipped === true;
+      if (positionSource.source === null && !positionIndexSkipped) {
+        return { cursor, skipped: true };
+      }
       const positionScale = positionFormat === 4 ? 1 : 2 ** -((vat0 >>> 4) & 0x1f);
       const position = [0, 0, 0];
-      for (let component = 0; component < positionElements; component += 1) {
-        position[component] = gxReadComponent(
-          positionSource.source,
-          positionSource.offset + component * gxComponentBytes(positionFormat),
-          positionFormat
-        ) * positionScale;
+      if (!positionIndexSkipped) {
+        for (let component = 0; component < positionElements; component += 1) {
+          position[component] = gxReadComponent(
+            positionSource.source,
+            positionSource.offset + component * gxComponentBytes(positionFormat),
+            positionFormat
+          ) * positionScale;
+        }
       }
 
       const normalStatus = gxAttributeStatus(1);
@@ -11717,7 +12014,16 @@ const TEMPLATE: &str = r##"<!doctype html>
         normalElements !== 0 && (vat0 & 0x80000000) !== 0
       );
       cursor = normalAttribute.cursor;
-      if (normalAttribute.skipped) return { cursor, skipped: true };
+      if (normalAttribute.skipped && !positionIndexSkipped) {
+        return { cursor, skipped: true };
+      }
+      if (!normalAttribute.skipped) {
+        gxResolveNormalAttribute(
+          normalAttribute,
+          commitNormalCache
+        );
+      }
+      const resolvedNormal = normalAttribute.normal ?? gxCachedNormal;
 
       const colors = Array.from({ length: 2 }, () => [0xff, 0xff, 0xff, 0xff]);
       for (let colorIndex = 0; colorIndex < 2; colorIndex += 1) {
@@ -11766,6 +12072,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (rawTextureCoords[texture].length === 1) rawTextureCoords[texture].push(0);
         }
       }
+      // Position index sentinels discard this output vertex only after every
+      // input attribute has been consumed. In particular, a final skipped
+      // input still updates the persistent normal caches above.
+      if (positionIndexSkipped) {
+        return { cursor, skipped: true, positionIndexSkipped: true };
+      }
       const viewPosition = gxTransformPosition(
         position,
         positionMatrix,
@@ -11773,17 +12085,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       const projected = gxProjectViewPosition(viewPosition, transformContext);
       const normal = gxTransformNormal(
-        normalAttribute.normal,
-        positionMatrix,
-        transformContext
-      );
-      const tangent = gxTransformNormalVector(
-        normalAttribute.tangent,
-        positionMatrix,
-        transformContext
-      );
-      const binormal = gxTransformNormalVector(
-        normalAttribute.binormal,
+        resolvedNormal,
         positionMatrix,
         transformContext
       );
@@ -11799,19 +12101,24 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       const texgenAttributes = {
         position,
+        viewPosition,
+        // Cached normals feed lighting when a vertex format omits them. XF
+        // regular texgen source selection still observes the raw format and
+        // uses its AB11 default for an absent normal, tangent, or binormal.
+        // Emboss is the exception: GX retains its NBT basis across vertices.
         normal: normalAttribute.normal,
         tangent: normalAttribute.tangent,
         binormal: normalAttribute.binormal,
+        embossTangent: normalAttribute.tangent ?? gxCachedTangent,
+        embossBinormal: normalAttribute.binormal ?? gxCachedBinormal,
         colors: rasterColors,
         rawTextureCoords,
       };
-      const texCoords = textureMatrices.map((matrixIndex, texgenIndex) =>
-        gxTransformTexCoord(
-          texgenAttributes,
-          matrixIndex,
-          texgenIndex,
-          transformContext
-        )
+      const texCoords = gxTransformTexCoords(
+        texgenAttributes,
+        textureMatrices,
+        positionMatrix,
+        transformContext
       );
       return {
         cursor,
@@ -11821,8 +12128,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         colors,
         rasterColors,
         normal,
-        tangent,
-        binormal,
         rawNormal: normalAttribute.normal,
         rawTangent: normalAttribute.tangent,
         rawBinormal: normalAttribute.binormal,
@@ -11952,7 +12257,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       // Emit directly into the Worker-bound f32 layout. The former boxed
       // number array doubled both allocation and copying in Luigi's opening,
       // where one frame can contain tens of thousands of tiny fan draws.
-      const sourceVertices = new Float32Array(vertexCount * 36);
+      const inputVertexCount = vertexCount;
+      let sourceVertices = new Float32Array(inputVertexCount * 36);
       const texCoordSets = Array.from({ length: 8 }, () => []);
       const rawTextureCoordSets = capturePrimitiveSample
         ? Array.from({ length: 8 }, () => [])
@@ -11965,18 +12271,26 @@ const TEMPLATE: &str = r##"<!doctype html>
       const positionMatrixIndices = [];
       let textureMatrices = null;
       let decodeComplete = true;
+      let outputVertexCount = 0;
+      let positionIndexSkips = 0;
       let exactGeometryRequired = false;
       let legacyProjectionNullVertices = 0;
-      for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+      for (let vertex = 0; vertex < inputVertexCount; vertex += 1) {
         const start = payloadOffset + vertex * vertexSize;
         const decoded = gxDecodeVertex(
           source,
           start,
           opcode & 7,
-          vertexTransformContext
+          vertexTransformContext,
+          vertex === inputVertexCount - 1
         );
         if (decoded.cursor !== start + vertexSize) gxVertexDecodeErrors += 1;
         if (decoded.skipped) {
+          if (decoded.positionIndexSkipped === true) {
+            gxPositionIndexSkips += 1;
+            positionIndexSkips += 1;
+            continue;
+          }
           gxDroppedVertices += 1;
           decodeComplete = false;
           continue;
@@ -12005,7 +12319,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           continue;
         }
         const [raster0, raster1] = decoded.rasterColors;
-        const output = vertex * 36;
+        const output = outputVertexCount * 36;
         sourceVertices[output] = projected[0];
         sourceVertices[output + 1] = projected[1];
         sourceVertices[output + 2] = projected[2];
@@ -12041,23 +12355,55 @@ const TEMPLATE: &str = r##"<!doctype html>
           normalSet.push(decoded.normal);
           textureMatrices = decoded.textureMatrices;
         }
+        outputVertexCount += 1;
       }
-      if (!decodeComplete || vertexCount === 0) {
+      if (!decodeComplete || outputVertexCount === 0) {
         gxDroppedVertices += legacyProjectionNullVertices;
         return;
       }
+      if (outputVertexCount !== inputVertexCount) {
+        vertexCount = outputVertexCount;
+        sourceVertices = sourceVertices.slice(0, outputVertexCount * 36);
+      }
       let exactClipInput = null;
       if (exactGeometryRequired) {
+        const exactCaptureFailure = {};
         exactClipInput = gxManagedCoverageExactClipInput(
           topology,
           pipeline.cullMode,
           sourcePositions,
-          positionMatrixIndices
+          positionMatrixIndices,
+          exactCaptureFailure
+        );
+        const carrierNonFiniteLane = sourceVertices.findIndex(
+          value => !Number.isFinite(value)
         );
         if (
           exactClipInput === null
-          || !sourceVertices.every(Number.isFinite)
+          || carrierNonFiniteLane !== -1
         ) {
+          gxRecordExactRequiredCaptureFailure(
+            exactClipInput === null
+              ? exactCaptureFailure.reason ?? "unknown"
+              : "carrier-nonfinite",
+            {
+              opcode,
+              topology,
+              vat: opcode & 7,
+              inputVertexCount,
+              vertexCount,
+              positionIndexSkips,
+              legacyProjectionNullVertices,
+              cullMode: pipeline.cullMode,
+              positions: sourcePositions,
+              matrixIndices: positionMatrixIndices,
+              failure: exactCaptureFailure,
+              carrierNonFiniteLane,
+              carrierNonFiniteValue: carrierNonFiniteLane === -1
+                ? null
+                : sourceVertices[carrierNonFiniteLane],
+            }
+          );
           gxExactRequiredCaptureMisses += 1;
           gxDroppedVertices += legacyProjectionNullVertices;
           return;
@@ -12234,6 +12580,129 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxRecentPrimitiveSamples.shift();
         }
       }
+    }
+
+    function gxRecordExactRequiredCaptureFailure(reason, sample) {
+      let reasonIndex = gxExactRequiredCaptureFailureReasons.indexOf(reason);
+      if (reasonIndex < 0) {
+        reasonIndex = gxExactRequiredCaptureFailureReasons.indexOf("unknown");
+      }
+      gxExactRequiredCaptureFailureCounts[reasonIndex] =
+        gxSaturatingUnsupportedIncrement(
+          gxExactRequiredCaptureFailureCounts[reasonIndex]
+        );
+      if (gxFirstExactRequiredCaptureFailure !== null) return;
+
+      const failure = sample?.failure;
+      const failureVertex = Number.isInteger(failure?.vertex)
+        ? failure.vertex
+        : null;
+      const failureMatrixIndex = Number.isFinite(failure?.matrixIndex)
+        ? failure.matrixIndex
+        : null;
+      const failurePosition = (
+        failureVertex !== null
+        && Array.isArray(sample?.positions?.[failureVertex])
+      )
+        ? sample.positions[failureVertex].map(value =>
+            Number.isFinite(value) ? value : String(value)
+          )
+        : null;
+      const failurePositionMatrixWords = (
+        Number.isInteger(failureMatrixIndex)
+        && failureMatrixIndex >= 0
+        && (failureMatrixIndex + 2) * 4 + 3 < 0x100
+      )
+        ? Array.from({ length: 12 }, (_unused, index) =>
+            hex32(gxXfRegisters[failureMatrixIndex * 4 + index])
+          )
+        : null;
+      const matrixIndices = [];
+      if (Array.isArray(sample?.matrixIndices)) {
+        for (const matrixIndex of sample.matrixIndices) {
+          if (matrixIndices.includes(matrixIndex)) continue;
+          matrixIndices.push(matrixIndex);
+          if (matrixIndices.length === 8) break;
+        }
+      }
+      gxFirstExactRequiredCaptureFailure = Object.freeze({
+        reason: gxExactRequiredCaptureFailureReasons[reasonIndex],
+        cycle: cycles,
+        dispatch: dispatches,
+        opcode: "0x" + (sample?.opcode ?? 0).toString(16).padStart(2, "0"),
+        topology: sample?.topology ?? null,
+        vat: sample?.vat ?? null,
+        inputVertexCount: sample?.inputVertexCount ?? null,
+        vertexCount: sample?.vertexCount ?? null,
+        positionIndexSkips: sample?.positionIndexSkips ?? null,
+        legacyProjectionNullVertices:
+          sample?.legacyProjectionNullVertices ?? null,
+        cullMode: sample?.cullMode ?? null,
+        positionCount: Array.isArray(sample?.positions)
+          ? sample.positions.length
+          : null,
+        matrixIndices,
+        failureVertex,
+        failureMatrixIndex,
+        failurePosition,
+        failurePositionMatrixWords,
+        carrierNonFiniteLane: Number.isInteger(sample?.carrierNonFiniteLane)
+          ? sample.carrierNonFiniteLane
+          : null,
+        carrierNonFiniteVertex: Number.isInteger(sample?.carrierNonFiniteLane)
+          && sample.carrierNonFiniteLane >= 0
+          ? Math.floor(sample.carrierNonFiniteLane / 36)
+          : null,
+        carrierNonFiniteComponent: Number.isInteger(sample?.carrierNonFiniteLane)
+          && sample.carrierNonFiniteLane >= 0
+          ? sample.carrierNonFiniteLane % 36
+          : null,
+        carrierNonFiniteValue: sample?.carrierNonFiniteValue === null
+          || sample?.carrierNonFiniteValue === undefined
+          ? null
+          : Number.isFinite(sample.carrierNonFiniteValue)
+            ? sample.carrierNonFiniteValue
+            : String(sample.carrierNonFiniteValue),
+        bpGenMode: hex32(gxBpRegisters[0x00]),
+        bpScissorTopLeft: hex32(gxBpRegisters[0x20]),
+        bpScissorBottomRight: hex32(gxBpRegisters[0x21]),
+        bpScissorOffset: hex32(gxBpRegisters[0x59]),
+        xfClipDisable: hex32(gxXfRegisters[0x1005]),
+        xfViewportWords: Array.from({ length: 6 }, (_unused, index) =>
+          hex32(gxXfRegisters[0x101a + index])
+        ),
+        xfProjectionType: hex32(gxXfRegisters[0x1026]),
+        xfProjectionWords: Array.from({ length: 6 }, (_unused, index) =>
+          hex32(gxXfRegisters[0x1020 + index])
+        ),
+      });
+    }
+
+    function snapshotGxExactRequiredCaptureFailures() {
+      const reasonCounts = gxExactRequiredCaptureFailureReasons.flatMap(
+        (reason, index) => {
+          const count = gxExactRequiredCaptureFailureCounts[index];
+          return count === 0 ? [] : [{ reason, count }];
+        }
+      );
+      const firstFailure = gxFirstExactRequiredCaptureFailure;
+      return {
+        schema: "lazuli-gx-exact-required-capture-failures-v1",
+        total: gxExactRequiredCaptureMisses,
+        reasonCounts,
+        firstFailure: firstFailure === null
+          ? null
+          : {
+              ...firstFailure,
+              matrixIndices: firstFailure.matrixIndices.slice(),
+              failurePosition: firstFailure.failurePosition?.slice() ?? null,
+              failurePositionMatrixWords:
+                firstFailure.failurePositionMatrixWords?.slice() ?? null,
+              xfViewportWords: firstFailure.xfViewportWords.slice(),
+              xfProjectionWords: firstFailure.xfProjectionWords.slice(),
+            },
+        countLimit: gxUnsupportedCountLimit,
+      };
     }
 
     function gxSaturatingUnsupportedIncrement(value) {
@@ -24752,12 +25221,25 @@ const TEMPLATE: &str = r##"<!doctype html>
             projectedVertices: gxProjectedVertices,
             droppedVertices: gxDroppedVertices,
             lightingRejectedVertices: gxLightingRejectedVertices,
+            positionIndexSkips: gxPositionIndexSkips,
+            normalCache: {
+              commits: gxNormalCacheCommits,
+              normalUses: gxCachedNormalUses,
+              tangentUses: gxCachedTangentUses,
+              binormalUses: gxCachedBinormalUses,
+              normal: gxCachedNormal.slice(),
+              tangent: gxCachedTangent.slice(),
+              binormal: gxCachedBinormal.slice(),
+            },
             legacyProjectionNullVertices: gxLegacyProjectionNullVertices,
             exactRequiredDraws: gxExactRequiredDraws,
             exactRequiredVertices: gxExactRequiredVertices,
             exactRequiredCaptureMisses: gxExactRequiredCaptureMisses,
+            exactRequiredCaptureFailures:
+              snapshotGxExactRequiredCaptureFailures(),
             vertexDecodeErrors: gxVertexDecodeErrors,
             texgenTransforms: gxTexgenTransforms,
+            texgenEmbossTransforms: gxTexgenEmbossTransforms,
             texgenNonFiniteTransforms: gxTexgenNonFiniteTransforms,
             texgenFallbacks: gxTexgenFallbacks,
             vertexTransformContextSnapshots: gxVertexTransformContextSnapshots,
@@ -25898,6 +26380,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       return {
         operations: { enqueued: 0, pending: 0, highWater: 0 },
         workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
+        xfbDrainBatch: {
+          limit: 8,
+          pending: 0,
+          highWater: 0,
+          acknowledgementsWithoutDrain: 0,
+          forcedDrains: 0,
+          mandatoryDrains: 0,
+        },
         wall: {
           workerStartToLastReportMs: null,
           phases: newRendererWallPhases(),
@@ -27802,7 +28292,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
     function captureSelectedXfb() {
-      return appendRendererOperation(readSelectedXfb);
+      return appendRendererOperation(async () => {
+        requireNoTextureCopyReceipts(
+          await drainWebGpuRenderer(),
+          "WebGPU selected XFB capture"
+        );
+        return readSelectedXfb();
+      });
     }
     function snapshotRendererPerformance(hostMetrics = rendererHostMetrics) {
       const webgpu = webGpuRenderer.diagnostics();
@@ -27816,6 +28312,16 @@ const TEMPLATE: &str = r##"<!doctype html>
         queue: {
           drains: Number(webgpu.drainCalls ?? 0),
           submits: Number(webgpu.queueSubmissions ?? 0),
+        },
+        xfbDrainBatch: {
+          ...(hostMetrics.xfbDrainBatch ?? {
+            limit: 8,
+            pending: 0,
+            highWater: 0,
+            acknowledgementsWithoutDrain: 0,
+            forcedDrains: 0,
+            mandatoryDrains: 0,
+          }),
         },
         resources: {
           bindGroups: Number(webgpu.bindGroupsCreated ?? 0),
@@ -27848,6 +28354,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       terminalReport = null
     ) {
       return appendRendererOperation(async () => {
+        requireNoTextureCopyReceipts(
+          await drainWebGpuRenderer(
+            hostMetrics.wall?.phases ?? null,
+            hostMetrics
+          ),
+          "WebGPU renderer terminal capture"
+        );
         const metrics = snapshotRendererPerformance(hostMetrics);
         const selectedXfb = await readSelectedXfb();
         const sustainedPlayTerminal =
@@ -28804,7 +29317,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
       return { receipts: transported, transfer };
     }
-    async function drainWebGpuRenderer(phases = rendererHostMetrics.wall?.phases ?? null) {
+    async function drainWebGpuRenderer(
+      phases = rendererHostMetrics.wall?.phases ?? null,
+      hostMetrics = rendererHostMetrics
+    ) {
+      if (hostMetrics.xfbDrainBatch !== undefined) {
+        hostMetrics.xfbDrainBatch.pending = 0;
+      }
       const drainStartedAt = phases === null
         ? null
         : beginRendererPhaseTiming(phases.queueDrain);
@@ -28922,7 +29441,36 @@ const TEMPLATE: &str = r##"<!doctype html>
           return fail(error);
         }
         return (async () => {
-          const textureCopyReceipts = await drainWebGpuRenderer(phases);
+          const xfbDrainBatch = rendererHostMetrics.xfbDrainBatch ??= {
+            limit: 8,
+            pending: 0,
+            highWater: 0,
+            acknowledgementsWithoutDrain: 0,
+            forcedDrains: 0,
+            mandatoryDrains: 0,
+          };
+          const xfbOnly = message.type === "gx-frame"
+            && Number(message.diagnostics?.copyKind) === 2;
+          let drainRequired = true;
+          if (xfbOnly) {
+            xfbDrainBatch.pending += 1;
+            xfbDrainBatch.highWater = Math.max(
+              xfbDrainBatch.highWater,
+              xfbDrainBatch.pending
+            );
+            drainRequired = xfbDrainBatch.pending >= xfbDrainBatch.limit;
+            if (drainRequired) {
+              xfbDrainBatch.forcedDrains += 1;
+            } else {
+              xfbDrainBatch.acknowledgementsWithoutDrain += 1;
+            }
+          } else {
+            xfbDrainBatch.mandatoryDrains += 1;
+          }
+          if (drainRequired) xfbDrainBatch.pending = 0;
+          const textureCopyReceipts = drainRequired
+            ? await drainWebGpuRenderer(phases)
+            : [];
           if (!isCurrentWorker()) return { ok: false, value: null };
           if (message.type === "vi-present" && value?.presented === true) {
             lastPresentedViProjection = {

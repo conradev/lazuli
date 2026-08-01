@@ -163,6 +163,14 @@ test("renderer performance derives exact bridge and resource totals", async () =
     Promise,
     rendererHostMetrics: {
       operations: { enqueued: 5, pending: 0, highWater: 1 },
+      xfbDrainBatch: {
+        limit: 8,
+        pending: 3,
+        highWater: 8,
+        acknowledgementsWithoutDrain: 19,
+        forcedDrains: 2,
+        mandatoryDrains: 4,
+      },
       wall: {
         workerStartToLastReportMs: 1234.5,
         phases: {
@@ -204,6 +212,14 @@ test("renderer performance derives exact bridge and resource totals", async () =
   assert.equal(performance.scope, "current-worker");
   assert.deepEqual(performance.wasmBridge, { calls: 17, typedArrayBytes: 1920 });
   assert.deepEqual(performance.queue, { drains: 5, submits: 6 });
+  assert.deepEqual(performance.xfbDrainBatch, {
+    limit: 8,
+    pending: 3,
+    highWater: 8,
+    acknowledgementsWithoutDrain: 19,
+    forcedDrains: 2,
+    mandatoryDrains: 4,
+  });
   assert.deepEqual(performance.resources, {
     bindGroups: 8,
     buffers: 9,
@@ -257,9 +273,11 @@ test("renderer performance derives exact bridge and resource totals", async () =
     },
   });
   context.rendererHostMetrics.wall.phases.operationQueueWait.totalMs = 999;
+  context.rendererHostMetrics.xfbDrainBatch.pending = 7;
   webgpuPhases.packetParse.totalMs = 999;
   assert.equal(performance.wall.phases.operationQueueWait.totalMs, 3);
   assert.equal(performance.wall.phases.packetParse.totalMs, 1.5);
+  assert.equal(performance.xfbDrainBatch.pending, 3);
   assert.deepEqual(context.rendererHostMetrics.operations, {
     enqueued: 5,
     pending: 0,
@@ -372,7 +390,7 @@ test("sampled renderer queue and drain phases account exact captured-epoch wall 
   assert.deepEqual(clock, []);
 });
 
-test("terminal capture snapshots metrics before its serialized XFB readback", async () => {
+test("terminal capture drains before snapshotting metrics and reading XFB", async () => {
   const calls = [];
   const originalHostMetrics = { id: "original" };
   const replacementHostMetrics = { id: "replacement" };
@@ -388,6 +406,13 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
     Promise,
     rendererOperationTail: new Promise(resolve => { release = resolve; }),
     rendererHostMetrics: originalHostMetrics,
+    drainWebGpuRenderer(_phases, hostMetrics) {
+      calls.push(`drain:${hostMetrics.id}`);
+      return Promise.resolve([]);
+    },
+    requireNoTextureCopyReceipts(receipts) {
+      assert.deepEqual(receipts, []);
+    },
     snapshotRendererPerformance(hostMetrics) {
       calls.push(`metrics:${hostMetrics.id}`);
       return { calls: 17 };
@@ -432,7 +457,13 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
       surfaceOracle: { captured: 0, capacity: 8 },
     },
   });
-  assert.deepEqual(calls, ["metrics:original", "read", "temporal", "surface"]);
+  assert.deepEqual(calls, [
+    "drain:original",
+    "metrics:original",
+    "read",
+    "temporal",
+    "surface",
+  ]);
 });
 
 test("headless capture consumes page-owned rendering without renderer calls", () => {

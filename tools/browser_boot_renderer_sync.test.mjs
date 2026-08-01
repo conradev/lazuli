@@ -788,6 +788,324 @@ test("main thread acknowledges a frame only after the WebGPU drain resolves", as
   }]);
 });
 
+test("XFB-only frames acknowledge in bounded batches of eight submissions", async () => {
+  const calls = [];
+  const messages = [];
+  let resolveDrain;
+  const currentWorker = { postMessage(message) { messages.push(message); } };
+  const context = {
+    Number,
+    Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
+    rendererOperationTail: Promise.resolve(),
+    drainWebGpuRenderer() {
+      calls.push("drain");
+      return new Promise(resolve => { resolveDrain = resolve; });
+    },
+    handleRendererError(error) { throw error; },
+    worker: currentWorker,
+  };
+  vm.createContext(context);
+  vm.runInContext(rendererFrameRuntime(), context, {
+    filename: "browser_boot.renderer-sync.xfb-drain-batch.js",
+  });
+  const message = rendererSequence => ({
+    type: "gx-frame",
+    rendererSequence,
+    diagnostics: { copyKind: 2 },
+  });
+
+  for (let rendererSequence = 1; rendererSequence < 8; rendererSequence += 1) {
+    await context.handleRendererFrame(message(rendererSequence), () => {
+      calls.push(`submit:${rendererSequence}`);
+      return { residentTextureKeys: [] };
+    });
+  }
+  assert.deepEqual(calls, [
+    "submit:1", "submit:2", "submit:3", "submit:4",
+    "submit:5", "submit:6", "submit:7",
+  ]);
+  assert.equal(messages.length, 7);
+  assert.equal(messages.every(message => (
+    Array.isArray(message.textureCopyReceipts)
+    && message.textureCopyReceipts.length === 0
+  )), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    context.rendererHostMetrics.xfbDrainBatch,
+  )), {
+    limit: 8,
+    pending: 7,
+    highWater: 7,
+    acknowledgementsWithoutDrain: 7,
+    forcedDrains: 0,
+    mandatoryDrains: 0,
+  });
+
+  const eighth = context.handleRendererFrame(message(8), () => {
+    calls.push("submit:8");
+    return { residentTextureKeys: [] };
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls.at(-2), "submit:8");
+  assert.deepEqual(calls.at(-1), "drain");
+  assert.equal(messages.length, 7);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 0);
+  resolveDrain([]);
+  await eighth;
+
+  assert.equal(messages.length, 8);
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    context.rendererHostMetrics.xfbDrainBatch,
+  )), {
+    limit: 8,
+    pending: 0,
+    highWater: 8,
+    acknowledgementsWithoutDrain: 7,
+    forcedDrains: 1,
+    mandatoryDrains: 0,
+  });
+});
+
+test("mandatory renderer frames reset a partial XFB drain batch", async () => {
+  const messages = [];
+  let drainCalls = 0;
+  const context = {
+    Number,
+    Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
+    rendererOperationTail: Promise.resolve(),
+    drainWebGpuRenderer() {
+      drainCalls += 1;
+      return Promise.resolve([]);
+    },
+    handleRendererError(error) { throw error; },
+    worker: { postMessage(message) { messages.push(message); } },
+  };
+  vm.createContext(context);
+  vm.runInContext(rendererFrameRuntime(), context, {
+    filename: "browser_boot.renderer-sync.xfb-mandatory-drain.js",
+  });
+  const xfb = rendererSequence => ({
+    type: "gx-frame",
+    rendererSequence,
+    diagnostics: { copyKind: 2 },
+  });
+
+  for (let rendererSequence = 1; rendererSequence <= 3; rendererSequence += 1) {
+    await context.handleRendererFrame(xfb(rendererSequence), () => ({}));
+  }
+  assert.equal(drainCalls, 0);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 3);
+
+  await context.handleRendererFrame({
+    type: "gx-frame",
+    rendererSequence: 4,
+    diagnostics: { copyKind: 1 },
+  }, () => ({}));
+  assert.equal(drainCalls, 1);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 0);
+
+  for (let rendererSequence = 5; rendererSequence <= 11; rendererSequence += 1) {
+    await context.handleRendererFrame(xfb(rendererSequence), () => ({}));
+  }
+  assert.equal(drainCalls, 1);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 7);
+
+  await context.handleRendererFrame({
+    type: "vi-present",
+    rendererSequence: 12,
+    frame: {},
+  }, () => ({ presented: false }));
+  assert.equal(drainCalls, 2);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 0);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.forcedDrains, 0);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.mandatoryDrains, 2);
+  assert.equal(messages.length, 12);
+});
+
+test("the eighth XFB frame propagates a deferred WebGPU failure", async () => {
+  const messages = [];
+  const visibleErrors = [];
+  let drainCalls = 0;
+  const context = {
+    Number,
+    Promise,
+    rendererHostMetrics: rendererOperationMetrics(),
+    rendererOperationTail: Promise.resolve(),
+    drainWebGpuRenderer() {
+      drainCalls += 1;
+      return Promise.reject(new Error("WebGPU device lost during XFB batch"));
+    },
+    handleRendererError(error, notifyWorker) {
+      visibleErrors.push([error.message, notifyWorker]);
+    },
+    worker: { postMessage(message) { messages.push(message); } },
+  };
+  vm.createContext(context);
+  vm.runInContext(rendererFrameRuntime(), context, {
+    filename: "browser_boot.renderer-sync.xfb-batch-failure.js",
+  });
+
+  for (let rendererSequence = 1; rendererSequence <= 8; rendererSequence += 1) {
+    await context.handleRendererFrame({
+      type: "gx-frame",
+      rendererSequence,
+      diagnostics: { copyKind: 2 },
+    }, () => ({}));
+  }
+
+  assert.equal(drainCalls, 1);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 0);
+  assert.equal(messages.length, 8);
+  assert.deepEqual(JSON.parse(JSON.stringify(messages.at(-1))), {
+    type: "renderer-frame-failed",
+    rendererSequence: 8,
+    error: "WebGPU device lost during XFB batch",
+  });
+  assert.deepEqual(visibleErrors, [[
+    "WebGPU device lost during XFB batch",
+    false,
+  ]]);
+});
+
+test("selected-XFB and terminal captures drain and reset partial XFB batches", async () => {
+  const makeHostMetrics = () => ({
+    ...rendererOperationMetrics(),
+    xfbDrainBatch: {
+      limit: 8,
+      pending: 7,
+      highWater: 7,
+      acknowledgementsWithoutDrain: 7,
+      forcedDrains: 0,
+      mandatoryDrains: 0,
+    },
+  });
+  {
+    const calls = [];
+    const context = {
+      Array,
+      Promise,
+      rendererHostMetrics: makeHostMetrics(),
+      rendererOperationTail: Promise.resolve(),
+      readSelectedXfb() {
+        calls.push("read");
+        return Promise.resolve({ selected: true });
+      },
+      webGpuRenderer: {
+        drain() { calls.push("drain"); return Promise.resolve([]); },
+        check_health() { calls.push("health"); },
+      },
+    };
+    vm.createContext(context);
+    vm.runInContext([
+      "appendRendererOperation",
+      "requireTextureCopyReceiptArray",
+      "requireNoTextureCopyReceipts",
+      "drainWebGpuRenderer",
+      "captureSelectedXfb",
+    ].map(extractFunction).join("\n\n"), context, {
+      filename: "browser_boot.renderer-sync.selected-xfb-fence.js",
+    });
+
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(await context.captureSelectedXfb())),
+      { selected: true },
+    );
+    assert.deepEqual(calls, ["drain", "health", "read"]);
+    assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 0);
+  }
+  {
+    const calls = [];
+    const hostMetrics = makeHostMetrics();
+    const context = {
+      Array,
+      Promise,
+      rendererHostMetrics: hostMetrics,
+      rendererOperationTail: Promise.resolve(),
+      snapshotRendererPerformance(metrics) {
+        calls.push("metrics");
+        return { pending: metrics.xfbDrainBatch.pending };
+      },
+      readSelectedXfb() { calls.push("read"); return Promise.resolve(null); },
+      summarizeTemporalSelectedXfb() { return {}; },
+      summarizeTemporalPresentedSurfaces() { return {}; },
+      temporalSelectedXfbCapacity: 8,
+      temporalSelectedXfbFrames: [],
+      webGpuRenderer: {
+        drain() { calls.push("drain"); return Promise.resolve([]); },
+        check_health() { calls.push("health"); },
+      },
+    };
+    vm.createContext(context);
+    vm.runInContext([
+      "appendRendererOperation",
+      "requireTextureCopyReceiptArray",
+      "requireNoTextureCopyReceipts",
+      "drainWebGpuRenderer",
+      "captureRendererTerminal",
+    ].map(extractFunction).join("\n\n"), context, {
+      filename: "browser_boot.renderer-sync.terminal-fence.js",
+    });
+
+    const capture = await context.captureRendererTerminal(
+      hostMetrics,
+      [],
+      null,
+    );
+    assert.equal(capture.metrics.pending, 0);
+    assert.deepEqual(calls, ["drain", "health", "metrics", "read"]);
+    assert.equal(hostMetrics.xfbDrainBatch.pending, 0);
+  }
+});
+
+test("non-frame renderer operations drain and reset a partial XFB batch", async () => {
+  const calls = [];
+  const currentWorker = {};
+  const context = {
+    Array,
+    Promise,
+    rendererHostMetrics: {
+      ...rendererOperationMetrics(),
+      xfbDrainBatch: {
+        limit: 8,
+        pending: 5,
+        highWater: 5,
+        acknowledgementsWithoutDrain: 5,
+        forcedDrains: 0,
+        mandatoryDrains: 0,
+      },
+    },
+    rendererOperationTail: Promise.resolve(),
+    handleRendererError(error) { throw error; },
+    webGpuRenderer: {
+      drain() { calls.push("drain"); return Promise.resolve([]); },
+      check_health() { calls.push("health"); },
+    },
+    worker: currentWorker,
+  };
+  vm.createContext(context);
+  vm.runInContext([
+    "appendRendererOperation",
+    "enqueueRendererOperation",
+    "requireTextureCopyReceiptArray",
+    "requireNoTextureCopyReceipts",
+    "drainWebGpuRenderer",
+    "handleRendererOperation",
+  ].map(extractFunction).join("\n\n"), context, {
+    filename: "browser_boot.renderer-sync.non-frame-fence.js",
+  });
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await context.handleRendererOperation(() => {
+      calls.push("render");
+      return { reset: true };
+    }))),
+    { ok: true, value: { reset: true } },
+  );
+  assert.deepEqual(calls, ["render", "drain", "health"]);
+  assert.equal(context.rendererHostMetrics.xfbDrainBatch.pending, 0);
+});
+
 test("temporal XFB readback completes before its VI frame acknowledgement", async () => {
   const calls = [];
   const messages = [];

@@ -63,8 +63,16 @@ function workerContext() {
     gxTevColorRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
     gxTevKonstRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
     gxTexgenFallbacks: 0,
+    gxTexgenEmbossTransforms: 0,
     gxTexgenNonFiniteTransforms: 0,
     gxTexgenTransforms: 0,
+    gxCachedNormal: [0, 0, 0],
+    gxCachedTangent: [0, 0, 0],
+    gxCachedBinormal: [0, 0, 0],
+    gxNormalCacheCommits: 0,
+    gxCachedNormalUses: 0,
+    gxCachedTangentUses: 0,
+    gxCachedBinormalUses: 0,
     gxVertexTransformContextSnapshots: 0,
     gxVertexTransformCacheSnapshots: 0,
     gxVertexTransformCacheMemoHits: 0,
@@ -161,6 +169,37 @@ function setXfMatrixRows(context, baseAddress, rowIndex, rows) {
       );
     }
   }
+}
+
+function setXfNormalMatrix(context, matrixIndex, matrix) {
+  matrix.forEach((value, index) => {
+    setXfFloat(context, 0x400 + matrixIndex * 3 + index, value);
+  });
+}
+
+function setXfLightPosition(context, lightIndex, position) {
+  position.forEach((value, component) => {
+    setXfFloat(
+      context,
+      0x603 + lightIndex * 0x10 + 7 + component,
+      value,
+    );
+  });
+}
+
+function texgenAttributes(overrides = {}) {
+  return {
+    position: [0, 0, 0],
+    viewPosition: [0, 0, 0],
+    normal: null,
+    tangent: null,
+    binormal: null,
+    embossTangent: [0, 0, 0],
+    embossBinormal: [0, 0, 0],
+    colors: [[0, 0, 0, 0], [0, 0, 0, 0]],
+    rawTextureCoords: Array(8).fill(null),
+    ...overrides,
+  };
 }
 
 test("Luigi GX_PTTEXMTX18 probe retains first and first non-finite loads", () => {
@@ -465,14 +504,37 @@ test("decodes direct signed normals with GX fixed-point scaling", () => {
   assertVector(decoded16.normal, [0.5, -1, 0.25]);
 });
 
+test("decodes unsigned normals with their distinct GX fixed-point scaling", () => {
+  const context = workerContext();
+  const decoded8 = context.gxDecodeNormalAttribute(
+    new Uint8Array([128, 64, 255]),
+    0,
+    1,
+    0,
+    0,
+    false,
+  );
+  assertVector(decoded8.normal, [1, 0.5, 255 / 128]);
+
+  const decoded16 = context.gxDecodeNormalAttribute(
+    new Uint8Array([0x80, 0, 0x40, 0, 0xff, 0xff]),
+    0,
+    1,
+    0,
+    2,
+    false,
+  );
+  assertVector(decoded16.normal, [1, 0.5, 65535 / 32768]);
+});
+
 test("decodes indexed normals and separate NBT indexes from array one", () => {
   const context = workerContext();
   context.gxCpRegisters[0xa1] = 0x40;
-  context.gxCpRegisters[0xb1] = 3;
+  context.gxCpRegisters[0xb1] = 9;
   context.bytes.set([
-    64, 0, 0,
-    0, 64, 0,
-    0, 0, 64,
+    64, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 64, 0, 0, 64, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 64,
   ], 0x40);
 
   const normal = context.gxDecodeNormalAttribute(
@@ -497,9 +559,291 @@ test("decodes indexed normals and separate NBT indexes from array one", () => {
   assert.equal(nbt.cursor, 3);
   assert.equal(nbt.skipped, false);
   assertVector(nbt.normal, [1, 0, 0]);
-  // NBT array order is normal, binormal, tangent.
-  assertVector(nbt.binormal, [0, 1, 0]);
-  assertVector(nbt.tangent, [0, 0, 1]);
+  // GX's NTB stream order is normal, tangent, binormal.
+  assertVector(nbt.tangent, [0, 1, 0]);
+  assertVector(nbt.binormal, [0, 0, 1]);
+
+  // Normal indexes do not inherit the position attribute's skip sentinel.
+  context.gxCpRegisters[0xb1] = 3;
+  context.gxCpRegisters[0xa1] = (0x70 - 0xff * 3) >>> 0;
+  context.bytes.set([128, 0, 0], 0x70);
+  const maximumIndex = context.gxDecodeNormalAttribute(
+    new Uint8Array([0xff]),
+    0,
+    2,
+    0,
+    0,
+    false,
+  );
+  assert.equal(maximumIndex.skipped, false);
+  assertVector(maximumIndex.normal, [1, 0, 0]);
+});
+
+test("reuses and commits GX cached normal attributes", () => {
+  const context = workerContext();
+  context.gxCachedNormal = [1, 2, 3];
+  context.gxCachedTangent = [4, 5, 6];
+  context.gxCachedBinormal = [7, 8, 9];
+
+  const omittedAttribute = {
+    cursor: 0,
+    normal: null,
+    tangent: null,
+    binormal: null,
+    skipped: false,
+  };
+  const omitted = context.gxResolveNormalAttribute(omittedAttribute, false);
+  assert.equal(omitted, omittedAttribute);
+  assertVector(omitted.normal ?? context.gxCachedNormal, [1, 2, 3]);
+  assertVector(omitted.tangent ?? context.gxCachedTangent, [4, 5, 6]);
+  assertVector(omitted.binormal ?? context.gxCachedBinormal, [7, 8, 9]);
+  assert.equal(context.gxNormalCacheCommits, 0);
+
+  const supplied = context.gxResolveNormalAttribute({
+    cursor: 0,
+    normal: [10, 11, 12],
+    tangent: null,
+    binormal: null,
+    skipped: false,
+  }, true);
+  assertVector(supplied.normal, [10, 11, 12]);
+  assertVector(supplied.tangent ?? context.gxCachedTangent, [4, 5, 6]);
+  assertVector(supplied.binormal ?? context.gxCachedBinormal, [7, 8, 9]);
+  assertVector(context.gxCachedNormal, [10, 11, 12]);
+  assertVector(context.gxCachedTangent, [4, 5, 6]);
+  assertVector(context.gxCachedBinormal, [7, 8, 9]);
+  assert.equal(context.gxNormalCacheCommits, 1);
+  assert.equal(context.gxCachedNormalUses, 1);
+  assert.equal(context.gxCachedTangentUses, 2);
+  assert.equal(context.gxCachedBinormalUses, 2);
+});
+
+test("a final position-index skip still commits its normal cache", () => {
+  const context = workerContext();
+  // Indexed-8 XYZ position followed by a direct signed-byte normal.
+  context.gxCpRegisters[0x50] = (2 << 9) | (1 << 11);
+  context.gxCpRegisters[0x70] = 1 | (4 << 1) | (1 << 10);
+  const decoded = context.gxDecodeVertex(
+    new Uint8Array([0xff, 64, 0, 0]),
+    0,
+    0,
+    null,
+    true,
+  );
+
+  assert.equal(decoded.cursor, 4);
+  assert.equal(decoded.skipped, true);
+  assert.equal(decoded.positionIndexSkipped, true);
+  assertVector(context.gxCachedNormal, [1, 0, 0]);
+  assert.equal(context.gxNormalCacheCommits, 1);
+});
+
+test("a position sentinel consumes trailing attributes after an invalid normal", () => {
+  const context = workerContext();
+  // Indexed-8 position and normal, then direct RGBA8 color and direct ST u8.
+  context.gxCpRegisters[0x50] = (2 << 9) | (2 << 11) | (1 << 13);
+  context.gxCpRegisters[0x60] = 1;
+  context.gxCpRegisters[0x70] = (
+    1
+    | (4 << 1)
+    | (1 << 10)
+    | (5 << 14)
+    | (1 << 21)
+  );
+  context.gxCpRegisters[0xa1] = 0x7ff;
+  context.gxCpRegisters[0xb1] = 3;
+  const decoded = context.gxDecodeVertex(
+    new Uint8Array([0xff, 1, 10, 20, 30, 40, 50, 60]),
+    0,
+    0,
+    null,
+    true,
+  );
+
+  assert.equal(decoded.cursor, 8);
+  assert.equal(decoded.skipped, true);
+  assert.equal(decoded.positionIndexSkipped, true);
+  assert.equal(context.gxNormalCacheCommits, 0);
+});
+
+test("commits only the final primitive normal tuple and preserves absent lanes", () => {
+  const context = workerContext();
+  context.gxCachedNormal = [-1, -2, -3];
+  context.gxCachedTangent = [-4, -5, -6];
+  context.gxCachedBinormal = [-7, -8, -9];
+  const tuple = (normal, tangent, binormal) => ({
+    cursor: 0,
+    normal,
+    tangent,
+    binormal,
+    skipped: false,
+  });
+
+  context.gxResolveNormalAttribute(
+    tuple([1, 2, 3], [4, 5, 6], [7, 8, 9]),
+    false,
+  );
+  assertVector(context.gxCachedNormal, [-1, -2, -3]);
+  assertVector(context.gxCachedTangent, [-4, -5, -6]);
+  assertVector(context.gxCachedBinormal, [-7, -8, -9]);
+
+  context.gxResolveNormalAttribute(
+    tuple([10, 11, 12], [13, 14, 15], [16, 17, 18]),
+    true,
+  );
+  assertVector(context.gxCachedNormal, [10, 11, 12]);
+  assertVector(context.gxCachedTangent, [13, 14, 15]);
+  assertVector(context.gxCachedBinormal, [16, 17, 18]);
+
+  context.gxResolveNormalAttribute(
+    tuple([20, 21, 22], null, null),
+    true,
+  );
+  assertVector(context.gxCachedNormal, [20, 21, 22]);
+  assertVector(context.gxCachedTangent, [13, 14, 15]);
+  assertVector(context.gxCachedBinormal, [16, 17, 18]);
+
+  const omittedTuple = tuple(null, null, null);
+  const omitted = context.gxResolveNormalAttribute(omittedTuple, false);
+  assert.equal(omitted, omittedTuple);
+  assert.equal(omitted.normal, null);
+  assert.equal(omitted.tangent, null);
+  assert.equal(omitted.binormal, null);
+  assertVector(context.gxCachedNormal, [20, 21, 22]);
+  assertVector(context.gxCachedTangent, [13, 14, 15]);
+  assertVector(context.gxCachedBinormal, [16, 17, 18]);
+  assert.equal(context.gxNormalCacheCommits, 2);
+
+  const capture = extractFunction("recordGxPrimitive");
+  assert.match(
+    capture,
+    /gxDecodeVertex\([\s\S]*?vertexTransformContext,\s*vertex === inputVertexCount - 1\s*\)/,
+  );
+});
+
+test("keeps cached lighting inputs separate from raw texgen sources", () => {
+  const decode = extractFunction("gxDecodeVertex");
+  assert.match(
+    decode,
+    /if \(normalAttribute\.skipped && !positionIndexSkipped\) \{\s*return \{ cursor, skipped: true \};\s*\}\s*if \(!normalAttribute\.skipped\) \{\s*gxResolveNormalAttribute\([\s\S]*?const resolvedNormal = normalAttribute\.normal \?\? gxCachedNormal/,
+  );
+  assert.match(
+    decode,
+    /const normal = gxTransformNormal\(\s*resolvedNormal/,
+  );
+  assert.match(
+    decode,
+    /const texgenAttributes = \{[\s\S]*?normal: normalAttribute\.normal,[\s\S]*?tangent: normalAttribute\.tangent,[\s\S]*?binormal: normalAttribute\.binormal/,
+  );
+  assert.match(
+    decode,
+    /embossTangent: normalAttribute\.tangent \?\? gxCachedTangent,[\s\S]*?embossBinormal: normalAttribute\.binormal \?\? gxCachedBinormal/,
+  );
+  assert.match(
+    decode,
+    /const texCoords = gxTransformTexCoords\(\s*texgenAttributes,\s*textureMatrices,\s*positionMatrix,\s*transformContext\s*\)/,
+  );
+  assert.match(
+    decode,
+    /rawNormal: normalAttribute\.normal,[\s\S]*?rawTangent: normalAttribute\.tangent,[\s\S]*?rawBinormal: normalAttribute\.binormal/,
+  );
+  assert.doesNotMatch(
+    decode,
+    /const texgenAttributes = \{[\s\S]*?normal: resolvedNormal/,
+  );
+});
+
+test("cached normals make an omitted-normal lit vertex executable", () => {
+  const context = workerContext();
+  // Direct XYZ position with no normal or color attributes.
+  context.gxCpRegisters[0x50] = 1 << 9;
+  context.gxCpRegisters[0x70] = 1 | (4 << 1);
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  [
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
+  ].forEach((value, index) => setXfFloat(context, 0x400 + index, value));
+
+  context.gxXfRegisters[0x100c] = 0xffffffff;
+  context.gxXfRegisters[0x100d] = 0xffffffff;
+  const litByLightZero = 2 | (1 << 2) | (2 << 7);
+  context.gxXfRegisters[0x100e] = litByLightZero;
+  context.gxXfRegisters[0x100f] = litByLightZero;
+  context.gxXfRegisters[0x1010] = litByLightZero;
+  context.gxXfRegisters[0x1011] = litByLightZero;
+  context.gxXfRegisters[0x603] = 0xffffffff;
+  setXfFloat(context, 0x603 + 9, 1);
+
+  const sourceBytes = new Uint8Array(12);
+  const sourceView = new DataView(sourceBytes.buffer);
+  [0, 0, 0].forEach((value, index) => {
+    sourceView.setFloat32(index * 4, value, false);
+  });
+
+  context.gxCachedNormal = [0, 0, 1];
+  const cached = context.gxDecodeVertex(sourceBytes, 0, 0);
+  assert.notEqual(cached.skipped, true);
+  assertVector(cached.normal, [0, 0, 1]);
+  assert.equal(cached.rasterColors.length, 2);
+
+  context.gxCachedNormal = [0, 0, 0];
+  const zeroInitialized = context.gxDecodeVertex(sourceBytes, 0, 0);
+  assert.notEqual(zeroInitialized.skipped, true);
+  assert.ok(
+    cached.rasterColors.flat().reduce((sum, value) => sum + value, 0)
+      > zeroInitialized.rasterColors.flat().reduce((sum, value) => sum + value, 0),
+  );
+});
+
+test("accepts invalid-float normal encodings and maximum 16-bit indexes", () => {
+  const context = workerContext();
+  const direct = new Uint8Array(12);
+  const directView = new DataView(direct.buffer);
+  [1, -0.5, 0.25].forEach((value, index) => {
+    directView.setFloat32(index * 4, value, false);
+  });
+  for (const format of [5, 6, 7]) {
+    const decoded = context.gxDecodeNormalAttribute(
+      direct,
+      0,
+      1,
+      0,
+      format,
+      false,
+    );
+    assert.equal(decoded.skipped, false);
+    assertVector(decoded.normal, [1, -0.5, 0.25]);
+  }
+
+  context.gxCpRegisters[0xb1] = 6;
+  context.gxCpRegisters[0xa1] = (0x90 - 0xffff * 6) >>> 0;
+  context.bytes.set([0x80, 0, 0, 0, 0, 0], 0x90);
+  const maximumIndex = context.gxDecodeNormalAttribute(
+    new Uint8Array([0xff, 0xff]),
+    0,
+    3,
+    0,
+    2,
+    false,
+  );
+  assert.equal(maximumIndex.cursor, 2);
+  assert.equal(maximumIndex.skipped, false);
+  assertVector(maximumIndex.normal, [1, 0, 0]);
+});
+
+test("reports bounded GX normal-cache provenance", () => {
+  assert.match(source, /let gxCachedNormal = \[0, 0, 0\];/);
+  assert.match(source, /let gxCachedTangent = \[0, 0, 0\];/);
+  assert.match(source, /let gxCachedBinormal = \[0, 0, 0\];/);
+  assert.match(
+    source,
+    /normalCache: \{\s*commits: gxNormalCacheCommits,\s*normalUses: gxCachedNormalUses,\s*tangentUses: gxCachedTangentUses,\s*binormalUses: gxCachedBinormalUses,\s*normal: gxCachedNormal\.slice\(\),\s*tangent: gxCachedTangent\.slice\(\),\s*binormal: gxCachedBinormal\.slice\(\),\s*\}/,
+  );
 });
 
 test("transforms and normalizes normals with the selected XF normal matrix", () => {
@@ -538,6 +882,251 @@ test("transforms NBT tangent and binormal vectors without normalizing their scal
   assert.ok(
     context.gxTransformNormal([0, 0, 0], matrixIndex).every(Number.isNaN),
     "only the lighting normal follows Common::Vec3::Normalized zero semantics",
+  );
+});
+
+test("orders emboss dependencies before applying each stage's BP scale", () => {
+  const context = workerContext();
+  context.gxXfRegisters[0x103f] = 3;
+  // Stage zero generates projective STQ from position. Stages one and two
+  // successively emboss the preceding generated coordinate.
+  context.gxXfRegisters[0x1040] = (1 << 1) | (1 << 2);
+  context.gxXfRegisters[0x1041] = 1 << 4;
+  context.gxXfRegisters[0x1042] = (1 << 4) | (1 << 12);
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  setXfNormalMatrix(context, 0, [
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
+  ]);
+  setXfLightPosition(context, 0, [0, 0, 1]);
+  [
+    [2, 4],
+    [1, 2],
+    [3, 1],
+  ].forEach(([scaleS, scaleT], texgenIndex) => {
+    context.gxBpRegisters[0x30 + texgenIndex * 2] = scaleS;
+    context.gxBpRegisters[0x31 + texgenIndex * 2] = scaleT;
+  });
+  const attributes = texgenAttributes({
+    position: [2, 3, 4],
+    embossTangent: [0, 0, 1],
+    embossBinormal: [0, 0, 2],
+  });
+  const transformContext = context.gxPrepareVertexTransformContext();
+
+  const result = context.gxTransformTexCoords(
+    attributes,
+    Array(8).fill(0),
+    0,
+    transformContext,
+  );
+
+  assertVector(result[0], [6, 15, 4]);
+  assertVector(result[1], [6, 15, 4]);
+  assertVector(result[2], [16, 14, 4]);
+  assert.ok(result.slice(3).every(value => value === null));
+  assert.equal(context.gxTexgenTransforms, 3);
+  assert.equal(context.gxTexgenEmbossTransforms, 2);
+  assert.equal(context.gxTexgenNonFiniteTransforms, 0);
+  assert.equal(context.gxTexgenFallbacks, 0);
+});
+
+test("vertex decode feeds omitted NBT caches into view-space emboss", () => {
+  const context = workerContext();
+  // Direct XYZ position with no normal, tangent, binormal, color, or texture
+  // attributes. The omitted NBT tuple must come from GX's persistent cache.
+  context.gxCpRegisters[0x50] = 1 << 9;
+  context.gxCpRegisters[0x70] = 1 | (4 << 1);
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  setXfNormalMatrix(context, 0, [
+    2, 0, 0,
+    0, 3, 0,
+    0, 0, 4,
+  ]);
+  [1, 0, 1, 0, 1, 0].forEach((value, index) => {
+    setXfFloat(context, 0x1020 + index, value);
+  });
+  context.gxXfRegisters[0x1026] = 1;
+  [320, 264, 1, 320, 264, 0].forEach((value, index) => {
+    setXfFloat(context, 0x101a + index, value);
+  });
+  context.gxXfRegisters[0x103f] = 1;
+  context.gxXfRegisters[0x1040] = (1 << 4) | (7 << 12);
+  setXfLightPosition(context, 0, [1, 5, 7]);
+  context.gxCachedNormal = [0, 0, 1];
+  context.gxCachedTangent = [1, 1, 0];
+  context.gxCachedBinormal = [0, 1, 1];
+
+  const sourceBytes = new Uint8Array(12);
+  const sourceView = new DataView(sourceBytes.buffer);
+  [1, 2, 3].forEach((value, index) => {
+    sourceView.setFloat32(index * 4, value, false);
+  });
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const decoded = context.gxDecodeVertex(
+    sourceBytes,
+    0,
+    0,
+    transformContext,
+  );
+
+  assert.notEqual(decoded.skipped, true);
+  assert.equal(decoded.rawTangent, null);
+  assert.equal(decoded.rawBinormal, null);
+  assertVector(decoded.texCoords[0], [1.8, 5, 0]);
+  assert.equal(context.gxCachedTangentUses, 1);
+  assert.equal(context.gxCachedBinormalUses, 1);
+  assert.equal(context.gxTexgenEmbossTransforms, 1);
+  assert.equal(context.gxTexgenFallbacks, 0);
+});
+
+test("emboss ignores unrelated texgen matrices and light fields", () => {
+  const context = workerContext();
+  const lightIndex = 2;
+  const postIndex = 62;
+  context.gxXfRegisters[0x103f] = 1;
+  // Poison every regular-only field while selecting forward-initialized
+  // texcoord seven and light two for emboss.
+  context.gxXfRegisters[0x1040] = (1 << 1) | (1 << 2) | (1 << 4)
+    | (31 << 7) | (7 << 12) | (lightIndex << 15);
+  context.gxXfRegisters[0x1012] = 1;
+  context.gxXfRegisters[0x1050] = 0x100 | postIndex;
+  context.gxXfRegisters[63 * 4] = 0x7fc00000;
+  context.gxXfRegisters[0x500 + postIndex * 4] = 0x7fc00000;
+  context.gxXfRegisters[0x603 + lightIndex * 0x10 + 1] = 0x7fc00000;
+  setXfNormalMatrix(context, 0, [
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
+  ]);
+  setXfLightPosition(context, lightIndex, [0, 0, 1]);
+  context.gxBpRegisters[0x30] = 1;
+  context.gxBpRegisters[0x31] = 2;
+  const attributes = texgenAttributes({
+    embossTangent: [1, 0, 1],
+    embossBinormal: [0, 2, 1],
+  });
+  const transformContext = context.gxPrepareVertexTransformContext();
+
+  const result = context.gxTransformTexCoords(
+    attributes,
+    Array(8).fill(63),
+    0,
+    transformContext,
+  );
+
+  assertVector(result[0], [2, 3, 0]);
+  assert.equal(context.gxXfLight(lightIndex), null);
+  assert.equal(transformContext.lights[lightIndex], undefined);
+  assert.equal(transformContext.texgenRows[63], undefined);
+  assert.equal(transformContext.texgenPostRows[postIndex], undefined);
+  assertVector(transformContext.embossLightPositions[lightIndex], [0, 0, 1]);
+  assert.equal(context.gxTexgenEmbossTransforms, 1);
+  assert.equal(context.gxTexgenFallbacks, 0);
+});
+
+test("emboss direct and cached paths agree and retain draw-scoped XF state", () => {
+  const context = workerContext();
+  const lightIndex = 3;
+  context.gxXfRegisters[0x103f] = 2;
+  context.gxXfRegisters[0x1040] = (1 << 1) | (1 << 2);
+  context.gxXfRegisters[0x1041] = (1 << 4) | (lightIndex << 15);
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  setXfNormalMatrix(context, 0, [
+    2, 0, 0,
+    0, 3, 0,
+    0, 0, 4,
+  ]);
+  setXfLightPosition(context, lightIndex, [4, 6, 3]);
+  const attributes = texgenAttributes({
+    position: [2, 3, 4],
+    viewPosition: [1, 2, 3],
+    embossTangent: [1, 0, 0],
+    embossBinormal: [0, 1, 0],
+  });
+  const matrixIndices = Array(8).fill(0);
+
+  const direct = context.gxTransformTexCoords(
+    attributes,
+    matrixIndices,
+    0,
+  );
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const cached = context.gxTransformTexCoords(
+    attributes,
+    matrixIndices,
+    0,
+    transformContext,
+  );
+  assertVector(direct[0], [2, 3, 4]);
+  assertVector(direct[1], [3.2, 5.4, 4]);
+  assert.deepEqual(plain(cached), plain(direct));
+
+  setXfNormalMatrix(context, 0, [
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
+  ]);
+  setXfLightPosition(context, lightIndex, [1, 2, 5]);
+  const reused = context.gxTransformTexCoords(
+    attributes,
+    matrixIndices,
+    0,
+    transformContext,
+  );
+  const changedDirect = context.gxTransformTexCoords(
+    attributes,
+    matrixIndices,
+    0,
+  );
+  assert.deepEqual(plain(reused), plain(cached));
+  assertVector(changedDirect[1], [2, 3, 4]);
+});
+
+test("zero normal matrices remain valid for emboss and telemetry exposes gaps", () => {
+  const context = workerContext();
+  context.gxXfRegisters[0x103f] = 2;
+  context.gxXfRegisters[0x1040] = (1 << 4) | (7 << 12);
+  // Values four through seven are reserved in the three-bit hardware field.
+  context.gxXfRegisters[0x1041] = 4 << 4;
+  setXfLightPosition(context, 0, [0, 0, 1]);
+  const attributes = texgenAttributes({
+    embossTangent: [1, 2, 3],
+    embossBinormal: [4, 5, 6],
+  });
+  const transformContext = context.gxPrepareVertexTransformContext();
+
+  const result = context.gxTransformTexCoords(
+    attributes,
+    Array(8).fill(0),
+    0,
+    transformContext,
+  );
+
+  assertVector(result[0], [0, 0, 0]);
+  assert.equal(result[1], null);
+  assert.deepEqual(plain(transformContext.normalMatrices[0]), Array(9).fill(0));
+  assert.equal(context.gxTexgenTransforms, 1);
+  assert.equal(context.gxTexgenEmbossTransforms, 1);
+  assert.equal(context.gxTexgenNonFiniteTransforms, 0);
+  assert.equal(context.gxTexgenFallbacks, 1);
+  assert.match(source, /let gxTexgenEmbossTransforms = 0;/);
+  assert.match(
+    source,
+    /texgenEmbossTransforms: gxTexgenEmbossTransforms/,
   );
 });
 
@@ -795,28 +1384,31 @@ test("cached dual texgen wraps post matrix 62 through rows 62, 63, and 0", () =>
   assert.equal(context.gxVertexTransformCacheMemoHits, 6);
 });
 
-test("vertex transform caches retain null matrices and raw texgen-row snapshots", () => {
+test("vertex transform caches retain zero matrices and raw row snapshots", () => {
   const context = workerContext();
   const transformContext = context.gxPrepareVertexTransformContext();
 
-  assert.equal(
-    context.gxVertexTransformPositionMatrix(transformContext, 0),
-    null,
+  const zeroPositionMatrix = context.gxVertexTransformPositionMatrix(
+    transformContext,
+    0,
   );
+  assert.deepEqual(plain(zeroPositionMatrix), Array(12).fill(0));
   setXfMatrixRows(context, 0, 0, [
     [1, 0, 0, 0],
     [0, 1, 0, 0],
     [0, 0, 1, 0],
   ]);
-  assert.equal(
-    context.gxVertexTransformPositionMatrix(transformContext, 0),
-    null,
+  assert.deepEqual(
+    plain(context.gxTransformPosition([2, -3, 4], 0, transformContext)),
+    [0, 0, 0],
+    "the draw snapshot keeps the zero matrix after later XF writes",
   );
 
-  assert.equal(
-    context.gxVertexTransformNormalMatrix(transformContext, 0),
-    null,
+  const zeroNormalMatrix = context.gxVertexTransformNormalMatrix(
+    transformContext,
+    0,
   );
+  assert.deepEqual(plain(zeroNormalMatrix), Array(9).fill(0));
   [
     1, 0, 0,
     0, 1, 0,
@@ -824,7 +1416,7 @@ test("vertex transform caches retain null matrices and raw texgen-row snapshots"
   ].forEach((value, index) => setXfFloat(context, 0x400 + index, value));
   assert.equal(
     context.gxVertexTransformNormalMatrix(transformContext, 0),
-    null,
+    zeroNormalMatrix,
   );
 
   const texgenRow = 10;
@@ -855,8 +1447,8 @@ test("vertex transform caches retain null matrices and raw texgen-row snapshots"
     cachedPostRow,
   );
 
-  assert.equal(transformContext.positionMatrices[0], null);
-  assert.equal(transformContext.normalMatrices[0], null);
+  assert.equal(transformContext.positionMatrices[0], zeroPositionMatrix);
+  assert.equal(transformContext.normalMatrices[0], zeroNormalMatrix);
   assert.equal(transformContext.texgenRows[texgenRow], cachedTexgenRow);
   assert.equal(transformContext.texgenPostRows[postRow], cachedPostRow);
   assert.equal(context.gxVertexTransformCacheSnapshots, 4);
@@ -952,8 +1544,8 @@ test("vertex decode retains two independent raster color channels", () => {
   assert.deepEqual(plain(prepared), plain(decoded));
   assert.deepEqual(plain(reused), plain(decoded));
   assert.equal(context.gxVertexTransformContextSnapshots, 1);
-  assert.equal(context.gxVertexTransformCacheSnapshots, 1);
-  assert.equal(context.gxVertexTransformCacheMemoHits, 1);
+  assert.equal(context.gxVertexTransformCacheSnapshots, 2);
+  assert.equal(context.gxVertexTransformCacheMemoHits, 2);
 });
 
 test("packs the exact 464-byte WebGPU TEV uniform layout", () => {
@@ -1107,7 +1699,16 @@ test("worker draw capture routes XF attributes through the TEV transport", () =>
   assert.match(capture, /gxPackTevState\s*\(/);
   assert.match(
     capture,
-    /const sourceVertices = new Float32Array\(vertexCount \* 36\)/,
+    /const inputVertexCount = vertexCount;\s*let sourceVertices = new Float32Array\(inputVertexCount \* 36\)/,
+  );
+  assert.match(
+    capture,
+    /if \(decoded\.positionIndexSkipped === true\) \{\s*gxPositionIndexSkips \+= 1;\s*positionIndexSkips \+= 1;\s*continue;/,
+  );
+  assert.match(capture, /const output = outputVertexCount \* 36/);
+  assert.match(
+    capture,
+    /vertexCount = outputVertexCount;\s*sourceVertices = sourceVertices\.slice\(0, outputVertexCount \* 36\)/,
   );
   assert.doesNotMatch(capture, /const vertices = \[\]/);
   assert.match(capture, /vertices:\s*sourceVertices/);

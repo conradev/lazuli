@@ -60,6 +60,8 @@ function workerContext() {
     "gxXfColorU8",
     "gxXfLight",
     "gxPrepareVertexTransformContext",
+    "gxVertexTransformPositionMatrix",
+    "gxVertexTransformNormalMatrix",
     "gxVertexTransformLight",
     "gxDot3",
     "gxVectorSubtract",
@@ -158,6 +160,99 @@ test("rounds live lighting position and normal transforms at every f32 operation
   const finalOnlyNormalX = Math.fround(finalOnlyX / finalOnlyLength);
   assert.equal(f32Bits(finalOnlyX), 0xa8800000);
   assert.notEqual(f32Bits(finalOnlyNormalX), f32Bits(normal[0]));
+});
+
+test("transforms positions through finite all-zero XF matrices", () => {
+  const context = workerContext();
+  const position = [-23.6857338, -25.620348, 8.084085];
+  const transformContext = context.gxPrepareVertexTransformContext();
+
+  for (const transformed of [
+    context.gxTransformPosition(position, 0),
+    context.gxTransformPosition(position, 0, transformContext),
+  ]) {
+    assert.notEqual(transformed, null);
+    assert.deepEqual(
+      Array.from(transformed, f32Bits),
+      [0, 0, 0],
+      "XF zero rows are matrix data, not an uninitialized-state sentinel",
+    );
+  }
+
+  const invalidContext = workerContext();
+  invalidContext.gxXfRegisters[0] = 0x7fc00000;
+  const invalidTransformContext = invalidContext.gxPrepareVertexTransformContext();
+  assert.equal(invalidContext.gxTransformPosition(position, 0), null);
+  assert.equal(
+    invalidContext.gxTransformPosition(position, 0, invalidTransformContext),
+    null,
+  );
+  assert.equal(invalidTransformContext.positionMatrices[0], null);
+});
+
+test("transforms normals through finite all-zero XF matrices", () => {
+  const context = workerContext();
+  const normal = [
+    -0.000018000000636675395,
+    0.7217109799385071,
+    0.6921949982643127,
+  ];
+  const transformContext = context.gxPrepareVertexTransformContext();
+
+  for (const transformed of [
+    context.gxTransformNormalVector(normal, 0),
+    context.gxTransformNormalVector(normal, 0, transformContext),
+  ]) {
+    assert.notEqual(transformed, null);
+    assert.deepEqual(Array.from(transformed, f32Bits), [0, 0, 0]);
+  }
+  for (const transformed of [
+    context.gxTransformNormal(normal, 0),
+    context.gxTransformNormal(normal, 0, transformContext),
+  ]) {
+    assert.notEqual(transformed, null);
+    assert.ok(transformed.every(Number.isNaN));
+  }
+
+  const invalidContext = workerContext();
+  invalidContext.gxXfRegisters[0x400] = 0x7fc00000;
+  const invalidTransformContext =
+    invalidContext.gxPrepareVertexTransformContext();
+  assert.equal(invalidContext.gxTransformNormalVector(normal, 0), null);
+  assert.equal(
+    invalidContext.gxTransformNormalVector(
+      normal,
+      0,
+      invalidTransformContext,
+    ),
+    null,
+  );
+  assert.equal(invalidContext.gxTransformNormal(normal, 0), null);
+  assert.equal(
+    invalidContext.gxTransformNormal(normal, 0, invalidTransformContext),
+    null,
+  );
+  assert.equal(invalidTransformContext.normalMatrices[0], null);
+});
+
+test("clamps zero-matrix normal NaNs through GX diffuse lighting", () => {
+  const context = workerContext();
+  context.gxXfRegisters[0x100a] = 0x40404040;
+  context.gxXfRegisters[0x100c] = 0xffffffff;
+  setLight(context, 0, { color: 0x80808080, position: [0, 0, 3] });
+  const diffuseClampedWithLight0 = 2 | (1 << 2) | (2 << 7);
+  context.gxXfRegisters[0x100e] = diffuseClampedWithLight0;
+  context.gxXfRegisters[0x1010] = diffuseClampedWithLight0;
+
+  const normal = context.gxTransformNormal([1, 0, 0], 0);
+  assert.ok(normal.every(Number.isNaN));
+  const lit = context.gxLightRasterChannels(
+    [0, 0, 1],
+    normal,
+    [[0, 0, 0, 0], [0, 0, 0, 0]],
+  );
+  assert.notEqual(lit, null);
+  assertVector(lit[0], Array(4).fill(63 / 255));
 });
 
 test("keeps every unlit byte canonical through the normalized f32 ABI", () => {

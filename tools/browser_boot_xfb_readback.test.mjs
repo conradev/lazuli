@@ -164,6 +164,9 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
   const context = evaluate(
     [
       "appendRendererOperation",
+      "requireTextureCopyReceiptArray",
+      "requireNoTextureCopyReceipts",
+      "drainWebGpuRenderer",
       "sha256Hex",
       "presentedXfbRgbBytes",
       "summarizePresentedXfbRgba",
@@ -180,6 +183,8 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
     {
       rendererOperationTail,
       webGpuRenderer: {
+        drain() { calls.push("drain"); return Promise.resolve([]); },
+        check_health() { calls.push("health"); },
         has_presented_xfb() { calls.push("has"); return true; },
         read_presented_xfb_rgba() {
           calls.push("read");
@@ -201,7 +206,7 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
   assert.deepEqual(calls, []);
   releaseRenderer();
   const capture = await pending;
-  assert.deepEqual(calls, ["has", "read"]);
+  assert.deepEqual(calls, ["drain", "health", "has", "read"]);
   assert.deepEqual(context.rendererHostMetrics.operations, {
     enqueued: 0,
     pending: 0,
@@ -240,6 +245,9 @@ test("selected XFB capture reports no image after a renderer reset", async () =>
   const context = evaluate(
     [
       "appendRendererOperation",
+      "requireTextureCopyReceiptArray",
+      "requireNoTextureCopyReceipts",
+      "drainWebGpuRenderer",
       "sha256Hex",
       "presentedXfbRgbBytes",
       "summarizePresentedXfbRgba",
@@ -249,6 +257,8 @@ test("selected XFB capture reports no image after a renderer reset", async () =>
     {
       rendererOperationTail: Promise.resolve(),
       webGpuRenderer: {
+        drain() { return Promise.resolve([]); },
+        check_health() {},
         has_presented_xfb() { return false; },
         read_presented_xfb_rgba() { reads += 1; },
       },

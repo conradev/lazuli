@@ -218,6 +218,7 @@ function recoveryDecodedVertex(index, projected) {
 
 function recoveryContext({
   decodedVertices,
+  exactFailureReason = null,
   exactResult = { tag: "exact-input" },
   collectCullSources = false,
   cullMode = 1,
@@ -227,10 +228,12 @@ function recoveryContext({
   textureEnabled = false,
 } = {}) {
   const exactCalls = [];
+  const exactFailureCalls = [];
   const postCullCalls = [];
   const textureCalls = [];
   const transformContexts = [];
   const decodedTransformContexts = [];
+  const normalCacheCommitFlags = [];
   const stage = {
     index: 0,
     order: 0,
@@ -264,6 +267,7 @@ function recoveryContext({
     gxDecodedVertices: 0,
     gxProjectedVertices: 0,
     gxDroppedVertices: 0,
+    gxPositionIndexSkips: 0,
     gxLegacyProjectionNullVertices: 0,
     gxExactRequiredDraws: 0,
     gxExactRequiredVertices: 0,
@@ -308,8 +312,9 @@ function recoveryContext({
     gxManagedCoverageStateCandidate() {
       return collectCullSources;
     },
-    gxDecodeVertex(_source, start, _vat, transformContext) {
+    gxDecodeVertex(_source, start, _vat, transformContext, commitNormalCache) {
       decodedTransformContexts.push(transformContext);
+      normalCacheCommitFlags.push(commitNormalCache);
       const decoded = decodedVertices[start];
       return { ...decoded, cursor: start + 1 };
     },
@@ -335,7 +340,16 @@ function recoveryContext({
     },
     gxManagedCoverageExactClipInput(...args) {
       exactCalls.push(args);
+      if (exactResult === null && exactFailureReason !== null) {
+        const failure = args[4];
+        failure.reason = exactFailureReason;
+        failure.vertex = 1;
+        failure.matrixIndex = decodedVertices[1]?.positionMatrix ?? null;
+      }
       return exactResult;
+    },
+    gxRecordExactRequiredCaptureFailure(...args) {
+      exactFailureCalls.push(args);
     },
     gxXfFloat() {
       return 264;
@@ -368,6 +382,8 @@ function recoveryContext({
     context,
     decodedTransformContexts,
     exactCalls,
+    exactFailureCalls,
+    normalCacheCommitFlags,
     postCullCalls,
     textureCalls,
     transformContexts,
@@ -1396,14 +1412,21 @@ test("projection-null recovery emits one required draw with canonical source pay
   assert.equal(context.gxFrameDrawVertices, 3);
 });
 
-test("required capture failure suppresses draw and all committed-draw telemetry", () => {
+test("required capture failure suppresses draw and records its reason", () => {
   const decodedVertices = [
     recoveryDecodedVertex(0, [10, 20, 30, 2]),
     recoveryDecodedVertex(1, null),
     recoveryDecodedVertex(2, [50, 60, 70, 4]),
   ];
-  const { context, exactCalls, postCullCalls, textureCalls } = recoveryContext({
+  const {
+    context,
+    exactCalls,
+    exactFailureCalls,
+    postCullCalls,
+    textureCalls,
+  } = recoveryContext({
     decodedVertices,
+    exactFailureReason: "position-matrix",
     exactResult: null,
     textureEnabled: true,
   });
@@ -1422,6 +1445,10 @@ test("required capture failure suppresses draw and all committed-draw telemetry"
   assert.equal(context.gxExactRequiredVertices, 0);
   assert.equal(context.gxExactRequiredCaptureMisses, 1);
   assert.equal(context.gxDroppedVertices, 1);
+  assert.equal(exactFailureCalls.length, 1);
+  assert.equal(exactFailureCalls[0][0], "position-matrix");
+  assert.equal(exactFailureCalls[0][1].failure.vertex, 1);
+  assert.equal(exactFailureCalls[0][1].legacyProjectionNullVertices, 1);
 });
 
 test("required recovery rejects nonfinite transported source attributes", () => {
@@ -1431,7 +1458,7 @@ test("required recovery rejects nonfinite transported source attributes", () => 
     recoveryDecodedVertex(2, [50, 60, 70, 4]),
   ];
   decodedVertices[1].texCoords[7][2] = Number.MAX_VALUE;
-  const { context, exactCalls, postCullCalls } = recoveryContext({
+  const { context, exactCalls, exactFailureCalls, postCullCalls } = recoveryContext({
     decodedVertices,
   });
 
@@ -1443,6 +1470,11 @@ test("required recovery rejects nonfinite transported source attributes", () => 
   assert.equal(context.gxFrameDrawVertices, 0);
   assert.equal(context.gxExactRequiredCaptureMisses, 1);
   assert.equal(context.gxDroppedVertices, 1);
+  assert.equal(exactFailureCalls.length, 1);
+  assert.equal(exactFailureCalls[0][0], "carrier-nonfinite");
+  const carrierFailure = exactFailureCalls[0][1];
+  assert.ok(carrierFailure.carrierNonFiniteLane >= 0);
+  assert.equal(Number.isFinite(carrierFailure.carrierNonFiniteValue), false);
 });
 
 test("a later skipped vertex drops an earlier unrecovered projection-null vertex", () => {
@@ -1470,6 +1502,127 @@ test("a later skipped vertex drops an earlier unrecovered projection-null vertex
   assert.equal(context.gxExactRequiredCaptureMisses, 0);
   assert.equal(context.gxTexturedDraws, 0);
   assert.equal(context.gxTevModeCounts.size, 0);
+});
+
+test("position-index sentinels compact one primitive without a decode failure", () => {
+  const decodedVertices = [
+    recoveryDecodedVertex(0, [10, 20, 30, 2]),
+    { skipped: true, positionIndexSkipped: true },
+    recoveryDecodedVertex(2, [30, 40, 50, 3]),
+    recoveryDecodedVertex(3, [40, 50, 60, 4]),
+  ];
+  const { context, exactCalls, normalCacheCommitFlags, postCullCalls } = recoveryContext({
+    decodedVertices,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(4), 0, 4, 1);
+
+  assert.equal(context.gxFrameDraws.length, 1);
+  const draw = context.gxFrameDraws[0];
+  assert.equal(draw.vertexCount, 3);
+  assert.equal(draw.vertices.length, 3 * 36);
+  assert.deepEqual(
+    [draw.vertices[0], draw.vertices[36], draw.vertices[72]],
+    [10, 30, 40],
+  );
+  assert.equal(context.gxDecodedVertices, 3);
+  assert.equal(context.gxProjectedVertices, 3);
+  assert.equal(context.gxPositionIndexSkips, 1);
+  assert.equal(context.gxDroppedVertices, 0);
+  assert.equal(context.gxFrameDrawVertices, 3);
+  assert.equal(context.gxExactRequiredCaptureMisses, 0);
+  assert.equal(exactCalls.length, 0);
+  assert.deepEqual(normalCacheCommitFlags, [false, false, false, true]);
+  assert.equal(postCullCalls.length, 0);
+});
+
+test("position-index compaction keeps exact-projection inputs aligned", () => {
+  const decodedVertices = [
+    recoveryDecodedVertex(0, [10, 20, 30, 2]),
+    { skipped: true, positionIndexSkipped: true },
+    recoveryDecodedVertex(2, null),
+    recoveryDecodedVertex(3, [40, 50, 60, 4]),
+  ];
+  const { context, exactCalls, postCullCalls } = recoveryContext({
+    decodedVertices,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(4), 0, 4, 1);
+
+  assert.equal(context.gxFrameDraws.length, 1);
+  const draw = context.gxFrameDraws[0];
+  assert.equal(draw.vertexCount, 3);
+  assert.equal(draw.vertices.length, 3 * 36);
+  assert.equal(draw.exactGeometryRequired, true);
+  assert.equal(exactCalls.length, 1);
+  assert.equal(postCullCalls.length, 0);
+  assert.deepEqual(
+    plain(exactCalls[0][2]),
+    [decodedVertices[0].position, decodedVertices[2].position, decodedVertices[3].position],
+  );
+  assert.deepEqual(
+    plain(exactCalls[0][3]),
+    [
+      decodedVertices[0].positionMatrix,
+      decodedVertices[2].positionMatrix,
+      decodedVertices[3].positionMatrix,
+    ],
+  );
+  assert.equal(context.gxPositionIndexSkips, 1);
+  assert.equal(context.gxLegacyProjectionNullVertices, 1);
+  assert.equal(context.gxExactRequiredDraws, 1);
+  assert.equal(context.gxExactRequiredVertices, 3);
+  assert.equal(context.gxExactRequiredCaptureMisses, 0);
+  assert.equal(context.gxDroppedVertices, 0);
+});
+
+test("an all-sentinel primitive emits nothing without reporting decode loss", () => {
+  const decodedVertices = Array.from(
+    { length: 3 },
+    () => ({ skipped: true, positionIndexSkipped: true }),
+  );
+  const { context, exactCalls, postCullCalls, textureCalls } = recoveryContext({
+    decodedVertices,
+    textureEnabled: true,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(3), 0, 3, 1);
+
+  assert.equal(context.gxFrameDraws.length, 0);
+  assert.equal(context.gxDecodedVertices, 0);
+  assert.equal(context.gxProjectedVertices, 0);
+  assert.equal(context.gxPositionIndexSkips, 3);
+  assert.equal(context.gxDroppedVertices, 0);
+  assert.equal(context.gxFrameDrawVertices, 0);
+  assert.equal(context.gxExactRequiredCaptureMisses, 0);
+  assert.equal(exactCalls.length, 0);
+  assert.equal(postCullCalls.length, 0);
+  assert.equal(textureCalls.length, 0);
+});
+
+test("a position sentinel does not mask a separate decode failure", () => {
+  const decodedVertices = [
+    recoveryDecodedVertex(0, [10, 20, 30, 2]),
+    { skipped: true, positionIndexSkipped: true },
+    { skipped: true },
+    recoveryDecodedVertex(3, [40, 50, 60, 4]),
+  ];
+  const { context, exactCalls, postCullCalls, textureCalls } = recoveryContext({
+    decodedVertices,
+    textureEnabled: true,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(4), 0, 4, 1);
+
+  assert.equal(context.gxFrameDraws.length, 0);
+  assert.equal(context.gxDecodedVertices, 2);
+  assert.equal(context.gxProjectedVertices, 2);
+  assert.equal(context.gxPositionIndexSkips, 1);
+  assert.equal(context.gxDroppedVertices, 1);
+  assert.equal(context.gxFrameDrawVertices, 0);
+  assert.equal(exactCalls.length, 0);
+  assert.equal(postCullCalls.length, 0);
+  assert.equal(textureCalls.length, 0);
 });
 
 test("all-projected draws preserve post-cull and optional exact behavior", () => {
@@ -1579,6 +1732,7 @@ test("raw face-cull draws bypass optional CPU cull evidence", () => {
 test("projection recovery and lighting rejection counters are exposed in decoder telemetry", () => {
   for (const counter of [
     "gxLightingRejectedVertices",
+    "gxPositionIndexSkips",
     "gxLegacyProjectionNullVertices",
     "gxExactRequiredDraws",
     "gxExactRequiredVertices",
@@ -1593,6 +1747,7 @@ test("projection recovery and lighting rejection counters are exposed in decoder
   }
   for (const [field, counter] of [
     ["lightingRejectedVertices", "gxLightingRejectedVertices"],
+    ["positionIndexSkips", "gxPositionIndexSkips"],
     ["legacyProjectionNullVertices", "gxLegacyProjectionNullVertices"],
     ["exactRequiredDraws", "gxExactRequiredDraws"],
     ["exactRequiredVertices", "gxExactRequiredVertices"],
@@ -1611,6 +1766,47 @@ test("projection recovery and lighting rejection counters are exposed in decoder
   ]) {
     assert.match(source, new RegExp(`${field}: ${counter}`));
   }
+});
+
+test("exact-capture failures expose a fixed bounded reason taxonomy", () => {
+  const capture = extractFunction("gxManagedCoverageExactClipInput");
+  assert.match(capture, /matrixIndices,\s*failure = null/);
+  assert.match(
+    capture,
+    /failure\.reason === undefined[\s\S]*failure\.reason = reason;[\s\S]*return null;/,
+  );
+  for (const reason of [
+    "source-geometry",
+    "bp-state",
+    "clip-disable",
+    "viewport",
+    "projection-state",
+    "position",
+    "position-matrix-index",
+    "position-matrix",
+    "view-nonfinite",
+    "clip-nonfinite",
+  ]) {
+    assert.match(capture, new RegExp(`reject\\("${reason}"`), reason);
+  }
+  const record = extractFunction("recordGxPrimitive");
+  assert.match(
+    record,
+    /const carrierNonFiniteLane = sourceVertices\.findIndex\([\s\S]*gxRecordExactRequiredCaptureFailure\([\s\S]*"carrier-nonfinite"[\s\S]*gxExactRequiredCaptureMisses \+= 1/,
+  );
+  assert.match(
+    source,
+    /exactRequiredCaptureFailures:\s*snapshotGxExactRequiredCaptureFailures\(\)/,
+  );
+  assert.match(
+    extractFunction("snapshotGxExactRequiredCaptureFailures"),
+    /schema: "lazuli-gx-exact-required-capture-failures-v1"[\s\S]*total: gxExactRequiredCaptureMisses[\s\S]*reasonCounts[\s\S]*firstFailure[\s\S]*countLimit/,
+  );
+  assert.doesNotMatch(source, /gxExactRequiredCaptureFailureTotal/);
+  assert.match(
+    extractFunction("gxRecordExactRequiredCaptureFailure"),
+    /carrierNonFiniteVertex:[\s\S]*carrierNonFiniteComponent:[\s\S]*carrierNonFiniteValue:/,
+  );
 });
 
 test("canonical cull clip transform rounds every scalar operation to f32", () => {
@@ -2036,28 +2232,109 @@ test("exact input capture rejects incomplete or noncanonical GX state", () => {
   const matrices = [0, 0, 0];
   const capture = () =>
     context.gxManagedCoverageExactClipInput(2, 1, positions, matrices);
+  const rejectAs = (expectedReason, rejectedPositions, rejectedMatrices, cull = 1) => {
+    const failure = {};
+    assert.equal(
+      context.gxManagedCoverageExactClipInput(
+        2,
+        cull,
+        rejectedPositions,
+        rejectedMatrices,
+        failure,
+      ),
+      null,
+    );
+    assert.equal(failure.reason, expectedReason);
+    return failure;
+  };
 
   assert.notEqual(capture(), null);
-  assert.equal(
-    context.gxManagedCoverageExactClipInput(2, 1, positions, [0, 0]),
-    null,
-  );
-  assert.equal(
-    context.gxManagedCoverageExactClipInput(2, 2, positions, matrices),
-    null,
-  );
-  assert.equal(
-    context.gxManagedCoverageExactClipInput(2, 1, positions.slice(0, 2), [0, 0]),
-    null,
-  );
+  rejectAs("source-geometry", positions, [0, 0]);
+  rejectAs("bp-state", positions, matrices, 2);
+  rejectAs("source-geometry", positions.slice(0, 2), [0, 0]);
   registers[0x1005] = 8;
-  assert.equal(capture(), null);
+  rejectAs("clip-disable", positions, matrices);
   registers[0x1005] = 0;
   registers[0x101a] = 0;
-  assert.equal(capture(), null);
+  rejectAs("viewport", positions, matrices);
   registers[0x101a] = f32Bits(320);
   registers[0x101b] = 0x7fc00000;
-  assert.equal(capture(), null);
+  rejectAs("viewport", positions, matrices);
+  registers[0x101b] = f32Bits(-264);
+
+  registers[0x1026] = 2;
+  rejectAs("projection-state", positions, matrices);
+  registers[0x1026] = 0;
+  const badPosition = positions.map(position => position.slice());
+  badPosition[0][0] = Number.NaN;
+  const positionFailure = rejectAs("position", badPosition, matrices);
+  assert.equal(positionFailure.vertex, 0);
+
+  const matrixIndexFailure = rejectAs(
+    "position-matrix-index",
+    positions,
+    [62, 0, 0],
+  );
+  assert.equal(matrixIndexFailure.matrixIndex, 62);
+
+  const zeroMatrixState = context.gxCullTransformState();
+  assert.deepEqual(
+    Array.from(context.gxCullViewPosition(positions[0], 4, zeroMatrixState)),
+    [0, 0, 0],
+    "finite all-zero position matrices transform rather than reject",
+  );
+  const zeroMatrixFailure = {};
+  const zeroMatrixCapture = context.gxManagedCoverageExactClipInput(
+    2,
+    1,
+    positions,
+    [4, 4, 4],
+    zeroMatrixFailure,
+  );
+  assert.notEqual(zeroMatrixCapture, null);
+  assert.deepEqual(zeroMatrixFailure, {});
+  assert.deepEqual(
+    f32BitPatterns(zeroMatrixCapture.clipPositions),
+    Array.from({ length: 3 }, () => [0, 0, 0, 0x80000000]).flat(),
+    "exact capture preserves the perspective -0 clip W for homogeneous clipping",
+  );
+
+  registers[0x1026] = 1;
+  const zeroMatrixOrthoCapture = context.gxManagedCoverageExactClipInput(
+    2,
+    1,
+    positions,
+    [4, 4, 4],
+  );
+  assert.notEqual(zeroMatrixOrthoCapture, null);
+  assert.deepEqual(
+    f32BitPatterns(zeroMatrixOrthoCapture.clipPositions),
+    Array.from({ length: 3 }, () => [0, 0, 0, 0x3f800000]).flat(),
+    "orthographic projection retains finite zero-matrix geometry with W equal to one",
+  );
+  registers[0x1026] = 0;
+
+  registers[16] = 0x7fc00000;
+  rejectAs("position-matrix", positions, [4, 4, 4]);
+
+  const maxF32 = 3.4028234663852886e38;
+  xf.set([
+    maxF32, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+  ], 16);
+  rejectAs(
+    "view-nonfinite",
+    [[maxF32, 0, -1], positions[1], positions[2]],
+    [4, 0, 0],
+  );
+
+  xf[0x1020] = maxF32;
+  rejectAs(
+    "clip-nonfinite",
+    [[2, 0, -1], positions[1], positions[2]],
+    matrices,
+  );
 });
 
 test("one per-draw cull state reuses exact position matrices", () => {
