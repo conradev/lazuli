@@ -1956,6 +1956,216 @@ const TEMPLATE: &str = r##"<!doctype html>
       return packet;
     }
 
+    function gxFramePacketIndirectTevState(value, name) {
+      const zero = () => ({
+        genMode: 0,
+        matrices: Array(9).fill(0),
+        imask: 0,
+        commands: Array(16).fill(0),
+        texScales: Array(2).fill(0),
+        iref: 0,
+      });
+      if (value === undefined || value === null) return zero();
+      if (typeof value !== "object" || Array.isArray(value)) {
+        throw new TypeError(`GX frame packet ${name} must be an object`);
+      }
+      const words = (values, length, field) => {
+        if (
+          values === null
+          || values === undefined
+          || (!Array.isArray(values) && !ArrayBuffer.isView(values))
+          || values.length !== length
+        ) {
+          throw new RangeError(
+            `GX frame packet ${name}.${field} must contain ${length} BP words`
+          );
+        }
+        return Array.from(values, (word, index) =>
+          gxFramePacketInteger(
+            word,
+            `${name}.${field}[${index}]`,
+            0x00ffffff
+          )
+        );
+      };
+      return {
+        genMode: gxFramePacketInteger(
+          value.genMode,
+          `${name}.genMode`,
+          0x00ffffff
+        ),
+        matrices: words(value.matrices, 9, "matrices"),
+        imask: gxFramePacketInteger(
+          value.imask,
+          `${name}.imask`,
+          0x00ffffff
+        ),
+        commands: words(value.commands, 16, "commands"),
+        texScales: words(value.texScales, 2, "texScales"),
+        iref: gxFramePacketInteger(
+          value.iref,
+          `${name}.iref`,
+          0x00ffffff
+        ),
+      };
+    }
+
+    // Packet flag bit one appends one fixed 128-byte BP-word tail per draw.
+    // It is deliberately outside the 464-byte direct WebGPU TEV uniform ABI,
+    // and follows every version-specific evidence, exact-clip, or MODE1 tail.
+    function gxAttachIndirectTevStateV1(packet, frame) {
+      if (
+        Object.prototype.toString.call(packet) !== "[object ArrayBuffer]"
+        || packet.byteLength < 160
+      ) {
+        throw new TypeError(
+          "GX indirect TEV state requires a complete LZGX ArrayBuffer"
+        );
+      }
+      if (
+        frame === null
+        || typeof frame !== "object"
+        || frame.geometry === null
+        || typeof frame.geometry !== "object"
+        || !Array.isArray(frame.geometry.draws)
+      ) {
+        throw new TypeError("GX indirect TEV state requires frame draws");
+      }
+      const legacy = new Uint8Array(packet);
+      const legacyView = new DataView(packet);
+      const version = legacyView.getUint16(0x04, true);
+      if (version < 4 || version > 7) {
+        throw new Error("GX indirect TEV state requires LZGX v4 through v7");
+      }
+      if (legacyView.getUint32(0x08, true) !== packet.byteLength) {
+        throw new Error("GX indirect TEV state requires canonical packet length");
+      }
+      const packetFlags = legacyView.getUint32(0x0c, true);
+      if ((packetFlags & ~1) !== 0) {
+        throw new Error("GX indirect TEV state conflicts with packet flags");
+      }
+      const drawCount = legacyView.getUint32(0x14, true);
+      if (frame.geometry.draws.length !== drawCount) {
+        throw new Error("GX indirect TEV state draw count conflicts with packet");
+      }
+      const states = frame.geometry.draws.map((draw, drawIndex) => {
+        const state = gxFramePacketIndirectTevState(
+          draw?.pipeline?.indirectTev,
+          `draws[${drawIndex}].pipeline.indirectTev`
+        );
+        const tevState = gxFramePacketBytes(
+          draw?.tevState,
+          `draws[${drawIndex}].tevState`
+        );
+        if (tevState.byteLength !== 464) {
+          throw new RangeError(
+            `GX frame packet draws[${drawIndex}].tevState must be 464 bytes`
+          );
+        }
+        const tevView = new DataView(
+          tevState.buffer,
+          tevState.byteOffset,
+          tevState.byteLength
+        );
+        const tevStageCount = tevView.getUint32(448, true);
+        const numTexGens = state.genMode & 0x0f;
+        // NUMTEXGENS=0 changes TEXC/TEXA to the fixed black input even when
+        // TEV order disables its texture lookup. Carry raw GEN_MODE for that
+        // direct-only case instead of mistaking the otherwise-zero BP tail for
+        // dormant indirect state.
+        let requiresDirectGenMode = numTexGens === 0;
+        for (let stage = 0; stage < tevStageCount; stage += 1) {
+          const references = tevView.getUint32(stage * 16 + 8, true);
+          if ((references & (1 << 6)) === 0) continue;
+          const requestedTexCoord = (references >>> 3) & 7;
+          if (numTexGens === 0 || requestedTexCoord >= numTexGens) {
+            requiresDirectGenMode = true;
+            break;
+          }
+        }
+        return { ...state, tevStageCount, requiresDirectGenMode };
+      });
+      const hasIndirectTev = states.some(state => (
+        ((state.genMode >>> 16) & 7) !== 0
+        || state.requiresDirectGenMode
+        || state.commands
+          .slice(0, state.tevStageCount)
+          .some(command => (command & 0x001fffff) !== 0)
+      ));
+      if (!hasIndirectTev) return packet;
+
+      states.forEach((state, drawIndex) => {
+        const draw = frame.geometry.draws[drawIndex];
+        const genModeTevStageCount = ((state.genMode >>> 10) & 0x0f) + 1;
+        if (state.tevStageCount !== genModeTevStageCount) {
+          throw new Error(
+            `GX indirect TEV draws[${drawIndex}] GEN_MODE TEV stage count`
+            + " conflicts with the direct TEV state"
+          );
+        }
+        const cullMode = gxFramePacketInteger(
+          draw?.pipeline?.cullMode ?? 0,
+          `draws[${drawIndex}].pipeline.cullMode`,
+          3
+        );
+        if (((state.genMode >>> 14) & 3) !== cullMode) {
+          throw new Error(
+            `GX indirect TEV draws[${drawIndex}] GEN_MODE cull mode`
+            + " conflicts with the draw"
+          );
+        }
+        if (draw.exactClipInput !== undefined && draw.exactClipInput !== null) {
+          const exactGenMode = gxFramePacketInteger(
+            draw.exactClipInput.bpGenMode,
+            `draws[${drawIndex}].exactClipInput.bpGenMode`,
+            0x00ffffff
+          );
+          if (state.genMode !== exactGenMode) {
+            throw new Error(
+              `GX indirect TEV draws[${drawIndex}] GEN_MODE conflicts with`
+              + " the exact-clip BP generation mode"
+            );
+          }
+        }
+      });
+
+      const tailBytes = gxFramePacketMultiply(
+        drawCount,
+        128,
+        "indirect TEV tail bytes"
+      );
+      const packetBytes = gxFramePacketAdd(
+        packet.byteLength,
+        tailBytes,
+        "indirect TEV packet bytes"
+      );
+      const output = new ArrayBuffer(packetBytes);
+      const bytes = new Uint8Array(output);
+      const view = new DataView(output);
+      bytes.set(legacy);
+      view.setUint32(0x08, packetBytes, true);
+      view.setUint32(0x0c, packetFlags | 2, true);
+      for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
+        const state = states[drawIndex];
+        const offset = packet.byteLength + drawIndex * 128;
+        view.setUint32(offset + 0x00, 1, true);
+        view.setUint32(offset + 0x04, state.genMode, true);
+        state.matrices.forEach((word, index) => {
+          view.setUint32(offset + 0x08 + index * 4, word, true);
+        });
+        view.setUint32(offset + 0x2c, state.imask, true);
+        state.commands.forEach((word, index) => {
+          view.setUint32(offset + 0x30 + index * 4, word, true);
+        });
+        state.texScales.forEach((word, index) => {
+          view.setUint32(offset + 0x70 + index * 4, word, true);
+        });
+        view.setUint32(offset + 0x78, state.iref, true);
+        // +0x7c remains the canonical zero reserved word.
+      }
+      return output;
+    }
+
     function postGxFrame(copyKind, frame) {
       frame = gxCompactNativeTriangleFans(frame);
       const diagnostics = {
@@ -1981,6 +2191,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           residentTextureKeys
         );
         packet = gxAttachTextureCopyLayoutV1(packet, copyKind, frame);
+        packet = gxAttachIndirectTevStateV1(packet, frame);
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
@@ -2444,15 +2655,46 @@ const TEMPLATE: &str = r##"<!doctype html>
             );
           }
         }
+        const resourceStages = Array.from(
+          { length: tevStageCount },
+          (_unused, stage) => {
+            const references = tevView.getUint32(stage * 16 + 8, true);
+            return {
+              index: stage,
+              textureMap: references & 7,
+              texCoordIndex: (references >>> 3) & 7,
+              textureEnabled: (references & (1 << 6)) !== 0,
+            };
+          }
+        );
+        // Some isolated packet-vector tests extract only the legacy packer.
+        // The full producer always has gxTevResourceDependencies in scope.
+        const resourceDependencies =
+          typeof gxTevResourceDependencies === "function"
+            ? gxTevResourceDependencies(
+              resourceStages,
+              pipeline.indirectTev
+            )
+            : resourceStages
+              .filter(stage => stage.textureEnabled)
+              .map(stage => ({
+                kind: "direct",
+                stageIndex: stage.index,
+                textureMap: stage.textureMap,
+              }));
         const requiredTextureMaps = new Set();
-        for (let stage = 0; stage < tevStageCount; stage += 1) {
-          const references = tevView.getUint32(stage * 16 + 8, true);
-          if ((references & (1 << 6)) === 0) continue;
-          const textureMap = references & 7;
+        for (const dependency of resourceDependencies) {
+          if (dependency.textureMap === null) continue;
+          const textureMap = dependency.textureMap;
           requiredTextureMaps.add(textureMap);
           if (textureReferences[textureMap].index === 0xffffffff) {
+            const requirement = dependency.kind === "indirect"
+              ? `TEV stage ${dependency.stageIndex} indirect stage`
+                + ` ${dependency.indirectStageIndex}`
+              : `TEV stage ${dependency.stageIndex}`;
             throw new Error(
-              `GX frame packet ${name} TEV stage ${stage} requires missing texture map ${textureMap}`
+              `GX frame packet ${name} ${requirement}`
+                + ` requires missing texture map ${textureMap}`
             );
           }
         }
@@ -10530,6 +10772,84 @@ const TEMPLATE: &str = r##"<!doctype html>
       return [rg & 3, (rg >>> 2) & 3, ba & 3, (ba >>> 2) & 3];
     }
 
+    function gxTevResourceDependencies(stages, indirectTev = null) {
+      // Standalone packet fixtures predate raw GEN_MODE capture. Preserve
+      // their direct-coordinate behavior when it is absent, while treating an
+      // authentic raw zero as NUMTEXGENS=0 rather than as an absence sentinel.
+      const hasGenMode = Number.isInteger(indirectTev?.genMode);
+      const genMode = hasGenMode ? indirectTev.genMode >>> 0 : 8;
+      const numTexGens = genMode & 0xf;
+      const numIndirectStages = (genMode >>> 16) & 7;
+      const commands = (
+        Array.isArray(indirectTev?.commands)
+        || ArrayBuffer.isView(indirectTev?.commands)
+      ) ? indirectTev.commands : [];
+        const iref = Number.isInteger(indirectTev?.iref)
+          ? indirectTev.iref >>> 0
+          : 0;
+      const effectiveTexCoord = texCoordIndex => {
+        if (numTexGens === 0) return null;
+        return texCoordIndex < numTexGens ? texCoordIndex : 0;
+      };
+      const dependencies = [];
+
+      for (const stage of stages) {
+        // GX disables ordinary direct texturing when there are no texture
+        // generators. Indirect IREF lookups remain independently live below
+        // and use the synthesized fixed coordinate (0, 0).
+        if (!stage.textureEnabled || numTexGens === 0) continue;
+        dependencies.push({
+          kind: "direct",
+          stageIndex: stage.index,
+          textureMap: stage.textureMap,
+          requestedTexCoordIndex: stage.texCoordIndex,
+          texCoordIndex: effectiveTexCoord(stage.texCoordIndex),
+        });
+      }
+
+      for (const stage of stages) {
+        const command = Number.isInteger(commands[stage.index])
+          ? commands[stage.index] >>> 0
+          : 0;
+        // Every live stage updates the persistent TEV coordinate. Raw command
+        // zero resets it to this stage's fixed base, which a later ADDPREV can
+        // consume even when direct texturing is disabled. A texture-enabled
+        // stage's direct edge already carries the same base coordinate.
+        if (!stage.textureEnabled) {
+          dependencies.push({
+            kind: "command",
+            stageIndex: stage.index,
+            textureMap: null,
+            requestedTexCoordIndex: stage.texCoordIndex,
+            texCoordIndex: effectiveTexCoord(stage.texCoordIndex),
+          });
+        }
+        const indirectStageIndex = command & 3;
+        const bumpAlphaSelect = (command >>> 7) & 3;
+        const matrixIndex = (command >>> 9) & 3;
+        // Wrap/addprev-only commands still alter TEV coordinates, but do not
+        // read an indirect texture. Invalid/stale BT selections do not sample
+        // either, even when their command has a bump or matrix selector.
+        if (
+          (bumpAlphaSelect === 0 && matrixIndex === 0)
+          || indirectStageIndex >= numIndirectStages
+        ) {
+          continue;
+        }
+        const reference = (iref >>> (indirectStageIndex * 6)) & 0x3f;
+        const requestedTexCoordIndex = (reference >>> 3) & 7;
+        dependencies.push({
+          kind: "indirect",
+          stageIndex: stage.index,
+          indirectStageIndex,
+          textureMap: reference & 7,
+          requestedTexCoordIndex,
+          texCoordIndex: effectiveTexCoord(requestedTexCoordIndex),
+        });
+      }
+      return dependencies;
+    }
+
     function gxPackTevState(stages) {
       const buffer = new ArrayBuffer(464);
       const state = new DataView(buffer);
@@ -10571,17 +10891,27 @@ const TEMPLATE: &str = r##"<!doctype html>
       return new Uint8Array(buffer);
     }
 
-    function gxTevTextures(stages, textureHashBatch = null) {
+    function gxTevTextures(stages, indirectTev, textureHashBatch = null) {
       const textures = Array(8).fill(null);
-      for (const stage of stages) {
-        if (!stage.textureEnabled || textures[stage.textureMap] !== null) continue;
-        const texture = gxDecodeTexture(stage.textureMap, textureHashBatch);
+      const dependencies = gxTevResourceDependencies(stages, indirectTev);
+      for (const dependency of dependencies) {
+        if (dependency.textureMap === null) continue;
+        if (textures[dependency.textureMap] !== null) continue;
+        const texture = gxDecodeTexture(
+          dependency.textureMap,
+          textureHashBatch
+        );
         if (texture === null) {
+          const requirement = dependency.kind === "indirect"
+            ? `GX TEV stage ${dependency.stageIndex} indirect stage`
+              + ` ${dependency.indirectStageIndex}`
+            : `GX TEV stage ${dependency.stageIndex}`;
           throw new Error(
-            `GX TEV stage ${stage.index} requires undecodable texture map ${stage.textureMap}`
+            `${requirement} requires undecodable texture map`
+              + ` ${dependency.textureMap}`
           );
         }
-        textures[stage.textureMap] = texture;
+        textures[dependency.textureMap] = texture;
       }
       return textures;
     }
@@ -12178,6 +12508,23 @@ const TEMPLATE: &str = r##"<!doctype html>
           (_unused, index) => gxBpRegisters[0xee + index] >>> 0
         ),
         viewportHalfWidthBits: gxXfRegisters[0x101a] >>> 0,
+        indirectTev: {
+          genMode: gxBpRegisters[0x00] >>> 0,
+          matrices: Array.from(
+            { length: 9 },
+            (_unused, index) => gxBpRegisters[0x06 + index] >>> 0
+          ),
+          imask: gxBpRegisters[0x0f] >>> 0,
+          commands: Array.from(
+            { length: 16 },
+            (_unused, index) => gxBpRegisters[0x10 + index] >>> 0
+          ),
+          texScales: [
+            gxBpRegisters[0x25] >>> 0,
+            gxBpRegisters[0x26] >>> 0,
+          ],
+          iref: gxBpRegisters[0x27] >>> 0,
+        },
       };
     }
 
@@ -12220,12 +12567,26 @@ const TEMPLATE: &str = r##"<!doctype html>
           (_unused, stageIndex) => gxTevStageState(stageIndex)
         );
         const texturedStages = stages.filter(stage => stage.textureEnabled);
+        // recordGxPrimitive is also extracted in small producer oracles. Those
+        // fixtures retain their direct-only behavior; the complete browser
+        // producer takes the shared raw-BP dependency path.
+        const tevResourceDependencies =
+          typeof gxTevResourceDependencies === "function"
+            ? gxTevResourceDependencies(stages, pipeline.indirectTev)
+            : texturedStages.map(stage => ({
+              kind: "direct",
+              stageIndex: stage.index,
+              textureMap: stage.textureMap,
+              requestedTexCoordIndex: stage.texCoordIndex,
+              texCoordIndex: stage.texCoordIndex,
+            }));
         drawState = {
           serial: drawStateSerial,
           pipeline,
           stageCount,
           stages,
           texturedStages,
+          tevResourceDependencies,
           textures: null,
           tevState: null,
           vertexTransformContext: null,
@@ -12242,6 +12603,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         stageCount,
         stages,
         texturedStages,
+        tevResourceDependencies,
       } = drawState;
       let vertexTransformContext = drawState.vertexTransformContext;
       if (vertexTransformContext === null) {
@@ -12425,11 +12787,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxRecordUnsupported("z-freeze", 0x00, genMode);
         }
         const indirectStageCount = (genMode >>> 16) & 7;
-        const indirectStage = indirectStageCount === 0
-          ? undefined
-          : stages.find(stage => (
-              gxBpRegisters[0x10 + stage.index] & 0x00ffffff
-            ) !== 0);
+        const indirectStage = stages.find(stage => (
+          gxBpRegisters[0x10 + stage.index] & 0x001fffff
+        ) !== 0);
         if (indirectStage !== undefined) {
           const indirectAddress = 0x10 + indirectStage.index;
           gxRecordUnsupported(
@@ -12441,17 +12801,26 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
       gxFrameDrawVertices += vertexCount;
-      for (const stage of stages) {
-        if (!stage.textureEnabled) continue;
-        const coords = texCoordSets[stage.texCoordIndex];
+      for (const dependency of tevResourceDependencies) {
+        if (dependency.texCoordIndex === null) continue;
+        const coords = texCoordSets[dependency.texCoordIndex];
         if (!gxTevCoordsTransportable(coords, vertexCount)) {
+          const requirement = dependency.kind === "indirect"
+            ? `GX TEV stage ${dependency.stageIndex} indirect stage`
+              + ` ${dependency.indirectStageIndex}`
+            : `GX TEV stage ${dependency.stageIndex}`;
           throw new Error(
-            `GX TEV stage ${stage.index} requires invalid texcoord ${stage.texCoordIndex}`
+            `${requirement} requires invalid texcoord`
+              + ` ${dependency.texCoordIndex}`
           );
         }
       }
       if (drawState.textures === null) {
-        drawState.textures = gxTevTextures(stages, textureHashBatch);
+        drawState.textures = gxTevTextures(
+          stages,
+          pipeline.indirectTev,
+          textureHashBatch
+        );
         drawState.tevState = gxPackTevState(stages);
       }
       const { textures, tevState } = drawState;
@@ -12462,13 +12831,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         texturedStages,
         textures
       );
-      if (texturedStages.length !== 0) {
+      if (tevResourceDependencies.some(dependency => dependency.textureMap !== null)) {
         gxTexturedDraws += 1;
         statusDataset.gxTextures = String(gxTexturedDraws);
       }
       const tevMode = `per-fragment-stage-${stageCount}`;
       gxTevModeCounts.set(tevMode, (gxTevModeCounts.get(tevMode) ?? 0) + 1);
-      const texCoordIndex = texturedStages[0]?.texCoordIndex ?? 0;
+      const texCoordIndex = tevResourceDependencies[0]?.texCoordIndex ?? 0;
       const selectedTexCoords = texCoordSets[texCoordIndex];
       const collectCullVertices = (
         !exactGeometryRequired

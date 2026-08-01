@@ -12,6 +12,10 @@ const sourcePath = new URL(
   import.meta.url,
 );
 const source = readFileSync(sourcePath, "utf8");
+const packetParserSource = readFileSync(
+  new URL("../crates/browser-renderer/src/packet.rs", import.meta.url),
+  "utf8",
+);
 
 function extractFunction(name) {
   const match = new RegExp(`function\\s+${name}\\s*\\(`).exec(source);
@@ -39,12 +43,16 @@ const packetFunctions = [
   "gxFramePacketEqualBytes",
   "gxFramePacketKeyBytes",
   "gxFramePacketSampler",
+  "gxTevResourceDependencies",
+  "gxTevTextures",
   "gxSourceTriangleCount",
   "gxSourceTriangleIndex",
   "gxExpandedTriangleIndices",
   "gxFramePacketPostCullEvidence",
   "packGxFramePacketV4",
   "gxAttachTextureCopyLayoutV1",
+  "gxFramePacketIndirectTevState",
+  "gxAttachIndirectTevStateV1",
   "gxFramePacketExactClipInput",
   "packGxFramePacketV5",
   "packGxFramePacketV6",
@@ -83,6 +91,50 @@ function copyState(copyCommand) {
     copyScale: 0x0d0e0f,
     copyFilter: [0x101112, 0x131415],
   };
+}
+
+function indirectTevState(
+  seed,
+  indirectStageCount,
+  tevStageCount = 1,
+  cullMode = 0,
+) {
+  const word = offset => (seed + offset * 0x010101) & 0x00ffffff;
+  return {
+    genMode: (
+      (word(29) & ~((0x0f << 10) | (3 << 14) | (7 << 16)))
+      | ((tevStageCount - 1) << 10)
+      | (cullMode << 14)
+      | (indirectStageCount << 16)
+    ) >>> 0,
+    matrices: Array.from({ length: 9 }, (_unused, index) => word(index)),
+    imask: word(9),
+    commands: Array.from(
+      { length: 16 },
+      (_unused, index) => word(10 + index),
+    ),
+    texScales: [word(26), word(27)],
+    iref: word(28),
+  };
+}
+
+function zeroIndirectTevState() {
+  return {
+    genMode: 0,
+    matrices: Array(9).fill(0),
+    imask: 0,
+    commands: Array(16).fill(0),
+    texScales: Array(2).fill(0),
+    iref: 0,
+  };
+}
+
+function setTevStageCount(draw, stageCount) {
+  new DataView(
+    draw.tevState.buffer,
+    draw.tevState.byteOffset,
+    draw.tevState.byteLength,
+  ).setUint32(448, stageCount, true);
 }
 
 function emptyTextureFrame() {
@@ -1210,4 +1262,600 @@ test("omits acknowledged resident payloads across GX frames", () => {
   assert.equal(view.getUint32(512 + 0x20, true), 0);
   assert.equal(view.getUint32(576 + 0x0c, true), 0);
   assert.equal(view.getUint32(576 + 0x20, true), 0);
+});
+
+test("unions direct and active IREF texture and texcoord dependencies", () => {
+  const context = packetContext();
+  const stages = [
+    {
+      index: 0,
+      textureEnabled: true,
+      textureMap: 7,
+      texCoordIndex: 6,
+    },
+    {
+      index: 1,
+      textureEnabled: false,
+      textureMap: 5,
+      texCoordIndex: 5,
+    },
+    {
+      index: 2,
+      textureEnabled: false,
+      textureMap: 4,
+      texCoordIndex: 4,
+    },
+    {
+      index: 3,
+      textureEnabled: false,
+      textureMap: 3,
+      texCoordIndex: 3,
+    },
+  ];
+  const commands = Array(16).fill(0);
+  commands[0] = 1 << 7; // BT=0, bump S: raw IREF zero is map 0 / coord 0.
+  commands[1] = 1 | (1 << 9); // BT=1, matrix 0.
+  commands[2] = (6 << 13) | (1 << 20); // Wrap zero + addprev only.
+  commands[3] = 2 | (1 << 7); // BT=2 is outside NUMINDSTAGES=2.
+  const stageOneReference = 3 | (6 << 3);
+  const dependencies = context.gxTevResourceDependencies(stages, {
+    genMode: 2 | (2 << 16),
+    commands,
+    iref: stageOneReference << 6,
+  });
+
+  assert.deepEqual(
+    Array.from(dependencies, dependency => ({
+      kind: dependency.kind,
+      stageIndex: dependency.stageIndex,
+      indirectStageIndex: dependency.indirectStageIndex ?? null,
+      textureMap: dependency.textureMap,
+      requestedTexCoordIndex: dependency.requestedTexCoordIndex,
+      texCoordIndex: dependency.texCoordIndex,
+    })),
+    [
+      {
+        kind: "direct",
+        stageIndex: 0,
+        indirectStageIndex: null,
+        textureMap: 7,
+        requestedTexCoordIndex: 6,
+        texCoordIndex: 0,
+      },
+      {
+        kind: "indirect",
+        stageIndex: 0,
+        indirectStageIndex: 0,
+        textureMap: 0,
+        requestedTexCoordIndex: 0,
+        texCoordIndex: 0,
+      },
+      {
+        kind: "command",
+        stageIndex: 1,
+        indirectStageIndex: null,
+        textureMap: null,
+        requestedTexCoordIndex: 5,
+        texCoordIndex: 0,
+      },
+      {
+        kind: "indirect",
+        stageIndex: 1,
+        indirectStageIndex: 1,
+        textureMap: 3,
+        requestedTexCoordIndex: 6,
+        texCoordIndex: 0,
+      },
+      {
+        kind: "command",
+        stageIndex: 2,
+        indirectStageIndex: null,
+        textureMap: null,
+        requestedTexCoordIndex: 4,
+        texCoordIndex: 0,
+      },
+      {
+        kind: "command",
+        stageIndex: 3,
+        indirectStageIndex: null,
+        textureMap: null,
+        requestedTexCoordIndex: 3,
+        texCoordIndex: 0,
+      },
+    ],
+  );
+
+  assert.deepEqual(
+    Array.from(
+      context.gxTevResourceDependencies(
+        [{ index: 0, textureEnabled: false, textureMap: 0, texCoordIndex: 0 }],
+        {
+          genMode: 0,
+          commands: [(6 << 13) | (1 << 20)],
+          iref: 0,
+        },
+      ),
+      dependency => ({
+        kind: dependency.kind,
+        textureMap: dependency.textureMap,
+        texCoordIndex: dependency.texCoordIndex,
+      }),
+    ),
+    [{ kind: "command", textureMap: null, texCoordIndex: null }],
+    "NUMTEXGENS=0 synthesizes the base coord without sampling map zero",
+  );
+
+  const zeroGeneratorSample = Array(16).fill(0);
+  zeroGeneratorSample[0] = 1 << 7;
+  assert.deepEqual(
+    Array.from(
+      context.gxTevResourceDependencies(
+        [{ index: 0, textureEnabled: true, textureMap: 4, texCoordIndex: 7 }],
+        {
+          genMode: 1 << 16,
+          commands: zeroGeneratorSample,
+          iref: 0,
+        },
+      ),
+      dependency => ({
+        kind: dependency.kind,
+        textureMap: dependency.textureMap,
+        texCoordIndex: dependency.texCoordIndex,
+      }),
+    ),
+    [{ kind: "indirect", textureMap: 0, texCoordIndex: null }],
+    "NUMTEXGENS=0 suppresses direct map 4 while retaining indirect IREF map 0",
+  );
+
+  const addPrevious = Array(16).fill(0);
+  addPrevious[1] = (6 << 13) | (1 << 20);
+  assert.deepEqual(
+    Array.from(
+      context.gxTevResourceDependencies(
+        [
+          { index: 0, textureEnabled: false, textureMap: 0, texCoordIndex: 7 },
+          { index: 1, textureEnabled: false, textureMap: 0, texCoordIndex: 3 },
+        ],
+        { genMode: 8 | (1 << 10), commands: addPrevious, iref: 0 },
+      ),
+      dependency => ({
+        stageIndex: dependency.stageIndex,
+        kind: dependency.kind,
+        textureMap: dependency.textureMap,
+        texCoordIndex: dependency.texCoordIndex,
+      }),
+    ),
+    [
+      { stageIndex: 0, kind: "command", textureMap: null, texCoordIndex: 7 },
+      { stageIndex: 1, kind: "command", textureMap: null, texCoordIndex: 3 },
+    ],
+    "raw-zero reset predecessors remain available to later ADDPREV stages",
+  );
+});
+
+test("decodes indirect-only IREF maps once in the fixed GX binding slots", () => {
+  const context = packetContext();
+  const textureHashBatch = { ordinal: 9 };
+  const decoded = [];
+  context.gxDecodeTexture = (textureMap, batch) => {
+    decoded.push({ textureMap, batch });
+    return { key: `map-${textureMap}` };
+  };
+  const stages = [{
+    index: 0,
+    textureEnabled: true,
+    textureMap: 5,
+    texCoordIndex: 0,
+  }];
+  const commands = Array(16).fill(0);
+  commands[0] = 1 << 7;
+  const textures = context.gxTevTextures(
+    stages,
+    {
+      genMode: 1 | (1 << 16),
+      commands,
+      iref: 0,
+    },
+    textureHashBatch,
+  );
+
+  assert.deepEqual(decoded.map(call => call.textureMap), [5, 0]);
+  assert.ok(decoded.every(call => call.batch === textureHashBatch));
+  assert.equal(textures[0].key, "map-0");
+  assert.equal(textures[5].key, "map-5");
+  assert.equal(textures.filter(Boolean).length, 2);
+});
+
+test("packet validation accepts raw IREF zero as an indirect-only map-0 binding", () => {
+  const context = packetContext();
+  const frame = evidencedXfbFrame();
+  const draw = frame.geometry.draws[0];
+  setTevStageCount(draw, 1);
+  const commands = Array(16).fill(0);
+  commands[0] = 1 << 7;
+  draw.pipeline.indirectTev = {
+    ...zeroIndirectTevState(),
+    genMode: 1 << 16,
+    commands,
+    iref: 0,
+  };
+  draw.textures = [{
+    key: "iref-zero-map-zero",
+    width: 1,
+    height: 1,
+    pixels: Uint8Array.of(9, 8, 7, 6),
+  }];
+
+  const packet = context.packGxFramePacketV4(2, frame);
+  const view = new DataView(packet);
+  const drawOffset = view.getUint32(0x1c, true);
+  assert.equal(view.getUint32(0x18, true), 1);
+  assert.equal(view.getUint32(drawOffset + 0x30, true), 0);
+
+  draw.textures = [];
+  assert.throws(
+    () => context.packGxFramePacketV4(2, frame),
+    /TEV stage 0 indirect stage 0 requires missing texture map 0/,
+  );
+});
+
+test("appends fixed indirect TEV BP tails without changing the 464-byte ABI", () => {
+  const context = packetContext();
+  const frame = evidencedXfbFrame();
+  const first = frame.geometry.draws[0];
+  const second = {
+    ...first,
+    vertices: first.vertices.slice(),
+    tevState: first.tevState.slice(),
+    postCullEvidence: first.postCullEvidence.slice(),
+    pipeline: { ...first.pipeline },
+  };
+  frame.geometry.draws.push(second);
+  frame.geometry.drawCalls = 2;
+  frame.geometry.vertices = 6;
+  setTevStageCount(first, 1);
+  setTevStageCount(second, 1);
+  first.pipeline.indirectTev = indirectTevState(0x10203, 3);
+  second.pipeline.indirectTev = indirectTevState(0x40506, 0);
+  // Stage zero selects indirect stage one, whose raw IREF entry names map 0.
+  // The producer must carry that binding even though direct TEV texturing is
+  // disabled in the 464-byte state.
+  first.textures = [{
+    key: "indirect-map-0",
+    width: 1,
+    height: 1,
+    pixels: Uint8Array.of(1, 2, 3, 4),
+  }];
+
+  const base = context.packGxFramePacketV4(2, frame);
+  const packet = context.gxAttachIndirectTevStateV1(base, frame);
+  const bytes = new Uint8Array(packet);
+  const baseBytes = new Uint8Array(base);
+  const view = new DataView(packet);
+  const baseView = new DataView(base);
+  const tailOffset = base.byteLength;
+
+  assert.equal(packet.byteLength, base.byteLength + 2 * 128);
+  assert.equal(view.getUint32(0x08, true), packet.byteLength);
+  assert.equal(view.getUint32(0x0c, true), 2);
+  assert.equal(view.getUint32(0x18, true), 1);
+  assert.equal(view.getUint32(0x3c, true), 2 * 464);
+  assert.equal(
+    view.getUint32(view.getUint32(0x1c, true) + 176 + 0x0c, true),
+    464,
+  );
+  assert.deepEqual(Array.from(bytes.subarray(0, 8)), Array.from(baseBytes.subarray(0, 8)));
+  assert.deepEqual(
+    Array.from(bytes.subarray(16, base.byteLength)),
+    Array.from(baseBytes.subarray(16)),
+  );
+  const tevOffset = baseView.getUint32(0x24, true);
+  assert.deepEqual(
+    Array.from(bytes.subarray(tevOffset, tevOffset + 2 * 464)),
+    Array.from(baseBytes.subarray(tevOffset, tevOffset + 2 * 464)),
+  );
+
+  for (const [drawIndex, expected] of [
+    [0, first.pipeline.indirectTev],
+    [1, second.pipeline.indirectTev],
+  ]) {
+    const offset = tailOffset + drawIndex * 128;
+    assert.equal(view.getUint32(offset + 0x00, true), 1);
+    assert.equal(view.getUint32(offset + 0x04, true), expected.genMode);
+    assert.deepEqual(
+      Array.from({ length: 9 }, (_unused, index) =>
+        view.getUint32(offset + 0x08 + index * 4, true)
+      ),
+      expected.matrices,
+    );
+    assert.equal(view.getUint32(offset + 0x2c, true), expected.imask);
+    assert.deepEqual(
+      Array.from({ length: 16 }, (_unused, index) =>
+        view.getUint32(offset + 0x30 + index * 4, true)
+      ),
+      expected.commands,
+    );
+    assert.deepEqual(
+      [0x70, 0x74].map(offsetInTail =>
+        view.getUint32(offset + offsetInTail, true)
+      ),
+      expected.texScales,
+    );
+    assert.equal(view.getUint32(offset + 0x78, true), expected.iref);
+    assert.equal(view.getUint32(offset + 0x7c, true), 0);
+  }
+});
+
+test("indirect TEV packet feature is optional, validated, and composable", () => {
+  const context = packetContext();
+  const inactive = evidencedXfbFrame();
+  inactive.geometry.draws[0].pipeline.indirectTev = {
+    ...zeroIndirectTevState(),
+    // IREF zero is map zero / coordinate zero, not an absence sentinel. With
+    // a nonzero texgen count, neither an indirect count nor a live command,
+    // and no live direct stage, the dormant state is inert.
+    genMode: 1,
+  };
+  const inactivePacket = context.packGxFramePacketV4(2, inactive);
+  assert.equal(
+    context.gxAttachIndirectTevStateV1(inactivePacket, inactive),
+    inactivePacket,
+  );
+
+  const reservedOnly = evidencedXfbFrame();
+  setTevStageCount(reservedOnly.geometry.draws[0], 1);
+  reservedOnly.geometry.draws[0].pipeline.indirectTev = {
+    ...zeroIndirectTevState(),
+    genMode: 1,
+    commands: [0x00e00000, ...Array(15).fill(0)],
+  };
+  const reservedOnlyPacket = context.packGxFramePacketV4(2, reservedOnly);
+  assert.equal(
+    context.gxAttachIndirectTevStateV1(reservedOnlyPacket, reservedOnly),
+    reservedOnlyPacket,
+    "IND_CMD bits 21 through 23 do not activate the transport tail",
+  );
+
+  const directGenMode = evidencedXfbFrame();
+  const directGenModeDraw = directGenMode.geometry.draws[0];
+  setTevStageCount(directGenModeDraw, 1);
+  new DataView(
+    directGenModeDraw.tevState.buffer,
+    directGenModeDraw.tevState.byteOffset,
+    directGenModeDraw.tevState.byteLength,
+  ).setUint32(8, (1 << 6) | (7 << 3) | 4, true);
+  directGenModeDraw.pipeline.indirectTev = zeroIndirectTevState();
+  const directGenModeBase = context.packGxFramePacketV4(2, directGenMode);
+  const directGenModePacket = context.gxAttachIndirectTevStateV1(
+    directGenModeBase,
+    directGenMode,
+  );
+  assert.equal(new DataView(directGenModeBase).getUint32(0x18, true), 0);
+  assert.equal(directGenModePacket.byteLength, directGenModeBase.byteLength + 128);
+  assert.equal(new DataView(directGenModePacket).getUint32(0x0c, true), 2);
+
+  const zeroTexGensDisabledOrder = evidencedXfbFrame();
+  const zeroTexGensDisabledDraw = zeroTexGensDisabledOrder.geometry.draws[0];
+  setTevStageCount(zeroTexGensDisabledDraw, 1);
+  const zeroTexGensDisabledTev = new DataView(
+    zeroTexGensDisabledDraw.tevState.buffer,
+    zeroTexGensDisabledDraw.tevState.byteOffset,
+    zeroTexGensDisabledDraw.tevState.byteLength,
+  );
+  zeroTexGensDisabledTev.setUint32(0x00, 8 << 12, true); // TEXC input.
+  zeroTexGensDisabledTev.setUint32(0x04, 4 << 13, true); // TEXA input.
+  zeroTexGensDisabledTev.setUint32(0x08, 0, true); // Texture order disabled.
+  zeroTexGensDisabledDraw.pipeline.indirectTev = zeroIndirectTevState();
+  const zeroTexGensDisabledBase = context.packGxFramePacketV4(
+    2,
+    zeroTexGensDisabledOrder,
+  );
+  const zeroTexGensDisabledPacket = context.gxAttachIndirectTevStateV1(
+    zeroTexGensDisabledBase,
+    zeroTexGensDisabledOrder,
+  );
+  const zeroTexGensDisabledView = new DataView(zeroTexGensDisabledPacket);
+  assert.equal(zeroTexGensDisabledView.getUint32(0x18, true), 0);
+  assert.equal(
+    zeroTexGensDisabledPacket.byteLength,
+    zeroTexGensDisabledBase.byteLength + 128,
+    "NUMTEXGENS=0 carries GEN_MODE for black TEXC/TEXA with disabled order",
+  );
+  assert.equal(zeroTexGensDisabledView.getUint32(0x0c, true), 2);
+  assert.equal(
+    zeroTexGensDisabledView.getUint32(zeroTexGensDisabledBase.byteLength + 0x04, true),
+    0,
+  );
+
+  const commandOnly = evidencedXfbFrame();
+  setTevStageCount(commandOnly.geometry.draws[0], 1);
+  commandOnly.geometry.draws[0].pipeline.indirectTev = {
+    ...zeroIndirectTevState(),
+    genMode: 0,
+    commands: Array.from(
+      { length: 16 },
+      (_unused, index) => index === 0 ? 6 << 13 : 0,
+    ),
+  };
+  const commandOnlyBase = context.packGxFramePacketV4(2, commandOnly);
+  const commandOnlyPacket = context.gxAttachIndirectTevStateV1(
+    commandOnlyBase,
+    commandOnly,
+  );
+  const commandOnlyView = new DataView(commandOnlyPacket);
+  assert.equal(commandOnlyView.getUint32(0x0c, true), 2);
+  assert.equal(
+    commandOnlyView.getUint32(commandOnlyBase.byteLength + 0x04, true),
+    0,
+  );
+  assert.equal(
+    commandOnlyView.getUint32(commandOnlyBase.byteLength + 0x30, true),
+    6 << 13,
+  );
+  assert.equal(commandOnlyView.getUint32(commandOnlyBase.byteLength + 0x78, true), 0);
+
+  const staleCommand = evidencedXfbFrame();
+  setTevStageCount(staleCommand.geometry.draws[0], 1);
+  staleCommand.geometry.draws[0].pipeline.indirectTev = {
+    ...zeroIndirectTevState(),
+    genMode: 1,
+    commands: Array.from(
+      { length: 16 },
+      (_unused, index) => index === 7 ? 6 << 13 : 0,
+    ),
+  };
+  const staleCommandPacket = context.packGxFramePacketV4(2, staleCommand);
+  assert.equal(
+    context.gxAttachIndirectTevStateV1(staleCommandPacket, staleCommand),
+    staleCommandPacket,
+  );
+
+  const malformed = evidencedXfbFrame();
+  setTevStageCount(malformed.geometry.draws[0], 1);
+  malformed.geometry.draws[0].pipeline.indirectTev = indirectTevState(0, 1);
+  malformed.geometry.draws[0].pipeline.indirectTev.commands[7] = 0x01000000;
+  const malformedPacket = context.packGxFramePacketV4(2, malformed);
+  assert.throws(
+    () => context.gxAttachIndirectTevStateV1(malformedPacket, malformed),
+    /commands\[7\].*0 through 16777215/,
+  );
+
+  for (const [name, mutate, pattern] of [
+    [
+      "stage count",
+      state => { state.genMode |= 1 << 10; },
+      /GEN_MODE TEV stage count.*direct TEV state/,
+    ],
+    [
+      "cull mode",
+      state => { state.genMode |= 1 << 14; },
+      /GEN_MODE cull mode.*draw/,
+    ],
+  ]) {
+    const contradictory = evidencedXfbFrame();
+    setTevStageCount(contradictory.geometry.draws[0], 1);
+    const state = indirectTevState(0, 1);
+    mutate(state);
+    contradictory.geometry.draws[0].pipeline.indirectTev = state;
+    const contradictoryPacket = context.packGxFramePacketV4(2, contradictory);
+    assert.throws(
+      () => context.gxAttachIndirectTevStateV1(
+        contradictoryPacket,
+        contradictory,
+      ),
+      pattern,
+      name,
+    );
+  }
+
+  const exactMismatch = exactClipXfbFrame();
+  setTevStageCount(exactMismatch.geometry.draws[0], 1);
+  exactMismatch.geometry.draws[0].pipeline.indirectTev = indirectTevState(0, 1);
+  const exactMismatchPacket = context.packGxFramePacketV6(2, exactMismatch);
+  assert.throws(
+    () => context.gxAttachIndirectTevStateV1(
+      exactMismatchPacket,
+      exactMismatch,
+    ),
+    /GEN_MODE conflicts with.*exact-clip BP generation mode/,
+  );
+
+  const textureFrame = emptyTextureFrame();
+  const draw = evidencedXfbFrame().geometry.draws[0];
+  setTevStageCount(draw, 1);
+  draw.pipeline.indirectTev = indirectTevState(0x223344, 1);
+  textureFrame.stride = 64;
+  textureFrame.geometry = {
+    drawCalls: 1,
+    vertices: 3,
+    draws: [draw],
+  };
+  const base = context.packGxFramePacketV4(1, textureFrame);
+  const textureLayout = context.gxAttachTextureCopyLayoutV1(
+    base,
+    1,
+    textureFrame,
+  );
+  const composed = context.gxAttachIndirectTevStateV1(
+    textureLayout,
+    textureFrame,
+  );
+  assert.equal(new DataView(textureLayout).getUint32(0x0c, true), 1);
+  assert.equal(new DataView(composed).getUint32(0x0c, true), 3);
+  assert.equal(composed.byteLength, textureLayout.byteLength + 128);
+});
+
+test("captures every indirect TEV producer register and retains its marker", () => {
+  const gxBpRegisters = new Uint32Array(256);
+  const gxXfRegisters = new Uint32Array(0x1100);
+  gxBpRegisters[0x00] = (5 << 16) | (2 << 14);
+  for (let index = 0; index < 9; index += 1) {
+    gxBpRegisters[0x06 + index] = 0x010000 + index;
+  }
+  gxBpRegisters[0x0f] = 0x020304;
+  for (let index = 0; index < 16; index += 1) {
+    gxBpRegisters[0x10 + index] = 0x030000 + index;
+  }
+  gxBpRegisters[0x25] = 0x040506;
+  gxBpRegisters[0x26] = 0x070809;
+  gxBpRegisters[0x27] = 0x0a0b0c;
+  const context = { Array, Math, gxBpRegisters, gxXfRegisters };
+  vm.createContext(context);
+  vm.runInContext(extractFunction("gxDrawPipelineState"), context);
+
+  const captured = context.gxDrawPipelineState().indirectTev;
+  assert.equal(captured.genMode, (5 << 16) | (2 << 14));
+  assert.equal((captured.genMode >>> 16) & 7, 5);
+  assert.deepEqual(
+    Array.from(captured.matrices),
+    Array.from({ length: 9 }, (_unused, index) => 0x010000 + index),
+  );
+  assert.equal(captured.imask, 0x020304);
+  assert.deepEqual(
+    Array.from(captured.commands),
+    Array.from({ length: 16 }, (_unused, index) => 0x030000 + index),
+  );
+  assert.deepEqual(Array.from(captured.texScales), [0x040506, 0x070809]);
+  assert.equal(captured.iref, 0x0a0b0c);
+  assert.match(
+    extractFunction("recordGxPrimitive"),
+    /gxRecordUnsupported\(\s*"indirect-tev",\s*indirectAddress/,
+  );
+  assert.match(
+    extractFunction("recordGxPrimitive"),
+    /const indirectStage = stages\.find/,
+  );
+  assert.doesNotMatch(
+    extractFunction("recordGxPrimitive"),
+    /indirectStageCount === 0/,
+  );
+  assert.match(
+    extractFunction("recordGxPrimitive"),
+    /gxTevResourceDependencies\(stages, pipeline\.indirectTev\)/,
+  );
+  assert.match(
+    extractFunction("recordGxPrimitive"),
+    /for \(const dependency of tevResourceDependencies\)[\s\S]*?gxTevCoordsTransportable/,
+  );
+  assert.match(
+    extractFunction("recordGxPrimitive"),
+    /gxTevTextures\(\s*stages,\s*pipeline\.indirectTev,\s*textureHashBatch/,
+  );
+});
+
+test("pins the cross-language indirect TEV tail feature ABI", () => {
+  assert.match(
+    packetParserSource,
+    /PACKET_FLAG_INDIRECT_TEV_STATE_V1: u32 = 1 << 1/,
+  );
+  assert.match(
+    packetParserSource,
+    /GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW: u32 = 128/,
+  );
+  assert.match(
+    packetParserSource,
+    /pub\(crate\) struct GxIndirectTevState \{[\s\S]*?gen_mode: u32,[\s\S]*?matrices: \[u32; 9\],[\s\S]*?imask: u32,[\s\S]*?commands: \[u32; 16\],[\s\S]*?tex_scales: \[u32; 2\],[\s\S]*?iref: u32/,
+  );
+  assert.match(source, /const buffer = new ArrayBuffer\(464\);/);
+  assert.match(source, /packet = gxAttachIndirectTevStateV1\(packet, frame\);/);
 });

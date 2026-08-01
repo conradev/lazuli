@@ -341,8 +341,9 @@ test("draw, copy, bbox, report, and reset anchors preserve consumer gating", () 
   );
   assert.match(
     primitive,
-    /indirectStageCount === 0[\s\S]*stages\.find\([\s\S]*"indirect-tev"/,
+    /const indirectStageCount[\s\S]*const indirectStage = stages\.find\([\s\S]*"indirect-tev"/,
   );
+  assert.doesNotMatch(primitive, /indirectStageCount === 0/);
 
   const bp = extractFunction("recordGxBpWrite");
   assert.ok(

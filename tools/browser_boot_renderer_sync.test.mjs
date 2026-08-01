@@ -85,6 +85,7 @@ function workerHarness({ transferMessages = false } = {}) {
     // Packet-layout semantics are covered by browser_boot_gx_packet.test.mjs;
     // this harness isolates acknowledgement and transfer ordering.
     gxAttachTextureCopyLayoutV1(packet) { return packet; },
+    gxAttachIndirectTevStateV1(packet) { return packet; },
     gxTextureCopyReceiptExpectation() { return null; },
     gxPreflightTextureCopyReceipts(receipts, expectation) {
       if (!Array.isArray(receipts) || receipts.length !== 0 || expectation !== null) {

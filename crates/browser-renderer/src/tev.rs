@@ -12,6 +12,9 @@ use std::array;
 pub(crate) const MAX_TEV_STAGES: usize = 16;
 pub(crate) const MAX_TEV_TEXTURES: usize = 8;
 pub(crate) const MAX_TEV_RASTER_CHANNELS: usize = 8;
+pub(crate) const MAX_INDIRECT_TEV_STAGES: usize = 4;
+pub(crate) const INDIRECT_TEV_MATRIX_COUNT: usize = 3;
+pub(crate) const INDIRECT_TEV_COMMAND_MASK: u32 = 0x001f_ffff;
 pub(crate) const TEV_VERTEX_FLOATS: usize = 36;
 pub(crate) const TEV_DRAW_STATE_BYTES: usize = 464;
 pub(crate) const TEV_TEXTURE_METADATA_WORDS: usize = MAX_TEV_TEXTURES * 5;
@@ -143,6 +146,431 @@ pub(crate) fn required_texture_coords(state: &[u8]) -> Result<[bool; MAX_TEV_TEX
         if refs & (1 << 6) != 0 {
             required[((refs >> 3) & 7) as usize] = true;
         }
+    }
+    Ok(required)
+}
+
+/// The precision selected by a BP indirect-stage command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndirectTevFormat {
+    Bits8,
+    Bits5,
+    Bits4,
+    Bits3,
+}
+
+impl IndirectTevFormat {
+    const fn from_bits(bits: u32) -> Self {
+        match bits & 3 {
+            0 => Self::Bits8,
+            1 => Self::Bits5,
+            2 => Self::Bits4,
+            _ => Self::Bits3,
+        }
+    }
+
+    const fn coordinate_shift(self) -> u32 {
+        match self {
+            Self::Bits8 => 0,
+            Self::Bits5 => 3,
+            Self::Bits4 => 4,
+            Self::Bits3 => 5,
+        }
+    }
+
+    const fn selected_bias(self) -> i32 {
+        match self {
+            Self::Bits8 => -128,
+            Self::Bits5 | Self::Bits4 | Self::Bits3 => 1,
+        }
+    }
+
+    const fn bump_shift(self) -> u32 {
+        match self {
+            Self::Bits8 => 0,
+            Self::Bits5 => 5,
+            Self::Bits4 => 4,
+            Self::Bits3 => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndirectTevBumpAlpha {
+    Off,
+    S,
+    T,
+    U,
+}
+
+impl IndirectTevBumpAlpha {
+    const fn from_bits(bits: u32) -> Self {
+        match bits & 3 {
+            0 => Self::Off,
+            1 => Self::S,
+            2 => Self::T,
+            _ => Self::U,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndirectTevMatrixId {
+    Static,
+    DynamicS,
+    DynamicT,
+    Invalid,
+}
+
+impl IndirectTevMatrixId {
+    const fn from_bits(bits: u32) -> Self {
+        match bits & 3 {
+            0 => Self::Static,
+            1 => Self::DynamicS,
+            2 => Self::DynamicT,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndirectTevWrap {
+    Off,
+    Wrap256,
+    Wrap128,
+    Wrap64,
+    Wrap32,
+    Wrap16,
+    Zero,
+    Invalid,
+}
+
+impl IndirectTevWrap {
+    const fn from_bits(bits: u32) -> Self {
+        match bits & 7 {
+            0 => Self::Off,
+            1 => Self::Wrap256,
+            2 => Self::Wrap128,
+            3 => Self::Wrap64,
+            4 => Self::Wrap32,
+            5 => Self::Wrap16,
+            6 => Self::Zero,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Decoded low 21 bits of one BP IND_CMD register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndirectTevCommand {
+    pub(crate) raw: u32,
+    pub(crate) indirect_stage: usize,
+    pub(crate) format: IndirectTevFormat,
+    pub(crate) bias: [bool; 3],
+    pub(crate) bump_alpha: IndirectTevBumpAlpha,
+    pub(crate) matrix_index: Option<usize>,
+    pub(crate) matrix_id: IndirectTevMatrixId,
+    pub(crate) wrap_s: IndirectTevWrap,
+    pub(crate) wrap_t: IndirectTevWrap,
+    pub(crate) use_unmodified_lod: bool,
+    pub(crate) add_previous: bool,
+}
+
+impl IndirectTevCommand {
+    pub(crate) const fn decode(raw: u32) -> Self {
+        let raw = raw & INDIRECT_TEV_COMMAND_MASK;
+        let encoded_matrix = ((raw >> 9) & 3) as usize;
+        Self {
+            raw,
+            indirect_stage: (raw & 3) as usize,
+            format: IndirectTevFormat::from_bits(raw >> 2),
+            bias: [
+                raw & (1 << 4) != 0,
+                raw & (1 << 5) != 0,
+                raw & (1 << 6) != 0,
+            ],
+            bump_alpha: IndirectTevBumpAlpha::from_bits(raw >> 7),
+            matrix_index: if encoded_matrix == 0 {
+                None
+            } else {
+                Some(encoded_matrix - 1)
+            },
+            matrix_id: IndirectTevMatrixId::from_bits(raw >> 11),
+            wrap_s: IndirectTevWrap::from_bits(raw >> 13),
+            wrap_t: IndirectTevWrap::from_bits(raw >> 16),
+            use_unmodified_lod: raw & (1 << 19) != 0,
+            add_previous: raw & (1 << 20) != 0,
+        }
+    }
+
+    pub(crate) const fn uses_indirect_sample(self, num_indirect_stages: usize) -> bool {
+        (self.bump_alpha as u32 != IndirectTevBumpAlpha::Off as u32 || self.matrix_index.is_some())
+            && self.indirect_stage < num_indirect_stages
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndirectTevMatrix {
+    pub(crate) rows: [[i32; 3]; 2],
+    pub(crate) exponent: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndirectTevReference {
+    pub(crate) texture_map: usize,
+    pub(crate) tex_coord: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndirectTevScale {
+    pub(crate) s_shift: u32,
+    pub(crate) t_shift: u32,
+}
+
+/// The raw BP state needed by the CPU indirect-coordinate reference model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndirectTevState {
+    pub(crate) gen_mode: u32,
+    pub(crate) matrices: [u32; INDIRECT_TEV_MATRIX_COUNT * 3],
+    pub(crate) imask: u32,
+    pub(crate) commands: [u32; MAX_TEV_STAGES],
+    pub(crate) tex_scales: [u32; 2],
+    pub(crate) iref: u32,
+}
+
+impl IndirectTevState {
+    pub(crate) fn from_bp(
+        gen_mode: u32,
+        matrices: [u32; INDIRECT_TEV_MATRIX_COUNT * 3],
+        imask: u32,
+        commands: [u32; MAX_TEV_STAGES],
+        tex_scales: [u32; 2],
+        iref: u32,
+    ) -> Self {
+        Self {
+            gen_mode: gen_mode & 0x00ff_ffff,
+            matrices: matrices.map(|word| word & 0x00ff_ffff),
+            imask: imask & 0x00ff_ffff,
+            commands: commands.map(|word| word & 0x00ff_ffff),
+            tex_scales: tex_scales.map(|word| word & 0x00ff_ffff),
+            iref: iref & 0x00ff_ffff,
+        }
+    }
+
+    pub(crate) const fn num_tex_gens(self) -> usize {
+        (self.gen_mode & 0xf) as usize
+    }
+
+    pub(crate) const fn direct_stage_count(self) -> usize {
+        (((self.gen_mode >> 10) & 0xf) + 1) as usize
+    }
+
+    pub(crate) const fn num_indirect_stages(self) -> usize {
+        ((self.gen_mode >> 16) & 7) as usize
+    }
+
+    pub(crate) const fn effective_tex_coord(self, requested: usize) -> usize {
+        if requested < self.num_tex_gens() {
+            requested
+        } else {
+            0
+        }
+    }
+
+    pub(crate) const fn command(self, direct_stage: usize) -> IndirectTevCommand {
+        IndirectTevCommand::decode(self.commands[direct_stage])
+    }
+
+    pub(crate) const fn reference(self, indirect_stage: usize) -> IndirectTevReference {
+        let shift = indirect_stage * 6;
+        IndirectTevReference {
+            texture_map: ((self.iref >> shift) & 7) as usize,
+            tex_coord: ((self.iref >> (shift + 3)) & 7) as usize,
+        }
+    }
+
+    pub(crate) const fn scale(self, indirect_stage: usize) -> IndirectTevScale {
+        let word = self.tex_scales[indirect_stage / 2];
+        let shift = (indirect_stage % 2) * 8;
+        IndirectTevScale {
+            s_shift: (word >> shift) & 0xf,
+            t_shift: (word >> (shift + 4)) & 0xf,
+        }
+    }
+
+    pub(crate) fn matrix(self, matrix_index: usize) -> IndirectTevMatrix {
+        let words = &self.matrices[matrix_index * 3..matrix_index * 3 + 3];
+        let encoded_exponent =
+            ((words[0] >> 22) & 3) | (((words[1] >> 22) & 3) << 2) | (((words[2] >> 22) & 1) << 4);
+        IndirectTevMatrix {
+            rows: [
+                [
+                    decode_signed_11(words[0]),
+                    decode_signed_11(words[1]),
+                    decode_signed_11(words[2]),
+                ],
+                [
+                    decode_signed_11(words[0] >> 11),
+                    decode_signed_11(words[1] >> 11),
+                    decode_signed_11(words[2] >> 11),
+                ],
+            ],
+            exponent: encoded_exponent as i32 - 17,
+        }
+    }
+
+    pub(crate) fn sampled_indirect_stages(self, direct_stage_count: usize) -> [bool; 4] {
+        let num_indirect_stages = self.num_indirect_stages().min(MAX_INDIRECT_TEV_STAGES);
+        let mut sampled = [false; MAX_INDIRECT_TEV_STAGES];
+        for stage in 0..direct_stage_count.min(MAX_TEV_STAGES) {
+            let command = self.command(stage);
+            if command.uses_indirect_sample(num_indirect_stages) {
+                sampled[command.indirect_stage] = true;
+            }
+        }
+        sampled
+    }
+}
+
+const fn decode_signed_11(value: u32) -> i32 {
+    ((value << 21) as i32) >> 21
+}
+
+fn checked_tev_stage_count(state: &[u8]) -> Result<usize, String> {
+    if state.len() != TEV_DRAW_STATE_BYTES {
+        return Err(format!(
+            "TEV draw state must be exactly {TEV_DRAW_STATE_BYTES} bytes, got {}",
+            state.len()
+        ));
+    }
+    Ok(u32::from_le_bytes(
+        state[448..452]
+            .try_into()
+            .expect("fixed TEV stage-count field"),
+    ) as usize)
+}
+
+fn tev_state_stage_refs(state: &[u8], stage: usize) -> u32 {
+    let refs_offset = stage * 16 + 8;
+    u32::from_le_bytes(
+        state[refs_offset..refs_offset + 4]
+            .try_into()
+            .expect("fixed TEV stage reference field"),
+    )
+}
+
+/// Whether ordinary direct TEV sampling needs GEN_MODE to resolve its base
+/// coordinate. With zero generators GX supplies a fixed zero coordinate and
+/// leaves the direct texture input black; an out-of-range coordinate request
+/// falls back to generator zero when at least one generator is active.
+pub(crate) fn direct_texture_requires_gen_mode(
+    direct_state: &[u8],
+    num_tex_gens: usize,
+) -> Result<bool, String> {
+    let direct_stage_count = checked_tev_stage_count(direct_state)?;
+    if num_tex_gens == 0 {
+        // GX exposes fixed black TEXC/TEXA to every live TEV stage when no
+        // texture generators exist, including stages whose TEV-order texture
+        // enable bit is clear. The renderer therefore needs raw GEN_MODE even
+        // when there is no ordinary direct texture lookup.
+        return Ok(true);
+    }
+    for stage in 0..direct_stage_count.min(MAX_TEV_STAGES) {
+        let refs = tev_state_stage_refs(direct_state, stage);
+        if refs & (1 << 6) != 0 {
+            let requested = ((refs >> 3) & 7) as usize;
+            if requested >= num_tex_gens {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Texture maps consumed by indirect samples, excluding ordinary direct TEV
+/// samples. IREF value zero is deliberately treated as map zero, not absent.
+pub(crate) fn required_indirect_texture_maps(
+    direct_state: &[u8],
+    indirect: &IndirectTevState,
+) -> Result<[bool; MAX_TEV_TEXTURES], String> {
+    let direct_stage_count = checked_tev_stage_count(direct_state)?;
+    let sampled = indirect.sampled_indirect_stages(direct_stage_count);
+    let mut required = [false; MAX_TEV_TEXTURES];
+    for (indirect_stage, is_sampled) in sampled.into_iter().enumerate() {
+        if is_sampled {
+            required[indirect.reference(indirect_stage).texture_map] = true;
+        }
+    }
+    Ok(required)
+}
+
+/// Texture coordinates consumed by indirect samples, excluding the base
+/// coordinates used by direct TEV stages. Out-of-range IREF coordinates use
+/// GX's GEN_MODE coordinate-zero fallback.
+pub(crate) fn required_indirect_texture_coords(
+    direct_state: &[u8],
+    indirect: &IndirectTevState,
+) -> Result<[bool; MAX_TEV_TEXTURES], String> {
+    let direct_stage_count = checked_tev_stage_count(direct_state)?;
+    if indirect.num_tex_gens() == 0 {
+        return Ok([false; MAX_TEV_TEXTURES]);
+    }
+    let sampled = indirect.sampled_indirect_stages(direct_stage_count);
+    let mut required = [false; MAX_TEV_TEXTURES];
+    for (indirect_stage, is_sampled) in sampled.into_iter().enumerate() {
+        if is_sampled {
+            let reference = indirect.reference(indirect_stage);
+            required[indirect.effective_tex_coord(reference.tex_coord)] = true;
+        }
+    }
+    Ok(required)
+}
+
+/// Full texture-map dataflow for direct and indirect sampling.
+pub(crate) fn required_texture_maps_with_indirect(
+    direct_state: &[u8],
+    indirect: &IndirectTevState,
+) -> Result<[bool; MAX_TEV_TEXTURES], String> {
+    let mut required = if indirect.num_tex_gens() == 0 {
+        // With no texture generators GX leaves ordinary direct texture input
+        // black and performs no direct lookup. Indirect stages may still
+        // sample a map at the synthesized fixed coordinate (0, 0).
+        checked_tev_stage_count(direct_state)?;
+        [false; MAX_TEV_TEXTURES]
+    } else {
+        required_texture_maps(direct_state)?
+    };
+    for (slot, is_required) in required
+        .iter_mut()
+        .zip(required_indirect_texture_maps(direct_state, indirect)?)
+    {
+        *slot |= is_required;
+    }
+    Ok(required)
+}
+
+/// Full coordinate dataflow. Every live stage updates the persistent indirect
+/// coordinate, including a texture-disabled raw-zero command that resets the
+/// value consumed by a later add-previous stage. NUMTEXGENS zero synthesizes a
+/// fixed zero coordinate and therefore requires no vertex coordinate slot.
+pub(crate) fn required_texture_coords_with_indirect(
+    direct_state: &[u8],
+    indirect: &IndirectTevState,
+) -> Result<[bool; MAX_TEV_TEXTURES], String> {
+    let direct_stage_count = checked_tev_stage_count(direct_state)?;
+    let mut required = [false; MAX_TEV_TEXTURES];
+    if indirect.num_tex_gens() != 0 {
+        for stage in 0..direct_stage_count.min(MAX_TEV_STAGES) {
+            let refs = tev_state_stage_refs(direct_state, stage);
+            let requested = ((refs >> 3) & 7) as usize;
+            required[indirect.effective_tex_coord(requested)] = true;
+        }
+    }
+    for (slot, is_required) in required
+        .iter_mut()
+        .zip(required_indirect_texture_coords(direct_state, indirect)?)
+    {
+        *slot |= is_required;
     }
     Ok(required)
 }
@@ -358,6 +786,244 @@ impl TevDrawState {
         };
         *table = decode_swap_table(rg, ba);
         true
+    }
+}
+
+/// Fixed-point S17.7 coordinates and already-fetched indirect texels for the
+/// pure CPU coordinate reference model. Indirect samples use RGBA channel
+/// order here and are converted to GX's A/B/G order during evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndirectTevInputs {
+    pub(crate) tex_coords: [[i32; 2]; MAX_TEV_TEXTURES],
+    pub(crate) samples: [TevColor; MAX_INDIRECT_TEV_STAGES],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndirectTevLookup {
+    pub(crate) required: bool,
+    pub(crate) texture_map: usize,
+    pub(crate) tex_coord: usize,
+    pub(crate) sample_coord: [i32; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndirectTevStageCoordinates {
+    pub(crate) base_coord: [i32; 2],
+    pub(crate) sample_coord: [i32; 2],
+    pub(crate) lod_coord: [i32; 2],
+    pub(crate) alpha_bump: i32,
+}
+
+impl IndirectTevStageCoordinates {
+    pub(crate) const fn normalized_alpha_bump(self) -> i32 {
+        self.alpha_bump | (self.alpha_bump >> 5)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndirectTevCoordinateEvaluation {
+    pub(crate) stages: [IndirectTevStageCoordinates; MAX_TEV_STAGES],
+    pub(crate) stage_count: usize,
+    pub(crate) indirect_lookups: [IndirectTevLookup; MAX_INDIRECT_TEV_STAGES],
+    pub(crate) final_coord: [i32; 2],
+    pub(crate) alpha_bump: i32,
+}
+
+fn selected_texture_coord(
+    indirect: &IndirectTevState,
+    inputs: &IndirectTevInputs,
+    requested: usize,
+) -> [i32; 2] {
+    if indirect.num_tex_gens() == 0 {
+        [0; 2]
+    } else {
+        inputs.tex_coords[indirect.effective_tex_coord(requested)]
+    }
+}
+
+const fn indirect_sample_abg(sample: TevColor) -> [i32; 3] {
+    [sample[3], sample[2], sample[1]]
+}
+
+fn formatted_indirect_sample(
+    sample_abg: [i32; 3],
+    format: IndirectTevFormat,
+    bias: [bool; 3],
+) -> [i32; 3] {
+    array::from_fn(|component| {
+        (sample_abg[component] >> format.coordinate_shift())
+            + if bias[component] {
+                format.selected_bias()
+            } else {
+                0
+            }
+    })
+}
+
+const fn indirect_bump_alpha(
+    sample_abg: [i32; 3],
+    bump_alpha: IndirectTevBumpAlpha,
+    format: IndirectTevFormat,
+) -> Option<i32> {
+    let component = match bump_alpha {
+        IndirectTevBumpAlpha::Off => return None,
+        IndirectTevBumpAlpha::S => sample_abg[0],
+        IndirectTevBumpAlpha::T => sample_abg[1],
+        IndirectTevBumpAlpha::U => sample_abg[2],
+    };
+    Some((component << format.bump_shift()) & 0xf8)
+}
+
+fn apply_indirect_exponent(value: i64, exponent: i32) -> i32 {
+    let scaled = if exponent >= 0 {
+        value << exponent
+    } else {
+        value >> -exponent
+    };
+    scaled as i32
+}
+
+fn indirect_matrix_transform(
+    matrix: IndirectTevMatrix,
+    matrix_id: IndirectTevMatrixId,
+    formatted_sample: [i32; 3],
+    base_coord: [i32; 2],
+) -> [i32; 2] {
+    match matrix_id {
+        IndirectTevMatrixId::Static => array::from_fn(|row| {
+            let dot = matrix.rows[row]
+                .into_iter()
+                .zip(formatted_sample)
+                .map(|(coefficient, component)| coefficient as i64 * component as i64)
+                .sum::<i64>();
+            apply_indirect_exponent(dot >> 3, matrix.exponent)
+        }),
+        IndirectTevMatrixId::DynamicS | IndirectTevMatrixId::DynamicT => {
+            let component = formatted_sample[match matrix_id {
+                IndirectTevMatrixId::DynamicS => 0,
+                IndirectTevMatrixId::DynamicT => 1,
+                _ => unreachable!(),
+            }];
+            array::from_fn(|axis| {
+                apply_indirect_exponent(
+                    (base_coord[axis] as i64 * component as i64) >> 8,
+                    matrix.exponent,
+                )
+            })
+        }
+        IndirectTevMatrixId::Invalid => [0; 2],
+    }
+}
+
+const fn wrap_indirect_coord(coord: i32, wrap: IndirectTevWrap) -> i32 {
+    let texels = match wrap {
+        IndirectTevWrap::Off => return coord,
+        IndirectTevWrap::Wrap256 => 256,
+        IndirectTevWrap::Wrap128 => 128,
+        IndirectTevWrap::Wrap64 => 64,
+        IndirectTevWrap::Wrap32 => 32,
+        IndirectTevWrap::Wrap16 => 16,
+        IndirectTevWrap::Zero | IndirectTevWrap::Invalid => return 0,
+    };
+    coord & ((texels << 7) - 1)
+}
+
+const fn signed_24(value: i32) -> i32 {
+    ((value as u32) << 8) as i32 >> 8
+}
+
+/// Evaluate the GameCube indirect-TEV coordinate pipeline without sampling or
+/// combining color. This intentionally leaves the existing direct evaluator's
+/// API and behavior unchanged.
+pub(crate) fn evaluate_indirect_coordinates(
+    direct: &TevDrawState,
+    indirect: &IndirectTevState,
+    inputs: &IndirectTevInputs,
+) -> IndirectTevCoordinateEvaluation {
+    let stage_count = (direct.stage_count as usize).min(MAX_TEV_STAGES);
+    let num_indirect_stages = indirect.num_indirect_stages().min(MAX_INDIRECT_TEV_STAGES);
+    let sampled_indirect_stages = indirect.sampled_indirect_stages(stage_count);
+    let mut indirect_lookups = [IndirectTevLookup::default(); MAX_INDIRECT_TEV_STAGES];
+    for indirect_stage in 0..MAX_INDIRECT_TEV_STAGES {
+        let reference = indirect.reference(indirect_stage);
+        let tex_coord = indirect.effective_tex_coord(reference.tex_coord);
+        let unscaled = selected_texture_coord(indirect, inputs, reference.tex_coord);
+        let scale = indirect.scale(indirect_stage);
+        indirect_lookups[indirect_stage] = IndirectTevLookup {
+            required: sampled_indirect_stages[indirect_stage],
+            texture_map: reference.texture_map,
+            tex_coord,
+            sample_coord: [unscaled[0] >> scale.s_shift, unscaled[1] >> scale.t_shift],
+        };
+    }
+
+    let mut stages = [IndirectTevStageCoordinates::default(); MAX_TEV_STAGES];
+    let mut previous_coord = [0; 2];
+    let mut alpha_bump = 0;
+    for (stage_index, direct_stage) in direct.stages.iter().copied().take(stage_count).enumerate() {
+        let base_coord = selected_texture_coord(indirect, inputs, direct_stage.tex_coord());
+        let command = indirect.command(stage_index);
+        if command.raw == 0 {
+            previous_coord = base_coord;
+            stages[stage_index] = IndirectTevStageCoordinates {
+                base_coord,
+                sample_coord: base_coord,
+                lod_coord: base_coord,
+                alpha_bump,
+            };
+            continue;
+        }
+
+        let mut transform = [0; 2];
+        if command.indirect_stage < num_indirect_stages {
+            let sample_abg = indirect_sample_abg(inputs.samples[command.indirect_stage]);
+            if let Some(next_alpha_bump) =
+                indirect_bump_alpha(sample_abg, command.bump_alpha, command.format)
+            {
+                alpha_bump = next_alpha_bump;
+            }
+            if let Some(matrix_index) = command.matrix_index {
+                transform = indirect_matrix_transform(
+                    indirect.matrix(matrix_index),
+                    command.matrix_id,
+                    formatted_indirect_sample(sample_abg, command.format, command.bias),
+                    base_coord,
+                );
+            }
+        }
+
+        let wrapped = [
+            wrap_indirect_coord(base_coord[0], command.wrap_s),
+            wrap_indirect_coord(base_coord[1], command.wrap_t),
+        ];
+        let sample_coord = array::from_fn(|axis| {
+            let with_transform = wrapped[axis].wrapping_add(transform[axis]);
+            let with_previous = if command.add_previous {
+                with_transform.wrapping_add(previous_coord[axis])
+            } else {
+                with_transform
+            };
+            signed_24(with_previous)
+        });
+        previous_coord = sample_coord;
+        stages[stage_index] = IndirectTevStageCoordinates {
+            base_coord,
+            sample_coord,
+            lod_coord: if command.use_unmodified_lod {
+                base_coord
+            } else {
+                sample_coord
+            },
+            alpha_bump,
+        };
+    }
+
+    IndirectTevCoordinateEvaluation {
+        stages,
+        stage_count,
+        indirect_lookups,
+        final_coord: previous_coord,
+        alpha_bump,
     }
 }
 
@@ -2577,6 +3243,76 @@ mod tests {
         texture | coord << 3 | u32::from(enabled) << 6 | raster << 7
     }
 
+    #[derive(Clone, Copy, Debug, Default)]
+    struct IndirectCommandFields {
+        indirect_stage: u32,
+        format: u32,
+        bias: u32,
+        bump_alpha: u32,
+        matrix: u32,
+        matrix_id: u32,
+        wrap_s: u32,
+        wrap_t: u32,
+        use_unmodified_lod: bool,
+        add_previous: bool,
+    }
+
+    fn indirect_command(fields: IndirectCommandFields) -> u32 {
+        (fields.indirect_stage & 3)
+            | (fields.format & 3) << 2
+            | (fields.bias & 7) << 4
+            | (fields.bump_alpha & 3) << 7
+            | (fields.matrix & 3) << 9
+            | (fields.matrix_id & 3) << 11
+            | (fields.wrap_s & 7) << 13
+            | (fields.wrap_t & 7) << 16
+            | u32::from(fields.use_unmodified_lod) << 19
+            | u32::from(fields.add_previous) << 20
+    }
+
+    fn indirect_gen_mode(tex_gens: u32, direct_stages: u32, indirect_stages: u32) -> u32 {
+        (tex_gens & 0xf)
+            | (direct_stages.saturating_sub(1) & 0xf) << 10
+            | (indirect_stages & 7) << 16
+    }
+
+    fn indirect_matrix_words(rows: [[i32; 3]; 2], exponent: i32) -> [u32; 3] {
+        let encoded_exponent = (exponent + 17) as u32 & 0x1f;
+        array::from_fn(|column| {
+            (rows[0][column] as u32 & 0x7ff)
+                | (rows[1][column] as u32 & 0x7ff) << 11
+                | match column {
+                    0 => (encoded_exponent & 3) << 22,
+                    1 => ((encoded_exponent >> 2) & 3) << 22,
+                    _ => ((encoded_exponent >> 4) & 1) << 22,
+                }
+        })
+    }
+
+    fn direct_state_from_refs(stage_refs: &[u32]) -> TevDrawState {
+        let mut state = TevDrawState::default();
+        let stages: Vec<_> = stage_refs
+            .iter()
+            .copied()
+            .map(|refs| TevStage {
+                refs,
+                ..TevStage::default()
+            })
+            .collect();
+        state.set_stages(&stages);
+        state
+    }
+
+    fn direct_state_bytes(stage_refs: &[u32]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; TEV_DRAW_STATE_BYTES];
+        for (stage, refs) in stage_refs.iter().copied().enumerate() {
+            let offset = stage * 16 + 8;
+            bytes[offset..offset + 4].copy_from_slice(&refs.to_le_bytes());
+        }
+        bytes[448..452].copy_from_slice(&(stage_refs.len() as u32).to_le_bytes());
+        bytes
+    }
+
     fn color_combiner(arguments: [u32; 4], operation: u32, destination: u32) -> u32 {
         arguments[0] << 12
             | arguments[1] << 8
@@ -3719,6 +4455,576 @@ mod tests {
             [false, false, true, false, false, false, false, true],
         );
         assert!(required_texture_coords(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn indirect_command_decode_covers_every_field_encoding() {
+        for indirect_stage in 0..4 {
+            assert_eq!(
+                IndirectTevCommand::decode(indirect_stage).indirect_stage,
+                indirect_stage as usize
+            );
+        }
+        for (format, expected) in [
+            IndirectTevFormat::Bits8,
+            IndirectTevFormat::Bits5,
+            IndirectTevFormat::Bits4,
+            IndirectTevFormat::Bits3,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                IndirectTevCommand::decode((format as u32) << 2).format,
+                expected
+            );
+        }
+        for bias in 0_u32..8 {
+            assert_eq!(
+                IndirectTevCommand::decode(bias << 4).bias,
+                [bias & 1 != 0, bias & 2 != 0, bias & 4 != 0]
+            );
+        }
+        for (bump_alpha, expected) in [
+            IndirectTevBumpAlpha::Off,
+            IndirectTevBumpAlpha::S,
+            IndirectTevBumpAlpha::T,
+            IndirectTevBumpAlpha::U,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                IndirectTevCommand::decode((bump_alpha as u32) << 7).bump_alpha,
+                expected
+            );
+        }
+        for matrix in 0_u32..4 {
+            assert_eq!(
+                IndirectTevCommand::decode(matrix << 9).matrix_index,
+                if matrix == 0 {
+                    None
+                } else {
+                    Some(matrix as usize - 1)
+                }
+            );
+        }
+        for (matrix_id, expected) in [
+            IndirectTevMatrixId::Static,
+            IndirectTevMatrixId::DynamicS,
+            IndirectTevMatrixId::DynamicT,
+            IndirectTevMatrixId::Invalid,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                IndirectTevCommand::decode((matrix_id as u32) << 11).matrix_id,
+                expected
+            );
+        }
+        let wraps = [
+            IndirectTevWrap::Off,
+            IndirectTevWrap::Wrap256,
+            IndirectTevWrap::Wrap128,
+            IndirectTevWrap::Wrap64,
+            IndirectTevWrap::Wrap32,
+            IndirectTevWrap::Wrap16,
+            IndirectTevWrap::Zero,
+            IndirectTevWrap::Invalid,
+        ];
+        for (wrap, expected) in wraps.into_iter().enumerate() {
+            assert_eq!(
+                IndirectTevCommand::decode((wrap as u32) << 13).wrap_s,
+                expected
+            );
+            assert_eq!(
+                IndirectTevCommand::decode((wrap as u32) << 16).wrap_t,
+                expected
+            );
+        }
+
+        let all = IndirectTevCommand::decode(0xfff8_ffff);
+        assert_eq!(
+            all.raw, 0x0018_ffff,
+            "IND_CMD semantics are limited to 21 bits"
+        );
+        assert!(all.use_unmodified_lod);
+        assert!(all.add_previous);
+        assert_eq!(
+            IndirectTevCommand::decode(0x00e0_0000).raw,
+            0,
+            "reserved BP bits cannot activate indirect coordinate behavior"
+        );
+    }
+
+    #[test]
+    fn indirect_matrix_decode_preserves_signed_rows_and_full_exponent_range() {
+        let rows = [[-1024, -1, 1023], [1023, 0, -1024]];
+        for exponent in -17..=14 {
+            let mut words = indirect_matrix_words(rows, exponent);
+            words[2] |= 1 << 23;
+            let mut raw_matrices = [0_u32; INDIRECT_TEV_MATRIX_COUNT * 3];
+            raw_matrices[..3].copy_from_slice(&words);
+            let state = IndirectTevState::from_bp(
+                0xff00_0000,
+                raw_matrices,
+                0xff00_0000,
+                [0xff00_0001; MAX_TEV_STAGES],
+                [0xff00_0000; 2],
+                0xff00_0000,
+            );
+            assert_eq!(
+                state.matrix(0),
+                IndirectTevMatrix { rows, exponent },
+                "matrix C bit 23 is not part of the five-bit exponent"
+            );
+            assert_eq!(state.commands[0], 1);
+            assert_eq!(state.gen_mode, 0);
+            assert_eq!(state.imask, 0);
+        }
+    }
+
+    #[test]
+    fn indirect_iref_and_texscale_decode_all_four_stages_including_zero() {
+        let maps = [0_usize, 1, 7, 3];
+        let coords = [0_usize, 6, 2, 7];
+        let mut iref = 0_u32;
+        let mut tex_scales = [0_u32; 2];
+        for stage in 0..MAX_INDIRECT_TEV_STAGES {
+            iref |= (maps[stage] as u32 | (coords[stage] as u32) << 3) << (stage * 6);
+            let scale_shift = (stage % 2) * 8;
+            tex_scales[stage / 2] |=
+                ((stage + 1) as u32 | ((stage + 5) as u32) << 4) << scale_shift;
+        }
+        let state = IndirectTevState {
+            iref,
+            tex_scales,
+            ..IndirectTevState::default()
+        };
+        for stage in 0..MAX_INDIRECT_TEV_STAGES {
+            assert_eq!(
+                state.reference(stage),
+                IndirectTevReference {
+                    texture_map: maps[stage],
+                    tex_coord: coords[stage]
+                }
+            );
+            assert_eq!(
+                state.scale(stage),
+                IndirectTevScale {
+                    s_shift: (stage + 1) as u32,
+                    t_shift: (stage + 5) as u32
+                }
+            );
+        }
+        assert_eq!(
+            IndirectTevState::default().reference(0),
+            IndirectTevReference {
+                texture_map: 0,
+                tex_coord: 0
+            },
+            "IREF zero is a valid map-zero/coord-zero reference"
+        );
+    }
+
+    #[test]
+    fn indirect_resource_helpers_separate_samples_from_complete_dataflow() {
+        let mut bytes = direct_state_bytes(&[
+            refs(0, 2, false, 0),
+            refs(0, 1, false, 0),
+            refs(0, 2, false, 0),
+            refs(6, 7, true, 0),
+            refs(5, 5, true, 0),
+        ]);
+        bytes[448..452].copy_from_slice(&4_u32.to_le_bytes());
+        let mut indirect = IndirectTevState {
+            gen_mode: indirect_gen_mode(3, 4, 1),
+            iref: 2 | 7 << 3,
+            ..IndirectTevState::default()
+        };
+        indirect.commands[0] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[2] = indirect_command(IndirectCommandFields {
+            indirect_stage: 1,
+            bump_alpha: 1,
+            add_previous: true,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[4] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            ..IndirectCommandFields::default()
+        });
+
+        assert_eq!(
+            required_indirect_texture_maps(&bytes, &indirect).unwrap(),
+            [false, false, true, false, false, false, false, false]
+        );
+        assert_eq!(
+            required_indirect_texture_coords(&bytes, &indirect).unwrap(),
+            [true, false, false, false, false, false, false, false],
+            "IREF coord 7 falls back to coord 0 with three texgens"
+        );
+        assert_eq!(
+            required_texture_maps_with_indirect(&bytes, &indirect).unwrap(),
+            [false, false, true, false, false, false, true, false]
+        );
+        assert_eq!(
+            required_texture_coords_with_indirect(&bytes, &indirect).unwrap(),
+            [true, true, true, false, false, false, false, false],
+            "disabled raw-zero reset stages remain in persistent-coordinate dataflow"
+        );
+
+        let zero_iref_bytes = direct_state_bytes(&[refs(4, 7, true, 0)]);
+        assert!(direct_texture_requires_gen_mode(&zero_iref_bytes, 0).unwrap());
+        assert!(direct_texture_requires_gen_mode(&zero_iref_bytes, 1).unwrap());
+        assert!(!direct_texture_requires_gen_mode(&zero_iref_bytes, 8).unwrap());
+        assert!(
+            direct_texture_requires_gen_mode(&direct_state_bytes(&[refs(4, 7, false, 0)]), 0,)
+                .unwrap(),
+            "zero texgens transports black TEXC/TEXA even with disabled texture order"
+        );
+        assert!(
+            !direct_texture_requires_gen_mode(&direct_state_bytes(&[refs(4, 7, false, 0)]), 1,)
+                .unwrap(),
+            "disabled texture order needs no coordinate fallback when a generator exists"
+        );
+        let zero_iref = IndirectTevState {
+            gen_mode: indirect_gen_mode(1, 1, 1),
+            commands: [indirect_command(IndirectCommandFields {
+                matrix: 1,
+                ..IndirectCommandFields::default()
+            }); MAX_TEV_STAGES],
+            ..IndirectTevState::default()
+        };
+        assert_eq!(
+            required_indirect_texture_maps(&zero_iref_bytes, &zero_iref).unwrap(),
+            [true, false, false, false, false, false, false, false]
+        );
+        assert_eq!(
+            required_indirect_texture_coords(&zero_iref_bytes, &zero_iref).unwrap(),
+            [true, false, false, false, false, false, false, false]
+        );
+
+        let no_texgens = IndirectTevState {
+            gen_mode: indirect_gen_mode(0, 1, 1),
+            ..zero_iref
+        };
+        assert_eq!(
+            required_texture_maps_with_indirect(&zero_iref_bytes, &no_texgens).unwrap(),
+            [true, false, false, false, false, false, false, false],
+            "zero texgens disables direct map 4 but retains indirect IREF map 0"
+        );
+        assert_eq!(
+            required_texture_coords_with_indirect(&zero_iref_bytes, &no_texgens).unwrap(),
+            [false; MAX_TEV_TEXTURES],
+            "NUMTEXGENS zero needs no vertex sidecar coordinate"
+        );
+
+        assert!(required_indirect_texture_maps(&bytes[..bytes.len() - 1], &indirect).is_err());
+        assert!(
+            required_texture_coords_with_indirect(&bytes[..bytes.len() - 1], &indirect).is_err()
+        );
+        assert!(direct_texture_requires_gen_mode(&bytes[..bytes.len() - 1], 1).is_err());
+    }
+
+    #[test]
+    fn indirect_formats_biases_and_bump_channels_match_gx_bit_rules() {
+        let sample_abg = indirect_sample_abg([0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(sample_abg, [0x44, 0x33, 0x22], "GX samples indirect A/B/G");
+        let formats = [
+            (IndirectTevFormat::Bits8, 0, -128, 0),
+            (IndirectTevFormat::Bits5, 3, 1, 5),
+            (IndirectTevFormat::Bits4, 4, 1, 4),
+            (IndirectTevFormat::Bits3, 5, 1, 3),
+        ];
+        for (format, coordinate_shift, selected_bias, bump_shift) in formats {
+            for bias in 0_u32..8 {
+                let selected = [bias & 1 != 0, bias & 2 != 0, bias & 4 != 0];
+                assert_eq!(
+                    formatted_indirect_sample(sample_abg, format, selected),
+                    array::from_fn(|component| {
+                        (sample_abg[component] >> coordinate_shift)
+                            + if selected[component] {
+                                selected_bias
+                            } else {
+                                0
+                            }
+                    })
+                );
+            }
+            assert_eq!(
+                indirect_bump_alpha(sample_abg, IndirectTevBumpAlpha::Off, format),
+                None
+            );
+            for (selection, component) in [
+                (IndirectTevBumpAlpha::S, 0),
+                (IndirectTevBumpAlpha::T, 1),
+                (IndirectTevBumpAlpha::U, 2),
+            ] {
+                assert_eq!(
+                    indirect_bump_alpha(sample_abg, selection, format),
+                    Some((sample_abg[component] << bump_shift) & 0xf8)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indirect_evaluator_covers_static_dynamic_and_invalid_matrices_and_utclod() {
+        let direct = direct_state_from_refs(&[
+            refs(0, 0, false, 0),
+            refs(0, 0, false, 0),
+            refs(0, 0, false, 0),
+            refs(0, 0, false, 0),
+        ]);
+        let mut indirect = IndirectTevState {
+            gen_mode: indirect_gen_mode(1, 4, 1),
+            ..IndirectTevState::default()
+        };
+        indirect.matrices[..3]
+            .copy_from_slice(&indirect_matrix_words([[512, 0, 0], [0, -512, 0]], 0));
+        indirect.commands[0] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            use_unmodified_lod: true,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[1] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            matrix_id: 1,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[2] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            matrix_id: 2,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[3] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            matrix_id: 3,
+            ..IndirectCommandFields::default()
+        });
+        let mut inputs = IndirectTevInputs::default();
+        inputs.tex_coords[0] = [1280, 2560];
+        inputs.samples[0] = [10, 20, 32, 64];
+
+        let evaluated = evaluate_indirect_coordinates(&direct, &indirect, &inputs);
+        assert_eq!(evaluated.stage_count, 4);
+        assert_eq!(evaluated.stages[0].sample_coord, [5376, 512]);
+        assert_eq!(evaluated.stages[0].lod_coord, [1280, 2560]);
+        assert_ne!(
+            evaluated.stages[0].sample_coord, evaluated.stages[0].lod_coord,
+            "utcLOD keeps the unmodified coordinate only for LOD"
+        );
+        assert_eq!(evaluated.stages[1].sample_coord, [1600, 3200]);
+        assert_eq!(evaluated.stages[1].lod_coord, [1600, 3200]);
+        assert_eq!(evaluated.stages[2].sample_coord, [1440, 2880]);
+        assert_eq!(evaluated.stages[3].sample_coord, [1280, 2560]);
+        assert_eq!(evaluated.final_coord, [1280, 2560]);
+        assert!(evaluated.indirect_lookups[0].required);
+    }
+
+    #[test]
+    fn indirect_evaluator_applies_matrix_exponent_extremes() {
+        let direct = direct_state_from_refs(&[refs(0, 0, false, 0), refs(0, 0, false, 0)]);
+        let mut indirect = IndirectTevState {
+            gen_mode: indirect_gen_mode(1, 2, 1),
+            ..IndirectTevState::default()
+        };
+        indirect.matrices[..3].copy_from_slice(&indirect_matrix_words([[8, 0, 0], [0, 8, 0]], 14));
+        indirect.matrices[3..6]
+            .copy_from_slice(&indirect_matrix_words([[8, 0, 0], [0, 8, 0]], -17));
+        indirect.commands[0] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[1] = indirect_command(IndirectCommandFields {
+            matrix: 2,
+            ..IndirectCommandFields::default()
+        });
+        let mut inputs = IndirectTevInputs::default();
+        inputs.samples[0] = [0, 0, 1, 1];
+
+        let evaluated = evaluate_indirect_coordinates(&direct, &indirect, &inputs);
+        assert_eq!(evaluated.stages[0].sample_coord, [16_384, 16_384]);
+        assert_eq!(evaluated.stages[1].sample_coord, [0, 0]);
+    }
+
+    #[test]
+    fn indirect_wrap_s24_count_zero_and_raw_reset_are_stateful() {
+        let wraps = [
+            (IndirectTevWrap::Off, -1),
+            (IndirectTevWrap::Wrap256, 32_767),
+            (IndirectTevWrap::Wrap128, 16_383),
+            (IndirectTevWrap::Wrap64, 8_191),
+            (IndirectTevWrap::Wrap32, 4_095),
+            (IndirectTevWrap::Wrap16, 2_047),
+            (IndirectTevWrap::Zero, 0),
+            (IndirectTevWrap::Invalid, 0),
+        ];
+        for (wrap, expected) in wraps {
+            assert_eq!(wrap_indirect_coord(-1, wrap), expected);
+        }
+        assert_eq!(signed_24(0x007f_ffff), 0x007f_ffff);
+        assert_eq!(signed_24(0x0080_0000), -0x0080_0000);
+        assert_eq!(signed_24(0x00ff_ffff), -1);
+        assert_eq!(signed_24(0x0100_0001), 1);
+
+        let direct = direct_state_from_refs(&[
+            refs(0, 0, false, 0),
+            refs(0, 1, false, 0),
+            refs(0, 2, false, 0),
+            refs(0, 3, false, 0),
+        ]);
+        let mut indirect = IndirectTevState {
+            gen_mode: indirect_gen_mode(4, 4, 0),
+            ..IndirectTevState::default()
+        };
+        indirect.commands[0] = indirect_command(IndirectCommandFields {
+            wrap_s: 5,
+            wrap_t: 5,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[1] = 0x00e0_0000;
+        indirect.commands[2] = indirect_command(IndirectCommandFields {
+            bump_alpha: 1,
+            matrix: 1,
+            add_previous: true,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[3] = 0;
+        let mut inputs = IndirectTevInputs::default();
+        inputs.tex_coords[0] = [3000, -1];
+        inputs.tex_coords[1] = [100, 200];
+        inputs.tex_coords[2] = [0x007f_ffff, 1];
+        inputs.tex_coords[3] = [-40, 50];
+        inputs.samples[0] = [255; 4];
+
+        let evaluated = evaluate_indirect_coordinates(&direct, &indirect, &inputs);
+        assert_eq!(evaluated.stages[0].sample_coord, [952, 2047]);
+        assert_eq!(evaluated.stages[1].sample_coord, [100, 200]);
+        assert_eq!(
+            evaluated.stages[2].sample_coord,
+            [signed_24(0x007f_ffff + 100), 201],
+            "count-zero skips sample/matrix/bump but still applies ADDPREV after reserved-only reset"
+        );
+        assert_eq!(evaluated.stages[2].alpha_bump, 0);
+        assert_eq!(evaluated.stages[3].sample_coord, [-40, 50]);
+        assert_eq!(evaluated.final_coord, [-40, 50]);
+    }
+
+    #[test]
+    fn indirect_out_of_range_bt_keeps_wrap_but_skips_sample_matrix_and_bump() {
+        let direct = direct_state_from_refs(&[refs(0, 0, false, 0)]);
+        let mut indirect = IndirectTevState {
+            gen_mode: indirect_gen_mode(1, 1, 1),
+            ..IndirectTevState::default()
+        };
+        indirect.commands[0] = indirect_command(IndirectCommandFields {
+            indirect_stage: 1,
+            bump_alpha: 2,
+            matrix: 1,
+            wrap_s: 5,
+            wrap_t: 5,
+            ..IndirectCommandFields::default()
+        });
+        indirect.matrices[..3]
+            .copy_from_slice(&indirect_matrix_words([[512, 0, 0], [0, 512, 0]], 0));
+        let mut inputs = IndirectTevInputs::default();
+        inputs.tex_coords[0] = [3000, -1];
+        inputs.samples[1] = [255; 4];
+
+        let evaluated = evaluate_indirect_coordinates(&direct, &indirect, &inputs);
+        assert_eq!(evaluated.stages[0].sample_coord, [952, 2047]);
+        assert_eq!(evaluated.alpha_bump, 0);
+        assert!(
+            evaluated
+                .indirect_lookups
+                .iter()
+                .all(|lookup| !lookup.required)
+        );
+    }
+
+    #[test]
+    fn indirect_alpha_bump_persists_normalizes_and_updates_only_on_valid_samples() {
+        let direct = direct_state_from_refs(&[
+            refs(0, 0, false, 0),
+            refs(0, 0, false, 0),
+            refs(0, 0, false, 0),
+            refs(0, 0, false, 0),
+        ]);
+        let mut indirect = IndirectTevState {
+            gen_mode: indirect_gen_mode(1, 4, 1),
+            ..IndirectTevState::default()
+        };
+        indirect.commands[0] = indirect_command(IndirectCommandFields {
+            bump_alpha: 1,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[1] = indirect_command(IndirectCommandFields {
+            wrap_s: 6,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[2] = indirect_command(IndirectCommandFields {
+            indirect_stage: 1,
+            bump_alpha: 2,
+            ..IndirectCommandFields::default()
+        });
+        indirect.commands[3] = indirect_command(IndirectCommandFields {
+            format: 3,
+            bump_alpha: 3,
+            ..IndirectCommandFields::default()
+        });
+        let mut inputs = IndirectTevInputs::default();
+        inputs.samples[0] = [0x11, 0x22, 0x33, 0x44];
+
+        let evaluated = evaluate_indirect_coordinates(&direct, &indirect, &inputs);
+        assert_eq!(evaluated.stages[0].alpha_bump, 64);
+        assert_eq!(evaluated.stages[0].normalized_alpha_bump(), 66);
+        assert_eq!(evaluated.stages[1].alpha_bump, 64);
+        assert_eq!(evaluated.stages[2].alpha_bump, 64);
+        assert_eq!(evaluated.stages[3].alpha_bump, 16);
+        assert_eq!(evaluated.alpha_bump, 16);
+    }
+
+    #[test]
+    fn indirect_lookup_scales_fallback_and_numtexgens_zero_synthesis() {
+        let direct = direct_state_from_refs(&[refs(0, 7, false, 0)]);
+        let mut indirect = IndirectTevState {
+            gen_mode: indirect_gen_mode(2, 1, 1),
+            iref: 7 << 3,
+            tex_scales: [1 | 2 << 4, 0],
+            ..IndirectTevState::default()
+        };
+        indirect.commands[0] = indirect_command(IndirectCommandFields {
+            matrix: 1,
+            matrix_id: 3,
+            ..IndirectCommandFields::default()
+        });
+        let mut inputs = IndirectTevInputs::default();
+        inputs.tex_coords[0] = [-9, 20];
+
+        let evaluated = evaluate_indirect_coordinates(&direct, &indirect, &inputs);
+        assert_eq!(
+            evaluated.indirect_lookups[0],
+            IndirectTevLookup {
+                required: true,
+                texture_map: 0,
+                tex_coord: 0,
+                sample_coord: [-5, 5]
+            }
+        );
+        assert_eq!(evaluated.stages[0].base_coord, [-9, 20]);
+
+        indirect.gen_mode = indirect_gen_mode(0, 1, 1);
+        let synthesized = evaluate_indirect_coordinates(&direct, &indirect, &inputs);
+        assert_eq!(synthesized.indirect_lookups[0].texture_map, 0);
+        assert_eq!(synthesized.indirect_lookups[0].tex_coord, 0);
+        assert_eq!(synthesized.indirect_lookups[0].sample_coord, [0, 0]);
+        assert_eq!(synthesized.stages[0].base_coord, [0, 0]);
+        assert_eq!(synthesized.stages[0].sample_coord, [0, 0]);
     }
 
     fn sidecar_source(vertex_count: usize) -> Vec<f32> {

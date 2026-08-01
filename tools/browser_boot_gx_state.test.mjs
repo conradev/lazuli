@@ -144,6 +144,17 @@ function offset(xPlus342Div2, yPlus342Div2) {
   return xPlus342Div2 | (yPlus342Div2 << 10);
 }
 
+function indirectTevState(genMode = 0) {
+  return {
+    genMode,
+    matrices: Array(9).fill(0),
+    imask: 0,
+    commands: Array(16).fill(0),
+    texScales: [0, 0],
+    iref: 0,
+  };
+}
+
 test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
   gxBpRegisters.fill(0);
   gxXfRegisters.fill(0);
@@ -188,6 +199,7 @@ test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
       fogRangeK: [0x010001, 0x010002, 0x010003, 0x010004, 0x010005],
       fogWords: [0x020001, 0x020002, 0x020003, 0x020004, 0x020005],
       viewportHalfWidthBits: 0x43a00000,
+      indirectTev: indirectTevState(2 << 14),
     },
   );
 });
@@ -218,6 +230,7 @@ test("applies independent GX X/Y scissor offsets and clips to the EFB", () => {
       fogRangeK: [0, 0, 0, 0, 0],
       fogWords: [0, 0, 0, 0, 0],
       viewportHalfWidthBits: 0,
+      indirectTev: indirectTevState(),
     },
   );
 
