@@ -8,7 +8,7 @@ use gekko::{
 };
 
 use crate::block::{BlockFn, Executed, ExitReason, Meta};
-use crate::hooks::{Context, ExitData, Hooks};
+use crate::hooks::{Context, ExitData, Hooks, READ_COMPLETE, READ_FAULT, READ_YIELD};
 use crate::{Artifact, CodegenSettings, FASTMEM_LUT_COUNT, FastmemLut, Jit, Sequence, Settings};
 
 macro_rules! ppc {
@@ -249,6 +249,30 @@ struct NativeLswxContext {
     exit_executed: Executed,
 }
 
+struct NativeSlowReadContext {
+    cpu: Cpu,
+    fastmem: Box<FastmemLut>,
+    statuses: Vec<u8>,
+    attempts: Vec<u32>,
+    value: i32,
+    next_link: Option<BlockFn>,
+    exits: Vec<(ExitReason, Executed)>,
+}
+
+impl NativeSlowReadContext {
+    fn new(statuses: impl IntoIterator<Item = u8>) -> Self {
+        Self {
+            cpu: Cpu::default(),
+            fastmem: Box::new([None; FASTMEM_LUT_COUNT]),
+            statuses: statuses.into_iter().collect(),
+            attempts: Vec::new(),
+            value: 0x89ab_cdefu32 as i32,
+            next_link: None,
+            exits: Vec::new(),
+        }
+    }
+}
+
 const LOCKED_CACHE_BASE: u32 = 0xe000_0000;
 const LOCKED_CACHE_PAGE_SIZE: usize = 1 << 17;
 const HID2_LCE: u32 = 0x1000_0000;
@@ -287,6 +311,49 @@ extern "C-unwind" fn native_lswx_registers(ctx: *mut Context) -> *mut Cpu {
     &raw mut ctx.cpu
 }
 
+extern "C-unwind" fn native_slow_read_registers(ctx: *mut Context) -> *mut Cpu {
+    let ctx = unsafe { &mut *ctx.cast::<NativeSlowReadContext>() };
+    &raw mut ctx.cpu
+}
+
+extern "C-unwind" fn native_slow_read_fastmem(ctx: *mut Context) -> *mut FastmemLut {
+    let ctx = unsafe { &mut *ctx.cast::<NativeSlowReadContext>() };
+    &raw mut *ctx.fastmem
+}
+
+extern "C-unwind" fn native_slow_read_i32(
+    ctx: *mut Context,
+    address: Address,
+    output: *mut i32,
+) -> u8 {
+    let ctx = unsafe { &mut *ctx.cast::<NativeSlowReadContext>() };
+    let attempt = ctx.attempts.len();
+    ctx.attempts.push(address.value());
+    // Deliberately populate the scratch slot for every status. A yield or fault must not expose it
+    // through the guest destination register.
+    unsafe { output.write(ctx.value) };
+    let status = ctx.statuses.get(attempt).copied().unwrap_or(READ_COMPLETE);
+    if status != READ_COMPLETE && status != READ_YIELD {
+        ctx.cpu.supervisor.exception.dsisr = 0x4200_0000;
+    }
+    status
+}
+
+extern "C-unwind" fn native_slow_read_exit(
+    ctx: *const Context,
+    _: *mut ExitData,
+    reason: ExitReason,
+    executed: Executed,
+) -> Option<BlockFn> {
+    let ctx = unsafe { &mut *ctx.cast_mut().cast::<NativeSlowReadContext>() };
+    ctx.exits.push((reason, executed));
+    if reason == ExitReason::YIELD {
+        None
+    } else {
+        ctx.next_link.take()
+    }
+}
+
 extern "C-unwind" fn native_lswx_fastmem(ctx: *mut Context) -> *mut FastmemLut {
     let ctx = unsafe { &mut *ctx.cast::<NativeLswxContext>() };
     &raw mut *ctx.fastmem
@@ -296,18 +363,18 @@ extern "C-unwind" fn native_lswx_read_i8(
     ctx: *mut Context,
     address: Address,
     output: *mut i8,
-) -> bool {
+) -> u8 {
     let ctx = unsafe { &mut *ctx.cast::<NativeLswxContext>() };
     let index = ctx.reads.len();
     ctx.reads.push(address.value());
     if ctx.fail_at == Some(index) {
         ctx.cpu.supervisor.exception.dsisr = 0x4200_0000;
-        return false;
+        return READ_FAULT;
     }
     unsafe {
         output.write(ctx.bytes[index].cast_signed());
     }
-    true
+    READ_COMPLETE
 }
 
 extern "C-unwind" fn native_lswx_exit(
@@ -433,6 +500,191 @@ fn native_illegal_instruction_records_the_program_cause_before_exit() {
         ProgramExceptionCause::IllegalInstruction.srr1_bits()
     );
     assert_eq!(context.exit_srr1, context.cpu.supervisor.exception.srr[1]);
+}
+
+#[test]
+fn native_slow_load_yields_at_the_exact_retry_boundary() {
+    let sequence = ppc! {
+        lwz gpr(3) off(0) gpr(5);
+        addi gpr(6) gpr(6) i(1);
+    };
+    let mut hooks = unsafe { Hooks::stub() };
+    hooks.get_registers = native_slow_read_registers;
+    hooks.get_fastmem = native_slow_read_fastmem;
+    hooks.read_i32 = native_slow_read_i32;
+    hooks.exit = native_slow_read_exit;
+    let mut jit = Jit::new(
+        Settings {
+            codegen: CodegenSettings::default(),
+            cache_path: None,
+            exit_data_layout: Layout::new::<u8>(),
+        },
+        hooks,
+    );
+    let block = jit.build(sequence.0.into_iter()).unwrap();
+
+    let initial_pc = 0x8000_7000;
+    let address = 0x084f_0500;
+    let untouched_destination = 0x55aa_33cc;
+    let untouched_dar = 0x1111_2222;
+    let untouched_dsisr = 0x3333_4444;
+    let mut context = NativeSlowReadContext::new([READ_YIELD, READ_COMPLETE]);
+    context.cpu.pc = Address(initial_pc);
+    context.cpu.user.gpr[3] = untouched_destination;
+    context.cpu.user.gpr[5] = address;
+    context.cpu.user.gpr[6] = 9;
+    context.cpu.supervisor.exception.dar = untouched_dar;
+    context.cpu.supervisor.exception.dsisr = untouched_dsisr;
+    // A normal synchronous exit would follow this link immediately. A cooperative yield must
+    // return to the dispatcher even when the unchanged PC already has a compiled native block.
+    context.next_link = Some(block.as_ptr());
+
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), block.as_ptr());
+    }
+
+    assert_eq!(context.attempts, [address]);
+    assert_eq!(context.cpu.pc, Address(initial_pc));
+    assert_eq!(context.cpu.user.gpr[3], untouched_destination);
+    assert_eq!(context.cpu.user.gpr[5], address);
+    assert_eq!(context.cpu.user.gpr[6], 9);
+    assert_eq!(context.cpu.supervisor.exception.dar, untouched_dar);
+    assert_eq!(context.cpu.supervisor.exception.dsisr, untouched_dsisr);
+    assert_eq!(context.exits.len(), 1);
+    assert_eq!(context.exits[0].0, ExitReason::YIELD);
+    assert_eq!(context.exits[0].1.instructions, 0);
+    assert_eq!(context.exits[0].1.cycles, 0);
+    assert_eq!(context.next_link, Some(block.as_ptr()));
+
+    // Redispatching the unchanged PC retries the load. Only the successful attempt exposes the
+    // scratch value and advances through the following instruction.
+    context.next_link = None;
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), block.as_ptr());
+    }
+    assert_eq!(context.attempts, [address, address]);
+    assert_eq!(context.cpu.pc, Address(initial_pc + 8));
+    assert_eq!(context.cpu.user.gpr[3], context.value as u32);
+    assert_eq!(context.cpu.user.gpr[5], address);
+    assert_eq!(context.cpu.user.gpr[6], 10);
+    assert_eq!(context.cpu.supervisor.exception.dar, untouched_dar);
+    assert_eq!(context.cpu.supervisor.exception.dsisr, untouched_dsisr);
+    assert_eq!(context.exits.len(), 2);
+    assert_eq!(context.exits[1].1.instructions, 2);
+    assert_eq!(context.exits[1].1.cycles, 4);
+
+    // Every status outside {complete, yield} follows the established read-fault path rather than
+    // consuming the output slot as a successful load.
+    for status in [READ_FAULT, 3, u8::MAX] {
+        let mut fault = NativeSlowReadContext::new([status]);
+        fault.cpu.pc = Address(initial_pc);
+        fault.cpu.user.gpr[3] = untouched_destination;
+        fault.cpu.user.gpr[5] = address;
+        fault.cpu.user.gpr[6] = 9;
+        unsafe {
+            jit.call((&raw mut fault).cast::<Context>(), block.as_ptr());
+        }
+        assert_eq!(fault.attempts, [address], "status {status}");
+        assert_eq!(
+            fault.cpu.user.gpr[3], untouched_destination,
+            "status {status}"
+        );
+        assert_eq!(fault.cpu.user.gpr[6], 9, "status {status}");
+        assert_eq!(
+            fault.cpu.supervisor.exception.dar, address,
+            "status {status}"
+        );
+        assert_eq!(
+            fault.cpu.supervisor.exception.dsisr, 0x4200_0000,
+            "status {status}"
+        );
+        assert_eq!(
+            fault.cpu.supervisor.exception.srr[0], initial_pc,
+            "status {status}"
+        );
+        assert_eq!(fault.cpu.pc, Address(0xfff0_0300), "status {status}");
+        assert_eq!(fault.exits.len(), 1, "status {status}");
+        assert_eq!(fault.exits[0].1.instructions, 1, "status {status}");
+        assert_eq!(fault.exits[0].1.cycles, 2, "status {status}");
+    }
+}
+
+#[test]
+fn native_linked_region_preserves_a_slow_load_retry_boundary() {
+    let prefix = ppc! {
+        addi gpr(4) gpr(4) i(1);
+    };
+    let linked = ppc! {
+        addi gpr(7) gpr(7) i(1);
+        lwz gpr(3) off(0) gpr(5);
+        addi gpr(6) gpr(6) i(1);
+    };
+    let resume = ppc! {
+        lwz gpr(3) off(0) gpr(5);
+        addi gpr(6) gpr(6) i(1);
+    };
+    let mut hooks = unsafe { Hooks::stub() };
+    hooks.get_registers = native_slow_read_registers;
+    hooks.get_fastmem = native_slow_read_fastmem;
+    hooks.read_i32 = native_slow_read_i32;
+    hooks.exit = native_slow_read_exit;
+    let mut jit = Jit::new(
+        Settings {
+            codegen: CodegenSettings::default(),
+            cache_path: None,
+            exit_data_layout: Layout::new::<u8>(),
+        },
+        hooks,
+    );
+    let prefix_block = jit.build(prefix.0.into_iter()).unwrap();
+    let linked_block = jit.build(linked.0.into_iter()).unwrap();
+    let resume_block = jit.build(resume.0.into_iter()).unwrap();
+
+    let initial_pc = 0x8000_7800;
+    let address = 0x084f_0500;
+    let untouched_destination = 0xa55a_33cc;
+    let mut context = NativeSlowReadContext::new([READ_YIELD, READ_COMPLETE]);
+    context.cpu.pc = Address(initial_pc);
+    context.cpu.user.gpr[3] = untouched_destination;
+    context.cpu.user.gpr[4] = 7;
+    context.cpu.user.gpr[5] = address;
+    context.cpu.user.gpr[6] = 11;
+    context.cpu.user.gpr[7] = 13;
+    context.cpu.supervisor.exception.dar = 0x1111_2222;
+    context.cpu.supervisor.exception.dsisr = 0x3333_4444;
+    context.next_link = Some(linked_block.as_ptr());
+
+    // The prefix tail-links into another region. Work on both sides of that link is flushed and
+    // accounted once, while the yielded load contributes no counters and leaves PC on itself.
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), prefix_block.as_ptr());
+    }
+    assert_eq!(context.attempts, [address]);
+    assert_eq!(context.cpu.pc, Address(initial_pc + 8));
+    assert_eq!(context.cpu.user.gpr[3], untouched_destination);
+    assert_eq!(context.cpu.user.gpr[4], 8);
+    assert_eq!(context.cpu.user.gpr[6], 11);
+    assert_eq!(context.cpu.user.gpr[7], 14);
+    assert_eq!(context.cpu.supervisor.exception.dar, 0x1111_2222);
+    assert_eq!(context.cpu.supervisor.exception.dsisr, 0x3333_4444);
+    assert_eq!(context.exits.len(), 2);
+    assert_eq!(context.exits[0].1.instructions, 1);
+    assert_eq!(context.exits[0].1.cycles, 2);
+    assert_eq!(context.exits[1].1.instructions, 1);
+    assert_eq!(context.exits[1].1.cycles, 2);
+
+    unsafe {
+        jit.call((&raw mut context).cast::<Context>(), resume_block.as_ptr());
+    }
+    assert_eq!(context.attempts, [address, address]);
+    assert_eq!(context.cpu.pc, Address(initial_pc + 16));
+    assert_eq!(context.cpu.user.gpr[3], context.value as u32);
+    assert_eq!(context.cpu.user.gpr[4], 8);
+    assert_eq!(context.cpu.user.gpr[6], 12);
+    assert_eq!(context.cpu.user.gpr[7], 14);
+    assert_eq!(context.exits.len(), 3);
+    assert_eq!(context.exits[2].1.instructions, 2);
+    assert_eq!(context.exits[2].1.cycles, 4);
 }
 
 #[test]

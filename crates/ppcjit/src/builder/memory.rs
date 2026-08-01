@@ -6,8 +6,9 @@ use gekko::{Exception, GPR, InsExt, Reg, SPR};
 
 use super::BlockBuilder;
 use crate::ExitMode;
+use crate::block::ExitReason;
 use crate::builder::{Action, InstructionInfo, MEMFLAGS, MEMFLAGS_READONLY};
-use crate::hooks::STORE_CONDITIONAL_STORED;
+use crate::hooks::{READ_COMPLETE, READ_YIELD, STORE_CONDITIONAL_STORED};
 
 const fn indexed_alignment_dsisr(instruction: u32) -> u32 {
     // PowerPC OEA indexed-form projection:
@@ -117,6 +118,63 @@ impl BlockBuilder<'_> {
         self.switch_to_bb(continue_block);
     }
 
+    /// Handles the exact tri-state ABI shared by scalar slow reads and load-reserve.
+    ///
+    /// Statuses outside the public contract take the fault path. In particular, do not treat an
+    /// arbitrary nonzero status as completion: that could consume an uninitialized output slot.
+    fn finish_slow_read(
+        &mut self,
+        status: ir::Value,
+        addr: ir::Value,
+        fault_info: InstructionInfo,
+    ) {
+        // Portable Wasm lowering has no scalar i8 value type. Normalize the
+        // ABI byte before comparing statuses so native and portable blocks
+        // share the exact same tri-state control flow.
+        let status = self.bd.ins().uextend(ir::types::I32, status);
+        let check_yield_block = self.bd.create_block();
+        let fault_block = self.bd.create_block();
+        let yield_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(check_yield_block);
+        self.bd.set_cold_block(fault_block);
+        self.bd.set_cold_block(yield_block);
+
+        let complete = self
+            .bd
+            .ins()
+            .icmp_imm(IntCC::Equal, status, i64::from(READ_COMPLETE));
+        self.bd
+            .ins()
+            .brif(complete, continue_block, &[], check_yield_block, &[]);
+        self.bd.seal_block(check_yield_block);
+        self.bd.seal_block(continue_block);
+
+        self.switch_to_bb(check_yield_block);
+        let should_yield = self
+            .bd
+            .ins()
+            .icmp_imm(IntCC::Equal, status, i64::from(READ_YIELD));
+        self.bd
+            .ins()
+            .brif(should_yield, yield_block, &[], fault_block, &[]);
+        self.bd.seal_block(fault_block);
+        self.bd.seal_block(yield_block);
+
+        self.switch_to_bb(fault_block);
+        self.set(SPR::DAR, addr);
+        self.raise_exception(Exception::DSI);
+        self.exit_with(fault_info);
+
+        self.switch_to_bb(yield_block);
+        self.flush();
+        // Do not use exit_with here: the current instruction has not completed, so its PC and
+        // execution counters must remain at the retry boundary.
+        self.exit(ExitReason::YIELD);
+
+        self.switch_to_bb(continue_block);
+    }
+
     fn load_reserve_i32(&mut self, addr: ir::Value) -> ir::Value {
         let stack_slot_addr =
             self.bd
@@ -127,22 +185,8 @@ impl BlockBuilder<'_> {
             self.hooks.load_reserve,
             &[self.consts.ctx_ptr, addr, stack_slot_addr],
         );
-        let loaded = self.bd.inst_results(inst)[0];
-        let fault_block = self.bd.create_block();
-        let continue_block = self.bd.create_block();
-        self.bd.set_cold_block(fault_block);
-        self.bd
-            .ins()
-            .brif(loaded, continue_block, &[], fault_block, &[]);
-        self.bd.seal_block(fault_block);
-        self.bd.seal_block(continue_block);
-
-        self.switch_to_bb(fault_block);
-        self.set(SPR::DAR, addr);
-        self.raise_exception(Exception::DSI);
-        self.exit_with(LOAD_INFO);
-
-        self.switch_to_bb(continue_block);
+        let status = self.bd.inst_results(inst)[0];
+        self.finish_slow_read(status, addr, LOAD_INFO);
         self.bd
             .ins()
             .stack_load(ir::types::I32, self.consts.read_stack_slot, 0)
@@ -242,24 +286,8 @@ impl BlockBuilder<'_> {
             .ins()
             .call(func, &[self.consts.ctx_ptr, addr, stack_slot_addr]);
 
-        let success = self.bd.inst_results(inst)[0];
-        let exit_block = self.bd.create_block();
-        let continue_block = self.bd.create_block();
-
-        self.bd.set_cold_block(exit_block);
-        self.bd
-            .ins()
-            .brif(success, continue_block, &[], exit_block, &[]);
-
-        self.bd.seal_block(exit_block);
-        self.bd.seal_block(continue_block);
-
-        self.switch_to_bb(exit_block);
-        self.set(SPR::DAR, addr);
-        self.raise_exception(Exception::DSI);
-        self.exit_with(fault_info);
-
-        self.switch_to_bb(continue_block);
+        let status = self.bd.inst_results(inst)[0];
+        self.finish_slow_read(status, addr, fault_info);
         self.bd
             .ins()
             .stack_load(P::IR_TYPE, self.consts.read_stack_slot, 0)

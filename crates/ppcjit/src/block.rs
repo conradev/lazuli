@@ -55,6 +55,12 @@ pub struct ExitReason {
 
 impl ExitReason {
     pub const SYNC: Self = Self(0);
+    /// A cooperative exit which leaves the current instruction at its retry boundary.
+    ///
+    /// Synchronous exits are normally eligible for native block linking. This distinct payload
+    /// uses address bits which have no meaning for a synchronous exit so runtimes can account the
+    /// completed prefix and return without linking the unchanged PC back to itself.
+    pub const YIELD: Self = Self(u32::MAX as u64);
 
     pub fn from_branch(branch: BranchMeta) -> Self {
         Self::from_bits(0)

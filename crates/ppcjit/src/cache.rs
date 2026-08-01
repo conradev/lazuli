@@ -10,7 +10,7 @@ use crate::{Artifact, CodegenSettings, Sequence};
 // Increment whenever the translated artifact ABI or frontend semantics change. Cached machine
 // code is intentionally invalidated across these boundaries even when the guest sequence and
 // Cranelift settings are otherwise identical.
-const ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 4;
+const ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 5;
 
 struct Hash128(twox_hash::XxHash3_128);
 
@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn artifact_cache_schema_changes_key() {
-        assert_eq!(ARTIFACT_CACHE_SCHEMA_VERSION, 4);
+        assert_eq!(ARTIFACT_CACHE_SCHEMA_VERSION, 5);
 
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         let isa = jitclif::isa::x86_64_v1().finish(flags).unwrap();
