@@ -45,7 +45,11 @@ test("reset remains an unconditional full-EFB clear", () => {
 
 test("texture and XFB copies encode their clipped clear after the copy and before submit", () => {
   for (const [start, end, copyMarker] of [
-    ["fn copy_texture_inner", "pub fn copy_xfb", "encoder.copy_texture_to_texture"],
+    [
+      "fn copy_texture_inner",
+      "pub fn copy_xfb",
+      "browser GX EFB-to-texture materialization pass",
+    ],
     [
       "fn copy_xfb_inner",
       "pub fn present_xfb",
@@ -65,6 +69,54 @@ test("texture and XFB copies encode their clipped clear after the copy and befor
     assert.ok(copy < clear, `${start} cleared before copying`);
     assert.ok(clear < submit, `${start} submitted before clearing`);
   }
+});
+
+test("texture copies materialize exact color or depth state through WebGPU", () => {
+  const submit = rendererSection("pub fn submit_gx_frame", "fn push_tev_draw_inner");
+  const plan = submit.indexOf("texture_copy_plan_for_source(");
+  const segment = submit.indexOf("self.begin_segment_inner()");
+  assert.notEqual(plan, -1);
+  assert.notEqual(segment, -1);
+  assert.ok(plan < segment, "texture-copy planning must precede renderer mutation");
+  assert.match(
+    submit,
+    /GxCopyKind::Texture => self\.copy_texture_inner\([\s\S]*header\.copy_state,[\s\S]*header\.clear,[\s\S]*texture_copy_plan/,
+  );
+
+  const copy = rendererSection("fn copy_texture_inner", "pub fn copy_xfb");
+  assert.match(copy, /browser GX EFB-to-texture materialization pass/);
+  assert.match(copy, /TextureView\(&self\.efb_color_view\)/);
+  assert.match(copy, /TextureView\(&self\.efb_depth_view\)/);
+  assert.match(copy, /wgpu::TextureUsages::RENDER_ATTACHMENT/);
+  assert.match(copy, /wgpu::TextureUsages::TEXTURE_BINDING/);
+  assert.doesNotMatch(copy, /copy_texture_to_texture/);
+
+  const shader = rendererSection(
+    "const EFB_TEXTURE_COPY_SHADER",
+    "const COPY_CLEAR_SHADER",
+  );
+  assert.match(shader, /@binding\(0\) var efb_color: texture_2d<f32>/);
+  assert.match(shader, /@binding\(1\) var efb_depth: texture_depth_2d/);
+  assert.match(shader, /fn native_color/);
+  assert.match(shader, /fn filtered_sample/);
+  assert.match(shader, /fn target_texel/);
+  assert.match(shader, /textureLoad\(efb_depth/);
+  assert.match(shader, /66 \* red \+ 129 \* green \+ 25 \* blue/);
+
+  const resources = rendererSection(
+    "fn create_efb_texture_copy_resources",
+    "fn create_xfb_copy_resources",
+  );
+  assert.match(resources, /sample_type: wgpu::TextureSampleType::Depth/);
+  assert.match(
+    resources,
+    /targets: &\[Some\(wgpu::ColorTargetState \{[\s\S]*format: wgpu::TextureFormat::Rgba8Unorm/,
+  );
+
+  const depth = rendererSection("let efb_depth =", "let efb_depth_view");
+  assert.match(depth, /format: wgpu::TextureFormat::Depth32Float/);
+  assert.match(depth, /wgpu::TextureUsages::RENDER_ATTACHMENT/);
+  assert.match(depth, /wgpu::TextureUsages::TEXTURE_BINDING/);
 });
 
 test("XFB copies materialize transported GX filter scale clamp and gamma state", () => {

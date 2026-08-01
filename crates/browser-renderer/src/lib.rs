@@ -1065,6 +1065,286 @@ pub(crate) fn gx_xfb_copy_parameters(state: packet::GxCopyState) -> GxXfbCopyPar
     }
 }
 
+/// The EFB tile-encoder mode selected by BP52's rotated target-format field.
+///
+/// These are encoder modes rather than ordinary texture formats: color and
+/// depth copies give several values different component meanings, while the
+/// bytes they produce are consumed through [`GxTextureBaseFormat`].
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxEfbCopyFormat {
+    R4,
+    R8_0x1,
+    Ra4,
+    Ra8,
+    Rgb565,
+    Rgb5a3,
+    Rgba8,
+    A8,
+    R8,
+    G8,
+    B8,
+    Rg8,
+    Gb8,
+}
+
+impl GxEfbCopyFormat {
+    pub(crate) const fn from_copy_command(copy_command: u32) -> Result<Self, u8> {
+        let format = gx_texture_copy_target_format(copy_command);
+        match format {
+            0x0 => Ok(Self::R4),
+            0x1 => Ok(Self::R8_0x1),
+            0x2 => Ok(Self::Ra4),
+            0x3 => Ok(Self::Ra8),
+            0x4 => Ok(Self::Rgb565),
+            0x5 => Ok(Self::Rgb5a3),
+            0x6 => Ok(Self::Rgba8),
+            0x7 => Ok(Self::A8),
+            0x8 => Ok(Self::R8),
+            0x9 => Ok(Self::G8),
+            0xa => Ok(Self::B8),
+            0xb => Ok(Self::Rg8),
+            0xc => Ok(Self::Gb8),
+            reserved => Err(reserved),
+        }
+    }
+
+    pub(crate) const fn base_texture_format(self) -> GxTextureBaseFormat {
+        match self {
+            Self::R4 => GxTextureBaseFormat::I4,
+            Self::R8_0x1 | Self::A8 | Self::R8 | Self::G8 | Self::B8 => GxTextureBaseFormat::I8,
+            Self::Ra4 => GxTextureBaseFormat::Ia4,
+            Self::Ra8 | Self::Rg8 | Self::Gb8 => GxTextureBaseFormat::Ia8,
+            Self::Rgb565 => GxTextureBaseFormat::Rgb565,
+            Self::Rgb5a3 => GxTextureBaseFormat::Rgb5a3,
+            Self::Rgba8 => GxTextureBaseFormat::Rgba8,
+        }
+    }
+}
+
+/// In-memory texture layout produced by one EFB tile-encoder mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxTextureBaseFormat {
+    I4,
+    I8,
+    Ia4,
+    Ia8,
+    Rgb565,
+    Rgb5a3,
+    Rgba8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GxTextureCopyPlane {
+    Color,
+    Depth,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxTextureCopyPlan {
+    pub(crate) source_format: GxEfbFormat,
+    pub(crate) source_plane: GxTextureCopyPlane,
+    pub(crate) copy_format: GxEfbCopyFormat,
+    pub(crate) base_texture_format: GxTextureBaseFormat,
+    pub(crate) filter_taps: [u8; 7],
+    pub(crate) filter_coefficients: [u32; 3],
+    pub(crate) gamma: GxCopyGamma,
+    pub(crate) clamp_top: bool,
+    pub(crate) clamp_bottom: bool,
+    pub(crate) half_scale: bool,
+    pub(crate) intensity_yuv: bool,
+    pub(crate) clear_after_copy: bool,
+    pub(crate) output_width: u32,
+    pub(crate) output_height: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxTextureCopyPlanError {
+    XfbCopy,
+    ReservedFormat(u8),
+    UnsupportedSourceFormat(GxEfbFormat),
+    ZeroExtent {
+        width: u32,
+        height: u32,
+        half_scale: bool,
+    },
+}
+
+impl fmt::Display for GxTextureCopyPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::XfbCopy => write!(formatter, "GX XFB copy is not an EFB texture copy"),
+            Self::ReservedFormat(format) => {
+                write!(formatter, "reserved GX EFB texture-copy format {format:#x}")
+            }
+            Self::UnsupportedSourceFormat(format) => {
+                write!(
+                    formatter,
+                    "unsupported GX EFB texture-copy source format {format:?}"
+                )
+            }
+            Self::ZeroExtent {
+                width,
+                height,
+                half_scale,
+            } => write!(
+                formatter,
+                "GX EFB texture copy {width}x{height} has a zero{} output extent",
+                if *half_scale { " post-half-scale" } else { "" }
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GxTextureCopyPlanError {}
+
+/// Decodes BP52's four-bit target field, whose most-significant encoded bit is
+/// physically stored first. The resulting sequence for encoded values 0..15
+/// is 0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15.
+pub(crate) const fn gx_texture_copy_target_format(copy_command: u32) -> u8 {
+    (((copy_command & 0x08 != 0) as u8) << 3) | (((copy_command >> 4) & 7) as u8)
+}
+
+pub(crate) fn gx_texture_copy_plan(
+    width: u32,
+    height: u32,
+    state: packet::GxCopyState,
+) -> Result<GxTextureCopyPlan, GxTextureCopyPlanError> {
+    if state.copy_command & (1 << 14) != 0 {
+        return Err(GxTextureCopyPlanError::XfbCopy);
+    }
+
+    let copy_format = GxEfbCopyFormat::from_copy_command(state.copy_command)
+        .map_err(GxTextureCopyPlanError::ReservedFormat)?;
+    let half_scale = state.copy_command & (1 << 9) != 0;
+    let (output_width, output_height) = if half_scale {
+        (width / 2, height / 2)
+    } else {
+        (width, height)
+    };
+    if output_width == 0 || output_height == 0 {
+        return Err(GxTextureCopyPlanError::ZeroExtent {
+            width,
+            height,
+            half_scale,
+        });
+    }
+
+    let source_format = gx_efb_format(state.pixel_control);
+    if source_format == GxEfbFormat::OtherNoAlpha {
+        // Raw formats 4..7 need PE CMode1 component/YUV state that LZGX does
+        // not transport yet. Never reinterpret those planes as ordinary RGB.
+        return Err(GxTextureCopyPlanError::UnsupportedSourceFormat(
+            source_format,
+        ));
+    }
+    let filter_taps = gx_copy_filter_taps(state.copy_filter);
+    Ok(GxTextureCopyPlan {
+        source_format,
+        source_plane: if source_format == GxEfbFormat::Z24 {
+            GxTextureCopyPlane::Depth
+        } else {
+            GxTextureCopyPlane::Color
+        },
+        copy_format,
+        base_texture_format: copy_format.base_texture_format(),
+        filter_taps,
+        filter_coefficients: gx_copy_filter_coefficients(filter_taps),
+        gamma: GxCopyGamma::from_copy_command(state.copy_command),
+        clamp_top: state.copy_command & 1 != 0,
+        clamp_bottom: state.copy_command & 2 != 0,
+        half_scale,
+        intensity_yuv: state.copy_command & (1 << 15) != 0 && state.copy_command & (1 << 16) != 0,
+        clear_after_copy: state.copy_command & (1 << 11) != 0,
+        output_width,
+        output_height,
+    })
+}
+
+/// Hardware-tested RGB-to-intensity/YUV conversion used before tile encoding.
+pub(crate) const fn gx_texture_copy_intensity_yuv_reference(rgb: [u8; 3]) -> [u8; 3] {
+    let [red, green, blue] = rgb;
+    let red = red as i32;
+    let green = green as i32;
+    let blue = blue as i32;
+    let y = 66 * red + 129 * green + 25 * blue + 16 * 256;
+    let u = -38 * red - 74 * green + 112 * blue + 128 * 256;
+    let v = 112 * red - 94 * green - 18 * blue + 128 * 256;
+    [
+        ((y >> 8) + ((y >> 7) & 1)) as u8,
+        ((u >> 8) + ((u >> 7) & 1)) as u8,
+        ((v >> 8) + ((v >> 7) & 1)) as u8,
+    ]
+}
+
+/// Scalar semantic color texel produced by the EFB tile encoder and decoded
+/// through its base texture format. This deliberately models components, not
+/// tiled RAM byte order, so it can be shared by CPU and WebGPU oracle tests.
+pub(crate) const fn gx_texture_copy_color_reference(
+    rgba: [u8; 4],
+    copy_format: GxEfbCopyFormat,
+    intensity_yuv: bool,
+) -> [u8; 4] {
+    let [mut red, mut green, mut blue, alpha] = rgba;
+    if intensity_yuv {
+        [red, green, blue] = gx_texture_copy_intensity_yuv_reference([red, green, blue]);
+    }
+
+    match copy_format {
+        GxEfbCopyFormat::R4 => {
+            let red = expand_4_to_8(red);
+            [red, red, red, red]
+        }
+        GxEfbCopyFormat::R8_0x1 | GxEfbCopyFormat::R8 => [red, red, red, red],
+        GxEfbCopyFormat::Ra4 => {
+            let red = expand_4_to_8(red);
+            [red, red, red, expand_4_to_8(alpha)]
+        }
+        GxEfbCopyFormat::Ra8 => [red, red, red, alpha],
+        GxEfbCopyFormat::Rgb565 => [
+            expand_5_to_8(red),
+            expand_6_to_8(green),
+            expand_5_to_8(blue),
+            0xff,
+        ],
+        GxEfbCopyFormat::Rgb5a3 if alpha & 0xe0 == 0xe0 => [
+            expand_5_to_8(red),
+            expand_5_to_8(green),
+            expand_5_to_8(blue),
+            0xff,
+        ],
+        GxEfbCopyFormat::Rgb5a3 => [
+            expand_4_to_8(red),
+            expand_4_to_8(green),
+            expand_4_to_8(blue),
+            expand_3_to_8(alpha),
+        ],
+        GxEfbCopyFormat::Rgba8 => [red, green, blue, alpha],
+        GxEfbCopyFormat::A8 => [alpha, alpha, alpha, alpha],
+        GxEfbCopyFormat::G8 => [green, green, green, green],
+        GxEfbCopyFormat::B8 => [blue, blue, blue, blue],
+        GxEfbCopyFormat::Rg8 => [red, red, red, green],
+        GxEfbCopyFormat::Gb8 => [green, green, green, blue],
+    }
+}
+
+/// Scalar semantic texel produced after selecting the Z24 EFB plane.
+///
+/// The GX tile encoder is shared by color and depth copies: depth selection
+/// first exposes the high, middle, and low Z bytes as RGB with opaque alpha,
+/// then optional intensity/YUV conversion and the selected encoder mode run
+/// exactly as they do for color.
+pub(crate) const fn gx_texture_copy_depth_reference(
+    depth: u32,
+    copy_format: GxEfbCopyFormat,
+    intensity_yuv: bool,
+) -> [u8; 4] {
+    let high = ((depth >> 16) & 0xff) as u8;
+    let middle = ((depth >> 8) & 0xff) as u8;
+    let low = (depth & 0xff) as u8;
+    gx_texture_copy_color_reference([high, middle, low, 0xff], copy_format, intensity_yuv)
+}
+
 pub(crate) fn gx_xfb_output_height(
     source_height: u32,
     copy_command: u32,
@@ -1377,6 +1657,14 @@ pub(crate) fn gx_destination_alpha_state(
             0
         },
     }
+}
+
+const fn expand_3_to_8(channel: u8) -> u8 {
+    (channel & 0xe0) | ((channel >> 3) & 0x1c) | (channel >> 6)
+}
+
+const fn expand_4_to_8(channel: u8) -> u8 {
+    (channel & 0xf0) | (channel >> 4)
 }
 
 const fn expand_5_to_8(channel: u8) -> u8 {
@@ -3085,8 +3373,9 @@ mod tests {
         GX_DEPTH16_MAX, GX_DEPTH24_MAX, GX_MANUAL_SAMPLING_MODE0_FLAG, GX_NON_AA_RASTER_CENTER_EFB,
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxAlphaTestOutcome, GxBlendFactor,
         GxBlendOperation, GxCopyClearMask, GxCopyGamma, GxDepthCompareLocation, GxDepthCompression,
-        GxEarlyDepthPlan, GxEfbDepthDecodeError, GxEfbDepthEncoding, GxEfbFormat, GxFogDecodeError,
-        GxFogProjection, GxFogState, GxFogType, GxRasterCenterEvidence, GxSamplerStateError,
+        GxEarlyDepthPlan, GxEfbCopyFormat, GxEfbDepthDecodeError, GxEfbDepthEncoding, GxEfbFormat,
+        GxFogDecodeError, GxFogProjection, GxFogState, GxFogType, GxRasterCenterEvidence,
+        GxSamplerStateError, GxTextureBaseFormat, GxTextureCopyPlanError, GxTextureCopyPlane,
         GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
         RendererMetrics, RendererPhaseTiming, SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY,
         SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
@@ -3101,8 +3390,11 @@ mod tests {
         gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
         gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
         gx_fog_reference, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
-        gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_reference, gx_z_texture_state,
-        legacy_gx_sampler_identity, materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
+        gx_texture_copy_color_reference, gx_texture_copy_depth_reference,
+        gx_texture_copy_intensity_yuv_reference, gx_texture_copy_plan,
+        gx_texture_copy_target_format, gx_xfb_copy_parameters, gx_xfb_output_height,
+        gx_z_texture_reference, gx_z_texture_state, legacy_gx_sampler_identity,
+        materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
         requested_surface_readback_layout, require_tev_texture, resolve_xfb_copy,
         reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture, select_texture,
         valid_rgba8_mip_chain, valid_rgba8_texture, xfb_copy_matches_selection,
@@ -3186,6 +3478,12 @@ mod tests {
         }
     }
 
+    fn texture_copy_state(encoded_target: u32, command_bits: u32) -> GxCopyState {
+        let mut state = copy_state(0, 256, [8, 8, 10, 12, 10, 8, 8]);
+        state.copy_command = ((encoded_target & 0xf) << 3) | command_bits;
+        state
+    }
+
     fn rgba_rows(values: &[[u8; 4]]) -> Vec<u8> {
         values.iter().flatten().copied().collect()
     }
@@ -3194,6 +3492,223 @@ mod tests {
         bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+    }
+
+    #[test]
+    fn bp52_target_format_rotation_decodes_all_sixteen_values() {
+        let expected = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+        for (encoded, decoded) in expected.into_iter().enumerate() {
+            assert_eq!(
+                gx_texture_copy_target_format((encoded as u32) << 3),
+                decoded,
+                "BP52 target format {encoded:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn texture_copy_plan_retains_complete_fixed_function_state() {
+        let mut state = texture_copy_state(
+            2,
+            3 | (2 << 7) | (1 << 9) | (1 << 11) | (1 << 15) | (1 << 16),
+        );
+        state.pixel_control = 3;
+        let plan = gx_texture_copy_plan(7, 5, state).unwrap();
+
+        assert_eq!(plan.source_format, GxEfbFormat::Z24);
+        assert_eq!(plan.source_plane, GxTextureCopyPlane::Depth);
+        assert_eq!(plan.copy_format, GxEfbCopyFormat::R8_0x1);
+        assert_eq!(plan.base_texture_format, GxTextureBaseFormat::I8);
+        assert_eq!(plan.filter_taps, [8, 8, 10, 12, 10, 8, 8]);
+        assert_eq!(plan.filter_coefficients, [16, 32, 16]);
+        assert_eq!(plan.gamma, GxCopyGamma::Gamma2_2);
+        assert!(plan.clamp_top);
+        assert!(plan.clamp_bottom);
+        assert!(plan.half_scale);
+        assert!(plan.intensity_yuv);
+        assert!(plan.clear_after_copy);
+        assert_eq!((plan.output_width, plan.output_height), (3, 2));
+
+        state.pixel_control = 1;
+        let color = gx_texture_copy_plan(7, 5, state).unwrap();
+        assert_eq!(color.source_format, GxEfbFormat::Rgba6Z24);
+        assert_eq!(color.source_plane, GxTextureCopyPlane::Color);
+    }
+
+    #[test]
+    fn intensity_conversion_requires_both_control_bits() {
+        for command_bits in [0, 1 << 15, 1 << 16] {
+            assert!(
+                !gx_texture_copy_plan(4, 4, texture_copy_state(0, command_bits))
+                    .unwrap()
+                    .intensity_yuv,
+                "command bits {command_bits:#x}"
+            );
+        }
+        assert!(
+            gx_texture_copy_plan(4, 4, texture_copy_state(0, (1 << 15) | (1 << 16)))
+                .unwrap()
+                .intensity_yuv
+        );
+    }
+
+    #[test]
+    fn rgb5a3_copy_retains_its_base_texture_format() {
+        let plan = gx_texture_copy_plan(4, 4, texture_copy_state(10, 0)).unwrap();
+        assert_eq!(plan.copy_format, GxEfbCopyFormat::Rgb5a3);
+        assert_eq!(plan.base_texture_format, GxTextureBaseFormat::Rgb5a3);
+    }
+
+    #[test]
+    fn texture_copy_plan_rejects_xfb_reserved_formats_and_zero_extents() {
+        assert_eq!(
+            gx_texture_copy_plan(4, 4, texture_copy_state(0, 1 << 14)),
+            Err(GxTextureCopyPlanError::XfbCopy)
+        );
+        for (encoded, decoded) in [(11, 13), (13, 14), (15, 15)] {
+            assert_eq!(
+                gx_texture_copy_plan(4, 4, texture_copy_state(encoded, 0)),
+                Err(GxTextureCopyPlanError::ReservedFormat(decoded)),
+                "BP52 target format {encoded:#x}"
+            );
+        }
+        let mut unsupported_source = texture_copy_state(0, 0);
+        unsupported_source.pixel_control = 4;
+        assert_eq!(
+            gx_texture_copy_plan(4, 4, unsupported_source),
+            Err(GxTextureCopyPlanError::UnsupportedSourceFormat(
+                GxEfbFormat::OtherNoAlpha
+            ))
+        );
+        assert_eq!(
+            gx_texture_copy_plan(0, 4, texture_copy_state(0, 0)),
+            Err(GxTextureCopyPlanError::ZeroExtent {
+                width: 0,
+                height: 4,
+                half_scale: false,
+            })
+        );
+        assert_eq!(
+            gx_texture_copy_plan(1, 4, texture_copy_state(0, 1 << 9)),
+            Err(GxTextureCopyPlanError::ZeroExtent {
+                width: 1,
+                height: 4,
+                half_scale: true,
+            })
+        );
+        assert_eq!(
+            gx_texture_copy_plan(4, 1, texture_copy_state(0, 1 << 9)),
+            Err(GxTextureCopyPlanError::ZeroExtent {
+                width: 4,
+                height: 1,
+                half_scale: true,
+            })
+        );
+    }
+
+    #[test]
+    fn raw_one_copy_selects_red_without_intensity_conversion() {
+        let plan = gx_texture_copy_plan(4, 4, texture_copy_state(2, 1 << 15)).unwrap();
+        assert_eq!(plan.copy_format, GxEfbCopyFormat::R8_0x1);
+        assert!(!plan.intensity_yuv);
+        assert_eq!(
+            gx_texture_copy_color_reference(
+                [18, 52, 86, 120],
+                plan.copy_format,
+                plan.intensity_yuv
+            ),
+            [18, 18, 18, 18]
+        );
+    }
+
+    #[test]
+    fn intensity_yuv_reference_matches_hardware_coefficients() {
+        assert_eq!(
+            gx_texture_copy_intensity_yuv_reference([18, 52, 86]),
+            [55, 148, 111]
+        );
+        assert_eq!(
+            gx_texture_copy_color_reference([18, 52, 86, 120], GxEfbCopyFormat::Rgba8, true),
+            [55, 148, 111, 120]
+        );
+        assert_eq!(
+            gx_texture_copy_depth_reference(0x12_3456, GxEfbCopyFormat::Rgba8, true),
+            [55, 148, 111, 255]
+        );
+    }
+
+    #[test]
+    fn color_copy_reference_matches_every_valid_format() {
+        let rgba = [18, 52, 86, 120];
+        let goldens = [
+            (GxEfbCopyFormat::R4, [17, 17, 17, 17]),
+            (GxEfbCopyFormat::R8_0x1, [18, 18, 18, 18]),
+            (GxEfbCopyFormat::Ra4, [17, 17, 17, 119]),
+            (GxEfbCopyFormat::Ra8, [18, 18, 18, 120]),
+            (GxEfbCopyFormat::Rgb565, [16, 52, 82, 255]),
+            (GxEfbCopyFormat::Rgb5a3, [17, 51, 85, 109]),
+            (GxEfbCopyFormat::Rgba8, [18, 52, 86, 120]),
+            (GxEfbCopyFormat::A8, [120, 120, 120, 120]),
+            (GxEfbCopyFormat::R8, [18, 18, 18, 18]),
+            (GxEfbCopyFormat::G8, [52, 52, 52, 52]),
+            (GxEfbCopyFormat::B8, [86, 86, 86, 86]),
+            (GxEfbCopyFormat::Rg8, [18, 18, 18, 52]),
+            (GxEfbCopyFormat::Gb8, [52, 52, 52, 86]),
+        ];
+        for (format, expected) in goldens {
+            assert_eq!(
+                gx_texture_copy_color_reference(rgba, format, false),
+                expected,
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rgb5a3_copy_switches_at_the_exact_opaque_alpha_boundary() {
+        assert_eq!(
+            gx_texture_copy_color_reference([18, 52, 86, 0xdf], GxEfbCopyFormat::Rgb5a3, false),
+            [17, 51, 85, 219]
+        );
+        assert_eq!(
+            gx_texture_copy_color_reference([18, 52, 86, 0xe0], GxEfbCopyFormat::Rgb5a3, false),
+            [16, 49, 82, 255]
+        );
+    }
+
+    #[test]
+    fn depth_copy_reference_runs_every_tile_encoder_on_selected_z24_bytes() {
+        let depth = 0x12_3456;
+        let goldens = [
+            (GxEfbCopyFormat::R4, [0x11, 0x11, 0x11, 0x11]),
+            (GxEfbCopyFormat::R8_0x1, [0x12, 0x12, 0x12, 0x12]),
+            (GxEfbCopyFormat::Ra4, [0x11, 0x11, 0x11, 0xff]),
+            (GxEfbCopyFormat::Ra8, [0x12, 0x12, 0x12, 0xff]),
+            (GxEfbCopyFormat::Rgb565, [0x10, 0x34, 0x52, 0xff]),
+            (GxEfbCopyFormat::Rgb5a3, [0x10, 0x31, 0x52, 0xff]),
+            (GxEfbCopyFormat::Rgba8, [0x12, 0x34, 0x56, 0xff]),
+            (GxEfbCopyFormat::A8, [0xff, 0xff, 0xff, 0xff]),
+            (GxEfbCopyFormat::R8, [0x12, 0x12, 0x12, 0x12]),
+            (GxEfbCopyFormat::G8, [0x34, 0x34, 0x34, 0x34]),
+            (GxEfbCopyFormat::B8, [0x56, 0x56, 0x56, 0x56]),
+            (GxEfbCopyFormat::Rg8, [0x12, 0x12, 0x12, 0x34]),
+            (GxEfbCopyFormat::Gb8, [0x34, 0x34, 0x34, 0x56]),
+        ];
+        for (format, expected) in goldens {
+            assert_eq!(
+                gx_texture_copy_depth_reference(depth, format, false),
+                expected,
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn z16l_uses_middle_and_low_depth_bytes() {
+        assert_eq!(
+            gx_texture_copy_depth_reference(0x12_3456, GxEfbCopyFormat::Gb8, false),
+            [0x34, 0x34, 0x34, 0x56]
+        );
     }
 
     #[test]

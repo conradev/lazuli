@@ -1804,6 +1804,76 @@ const TEMPLATE: &str = r##"<!doctype html>
       return packet;
     }
 
+    // The v4-v7 tail layouts remain independently canonical. This header
+    // feature adds only the physical texture-copy layout that their legacy
+    // form deliberately left zero, after version selection has completed.
+    function gxAttachTextureCopyLayoutV1(packet, copyKind, frame) {
+      if (
+        packet === null
+        || typeof packet !== "object"
+        || !Number.isSafeInteger(packet.byteLength)
+        || packet.byteLength < 160
+      ) {
+        throw new TypeError("GX texture-copy layout requires a complete LZGX packet");
+      }
+      copyKind = gxFramePacketInteger(copyKind, "copyKind", 2);
+      const view = new DataView(packet);
+      const packetKind = view.getUint32(0x10, true);
+      if (packetKind !== copyKind) {
+        throw new Error("GX texture-copy layout kind conflicts with packet header");
+      }
+      if (view.getUint32(0x0c, true) !== 0) {
+        throw new Error("GX texture-copy layout requires canonical zero packet flags");
+      }
+      if (copyKind === 2) return packet;
+      if (copyKind !== 1) {
+        throw new RangeError("GX texture-copy layout copyKind must be 1 or 2");
+      }
+      if (
+        view.getUint32(0x5c, true) !== 0
+        || view.getUint32(0x60, true) !== 0
+        || view.getUint32(0x68, true) !== 0
+      ) {
+        throw new Error(
+          "GX texture-copy layout requires canonical zero legacy layout fields"
+        );
+      }
+
+      const sourceX = view.getUint32(0x4c, true);
+      const sourceY = view.getUint32(0x50, true);
+      const sourceWidth = view.getUint32(0x54, true);
+      const sourceHeight = view.getUint32(0x58, true);
+      if (sourceX >= 640 || sourceY >= 528) {
+        // Preserve the legacy ordered no-op packet. The renderer still has to
+        // submit preceding geometry and pre-clears even though no copy exists.
+        return packet;
+      }
+      const clippedWidth = Math.min(sourceWidth, 640 - sourceX);
+      const clippedHeight = Math.min(sourceHeight, 528 - sourceY);
+      const copyCommand = view.getUint32(0x8c, true);
+      if ((copyCommand & 0x4000) !== 0) {
+        throw new Error("GX texture-copy layout conflicts with XFB copy command");
+      }
+      const divisor = (copyCommand & 0x0200) !== 0 ? 2 : 1;
+      const outputWidth = Math.floor(clippedWidth / divisor);
+      const outputHeight = Math.floor(clippedHeight / divisor);
+      if (outputWidth === 0 || outputHeight === 0) {
+        return packet;
+      }
+      const stride = gxFramePacketInteger(frame.stride, "frame.stride");
+      if (stride > 0x1fffffe0 || stride % 32 !== 0) {
+        throw new RangeError(
+          "GX texture-copy physical stride must be a shifted 24-bit BP4D value"
+        );
+      }
+
+      view.setUint32(0x0c, 1, true);
+      view.setUint32(0x5c, outputWidth, true);
+      view.setUint32(0x60, outputHeight, true);
+      view.setUint32(0x68, stride, true);
+      return packet;
+    }
+
     function postGxFrame(copyKind, frame) {
       frame = gxCompactNativeTriangleFans(frame);
       const diagnostics = {
@@ -1828,6 +1898,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           frame,
           residentTextureKeys
         );
+        packet = gxAttachTextureCopyLayoutV1(packet, copyKind, frame);
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
@@ -6152,10 +6223,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       gxTevTextureCacheByteLimit,
       texture => texture.pixels.byteLength
     );
-    // The index here must identify an EFB canvas that was actually sent to the
-    // browser. Sparse presentation skips most copy generations; advancing this
-    // map for an uncaptured copy makes the browser reject its last valid canvas
-    // and fall back to stale RAM texture bytes.
+    // Each entry records the most recent captured EFB output at a destination.
+    // Direct-compatible entries certify a browser surface; incompatible ones
+    // are tombstones that prevent stale pre-copy RAM from being decoded.
+    // Sparse presentation skips most generations, so uncaptured copies retain
+    // the last browser-side provenance until recovery captures a replacement.
     const gxTextureCopyDestinations = new Map();
     const gxTextureCopyConsumers = new Map();
     const gxTextureFormatCounts = new Map();
@@ -8894,18 +8966,56 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function gxRecordTextureCopyGeneration(address, index, captured) {
+    function gxTextureCopyDestinationMetadata(frame, generation) {
+      const sourceX = frame.sourceX ?? 0;
+      const sourceY = frame.sourceY ?? 0;
+      if (sourceX >= 640 || sourceY >= 528) return { kind: "noop" };
+      const divisor = (frame.copyState.copyCommand & 0x200) !== 0 ? 2 : 1;
+      const clippedWidth = Math.min(frame.width, 640 - sourceX);
+      const clippedHeight = Math.min(frame.sourceHeight, 528 - sourceY);
+      const width = Math.floor(clippedWidth / divisor);
+      const height = Math.floor(clippedHeight / divisor);
+      if (width === 0 || height === 0) return { kind: "noop" };
+      const layout = gxCopyTextureLayout(
+        frame.copyState.copyCommand,
+        frame.copyState.pixelControl
+      );
+      const packedStride = layout === null
+        ? null
+        : Math.ceil(width / layout.blockWidth) * layout.blockBytes;
+      return {
+        kind: "output",
+        generation,
+        width,
+        height,
+        format: layout?.format ?? null,
+        stride: frame.stride,
+        packedStride,
+        directCompatible: packedStride !== null && frame.stride === packedStride,
+      };
+    }
+
+    function gxRecordTextureCopyGeneration(address, index, captured, frame) {
+      const metadata = gxTextureCopyDestinationMetadata(frame, index);
+      const hasOutput = metadata.kind === "output";
       if (!captured) {
         if (gxTextureCopyDestinations.has(address)) {
           gxTextureCopyCapturedSurfacesRetained += 1;
         }
-        return;
+        return hasOutput;
       }
+      // A clipped or post-half-scale zero extent is an ordered hardware no-op,
+      // so it neither clears nor replaces the last captured destination.
+      if (!hasOutput) return false;
       gxTextureCopyDestinations.delete(address);
-      gxTextureCopyDestinations.set(address, index);
+      // Retain non-direct outputs as tombstones. The EFB bytes were never
+      // materialized in WASM RAM, so a later consumer must fail closed rather
+      // than decode the stale bytes that preceded this captured copy.
+      gxTextureCopyDestinations.set(address, metadata);
       if (gxTextureCopyDestinations.size > 64) {
         gxTextureCopyDestinations.delete(gxTextureCopyDestinations.keys().next().value);
       }
+      return true;
     }
 
     function gxRecordXfbCopyGeneration(frame) {
@@ -9203,31 +9313,25 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function gxCopyTextureLayout(copyCommand, pixelControl) {
+    function gxCopyTextureLayout(copyCommand, _pixelControl) {
       const copyFormat = (
         ((copyCommand & 0x08) !== 0 ? 8 : 0)
         | ((copyCommand >>> 4) & 7)
       );
-      const depthCopy = (pixelControl & 7) === 3;
       let textureFormat;
-      if (depthCopy) {
-        switch (copyFormat) {
-          case 0: textureFormat = 0; break;
-          case 1: case 8: case 9: case 10: textureFormat = 1; break;
-          case 3: case 11: case 12: textureFormat = 3; break;
-          case 6: textureFormat = 6; break;
-        }
-      } else {
-        switch (copyFormat) {
-          case 0: textureFormat = 0; break;
-          case 1: case 7: case 8: case 9: case 10: textureFormat = 1; break;
-          case 2: textureFormat = 2; break;
-          case 3: case 11: case 12: textureFormat = 3; break;
-          case 4: case 5: textureFormat = 4; break;
-          case 6: textureFormat = 6; break;
-        }
+      // Color/depth selection precedes one shared tile encoder. Its base RAM
+      // layout therefore depends only on the rotated BP52 target format.
+      switch (copyFormat) {
+        case 0: textureFormat = 0; break;
+        case 1: case 7: case 8: case 9: case 10: textureFormat = 1; break;
+        case 2: textureFormat = 2; break;
+        case 3: case 11: case 12: textureFormat = 3; break;
+        case 4: textureFormat = 4; break;
+        case 5: textureFormat = 5; break;
+        case 6: textureFormat = 6; break;
       }
-      return textureFormat === undefined ? null : gxTextureLayout(textureFormat);
+      if (textureFormat === undefined) return null;
+      return { ...gxTextureLayout(textureFormat), format: textureFormat };
     }
 
     function invalidateGxCopyReservation(frame) {
@@ -9252,8 +9356,13 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
       }
       const divisor = (frame.copyState.copyCommand & 0x200) !== 0 ? 2 : 1;
-      const width = Math.floor(frame.width / divisor);
-      const height = Math.floor(frame.sourceHeight / divisor);
+      const sourceX = frame.sourceX ?? 0;
+      const sourceY = frame.sourceY ?? 0;
+      if (sourceX >= 640 || sourceY >= 528) return false;
+      const clippedWidth = Math.min(frame.width, 640 - sourceX);
+      const clippedHeight = Math.min(frame.sourceHeight, 528 - sourceY);
+      const width = Math.floor(clippedWidth / divisor);
+      const height = Math.floor(clippedHeight / divisor);
       if (width === 0 || height === 0) return false;
       const blockColumns = Math.ceil(width / layout.blockWidth);
       const blockRows = Math.ceil(height / layout.blockHeight);
@@ -9411,13 +9520,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     function gxTextureLowerMipCopyGeneration(address, mipChain) {
       if (mipChain.levelCount <= 1) return null;
       const lowerMipOffset = mipChain.levels[1].encodedOffset;
-      for (const [destination, generation] of gxTextureCopyDestinations) {
+      for (const [destination, metadata] of gxTextureCopyDestinations) {
         const relativeAddress = (destination >>> 0) - (address >>> 0);
         if (
           relativeAddress >= lowerMipOffset
           && relativeAddress < mipChain.encodedBytes
         ) {
-          return { address: destination >>> 0, generation };
+          return { address: destination >>> 0, generation: metadata.generation };
         }
       }
       return null;
@@ -9592,7 +9701,30 @@ const TEMPLATE: &str = r##"<!doctype html>
         return null;
       }
       const address = imageSource.address;
-      const textureCopyIndex = gxTextureCopyDestinations.get(address);
+      const textureCopy = gxTextureCopyDestinations.get(address);
+      let textureCopyIndex;
+      if (textureCopy !== undefined) {
+        if (
+          textureCopy.kind !== "output"
+          || !textureCopy.directCompatible
+          || textureCopy.width !== width
+          || textureCopy.height !== height
+          || textureCopy.format !== format
+        ) {
+          gxTextureDecodeErrors += 1;
+          return null;
+        }
+        if (mipChain.levelCount > 1) {
+          // The browser cache contains only the copied base surface. Decoding
+          // the chain from RAM would substitute the stale pre-copy base bytes,
+          // while the renderer deliberately cannot bind a one-level surface
+          // as a mipmapped texture. Fail before either source is consumed until
+          // WebGPU can assemble copied level 0 with decoded lower levels.
+          gxTextureDecodeErrors += 1;
+          return null;
+        }
+        textureCopyIndex = textureCopy.generation;
+      }
       if (gxTextureLowerMipCopyGeneration(address, mipChain) !== null) {
         // LZGX transport identifies only the base texture-copy generation. A
         // copied EFB surface inside a lower level would otherwise be silently
@@ -11940,8 +12072,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxTextureCopyCount += 1;
         const collectedGeometry = gxCollectFrameGeometry;
         const knownConsumer = gxTextureCopyConsumers.has(frame.destination);
-        gxRecordTextureCopyGeneration(
-          frame.destination, gxTextureCopyCount, collectedGeometry
+        const hasTextureCopyOutput = gxRecordTextureCopyGeneration(
+          frame.destination, gxTextureCopyCount, collectedGeometry, frame
         );
         const boundAsTexture = gxTextureCopyIsBound(frame.destination);
         gxTextureCopies.push({
@@ -11957,7 +12089,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (collectedGeometry) {
           postGxFrame(1, frame);
           gxTextureCopyFramesPresented += 1;
-        } else if (frame.clear) {
+        } else if (frame.clear && hasTextureCopyOutput) {
           gxSkippedCopyClears.push(gxCopyClearOperation(frame));
         }
         gxFrameDraws = [];

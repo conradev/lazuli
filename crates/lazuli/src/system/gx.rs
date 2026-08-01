@@ -776,6 +776,7 @@ pub fn set_register(sys: &mut System, reg: Reg, value: u32) {
             sys.gpu.pix.copy.dst = Address((value << 5).with_bits(26, 32, 0));
         }
         Reg::PixelCopyDstStride => write_masked!(sys.gpu.pix.copy.stride),
+        Reg::PixelCopyScale => write_masked!(sys.gpu.pix.copy.scale),
         Reg::PixelCopyClearAr => {
             let mut value = 0
                 .with_bits(0, 8, sys.gpu.pix.copy.clear_color.r as u32)
@@ -799,10 +800,12 @@ pub fn set_register(sys: &mut System, reg: Reg, value: u32) {
             ));
         }
         Reg::PixelCopyCmd => {
-            // TODO: proper masked
-            let cmd = pix::CopyCmd::from_bits(value);
+            write_masked!(sys.gpu.pix.copy.command);
+            let cmd = sys.gpu.pix.copy.command;
             efb_copy(sys, cmd);
         }
+        Reg::PixelCopyFilter0 => write_masked!(sys.gpu.pix.copy.filter[0]),
+        Reg::PixelCopyFilter1 => write_masked!(sys.gpu.pix.copy.filter[1]),
 
         Reg::TexLutAddress => {
             let mut value = sys.gpu.tex.clut_addr.value() >> 5;
@@ -1172,7 +1175,10 @@ fn efb_copy(sys: &mut System, cmd: pix::CopyCmd) {
     let args = render::CopyArgs {
         src: sys.gpu.pix.copy.src,
         dims: sys.gpu.pix.copy.dims,
-        half: cmd.half(),
+        // BP52 half-scale is a texture-copy box filter. XFB copies derive
+        // their vertical scale from BP4E and must never reach the renderer's
+        // texture-only half-scale path.
+        half: cmd.half() && !cmd.to_xfb(),
         clear: cmd.clear(),
     };
 
@@ -1337,6 +1343,55 @@ mod tests {
         set_register(&mut sys, Reg::PixelCopyCmd, 1 << 14);
         assert!(!sys.cpu.reservation.is_valid());
         assert_eq!(sys.gpu.xfb_copies.len(), 2);
+    }
+
+    #[test]
+    fn efb_copy_auxiliary_registers_retain_masked_state() {
+        let mut sys = test_system();
+
+        set_register(&mut sys, Reg::PixelCopyScale, 0x0012_3456);
+        sys.gpu.write_mask = 0x0000_FF00;
+        set_register(&mut sys, Reg::PixelCopyScale, 0x00AB_CDEF);
+        assert_eq!(sys.gpu.pix.copy.scale, 0x0012_CD56);
+
+        set_register(&mut sys, Reg::PixelCopyFilter0, 0x0011_2233);
+        sys.gpu.write_mask = 0x00FF_0000;
+        set_register(&mut sys, Reg::PixelCopyFilter0, 0x00AA_BBCC);
+        assert_eq!(sys.gpu.pix.copy.filter[0], 0x00AA_2233);
+
+        set_register(&mut sys, Reg::PixelCopyFilter1, 0x0044_5566);
+        sys.gpu.write_mask = 0x0000_FFFF;
+        set_register(&mut sys, Reg::PixelCopyFilter1, 0x0077_8899);
+        assert_eq!(sys.gpu.pix.copy.filter[1], 0x0044_8899);
+    }
+
+    #[test]
+    fn efb_copy_command_retains_masked_trigger_state() {
+        let mut sys = test_system();
+        let initial = (1 << 9) | (1 << 11) | (1 << 14);
+        set_register(&mut sys, Reg::PixelCopyCmd, initial);
+
+        let mask = (0b11 << 7) | (1 << 15) | (1 << 16);
+        let update = (0b10 << 7) | (1 << 15) | (1 << 16);
+        sys.gpu.write_mask = mask;
+        set_register(&mut sys, Reg::PixelCopyCmd, update);
+
+        let expected = (initial & !mask) | (update & mask);
+        assert_eq!(sys.gpu.pix.copy.command.to_bits(), expected);
+        assert_eq!(sys.gpu.pix.copy.command.gamma(), pix::CopyGamma::Gamma2_2);
+        assert!(sys.gpu.pix.copy.command.half());
+        assert!(sys.gpu.pix.copy.command.clear());
+        assert!(sys.gpu.pix.copy.command.to_xfb());
+        assert!(sys.gpu.pix.copy.command.intensity());
+        assert_eq!(sys.gpu.xfb_copies.len(), 2);
+        assert!(!sys.gpu.xfb_copies[0].args.half);
+        assert!(!sys.gpu.xfb_copies[1].args.half);
+
+        sys.gpu.write_mask = 0;
+        set_register(&mut sys, Reg::PixelCopyCmd, 0);
+        assert_eq!(sys.gpu.pix.copy.command.to_bits(), expected);
+        assert_eq!(sys.gpu.xfb_copies.len(), 3);
+        assert!(!sys.gpu.xfb_copies[2].args.half);
     }
 
     #[test]

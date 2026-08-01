@@ -33,9 +33,10 @@ use crate::{
     ExactRequiredRejectionReason, ExactRequiredRejectionSnapshot, GX_DEPTH24_MAX,
     GX_IDENTITY_COPY_FILTER, GX_MAX_COPY_DIMENSION, GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB,
     GxBlendFactor, GxBlendOperation, GxCopyClearMask, GxDepthCompareLocation,
-    GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbDepthEncoding, GxEfbFormat, GxFogState,
-    GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor, GxRasterSetup,
-    GxRasterTriangle28_4, GxRasterWinding, GxSamplerState, GxXfbCopyParameters, GxZTextureFormat,
+    GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbCopyFormat, GxEfbDepthEncoding, GxEfbFormat,
+    GxFogState, GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor, GxRasterSetup,
+    GxRasterTriangle28_4, GxRasterWinding, GxSamplerState, GxTextureBaseFormat, GxTextureCopyPlan,
+    GxTextureCopyPlanError, GxTextureCopyPlane, GxXfbCopyParameters, GxZTextureFormat,
     GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
     RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
     SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory, TextureAddressMode,
@@ -46,10 +47,10 @@ use crate::{
     decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
     gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state, gx_early_depth_plan,
     gx_efb_depth_encoding, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
-    gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
-    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
-    rgba8_mip_chain_byte_len, select_mip_texture, xfb_copy_matches_selection, xfb_readback_layout,
-    xfb_scanout_plan, xfb_surface_extent_matches,
+    gx_texture_copy_plan, gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state,
+    merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
+    reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture,
+    xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -238,6 +239,215 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         ));
     }
     return vec4<f32>(vec4<u32>(filtered, 255u)) / 255.0;
+}
+";
+
+const EFB_TEXTURE_COPY_SHADER: &str = "
+struct EfbTextureCopyUniform {
+    source_rect: vec4<u32>,
+    output_and_format: vec4<u32>,
+    filter_coefficients: vec4<u32>,
+    options: vec4<u32>,
+    clamp_rows: vec4<u32>,
+    gamma: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@group(0) @binding(0) var efb_color: texture_2d<f32>;
+@group(0) @binding(1) var efb_depth: texture_depth_2d;
+@group(0) @binding(2) var<uniform> copy: EfbTextureCopyUniform;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[index], 0.0, 1.0);
+    return output;
+}
+
+fn round_even_unorm8(channel: f32) -> u32 {
+    let scaled = clamp(channel, 0.0, 1.0) * 255.0;
+    let lower = floor(scaled);
+    let fraction = scaled - lower;
+    let lower_int = u32(lower);
+    let increment = fraction > 0.5 || (fraction == 0.5 && (lower_int & 1u) != 0u);
+    return lower_int + select(0u, 1u, increment);
+}
+
+fn expand3(channel: u32) -> u32 {
+    return (channel & 0xe0u) | ((channel >> 3u) & 0x1cu) | (channel >> 6u);
+}
+
+fn expand4(channel: u32) -> u32 {
+    return (channel & 0xf0u) | (channel >> 4u);
+}
+
+fn expand5(channel: u32) -> u32 {
+    return (channel & 0xf8u) | (channel >> 5u);
+}
+
+fn expand6(channel: u32) -> u32 {
+    return (channel & 0xfcu) | (channel >> 6u);
+}
+
+fn native_color(texel: vec4<f32>) -> vec4<u32> {
+    let truncated = vec4<u32>(clamp(texel, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0);
+    let rounded = vec4<u32>(
+        round_even_unorm8(texel.r),
+        round_even_unorm8(texel.g),
+        round_even_unorm8(texel.b),
+        round_even_unorm8(texel.a),
+    );
+    switch copy.output_and_format.w {
+        case 0u: {
+            return vec4<u32>(truncated.rgb, 255u);
+        }
+        case 1u: {
+            return (rounded & vec4<u32>(0xfcu)) | (rounded >> vec4<u32>(6u));
+        }
+        case 2u: {
+            return vec4<u32>(expand5(rounded.r), expand6(rounded.g), expand5(rounded.b), 255u);
+        }
+        default: {
+            return rounded;
+        }
+    }
+}
+
+fn clamped_row(row: i32) -> i32 {
+    return clamp(row, i32(copy.clamp_rows.x), i32(copy.clamp_rows.y));
+}
+
+fn color_sample(base: vec2<u32>, row_offset: i32) -> vec4<u32> {
+    if copy.options.y == 0u {
+        return native_color(textureLoad(
+            efb_color,
+            vec2<i32>(i32(base.x), clamped_row(i32(base.y) + row_offset)),
+            0,
+        ));
+    }
+    let y0 = clamped_row(i32(base.y) + row_offset);
+    let y1 = clamped_row(i32(base.y) + row_offset + 1);
+    let sample = (
+        textureLoad(efb_color, vec2<i32>(i32(base.x), y0), 0)
+        + textureLoad(efb_color, vec2<i32>(i32(base.x + 1u), y0), 0)
+        + textureLoad(efb_color, vec2<i32>(i32(base.x), y1), 0)
+        + textureLoad(efb_color, vec2<i32>(i32(base.x + 1u), y1), 0)
+    ) * 0.25;
+    return native_color(sample);
+}
+
+fn depth_sample(base: vec2<u32>, row_offset: i32) -> vec4<u32> {
+    let center_offset = select(0u, 1u, copy.options.y != 0u);
+    let coord = vec2<i32>(
+        i32(base.x + center_offset),
+        clamped_row(i32(base.y + center_offset) + row_offset),
+    );
+    let depth = u32(clamp(textureLoad(efb_depth, coord, 0), 0.0, 1.0) * 16777215.0);
+    return vec4<u32>((depth >> 16u) & 255u, (depth >> 8u) & 255u, depth & 255u, 255u);
+}
+
+fn source_sample(base: vec2<u32>, row_offset: i32) -> vec4<u32> {
+    if copy.options.x != 0u {
+        return depth_sample(base, row_offset);
+    }
+    return color_sample(base, row_offset);
+}
+
+fn filtered_sample(base: vec2<u32>) -> vec4<u32> {
+    let previous = source_sample(base, -1);
+    let current = source_sample(base, 0);
+    let next = source_sample(base, 1);
+    let combined = previous.rgb * copy.filter_coefficients.x
+        + current.rgb * copy.filter_coefficients.y
+        + next.rgb * copy.filter_coefficients.z;
+    var texel = vec4<u32>(combined >> vec3<u32>(6u), current.a);
+    if copy.options.w != 0u {
+        texel = texel & vec4<u32>(0x1ffu);
+    }
+    texel = min(texel, vec4<u32>(255u));
+    if copy.gamma.x != 1.0 {
+        texel = vec4<u32>(
+            vec3<u32>(round(pow(abs(vec3<f32>(texel.rgb) / 255.0), vec3<f32>(copy.gamma.x)) * 255.0)),
+            texel.a,
+        );
+    }
+    if copy.options.z != 0u {
+        let red = i32(texel.r);
+        let green = i32(texel.g);
+        let blue = i32(texel.b);
+        let y = 66 * red + 129 * green + 25 * blue + 16 * 256;
+        let u = -38 * red - 74 * green + 112 * blue + 128 * 256;
+        let v = 112 * red - 94 * green - 18 * blue + 128 * 256;
+        texel.r = u32((y >> 8) + ((y >> 7) & 1));
+        texel.g = u32((u >> 8) + ((u >> 7) & 1));
+        texel.b = u32((v >> 8) + ((v >> 7) & 1));
+    }
+    return texel;
+}
+
+fn target_texel(texel: vec4<u32>) -> vec4<u32> {
+    switch copy.output_and_format.z {
+        case 0u: {
+            let red = expand4(texel.r);
+            return vec4<u32>(red);
+        }
+        case 1u: {
+            return vec4<u32>(texel.r);
+        }
+        case 2u: {
+            let red = expand4(texel.r);
+            return vec4<u32>(red, red, red, expand4(texel.a));
+        }
+        case 3u: {
+            return vec4<u32>(texel.r, texel.r, texel.r, texel.a);
+        }
+        case 4u: {
+            return vec4<u32>(expand5(texel.r), expand6(texel.g), expand5(texel.b), 255u);
+        }
+        case 5u: {
+            if (texel.a & 0xe0u) == 0xe0u {
+                return vec4<u32>(expand5(texel.r), expand5(texel.g), expand5(texel.b), 255u);
+            }
+            return vec4<u32>(expand4(texel.r), expand4(texel.g), expand4(texel.b), expand3(texel.a));
+        }
+        case 6u: {
+            return texel;
+        }
+        case 7u: {
+            return vec4<u32>(texel.a);
+        }
+        case 8u: {
+            return vec4<u32>(texel.r);
+        }
+        case 9u: {
+            return vec4<u32>(texel.g);
+        }
+        case 10u: {
+            return vec4<u32>(texel.b);
+        }
+        case 11u: {
+            return vec4<u32>(texel.r, texel.r, texel.r, texel.g);
+        }
+        default: {
+            return vec4<u32>(texel.g, texel.g, texel.g, texel.b);
+        }
+    }
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let output = vec2<u32>(input.position.xy);
+    let scale = select(1u, 2u, copy.options.y != 0u);
+    let source = copy.source_rect.xy + output * scale;
+    return vec4<f32>(target_texel(filtered_sample(source))) / 255.0;
 }
 ";
 
@@ -685,6 +895,89 @@ struct XfbCopyResources {
     pipeline: wgpu::RenderPipeline,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+struct EfbTextureCopyUniform {
+    source_rect: [u32; 4],
+    output_and_format: [u32; 4],
+    filter_coefficients: [u32; 4],
+    options: [u32; 4],
+    clamp_rows: [u32; 4],
+    gamma: [f32; 4],
+}
+
+impl EfbTextureCopyUniform {
+    fn new(
+        source_x: u32,
+        source_y: u32,
+        source_width: u32,
+        source_height: u32,
+        plan: GxTextureCopyPlan,
+    ) -> Self {
+        let clamp_top = if plan.clamp_top { source_y } else { 0 };
+        let clamp_bottom = if plan.clamp_bottom {
+            source_y + source_height
+        } else {
+            EFB_HEIGHT
+        } - 1;
+        Self {
+            source_rect: [source_x, source_y, source_width, source_height],
+            output_and_format: [
+                plan.output_width,
+                plan.output_height,
+                texture_copy_format_code(plan.copy_format),
+                texture_copy_source_format_code(plan.source_format),
+            ],
+            filter_coefficients: [
+                plan.filter_coefficients[0],
+                plan.filter_coefficients[1],
+                plan.filter_coefficients[2],
+                0,
+            ],
+            options: [
+                u32::from(plan.source_plane == GxTextureCopyPlane::Depth),
+                u32::from(plan.half_scale),
+                u32::from(plan.intensity_yuv),
+                u32::from(plan.filter_coefficients.into_iter().sum::<u32>() >= 128),
+            ],
+            clamp_rows: [clamp_top, clamp_bottom, 0, 0],
+            gamma: [plan.gamma.reciprocal(), 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+const fn texture_copy_format_code(format: GxEfbCopyFormat) -> u32 {
+    match format {
+        GxEfbCopyFormat::R4 => 0,
+        GxEfbCopyFormat::R8_0x1 => 1,
+        GxEfbCopyFormat::Ra4 => 2,
+        GxEfbCopyFormat::Ra8 => 3,
+        GxEfbCopyFormat::Rgb565 => 4,
+        GxEfbCopyFormat::Rgb5a3 => 5,
+        GxEfbCopyFormat::Rgba8 => 6,
+        GxEfbCopyFormat::A8 => 7,
+        GxEfbCopyFormat::R8 => 8,
+        GxEfbCopyFormat::G8 => 9,
+        GxEfbCopyFormat::B8 => 10,
+        GxEfbCopyFormat::Rg8 => 11,
+        GxEfbCopyFormat::Gb8 => 12,
+    }
+}
+
+const fn texture_copy_source_format_code(format: GxEfbFormat) -> u32 {
+    match format {
+        GxEfbFormat::Rgb8Z24 => 0,
+        GxEfbFormat::Rgba6Z24 => 1,
+        GxEfbFormat::Rgb565Z16 => 2,
+        GxEfbFormat::Z24 | GxEfbFormat::OtherNoAlpha => u32::MAX,
+    }
+}
+
+struct EfbTextureCopyResources {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Primitive {
     Triangles,
@@ -820,6 +1113,7 @@ struct CachedTexture {
     width: u32,
     height: u32,
     mip_level_count: u32,
+    base_format: Option<GxTextureBaseFormat>,
 }
 
 #[derive(Clone)]
@@ -1042,11 +1336,12 @@ pub struct WebGpuRenderer {
     host_timings: Rc<Cell<RendererHostTimings>>,
     draw_timing_eligible_calls: Cell<u64>,
     surface_config: wgpu::SurfaceConfiguration,
-    efb_color: wgpu::Texture,
+    _efb_color: wgpu::Texture,
     efb_color_view: wgpu::TextureView,
     _efb_depth: wgpu::Texture,
     efb_depth_view: wgpu::TextureView,
     copy_clear: CopyClearResources,
+    efb_texture_copy: EfbTextureCopyResources,
     xfb_copy: XfbCopyResources,
     xfb_present: XfbPresentResources,
     tev_draw_layout: wgpu::BindGroupLayout,
@@ -1202,12 +1497,39 @@ fn public_copy_clear_state(
     if !clear {
         return Ok(None);
     }
+    public_copy_state(
+        z_mode,
+        blend_mode,
+        pixel_control,
+        copy_command,
+        clear_rgba,
+        clear_depth,
+        0,
+        [0; 2],
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn public_copy_state(
+    z_mode: u32,
+    blend_mode: u32,
+    pixel_control: u32,
+    copy_command: u32,
+    clear_rgba: [u8; 4],
+    clear_depth: u32,
+    copy_scale: u32,
+    copy_filter: [u32; 2],
+) -> Result<GxCopyState, JsValue> {
     for (field, value) in [
         ("terminal Z mode", z_mode),
         ("terminal blend mode", blend_mode),
         ("pixel control", pixel_control),
         ("copy command", copy_command),
         ("clear depth", clear_depth),
+        ("copy scale", copy_scale),
+        ("copy filter 0", copy_filter[0]),
+        ("copy filter 1", copy_filter[1]),
     ] {
         if value & !0x00ff_ffff != 0 {
             return Err(JsValue::from_str(&format!(
@@ -1215,16 +1537,60 @@ fn public_copy_clear_state(
             )));
         }
     }
-    Ok(Some(GxCopyState {
+    Ok(GxCopyState {
         z_mode,
         blend_mode,
         pixel_control,
         copy_command,
         clear_rgba,
         clear_depth,
-        copy_scale: 0,
-        copy_filter: [0; 2],
-    }))
+        copy_scale,
+        copy_filter,
+    })
+}
+
+fn texture_copy_plan_for_source(
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    copy_state: GxCopyState,
+    clear: bool,
+) -> Result<Option<GxTextureCopyPlan>, JsValue> {
+    let plan = clipped_copy_extent(source_x, source_y, source_width, source_height)
+        .map(
+            |(width, height)| match gx_texture_copy_plan(width, height, copy_state) {
+                Ok(plan) => Ok(Some(plan)),
+                // Legacy packets cannot transport a zero output extent. Preserve
+                // the terminal command as an ordered no-op: preceding work still
+                // submits, but no texture is materialized and no clear is run.
+                Err(GxTextureCopyPlanError::ZeroExtent { .. }) => Ok(None),
+                Err(error) => Err(JsValue::from_str(&format!("GX EFB texture copy: {error}"))),
+            },
+        )
+        .transpose()?
+        .flatten();
+    if let Some(plan) = plan
+        && plan.clear_after_copy != clear
+    {
+        return Err(JsValue::from_str(
+            "GX EFB texture-copy clear flag does not match BP52",
+        ));
+    }
+    if plan.is_some()
+        && clear
+        && gx_copy_clear_mask(
+            copy_state.z_mode,
+            copy_state.blend_mode,
+            copy_state.pixel_control,
+        )
+        .depth
+    {
+        gx_efb_depth_encoding(copy_state.pixel_control).map_err(|error| {
+            JsValue::from_str(&format!("GX EFB texture-copy terminal clear: {error}"))
+        })?;
+    }
+    Ok(plan)
 }
 
 const GX_PRE_CLEAR_WORDS: usize = 12;
@@ -2346,31 +2712,47 @@ impl WebGpuRenderer {
 
     /// Submit one completely validated GX segment and its terminal EFB copy.
     ///
-    /// Bridge telemetry records every call at entry, but parsing and resource
-    /// preflight and command encoding finish before the queue submission, so a
-    /// rejected Worker packet cannot leave a partial EFB frame behind.
+    /// Structural and terminal-copy preflight finish before bridge telemetry,
+    /// resource preparation, or command encoding, so a rejected Worker packet
+    /// cannot mutate renderer state or leave a partial EFB frame behind.
     pub fn submit_gx_frame(
         &mut self,
         source_packet: Uint8Array,
         source_pre_clears: Option<Uint32Array>,
     ) -> Result<Array, JsValue> {
-        // Keep the existing `packetParse` diagnostic as one inclusive packet-
-        // preparation phase: JS-to-Wasm copying, structural parsing, texture
-        // preflight, and vertex flattening all happen before renderer mutation.
-        let packet_parse_timer = self.host_phase_timer(RendererHostPhase::PacketParse);
         let packet_bytes = source_packet.to_vec();
         let pre_clear_words = source_pre_clears
             .map(|source| source.to_vec())
             .unwrap_or_default();
+        let pre_clears = gx_pre_clears(&pre_clear_words)?;
+        let packet = GxFramePacket::parse(&packet_bytes)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let header = *packet.header();
+        let texture_copy_plan = if header.copy_kind == GxCopyKind::Texture {
+            texture_copy_plan_for_source(
+                header.source_x,
+                header.source_y,
+                header.source_width,
+                header.source_height,
+                header.copy_state,
+                header.clear,
+            )?
+        } else {
+            None
+        };
+        if header.texture_copy_layout_v1 {
+            let plan = texture_copy_plan.expect("validated texture-copy layout overlaps the EFB");
+            debug_assert_eq!(header.output_width, plan.output_width);
+            debug_assert_eq!(header.output_height, plan.output_height);
+        }
         self.record_wasm_bridge_call(
             packet_bytes
                 .len()
                 .saturating_add(pre_clear_words.len().saturating_mul(size_of::<u32>())),
         );
-        let pre_clears = gx_pre_clears(&pre_clear_words)?;
-        let packet = GxFramePacket::parse(&packet_bytes)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let header = *packet.header();
+        // This phase now starts after rejection-only structural and terminal
+        // preflight, and covers texture validation plus vertex flattening.
+        let packet_parse_timer = self.host_phase_timer(RendererHostPhase::PacketParse);
         let payload_bytes: usize = packet.textures().map(|texture| texture.pixels.len()).sum();
         // V7 requires at least one genuine mip binding, while v2-v6 always
         // synthesize one resident level. This invariant lets the renderer
@@ -2459,7 +2841,12 @@ impl WebGpuRenderer {
                         texture.record.generation,
                         self.efb_copy_cache
                             .get(&texture.record.address)
-                            .map(|cached| cached.generation),
+                            .and_then(|cached| {
+                                (cached.width == texture.record.width
+                                    && cached.height == texture.record.height
+                                    && cached.base_format.is_some())
+                                .then_some(cached.generation)
+                            }),
                         decoded_is_valid,
                         texture.record.mip_level_count,
                     ),
@@ -2561,7 +2948,9 @@ impl WebGpuRenderer {
                     header.source_height,
                     header.destination,
                     header.generation,
-                    header.clear.then_some(header.copy_state),
+                    header.copy_state,
+                    header.clear,
+                    texture_copy_plan,
                     &pre_clears,
                 ),
                 GxCopyKind::Xfb => self.copy_xfb_inner(
@@ -2973,9 +3362,12 @@ impl WebGpuRenderer {
                 true,
                 select_mip_texture(
                     input.generation,
-                    self.efb_copy_cache
-                        .get(&input.address)
-                        .map(|texture| texture.generation),
+                    self.efb_copy_cache.get(&input.address).and_then(|texture| {
+                        (texture.width == input.width
+                            && texture.height == input.height
+                            && texture.base_format.is_some())
+                        .then_some(texture.generation)
+                    }),
                     decoded_is_valid,
                     input.mip_level_count,
                 ),
@@ -3269,16 +3661,22 @@ impl WebGpuRenderer {
         clear_alpha: u8,
         clear_depth: u32,
     ) -> Result<(), JsValue> {
-        self.record_wasm_bridge_call(0);
-        let copy_clear = public_copy_clear_state(
-            clear,
+        // The legacy bridge predates BP52 transport. Preserve its public shape
+        // while making its historical raw RGBA copy explicit.
+        let copy_command = 0x60 | if clear { 0x0800 } else { 0 };
+        let copy_state = public_copy_state(
             z_mode,
             blend_mode,
             pixel_control,
-            if clear { 0x0800 } else { 0 },
+            copy_command,
             [clear_red, clear_green, clear_blue, clear_alpha],
             clear_depth,
+            256,
+            GX_IDENTITY_COPY_FILTER,
         )?;
+        let plan =
+            texture_copy_plan_for_source(source_x, source_y, width, height, copy_state, clear)?;
+        self.record_wasm_bridge_call(0);
         self.copy_texture_inner(
             source_x,
             source_y,
@@ -3286,7 +3684,9 @@ impl WebGpuRenderer {
             height,
             destination,
             generation,
-            copy_clear,
+            copy_state,
+            clear,
+            plan,
             &[],
         )
     }
@@ -3300,15 +3700,25 @@ impl WebGpuRenderer {
         height: u32,
         destination: u32,
         generation: u32,
-        copy_clear: Option<GxCopyState>,
+        copy_state: GxCopyState,
+        clear: bool,
+        plan: Option<GxTextureCopyPlan>,
         pre_clears: &[GxPreClear],
     ) -> Result<(), JsValue> {
+        let clipped = clipped_copy_extent(source_x, source_y, width, height);
+        let checked_plan =
+            texture_copy_plan_for_source(source_x, source_y, width, height, copy_state, clear)?;
+        if checked_plan != plan {
+            return Err(JsValue::from_str(
+                "GX EFB texture-copy plan changed after preflight",
+            ));
+        }
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.copy_texture_calls = metrics.copy_texture_calls.saturating_add(1);
         });
         let mut encoder = self.flush_geometry_with_pre_clears(pre_clears)?;
-        let Some((width, height)) = clipped_copy_extent(source_x, source_y, width, height) else {
+        let (Some((width, height)), Some(plan)) = (clipped, plan) else {
             self.queue.submit([encoder.finish()]);
             update_renderer_metrics(&self.metrics, |metrics| {
                 metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
@@ -3318,44 +3728,73 @@ impl WebGpuRenderer {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("browser EFB texture copy"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: plan.output_width,
+                height: plan.output_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let uniform = EfbTextureCopyUniform::new(source_x, source_y, width, height, plan);
+        let uniform_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("browser GX immutable EFB-to-texture copy uniform"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser GX immutable EFB-to-texture copy bind group"),
+            layout: &self.efb_texture_copy.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.efb_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.efb_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
         });
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.textures_created = metrics.textures_created.saturating_add(1);
+            metrics.buffers_created = metrics.buffers_created.saturating_add(1);
+            metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
         });
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.efb_color,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: source_x,
-                    y: source_y,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        if let Some(state) = copy_clear {
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("browser GX EFB-to-texture materialization pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.efb_texture_copy.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if clear {
             update_renderer_metrics(&self.metrics, |metrics| {
                 metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
             });
@@ -3367,10 +3806,9 @@ impl WebGpuRenderer {
                     width,
                     height,
                 },
-                state,
+                copy_state,
             )?;
         }
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.submit([encoder.finish()]);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
@@ -3381,9 +3819,10 @@ impl WebGpuRenderer {
                 _texture: texture,
                 view,
                 generation,
-                width,
-                height,
+                width: plan.output_width,
+                height: plan.output_height,
                 mip_level_count: 1,
+                base_format: Some(plan.base_texture_format),
             },
         );
         while self.efb_copy_cache.len() > 64 {
@@ -4174,7 +4613,7 @@ impl WebGpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let efb_depth_view = efb_depth.create_view(&wgpu::TextureViewDescriptor::default());
@@ -4278,6 +4717,7 @@ impl WebGpuRenderer {
             ],
         });
         let copy_clear = create_copy_clear_resources(&device);
+        let efb_texture_copy = create_efb_texture_copy_resources(&device);
         let xfb_copy = create_xfb_copy_resources(&device, &efb_color_view);
         let xfb_present = create_xfb_present_resources(&device);
         let pipelines = create_pipelines(
@@ -4312,11 +4752,12 @@ impl WebGpuRenderer {
             host_timings: Rc::new(Cell::new(RendererHostTimings::default())),
             draw_timing_eligible_calls: Cell::new(0),
             surface_config,
-            efb_color,
+            _efb_color: efb_color,
             efb_color_view,
             _efb_depth: efb_depth,
             efb_depth_view,
             copy_clear,
+            efb_texture_copy,
             xfb_copy,
             xfb_present,
             tev_draw_layout,
@@ -6182,6 +6623,7 @@ fn upload_texture(
         width,
         height,
         mip_level_count,
+        base_format: None,
     })
 }
 
@@ -6393,6 +6835,82 @@ fn webgpu_cull_mode(cull: CullMode) -> Option<wgpu::Face> {
         CullMode::Back | CullMode::All => Some(wgpu::Face::Back),
         CullMode::Front => Some(wgpu::Face::Front),
     }
+}
+
+fn create_efb_texture_copy_resources(device: &wgpu::Device) -> EfbTextureCopyResources {
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("browser GX EFB-to-texture copy layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("browser GX EFB-to-texture copy shader"),
+        source: wgpu::ShaderSource::Wgsl(EFB_TEXTURE_COPY_SHADER.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("browser GX EFB-to-texture copy pipeline layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("browser GX EFB-to-texture copy pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    EfbTextureCopyResources { layout, pipeline }
 }
 
 fn create_xfb_copy_resources(
@@ -6748,7 +7266,8 @@ mod tests {
     use super::{
         BlendComponentState, CopyClearUniform, CullMode, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
-        DepthCommitPipelineKey, DrawUniform, ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT,
+        DepthCommitPipelineKey, DrawUniform, EFB_TEXTURE_COPY_SHADER, EfbTextureCopyUniform,
+        ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT,
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxExactPreparationFailure, GxRasterPoint28_4,
         GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
         MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
@@ -6766,9 +7285,10 @@ mod tests {
         managed_vertices_with_sidecar_record_base, merge_contiguous_draw_range,
         prepare_managed_coverage_vertices, rgba8_mip_uploads,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
+        texture_copy_plan_for_source,
     };
     use crate::clip::{GxClipError, GxExactGeometryError};
-    use crate::packet::GxTriangleAction;
+    use crate::packet::{GxCopyState, GxTriangleAction};
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS, managed_tex_coord_sidecar_fits};
     use crate::{
         ExactRequiredPreparationRejectionReason, GX_DEPTH24_MAX, GxBlendFactor, GxDepthCompression,
@@ -6812,6 +7332,130 @@ mod tests {
 
     fn legacy_sampler_states(modes: [u32; MAX_TEV_TEXTURES]) -> [GxSamplerState; MAX_TEV_TEXTURES] {
         modes.map(|mode| gx_sampler_state(mode, 0, 1, false).unwrap())
+    }
+
+    fn texture_copy_state(
+        encoded_target: u32,
+        command_bits: u32,
+        pixel_control: u32,
+    ) -> GxCopyState {
+        GxCopyState {
+            z_mode: 0,
+            blend_mode: 0,
+            pixel_control,
+            copy_command: ((encoded_target & 0xf) << 3) | command_bits,
+            clear_rgba: [1, 2, 3, 4],
+            clear_depth: 0x12_3456,
+            copy_scale: 256,
+            copy_filter: [
+                (8 << 0) | (8 << 6) | (10 << 12) | (12 << 18),
+                (10 << 0) | (8 << 6) | (8 << 12),
+            ],
+        }
+    }
+
+    #[test]
+    fn efb_texture_copy_wgsl_parses_and_validates() {
+        let module = naga::front::wgsl::parse_str(EFB_TEXTURE_COPY_SHADER)
+            .unwrap_or_else(|error| panic!("browser EFB texture-copy WGSL parse failed: {error}"));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("browser EFB texture-copy WGSL validation failed: {error}"));
+
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("@binding(0) var efb_color: texture_2d<f32>"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("@binding(1) var efb_depth: texture_depth_2d"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("fn filtered_sample(base: vec2<u32>)"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("target_texel(filtered_sample(source))"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("i32(base.y) + row_offset"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("i32(base.y + center_offset) + row_offset"),);
+        assert!(!EFB_TEXTURE_COPY_SHADER.contains("row_offset * i32(scale)"));
+    }
+
+    #[test]
+    fn rgb8_source_truncates_fractional_half_samples_before_copy_filtering() {
+        let native_color = EFB_TEXTURE_COPY_SHADER
+            .split_once("fn native_color(texel: vec4<f32>)")
+            .unwrap()
+            .1
+            .split_once("fn clamped_row")
+            .unwrap()
+            .0;
+        assert!(native_color.contains("let truncated = vec4<u32>(clamp(texel"));
+        assert!(native_color.contains("return vec4<u32>(truncated.rgb, 255u)"));
+        assert!(native_color.contains("return (rounded & vec4<u32>(0xfcu))"));
+
+        let half_sample = ((1.0f32 / 255.0) + (2.0f32 / 255.0)) * 0.5 * 255.0;
+        assert_eq!(half_sample as u32, 1);
+        assert_eq!(half_sample.round() as u32, 2);
+    }
+
+    #[test]
+    fn texture_copy_uniform_retains_depth_half_filter_and_conversion_plan() {
+        let state = texture_copy_state(
+            10,
+            3 | (2 << 7) | (1 << 9) | (1 << 11) | (1 << 15) | (1 << 16),
+            3,
+        );
+        let plan = texture_copy_plan_for_source(11, 13, 7, 5, state, true)
+            .unwrap()
+            .unwrap();
+        let uniform = EfbTextureCopyUniform::new(11, 13, 7, 5, plan);
+
+        assert_eq!(uniform.source_rect, [11, 13, 7, 5]);
+        assert_eq!(uniform.output_and_format, [3, 2, 5, u32::MAX]);
+        assert_eq!(uniform.filter_coefficients, [16, 32, 16, 0]);
+        assert_eq!(uniform.options, [1, 1, 1, 0]);
+        assert_eq!(uniform.clamp_rows, [13, 17, 0, 0]);
+        assert_eq!(uniform.gamma[0], 1.0 / 2.2);
+    }
+
+    #[test]
+    fn texture_copy_uniform_selects_the_color_plane_and_rgba6_source() {
+        let state = texture_copy_state(12, 0, 1);
+        let plan = texture_copy_plan_for_source(5, 7, 4, 3, state, false)
+            .unwrap()
+            .unwrap();
+        let uniform = EfbTextureCopyUniform::new(5, 7, 4, 3, plan);
+
+        assert_eq!(uniform.output_and_format, [4, 3, 6, 1]);
+        assert_eq!(uniform.options, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn one_pixel_half_texture_copy_is_an_ordered_terminal_noop() {
+        let state = texture_copy_state(12, 1 << 9, 0);
+        assert_eq!(
+            texture_copy_plan_for_source(0, 0, 1, 1, state, false).unwrap(),
+            None
+        );
+        let clear_state = texture_copy_state(12, (1 << 9) | (1 << 11), 0);
+        assert_eq!(
+            texture_copy_plan_for_source(0, 0, 1, 1, clear_state, true).unwrap(),
+            None
+        );
+        let mut invalid_clear_state = texture_copy_state(12, (1 << 9) | (1 << 11), 2 | (4 << 3));
+        invalid_clear_state.z_mode = 1 << 4;
+        assert_eq!(
+            texture_copy_plan_for_source(0, 0, 1, 1, invalid_clear_state, true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_z16_terminal_clear_rejects_during_texture_copy_preflight() {
+        for compression in 4..=7 {
+            let mut state = texture_copy_state(12, 1 << 11, 2 | (compression << 3));
+            state.z_mode = 1 << 4;
+            let error = texture_copy_plan_for_source(0, 0, 4, 4, state, true).unwrap_err();
+            assert!(error.as_string().is_some_and(|message| {
+                message.contains(&format!(
+                    "unsupported inverse GX Z16 compression {compression}"
+                ))
+            }));
+        }
     }
 
     #[test]

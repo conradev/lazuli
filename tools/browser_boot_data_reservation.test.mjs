@@ -453,6 +453,46 @@ test("GX XFB rows and EFB texture copies invalidate exact physical footprints", 
   assert.equal(reservation(context), null);
 });
 
+test("EFB copy layout keeps RGB5A3 and all shared depth tile modes distinct", () => {
+  const context = makeContext();
+  const encodedTarget = raw => (((raw << 1) & 0xf) | (raw >>> 3)) << 3;
+
+  assert.equal(context.gxCopyTextureLayout(encodedTarget(4), 0).name, "RGB565");
+  assert.equal(context.gxCopyTextureLayout(encodedTarget(5), 0).name, "RGB5A3");
+  assert.equal(context.gxCopyTextureLayout(encodedTarget(2), 3).name, "IA4");
+  assert.equal(context.gxCopyTextureLayout(encodedTarget(5), 3).name, "RGB5A3");
+  assert.equal(context.gxCopyTextureLayout(encodedTarget(13), 3), null);
+
+  const writes = [];
+  context.invalidateDataReservationForExternalStridedWrite = (...args) => {
+    writes.push(args);
+    return false;
+  };
+  const clippedHalf = {
+    copyToXfb: false,
+    destination: 0x1000,
+    sourceX: 638,
+    sourceY: 526,
+    width: 4,
+    sourceHeight: 4,
+    stride: 64,
+    copyState: { copyCommand: 0x200, pixelControl: 0 },
+  };
+  assert.equal(context.invalidateGxCopyReservation(clippedHalf), false);
+  assert.deepEqual(writes, [[0x1000, 32, 64, 1]]);
+
+  writes.length = 0;
+  assert.equal(
+    context.invalidateGxCopyReservation({
+      ...clippedHalf,
+      sourceX: 639,
+      sourceY: 527,
+    }),
+    false,
+  );
+  assert.deepEqual(writes, []);
+});
+
 test("zero-stride GX copies repeatedly invalidate only their bounded base row", () => {
   const context = makeContext();
   writeRuntimeTranslationState(context);

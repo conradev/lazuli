@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use crate::tev::{MAX_TEV_STAGES, MAX_TEV_TEXTURES, required_texture_maps};
+use crate::{GxTextureCopyPlanError, clipped_copy_extent, gx_texture_copy_plan};
 
 pub(crate) const GX_PACKET_MAGIC: [u8; 4] = *b"LZGX";
 pub(crate) const GX_PACKET_VERSION: u16 = 4;
@@ -27,6 +28,7 @@ pub(crate) const GX_PACKET_VERSION_V7: u16 = 7;
 const GX_DRAW_RECORD_BYTES_V2: u16 = 128;
 const PACKET_ALIGNMENT: u32 = 16;
 const COPY_FLAG_CLEAR: u32 = 1;
+pub(crate) const PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1: u32 = 1;
 const DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE: u16 = 1;
 const DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE: u16 = 1 << 1;
 const DRAW_FLAG_EXACT_CLIP_REQUIRED: u16 = 1 << 2;
@@ -101,6 +103,7 @@ pub(crate) struct GxPacketHeader {
     pub(crate) stride: u32,
     pub(crate) generation: u32,
     pub(crate) clear: bool,
+    pub(crate) texture_copy_layout_v1: bool,
     pub(crate) copy_state: GxCopyState,
     pub(crate) total_vertex_count: u32,
 }
@@ -303,7 +306,20 @@ impl<'a> GxFramePacket<'a> {
                 actual: bytes.len(),
             });
         }
-        expect_u32("packet flags", read_u32(bytes, 0x0c), 0)?;
+        let packet_flags = read_u32(bytes, 0x0c);
+        if packet_flags & !PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1 != 0 {
+            return Err(GxPacketError::InvalidField {
+                field: "packet flags",
+                value: u64::from(packet_flags),
+            });
+        }
+        let texture_copy_layout_v1 = packet_flags & PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1 != 0;
+        if texture_copy_layout_v1 && matches!(version, GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3)
+        {
+            return Err(GxPacketError::NonCanonical(
+                "texture-copy layout provenance requires LZGX v4 or later",
+            ));
+        }
         let copy_kind = GxCopyKind::parse(read_u32(bytes, 0x10))?;
         let draw_count = read_u32(bytes, 0x14);
         let texture_count = read_u32(bytes, 0x18);
@@ -359,6 +375,16 @@ impl<'a> GxFramePacket<'a> {
             read_bp_word(bytes, 0x98, "copy filter 0")?,
             read_bp_word(bytes, 0x9c, "copy filter 1")?,
         ];
+        let copy_state = GxCopyState {
+            z_mode: terminal_z_mode,
+            blend_mode: terminal_blend_mode,
+            pixel_control,
+            copy_command,
+            clear_rgba,
+            clear_depth,
+            copy_scale,
+            copy_filter,
+        };
 
         if (copy_flags & COPY_FLAG_CLEAR != 0) != (copy_command & 0x0800 != 0) {
             return Err(GxPacketError::NonCanonical(
@@ -377,15 +403,48 @@ impl<'a> GxFramePacket<'a> {
                 value: 0,
             });
         }
-        match copy_kind {
-            GxCopyKind::Texture => {
+        match (copy_kind, texture_copy_layout_v1) {
+            (GxCopyKind::Texture, false) => {
                 if output_width != 0 || output_height != 0 || stride != 0 {
                     return Err(GxPacketError::NonCanonical(
                         "texture copies must have zero output width, output height, and stride",
                     ));
                 }
             }
-            GxCopyKind::Xfb => {
+            (GxCopyKind::Texture, true) => {
+                if !stride.is_multiple_of(32) || stride > 0x1fff_ffe0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "texture copy physical stride",
+                        value: u64::from(stride),
+                    });
+                }
+                let (clipped_width, clipped_height) =
+                    clipped_copy_extent(source_x, source_y, source_width, source_height).ok_or(
+                        GxPacketError::NonCanonical(
+                            "texture-copy layout source must overlap the EFB",
+                        ),
+                    )?;
+                let plan = gx_texture_copy_plan(clipped_width, clipped_height, copy_state)
+                    .map_err(GxPacketError::InvalidTextureCopyPlan)?;
+                if output_width == 0 || output_height == 0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "texture copy output extent",
+                        value: 0,
+                    });
+                }
+                expect_u32("texture copy output width", output_width, plan.output_width)?;
+                expect_u32(
+                    "texture copy output height",
+                    output_height,
+                    plan.output_height,
+                )?;
+            }
+            (GxCopyKind::Xfb, true) => {
+                return Err(GxPacketError::NonCanonical(
+                    "XFB copies cannot carry texture-copy layout provenance",
+                ));
+            }
+            (GxCopyKind::Xfb, false) => {
                 if output_width == 0 || output_height == 0 || stride == 0 {
                     return Err(GxPacketError::InvalidField {
                         field: "XFB output extent/stride",
@@ -508,16 +567,8 @@ impl<'a> GxFramePacket<'a> {
             stride,
             generation,
             clear: copy_flags & COPY_FLAG_CLEAR != 0,
-            copy_state: GxCopyState {
-                z_mode: terminal_z_mode,
-                blend_mode: terminal_blend_mode,
-                pixel_control,
-                copy_command,
-                clear_rgba,
-                clear_depth,
-                copy_scale,
-                copy_filter,
-            },
+            texture_copy_layout_v1,
+            copy_state,
             total_vertex_count,
         };
 
@@ -1454,6 +1505,7 @@ pub(crate) enum GxPacketError {
         expected: Option<u32>,
         actual: u32,
     },
+    InvalidTextureCopyPlan(GxTextureCopyPlanError),
 }
 
 impl fmt::Display for GxPacketError {
@@ -1571,6 +1623,9 @@ impl fmt::Display for GxPacketError {
                     "LZGX texture {texture} has invalid zero extent {width}x{height}"
                 ),
             },
+            Self::InvalidTextureCopyPlan(error) => {
+                write!(formatter, "invalid LZGX texture-copy plan: {error}")
+            }
         }
     }
 }
@@ -1748,6 +1803,13 @@ mod tests {
         put_u32(&mut bytes, 0x94, 0x000d_0e0f);
         put_u32(&mut bytes, 0x98, 0x0010_1112);
         put_u32(&mut bytes, 0x9c, 0x0013_1415);
+        bytes
+    }
+
+    fn empty_texture_copy_v4() -> Vec<u8> {
+        let mut bytes = empty_texture_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u16(&mut bytes, 0x78, GX_DRAW_RECORD_BYTES);
         bytes
     }
 
@@ -2296,6 +2358,7 @@ mod tests {
         let packet = GxFramePacket::parse(&bytes).unwrap();
         assert_eq!(packet.header().copy_kind, GxCopyKind::Texture);
         assert!(packet.header().clear);
+        assert!(!packet.header().texture_copy_layout_v1);
         assert_eq!(
             packet.header().copy_state,
             GxCopyState {
@@ -2311,6 +2374,179 @@ mod tests {
         );
         assert_eq!(packet.draws().len(), 0);
         assert_eq!(packet.textures().len(), 0);
+    }
+
+    #[test]
+    fn flagged_texture_copy_layout_clips_source_and_preserves_physical_stride() {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        put_u32(&mut bytes, 0x4c, 639);
+        put_u32(&mut bytes, 0x50, 527);
+        put_u32(&mut bytes, 0x54, 4);
+        put_u32(&mut bytes, 0x58, 4);
+        put_u32(&mut bytes, 0x5c, 1);
+        put_u32(&mut bytes, 0x60, 1);
+        put_u32(&mut bytes, 0x68, 0x3440);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert!(packet.header().texture_copy_layout_v1);
+        assert_eq!(packet.header().output_width, 1);
+        assert_eq!(packet.header().output_height, 1);
+        assert_eq!(packet.header().stride, 0x3440);
+
+        put_u32(&mut bytes, 0x68, 0);
+        assert_eq!(GxFramePacket::parse(&bytes).unwrap().header().stride, 0);
+
+        put_u32(&mut bytes, 0x4c, 638);
+        put_u32(&mut bytes, 0x50, 526);
+        put_u32(&mut bytes, 0x8c, 0x0000_0a00);
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap().header().output_width,
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_texture_copy_still_requires_zero_layout_fields() {
+        for offset in [0x5c, 0x60, 0x68] {
+            let mut bytes = empty_texture_copy();
+            put_u32(&mut bytes, offset, 1);
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::NonCanonical(
+                    "texture copies must have zero output width, output height, and stride"
+                ),
+                "layout field at {offset:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn flagged_texture_copy_rejects_layout_mismatch() {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        put_u32(&mut bytes, 0x5c, 2);
+        put_u32(&mut bytes, 0x60, 4);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "texture copy output width",
+                expected: 3,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_packet_flag() {
+        let mut bytes = empty_texture_copy();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1 << 1);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "packet flags",
+                value: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn xfb_copy_rejects_texture_layout_flag() {
+        let mut bytes = textured_xfb_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::NonCanonical("XFB copies cannot carry texture-copy layout provenance")
+        );
+    }
+
+    #[test]
+    fn flagged_texture_copy_rejects_unsupported_source_before_rendering() {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        put_u32(&mut bytes, 0x5c, 3);
+        put_u32(&mut bytes, 0x60, 4);
+        put_u32(&mut bytes, 0x88, 4);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::InvalidTextureCopyPlan(GxTextureCopyPlanError::UnsupportedSourceFormat(
+                crate::GxEfbFormat::OtherNoAlpha
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_versions_reject_texture_layout_provenance() {
+        for version in [GX_PACKET_VERSION_V2, GX_PACKET_VERSION_V3] {
+            let mut bytes = empty_texture_copy();
+            put_u16(&mut bytes, 0x04, version);
+            if version == GX_PACKET_VERSION_V3 {
+                put_u16(&mut bytes, 0x78, GX_DRAW_RECORD_BYTES);
+            }
+            put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::NonCanonical(
+                    "texture-copy layout provenance requires LZGX v4 or later"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn flagged_texture_copy_rejects_nonphysical_stride() {
+        for stride in [1, 0x2000_0000] {
+            let mut bytes = empty_texture_copy_v4();
+            put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+            put_u32(&mut bytes, 0x5c, 3);
+            put_u32(&mut bytes, 0x60, 4);
+            put_u32(&mut bytes, 0x68, stride);
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::InvalidField {
+                    field: "texture copy physical stride",
+                    value: u64::from(stride),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn texture_layout_feature_composes_with_every_v4_through_v7_tail() {
+        let mut v4 = textured_xfb_copy();
+        put_u16(&mut v4, 0x04, GX_PACKET_VERSION);
+
+        let mut exact_base = v4.clone();
+        put_u32(&mut exact_base, V3_DRAW_OFFSET + 0x04, 3);
+        let second_draw = V3_DRAW_OFFSET + usize::from(GX_DRAW_RECORD_BYTES);
+        put_u32(&mut exact_base, second_draw + 0x04, 0);
+        put_u32(&mut exact_base, second_draw + 0x08, 3 * GX_VERTEX_BYTES);
+        let positions = exact_clip_positions();
+        let v5 = promote_v4_to_v5(
+            exact_base,
+            &[(0, exact_clip_state(2), positions.as_slice())],
+        );
+        let v6 = promote_v5_to_v6(v5.clone(), &[0]);
+        let v7 = textured_xfb_copy_v7();
+
+        for (version, mut bytes) in [(4, v4), (5, v5), (6, v6), (7, v7)] {
+            put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+            put_u32(&mut bytes, 0x10, 1);
+            put_u32(&mut bytes, 0x5c, 320);
+            put_u32(&mut bytes, 0x60, 240);
+            put_u32(&mut bytes, 0x8c, 0x0000_0800);
+
+            let packet = GxFramePacket::parse(&bytes).unwrap();
+            assert_eq!(read_u16(&bytes, 0x04), version);
+            assert!(packet.header().texture_copy_layout_v1);
+            assert_eq!(packet.header().output_width, 320);
+            assert_eq!(packet.header().output_height, 240);
+        }
     }
 
     #[test]

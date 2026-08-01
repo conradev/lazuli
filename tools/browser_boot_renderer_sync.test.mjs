@@ -69,6 +69,9 @@ function workerHarness({ transferMessages = false } = {}) {
     cycles: 0,
     dispatches: 0,
     blocks: { size: 0 },
+    // Packet-layout semantics are covered by browser_boot_gx_packet.test.mjs;
+    // this harness isolates acknowledgement and transfer ordering.
+    gxAttachTextureCopyLayoutV1(packet) { return packet; },
     hex32(value) { return `0x${value.toString(16).padStart(8, "0")}`; },
     finish(status, details) { reports.push({ status, details }); },
     postMessage(message, transfer = []) {

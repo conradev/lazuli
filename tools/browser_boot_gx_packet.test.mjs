@@ -44,6 +44,7 @@ const packetFunctions = [
   "gxExpandedTriangleIndices",
   "gxFramePacketPostCullEvidence",
   "packGxFramePacketV4",
+  "gxAttachTextureCopyLayoutV1",
   "gxFramePacketExactClipInput",
   "packGxFramePacketV5",
   "packGxFramePacketV6",
@@ -327,6 +328,79 @@ test("packs the exact canonical empty LZGX v4 vector", () => {
     "d0bdcbf77a5ef318c3e8ca92c1e3a940bd9a7c331d5d7ee26fff305f8dd82667",
   );
   assert.equal(fnv1a64(packet), "9613a764ac1940e8");
+});
+
+test("attaches exact texture-copy layout without changing legacy packet versions", () => {
+  const context = packetContext();
+  const frame = emptyTextureFrame();
+  frame.stride = 0x320;
+  const packet = context.packGxFramePacketV4(1, frame);
+  const legacy = Buffer.from(packetBytes(packet));
+  const attached = context.gxAttachTextureCopyLayoutV1(packet, 1, frame);
+  const view = new DataView(attached);
+
+  assert.equal(attached, packet);
+  assert.equal(view.getUint16(0x04, true), 4);
+  assert.equal(view.getUint32(0x0c, true), 1);
+  assert.equal(view.getUint32(0x5c, true), 3);
+  assert.equal(view.getUint32(0x60, true), 4);
+  assert.equal(view.getUint32(0x68, true), 0x320);
+  assert.deepEqual(packetBytes(attached).subarray(0, 0x0c), legacy.subarray(0, 0x0c));
+  assert.deepEqual(packetBytes(attached).subarray(0x10, 0x5c), legacy.subarray(0x10, 0x5c));
+  assert.deepEqual(packetBytes(attached).subarray(0x6c), legacy.subarray(0x6c));
+});
+
+test("texture-copy layout clips before half-scaling and preserves zero stride", () => {
+  const context = packetContext();
+  const frame = {
+    ...emptyTextureFrame(),
+    sourceX: 638,
+    sourceY: 526,
+    width: 4,
+    sourceHeight: 4,
+    stride: 0,
+    copyState: copyState(0x000a00),
+  };
+  const packet = context.packGxFramePacketV4(1, frame);
+  context.gxAttachTextureCopyLayoutV1(packet, 1, frame);
+  const view = new DataView(packet);
+
+  assert.equal(view.getUint32(0x5c, true), 1);
+  assert.equal(view.getUint32(0x60, true), 1);
+  assert.equal(view.getUint32(0x68, true), 0);
+
+  const empty = {
+    ...frame,
+    sourceX: 639,
+    sourceY: 527,
+  };
+  const emptyPacket = context.packGxFramePacketV4(1, empty);
+  const legacyEmpty = Buffer.from(packetBytes(emptyPacket));
+  assert.equal(
+    context.gxAttachTextureCopyLayoutV1(emptyPacket, 1, empty),
+    emptyPacket,
+  );
+  assert.deepEqual(packetBytes(emptyPacket), legacyEmpty);
+
+  const nonphysicalStride = { ...frame, stride: 1 };
+  assert.throws(
+    () => context.gxAttachTextureCopyLayoutV1(
+      context.packGxFramePacketV4(1, nonphysicalStride),
+      1,
+      nonphysicalStride,
+    ),
+    /physical stride must be a shifted 24-bit BP4D value/,
+  );
+});
+
+test("texture-copy layout leaves XFB packets byte-identical", () => {
+  const context = packetContext();
+  const frame = evidencedXfbFrame();
+  const packet = context.packGxFramePacketV4(2, frame);
+  const expected = Buffer.from(packetBytes(packet));
+
+  assert.equal(context.gxAttachTextureCopyLayoutV1(packet, 2, frame), packet);
+  assert.deepEqual(packetBytes(packet), expected);
 });
 
 test("appends canonical post-cull evidence without rewriting raw draw bytes", () => {

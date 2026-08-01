@@ -1,5 +1,5 @@
 //! Pixel engine (PE).
-use bitos::integer::{u2, u3, u4, u10, u11};
+use bitos::integer::{u4, u10, u11};
 use bitos::{BitUtils, Bits, bitos};
 use color::Abgr8;
 use gekko::Address;
@@ -103,8 +103,8 @@ pub enum DepthCopyFormat {
     Z8H       = 0x8,
     Z8M       = 0x9,
     Z8L       = 0xA,
-    Z16A      = 0xB,
-    Z16B      = 0xC,
+    Z16R      = 0xB,
+    Z16L      = 0xC,
     Reserved4 = 0xD,
     Reserved5 = 0xE,
     Reserved6 = 0xF,
@@ -121,11 +121,19 @@ impl DepthCopyFormat {
             Self::Z8H => I8,
             Self::Z8M => I8,
             Self::Z8L => I8,
-            Self::Z16A => IA8,
-            Self::Z16B => IA8,
+            Self::Z16R => IA8,
+            Self::Z16L => IA8,
             _ => panic!("reserved copy format {self:?}"),
         }
     }
+
+    // Keep the old names available until the texture encoder is migrated to
+    // the hardware names. Raw format 0xB selects the high and middle depth
+    // bytes (Z16R); raw format 0xC selects the middle and low bytes (Z16L).
+    #[allow(non_upper_case_globals)]
+    pub const Z16A: Self = Self::Z16R;
+    #[allow(non_upper_case_globals)]
+    pub const Z16B: Self = Self::Z16L;
 }
 
 #[bitos(4)]
@@ -133,7 +141,7 @@ impl DepthCopyFormat {
 pub enum ColorCopyFormat {
     #[default]
     R4        = 0x0,
-    Y8        = 0x1,
+    R8_0x1    = 0x1,
     RA4       = 0x2,
     RA8       = 0x3,
     RGB565    = 0x4,
@@ -155,11 +163,11 @@ impl ColorCopyFormat {
         use tex::Format::*;
         match self {
             Self::R4 => I4,
-            Self::Y8 => I8,
+            Self::R8_0x1 => I8,
             Self::RA4 => IA4,
             Self::RA8 => IA8,
             Self::RGB565 => RGB565,
-            Self::RGB5A3 => RGB565,
+            Self::RGB5A3 => RGB5A3,
             Self::RGBA8 => RGBA8,
             Self::A8 => I8,
             Self::R8 => I8,
@@ -170,39 +178,82 @@ impl ColorCopyFormat {
             _ => panic!("reserved copy format {self:?}"),
         }
     }
+
+    // Intensity conversion is controlled by two independent BP52 bits. The
+    // raw 0x1 tile-encoder mode is not intrinsically a luma format.
+    #[allow(non_upper_case_globals)]
+    pub const Y8: Self = Self::R8_0x1;
+}
+
+#[bitos(2)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyGamma {
+    #[default]
+    Gamma1_0         = 0b00,
+    Gamma1_7         = 0b01,
+    Gamma2_2         = 0b10,
+    Gamma2_2Reserved = 0b11,
+}
+
+#[bitos(2)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameToField {
+    #[default]
+    Progressive    = 0b00,
+    Reserved       = 0b01,
+    InterlacedEven = 0b10,
+    InterlacedOdd  = 0b11,
 }
 
 #[bitos(32)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CopyCmd {
-    #[bits(0..2)]
-    pub clamp: u2,
-    #[bits(3)]
-    pub format_bit_3: bool,
-    #[bits(4..7)]
-    pub format_bits_0to2: u3,
+    #[bits(0)]
+    pub clamp_top: bool,
+    #[bits(1)]
+    pub clamp_bottom: bool,
+    #[bits(2)]
+    pub unknown_bit: bool,
+    #[bits(3..7)]
+    pub target_format: u4,
     #[bits(7..9)]
-    pub gamma: u2,
+    pub gamma: CopyGamma,
     #[bits(9)]
     pub half: bool,
+    #[bits(10)]
+    pub scale_invert: bool,
     #[bits(11)]
     pub clear: bool,
-    /// to XFB or to texture?
+    #[bits(12..14)]
+    pub frame_to_field: FrameToField,
     #[bits(14)]
     pub to_xfb: bool,
+    #[bits(15)]
+    pub intensity_format: bool,
+    #[bits(16)]
+    pub auto_convert: bool,
 }
 
 impl CopyCmd {
+    /// Returns the tile-encoder format after BP52's four format bits are
+    /// rotated right by one position.
+    pub fn raw_format(&self) -> u4 {
+        let encoded = self.target_format().value();
+        u4::new((encoded >> 1) | ((encoded & 1) << 3))
+    }
+
     pub fn color_format(&self) -> ColorCopyFormat {
-        ColorCopyFormat::from_bits(u4::new(
-            (self.format_bit_3() as u8) << 3 | self.format_bits_0to2().value(),
-        ))
+        ColorCopyFormat::from_bits(self.raw_format())
     }
 
     pub fn depth_format(&self) -> DepthCopyFormat {
-        DepthCopyFormat::from_bits(u4::new(
-            (self.format_bit_3() as u8) << 3 | self.format_bits_0to2().value(),
-        ))
+        DepthCopyFormat::from_bits(self.raw_format())
+    }
+
+    /// Luma/intensity conversion is enabled only when both BP52 controls are
+    /// set. Neither bit changes the raw tile-encoder format by itself.
+    pub fn intensity(&self) -> bool {
+        self.intensity_format() && self.auto_convert()
     }
 }
 
@@ -392,6 +443,9 @@ pub struct FramebufferCopy {
     pub dst: Address,
     pub dims: CopyDims,
     pub stride: u32,
+    pub scale: u32,
+    pub command: CopyCmd,
+    pub filter: [u32; 2],
     pub clear_color: Abgr8,
     pub clear_depth: u32,
 }
@@ -416,5 +470,86 @@ impl Interface {
             .set_token(self.interrupt.token() & !status.bit(2));
         self.interrupt
             .set_finish(self.interrupt.finish() & !status.bit(3));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitos::TryBits;
+
+    use super::*;
+
+    fn encoded_target_format(raw_format: u8) -> u8 {
+        ((raw_format << 1) & 0xF) | (raw_format >> 3)
+    }
+
+    #[test]
+    fn copy_command_decodes_every_rotated_target_format() {
+        for encoded in 0..16 {
+            let command = CopyCmd::from_bits(encoded << 3);
+            let expected = (encoded >> 1) | ((encoded & 1) << 3);
+
+            assert_eq!(command.target_format().value(), encoded as u8);
+            assert_eq!(command.raw_format().value(), expected as u8);
+            assert_eq!(command.color_format().to_bits().value(), expected as u8);
+            assert_eq!(command.depth_format().to_bits().value(), expected as u8);
+        }
+    }
+
+    #[test]
+    fn copy_command_exposes_every_architected_field() {
+        let bits = (1 << 0)
+            | (1 << 1)
+            | (1 << 2)
+            | (encoded_target_format(5) as u32) << 3
+            | (0b11 << 7)
+            | (1 << 9)
+            | (1 << 10)
+            | (1 << 11)
+            | (0b11 << 12)
+            | (1 << 14)
+            | (1 << 15)
+            | (1 << 16);
+        let command = CopyCmd::from_bits(bits);
+
+        assert!(command.clamp_top());
+        assert!(command.clamp_bottom());
+        assert!(command.unknown_bit());
+        assert_eq!(command.color_format(), ColorCopyFormat::RGB5A3);
+        assert_eq!(command.gamma(), CopyGamma::Gamma2_2Reserved);
+        assert!(command.half());
+        assert!(command.scale_invert());
+        assert!(command.clear());
+        assert_eq!(command.frame_to_field(), FrameToField::InterlacedOdd);
+        assert!(command.to_xfb());
+        assert!(command.intensity_format());
+        assert!(command.auto_convert());
+        assert!(command.intensity());
+    }
+
+    #[test]
+    fn copy_command_requires_both_intensity_controls() {
+        for intensity_format in [false, true] {
+            for auto_convert in [false, true] {
+                let bits = ((intensity_format as u32) << 15) | ((auto_convert as u32) << 16);
+                let command = CopyCmd::from_bits(bits);
+                assert_eq!(command.intensity(), intensity_format && auto_convert);
+            }
+        }
+    }
+
+    #[test]
+    fn copy_formats_preserve_exact_base_texture_semantics() {
+        let rgb5a3 = CopyCmd::from_bits((encoded_target_format(5) as u32) << 3);
+        assert_eq!(rgb5a3.color_format(), ColorCopyFormat::RGB5A3);
+        assert_eq!(rgb5a3.color_format().texture_format(), tex::Format::RGB5A3);
+
+        let z16r = CopyCmd::from_bits((encoded_target_format(0xB) as u32) << 3);
+        assert_eq!(z16r.depth_format(), DepthCopyFormat::Z16R);
+        assert_eq!(z16r.depth_format().texture_format(), tex::Format::IA8);
+
+        let z16l = CopyCmd::from_bits((encoded_target_format(0xC) as u32) << 3);
+        assert_eq!(z16l.depth_format(), DepthCopyFormat::Z16L);
+        assert_eq!(z16l.depth_format().texture_format(), tex::Format::IA8);
     }
 }
