@@ -845,7 +845,8 @@ export async function waitForPublicSmbTerminal(
       || report?.stage === "scenario-complete";
     if (!terminal && state.dataset.status === "running") {
       snapshotRequestedAtMs = now();
-      if (await requestSnapshot(session) !== true) {
+      const diagnosticsRequestId = await requestSnapshot(session);
+      if (!Number.isSafeInteger(diagnosticsRequestId) || diagnosticsRequestId <= 0) {
         throw captureFailure(
           "public SMB cycle runner cannot publish a sustained snapshot",
         );
@@ -853,6 +854,7 @@ export async function waitForPublicSmbTerminal(
       const snapshot = await waitSnapshot(session, {
         deadline,
         pollMs,
+        requestId: diagnosticsRequestId,
       });
       state = snapshot.state;
       report = snapshot.report;

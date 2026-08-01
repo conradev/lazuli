@@ -277,10 +277,8 @@ export function publicWarioWareSnapshotHasCoherentXfb(report) {
 }
 
 async function capturePublicWarioWareSnapshot(session, { deadline, pollMs }) {
-  if (await requestPublicSnapshot(session) !== true) {
-    throw new Error("public WarioWare cycle runner cannot publish a snapshot");
-  }
-  return waitForPublicSnapshot(session, { deadline, pollMs });
+  const requestId = await requestPublicSnapshot(session);
+  return waitForPublicSnapshot(session, { deadline, pollMs, requestId });
 }
 
 export async function waitForCoherentPublicWarioWareSnapshot(

@@ -13,7 +13,7 @@ import {
 } from "./browser_game_compatibility_oracle.mjs";
 
 export const GAME_FIRST_PLAYABLE_TRANSCRIPT_SCHEMA =
-  "lazuli-game-first-playable-transcript-v1";
+  "lazuli-game-first-playable-transcript-v2";
 
 export const GAME_FIRST_PLAYABLE_BUTTONS = Object.freeze({
   a: 0x0100,

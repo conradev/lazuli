@@ -81,7 +81,7 @@ test("builds a deterministic licensed release from a generic generated frontend"
   const sourceAnchor = '<a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a>';
   await writeFile(
     appPath,
-    `<!doctype html><body>${sourceAnchor}<main class="shell" data-surface="debug">
+    `<!doctype html><body><main class="shell" data-surface="debug">
 <!-- LAZULI DEBUG UI START -->
 <div id="runner-controls">
 <button id="pause-runner">Pause</button>
@@ -95,7 +95,7 @@ test("builds a deterministic licensed release from a generic generated frontend"
 <script type="module">import initRenderer from "/browser_renderer.js";
 new URL("/ppcwasmjit.wasm", location.href);
 ${genericDiscSourceConfig}
-</script></main></body>`,
+</script><footer>${sourceAnchor}</footer></main></body>`,
   );
   const wasm = Buffer.alloc(WASM_CHUNK_SIZE * 2 + 17);
   for (let index = 0; index < wasm.length; index += 1) wasm[index] = index * 31 & 0xff;
@@ -151,6 +151,14 @@ ${genericDiscSourceConfig}
   assert.match(
     frontend,
     /href="\/source\/"[^>]*>Legal<\/a>/,
+  );
+  assert.match(
+    frontend,
+    /<footer><button id="capture-diagnostics" type="button" aria-controls="result" data-capture-state="unavailable" disabled>Capture diagnostics<\/button> · <a [^>]*>Source<\/a> · <a [^>]*>Legal<\/a><\/footer>/,
+  );
+  assert.doesNotMatch(
+    frontend.match(/<button id="capture-diagnostics"[^>]*>[\s\S]*?<\/button>/)?.[0] ?? "",
+    /download|formaction|type="file"|fetch\(|XMLHttpRequest/,
   );
   assert.doesNotMatch(frontend, />GPL-3\.0-only<|>Apache-2\.0 font notice</);
   assert.doesNotMatch(frontend, /href="https:\/\/github\.com\/conradev\/lazuli"/);

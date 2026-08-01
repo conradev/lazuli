@@ -795,7 +795,29 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     .shell[data-surface="release"] footer span { display: none; }
-    .shell[data-surface="release"] footer a { font-size: 0.65rem; }
+    .shell[data-surface="release"] footer a,
+    .shell[data-surface="release"] footer button {
+      color: #aeb7c4;
+      font-size: 0.65rem;
+    }
+
+    .shell[data-surface="release"] footer button {
+      min-height: 0;
+      border: 0;
+      padding: 0;
+      background: transparent;
+      font-weight: inherit;
+    }
+
+    .shell[data-surface="release"] footer button:hover:not(:disabled) {
+      background: transparent;
+      color: #eef1f5;
+    }
+
+    .shell[data-surface="release"] footer button:disabled {
+      color: #737b87;
+      cursor: default;
+    }
 
     body[data-status="waiting"] .shell[data-surface="release"] header {
       top: 50%;
@@ -999,6 +1021,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let runnerPaused = false;
     let runnerStopRequested = false;
     let runnerSnapshotRequested = false;
+    let runnerSnapshotRequestId = null;
     let runnerResume = null;
     let rendererFrameSequence = 0;
     const rendererFramesInFlight = new Set();
@@ -1348,6 +1371,22 @@ const TEMPLATE: &str = r##"<!doctype html>
         statusDataset.controllerQueue = "overflow";
       }
     }
+
+    function requestRunnerSnapshot(diagnosticsRequestId) {
+      const alreadyRequested = runnerSnapshotRequested;
+      runnerSnapshotRequested = true;
+      if (
+        Number.isSafeInteger(diagnosticsRequestId)
+        && diagnosticsRequestId > 0
+        && runnerSnapshotRequestId === null
+      ) {
+        runnerSnapshotRequestId = diagnosticsRequestId;
+      } else if (!alreadyRequested) {
+        // Debug snapshots intentionally carry no public request identity.
+        runnerSnapshotRequestId = null;
+      }
+    }
+
     addEventListener("message", event => {
       const message = event.data;
       if (message?.type === "controller") {
@@ -1410,7 +1449,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           runnerResume?.();
           rendererBackpressureResume?.();
         } else if (message.action === "snapshot") {
-          runnerSnapshotRequested = true;
+          requestRunnerSnapshot(message.diagnosticsRequestId);
         }
       }
     });
@@ -6515,6 +6554,16 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxDisplayListErrors = 0;
     let gxVertexDecodeErrors = 0;
     let gxUnknownOpcodes = 0;
+    // Missing-feature telemetry is bounded and behavior-neutral. Preserve the
+    // first consumer-visible gap for diagnosis, then retain only saturated
+    // per-reason and per-BP-address counters for the rest of this worker boot.
+    const gxUnsupportedReasonLimit = 32;
+    const gxUnsupportedCountLimit = 0xffffffff;
+    const gxUnsupportedReasonCounts = new Map();
+    const gxUnsupportedAddressCounts = new Uint32Array(256);
+    let gxUnsupportedTotalEvents = 0;
+    let gxUnsupportedUntrackedReasonEvents = 0;
+    let gxFirstUnsupportedEvent = null;
     let gxTextureDecodes = 0;
     let gxTextureCacheHits = 0;
     let gxTextureSourceHashComputations = 0;
@@ -9912,6 +9961,25 @@ const TEMPLATE: &str = r##"<!doctype html>
         width,
         height
       );
+      if (
+        typeof gxRecordUnsupported === "function"
+        && strictV7Preflight !== null
+        && typeof strictV7Preflight === "object"
+        && strictV7Preflight.accepted !== true
+      ) {
+        const mode1Failure = strictV7Preflight.reason === "invalid-mode1"
+          || strictV7Preflight.reason === "noncanonical-mode1-bits";
+        const imageFailure =
+          strictV7Preflight.reason === "unsupported-texture-format"
+          || strictV7Preflight.reason === "invalid-texture-dimensions";
+        gxRecordUnsupported(
+          `texture-preflight:${strictV7Preflight.reason}`,
+          mode1Failure
+            ? registers.mode1
+            : imageFailure ? registers.image0 : registers.mode0,
+          mode1Failure ? rawMode1 : imageFailure ? image0 : rawMode0
+        );
+      }
       const sampler = gxTextureSamplerState(rawMode0, rawMode1);
       const layout = gxTextureLayout(format);
       if (layout === null || width > 1024 || height > 1024 || width * height > 1_048_576) {
@@ -9940,6 +10008,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         // IMAGE3 is not a main-memory address when IMAGE1 selects manually
         // managed/preloaded TMEM. Reject that path until its even/odd TMEM
         // banks are modeled instead of decoding unrelated DRAM.
+        if (typeof gxRecordUnsupported === "function") {
+          gxRecordUnsupported(
+            "preloaded-tmem-texture",
+            registers.image1,
+            gxBpRegisters[registers.image1],
+            `map=${textureMap}`
+          );
+        }
         gxTextureDecodeErrors += 1;
         return null;
       }
@@ -10017,6 +10093,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         paletteFormat = (tlut >>> 10) & 3;
         const paletteBytes = paletteEntries * 2;
         if (paletteFormat > 2 || paletteOffset + paletteBytes > gxTmem.length) {
+          if (
+            paletteFormat > 2
+            && typeof gxRecordUnsupported === "function"
+          ) {
+            gxRecordUnsupported(
+              "tlut-format",
+              registers.tlut,
+              tlut,
+              `map=${textureMap}`
+            );
+          }
           gxTextureDecodeErrors += 1;
           return null;
         }
@@ -11976,6 +12063,37 @@ const TEMPLATE: &str = r##"<!doctype html>
           return;
         }
       }
+      if (typeof gxRecordUnsupported === "function") {
+        const genMode = gxBpRegisters[0x00] >>> 0;
+        if (topology > 4) {
+          gxRecordUnsupported(
+            "unsupported-primitive-topology",
+            null,
+            opcode
+          );
+        }
+        if ((genMode & (1 << 9)) !== 0) {
+          gxRecordUnsupported("multisampling", 0x00, genMode);
+        }
+        if ((genMode & (1 << 19)) !== 0) {
+          gxRecordUnsupported("z-freeze", 0x00, genMode);
+        }
+        const indirectStageCount = (genMode >>> 16) & 7;
+        const indirectStage = indirectStageCount === 0
+          ? undefined
+          : stages.find(stage => (
+              gxBpRegisters[0x10 + stage.index] & 0x00ffffff
+            ) !== 0);
+        if (indirectStage !== undefined) {
+          const indirectAddress = 0x10 + indirectStage.index;
+          gxRecordUnsupported(
+            "indirect-tev",
+            indirectAddress,
+            gxBpRegisters[indirectAddress],
+            `stages=${indirectStageCount}`
+          );
+        }
+      }
       gxFrameDrawVertices += vertexCount;
       for (const stage of stages) {
         if (!stage.textureEnabled) continue;
@@ -12116,6 +12234,103 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxRecentPrimitiveSamples.shift();
         }
       }
+    }
+
+    function gxSaturatingUnsupportedIncrement(value) {
+      return value >= gxUnsupportedCountLimit
+        ? gxUnsupportedCountLimit
+        : value + 1;
+    }
+
+    function gxRecordUnsupported(
+      reason,
+      address = null,
+      value = null,
+      detail = null
+    ) {
+      const normalizedReason = (
+        typeof reason === "string" && reason.length !== 0
+      )
+        ? reason.slice(0, 96)
+        : "unknown";
+      const normalizedAddress = (
+        Number.isInteger(address) && address >= 0 && address < 256
+      )
+        ? address
+        : null;
+      const normalizedValue = Number.isInteger(value) ? value >>> 0 : null;
+      const normalizedDetail = typeof detail === "string"
+        ? detail.slice(0, 96)
+        : null;
+
+      gxUnsupportedTotalEvents = gxSaturatingUnsupportedIncrement(
+        gxUnsupportedTotalEvents
+      );
+      const previousReasonCount = gxUnsupportedReasonCounts.get(
+        normalizedReason
+      );
+      if (previousReasonCount !== undefined) {
+        gxUnsupportedReasonCounts.set(
+          normalizedReason,
+          gxSaturatingUnsupportedIncrement(previousReasonCount)
+        );
+      } else if (gxUnsupportedReasonCounts.size < gxUnsupportedReasonLimit) {
+        gxUnsupportedReasonCounts.set(normalizedReason, 1);
+      } else {
+        gxUnsupportedUntrackedReasonEvents = gxSaturatingUnsupportedIncrement(
+          gxUnsupportedUntrackedReasonEvents
+        );
+      }
+      if (normalizedAddress !== null) {
+        gxUnsupportedAddressCounts[normalizedAddress] =
+          gxSaturatingUnsupportedIncrement(
+            gxUnsupportedAddressCounts[normalizedAddress]
+          );
+      }
+      if (gxFirstUnsupportedEvent === null) {
+        gxFirstUnsupportedEvent = Object.freeze({
+          reason: normalizedReason,
+          address: normalizedAddress === null
+            ? null
+            : "0x" + normalizedAddress.toString(16).padStart(2, "0"),
+          value: normalizedValue === null
+            ? null
+            : "0x" + normalizedValue.toString(16).padStart(8, "0"),
+          detail: normalizedDetail,
+          cycle: cycles,
+          dispatch: dispatches,
+        });
+      }
+    }
+
+    function snapshotGxUnsupported() {
+      const reasonCounts = Array.from(
+        gxUnsupportedReasonCounts,
+        ([reason, count]) => ({ reason, count })
+      ).sort((left, right) => (
+        left.reason < right.reason ? -1 : left.reason > right.reason ? 1 : 0
+      ));
+      const addressCounts = [];
+      for (let address = 0; address < gxUnsupportedAddressCounts.length; address += 1) {
+        const count = gxUnsupportedAddressCounts[address];
+        if (count === 0) continue;
+        addressCounts.push({
+          address: "0x" + address.toString(16).padStart(2, "0"),
+          count,
+        });
+      }
+      return {
+        schema: "lazuli-gx-unsupported-v1",
+        totalEvents: gxUnsupportedTotalEvents,
+        firstEvent: gxFirstUnsupportedEvent === null
+          ? null
+          : { ...gxFirstUnsupportedEvent },
+        reasonCounts,
+        addressCounts,
+        reasonKeyLimit: gxUnsupportedReasonLimit,
+        countLimit: gxUnsupportedCountLimit,
+        untrackedReasonEvents: gxUnsupportedUntrackedReasonEvents,
+      };
     }
 
     function gxSparseRegisters(registers) {
@@ -12261,6 +12476,32 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxBpRegisters[0x54] >>> 0,
         ],
       };
+      if (typeof gxRecordUnsupported === "function") {
+        const sourceFormat = copyState.pixelControl & 7;
+        if (sourceFormat >= 4) {
+          gxRecordUnsupported(
+            "efb-copy-source-format",
+            0x43,
+            copyState.pixelControl,
+            `cmode1-required:${sourceFormat}`
+          );
+        }
+        if (
+          !copyToXfb
+          && gxCopyTextureLayout(trigger, copyState.pixelControl) === null
+        ) {
+          const targetFormat = (
+            ((trigger & 0x08) !== 0 ? 8 : 0)
+            | ((trigger >>> 4) & 7)
+          );
+          gxRecordUnsupported(
+            "efb-copy-target-format",
+            0x52,
+            trigger,
+            `copy-format=${targetFormat}`
+          );
+        }
+      }
       const frame = {
         index: copyToXfb ? gxXfbCopyCount + 1 : gxTextureCopyCount + 1,
         capturedAtCycle: cycles,
@@ -12396,6 +12637,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           const vertices = gxReadU16(source, offset + 1);
           commandBytes = 3 + vertices * gxVertexSize(opcode & 7);
         } else {
+          if (typeof gxRecordUnsupported === "function") {
+            gxRecordUnsupported(
+              "unknown-opcode",
+              null,
+              opcode,
+              inDisplayList ? "display-list" : "fifo"
+            );
+          }
           gxUnknownOpcodes += 1;
           offset += 1;
           continue;
@@ -12450,6 +12699,15 @@ const TEMPLATE: &str = r##"<!doctype html>
                 }
               }
             }
+          } else if (typeof gxRecordUnsupported === "function") {
+            // Nested CALL_DL is currently consumed but not executed. Record
+            // only that actual skipped call, not ordinary display-list state.
+            gxRecordUnsupported(
+              "nested-display-list",
+              null,
+              address,
+              `size=${size}`
+            );
           }
         } else if (opcode === 0x61) {
           recordGxBpWrite(gxReadU32(source, offset + 1));
@@ -14822,6 +15080,27 @@ const TEMPLATE: &str = r##"<!doctype html>
           break;
         default:
           return reject("format", "integer-size-rejected");
+      }
+      if (typeof gxRecordUnsupported === "function") {
+        // PE exposes the accumulated X and Y bounding-box pairs as two
+        // four-byte register windows. Only classify a successful read wholly
+        // inside one pair; crossing or rejected accesses remain ordinary MMIO
+        // diagnostics instead of compatibility false positives.
+        const bboxAddress = (
+          physical >= 0x0c001010 && physical + size <= 0x0c001014
+        )
+          ? 0x55
+          : (
+              physical >= 0x0c001014 && physical + size <= 0x0c001018
+            ) ? 0x56 : null;
+        if (bboxAddress !== null) {
+          gxRecordUnsupported(
+            "bounding-box-read",
+            bboxAddress,
+            null,
+            `size=${size}`
+          );
+        }
       }
       if (lockedSource !== null) {
         lockedCacheReads += 1;
@@ -24489,6 +24768,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             pendingFrameVertices: gxFrameDrawVertices,
             pendingFrameSkippedPrimitives: gxFrameSkippedPrimitives,
             unknownOpcodes: gxUnknownOpcodes,
+            unsupported: snapshotGxUnsupported(),
             textures: {
               draws: gxTexturedDraws,
               decodes: gxTextureDecodes,
@@ -25050,10 +25330,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function publishRunnerSnapshot() {
+      const diagnosticsRequestId = runnerSnapshotRequestId;
       runnerSnapshotRequested = false;
+      runnerSnapshotRequestId = null;
       const status = runnerPaused ? "paused" : "running";
       finish(status, {
         stage: "snapshot",
+        ...(diagnosticsRequestId === null ? {} : { diagnosticsRequestId }),
         pc: hex32(pc),
         instructions,
         cycles,
@@ -27777,14 +28060,90 @@ const TEMPLATE: &str = r##"<!doctype html>
         : null;
     const discStatus = document.querySelector("#disc-status");
     const iplStatus = document.querySelector("#ipl-status");
+    const captureDiagnosticsButton = document.querySelector("#capture-diagnostics");
     let worker = null;
     let workerUrl = null;
     let terminalPublicationSequence = 0;
+    let captureDiagnosticsRequestSequence = 0;
+    let captureDiagnosticsPendingRequestId = null;
     let controllerScenarioState = null;
     let selectedCompatibilityRunnerSearch = "";
     let selectedLocalIpl = null;
     let activeDiscConfig = null;
     let activeDiscLabel = null;
+
+    function resetCaptureDiagnosticsControl() {
+      captureDiagnosticsPendingRequestId = null;
+      if (captureDiagnosticsButton === null) return;
+      captureDiagnosticsButton.disabled = worker === null;
+      captureDiagnosticsButton.textContent = "Capture diagnostics";
+      captureDiagnosticsButton.dataset.captureState = worker === null
+        ? "unavailable"
+        : "ready";
+      delete captureDiagnosticsButton.dataset.requestId;
+      delete captureDiagnosticsButton.dataset.completedRequestId;
+      delete captureDiagnosticsButton.dataset.failedRequestId;
+      delete captureDiagnosticsButton.dataset.failure;
+    }
+
+    function requestCaptureDiagnostics() {
+      if (
+        captureDiagnosticsButton === null
+        || worker === null
+        || captureDiagnosticsPendingRequestId !== null
+      ) {
+        return false;
+      }
+      captureDiagnosticsRequestSequence += 1;
+      const requestId = captureDiagnosticsRequestSequence;
+      captureDiagnosticsPendingRequestId = requestId;
+      captureDiagnosticsButton.disabled = true;
+      captureDiagnosticsButton.textContent = "Capturing…";
+      captureDiagnosticsButton.dataset.captureState = "pending";
+      captureDiagnosticsButton.dataset.requestId = String(requestId);
+      delete captureDiagnosticsButton.dataset.completedRequestId;
+      delete captureDiagnosticsButton.dataset.failedRequestId;
+      delete captureDiagnosticsButton.dataset.failure;
+      output.textContent = "";
+      globalThis.lazuliCycleRunner.snapshot(requestId);
+      return requestId;
+    }
+
+    function completeCaptureDiagnostics(report) {
+      const requestId = captureDiagnosticsPendingRequestId;
+      if (
+        requestId === null
+        || report?.stage !== "snapshot"
+        || report?.diagnosticsRequestId !== requestId
+      ) {
+        return false;
+      }
+      captureDiagnosticsPendingRequestId = null;
+      if (captureDiagnosticsButton === null) return true;
+      captureDiagnosticsButton.disabled = false;
+      captureDiagnosticsButton.textContent = "Capture diagnostics";
+      captureDiagnosticsButton.dataset.captureState = "complete";
+      captureDiagnosticsButton.dataset.completedRequestId = String(requestId);
+      delete captureDiagnosticsButton.dataset.failedRequestId;
+      delete captureDiagnosticsButton.dataset.failure;
+      return true;
+    }
+
+    function failCaptureDiagnostics(reason) {
+      const requestId = captureDiagnosticsPendingRequestId;
+      captureDiagnosticsPendingRequestId = null;
+      if (captureDiagnosticsButton === null) return requestId !== null;
+      captureDiagnosticsButton.disabled = true;
+      captureDiagnosticsButton.textContent = "Diagnostics failed";
+      captureDiagnosticsButton.dataset.captureState = "failed";
+      if (requestId === null) {
+        delete captureDiagnosticsButton.dataset.failedRequestId;
+      } else {
+        captureDiagnosticsButton.dataset.failedRequestId = String(requestId);
+      }
+      captureDiagnosticsButton.dataset.failure = String(reason);
+      return requestId !== null;
+    }
 
     function resetPresentation() {
       output.textContent = "STARTING";
@@ -27853,6 +28212,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       globalThis.lazuliWorker = worker;
       discStatus.textContent = label;
+      resetCaptureDiagnosticsControl();
       queueMicrotask(() => { lastControllerPacket = ""; });
       return worker;
     }
@@ -27903,8 +28263,17 @@ const TEMPLATE: &str = r##"<!doctype html>
         postRunControl({ action: "presentation", renderEvery });
       },
       stop() { postRunControl({ action: "stop" }); },
-      snapshot() { postRunControl({ action: "snapshot" }); },
+      snapshot(diagnosticsRequestId) {
+        const message = { action: "snapshot" };
+        if (diagnosticsRequestId !== undefined) {
+          message.diagnosticsRequestId = diagnosticsRequestId;
+        }
+        postRunControl(message);
+      },
     };
+    if (captureDiagnosticsButton !== null) {
+      captureDiagnosticsButton.addEventListener("click", requestCaptureDiagnostics);
+    }
     const discFileInput = document.querySelector("#disc-file");
     discFileInput.addEventListener("click", event => {
       event.currentTarget.value = "";
@@ -28647,9 +29016,6 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
     async function publishWorkerTerminalReport(text, sourceWorker = worker) {
       if (worker !== sourceWorker) return false;
-      const publicationSequence = ++terminalPublicationSequence;
-      const isCurrentPublication = () => worker === sourceWorker
-        && terminalPublicationSequence === publicationSequence;
       const report = parseWorkerTerminalReport(text);
       if (report === null) {
         handleWorkerError({
@@ -28658,6 +29024,30 @@ const TEMPLATE: &str = r##"<!doctype html>
         });
         return false;
       }
+      const diagnosticsRequestId = captureDiagnosticsPendingRequestId;
+      const matchesDiagnosticsRequest = diagnosticsRequestId !== null
+        && report.stage === "snapshot"
+        && report.diagnosticsRequestId === diagnosticsRequestId;
+      const terminalFailure = report.status === "stopped"
+        || (report.error !== undefined && report.error !== null);
+      if (
+        diagnosticsRequestId !== null
+        && !matchesDiagnosticsRequest
+        && !terminalFailure
+      ) {
+        // An explicit public capture owns the report sink until the worker
+        // echoes its identity. Do not let an older automatic publication
+        // supersede the requested snapshot while renderer capture is pending.
+        return false;
+      }
+      if (diagnosticsRequestId !== null && terminalFailure) {
+        failCaptureDiagnostics(
+          report.error ?? "worker stopped before publishing diagnostics"
+        );
+      }
+      const publicationSequence = ++terminalPublicationSequence;
+      const isCurrentPublication = () => worker === sourceWorker
+        && terminalPublicationSequence === publicationSequence;
       const hostMetrics = rendererHostMetrics;
       const temporalFrames = temporalSelectedXfbFrames;
       const backend = document.body.dataset.renderer ?? null;
@@ -28675,6 +29065,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (!isCurrentPublication()) return false;
         report.rendering = { ...capture, backend };
         output.textContent = JSON.stringify(report, null, 2);
+        completeCaptureDiagnostics(report);
         return true;
       } catch (error) {
         if (!isCurrentPublication()) return false;
@@ -28757,6 +29148,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const message = String(event.message || "unknown worker error");
       const rendererError = String(event.rendererError ?? message);
       terminalPublicationSequence += 1;
+      failCaptureDiagnostics(message);
       document.body.dataset.status = "stopped";
       runnerStatus.textContent = "worker error";
       discStatus.textContent = message;

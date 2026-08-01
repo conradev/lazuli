@@ -15,9 +15,11 @@ import {
   configurePublicCompatibilityDebug,
   configurePublicViewport,
   expectedPublicFrameUrl,
+  requestPublicSnapshot,
   validateObservedPublicActiveRelease,
   waitForPublicRelease,
   waitForPublicRunner,
+  waitForPublicSnapshot,
 } from "./browser_public_cdp.mjs";
 
 async function activeRelease() {
@@ -64,6 +66,13 @@ function readyState(frameUrl, publicUrl) {
     compatibilityDebugAvailable: true,
     compositorCaptureAvailable: false,
     dataset: { renderer: "wgpu-webgpu", status: "waiting" },
+    diagnosticsCaptureAvailable: true,
+    diagnosticsCaptureCompletedRequestId: null,
+    diagnosticsCaptureDisabled: true,
+    diagnosticsCaptureFailedRequestId: null,
+    diagnosticsCaptureFailure: null,
+    diagnosticsCaptureRequestId: null,
+    diagnosticsCaptureState: "unavailable",
     discStatus: "open a disc",
     frameHidden: false,
     frameReadyState: "complete",
@@ -146,6 +155,8 @@ test("shared public disc assignment and runner observation stay iframe-owned", a
   const state = {
     ...readyState(frameUrl, publicUrl),
     dataset: { renderer: "wgpu-webgpu", status: "running" },
+    diagnosticsCaptureDisabled: false,
+    diagnosticsCaptureState: "ready",
     discStatus: "local: game.ciso",
     runnerAvailable: true,
   };
@@ -173,6 +184,116 @@ test("shared public disc assignment and runner observation stay iframe-owned", a
   }), state);
   assert.ok(calls.some(call => call.method === "DOM.setFileInputFiles"));
   assert.ok(calls.some(call => call.method === "Runtime.releaseObject"));
+});
+
+test("public snapshots exercise the visible diagnostics control", async () => {
+  const expressions = [];
+  const requestSession = {
+    async evaluate(expression) {
+      expressions.push(expression);
+      return { disabled: true, requestId: 7, state: "pending" };
+    },
+  };
+  assert.equal(await requestPublicSnapshot(requestSession), 7);
+  assert.equal(expressions.length, 1);
+  assert.match(expressions[0], /#capture-diagnostics/);
+  assert.match(expressions[0], /HTMLButtonElement/);
+  assert.match(expressions[0], /button\.disabled/);
+  assert.match(expressions[0], /button\.click\(\)/);
+  assert.match(expressions[0], /button\.dataset\.requestId/);
+  assert.doesNotMatch(expressions[0], /lazuliCycleRunner|output\.textContent/);
+
+  const states = [
+    {
+      diagnosticsCaptureDisabled: true,
+      diagnosticsCaptureRequestId: "7",
+      diagnosticsCaptureState: "pending",
+      result: JSON.stringify({
+        diagnosticsRequestId: 6,
+        status: "running",
+        stage: "snapshot",
+      }),
+    },
+    {
+      diagnosticsCaptureDisabled: true,
+      diagnosticsCaptureRequestId: "7",
+      diagnosticsCaptureState: "pending",
+      result: JSON.stringify({
+        diagnosticsRequestId: 7,
+        status: "paused",
+        stage: "scenario-complete",
+      }),
+    },
+    {
+      diagnosticsCaptureCompletedRequestId: "7",
+      diagnosticsCaptureDisabled: false,
+      diagnosticsCaptureRequestId: "7",
+      diagnosticsCaptureState: "complete",
+      result: JSON.stringify({
+        diagnosticsRequestId: 7,
+        status: "running",
+        stage: "snapshot",
+      }),
+    },
+  ];
+  const waitSession = {
+    async evaluate() { return states.shift() ?? states.at(-1); },
+  };
+  const captured = await waitForPublicSnapshot(waitSession, {
+    deadline: Date.now() + 1_000,
+    pollMs: 0,
+    requestId: 7,
+  });
+  assert.equal(captured.report.stage, "snapshot");
+  assert.equal(captured.report.diagnosticsRequestId, 7);
+  assert.equal(captured.state.diagnosticsCaptureDisabled, false);
+});
+
+test("public snapshot failures reject immediately without accepting stale JSON", async () => {
+  const failedState = {
+    diagnosticsCaptureDisabled: true,
+    diagnosticsCaptureFailedRequestId: "9",
+    diagnosticsCaptureFailure: "WebGPU renderer failed: device lost",
+    diagnosticsCaptureRequestId: "9",
+    diagnosticsCaptureState: "failed",
+    result: JSON.stringify({
+      diagnosticsRequestId: 8,
+      status: "running",
+      stage: "snapshot",
+    }),
+  };
+  let evaluations = 0;
+  await assert.rejects(
+    waitForPublicSnapshot({
+      async evaluate() {
+        evaluations += 1;
+        return failedState;
+      },
+    }, {
+      deadline: Date.now() + 10_000,
+      pollMs: 1_000,
+      requestId: 9,
+    }),
+    /request 9 failed: WebGPU renderer failed: device lost/,
+  );
+  assert.equal(evaluations, 1, "a DOM-visible capture failure must not poll until timeout");
+
+  await assert.rejects(
+    waitForPublicSnapshot({
+      async evaluate() {
+        return {
+          diagnosticsCaptureRequestId: "10",
+          diagnosticsCaptureState: "pending",
+          result: JSON.stringify({ status: "stopped", stage: "worker", error: "disc read" }),
+        };
+      },
+    }, {
+      deadline: Date.now() + 10_000,
+      pollMs: 1_000,
+      requestId: 10,
+    }),
+    /request 10 stopped.*disc read/,
+  );
 });
 
 test("compatibility scenarios use the explicit iframe debug control before disc activation", async () => {

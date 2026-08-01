@@ -153,6 +153,8 @@ function readyViPresentation(pairEpoch = 1, presentationSerial = 1) {
 
 function terminalPublicationHarness() {
   const captures = [];
+  const captureDiagnosticsCompletions = [];
+  const captureDiagnosticsFailures = [];
   const rendererNotifications = [];
   const oldWorker = {
     postMessage(message) { rendererNotifications.push(message); },
@@ -169,6 +171,7 @@ function terminalPublicationHarness() {
     Math,
     Promise,
     document: { body: { dataset: { renderer: "wgpu-webgpu" } } },
+    captureDiagnosticsPendingRequestId: null,
     discStatus: { textContent: "ready" },
     output: { textContent: "RUNNING" },
     performance: { now: () => 175 },
@@ -188,6 +191,22 @@ function terminalPublicationHarness() {
       captures.push({ hostMetrics, temporalFrames, pending, reject, resolve });
       return pending;
     },
+    completeCaptureDiagnostics(report) {
+      captureDiagnosticsCompletions.push(report);
+      if (
+        context.captureDiagnosticsPendingRequestId === null
+        || report.stage !== "snapshot"
+        || report.diagnosticsRequestId !== context.captureDiagnosticsPendingRequestId
+      ) return false;
+      context.captureDiagnosticsPendingRequestId = null;
+      return true;
+    },
+    failCaptureDiagnostics(reason) {
+      captureDiagnosticsFailures.push(reason);
+      const pending = context.captureDiagnosticsPendingRequestId !== null;
+      context.captureDiagnosticsPendingRequestId = null;
+      return pending;
+    },
   };
   vm.createContext(context);
   vm.runInContext(
@@ -204,6 +223,8 @@ function terminalPublicationHarness() {
     { filename: "browser_boot.renderer-sync.terminal-publication.js" },
   );
   return {
+    captureDiagnosticsCompletions,
+    captureDiagnosticsFailures,
     captures,
     context,
     oldHostMetrics,
@@ -542,6 +563,48 @@ test("the page publishes a terminal report only after one bound renderer capture
     },
   });
   assert.deepEqual(harness.rendererNotifications, []);
+  assert.equal(harness.captureDiagnosticsCompletions.length, 1);
+  assert.equal(harness.captureDiagnosticsCompletions[0].stage, "scenario-complete");
+});
+
+test("a pending public request rejects stale stage and identity before renderer capture", async () => {
+  const harness = terminalPublicationHarness();
+  harness.context.captureDiagnosticsPendingRequestId = 17;
+
+  for (const report of [
+    { diagnosticsRequestId: 17, stage: "scenario-complete", status: "paused" },
+    { diagnosticsRequestId: 16, stage: "snapshot", status: "running" },
+  ]) {
+    assert.equal(await harness.context.handleWorkerMessage({
+      currentTarget: harness.oldWorker,
+      data: { type: "finish", text: JSON.stringify(report) },
+    }), false);
+  }
+  assert.equal(harness.captures.length, 0);
+  assert.equal(harness.context.output.textContent, "RUNNING");
+  assert.equal(harness.context.captureDiagnosticsPendingRequestId, 17);
+  assert.equal(harness.context.terminalPublicationSequence, 0);
+
+  const exact = harness.context.handleWorkerMessage({
+    currentTarget: harness.oldWorker,
+    data: {
+      type: "finish",
+      text: JSON.stringify({
+        diagnosticsRequestId: 17,
+        stage: "snapshot",
+        status: "running",
+      }),
+    },
+  });
+  assert.equal(harness.captures.length, 1);
+  harness.captures[0].resolve({
+    metrics: {},
+    selectedXfb: null,
+    temporalSelectedXfb: {},
+  });
+  assert.equal(await exact, true);
+  assert.equal(harness.context.captureDiagnosticsPendingRequestId, null);
+  assert.equal(JSON.parse(harness.context.output.textContent).diagnosticsRequestId, 17);
 });
 
 test("an old terminal capture cannot publish success or failure into a new run", async () => {
@@ -617,6 +680,8 @@ test("a superseded same-worker terminal capture cannot publish success or failur
     });
     assert.equal(await second, true);
     assert.equal(JSON.parse(harness.context.output.textContent).report, "second");
+    assert.equal(harness.captureDiagnosticsCompletions.length, 1);
+    assert.equal(harness.captureDiagnosticsCompletions[0].report, "second");
   }
 });
 
@@ -650,6 +715,7 @@ test("worker and renderer-capture failures retain page-owned error envelopes", a
   });
   assert.equal(await interruptedCapture, false);
   assert.equal(workerFailure.context.output.textContent, workerErrorEnvelope);
+  assert.deepEqual(workerFailure.captureDiagnosticsFailures, ["guest worker crashed"]);
 
   const rendererFailure = terminalPublicationHarness();
   const pending = rendererFailure.context.handleWorkerMessage({
@@ -671,6 +737,21 @@ test("worker and renderer-capture failures retain page-owned error envelopes", a
     },
   });
   assert.deepEqual(rendererFailure.rendererNotifications, []);
+  assert.deepEqual(rendererFailure.captureDiagnosticsFailures, [
+    "WebGPU renderer failed: readback device lost",
+  ]);
+});
+
+test("an invalid worker report fails public diagnostics immediately", async () => {
+  const harness = terminalPublicationHarness();
+  assert.equal(await harness.context.handleWorkerMessage({
+    currentTarget: harness.oldWorker,
+    data: { type: "finish", text: "not JSON" },
+  }), false);
+  assert.deepEqual(harness.captureDiagnosticsFailures, [
+    "worker terminal report is not valid JSON",
+  ]);
+  assert.equal(harness.captures.length, 0);
 });
 
 test("main thread acknowledges a frame only after the WebGPU drain resolves", async () => {

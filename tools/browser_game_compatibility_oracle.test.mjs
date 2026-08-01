@@ -8,6 +8,7 @@ import {
   GAME_COMPATIBILITY_RUNTIME_SCHEMA,
   verifyGameCompatibilitySnapshot,
   verifyGameCompatibilityWindow,
+  verifyGameFirstVisibleFrameCompatibility,
 } from "./browser_game_compatibility_oracle.mjs";
 
 const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS = [
@@ -117,6 +118,12 @@ function report(offset = 0, overrides = {}) {
           inFlight: 0,
           highWater: 1,
           resultMisses: 0,
+          textureCopyBarrier: {
+            pendingSequence: null,
+            pendingCycle: null,
+            armed: 2 + offset,
+            resumed: 2 + offset,
+          },
         },
       },
     },
@@ -143,6 +150,10 @@ function report(offset = 0, overrides = {}) {
     serialInterface: {
       unknownOutputCommands: 0,
     },
+    audioCompatibility: {
+      dspFirstUnsupported: null,
+      dtkFirstUnsupported: null,
+    },
     gxFifo: {
       bytes: 3_320 + offset * 10_000,
       staging: {
@@ -163,6 +174,19 @@ function report(offset = 0, overrides = {}) {
         texgenFallbacks: 0,
         unknownOpcodes: 0,
         vertexDecodeErrors: 0,
+        deferredDisplayListSegments: 0,
+        textureCopyBarrierStops: 2 + offset,
+        textureCopyBarrierResumes: 2 + offset,
+        unsupported: {
+          schema: "lazuli-gx-unsupported-v1",
+          totalEvents: 0,
+          firstEvent: null,
+          reasonCounts: [],
+          addressCounts: [],
+          reasonKeyLimit: 32,
+          countLimit: 0xffff_ffff,
+          untrackedReasonEvents: 0,
+        },
         maximumBufferedBytes: 16 * 1024 * 1024,
         bufferedBytes: 0,
         capacityWatermarkBytes: 4096,
@@ -258,7 +282,20 @@ function sample(offset = 0, surface = "local-debug") {
   };
 }
 
+function makeInvisible(value, { blackAndWhite = false } = {}) {
+  const selected = value.report.rendering.selectedXfb;
+  const pixels = selected.width * selected.height;
+  selected.rgb = blackAndWhite
+    ? { black: pixels - 1, white: 1, other: 0, unique: 2 }
+    : { black: pixels, white: 0, other: 0, unique: 1 };
+  return value;
+}
+
 test("strict snapshot accepts private local WebGPU evidence", () => {
+  assert.equal(
+    GAME_COMPATIBILITY_RUNTIME_SCHEMA,
+    "lazuli-game-compatibility-runtime-v2",
+  );
   const verified = verifyGameCompatibilitySnapshot({
     ...sample(),
     game: game(),
@@ -351,6 +388,121 @@ test("snapshot fails closed on renderer, device, queue, GX, and XFB faults", () 
     [value => { value.report.gxFifo.decoder.textures.decodeErrors = 1; }, /decodeErrors/],
     [value => { value.report.rendering.selectedXfb.generation += 1; }, /selectedXfb\.generation/],
     [value => { value.report.rendering.selectedXfb.rgb.other = 0; }, /rgb\.other/],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const invalid = sample();
+    mutate(invalid);
+    assert.throws(
+      () => verifyGameCompatibilitySnapshot({ ...invalid, game: game() }),
+      pattern,
+    );
+  }
+});
+
+test("runtime v2 fails closed on pending barriers and unsupported hardware", () => {
+  const cases = [
+    [
+      value => { delete value.report.execution.scheduler.rendererSync.textureCopyBarrier; },
+      /textureCopyBarrier.*expected an object/,
+    ],
+    [
+      value => {
+        value.report.execution.scheduler.rendererSync
+          .textureCopyBarrier.pendingSequence = 9;
+      },
+      /pendingSequence.*expected null/,
+    ],
+    [
+      value => {
+        value.report.execution.scheduler.rendererSync
+          .textureCopyBarrier.pendingCycle = 9;
+      },
+      /pendingCycle.*expected null/,
+    ],
+    [
+      value => {
+        value.report.execution.scheduler.rendererSync
+          .textureCopyBarrier.armed = -1;
+      },
+      /textureCopyBarrier\.armed.*non-negative safe integer/,
+    ],
+    [
+      value => {
+        value.report.execution.scheduler.rendererSync
+          .textureCopyBarrier.resumed -= 1;
+      },
+      /textureCopyBarrier\.resumed/,
+    ],
+    [
+      value => { value.report.gxFifo.decoder.deferredDisplayListSegments = 1; },
+      /deferredDisplayListSegments.*expected 0/,
+    ],
+    [
+      value => { delete value.report.gxFifo.decoder.deferredDisplayListSegments; },
+      /deferredDisplayListSegments.*expected 0/,
+    ],
+    [
+      value => { value.report.gxFifo.decoder.textureCopyBarrierStops = -1; },
+      /textureCopyBarrierStops.*non-negative safe integer/,
+    ],
+    [
+      value => { value.report.gxFifo.decoder.textureCopyBarrierResumes -= 1; },
+      /textureCopyBarrierResumes/,
+    ],
+    [
+      value => {
+        value.report.gxFifo.decoder.textureCopyBarrierStops += 1;
+        value.report.gxFifo.decoder.textureCopyBarrierResumes += 1;
+      },
+      /textureCopyBarrierStops/,
+    ],
+    [
+      value => { delete value.report.audioCompatibility; },
+      /audioCompatibility.*expected an object/,
+    ],
+    [
+      value => {
+        value.report.audioCompatibility.dspFirstUnsupported = { code: 4 };
+      },
+      /dspFirstUnsupported.*expected null/,
+    ],
+    [
+      value => { delete value.report.audioCompatibility.dspFirstUnsupported; },
+      /dspFirstUnsupported.*expected null/,
+    ],
+    [
+      value => {
+        value.report.audioCompatibility.dtkFirstUnsupported = { reason: "opcode" };
+      },
+      /dtkFirstUnsupported.*expected null/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const invalid = sample();
+    mutate(invalid);
+    assert.throws(
+      () => verifyGameCompatibilitySnapshot({ ...invalid, game: game() }),
+      pattern,
+    );
+  }
+});
+
+test("runtime v2 requires canonical clear GX unsupported telemetry", () => {
+  const cases = [
+    [value => { delete value.report.gxFifo.decoder.unsupported; }, /unsupported.*expected an object/],
+    [value => { value.report.gxFifo.decoder.unsupported = null; }, /unsupported.*expected an object/],
+    [value => { delete value.report.gxFifo.decoder.unsupported.schema; }, /unsupported\.\[keys\]/],
+    [value => { value.report.gxFifo.decoder.unsupported.schema = "future"; }, /unsupported\.schema/],
+    [value => { value.report.gxFifo.decoder.unsupported.totalEvents = 1; }, /totalEvents.*expected 0/],
+    [value => { value.report.gxFifo.decoder.unsupported.firstEvent = {}; }, /firstEvent.*expected null/],
+    [value => { value.report.gxFifo.decoder.unsupported.reasonCounts.push({ reason: "x", count: 1 }); }, /reasonCounts\.length/],
+    [value => { value.report.gxFifo.decoder.unsupported.reasonCounts = {}; }, /reasonCounts.*expected an array/],
+    [value => { value.report.gxFifo.decoder.unsupported.addressCounts.push({ address: "0x00", count: 1 }); }, /addressCounts\.length/],
+    [value => { value.report.gxFifo.decoder.unsupported.addressCounts = {}; }, /addressCounts.*expected an array/],
+    [value => { value.report.gxFifo.decoder.unsupported.reasonKeyLimit = 31; }, /reasonKeyLimit/],
+    [value => { value.report.gxFifo.decoder.unsupported.countLimit -= 1; }, /countLimit/],
+    [value => { value.report.gxFifo.decoder.unsupported.untrackedReasonEvents = 1; }, /untrackedReasonEvents/],
+    [value => { value.report.gxFifo.decoder.unsupported.future = 0; }, /unsupported\.\[keys\]/],
   ];
   for (const [mutate, pattern] of cases) {
     const invalid = sample();
@@ -592,4 +744,176 @@ test("window rejects stalls, regressions, resets, and static selected XFBs", () 
       pattern,
     );
   }
+});
+
+test("first-visible gate tolerates boot frames then sustains direct WebGPU output", () => {
+  const snapshots = [makeInvisible(sample(0)), sample(1), sample(2)];
+  const verified = verifyGameFirstVisibleFrameCompatibility({
+    game: game(),
+    snapshots,
+  });
+  assert.deepEqual(verified, {
+    delta: {
+      controllerAppliedSequence: 2,
+      cycles: 1_000_000_000,
+      diskReads: 1,
+      dispatches: 1_000_000,
+      gxCommands: 1_000,
+      hostPresentations: 70,
+      instructions: 20_000_000,
+      presentationSerial: 70,
+      primitives: 300,
+      rendererPresents: 140,
+      siPolls: 140,
+      viFields: 140,
+      xfbCopies: 1,
+    },
+    firstVisible: {
+      cycles: 1_100_000_000,
+      hostPresentations: 72,
+      index: 1,
+      presentationSerial: 72,
+      rgbSha256: "3".repeat(64),
+      viFields: 151,
+    },
+    game: "example-game",
+    image: "a".repeat(64),
+    observedSamples: 3,
+    samples: 2,
+    schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
+    surface: "local-debug",
+  });
+  assert.equal(Object.isFrozen(verified.firstVisible), true);
+  assert.deepEqual(Object.keys(verified.firstVisible).sort(), [
+    "cycles",
+    "hostPresentations",
+    "index",
+    "presentationSerial",
+    "rgbSha256",
+    "viFields",
+  ]);
+  assert.throws(() => {
+    verified.firstVisible.index = 0;
+  }, TypeError);
+});
+
+test("first-visible gate uses other > 0 and unique >= 2 as one exact boundary", () => {
+  const noOther = makeInvisible(sample(0), { blackAndWhite: true });
+  const oneColor = sample(1);
+  const pixels = oneColor.report.rendering.selectedXfb.width
+    * oneColor.report.rendering.selectedXfb.height;
+  oneColor.report.rendering.selectedXfb.rgb = {
+    black: 0,
+    white: 0,
+    other: pixels,
+    unique: 1,
+  };
+  assert.throws(
+    () => verifyGameFirstVisibleFrameCompatibility({
+      game: game(),
+      snapshots: [noOther, oneColor],
+    }),
+    /expected a first visible frame with other > 0 and unique >= 2/,
+  );
+});
+
+test("first-visible gate rejects renderer, GX, decoder, exact-path, and DSP faults", () => {
+  const cases = [
+    [
+      value => { value[0].environment.dataset.renderer = "canvas-2d"; },
+      /wgpu-webgpu/,
+    ],
+    [
+      value => { value[0].report.rendering.backend = "canvas-2d"; },
+      /wgpu-webgpu/,
+    ],
+    [
+      value => { value[0].report.gxFifo.decoder.unsupported.totalEvents = 1; },
+      /totalEvents.*expected 0/,
+    ],
+    [
+      value => { value[0].report.gxFifo.decoder.unknownOpcodes = 1; },
+      /unknownOpcodes.*expected zero/,
+    ],
+    [
+      value => {
+        const webgpu = value[0].report.rendering.metrics.webgpu;
+        webgpu.exactRequiredRejectedDraws = 1;
+        webgpu.exactRequiredRejectionReasons.unclassified = 1;
+      },
+      /exactRequiredRejectedDraws.*expected zero/,
+    ],
+    [
+      value => { value[0].report.deviceEvents.dspZeldaCommandRejected = 1; },
+      /dspZeldaCommandRejected.*expected zero/,
+    ],
+    [
+      value => {
+        value[0].report.audioCompatibility.dspFirstUnsupported = {
+          reason: "opcode",
+        };
+      },
+      /dspFirstUnsupported.*expected null/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const snapshots = [makeInvisible(sample(0)), sample(1), sample(2)];
+    mutate(snapshots);
+    assert.throws(
+      () => verifyGameFirstVisibleFrameCompatibility({
+        game: game(),
+        snapshots,
+      }),
+      pattern,
+    );
+  }
+});
+
+test("first-visible gate keeps pre-visible boot samples on one surface", () => {
+  const snapshots = [makeInvisible(sample(0)), sample(1), sample(2)];
+  for (const snapshot of snapshots.slice(1)) {
+    snapshot.environment.surface = "public-root";
+    snapshot.report.disc.source = { kind: "local-file" };
+  }
+  assert.throws(
+    () => verifyGameFirstVisibleFrameCompatibility({
+      game: game(),
+      snapshots,
+    }),
+    /snapshots\[1\]\.environment\.surface.*surface changed/,
+  );
+});
+
+test("first-visible gate rejects flicker and incomplete sustained windows", () => {
+  const flicker = [makeInvisible(sample(0)), sample(1), makeInvisible(sample(2))];
+  assert.throws(
+    () => verifyGameFirstVisibleFrameCompatibility({
+      game: game(),
+      snapshots: flicker,
+    }),
+    /visible-frame evidence regressed/,
+  );
+
+  const shortFields = [makeInvisible(sample(0)), sample(1), sample(2)];
+  shortFields[2].report.deviceEvents.viField =
+    shortFields[1].report.deviceEvents.viField + 119;
+  assert.throws(
+    () => verifyGameFirstVisibleFrameCompatibility({
+      game: game(),
+      snapshots: shortFields,
+    }),
+    /expected at least 120 new VI fields/,
+  );
+
+  const shortPresentations = [makeInvisible(sample(0)), sample(1), sample(2)];
+  shortPresentations[2].report.mmioState.viInterruptModel.hostPresentationCount =
+    shortPresentations[1].report.mmioState.viInterruptModel.hostPresentationCount
+    + 63;
+  assert.throws(
+    () => verifyGameFirstVisibleFrameCompatibility({
+      game: game(),
+      snapshots: shortPresentations,
+    }),
+    /expected at least 64 completed host presentations/,
+  );
 });

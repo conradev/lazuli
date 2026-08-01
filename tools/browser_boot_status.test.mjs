@@ -29,6 +29,7 @@ function extractFunction(name) {
 }
 
 function createHarness() {
+  const diagnosticsFailures = [];
   const document = {
     body: { dataset: { renderer: "wgpu-webgpu", status: "running" } },
   };
@@ -38,6 +39,8 @@ function createHarness() {
   const context = {
     document,
     discStatus,
+    diagnosticsFailures,
+    failCaptureDiagnostics(reason) { diagnosticsFailures.push(reason); },
     output,
     runnerStatus,
     terminalPublicationSequence: 0,
@@ -67,6 +70,7 @@ test("worker errors remain visible when release diagnostics are stripped", () =>
     },
   });
   assert.equal(context.terminalPublicationSequence, 1);
+  assert.deepEqual(context.diagnosticsFailures, ["disc read failed"]);
 });
 
 test("worker errors have a visible message when the browser omits one", () => {
@@ -77,4 +81,5 @@ test("worker errors have a visible message when the browser omits one", () => {
   assert.equal(context.runnerStatus.textContent, "worker error");
   assert.equal(context.discStatus.textContent, "unknown worker error");
   assert.equal(JSON.parse(context.output.textContent).error, "unknown worker error");
+  assert.deepEqual(context.diagnosticsFailures, ["unknown worker error"]);
 });

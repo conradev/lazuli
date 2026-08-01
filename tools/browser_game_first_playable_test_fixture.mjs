@@ -124,6 +124,12 @@ export function makeGameFirstPlayableReport(game, offset) {
           inFlight: 0,
           highWater: 1,
           resultMisses: 0,
+          textureCopyBarrier: {
+            pendingSequence: null,
+            pendingCycle: null,
+            armed: 2 + offset,
+            resumed: 2 + offset,
+          },
         },
       },
     },
@@ -152,6 +158,10 @@ export function makeGameFirstPlayableReport(game, offset) {
     serialInterface: {
       unknownOutputCommands: 0,
     },
+    audioCompatibility: {
+      dspFirstUnsupported: null,
+      dtkFirstUnsupported: null,
+    },
     gxFifo: {
       bytes: 3_320 + offset * 10_000,
       staging: {
@@ -172,6 +182,19 @@ export function makeGameFirstPlayableReport(game, offset) {
         texgenFallbacks: 0,
         unknownOpcodes: 0,
         vertexDecodeErrors: 0,
+        deferredDisplayListSegments: 0,
+        textureCopyBarrierStops: 2 + offset,
+        textureCopyBarrierResumes: 2 + offset,
+        unsupported: {
+          schema: "lazuli-gx-unsupported-v1",
+          totalEvents: 0,
+          firstEvent: null,
+          reasonCounts: [],
+          addressCounts: [],
+          reasonKeyLimit: 32,
+          countLimit: 0xffff_ffff,
+          untrackedReasonEvents: 0,
+        },
         maximumBufferedBytes: 16 * 1024 * 1024,
         bufferedBytes: 0,
         capacityWatermarkBytes: 4096,

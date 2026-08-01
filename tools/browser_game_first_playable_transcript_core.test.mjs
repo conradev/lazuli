@@ -11,9 +11,17 @@ import {
   deriveGameFirstPlayableTranscriptCore,
   verifyGameFirstPlayableTranscriptCore,
 } from "./browser_game_first_playable_transcript_core.mjs";
+
 import {
   makeGameFirstPlayableReportPair,
 } from "./browser_game_first_playable_test_fixture.mjs";
+
+test("first-playable transcripts use the v2 compatibility contract", () => {
+  assert.equal(
+    GAME_FIRST_PLAYABLE_TRANSCRIPT_SCHEMA,
+    "lazuli-game-first-playable-transcript-v2",
+  );
+});
 
 function projectFixtureGuestConsumption({ button, game, publication }) {
   return Object.freeze({

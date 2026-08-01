@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 export const GAME_COMPATIBILITY_RUNTIME_SCHEMA =
-  "lazuli-game-compatibility-runtime-v1";
+  "lazuli-game-compatibility-runtime-v2";
+
+const GX_UNSUPPORTED_TELEMETRY_SCHEMA = "lazuli-gx-unsupported-v1";
+const GX_UNSUPPORTED_REASON_KEY_LIMIT = 32;
+const GX_UNSUPPORTED_COUNT_LIMIT = 0xffff_ffff;
 
 const HEX_U32_PATTERN = /^0x[0-9a-f]{8}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -328,6 +332,29 @@ function verifyRendererSync(report) {
       "expected at most one renderer operation in flight",
     );
   }
+  const barrierPath =
+    "$.report.execution.scheduler.rendererSync.textureCopyBarrier";
+  const barrier = requiredObject(sync.textureCopyBarrier, barrierPath);
+  requireExact(
+    barrier.pendingSequence,
+    null,
+    `${barrierPath}.pendingSequence`,
+  );
+  requireExact(
+    barrier.pendingCycle,
+    null,
+    `${barrierPath}.pendingCycle`,
+  );
+  const armed = requireNonNegativeInteger(
+    barrier.armed,
+    `${barrierPath}.armed`,
+  );
+  requireExact(
+    requireNonNegativeInteger(barrier.resumed, `${barrierPath}.resumed`),
+    armed,
+    `${barrierPath}.resumed`,
+  );
+  return armed;
 }
 
 function verifyDeviceHealth(report) {
@@ -368,9 +395,81 @@ function verifyDeviceHealth(report) {
     serial.unknownOutputCommands,
     "$.report.serialInterface.unknownOutputCommands",
   );
+
+  const audio = requiredObject(
+    report.audioCompatibility,
+    "$.report.audioCompatibility",
+  );
+  requireExact(
+    audio.dspFirstUnsupported,
+    null,
+    "$.report.audioCompatibility.dspFirstUnsupported",
+  );
+  requireExact(
+    audio.dtkFirstUnsupported,
+    null,
+    "$.report.audioCompatibility.dtkFirstUnsupported",
+  );
 }
 
-function verifyGx(report) {
+function verifyGxUnsupportedTelemetry(decoder) {
+  const path = "$.report.gxFifo.decoder.unsupported";
+  const unsupported = requiredObject(decoder.unsupported, path);
+  const expectedKeys = [
+    "addressCounts",
+    "countLimit",
+    "firstEvent",
+    "reasonCounts",
+    "reasonKeyLimit",
+    "schema",
+    "totalEvents",
+    "untrackedReasonEvents",
+  ];
+  const actualKeys = Object.keys(unsupported).sort();
+  if (
+    actualKeys.length !== expectedKeys.length
+    || actualKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    oracleFailure(
+      `${path}.[keys]`,
+      `expected exactly ${expectedKeys.join(", ")}`,
+    );
+  }
+  requireExact(
+    unsupported.schema,
+    GX_UNSUPPORTED_TELEMETRY_SCHEMA,
+    `${path}.schema`,
+  );
+  requireExact(unsupported.totalEvents, 0, `${path}.totalEvents`);
+  requireExact(unsupported.firstEvent, null, `${path}.firstEvent`);
+  const reasonCounts = requiredArray(
+    unsupported.reasonCounts,
+    `${path}.reasonCounts`,
+  );
+  const addressCounts = requiredArray(
+    unsupported.addressCounts,
+    `${path}.addressCounts`,
+  );
+  requireExact(reasonCounts.length, 0, `${path}.reasonCounts.length`);
+  requireExact(addressCounts.length, 0, `${path}.addressCounts.length`);
+  requireExact(
+    unsupported.reasonKeyLimit,
+    GX_UNSUPPORTED_REASON_KEY_LIMIT,
+    `${path}.reasonKeyLimit`,
+  );
+  requireExact(
+    unsupported.countLimit,
+    GX_UNSUPPORTED_COUNT_LIMIT,
+    `${path}.countLimit`,
+  );
+  requireExact(
+    unsupported.untrackedReasonEvents,
+    0,
+    `${path}.untrackedReasonEvents`,
+  );
+}
+
+function verifyGx(report, expectedTextureCopyBarriers) {
   const gx = requiredObject(report.gxFifo, "$.report.gxFifo");
   requirePositiveInteger(gx.bytes, "$.report.gxFifo.bytes");
   const staging = requiredObject(gx.staging, "$.report.gxFifo.staging");
@@ -385,6 +484,29 @@ function verifyGx(report) {
   for (const name of DECODER_FAILURE_COUNTERS) {
     requireZero(decoder[name], `$.report.gxFifo.decoder.${name}`);
   }
+  requireExact(
+    decoder.deferredDisplayListSegments,
+    0,
+    "$.report.gxFifo.decoder.deferredDisplayListSegments",
+  );
+  const barrierStops = requireNonNegativeInteger(
+    decoder.textureCopyBarrierStops,
+    "$.report.gxFifo.decoder.textureCopyBarrierStops",
+  );
+  requireExact(
+    barrierStops,
+    expectedTextureCopyBarriers,
+    "$.report.gxFifo.decoder.textureCopyBarrierStops",
+  );
+  requireExact(
+    requireNonNegativeInteger(
+      decoder.textureCopyBarrierResumes,
+      "$.report.gxFifo.decoder.textureCopyBarrierResumes",
+    ),
+    barrierStops,
+    "$.report.gxFifo.decoder.textureCopyBarrierResumes",
+  );
+  verifyGxUnsupportedTelemetry(decoder);
   if (decoder.legacyProjectionNullVertices !== undefined) {
     requireNonNegativeInteger(
       decoder.legacyProjectionNullVertices,
@@ -529,7 +651,7 @@ function verifyWebGpu(report) {
   return rendering;
 }
 
-function verifySelectedXfb(report, rendering) {
+function verifySelectedXfb(report, rendering, { requireVisible = true } = {}) {
   const selected = requiredObject(
     rendering.selectedXfb,
     "$.report.rendering.selectedXfb",
@@ -634,26 +756,34 @@ function verifySelectedXfb(report, rendering) {
     rgb.white,
     "$.report.rendering.selectedXfb.rgb.white",
   );
-  const other = requirePositiveInteger(
+  const other = requireNonNegativeInteger(
     rgb.other,
     "$.report.rendering.selectedXfb.rgb.other",
   );
+  const unique = requirePositiveInteger(
+    rgb.unique,
+    "$.report.rendering.selectedXfb.rgb.unique",
+  );
+  if (requireVisible && other === 0) {
+    oracleFailure(
+      "$.report.rendering.selectedXfb.rgb.other",
+      "expected a value greater than zero",
+    );
+  }
+  if (requireVisible && unique < 2) {
+    oracleFailure(
+      "$.report.rendering.selectedXfb.rgb.unique",
+      "expected at least two RGB values",
+    );
+  }
   if (black + white + other !== width * height) {
     oracleFailure(
       "$.report.rendering.selectedXfb.rgb",
       "RGB populations must cover the complete selected XFB",
     );
   }
-  if (requirePositiveInteger(
-    rgb.unique,
-    "$.report.rendering.selectedXfb.rgb.unique",
-  ) < 2) {
-    oracleFailure(
-      "$.report.rendering.selectedXfb.rgb.unique",
-      "expected at least two RGB values",
-    );
-  }
-  return { expected, presentationCount, selected };
+  const visible = other > 0 && unique >= 2;
+  return { expected, presentationCount, selected, visible };
 }
 
 function progressProjection(
@@ -680,7 +810,12 @@ function progressProjection(
   });
 }
 
-export function verifyGameCompatibilitySnapshot({ environment, game, report }) {
+function verifyGameCompatibilityObservation({
+  environment,
+  game,
+  report,
+  requireVisible,
+}) {
   requireGame(game);
   const surface = verifyEnvironment(environment, game);
   requiredObject(report, "$.report");
@@ -693,13 +828,13 @@ export function verifyGameCompatibilitySnapshot({ environment, game, report }) {
   for (const name of ["cycles", "dispatches", "instructions"]) {
     requirePositiveInteger(report[name], `$.report.${name}`);
   }
-  verifyRendererSync(report);
+  const textureCopyBarriers = verifyRendererSync(report);
   verifyDeviceHealth(report);
-  verifyGx(report);
+  verifyGx(report, textureCopyBarriers);
   const rendering = verifyWebGpu(report);
-  const { expected, presentationCount, selected } =
-    verifySelectedXfb(report, rendering);
-  return Object.freeze({
+  const { expected, presentationCount, selected, visible } =
+    verifySelectedXfb(report, rendering, { requireVisible });
+  const verification = Object.freeze({
     game: game.key,
     image: game.image.sha256,
     progress: progressProjection(
@@ -711,6 +846,16 @@ export function verifyGameCompatibilitySnapshot({ environment, game, report }) {
     schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
     surface,
   });
+  return Object.freeze({ verification, visible });
+}
+
+export function verifyGameCompatibilitySnapshot({ environment, game, report }) {
+  return verifyGameCompatibilityObservation({
+    environment,
+    game,
+    report,
+    requireVisible: true,
+  }).verification;
 }
 
 function progressDelta(first, last) {
@@ -813,5 +958,71 @@ export function verifyGameCompatibilityWindow({
     samples: verified.length,
     schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
     surface,
+  });
+}
+
+export function verifyGameFirstVisibleFrameCompatibility({
+  game,
+  snapshots,
+  sustainedViFields = 120,
+  viewportFrames = 64,
+}) {
+  requireGame(game);
+  if (!Array.isArray(snapshots) || snapshots.length < 2) {
+    oracleFailure("$.snapshots", "expected at least two ordered snapshots");
+  }
+
+  const observations = snapshots.map(snapshot =>
+    verifyGameCompatibilityObservation({
+      ...snapshot,
+      game,
+      requireVisible: false,
+    })
+  );
+  const surface = observations[0].verification.surface;
+  for (let index = 1; index < observations.length; index += 1) {
+    if (observations[index].verification.surface !== surface) {
+      oracleFailure(
+        `$.snapshots[${index}].environment.surface`,
+        "surface changed during the compatibility window",
+      );
+    }
+  }
+  const firstVisibleIndex = observations.findIndex(({ visible }) => visible);
+  if (firstVisibleIndex === -1) {
+    oracleFailure(
+      "$.snapshots",
+      "expected a first visible frame with other > 0 and unique >= 2",
+    );
+  }
+  const regressedIndex = observations.findIndex(
+    ({ visible }, index) => index > firstVisibleIndex && !visible,
+  );
+  if (regressedIndex !== -1) {
+    oracleFailure(
+      `$.snapshots[${regressedIndex}].report.rendering.selectedXfb.rgb`,
+      "visible-frame evidence regressed after the first visible frame",
+    );
+  }
+
+  const window = verifyGameCompatibilityWindow({
+    game,
+    snapshots: snapshots.slice(firstVisibleIndex),
+    sustainedViFields,
+    viewportFrames,
+  });
+  const firstVisibleProgress =
+    observations[firstVisibleIndex].verification.progress;
+  return Object.freeze({
+    ...window,
+    firstVisible: Object.freeze({
+      cycles: firstVisibleProgress.cycles,
+      hostPresentations: firstVisibleProgress.hostPresentations,
+      index: firstVisibleIndex,
+      presentationSerial: firstVisibleProgress.presentationSerial,
+      rgbSha256: firstVisibleProgress.rgbSha256,
+      viFields: firstVisibleProgress.viFields,
+    }),
+    observedSamples: snapshots.length,
   });
 }

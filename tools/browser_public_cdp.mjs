@@ -32,6 +32,13 @@ const PUBLIC_RELEASE_STATE = `(() => {
       compatibilityDebugAvailable: false,
       compositorCaptureAvailable: false,
       dataset: {},
+      diagnosticsCaptureAvailable: false,
+      diagnosticsCaptureCompletedRequestId: null,
+      diagnosticsCaptureDisabled: null,
+      diagnosticsCaptureFailedRequestId: null,
+      diagnosticsCaptureFailure: null,
+      diagnosticsCaptureRequestId: null,
+      diagnosticsCaptureState: null,
       discStatus: null,
       frameHidden: frame?.hidden ?? null,
       frameReadyState: null,
@@ -48,6 +55,7 @@ const PUBLIC_RELEASE_STATE = `(() => {
   }
   const compositor = frameWindow.lazuliCompositorCapture;
   const compatibilityDebug = frameWindow.lazuliCompatibilityDebug;
+  const diagnosticsCapture = frameDocument.querySelector("#capture-diagnostics");
   return {
     compatibilityDebugAvailable:
       typeof compatibilityDebug?.selectScenario === "function",
@@ -56,6 +64,16 @@ const PUBLIC_RELEASE_STATE = `(() => {
       && typeof compositor.pending === "function"
       && typeof compositor.acknowledge === "function",
     dataset: Object.fromEntries(Object.entries(frameDocument.body?.dataset ?? {})),
+    diagnosticsCaptureAvailable:
+      diagnosticsCapture instanceof frameWindow.HTMLButtonElement,
+    diagnosticsCaptureCompletedRequestId:
+      diagnosticsCapture?.dataset.completedRequestId ?? null,
+    diagnosticsCaptureDisabled: diagnosticsCapture?.disabled ?? null,
+    diagnosticsCaptureFailedRequestId:
+      diagnosticsCapture?.dataset.failedRequestId ?? null,
+    diagnosticsCaptureFailure: diagnosticsCapture?.dataset.failure ?? null,
+    diagnosticsCaptureRequestId: diagnosticsCapture?.dataset.requestId ?? null,
+    diagnosticsCaptureState: diagnosticsCapture?.dataset.captureState ?? null,
     discStatus: frameDocument.querySelector("#disc-status")?.textContent ?? null,
     frameHidden: frame.hidden,
     frameReadyState: frameDocument.readyState,
@@ -118,12 +136,16 @@ const CONFIGURE_PUBLIC_COMPATIBILITY_DEBUG = `(request => {
 const REQUEST_PUBLIC_SNAPSHOT = `(() => {
   const frame = document.querySelector("#app");
   const frameDocument = frame?.contentDocument ?? null;
-  const runner = frame?.contentWindow?.lazuliCycleRunner ?? null;
-  if (typeof runner?.snapshot !== "function") return false;
-  const output = frameDocument?.querySelector("#result") ?? null;
-  if (output !== null) output.textContent = "";
-  runner.snapshot();
-  return true;
+  const frameWindow = frame?.contentWindow ?? null;
+  const button = frameDocument?.querySelector("#capture-diagnostics") ?? null;
+  if (!(button instanceof frameWindow?.HTMLButtonElement) || button.disabled) return false;
+  button.click();
+  const requestId = Number(button.dataset.requestId);
+  return {
+    disabled: button.disabled,
+    requestId: Number.isSafeInteger(requestId) ? requestId : null,
+    state: button.dataset.captureState ?? null,
+  };
 })()`;
 
 const PUBLIC_ACTIVE_RELEASE_OBSERVATION = `(async () => {
@@ -215,6 +237,9 @@ export async function waitForPublicRelease(
       state.topUrl === publicUrl
       && state.topReadyState === "complete"
       && state.compatibilityDebugAvailable
+      && state.diagnosticsCaptureAvailable
+      && state.diagnosticsCaptureDisabled === true
+      && state.diagnosticsCaptureState === "unavailable"
       && state.frameReadyState === "complete"
       && state.frameHidden === false
       && state.statusHidden === true
@@ -303,13 +328,19 @@ export async function waitForPublicRunner(
   while (Date.now() < deadline) {
     state = await publicReleaseState(session);
     const report = parsePublicReport(state.result);
-    if (report?.status === "stopped" || report?.error !== undefined) {
+    if (
+      report?.status === "stopped"
+      || (report?.error !== undefined && report.error !== null)
+    ) {
       throw new Error(`public ${stoppedLabel} boot stopped: ${JSON.stringify(report)}`);
     }
     if (
       state.dataset.status === "running"
       && state.dataset.renderer === "wgpu-webgpu"
       && state.discStatus?.startsWith("local: ")
+      && state.diagnosticsCaptureAvailable
+      && state.diagnosticsCaptureDisabled === false
+      && state.diagnosticsCaptureState === "ready"
       && state.runnerAvailable
     ) return state;
     await publicDelay(pollMs);
@@ -318,15 +349,59 @@ export async function waitForPublicRunner(
 }
 
 export async function requestPublicSnapshot(session) {
-  return session.evaluate(REQUEST_PUBLIC_SNAPSHOT);
+  const request = await session.evaluate(REQUEST_PUBLIC_SNAPSHOT);
+  if (
+    request?.disabled !== true
+    || !Number.isSafeInteger(request.requestId)
+    || request.requestId <= 0
+    || request.state !== "pending"
+  ) {
+    throw new Error(`public diagnostics request failed: ${JSON.stringify(request)}`);
+  }
+  return request.requestId;
 }
 
-export async function waitForPublicSnapshot(session, { deadline, pollMs }) {
+export async function waitForPublicSnapshot(session, { deadline, pollMs, requestId }) {
+  if (!Number.isSafeInteger(requestId) || requestId <= 0) {
+    throw new Error("public diagnostics request ID is invalid");
+  }
+  const requestIdText = String(requestId);
   let state = null;
   while (Date.now() < deadline) {
     state = await publicReleaseState(session);
     const report = parsePublicReport(state.result);
-    if (report !== null) return { report, state };
+    if (
+      state.diagnosticsCaptureState === "failed"
+      && state.diagnosticsCaptureFailedRequestId === requestIdText
+    ) {
+      throw new Error(
+        `public diagnostics request ${requestId} failed: `
+          + `${state.diagnosticsCaptureFailure ?? "unknown capture failure"}`,
+      );
+    }
+    if (
+      report?.status === "stopped"
+      || (report?.error !== undefined && report.error !== null)
+    ) {
+      throw new Error(
+        `public diagnostics request ${requestId} stopped: ${JSON.stringify(report)}`,
+      );
+    }
+    if (
+      state.diagnosticsCaptureRequestId !== null
+      && Number(state.diagnosticsCaptureRequestId) > requestId
+    ) {
+      throw new Error(`public diagnostics request ${requestId} was superseded`);
+    }
+    if (
+      report?.stage === "snapshot"
+      && report.diagnosticsRequestId === requestId
+      && state.diagnosticsCaptureState === "complete"
+      && state.diagnosticsCaptureCompletedRequestId === requestIdText
+      && state.diagnosticsCaptureDisabled === false
+    ) {
+      return { report, state };
+    }
     await publicDelay(pollMs);
   }
   throw new Error(`public snapshot did not arrive: ${JSON.stringify(state)}`);

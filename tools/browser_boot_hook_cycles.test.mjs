@@ -80,17 +80,33 @@ const hookFunctions = [
   "drainGxFifoStagingAtCycle",
   "invokeJitHook",
   "createJitHookProxy",
+  "requestRunnerSnapshot",
+  "publishRunnerSnapshot",
 ];
 
 function makeContext() {
   const memory = new ArrayBuffer(256);
   const events = [];
   const context = {
+    blocks: new Map(),
     cycles: 1_000,
     drainFailure: null,
+    dispatches: 300,
+    finish(status, details) {
+      context.finishedDetails.push(details);
+      events.push([
+        "finish",
+        status,
+        details.stage,
+        context.view.getUint32(context.gxFifoStagingMeta, true),
+      ]);
+    },
     gxFifoStagingMeta: 0,
+    hex32: value => "0x" + (value >>> 0).toString(16).padStart(8, "0"),
     hookCalls: new Map(),
     hookCycleOffset: 8,
+    instructions: 200,
+    pc: 0x8000_1000,
     dataRamOrLockedCachePointer(address, size) {
       return address === 0x8000 && size === 1 ? 0 : null;
     },
@@ -99,7 +115,12 @@ function makeContext() {
     regionCyclePrefixOffset: 0,
     regionExitRequestOffset: 4,
     regionRunning: false,
+    runnerPaused: false,
+    runnerSnapshotRequested: true,
+    runnerSnapshotRequestId: null,
+    statusDataset: {},
     view: new DataView(memory),
+    finishedDetails: [],
   };
   context.drainGxFifoStaging = () => {
     events.push(["drain", context.cycles]);
@@ -298,6 +319,27 @@ test("post-execution FIFO drains use returned aggregate cycles", () => {
     /post-block drain failed/,
   );
   assert.equal(context.cycles, 1_000);
+});
+
+test("public snapshot identity survives an overlapping debug request and is echoed once", () => {
+  const context = makeContext();
+  context.runnerSnapshotRequested = false;
+
+  context.requestRunnerSnapshot(41);
+  context.requestRunnerSnapshot();
+  context.requestRunnerSnapshot(42);
+  assert.equal(context.runnerSnapshotRequested, true);
+  assert.equal(context.runnerSnapshotRequestId, 41);
+
+  context.publishRunnerSnapshot();
+  assert.equal(context.finishedDetails[0].stage, "snapshot");
+  assert.equal(context.finishedDetails[0].diagnosticsRequestId, 41);
+  assert.equal(context.runnerSnapshotRequested, false);
+  assert.equal(context.runnerSnapshotRequestId, null);
+
+  context.requestRunnerSnapshot();
+  context.publishRunnerSnapshot();
+  assert.equal("diagnosticsRequestId" in context.finishedDetails[1], false);
 });
 
 test("inline BAT barriers drain prior FIFO bytes at their exact cycle", () => {

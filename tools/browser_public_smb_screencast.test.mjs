@@ -234,6 +234,7 @@ test("terminal wait actively snapshots and retries before the first completed pa
     { report: ready, state: runningState },
   ];
   let snapshotRequests = 0;
+  const waitedRequestIds = [];
   let clockMs = 1_000;
   const collector = {
     window: null,
@@ -261,11 +262,15 @@ test("terminal wait actively snapshots and retries before the first completed pa
     pollMs: 10,
     requestSnapshot: async () => {
       snapshotRequests += 1;
-      return true;
+      return snapshotRequests;
     },
-    waitSnapshot: async () => snapshots.shift(),
+    waitSnapshot: async (_session, options) => {
+      waitedRequestIds.push(options.requestId);
+      return snapshots.shift();
+    },
   });
   assert.equal(snapshotRequests, 2);
+  assert.deepEqual(waitedRequestIds, [1, 2]);
   assert.equal(collector.window.snapshotRequestedAtMs, 1_004);
   assert.equal(collector.window.observedAtMs, 1_005);
   assert.equal(collector.window.acceptedReceipts, 16);

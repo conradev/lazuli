@@ -43,6 +43,7 @@ const STATIC_FILES = [
 const DEBUG_UI_START = "<!-- LAZULI DEBUG UI START -->";
 const DEBUG_UI_END = "<!-- LAZULI DEBUG UI END -->";
 const TERMINAL_REPORT_SINK = '<pre id="result" data-testid="browser-boot-result" hidden aria-hidden="true"></pre>';
+const CAPTURE_DIAGNOSTICS_CONTROL = '<button id="capture-diagnostics" type="button" aria-controls="result" data-capture-state="unavailable" disabled>Capture diagnostics</button>';
 const DEBUG_ONLY_IDS = [
   "runner-controls",
   "pause-runner",
@@ -142,6 +143,7 @@ function licensedFrontend(html, source, rendererJavascriptUrl) {
   html = html.replaceAll(RENDERER_IMPORT_URL, rendererJavascriptUrl);
   check(!html.includes(RENDERER_IMPORT_URL), "generated frontend still imports the stable browser renderer URL");
   const links = [
+    CAPTURE_DIAGNOSTICS_CONTROL,
     `<a href="${source.tree}" target="_blank" rel="source noopener">Source</a>`,
     `<a href="${LEGAL_PAGE_URL}" target="_blank" rel="license noopener">Legal</a>`,
   ].join(" · ");
