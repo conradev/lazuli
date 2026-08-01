@@ -1438,6 +1438,7 @@ const _: () = {
 /// - bind this block at group 1;
 /// - upload one [`TevDrawState`] at binding 0;
 /// - bind texture maps 0..7 at bindings 1..8 and their samplers at 9..16;
+/// - upload the 128-byte indirect/GEN_MODE side uniform at binding 17;
 /// - call `tev_evaluate(raster_colors, managed_raster_bytes, tex_coords,
 ///   managed_exact_sampler)` from a fragment entry point;
 /// - provide GX-scaled, texel-space STQ coordinates; sampling performs `st / q`
@@ -2161,19 +2162,11 @@ fn gx_managed_sidecar_stq(
 }
 
 fn gx_managed_required_tex_coord_mask() -> u32 {
-    var mask = 0u;
-    var stage_index = 0u;
-    loop {
-        if stage_index >= min(tev_state.stage_count_and_padding.x, TEV_MAX_STAGES) {
-            break;
-        }
-        let refs = tev_state.stages[stage_index].refs;
-        if (refs & (1u << 6u)) != 0u {
-            mask |= 1u << ((refs >> 3u) & 7u);
-        }
-        stage_index += 1u;
-    }
-    return mask;
+    // The CPU dataflow pass includes indirect IREF coordinates, direct-stage
+    // GEN_MODE fallbacks, and texture-disabled stages that still update the
+    // persistent indirect coordinate. Re-scanning only enabled direct stages
+    // here would omit all three cases.
+    return indirect_tev_state.matrix_rows[1].w & 0xffu;
 }
 
 fn managed_multi_coord_tev_input(
@@ -2355,6 +2348,8 @@ fn alpha_test_passes(value: u32, test: u32) -> bool {
 
 pub(crate) const TEV_WGSL: &str = "
 const TEV_MAX_STAGES: u32 = 16u;
+const TEV_INDIRECT_MAX_STAGES: u32 = 4u;
+const TEV_INDIRECT_COMMAND_MASK: u32 = 0x001fffffu;
 const TEV_KONST_FRACTIONS = array<i32, 8>(255, 223, 191, 159, 128, 96, 64, 32);
 
 struct TevStageState {
@@ -2370,6 +2365,12 @@ struct TevDrawState {
     konst_registers: array<vec4<i32>, 4>,
     swap_tables: array<vec4<u32>, 4>,
     stage_count_and_padding: vec4<u32>,
+};
+
+struct IndirectTevDrawState {
+    control: vec4<u32>,
+    matrix_rows: array<vec4<u32>, 3>,
+    commands: array<vec4<u32>, 4>,
 };
 
 @group(1) @binding(0) var<uniform> tev_state: TevDrawState;
@@ -2389,6 +2390,7 @@ struct TevDrawState {
 @group(1) @binding(14) var tev_sampler5: sampler;
 @group(1) @binding(15) var tev_sampler6: sampler;
 @group(1) @binding(16) var tev_sampler7: sampler;
+@group(1) @binding(17) var<uniform> indirect_tev_state: IndirectTevDrawState;
 
 fn tev_register_index(encoded: u32) -> u32 {
     if (encoded & 3u) == 0u { return 3u; }
@@ -2401,6 +2403,14 @@ fn tev_to_bytes(value: vec4<f32>) -> vec4<i32> {
 
 fn gx_native_normalized_uv(texture: texture_2d<f32>, texel_uv: vec2<f32>) -> vec2<f32> {
     return texel_uv / vec2<f32>(textureDimensions(texture, 0));
+}
+
+fn gx_projective_uv(stq: vec3<f32>) -> vec2<f32> {
+    // GX keeps ST unchanged when Q is zero rather than producing infinities.
+    if stq.z == 0.0 {
+        return stq.xy;
+    }
+    return stq.xy / stq.z;
 }
 
 fn gx_sampler_mode0(map: u32) -> u32 {
@@ -2578,6 +2588,72 @@ fn gx_manual_sample_texture(
     return vec4<i32>(result);
 }
 
+fn gx_manual_sample_texture_with_lod(
+    texture: texture_2d<f32>,
+    mode0: u32,
+    mode1: u32,
+    sample_uv: vec2<f32>,
+    lod_uv: vec2<f32>,
+) -> vec4<i32> {
+    let sample_s17_7 = vec2<i32>(sample_uv * 128.0);
+    let lod_s17_7 = vec2<i32>(lod_uv * 128.0);
+    let mip_mode = (mode0 >> 5u) & 3u;
+    let full_lod_state = (mode0 & 0x80000000u) != 0u;
+    if !full_lod_state && mip_mode == 0u {
+        let linear = (mode0 & (1u << 4u)) != 0u;
+        return vec4<i32>(
+            gx_manual_sample_level(texture, mode0, sample_s17_7, 0u, linear)
+        );
+    }
+
+    // UTCLOD selects the unmodified base coordinate only for derivative
+    // calculation. Texture addressing always uses the post-indirect result.
+    let uv_delta_x = abs(dpdxCoarse(vec2<f32>(lod_s17_7)));
+    let uv_delta_y = abs(dpdyCoarse(vec2<f32>(lod_s17_7)));
+    var uv_delta = max(uv_delta_x, uv_delta_y);
+    if (mode0 & (1u << 8u)) != 0u {
+        uv_delta = uv_delta_x + uv_delta_y;
+    }
+    let rho = max(uv_delta.x, uv_delta.y) / 128.0;
+    let max_lod = i32((mode1 >> 8u) & 0xffu);
+    let min_lod = min(i32(mode1 & 0xffu), max_lod);
+    let raw_bias = i32((mode0 >> 9u) & 0xffu);
+    let signed_bias = select(raw_bias, raw_bias - 256, raw_bias >= 128);
+    let bias_sixteenths = select(0, signed_bias >> 1u, mip_mode != 0u);
+    var lod = min_lod;
+    if rho != 0.0 {
+        lod = i32(floor(log2(rho) * 16.0)) + bias_sixteenths;
+    }
+    let linear = select(
+        (mode0 & (1u << 4u)) != 0u,
+        (mode0 & (1u << 7u)) != 0u,
+        lod > 0,
+    );
+    if mip_mode == 0u {
+        return vec4<i32>(
+            gx_manual_sample_level(texture, mode0, sample_s17_7, 0u, linear)
+        );
+    }
+    lod = clamp(lod, min_lod, max_lod);
+    var base_lod = u32(lod >> 4u);
+    let fractional_lod = u32(lod & 15);
+    if mip_mode == 1u && fractional_lod >= 8u {
+        base_lod += 1u;
+    }
+
+    var result =
+        gx_manual_sample_level(texture, mode0, sample_s17_7, base_lod, linear);
+    if mip_mode == 2u && fractional_lod != 0u {
+        let next = gx_manual_sample_level(
+            texture, mode0, sample_s17_7, base_lod + 1u, linear,
+        );
+        result =
+            (result * vec4<u32>(16u - fractional_lod) +
+             next * vec4<u32>(fractional_lod)) >> vec4<u32>(4u);
+    }
+    return vec4<i32>(result);
+}
+
 fn gx_native_sample_texture(
     texture: texture_2d<f32>,
     texture_sampler: sampler,
@@ -2588,14 +2664,43 @@ fn gx_native_sample_texture(
     if (mode0 & 0x80000000u) != 0u {
         return gx_manual_sample_texture(texture, mode0, mode1, uv);
     }
-    return tev_to_bytes(textureSample(
+    let raw_bias = i32((mode0 >> 9u) & 0xffu);
+    let signed_bias = select(raw_bias, raw_bias - 256, raw_bias >= 128);
+    return tev_to_bytes(textureSampleBias(
         texture, texture_sampler, gx_native_normalized_uv(texture, uv),
+        f32(signed_bias) / 32.0,
+    ));
+}
+
+fn gx_native_sample_texture_with_lod(
+    texture: texture_2d<f32>,
+    texture_sampler: sampler,
+    mode0: u32,
+    mode1: u32,
+    sample_uv: vec2<f32>,
+    lod_uv: vec2<f32>,
+) -> vec4<i32> {
+    if (mode0 & 0x80000000u) != 0u {
+        return gx_manual_sample_texture_with_lod(
+            texture, mode0, mode1, sample_uv, lod_uv,
+        );
+    }
+    let dimensions = vec2<f32>(textureDimensions(texture, 0));
+    let normalized_sample = sample_uv / dimensions;
+    let normalized_lod = lod_uv / dimensions;
+    let raw_bias = i32((mode0 >> 9u) & 0xffu);
+    let signed_bias = select(raw_bias, raw_bias - 256, raw_bias >= 128);
+    let lod_scale = exp2(f32(signed_bias) / 32.0);
+    return tev_to_bytes(textureSampleGrad(
+        texture, texture_sampler, normalized_sample,
+        dpdxCoarse(normalized_lod) * lod_scale,
+        dpdyCoarse(normalized_lod) * lod_scale,
     ));
 }
 
 fn tev_sample_texture_native(map: u32, stq: vec3<f32>) -> vec4<i32> {
     // Q remains part of the interpolant until the fragment stage.
-    let uv = stq.xy / stq.z;
+    let uv = gx_projective_uv(stq);
     let mode0 = gx_sampler_mode0(map);
     let mode1 = gx_sampler_mode1(map);
     switch map & 7u {
@@ -2642,35 +2747,388 @@ fn tev_sample_texture_native(map: u32, stq: vec3<f32>) -> vec4<i32> {
     }
 }
 
+fn gx_managed_sample_texture(
+    texture: texture_2d<f32>,
+    texture_sampler: sampler,
+    mode0: u32,
+    mode1: u32,
+    uv: vec2<f32>,
+) -> vec4<i32> {
+    if ((mode0 >> 19u) & 3u) != 0u {
+        return gx_native_sample_texture(texture, texture_sampler, mode0, mode1, uv);
+    }
+    return gx_manual_sample_texture(texture, mode0, mode1, uv);
+}
+
 fn tev_sample_texture_managed(map: u32, uv: vec2<f32>) -> vec4<i32> {
     let mode0 = gx_sampler_mode0(map);
     let mode1 = gx_sampler_mode1(map);
     switch map & 7u {
         case 0u: {
-            return gx_manual_sample_texture(tev_texture0, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture0, tev_sampler0, mode0, mode1, uv,
+            );
         }
         case 1u: {
-            return gx_manual_sample_texture(tev_texture1, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture1, tev_sampler1, mode0, mode1, uv,
+            );
         }
         case 2u: {
-            return gx_manual_sample_texture(tev_texture2, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture2, tev_sampler2, mode0, mode1, uv,
+            );
         }
         case 3u: {
-            return gx_manual_sample_texture(tev_texture3, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture3, tev_sampler3, mode0, mode1, uv,
+            );
         }
         case 4u: {
-            return gx_manual_sample_texture(tev_texture4, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture4, tev_sampler4, mode0, mode1, uv,
+            );
         }
         case 5u: {
-            return gx_manual_sample_texture(tev_texture5, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture5, tev_sampler5, mode0, mode1, uv,
+            );
         }
         case 6u: {
-            return gx_manual_sample_texture(tev_texture6, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture6, tev_sampler6, mode0, mode1, uv,
+            );
         }
         default: {
-            return gx_manual_sample_texture(tev_texture7, mode0, mode1, uv);
+            return gx_managed_sample_texture(
+                tev_texture7, tev_sampler7, mode0, mode1, uv,
+            );
         }
     }
+}
+
+fn gx_sample_texture_coordinates(
+    texture: texture_2d<f32>,
+    texture_sampler: sampler,
+    mode0: u32,
+    mode1: u32,
+    sample_uv: vec2<f32>,
+    lod_uv: vec2<f32>,
+    use_unmodified_lod: bool,
+    managed_exact_sampler: bool,
+) -> vec4<i32> {
+    if managed_exact_sampler && ((mode0 >> 19u) & 3u) == 0u {
+        return gx_manual_sample_texture_with_lod(
+            texture, mode0, mode1, sample_uv, lod_uv,
+        );
+    }
+    if use_unmodified_lod {
+        return gx_native_sample_texture_with_lod(
+            texture, texture_sampler, mode0, mode1, sample_uv, lod_uv,
+        );
+    }
+    // Preserve the implicit native-WebGPU sampler for commands whose sample
+    // and LOD coordinates are the same. In particular, presence=0 never
+    // reaches this helper and keeps the original legacy call graph exactly.
+    return gx_native_sample_texture(
+        texture, texture_sampler, mode0, mode1, sample_uv,
+    );
+}
+
+fn tev_sample_texture_coordinates(
+    map: u32,
+    sample_uv: vec2<f32>,
+    lod_uv: vec2<f32>,
+    use_unmodified_lod: bool,
+    managed_exact_sampler: bool,
+) -> vec4<i32> {
+    let mode0 = gx_sampler_mode0(map);
+    let mode1 = gx_sampler_mode1(map);
+    switch map & 7u {
+        case 0u: {
+            return gx_sample_texture_coordinates(
+                tev_texture0, tev_sampler0, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+        case 1u: {
+            return gx_sample_texture_coordinates(
+                tev_texture1, tev_sampler1, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+        case 2u: {
+            return gx_sample_texture_coordinates(
+                tev_texture2, tev_sampler2, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+        case 3u: {
+            return gx_sample_texture_coordinates(
+                tev_texture3, tev_sampler3, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+        case 4u: {
+            return gx_sample_texture_coordinates(
+                tev_texture4, tev_sampler4, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+        case 5u: {
+            return gx_sample_texture_coordinates(
+                tev_texture5, tev_sampler5, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+        case 6u: {
+            return gx_sample_texture_coordinates(
+                tev_texture6, tev_sampler6, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+        default: {
+            return gx_sample_texture_coordinates(
+                tev_texture7, tev_sampler7, mode0, mode1, sample_uv, lod_uv,
+                use_unmodified_lod, managed_exact_sampler,
+            );
+        }
+    }
+}
+
+fn gx_indirect_present() -> bool {
+    return indirect_tev_state.matrix_rows[2].w != 0u;
+}
+
+fn gx_indirect_num_tex_gens() -> u32 {
+    return indirect_tev_state.control.x & 0xfu;
+}
+
+fn gx_indirect_num_stages() -> u32 {
+    return min((indirect_tev_state.control.x >> 16u) & 7u, TEV_INDIRECT_MAX_STAGES);
+}
+
+fn gx_indirect_command(stage: u32) -> u32 {
+    return indirect_tev_state.commands[stage >> 2u][stage & 3u]
+        & TEV_INDIRECT_COMMAND_MASK;
+}
+
+fn gx_indirect_effective_tex_coord(requested: u32) -> u32 {
+    let num_tex_gens = gx_indirect_num_tex_gens();
+    if num_tex_gens != 0u && requested < num_tex_gens {
+        return requested;
+    }
+    return 0u;
+}
+
+fn gx_indirect_projected_s17_7(stq: vec3<f32>) -> vec2<i32> {
+    return vec2<i32>(gx_projective_uv(stq) * 128.0);
+}
+
+fn gx_indirect_selected_coord(
+    tex_coords: array<vec3<f32>, 8>,
+    requested: u32,
+) -> vec2<i32> {
+    if gx_indirect_num_tex_gens() == 0u {
+        return vec2<i32>(0);
+    }
+    return gx_indirect_projected_s17_7(
+        tex_coords[gx_indirect_effective_tex_coord(requested)]
+    );
+}
+
+fn gx_indirect_reference(stage: u32) -> vec2<u32> {
+    let shift = stage * 6u;
+    let iref = indirect_tev_state.control.y;
+    return vec2<u32>((iref >> shift) & 7u, (iref >> (shift + 3u)) & 7u);
+}
+
+fn gx_indirect_scale(stage: u32) -> vec2<u32> {
+    let word = select(
+        indirect_tev_state.control.z,
+        indirect_tev_state.control.w,
+        stage >= 2u,
+    );
+    let shift = (stage & 1u) * 8u;
+    return vec2<u32>((word >> shift) & 0xfu, (word >> (shift + 4u)) & 0xfu);
+}
+
+fn gx_indirect_sampled_stage_mask(stage_count: u32) -> u32 {
+    let num_indirect_stages = gx_indirect_num_stages();
+    var mask = 0u;
+    for (var stage = 0u; stage < min(stage_count, TEV_MAX_STAGES); stage += 1u) {
+        let command = gx_indirect_command(stage);
+        let indirect_stage = command & 3u;
+        let bump_alpha = (command >> 7u) & 3u;
+        let encoded_matrix = (command >> 9u) & 3u;
+        if indirect_stage < num_indirect_stages
+            && (bump_alpha != 0u || encoded_matrix != 0u) {
+            mask |= 1u << indirect_stage;
+        }
+    }
+    return mask;
+}
+
+fn gx_indirect_prefetch_samples(
+    tex_coords: array<vec3<f32>, 8>,
+    stage_count: u32,
+    managed_exact_sampler: bool,
+) -> array<vec4<i32>, 4> {
+    var samples = array<vec4<i32>, 4>(
+        vec4<i32>(0), vec4<i32>(0), vec4<i32>(0), vec4<i32>(0),
+    );
+    if !gx_indirect_present() {
+        return samples;
+    }
+    let sampled_mask = gx_indirect_sampled_stage_mask(stage_count);
+    for (var indirect_stage = 0u;
+         indirect_stage < TEV_INDIRECT_MAX_STAGES;
+         indirect_stage += 1u) {
+        if (sampled_mask & (1u << indirect_stage)) == 0u {
+            continue;
+        }
+        let reference = gx_indirect_reference(indirect_stage);
+        let scale = gx_indirect_scale(indirect_stage);
+        let unscaled = gx_indirect_selected_coord(tex_coords, reference.y);
+        let sample_s17_7 = vec2<i32>(
+            unscaled.x >> scale.x,
+            unscaled.y >> scale.y,
+        );
+        let sample_uv = vec2<f32>(sample_s17_7) / 128.0;
+        samples[indirect_stage] = tev_sample_texture_coordinates(
+            reference.x, sample_uv, sample_uv, false, managed_exact_sampler,
+        );
+    }
+    return samples;
+}
+
+fn gx_indirect_sample_abg(sample: vec4<i32>) -> vec3<i32> {
+    return vec3<i32>(sample.a, sample.b, sample.g);
+}
+
+fn gx_indirect_format_shift(format: u32) -> u32 {
+    if format == 1u { return 3u; }
+    if format == 2u { return 4u; }
+    if format == 3u { return 5u; }
+    return 0u;
+}
+
+fn gx_indirect_bump_shift(format: u32) -> u32 {
+    if format == 1u { return 5u; }
+    if format == 2u { return 4u; }
+    if format == 3u { return 3u; }
+    return 0u;
+}
+
+fn gx_indirect_formatted_sample(command: u32, sample_abg: vec3<i32>) -> vec3<i32> {
+    let format = (command >> 2u) & 3u;
+    let shift = gx_indirect_format_shift(format);
+    let bias = select(1, -128, format == 0u);
+    var formatted = vec3<i32>(
+        sample_abg.x >> shift,
+        sample_abg.y >> shift,
+        sample_abg.z >> shift,
+    );
+    if (command & (1u << 4u)) != 0u { formatted.x += bias; }
+    if (command & (1u << 5u)) != 0u { formatted.y += bias; }
+    if (command & (1u << 6u)) != 0u { formatted.z += bias; }
+    return formatted;
+}
+
+fn gx_indirect_bump_alpha(command: u32, sample_abg: vec3<i32>) -> i32 {
+    let bump_alpha = (command >> 7u) & 3u;
+    var component = sample_abg.z;
+    if bump_alpha == 1u { component = sample_abg.x; }
+    if bump_alpha == 2u { component = sample_abg.y; }
+    let format = (command >> 2u) & 3u;
+    return (component << gx_indirect_bump_shift(format)) & 0xf8;
+}
+
+fn gx_indirect_signed_11(value: u32) -> i32 {
+    return i32(value << 21u) >> 21u;
+}
+
+fn gx_indirect_apply_exponent(value: i32, exponent: i32) -> i32 {
+    if exponent >= 0 {
+        return bitcast<i32>(bitcast<u32>(value) << u32(exponent));
+    }
+    return value >> u32(-exponent);
+}
+
+fn gx_indirect_dynamic_product(base: i32, component: i32) -> i32 {
+    // Exact signed (i64(base) * i64(component)) >> 8 without shader-i64.
+    // The formatted component is at most eight bits, so both terms fit i32.
+    let high = base >> 8u;
+    let low = base & 0xff;
+    return high * component + ((low * component) >> 8u);
+}
+
+fn gx_indirect_matrix_transform(
+    command: u32,
+    sample_abg: vec3<i32>,
+    base_coord: vec2<i32>,
+) -> vec2<i32> {
+    let encoded_matrix = (command >> 9u) & 3u;
+    if encoded_matrix == 0u {
+        return vec2<i32>(0);
+    }
+    let words = indirect_tev_state.matrix_rows[encoded_matrix - 1u].xyz;
+    let exponent_bits =
+        ((words.x >> 22u) & 3u) |
+        (((words.y >> 22u) & 3u) << 2u) |
+        (((words.z >> 22u) & 1u) << 4u);
+    let exponent = i32(exponent_bits) - 17;
+    let matrix_id = (command >> 11u) & 3u;
+    let formatted = gx_indirect_formatted_sample(command, sample_abg);
+    if matrix_id == 0u {
+        let row0 = vec3<i32>(
+            gx_indirect_signed_11(words.x),
+            gx_indirect_signed_11(words.y),
+            gx_indirect_signed_11(words.z),
+        );
+        let row1 = vec3<i32>(
+            gx_indirect_signed_11(words.x >> 11u),
+            gx_indirect_signed_11(words.y >> 11u),
+            gx_indirect_signed_11(words.z >> 11u),
+        );
+        let dot0 = (
+            row0.x * formatted.x + row0.y * formatted.y + row0.z * formatted.z
+        ) >> 3u;
+        let dot1 = (
+            row1.x * formatted.x + row1.y * formatted.y + row1.z * formatted.z
+        ) >> 3u;
+        return vec2<i32>(
+            gx_indirect_apply_exponent(dot0, exponent),
+            gx_indirect_apply_exponent(dot1, exponent),
+        );
+    }
+    if matrix_id == 1u || matrix_id == 2u {
+        let component = select(formatted.x, formatted.y, matrix_id == 2u);
+        return vec2<i32>(
+            gx_indirect_apply_exponent(
+                gx_indirect_dynamic_product(base_coord.x, component), exponent,
+            ),
+            gx_indirect_apply_exponent(
+                gx_indirect_dynamic_product(base_coord.y, component), exponent,
+            ),
+        );
+    }
+    return vec2<i32>(0);
+}
+
+fn gx_indirect_wrap_coord(coord: i32, wrap: u32) -> i32 {
+    if wrap == 0u { return coord; }
+    if wrap >= 6u { return 0; }
+    let texels = 512u >> wrap;
+    return coord & i32((texels << 7u) - 1u);
+}
+
+fn gx_indirect_wrapping_add(left: i32, right: i32) -> i32 {
+    return bitcast<i32>(bitcast<u32>(left) + bitcast<u32>(right));
+}
+
+fn gx_indirect_signed_24(value: i32) -> i32 {
+    return i32(bitcast<u32>(value) << 8u) >> 8u;
 }
 
 fn tev_swizzle(color: vec4<i32>, table_index: u32) -> vec4<i32> {
@@ -2849,28 +3307,112 @@ fn tev_evaluate(
     var raw_texture = vec4<i32>(0);
     var last_color_destination = 3u;
     var last_alpha_destination = 3u;
+    let stage_count = min(tev_state.stage_count_and_padding.x, TEV_MAX_STAGES);
+    let indirect_present = gx_indirect_present();
+    let num_indirect_stages = gx_indirect_num_stages();
+    let indirect_samples = gx_indirect_prefetch_samples(
+        tex_coords, stage_count, managed_exact_sampler,
+    );
+    var previous_coord = vec2<i32>(0);
+    var alpha_bump = 0;
     var stage_index = 0u;
     loop {
-        if stage_index >= min(tev_state.stage_count_and_padding.x, TEV_MAX_STAGES) { break; }
+        if stage_index >= stage_count { break; }
         let stage = tev_state.stages[stage_index];
         let texture_map = stage.refs & 7u;
         let tex_coord = (stage.refs >> 3u) & 7u;
-        var texture_base = vec4<i32>(255);
-        if (stage.refs & (1u << 6u)) != 0u {
-            if managed_exact_sampler {
-                // Managed coverage has already reconstructed every live
-                // stage-selected UV with Dolphin's BuildBlock operation order.
-                texture_base =
-                    tev_sample_texture_managed(texture_map, tex_coords[tex_coord].xy);
+        var sample_coord = vec2<i32>(0);
+        var lod_coord = vec2<i32>(0);
+        var use_unmodified_lod = false;
+        if indirect_present {
+            let base_coord = gx_indirect_selected_coord(tex_coords, tex_coord);
+            let command = gx_indirect_command(stage_index);
+            if command == 0u {
+                // A semantic raw-zero command resets the persistent coordinate
+                // even when this direct stage has texturing disabled.
+                previous_coord = base_coord;
+                sample_coord = base_coord;
+                lod_coord = base_coord;
             } else {
-                texture_base = tev_sample_texture_native(texture_map, tex_coords[tex_coord]);
+                var transform = vec2<i32>(0);
+                let indirect_stage = command & 3u;
+                if indirect_stage < num_indirect_stages {
+                    let sample_abg =
+                        gx_indirect_sample_abg(indirect_samples[indirect_stage]);
+                    if ((command >> 7u) & 3u) != 0u {
+                        alpha_bump = gx_indirect_bump_alpha(command, sample_abg);
+                    }
+                    if ((command >> 9u) & 3u) != 0u {
+                        transform = gx_indirect_matrix_transform(
+                            command, sample_abg, base_coord,
+                        );
+                    }
+                }
+                let wrapped = vec2<i32>(
+                    gx_indirect_wrap_coord(base_coord.x, (command >> 13u) & 7u),
+                    gx_indirect_wrap_coord(base_coord.y, (command >> 16u) & 7u),
+                );
+                var next_coord = vec2<i32>(
+                    gx_indirect_wrapping_add(wrapped.x, transform.x),
+                    gx_indirect_wrapping_add(wrapped.y, transform.y),
+                );
+                if (command & (1u << 20u)) != 0u {
+                    next_coord = vec2<i32>(
+                        gx_indirect_wrapping_add(next_coord.x, previous_coord.x),
+                        gx_indirect_wrapping_add(next_coord.y, previous_coord.y),
+                    );
+                }
+                sample_coord = vec2<i32>(
+                    gx_indirect_signed_24(next_coord.x),
+                    gx_indirect_signed_24(next_coord.y),
+                );
+                previous_coord = sample_coord;
+                use_unmodified_lod = (command & (1u << 19u)) != 0u;
+                lod_coord = select(sample_coord, base_coord, use_unmodified_lod);
+            }
+        }
+        let no_texture_generators =
+            indirect_present && gx_indirect_num_tex_gens() == 0u;
+        // With a transported zero NUMTEXGENS, GX exposes black texture input
+        // to every stage, including stages whose direct texture-enable bit is
+        // clear. raw_texture remains last-sample state and is updated below
+        // only for texture-enabled stages.
+        var texture_base = select(
+            vec4<i32>(255), vec4<i32>(0), no_texture_generators,
+        );
+        if (stage.refs & (1u << 6u)) != 0u {
+            if indirect_present {
+                if !no_texture_generators {
+                    texture_base = tev_sample_texture_coordinates(
+                        texture_map,
+                        vec2<f32>(sample_coord) / 128.0,
+                        vec2<f32>(lod_coord) / 128.0,
+                        use_unmodified_lod,
+                        managed_exact_sampler,
+                    );
+                }
+            } else {
+                // This branch is intentionally the original direct-only path.
+                // An absent tail must not change interpolation, implicit LOD,
+                // or the managed sampler's operation order.
+                if managed_exact_sampler {
+                    texture_base =
+                        tev_sample_texture_managed(texture_map, tex_coords[tex_coord].xy);
+                } else {
+                    texture_base =
+                        tev_sample_texture_native(texture_map, tex_coords[tex_coord]);
+                }
             }
             raw_texture = texture_base;
         }
         let texture = tev_swizzle(texture_base, (stage.alpha_combiner >> 2u) & 3u);
         let raster_channel = (stage.refs >> 7u) & 7u;
         var raster_base = vec4<i32>(0);
-        if raster_channel != 7u {
+        if indirect_present && raster_channel == 5u {
+            raster_base = vec4<i32>(alpha_bump);
+        } else if indirect_present && raster_channel == 6u {
+            raster_base = vec4<i32>(alpha_bump | (alpha_bump >> 5u));
+        } else if raster_channel != 7u {
             if managed_exact_sampler {
                 raster_base = managed_raster_bytes[raster_channel];
             } else {
@@ -3782,11 +4324,14 @@ mod tests {
     #[test]
     fn wgsl_contract_has_fixed_bindings_projective_sampling_and_full_stage_loop() {
         assert!(TEV_WGSL.contains("@group(1) @binding(0) var<uniform> tev_state"));
+        assert!(TEV_WGSL.contains(
+            "@group(1) @binding(17) var<uniform> indirect_tev_state: IndirectTevDrawState"
+        ));
         for map in 0..MAX_TEV_TEXTURES {
             assert!(TEV_WGSL.contains(&format!("var tev_texture{map}: texture_2d<f32>")));
             assert!(TEV_WGSL.contains(&format!("var tev_sampler{map}: sampler")));
         }
-        assert!(TEV_WGSL.contains("let uv = stq.xy / stq.z"));
+        assert!(TEV_WGSL.contains("let uv = gx_projective_uv(stq)"));
         assert!(TEV_WGSL.contains("TEV_MAX_STAGES: u32 = 16u"));
         assert!(TEV_WGSL.contains("fn tev_color_combiner"));
         assert!(TEV_WGSL.contains("fn tev_alpha_combiner"));
@@ -3809,6 +4354,90 @@ mod tests {
         assert!(!regular.contains("/ 255"));
         assert!(TEV_VERTEX_WGSL.contains("input.position.z / 16777215.0"));
         assert!(!TEV_VERTEX_WGSL.contains("input.position.z / 16777216.0"));
+    }
+
+    #[test]
+    fn wgsl_projective_q_zero_keeps_st_for_legacy_and_indirect_coordinates() {
+        let shader = shader_source();
+        let projection_start = shader.find("fn gx_projective_uv(").unwrap();
+        let projection_end = shader[projection_start..]
+            .find("\n}\n\nfn gx_sampler_mode0")
+            .unwrap()
+            + projection_start;
+        let projection = &shader[projection_start..projection_end];
+        assert!(projection.contains("if stq.z == 0.0"));
+        assert!(projection.contains("return stq.xy"));
+        assert!(projection.contains("return stq.xy / stq.z"));
+        assert!(shader.contains("let uv = gx_projective_uv(stq)"));
+        assert!(shader.contains("return vec2<i32>(gx_projective_uv(stq) * 128.0)"));
+        assert!(!shader.contains("let uv = stq.xy / stq.z"));
+        assert!(!shader.contains("(stq.xy / stq.z) * 128.0"));
+
+        let project = |stq: [f32; 3]| {
+            if stq[2] == 0.0 {
+                [stq[0], stq[1]]
+            } else {
+                [stq[0] / stq[2], stq[1] / stq[2]]
+            }
+        };
+        assert_eq!(project([320.0, -96.0, 0.0]), [320.0, -96.0]);
+        assert_eq!(project([320.0, -96.0, 2.0]), [160.0, -48.0]);
+    }
+
+    #[test]
+    fn wgsl_indirect_tev_contract_covers_stateful_coordinates_lod_and_bump_rasters() {
+        let shader = shader_source();
+        assert!(shader.contains(
+            "struct IndirectTevDrawState {\n    control: vec4<u32>,\n    matrix_rows: array<vec4<u32>, 3>,\n    commands: array<vec4<u32>, 4>,\n};"
+        ));
+        assert!(shader.contains("const TEV_INDIRECT_COMMAND_MASK: u32 = 0x001fffffu"));
+        assert!(shader.contains(
+            "return indirect_tev_state.commands[stage >> 2u][stage & 3u]\n        & TEV_INDIRECT_COMMAND_MASK"
+        ));
+        assert!(shader.contains("return indirect_tev_state.matrix_rows[2].w != 0u"));
+        assert!(shader.contains("return indirect_tev_state.matrix_rows[1].w & 0xffu"));
+
+        let evaluate_start = shader.find("fn tev_evaluate(").unwrap();
+        let evaluate_end = shader[evaluate_start..]
+            .find("\n}\n\nstruct TevFragmentOutput")
+            .unwrap()
+            + evaluate_start;
+        let evaluate = &shader[evaluate_start..evaluate_end];
+        let coordinate_update = evaluate.find("if indirect_present {").unwrap();
+        let texture_sample = evaluate.find("let no_texture_generators =").unwrap();
+        let raster_select = evaluate.find("let raster_channel =").unwrap();
+        assert!(coordinate_update < texture_sample && texture_sample < raster_select);
+        assert!(evaluate.contains("if command == 0u"));
+        assert!(evaluate.contains("previous_coord = base_coord"));
+        assert!(evaluate.contains("gx_indirect_signed_24(next_coord.x)"));
+        assert!(evaluate.contains("gx_indirect_wrapping_add(next_coord.x, previous_coord.x)"));
+        assert!(
+            evaluate.contains("lod_coord = select(sample_coord, base_coord, use_unmodified_lod)")
+        );
+        assert!(evaluate.contains("indirect_present && gx_indirect_num_tex_gens() == 0u"));
+        assert!(evaluate.contains("vec4<i32>(255), vec4<i32>(0), no_texture_generators"));
+        assert!(evaluate.contains("if !no_texture_generators"));
+        let texture_enable = evaluate.find("if (stage.refs & (1u << 6u)) != 0u").unwrap();
+        let raw_texture_update = evaluate.find("raw_texture = texture_base").unwrap();
+        assert!(texture_sample < texture_enable && texture_enable < raw_texture_update);
+        assert!(evaluate.contains("raster_channel == 5u"));
+        assert!(evaluate.contains("raster_channel == 6u"));
+        assert!(evaluate.contains("alpha_bump | (alpha_bump >> 5u)"));
+
+        assert!(shader.contains("return vec3<i32>(sample.a, sample.b, sample.g)"));
+        assert!(shader.contains("let bias = select(1, -128, format == 0u)"));
+        assert!(shader.contains("return (component << gx_indirect_bump_shift(format)) & 0xf8"));
+        assert!(shader.contains("fn gx_indirect_matrix_transform("));
+        assert!(shader.contains("let exponent = i32(exponent_bits) - 17"));
+        assert!(shader.contains("fn gx_indirect_dynamic_product("));
+        assert!(shader.contains("return coord & i32((texels << 7u) - 1u)"));
+
+        assert!(shader.contains("fn gx_manual_sample_texture_with_lod("));
+        assert!(shader.contains("dpdxCoarse(vec2<f32>(lod_s17_7))"));
+        assert!(shader.contains("fn gx_native_sample_texture_with_lod("));
+        assert!(shader.contains("textureSampleGrad("));
+        assert!(shader.contains("dpdxCoarse(normalized_lod) * lod_scale"));
+        assert!(shader.contains("dpdyCoarse(normalized_lod) * lod_scale"));
     }
 
     #[test]
@@ -3851,12 +4480,13 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_native_texture_path_keeps_legacy_implicit_sampling_but_not_v7_lod() {
+    fn wgsl_native_texture_path_preserves_bias_for_webgpu_anisotropy() {
         let shader = shader_source();
         let native_start = shader.find("fn gx_native_normalized_uv(").unwrap();
         let native_end = shader.find("fn tev_sample_texture_managed(").unwrap();
         let native = &shader[native_start..native_end];
-        assert!(native.contains("let uv = stq.xy / stq.z"));
+        assert!(native.contains("let uv = gx_projective_uv(stq)"));
+        assert!(native.contains("if stq.z == 0.0"));
         assert!(native.contains("return texel_uv / vec2<f32>(textureDimensions(texture, 0))"));
         assert!(native.contains("if (mode0 & 0x80000000u) != 0u"));
         assert!(native.contains("return gx_manual_sample_texture(texture, mode0, mode1, uv)"));
@@ -3865,9 +4495,10 @@ mod tests {
                 "tev_texture{map}, tev_sampler{map}, mode0, mode1, uv"
             )));
         }
-        assert_eq!(native.matches("textureSample(").count(), 1);
+        assert_eq!(native.matches("textureSampleBias(").count(), 1);
+        assert!(native.contains("f32(signed_bias) / 32.0"));
+        assert!(native.contains("let lod_scale = exp2(f32(signed_bias) / 32.0)"));
         assert!(native.contains("textureLoad(texture, coord, i32(mip_level))"));
-        assert!(!native.contains("textureSampleBias("));
         assert!(!native.contains("textureSampleLevel("));
     }
 
@@ -3909,7 +4540,7 @@ mod tests {
         assert!(!manual.contains("textureSampleLevel("));
         for map in 0..MAX_TEV_TEXTURES {
             assert!(managed.contains(&format!(
-                "gx_manual_sample_texture(tev_texture{map}, mode0, mode1, uv)"
+                "tev_texture{map}, tev_sampler{map}, mode0, mode1, uv"
             )));
         }
         for field in [
@@ -3935,7 +4566,9 @@ mod tests {
                 "missing DrawState field access {field}"
             );
         }
-        assert!(!managed.contains("textureSampleBias("));
+        assert!(managed.contains("if ((mode0 >> 19u) & 3u) != 0u"));
+        assert!(managed.contains("textureSampleBias("));
+        assert!(managed.contains("textureSampleGrad("));
         assert!(!managed.contains("textureSampleLevel("));
     }
 
@@ -4097,7 +4730,8 @@ mod tests {
         assert!(shader.contains("managed_tex_coord_sidecar[record * 19u + word / 4u]"));
         assert!(shader.contains("let base = 3u + texture_coord * 9u"));
         assert!(shader.contains("fn gx_managed_required_tex_coord_mask() -> u32"));
-        assert!(shader.contains("mask |= 1u << ((refs >> 3u) & 7u)"));
+        assert!(shader.contains("return indirect_tev_state.matrix_rows[1].w & 0xffu"));
+        assert!(!shader.contains("mask |= 1u << ((refs >> 3u) & 7u)"));
 
         let start = shader.find("fn managed_multi_coord_tev_input(").unwrap();
         let end = shader[start..]
@@ -4312,7 +4946,7 @@ mod tests {
         assert!(!shader.contains("u32(round(clamp(input.position.z, 0.0, 1.0) * 16777215.0))"));
         assert!(shader.contains("fn fs_main(input: TevVertexOutput)"));
         assert!(shader.contains("fn fs_depth_main(input: TevVertexOutput)"));
-        assert!(shader.contains("textureSample("));
+        assert!(shader.contains("textureSampleBias("));
         assert!(!shader.contains("textureSampleLevel("));
         assert!(
             shader.contains(
@@ -5180,7 +5814,8 @@ mod tests {
             assert!(shader.contains(&format!("stq{coord}: vec3<f32>")));
             assert!(shader.contains(&format!("input.stq{coord}")));
         }
-        assert!(shader.contains("let uv = stq.xy / stq.z"));
+        assert!(shader.contains("let uv = gx_projective_uv(stq)"));
+        assert!(shader.contains("if stq.z == 0.0"));
         assert!(shader.contains(
             "tev_evaluate(raster_colors, managed_raster_bytes, tex_coords, managed_exact_sampler)"
         ));

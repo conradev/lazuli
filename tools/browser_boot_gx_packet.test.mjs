@@ -98,6 +98,7 @@ function indirectTevState(
   indirectStageCount,
   tevStageCount = 1,
   cullMode = 0,
+  xfNumTexGens = 1,
 ) {
   const word = offset => (seed + offset * 0x010101) & 0x00ffffff;
   return {
@@ -107,6 +108,7 @@ function indirectTevState(
       | (cullMode << 14)
       | (indirectStageCount << 16)
     ) >>> 0,
+    xfNumTexGens,
     matrices: Array.from({ length: 9 }, (_unused, index) => word(index)),
     imask: word(9),
     commands: Array.from(
@@ -121,6 +123,7 @@ function indirectTevState(
 function zeroIndirectTevState() {
   return {
     genMode: 0,
+    xfNumTexGens: 0,
     matrices: Array(9).fill(0),
     imask: 0,
     commands: Array(16).fill(0),
@@ -1264,6 +1267,52 @@ test("omits acknowledged resident payloads across GX frames", () => {
   assert.equal(view.getUint32(576 + 0x20, true), 0);
 });
 
+test("uses XF NUMTEXGENS instead of the unrelated BP GEN_MODE low nibble", () => {
+  const context = packetContext();
+  const stages = [{
+    index: 0,
+    textureEnabled: true,
+    textureMap: 0,
+    texCoordIndex: 0,
+  }];
+  const indirectTev = {
+    genMode: 0x10,
+    xfNumTexGens: 1,
+    commands: Array(16).fill(0),
+    iref: 0,
+  };
+
+  assert.deepEqual(
+    Array.from(
+      context.gxTevResourceDependencies(stages, indirectTev),
+      dependency => ({
+        kind: dependency.kind,
+        stageIndex: dependency.stageIndex,
+        textureMap: dependency.textureMap,
+        requestedTexCoordIndex: dependency.requestedTexCoordIndex,
+        texCoordIndex: dependency.texCoordIndex,
+      }),
+    ),
+    [{
+      kind: "direct",
+      stageIndex: 0,
+      textureMap: 0,
+      requestedTexCoordIndex: 0,
+      texCoordIndex: 0,
+    }],
+  );
+  assert.deepEqual(
+    Array.from(
+      context.gxTevResourceDependencies(stages, {
+        ...indirectTev,
+        xfNumTexGens: 0,
+      }),
+    ),
+    [],
+  );
+  assert.equal(indirectTev.genMode, 0x10, "raw BP GEN_MODE remains unchanged");
+});
+
 test("unions direct and active IREF texture and texcoord dependencies", () => {
   const context = packetContext();
   const stages = [
@@ -1516,6 +1565,7 @@ test("appends fixed indirect TEV BP tails without changing the 464-byte ABI", ()
   setTevStageCount(first, 1);
   setTevStageCount(second, 1);
   first.pipeline.indirectTev = indirectTevState(0x10203, 3);
+  first.pipeline.indirectTev.genMode = 0x10 | (3 << 16);
   second.pipeline.indirectTev = indirectTevState(0x40506, 0);
   // Stage zero selects indirect stage one, whose raw IREF entry names map 0.
   // The producer must carry that binding even though direct TEV texturing is
@@ -1560,7 +1610,7 @@ test("appends fixed indirect TEV BP tails without changing the 464-byte ABI", ()
     [1, second.pipeline.indirectTev],
   ]) {
     const offset = tailOffset + drawIndex * 128;
-    assert.equal(view.getUint32(offset + 0x00, true), 1);
+    assert.equal(view.getUint32(offset + 0x00, true), 2);
     assert.equal(view.getUint32(offset + 0x04, true), expected.genMode);
     assert.deepEqual(
       Array.from({ length: 9 }, (_unused, index) =>
@@ -1582,7 +1632,10 @@ test("appends fixed indirect TEV BP tails without changing the 464-byte ABI", ()
       expected.texScales,
     );
     assert.equal(view.getUint32(offset + 0x78, true), expected.iref);
-    assert.equal(view.getUint32(offset + 0x7c, true), 0);
+    assert.equal(
+      view.getUint32(offset + 0x7c, true),
+      expected.xfNumTexGens,
+    );
   }
 });
 
@@ -1595,6 +1648,7 @@ test("indirect TEV packet feature is optional, validated, and composable", () =>
     // a nonzero texgen count, neither an indirect count nor a live command,
     // and no live direct stage, the dormant state is inert.
     genMode: 1,
+    xfNumTexGens: 1,
   };
   const inactivePacket = context.packGxFramePacketV4(2, inactive);
   assert.equal(
@@ -1607,6 +1661,7 @@ test("indirect TEV packet feature is optional, validated, and composable", () =>
   reservedOnly.geometry.draws[0].pipeline.indirectTev = {
     ...zeroIndirectTevState(),
     genMode: 1,
+    xfNumTexGens: 1,
     commands: [0x00e00000, ...Array(15).fill(0)],
   };
   const reservedOnlyPacket = context.packGxFramePacketV4(2, reservedOnly);
@@ -1699,6 +1754,7 @@ test("indirect TEV packet feature is optional, validated, and composable", () =>
   staleCommand.geometry.draws[0].pipeline.indirectTev = {
     ...zeroIndirectTevState(),
     genMode: 1,
+    xfNumTexGens: 1,
     commands: Array.from(
       { length: 16 },
       (_unused, index) => index === 7 ? 6 << 13 : 0,
@@ -1785,7 +1841,7 @@ test("indirect TEV packet feature is optional, validated, and composable", () =>
   assert.equal(composed.byteLength, textureLayout.byteLength + 128);
 });
 
-test("captures every indirect TEV producer register and retains its marker", () => {
+test("captures every indirect TEV producer register without stale unsupported telemetry", () => {
   const gxBpRegisters = new Uint32Array(256);
   const gxXfRegisters = new Uint32Array(0x1100);
   gxBpRegisters[0x00] = (5 << 16) | (2 << 14);
@@ -1799,12 +1855,14 @@ test("captures every indirect TEV producer register and retains its marker", () 
   gxBpRegisters[0x25] = 0x040506;
   gxBpRegisters[0x26] = 0x070809;
   gxBpRegisters[0x27] = 0x0a0b0c;
+  gxXfRegisters[0x103f] = 6;
   const context = { Array, Math, gxBpRegisters, gxXfRegisters };
   vm.createContext(context);
   vm.runInContext(extractFunction("gxDrawPipelineState"), context);
 
   const captured = context.gxDrawPipelineState().indirectTev;
   assert.equal(captured.genMode, (5 << 16) | (2 << 14));
+  assert.equal(captured.xfNumTexGens, 6);
   assert.equal((captured.genMode >>> 16) & 7, 5);
   assert.deepEqual(
     Array.from(captured.matrices),
@@ -1817,17 +1875,9 @@ test("captures every indirect TEV producer register and retains its marker", () 
   );
   assert.deepEqual(Array.from(captured.texScales), [0x040506, 0x070809]);
   assert.equal(captured.iref, 0x0a0b0c);
-  assert.match(
-    extractFunction("recordGxPrimitive"),
-    /gxRecordUnsupported\(\s*"indirect-tev",\s*indirectAddress/,
-  );
-  assert.match(
-    extractFunction("recordGxPrimitive"),
-    /const indirectStage = stages\.find/,
-  );
   assert.doesNotMatch(
     extractFunction("recordGxPrimitive"),
-    /indirectStageCount === 0/,
+    /"indirect-tev"/,
   );
   assert.match(
     extractFunction("recordGxPrimitive"),
@@ -1854,7 +1904,15 @@ test("pins the cross-language indirect TEV tail feature ABI", () => {
   );
   assert.match(
     packetParserSource,
-    /pub\(crate\) struct GxIndirectTevState \{[\s\S]*?gen_mode: u32,[\s\S]*?matrices: \[u32; 9\],[\s\S]*?imask: u32,[\s\S]*?commands: \[u32; 16\],[\s\S]*?tex_scales: \[u32; 2\],[\s\S]*?iref: u32/,
+    /INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1: u32 = 1/,
+  );
+  assert.match(
+    packetParserSource,
+    /INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2: u32 = 2/,
+  );
+  assert.match(
+    packetParserSource,
+    /pub\(crate\) struct GxIndirectTevState \{[\s\S]*?gen_mode: u32,[\s\S]*?xf_num_tex_gens: u32,[\s\S]*?matrices: \[u32; 9\],[\s\S]*?imask: u32,[\s\S]*?commands: \[u32; 16\],[\s\S]*?tex_scales: \[u32; 2\],[\s\S]*?iref: u32/,
   );
   assert.match(source, /const buffer = new ArrayBuffer\(464\);/);
   assert.match(source, /packet = gxAttachIndirectTevStateV1\(packet, frame\);/);

@@ -48,6 +48,7 @@ const SAMPLER_MODE1_MASK_V7: u32 = 0xffff;
 const GX_MODE1_TAIL_BYTES_PER_DRAW: u32 = (MAX_TEV_TEXTURES as u32) * 4;
 const GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW: u32 = 128;
 const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1: u32 = 1;
+const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2: u32 = 2;
 const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
 const FOG_RANGE_ADJUSTMENT_ENABLE: u32 = 1 << 10;
 
@@ -138,6 +139,7 @@ pub(crate) struct GxFragmentTailState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GxIndirectTevState {
     pub(crate) gen_mode: u32,
+    pub(crate) xf_num_tex_gens: u32,
     pub(crate) matrices: [u32; 9],
     pub(crate) imask: u32,
     pub(crate) commands: [u32; 16],
@@ -151,7 +153,7 @@ fn indirect_texture_dependencies(
 ) -> impl Iterator<Item = (usize, Option<usize>)> + '_ {
     let direct_tev_stage_count = (((state.gen_mode >> 10) & 0xf) + 1) as usize;
     let indirect_stage_count = ((state.gen_mode >> 16) & 7) as usize;
-    let texture_generator_count = (state.gen_mode & 0xf) as usize;
+    let texture_generator_count = state.xf_num_tex_gens as usize;
     state.commands[..direct_tev_stage_count]
         .iter()
         .filter_map(move |command| {
@@ -166,7 +168,7 @@ fn indirect_texture_dependencies(
             let texture_map = ((state.iref >> reference_shift) & 7) as usize;
             let texture_coord = ((state.iref >> (reference_shift + 3)) & 7) as usize;
             // With no active texture generators GX synthesizes the zero
-            // coordinate. Otherwise an IREF coordinate beyond GEN_MODE's
+            // coordinate. Otherwise an IREF coordinate beyond XF's
             // active range falls back to coordinate zero. The texture-map
             // dependency remains live in both cases, including all-zero IREF.
             let effective_texture_coord = if texture_generator_count == 0 {
@@ -181,8 +183,9 @@ fn indirect_texture_dependencies(
 }
 
 fn renderer_indirect_tev_state(state: &GxIndirectTevState) -> IndirectTevState {
+    let effective_gen_mode = (state.gen_mode & !0xf) | state.xf_num_tex_gens;
     IndirectTevState::from_bp(
-        state.gen_mode,
+        effective_gen_mode,
         state.matrices,
         state.imask,
         state.commands,
@@ -1232,11 +1235,17 @@ impl<'a> GxFramePacket<'a> {
                     "draw indirect TEV tail offset",
                 )?;
                 let offset = to_usize(tail_offset);
-                expect_u32(
-                    "indirect TEV state encoding",
-                    read_u32(bytes, offset),
-                    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1,
-                )?;
+                let state_encoding = read_u32(bytes, offset);
+                if !matches!(
+                    state_encoding,
+                    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1
+                        | INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2
+                ) {
+                    return Err(GxPacketError::InvalidField {
+                        field: "indirect TEV state encoding",
+                        value: u64::from(state_encoding),
+                    });
+                }
                 let gen_mode = read_bp_word(bytes, offset + 0x04, "indirect TEV generation mode")?;
                 let direct_tev_stage_count = read_u32(
                     bytes,
@@ -1279,13 +1288,30 @@ impl<'a> GxFramePacket<'a> {
                     read_bp_word(bytes, offset + 0x74, "indirect TEV texture scale")?,
                 ];
                 let iref = read_bp_word(bytes, offset + 0x78, "indirect TEV reference")?;
-                expect_u32(
-                    "indirect TEV reserved word",
-                    read_u32(bytes, offset + 0x7c),
-                    0,
-                )?;
+                let xf_num_tex_gens = match state_encoding {
+                    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1 => {
+                        expect_u32(
+                            "indirect TEV reserved word",
+                            read_u32(bytes, offset + 0x7c),
+                            0,
+                        )?;
+                        gen_mode & 0xf
+                    }
+                    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2 => {
+                        let xf_num_tex_gens = read_u32(bytes, offset + 0x7c);
+                        if xf_num_tex_gens > MAX_TEV_TEXTURES as u32 {
+                            return Err(GxPacketError::InvalidField {
+                                field: "indirect TEV XF texture generator count",
+                                value: u64::from(xf_num_tex_gens),
+                            });
+                        }
+                        xf_num_tex_gens
+                    }
+                    _ => unreachable!("validated indirect TEV state encoding"),
+                };
                 let indirect_tev = GxIndirectTevState {
                     gen_mode,
+                    xf_num_tex_gens,
                     matrices,
                     imask,
                     commands,
@@ -1306,7 +1332,7 @@ impl<'a> GxFramePacket<'a> {
                 has_semantic_indirect_tev |= ((gen_mode >> 16) & 7) != 0
                     || direct_texture_requires_gen_mode(
                         direct_state,
-                        (gen_mode & 0xf) as usize,
+                        xf_num_tex_gens as usize,
                     )
                     .map_err(|_| GxPacketError::InvalidField {
                         field: "TEV state",
@@ -2167,11 +2193,13 @@ mod tests {
         assert!((1..=MAX_TEV_STAGES as u32).contains(&tev_stage_count));
         assert!(cull_mode <= 3);
         let word = |offset: u32| seed.wrapping_add(offset * 0x01_0101) & 0x00ff_ffff;
-        GxIndirectTevState {
-            gen_mode: (word(29) & !((0xf << 10) | (3 << 14) | (7 << 16)))
+        let gen_mode = (word(29) & !((0xf << 10) | (3 << 14) | (7 << 16)))
                 | ((tev_stage_count - 1) << 10)
                 | (cull_mode << 14)
-                | (indirect_stage_count << 16),
+                | (indirect_stage_count << 16);
+        GxIndirectTevState {
+            gen_mode,
+            xf_num_tex_gens: 8,
             matrices: std::array::from_fn(|index| word(index as u32)),
             imask: word(9),
             // Generic transport fixtures exercise arbitrary indirect command
@@ -2210,7 +2238,11 @@ mod tests {
         put_u32(&mut bytes, 0x08, packet_bytes);
         for (draw_index, state) in states.iter().enumerate() {
             let offset = tail_offset + draw_index * GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW as usize;
-            put_u32(&mut bytes, offset, INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1);
+            put_u32(
+                &mut bytes,
+                offset,
+                INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2,
+            );
             put_u32(&mut bytes, offset + 0x04, state.gen_mode);
             for (index, word) in state.matrices.iter().enumerate() {
                 put_u32(&mut bytes, offset + 0x08 + index * 4, *word);
@@ -2222,6 +2254,7 @@ mod tests {
             put_u32(&mut bytes, offset + 0x70, state.tex_scales[0]);
             put_u32(&mut bytes, offset + 0x74, state.tex_scales[1]);
             put_u32(&mut bytes, offset + 0x78, state.iref);
+            put_u32(&mut bytes, offset + 0x7c, state.xf_num_tex_gens);
         }
         bytes
     }
@@ -2759,12 +2792,78 @@ mod tests {
     }
 
     #[test]
+    fn indirect_tev_tail_versions_legacy_padding_and_explicit_xf_state() {
+        let mut state = GxIndirectTevState {
+            gen_mode: 1,
+            xf_num_tex_gens: 7,
+            ..GxIndirectTevState::default()
+        };
+        state.commands[0] = 6 << 13;
+        let mut base = v4_texture_copy(&[(2, 0, 3, None)]);
+        set_tev_stage_count(&mut base, 0, 1);
+        let tail_offset = base.len();
+        let current = append_indirect_tev_tail(base, &[state]);
+
+        assert_eq!(
+            read_u32(&current, tail_offset),
+            INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2
+        );
+        assert_eq!(
+            GxFramePacket::parse(&current)
+                .unwrap()
+                .draw(0)
+                .unwrap()
+                .record
+                .indirect_tev,
+            Some(state),
+        );
+
+        let mut legacy = current.clone();
+        put_u32(
+            &mut legacy,
+            tail_offset,
+            INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1,
+        );
+        put_u32(&mut legacy, tail_offset + 0x7c, 0);
+        let legacy_state = GxFramePacket::parse(&legacy)
+            .unwrap()
+            .draw(0)
+            .unwrap()
+            .record
+            .indirect_tev
+            .unwrap();
+        assert_eq!(legacy_state.gen_mode, state.gen_mode);
+        assert_eq!(legacy_state.xf_num_tex_gens, state.gen_mode & 0xf);
+
+        put_u32(&mut legacy, tail_offset + 0x7c, 1);
+        assert_eq!(
+            GxFramePacket::parse(&legacy).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "indirect TEV reserved word",
+                expected: 0,
+                actual: 1,
+            }
+        );
+
+        let mut unknown = current;
+        put_u32(&mut unknown, tail_offset, 3);
+        assert_eq!(
+            GxFramePacket::parse(&unknown).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "indirect TEV state encoding",
+                value: 3,
+            }
+        );
+    }
+
+    #[test]
     fn indirect_tev_tail_carries_direct_gen_mode_fallback_without_claiming_a_texture() {
         let mut base = v4_texture_copy(&[(2, 0, 3, None)]);
         set_tev_stage_count(&mut base, 0, 1);
         let tev_offset = read_u32(&base, 0x24) as usize;
         // Even with texture order disabled, TEXC/TEXA combiner inputs are
-        // black at NUMTEXGENS zero. Carry GEN_MODE without claiming map four.
+        // black at XF NUMTEXGENS zero. Carry the side state without claiming
+        // map four.
         put_u32(&mut base, tev_offset, 8 << 12);
         put_u32(&mut base, tev_offset + 0x04, 4 << 13);
         put_u32(&mut base, tev_offset + 0x08, (7 << 3) | 4);
@@ -2786,10 +2885,12 @@ mod tests {
         let states = [
             GxIndirectTevState {
                 gen_mode: 1 | (1 << 10) | (2 << 14),
+                xf_num_tex_gens: 1,
                 ..GxIndirectTevState::default()
             },
             GxIndirectTevState {
                 gen_mode: 1 | (1 << 14),
+                xf_num_tex_gens: 1,
                 ..GxIndirectTevState::default()
             },
         ];
@@ -2806,6 +2907,7 @@ mod tests {
                 // Two direct TEV stages, cull mode two, one texture generator,
                 // and one indirect stage.
                 gen_mode: 1 | (1 << 10) | (2 << 14) | (1 << 16),
+                xf_num_tex_gens: 1,
                 iref,
                 ..GxIndirectTevState::default()
             };
@@ -2819,18 +2921,26 @@ mod tests {
             [(0, Some(0))]
         );
         let no_texture_generators = GxIndirectTevState {
-            gen_mode: zero_iref.gen_mode & !0xf,
+            xf_num_tex_gens: 0,
             ..zero_iref
         };
+        assert_eq!(no_texture_generators.gen_mode, zero_iref.gen_mode);
+        assert_eq!(renderer_indirect_tev_state(&zero_iref).num_tex_gens(), 1);
+        assert_eq!(
+            renderer_indirect_tev_state(&no_texture_generators).num_tex_gens(),
+            0
+        );
         assert_eq!(
             indirect_texture_dependencies(&no_texture_generators).collect::<Vec<_>>(),
             [(0, None)]
         );
         let in_range_coord = GxIndirectTevState {
-            gen_mode: (zero_iref.gen_mode & !0xf) | 4,
+            xf_num_tex_gens: 4,
             iref: 3 << 3,
             ..zero_iref
         };
+        assert_eq!(in_range_coord.gen_mode, zero_iref.gen_mode);
+        assert_eq!(renderer_indirect_tev_state(&in_range_coord).num_tex_gens(), 4);
         assert_eq!(
             indirect_texture_dependencies(&in_range_coord).collect::<Vec<_>>(),
             [(0, Some(3))]
@@ -2843,6 +2953,7 @@ mod tests {
 
         let second_draw_state = GxIndirectTevState {
             gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         for (mut base, state) in [
@@ -2869,10 +2980,12 @@ mod tests {
     fn indirect_texture_dependencies_ignore_unclaimed_commands() {
         let base_state = GxIndirectTevState {
             gen_mode: 1 | (1 << 10) | (2 << 14) | (1 << 16),
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         let second_draw_state = GxIndirectTevState {
             gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         let mut stages = Vec::new();
@@ -2906,10 +3019,12 @@ mod tests {
     fn indirect_texture_dependencies_preserve_missing_and_first_use_validation() {
         let mut state = GxIndirectTevState {
             gen_mode: 1 | (1 << 10) | (2 << 14) | (1 << 16),
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         let second_draw_state = GxIndirectTevState {
             gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
 
@@ -2960,6 +3075,7 @@ mod tests {
 
         let mut command_only = GxIndirectTevState {
             gen_mode: 1,
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         command_only.commands[0] = 6 << 13;
@@ -2978,6 +3094,7 @@ mod tests {
 
         let mut stale_command = GxIndirectTevState {
             gen_mode: 1,
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         stale_command.commands[7] = 6 << 13;
@@ -2993,6 +3110,7 @@ mod tests {
 
         let mut reserved_only = GxIndirectTevState {
             gen_mode: 1,
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         reserved_only.commands[0] = !INDIRECT_TEV_COMMAND_MASK & 0x00ff_ffff;
@@ -3010,10 +3128,12 @@ mod tests {
         let inert = [
             GxIndirectTevState {
                 gen_mode: 1 | (1 << 10) | (2 << 14),
+                xf_num_tex_gens: 1,
                 ..GxIndirectTevState::default()
             },
             GxIndirectTevState {
                 gen_mode: 1 | (1 << 14),
+                xf_num_tex_gens: 1,
                 iref: 1,
                 ..GxIndirectTevState::default()
             },
@@ -3027,14 +3147,13 @@ mod tests {
         );
 
         let mut malformed = bytes;
-        let reserved_offset = malformed.len() - states.len() * 128 + 0x7c;
-        put_u32(&mut malformed, reserved_offset, 1);
+        let xf_count_offset = malformed.len() - states.len() * 128 + 0x7c;
+        put_u32(&mut malformed, xf_count_offset, 9);
         assert_eq!(
             GxFramePacket::parse(&malformed).unwrap_err(),
-            GxPacketError::FieldMismatch {
-                field: "indirect TEV reserved word",
-                expected: 0,
-                actual: 1,
+            GxPacketError::InvalidField {
+                field: "indirect TEV XF texture generator count",
+                value: 9,
             }
         );
     }
@@ -3129,11 +3248,13 @@ mod tests {
         put_u32(&mut v7, exact_offset + 0x04, first_v7_gen_mode);
         let mut first_v7_state = GxIndirectTevState {
             gen_mode: first_v7_gen_mode,
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         first_v7_state.commands[0] = 6 << 13;
         let second_v7_state = GxIndirectTevState {
             gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
             ..GxIndirectTevState::default()
         };
         let v7_len = v7.len();

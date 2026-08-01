@@ -50,6 +50,19 @@ class BrowserBootServerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def test_static_harness_assets_are_never_reused_across_rebuilds(self) -> None:
+        handler = object.__new__(BrowserBootHandler)
+        handler.path = "/browser_renderer_bg.wasm"
+        handler.request_version = "HTTP/1.1"
+        handler._headers_buffer = []
+        handler.wfile = BytesIO()
+        headers: dict[str, str] = {}
+        handler.send_header = headers.__setitem__
+
+        handler.end_headers()
+
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
     def test_raw_iso_reads_only_the_requested_range(self) -> None:
         image = gamecube_iso()
         path = self.root / "game.iso"

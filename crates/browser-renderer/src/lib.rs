@@ -412,6 +412,7 @@ impl ExactRequiredRejectionInputs {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RendererMetrics {
+    pub(crate) anisotropic_samplers_created: u64,
     pub(crate) begin_segment_calls: u64,
     pub(crate) bind_groups_created: u64,
     pub(crate) buffers_created: u64,
@@ -433,6 +434,7 @@ pub(crate) struct RendererMetrics {
     pub(crate) managed_coverage_triangles: u64,
     pub(crate) managed_early_depth_commands: u64,
     pub(crate) managed_early_depth_primitives: u64,
+    pub(crate) maximum_requested_sampler_anisotropy: u64,
     pub(crate) present_xfb_calls: u64,
     pub(crate) push_tev_draw_calls: u64,
     pub(crate) queue_submissions: u64,
@@ -633,7 +635,8 @@ pub(crate) enum GxSamplerStateError {
     EmptyMipChain,
     ReservedMinificationMode(u8),
     UnsupportedLodAndBiasClamp,
-    UnsupportedAnisotropy(u8),
+    UnsupportedAnisotropyFilterMode(u8),
+    AnisotropyRequiresMipChain(u8),
     ReservedAnisotropyEncoding,
 }
 
@@ -649,9 +652,13 @@ impl std::fmt::Display for GxSamplerStateError {
                 formatter,
                 "GX sampler requests the undocumented LOD/bias clamp"
             ),
-            Self::UnsupportedAnisotropy(value) => write!(
+            Self::UnsupportedAnisotropyFilterMode(value) => write!(
                 formatter,
-                "GX sampler requests unsupported {value}x anisotropy"
+                "GX sampler requests {value}x anisotropy with an unsupported filter combination"
+            ),
+            Self::AnisotropyRequiresMipChain(value) => write!(
+                formatter,
+                "GX sampler requests {value}x anisotropy without a resident mip chain"
             ),
             Self::ReservedAnisotropyEncoding => {
                 write!(formatter, "GX sampler uses reserved anisotropy encoding 3")
@@ -713,11 +720,6 @@ pub(crate) fn gx_sampler_state(
     if anisotropy_log2 == 3 {
         return Err(GxSamplerStateError::ReservedAnisotropyEncoding);
     }
-    if anisotropy_log2 != 0 {
-        return Err(GxSamplerStateError::UnsupportedAnisotropy(
-            1 << anisotropy_log2,
-        ));
-    }
 
     let minification_mode = ((mode0 >> 5) & 7) as u8;
     let (min_filter, mipmap_filter, uses_mips) = match minification_mode {
@@ -730,6 +732,35 @@ pub(crate) fn gx_sampler_state(
         reserved => {
             return Err(GxSamplerStateError::ReservedMinificationMode(reserved));
         }
+    };
+    let mag_filter = mode0 & (1 << 4) != 0;
+    let diagonal_lod = mode0 & (1 << 8) != 0;
+    // GX anisotropy only operates with edge LOD. A programmed anisotropy
+    // value is inert with diagonal LOD, so preserve the diagonal derivative
+    // rule through the manual WebGPU path with an isotropic host sampler.
+    let native_anisotropic_sampling = anisotropy_log2 != 0 && !diagonal_lod;
+    if native_anisotropic_sampling && (!mag_filter || !min_filter || minification_mode != 6) {
+        return Err(GxSamplerStateError::UnsupportedAnisotropyFilterMode(
+            1 << anisotropy_log2,
+        ));
+    }
+    if native_anisotropic_sampling && mip_level_count < 2 {
+        return Err(GxSamplerStateError::AnisotropyRequiresMipChain(
+            1 << anisotropy_log2,
+        ));
+    }
+    let max_anisotropy = if native_anisotropic_sampling {
+        1 << anisotropy_log2
+    } else {
+        1
+    };
+    // WebGPU requires every filter to be linear when anisotropy is enabled.
+    // The certified GX state already uses linear mip interpolation; keep that
+    // requirement explicit in the host identity.
+    let effective_mipmap_filter = if native_anisotropic_sampling {
+        TextureMipmapFilter::Linear
+    } else {
+        mipmap_filter
     };
 
     let mut effective_min = 0;
@@ -749,21 +780,26 @@ pub(crate) fn gx_sampler_state(
     let lod_bias_raw = ((mode0 >> 9) & 0xff) as u8 as i8;
     Ok(GxSamplerState {
         identity: SamplerIdentity {
-            mag_filter: mode0 & (1 << 4) != 0,
+            mag_filter,
             min_filter,
-            mipmap_filter,
+            mipmap_filter: effective_mipmap_filter,
             address_u: address_mode(mode0),
             address_v: address_mode(mode0 >> 2),
             lod_min_sixteenths: effective_min,
             lod_max_sixteenths: effective_max,
-            max_anisotropy: 1,
+            max_anisotropy,
         },
         mip_filter: uses_mips.then_some(mipmap_filter),
-        diagonal_lod: mode0 & (1 << 8) != 0,
+        diagonal_lod,
         lod_bias_sixteenths: if uses_mips { lod_bias_raw >> 1 } else { 0 },
-        mode0: mode0 | GX_MANUAL_SAMPLING_MODE0_FLAG,
+        mode0: mode0
+            | if native_anisotropic_sampling {
+                0
+            } else {
+                GX_MANUAL_SAMPLING_MODE0_FLAG
+            },
         mode1: effective_mode1,
-        manual_sampling: true,
+        manual_sampling: !native_anisotropic_sampling,
         derivative_lod_oracle_gap: true,
         managed_exact_eligible: true,
     })
@@ -6232,7 +6268,7 @@ mod tests {
                 let expected = if anisotropy_log2 == 3 {
                     GxSamplerStateError::ReservedAnisotropyEncoding
                 } else {
-                    GxSamplerStateError::UnsupportedAnisotropy(1 << anisotropy_log2)
+                    GxSamplerStateError::UnsupportedAnisotropyFilterMode(1 << anisotropy_log2)
                 };
                 assert_eq!(
                     gx_sampler_state(base | (anisotropy_log2 << 19), 0, 1, true,),
@@ -6240,6 +6276,38 @@ mod tests {
                 );
             }
         }
+        let fzero_mode0 = 0x0011_c0d8;
+        for (anisotropy_log2, expected) in [(1, 2), (2, 4)] {
+            let mode0 = (fzero_mode0 & !(3 << 19)) | (anisotropy_log2 << 19);
+            let state = gx_sampler_state(mode0, 0x5000, 6, true).unwrap();
+            assert_eq!(state.mode0, mode0);
+            assert!(!state.manual_sampling);
+            assert!(state.derivative_lod_oracle_gap);
+            assert!(state.managed_exact_eligible);
+            assert_eq!(state.identity.max_anisotropy, expected);
+            assert!(state.identity.mag_filter);
+            assert!(state.identity.min_filter);
+            assert_eq!(state.identity.mipmap_filter, TextureMipmapFilter::Linear);
+            assert_eq!(state.lod_bias_sixteenths, -16);
+            assert_eq!(state.mode1, 0x5000);
+        }
+        let rogue_mode0 = 0x0011_c1d0;
+        let rogue = gx_sampler_state(rogue_mode0, 0x5000, 6, true).unwrap();
+        assert_eq!(rogue.mode0 & !GX_MANUAL_SAMPLING_MODE0_FLAG, rogue_mode0,);
+        assert_ne!(rogue.mode0 & GX_MANUAL_SAMPLING_MODE0_FLAG, 0);
+        assert!(rogue.manual_sampling);
+        assert!(rogue.diagonal_lod);
+        assert!(rogue.managed_exact_eligible);
+        assert_eq!(rogue.identity.max_anisotropy, 1);
+        assert!(rogue.identity.mag_filter);
+        assert!(rogue.identity.min_filter);
+        assert_eq!(rogue.identity.mipmap_filter, TextureMipmapFilter::Linear);
+        assert_eq!(rogue.lod_bias_sixteenths, -16);
+        assert_eq!(rogue.mode1, 0x5000);
+        assert_eq!(
+            gx_sampler_state(fzero_mode0, 0, 1, true),
+            Err(GxSamplerStateError::AnisotropyRequiresMipChain(4)),
+        );
         assert_eq!(
             gx_sampler_state(0, 0, 0, true),
             Err(GxSamplerStateError::EmptyMipChain),

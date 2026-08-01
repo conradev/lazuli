@@ -1629,6 +1629,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         || preflight.levelCount !== canonicalPreflight.levelCount
         || preflight.minFilter !== canonicalPreflight.minFilter
         || preflight.mipMode !== canonicalPreflight.mipMode
+        || preflight.maxAnisotropy !== canonicalPreflight.maxAnisotropy
         || preflight.magLinear !== canonicalPreflight.magLinear
         || preflight.minLinear !== canonicalPreflight.minLinear
         || preflight.diagonalLod !== canonicalPreflight.diagonalLod
@@ -1959,6 +1960,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function gxFramePacketIndirectTevState(value, name) {
       const zero = () => ({
         genMode: 0,
+        xfNumTexGens: 0,
         matrices: Array(9).fill(0),
         imask: 0,
         commands: Array(16).fill(0),
@@ -1988,12 +1990,21 @@ const TEMPLATE: &str = r##"<!doctype html>
           )
         );
       };
+      const genMode = gxFramePacketInteger(
+        value.genMode,
+        `${name}.genMode`,
+        0x00ffffff
+      );
+      const xfNumTexGens = value.xfNumTexGens === undefined
+        ? genMode & 0x0f
+        : gxFramePacketInteger(
+          value.xfNumTexGens,
+          `${name}.xfNumTexGens`,
+          8
+        );
       return {
-        genMode: gxFramePacketInteger(
-          value.genMode,
-          `${name}.genMode`,
-          0x00ffffff
-        ),
+        genMode,
+        xfNumTexGens,
         matrices: words(value.matrices, 9, "matrices"),
         imask: gxFramePacketInteger(
           value.imask,
@@ -2068,11 +2079,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           tevState.byteLength
         );
         const tevStageCount = tevView.getUint32(448, true);
-        const numTexGens = state.genMode & 0x0f;
-        // NUMTEXGENS=0 changes TEXC/TEXA to the fixed black input even when
-        // TEV order disables its texture lookup. Carry raw GEN_MODE for that
-        // direct-only case instead of mistaking the otherwise-zero BP tail for
-        // dormant indirect state.
+        const numTexGens = state.xfNumTexGens;
+        // XF NUMTEXGENS=0 changes TEXC/TEXA to the fixed black input even when
+        // TEV order disables its texture lookup. Carry generation side state
+        // for that direct-only case instead of mistaking the otherwise-zero BP
+        // tail for dormant indirect state.
         let requiresDirectGenMode = numTexGens === 0;
         for (let stage = 0; stage < tevStageCount; stage += 1) {
           const references = tevView.getUint32(stage * 16 + 8, true);
@@ -2148,7 +2159,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       for (let drawIndex = 0; drawIndex < drawCount; drawIndex += 1) {
         const state = states[drawIndex];
         const offset = packet.byteLength + drawIndex * 128;
-        view.setUint32(offset + 0x00, 1, true);
+        // Encoding two makes the final word explicit XF NUMTEXGENS state.
+        // Encoding one reserved that word as canonical zero, so retaining its
+        // marker would make a stale renderer misdiagnose valid state.
+        view.setUint32(offset + 0x00, 2, true);
         view.setUint32(offset + 0x04, state.genMode, true);
         state.matrices.forEach((word, index) => {
           view.setUint32(offset + 0x08 + index * 4, word, true);
@@ -2161,7 +2175,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           view.setUint32(offset + 0x70 + index * 4, word, true);
         });
         view.setUint32(offset + 0x78, state.iref, true);
-        // +0x7c remains the canonical zero reserved word.
+        view.setUint32(offset + 0x7c, state.xfNumTexGens, true);
       }
       return output;
     }
@@ -9969,13 +9983,29 @@ const TEMPLATE: &str = r##"<!doctype html>
       const mode1 = rawMode1 >>> 0;
       const minFilter = (mode0 >>> 5) & 7;
       const mipMode = minFilter & 3;
+      const magLinear = (mode0 & (1 << 4)) !== 0;
+      const minLinear = (mode0 & (1 << 7)) !== 0;
+      const diagonalLod = (mode0 & (1 << 8)) !== 0;
       if (mipMode === 3) return reject("reserved-min-filter");
       if ((mode0 & (1 << 21)) !== 0) {
         return reject("unsupported-lod-bias-clamp");
       }
       const anisotropyRaw = (mode0 >>> 19) & 3;
       if (anisotropyRaw === 3) return reject("reserved-anisotropy");
-      if (anisotropyRaw !== 0) return reject("unsupported-anisotropy");
+      // GX anisotropy only operates with edge LOD. With diagonal LOD the raw
+      // setting is legal but inert, and the receiver uses its exact manual
+      // diagonal-derivative path with an isotropic WebGPU sampler.
+      const nativeAnisotropicSampling = anisotropyRaw !== 0 && !diagonalLod;
+      if (
+        nativeAnisotropicSampling
+        && (
+          !magLinear
+          || !minLinear
+          || minFilter !== 6
+        )
+      ) {
+        return reject("unsupported-anisotropy-filter-combination");
+      }
 
       const supportedFormat =
         Number.isInteger(format)
@@ -10019,6 +10049,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (!Number.isInteger(levelCount) || levelCount < 1) {
         return reject("invalid-mip-state");
       }
+      if (nativeAnisotropicSampling && levelCount < 2) {
+        return reject("anisotropy-requires-mip-chain");
+      }
 
       const lodMinRaw = mode1 & 0xff;
       const lodMaxRaw = (mode1 >>> 8) & 0xff;
@@ -10046,9 +10079,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         levelCount,
         minFilter,
         mipMode,
-        magLinear: (mode0 & (1 << 4)) !== 0,
-        minLinear: (mode0 & (1 << 7)) !== 0,
-        diagonalLod: (mode0 & (1 << 8)) !== 0,
+        maxAnisotropy: 1 << anisotropyRaw,
+        magLinear,
+        minLinear,
+        diagonalLod,
         lodBiasRaw,
         lodBiasSixteenths: usesMipFilter ? signedLodBiasRaw >> 1 : 0,
         lodMinRaw,
@@ -10773,12 +10807,14 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxTevResourceDependencies(stages, indirectTev = null) {
-      // Standalone packet fixtures predate raw GEN_MODE capture. Preserve
-      // their direct-coordinate behavior when it is absent, while treating an
-      // authentic raw zero as NUMTEXGENS=0 rather than as an absence sentinel.
+      // Standalone packet fixtures predate explicit XF NUMTEXGENS capture.
+      // Preserve their direct-coordinate behavior when it is absent. Complete
+      // draw snapshots always use XF state; BP GEN_MODE remains raw evidence.
       const hasGenMode = Number.isInteger(indirectTev?.genMode);
       const genMode = hasGenMode ? indirectTev.genMode >>> 0 : 8;
-      const numTexGens = genMode & 0xf;
+      const numTexGens = Number.isInteger(indirectTev?.xfNumTexGens)
+        ? indirectTev.xfNumTexGens >>> 0
+        : genMode & 0xf;
       const numIndirectStages = (genMode >>> 16) & 7;
       const commands = (
         Array.isArray(indirectTev?.commands)
@@ -12510,6 +12546,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         viewportHalfWidthBits: gxXfRegisters[0x101a] >>> 0,
         indirectTev: {
           genMode: gxBpRegisters[0x00] >>> 0,
+          xfNumTexGens: Math.min(8, gxXfRegisters[0x103f] & 0x0f),
           matrices: Array.from(
             { length: 9 },
             (_unused, index) => gxBpRegisters[0x06 + index] >>> 0
@@ -12785,19 +12822,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
         if ((genMode & (1 << 19)) !== 0) {
           gxRecordUnsupported("z-freeze", 0x00, genMode);
-        }
-        const indirectStageCount = (genMode >>> 16) & 7;
-        const indirectStage = stages.find(stage => (
-          gxBpRegisters[0x10 + stage.index] & 0x001fffff
-        ) !== 0);
-        if (indirectStage !== undefined) {
-          const indirectAddress = 0x10 + indirectStage.index;
-          gxRecordUnsupported(
-            "indirect-tev",
-            indirectAddress,
-            gxBpRegisters[indirectAddress],
-            `stages=${indirectStageCount}`
-          );
         }
       }
       gxFrameDrawVertices += vertexCount;
@@ -14290,6 +14314,15 @@ const TEMPLATE: &str = r##"<!doctype html>
         outputLeftAddress: null,
         outputRightAddress: null,
         clearedBytes: 0,
+        renderBatch: 0,
+        voiceSyncMaps: [],
+        voiceParameterBlocksInspected: 0,
+        voiceParameterBlockReadBytes: 0,
+        voiceRenderableParameterBlocks: 0,
+        voiceSkippedParameterBlocks: 0,
+        voiceSourceTypesSeen: [],
+        voiceChannelIdsSeen: [],
+        voiceSnapshots: new Array(64).fill(null),
       };
     }
 
@@ -15058,6 +15091,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             group,
             expectedGroup,
           });
+        }
+        if (!inspectDspZeldaVoiceGroup(group, payload & 0xffff)) {
+          return false;
         }
         render.currentVoice += 16;
         traceDsp("zelda-render-sync", {
@@ -26024,6 +26060,7 @@ const TEMPLATE: &str = r##"<!doctype html>
                   },
             render: {
               active: dspZeldaCommandState.render.active,
+              renderBatch: dspZeldaCommandState.render.renderBatch,
               awaitingTaskMail:
                 dspZeldaCommandState.render.awaitingTaskMail,
               requestedFrames:
@@ -26044,6 +26081,46 @@ const TEMPLATE: &str = r##"<!doctype html>
                       dspZeldaCommandState.render.outputRightAddress
                     ),
               clearedBytes: dspZeldaCommandState.render.clearedBytes,
+              voiceSyncMaps:
+                dspZeldaCommandState.render.voiceSyncMaps.map(entry => ({
+                  batch: entry.batch,
+                  frame: entry.frame,
+                  group: entry.group,
+                  activeVoiceMap:
+                    "0x" + entry.activeVoiceMap
+                      .toString(16).padStart(4, "0"),
+                })),
+              voiceParameterBlocksInspected:
+                dspZeldaCommandState.render.voiceParameterBlocksInspected,
+              voiceParameterBlockReadBytes:
+                dspZeldaCommandState.render.voiceParameterBlockReadBytes,
+              voiceRenderableParameterBlocks:
+                dspZeldaCommandState.render.voiceRenderableParameterBlocks,
+              voiceSkippedParameterBlocks:
+                dspZeldaCommandState.render.voiceSkippedParameterBlocks,
+              voiceSourceTypesSeen:
+                [...dspZeldaCommandState.render.voiceSourceTypesSeen],
+              voiceChannelIdsSeen:
+                dspZeldaCommandState.render.voiceChannelIdsSeen.map(
+                  id => "0x" + id.toString(16).padStart(4, "0")
+                ),
+              voiceSnapshots:
+                dspZeldaCommandState.render.voiceSnapshots
+                  .filter(snapshot => snapshot !== null)
+                  .map(snapshot => ({
+                    ...snapshot,
+                    vpbAddress: hex32(snapshot.vpbAddress),
+                    currentAramAddress: hex32(
+                      snapshot.currentAramAddress
+                    ),
+                    loopAddress: hex32(snapshot.loopAddress),
+                    baseAddress: hex32(snapshot.baseAddress),
+                    channels: snapshot.channels.map(channel => ({
+                      ...channel,
+                      id:
+                        "0x" + channel.id.toString(16).padStart(4, "0"),
+                    })),
+                  })),
             },
           },
           dspTrace,

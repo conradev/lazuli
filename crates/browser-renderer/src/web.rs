@@ -16,16 +16,20 @@ use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
 use crate::clip::{GxExactPreparationFailure, gx_exact_draw_raster_geometry};
-use crate::packet::{GxCopyKind, GxCopyState, GxFramePacket, GxTriangleAction};
+use crate::packet::{
+    GxCopyKind, GxCopyState, GxFramePacket, GxIndirectTevState, GxTriangleAction,
+};
 use crate::raster::{
     GxRasterAttributePlaneF32, gx_non_aa_raster_color_rgba8, gx_normalized_raster_channel_u8,
 };
 use crate::tev::{
     MANAGED_TEX_COORD_SIDECAR_WORDS, MAX_TEV_TEXTURES, ManagedSidecarCapacityOutcome,
     TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS, TevPipelineLayoutKind,
-    managed_sidecar_capacity_outcome, managed_tex_coord_sidecar_record,
-    managed_tex_coord_sidecar_record_base, required_texture_coords, required_texture_maps,
-    shader_source as tev_shader_source, tev_pipeline_layout_kind, validate_draw_transport,
+    IndirectTevState, managed_sidecar_capacity_outcome, managed_tex_coord_sidecar_record,
+    managed_tex_coord_sidecar_record_base, required_texture_coords,
+    required_texture_coords_with_indirect, required_texture_maps,
+    required_texture_maps_with_indirect, shader_source as tev_shader_source,
+    tev_pipeline_layout_kind, validate_draw_transport,
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, ExactRequiredPreparationRejectionCounts,
@@ -785,6 +789,75 @@ struct DrawUniform {
 
 const _: () = assert!(std::mem::size_of::<DrawUniform>() == 160);
 
+/// Canonical raw-BP payload consumed by the direct-WebGPU indirect TEV path.
+///
+/// The 464-byte direct TEV ABI stays byte-for-byte stable. This side uniform
+/// carries GEN_MODE/IREF/scale state, three raw 3-word matrices, all sixteen
+/// direct-stage commands, the CPU-certified required-coordinate mask, and an
+/// explicit presence bit. IMASK occupies another matrix-padding word so the
+/// packet state remains inspectable without widening the binding again.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
+struct IndirectTevUniform {
+    control: [u32; 4],
+    matrix_rows: [[u32; 4]; 3],
+    commands: [[u32; 4]; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<IndirectTevUniform>() == 128);
+
+impl IndirectTevUniform {
+    fn from_packet(
+        state: Option<&GxIndirectTevState>,
+        required_coords: [bool; MAX_TEV_TEXTURES],
+    ) -> Self {
+        let required_coord_mask = required_coords
+            .into_iter()
+            .enumerate()
+            .fold(0_u32, |mask, (coord, required)| {
+                mask | (u32::from(required) << coord)
+            });
+        let Some(state) = state else {
+            return Self {
+                matrix_rows: [[0; 4], [0, 0, 0, required_coord_mask], [0; 4]],
+                ..Self::default()
+            };
+        };
+        let effective_gen_mode = (state.gen_mode & !0xf) | state.xf_num_tex_gens;
+        Self {
+            control: [
+                effective_gen_mode,
+                state.iref,
+                state.tex_scales[0],
+                state.tex_scales[1],
+            ],
+            matrix_rows: [
+                [
+                    state.matrices[0],
+                    state.matrices[1],
+                    state.matrices[2],
+                    state.imask,
+                ],
+                [
+                    state.matrices[3],
+                    state.matrices[4],
+                    state.matrices[5],
+                    required_coord_mask,
+                ],
+                [
+                    state.matrices[6],
+                    state.matrices[7],
+                    state.matrices[8],
+                    1,
+                ],
+            ],
+            commands: std::array::from_fn(|row| {
+                std::array::from_fn(|column| state.commands[row * 4 + column])
+            }),
+        }
+    }
+}
+
 impl DrawUniform {
     fn from_gx(
         alpha_test: u32,
@@ -1247,6 +1320,35 @@ struct TevTextureInput<'a> {
     full_lod_state: bool,
 }
 
+fn renderer_indirect_tev_state(state: &GxIndirectTevState) -> IndirectTevState {
+    let effective_gen_mode = (state.gen_mode & !0xf) | state.xf_num_tex_gens;
+    IndirectTevState::from_bp(
+        effective_gen_mode,
+        state.matrices,
+        state.imask,
+        state.commands,
+        state.tex_scales,
+        state.iref,
+    )
+}
+
+fn tev_resource_requirements(
+    direct_state: &[u8],
+    indirect_state: Option<&GxIndirectTevState>,
+) -> Result<([bool; MAX_TEV_TEXTURES], [bool; MAX_TEV_TEXTURES]), String> {
+    let Some(indirect_state) = indirect_state else {
+        return Ok((
+            required_texture_maps(direct_state)?,
+            required_texture_coords(direct_state)?,
+        ));
+    };
+    let indirect_state = renderer_indirect_tev_state(indirect_state);
+    Ok((
+        required_texture_maps_with_indirect(direct_state, &indirect_state)?,
+        required_texture_coords_with_indirect(direct_state, &indirect_state)?,
+    ))
+}
+
 fn tev_sampler_states(
     textures: &[TevTextureInput<'_>; MAX_TEV_TEXTURES],
 ) -> Result<[GxSamplerState; MAX_TEV_TEXTURES], String> {
@@ -1268,6 +1370,7 @@ struct TevBindingKey {
     textures: [TextureBindingIdentity; MAX_TEV_TEXTURES],
     samplers: [SamplerIdentity; MAX_TEV_TEXTURES],
     state: Vec<u8>,
+    indirect: IndirectTevUniform,
     draw: DrawUniform,
 }
 
@@ -1275,6 +1378,7 @@ struct CachedTevDrawBinding {
     _draw_uniform: wgpu::Buffer,
     draw_bind_group: wgpu::BindGroup,
     _tev_uniform: wgpu::Buffer,
+    _indirect_tev_uniform: wgpu::Buffer,
     tev_bind_group: wgpu::BindGroup,
 }
 
@@ -1830,6 +1934,10 @@ fn renderer_metrics_object(
 ) -> Result<Object, JsValue> {
     let result = Object::new();
     for (name, value) in [
+        (
+            "anisotropicSamplersCreated",
+            metrics.anisotropic_samplers_created,
+        ),
         ("beginSegmentCalls", metrics.begin_segment_calls),
         ("bindGroupsCreated", metrics.bind_groups_created),
         ("buffersCreated", metrics.buffers_created),
@@ -1864,6 +1972,10 @@ fn renderer_metrics_object(
         (
             "managedEarlyDepthPrimitives",
             metrics.managed_early_depth_primitives,
+        ),
+        (
+            "maximumRequestedSamplerAnisotropy",
+            metrics.maximum_requested_sampler_anisotropy,
         ),
         ("presentXfbCalls", metrics.present_xfb_calls),
         ("pushTevDrawCalls", metrics.push_tev_draw_calls),
@@ -2943,6 +3055,7 @@ impl WebGpuRenderer {
             topology,
             &source_vertices,
             &tev_state,
+            None,
             &textures,
             None,
             texture_pixel_bytes,
@@ -3183,6 +3296,7 @@ impl WebGpuRenderer {
                     draw.record.topology,
                     draw_vertices,
                     draw.tev_state,
+                    draw.record.indirect_tev.as_ref(),
                     &textures,
                     Some(&packet_texture_keys),
                     0,
@@ -3263,6 +3377,7 @@ impl WebGpuRenderer {
         topology: u8,
         source_vertices: &[f32],
         tev_state: &[u8],
+        indirect_tev: Option<&GxIndirectTevState>,
         textures: &[TevTextureInput<'_>; MAX_TEV_TEXTURES],
         packet_protected_keys: Option<&HashSet<&str>>,
         transport_texture_pixel_bytes: usize,
@@ -3329,6 +3444,7 @@ impl WebGpuRenderer {
                         prepared,
                         topology,
                         tev_state,
+                        indirect_tev,
                         textures,
                         z_mode,
                         blend_mode,
@@ -3415,10 +3531,9 @@ impl WebGpuRenderer {
             );
         }
 
-        let required_maps =
-            required_texture_maps(tev_state).map_err(|error| JsValue::from_str(&error))?;
-        let required_coords =
-            required_texture_coords(tev_state).map_err(|error| JsValue::from_str(&error))?;
+        let (required_maps, required_coords) =
+            tev_resource_requirements(tev_state, indirect_tev)
+                .map_err(|error| JsValue::from_str(&error))?;
         let sampler_states =
             tev_sampler_states(textures).map_err(|error| JsValue::from_str(&error))?;
         let sampler_mode0 = sampler_states.map(|state| state.mode0);
@@ -3475,6 +3590,7 @@ impl WebGpuRenderer {
                     prepared_exact.expect("required draw has prepared exact input"),
                     topology,
                     tev_state,
+                    indirect_tev,
                     textures,
                     z_mode,
                     blend_mode,
@@ -3701,6 +3817,7 @@ impl WebGpuRenderer {
             textures: texture_identities,
             samplers: sampler_identities,
             state: tev_state.to_vec(),
+            indirect: IndirectTevUniform::from_packet(indirect_tev, required_coords),
             draw: draw_uniform,
         };
         let binding = if let Some(binding) = self.tev_draw_binding_indices.get(&binding_key) {
@@ -3728,6 +3845,13 @@ impl WebGpuRenderer {
                     contents: tev_state,
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
+            let indirect_tev_uniform =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("browser GX indirect TEV state"),
+                        contents: bytemuck::bytes_of(&binding_key.indirect),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
             let texture_views = (0..MAX_TEV_TEXTURES)
                 .map(|map| match selected[map] {
                     SelectedTexture::EfbCopy => &self.efb_copy_cache[&textures[map].address].view,
@@ -3737,12 +3861,21 @@ impl WebGpuRenderer {
                 .collect::<Vec<_>>();
             for identity in sampler_identities {
                 if !self.samplers.contains_key(&identity) {
-                    self.samplers
-                        .insert(identity, sampler(&self.device, identity));
+                    let created_sampler = sampler(&self.device, identity);
+                    self.samplers.insert(identity, created_sampler);
+                    if identity.max_anisotropy > 1 {
+                        update_renderer_metrics(&self.metrics, |metrics| {
+                            metrics.anisotropic_samplers_created =
+                                metrics.anisotropic_samplers_created.saturating_add(1);
+                            metrics.maximum_requested_sampler_anisotropy = metrics
+                                .maximum_requested_sampler_anisotropy
+                                .max(u64::from(identity.max_anisotropy));
+                        });
+                    }
                 }
             }
             let samplers = sampler_identities.map(|identity| &self.samplers[&identity]);
-            let mut entries = Vec::with_capacity(1 + MAX_TEV_TEXTURES * 2);
+            let mut entries = Vec::with_capacity(2 + MAX_TEV_TEXTURES * 2);
             entries.push(wgpu::BindGroupEntry {
                 binding: 0,
                 resource: tev_uniform.as_entire_binding(),
@@ -3759,13 +3892,17 @@ impl WebGpuRenderer {
                     resource: wgpu::BindingResource::Sampler(sampler),
                 });
             }
+            entries.push(wgpu::BindGroupEntry {
+                binding: 17,
+                resource: indirect_tev_uniform.as_entire_binding(),
+            });
             let tev_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("browser GX per-fragment TEV bind group"),
                 layout: &self.tev_texture_layout,
                 entries: &entries,
             });
             update_renderer_metrics(&self.metrics, |metrics| {
-                metrics.buffers_created = metrics.buffers_created.saturating_add(2);
+                metrics.buffers_created = metrics.buffers_created.saturating_add(3);
                 metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(2);
             });
             let binding = self.tev_draw_bindings.len();
@@ -3773,6 +3910,7 @@ impl WebGpuRenderer {
                 _draw_uniform: draw_uniform,
                 draw_bind_group,
                 _tev_uniform: tev_uniform,
+                _indirect_tev_uniform: indirect_tev_uniform,
                 tev_bind_group,
             });
             self.tev_draw_binding_indices.insert(binding_key, binding);
@@ -4975,7 +5113,7 @@ impl WebGpuRenderer {
                 count: None,
             }],
         });
-        let mut tev_texture_layout_entries = Vec::with_capacity(1 + MAX_TEV_TEXTURES * 2);
+        let mut tev_texture_layout_entries = Vec::with_capacity(2 + MAX_TEV_TEXTURES * 2);
         tev_texture_layout_entries.push(wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -5006,6 +5144,16 @@ impl WebGpuRenderer {
                 count: None,
             });
         }
+        tev_texture_layout_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 17,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
         let tev_texture_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("browser GX per-fragment TEV layout"),
@@ -6453,6 +6601,7 @@ fn classify_exact_required_rejection(
     prepared: &PreparedExactDraw,
     topology: u8,
     tev_state: &[u8],
+    indirect_tev: Option<&GxIndirectTevState>,
     textures: &[TevTextureInput<'_>; MAX_TEV_TEXTURES],
     z_mode: u32,
     blend_mode: u32,
@@ -6474,8 +6623,9 @@ fn classify_exact_required_rejection(
         _ => Primitive::Triangles,
     };
     let early_depth = gx_early_depth_plan(z_mode, blend_mode, alpha_test, pixel_control);
-    let required_maps = required_texture_maps(tev_state).ok();
-    let required_coords = required_texture_coords(tev_state).ok();
+    let requirements = tev_resource_requirements(tev_state, indirect_tev).ok();
+    let required_maps = requirements.map(|(maps, _)| maps);
+    let required_coords = requirements.map(|(_, coords)| coords);
     let sampler_states = tev_sampler_states(textures).ok();
     let z_texture = gx_z_texture_state(z_texture_bias, z_texture_mode, pixel_control).ok();
     let fog = gx_fog_state(
@@ -6631,10 +6781,9 @@ fn prepare_exact_managed_vertices(
     if draw_depth_encoding(draw.record.z_mode, draw.record.fragment_tail.pixel_control).is_err() {
         return None;
     }
-    let Ok(required_maps) = required_texture_maps(draw.tev_state) else {
-        return None;
-    };
-    let Ok(required_coords) = required_texture_coords(draw.tev_state) else {
+    let Ok((required_maps, required_coords)) =
+        tev_resource_requirements(draw.tev_state, draw.record.indirect_tev.as_ref())
+    else {
         return None;
     };
     let Ok(z_texture) = gx_z_texture_state(
@@ -7646,7 +7795,7 @@ mod tests {
         BlendComponentState, CopyClearUniform, CullMode, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
         DepthCommitPipelineKey, DrawUniform, EFB_TEXTURE_COPY_SHADER, EfbTextureCopyUniform,
-        ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT,
+        ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT, IndirectTevUniform,
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxExactPreparationFailure, GxRasterPoint28_4,
         GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
         MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
@@ -7664,10 +7813,11 @@ mod tests {
         managed_vertices_with_sidecar_record_base, merge_contiguous_draw_range,
         prepare_managed_coverage_vertices, rgba8_mip_uploads,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
-        texture_base_format_code, texture_copy_format_code, texture_copy_plan_for_source,
+        tev_resource_requirements, texture_base_format_code, texture_copy_format_code,
+        texture_copy_plan_for_source,
     };
     use crate::clip::{GxClipError, GxExactGeometryError};
-    use crate::packet::{GxCopyState, GxTriangleAction};
+    use crate::packet::{GxCopyState, GxIndirectTevState, GxTriangleAction};
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS, managed_tex_coord_sidecar_fits};
     use crate::{
         ExactRequiredPreparationRejectionReason, GX_DEPTH24_MAX, GxBlendFactor, GxDepthCompression,
@@ -7706,6 +7856,7 @@ mod tests {
             textures: std::array::from_fn(|_| TextureBindingIdentity::White),
             samplers: [sampler; MAX_TEV_TEXTURES],
             state: vec![0; 464],
+            indirect: IndirectTevUniform::default(),
             draw,
         }
     }
@@ -9355,7 +9506,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_textured_sampler_gate_accepts_only_matching_non_mip_filters() {
+    fn managed_textured_sampler_gate_accepts_certified_full_lod_states() {
         let mut required_maps = [false; MAX_TEV_TEXTURES];
         required_maps[0] = true;
 
@@ -9380,6 +9531,14 @@ mod tests {
         let mut full_lod_states = [GxSamplerState::default(); MAX_TEV_TEXTURES];
         full_lod_states[0] = gx_sampler_state(2 << 5, 0x2010, 3, true).unwrap();
         assert!(full_lod_states[0].derivative_lod_oracle_gap);
+        assert!(managed_coverage_samplers_are_safe(
+            required_maps,
+            full_lod_states,
+        ));
+
+        full_lod_states[0] = gx_sampler_state(0x0011_c0d8, 0x5000, 6, true).unwrap();
+        assert_eq!(full_lod_states[0].identity.max_anisotropy, 4);
+        assert!(!full_lod_states[0].manual_sampling);
         assert!(managed_coverage_samplers_are_safe(
             required_maps,
             full_lod_states,
@@ -10009,6 +10168,94 @@ mod tests {
         );
         assert_eq!(no_alpha.fragment_flags, 0);
         assert_ne!(binding_key(inactive_a), binding_key(no_alpha));
+    }
+
+    #[test]
+    fn indirect_tev_uniform_preserves_raw_bp_words_and_distinguishes_absence() {
+        assert_eq!(std::mem::size_of::<IndirectTevUniform>(), 128);
+        assert_eq!(
+            IndirectTevUniform::from_packet(None, [false; MAX_TEV_TEXTURES]),
+            IndirectTevUniform::default()
+        );
+
+        let mut required_coords = [false; MAX_TEV_TEXTURES];
+        required_coords[1] = true;
+        required_coords[7] = true;
+        let legacy = IndirectTevUniform::from_packet(None, required_coords);
+        assert_eq!(legacy.matrix_rows[1][3], 0x82);
+        assert_eq!(legacy.matrix_rows[2][3], 0);
+
+        let state = GxIndirectTevState {
+            gen_mode: 0x00ab_cdef,
+            xf_num_tex_gens: 4,
+            matrices: std::array::from_fn(|index| 0x0010_0000 + index as u32),
+            imask: 0x0000_cafe,
+            commands: std::array::from_fn(|index| 0x0020_0000 + index as u32),
+            tex_scales: [0x0001_2345, 0x0006_789a],
+            iref: 0,
+        };
+        let uniform = IndirectTevUniform::from_packet(Some(&state), required_coords);
+        assert_eq!(
+            uniform.control,
+            [
+                (state.gen_mode & !0xf) | state.xf_num_tex_gens,
+                state.iref,
+                state.tex_scales[0],
+                state.tex_scales[1]
+            ]
+        );
+        assert_eq!(state.gen_mode, 0x00ab_cdef, "packet keeps raw BP GEN_MODE");
+        assert_eq!(uniform.matrix_rows[0], [state.matrices[0], state.matrices[1], state.matrices[2], state.imask]);
+        assert_eq!(uniform.matrix_rows[1], [state.matrices[3], state.matrices[4], state.matrices[5], 0x82]);
+        assert_eq!(uniform.matrix_rows[2], [state.matrices[6], state.matrices[7], state.matrices[8], 1]);
+        assert_eq!(uniform.commands[0], state.commands[0..4]);
+        assert_eq!(uniform.commands[3], state.commands[12..16]);
+        assert_ne!(uniform, IndirectTevUniform::default());
+
+        // All-zero raw BP state is still distinguishable from an absent tail:
+        // IREF map 0 / coord 0 and XF NUMTEXGENS=0 are valid values.
+        let zero = IndirectTevUniform::from_packet(
+            Some(&GxIndirectTevState::default()),
+            [false; MAX_TEV_TEXTURES],
+        );
+        assert_eq!(zero.matrix_rows[2][3], 1);
+        assert_ne!(zero, IndirectTevUniform::default());
+    }
+
+    #[test]
+    fn renderer_resource_requirements_union_direct_and_indirect_dataflow() {
+        let mut direct = vec![0_u8; 464];
+        // Stage 0 samples map 7 / coord 6. Stage 1 has direct texturing
+        // disabled but still updates the persistent base coordinate from 5.
+        direct[8..12].copy_from_slice(&(7 | (6 << 3) | (1 << 6)).to_le_bytes());
+        direct[24..28].copy_from_slice(&(5 << 3).to_le_bytes());
+        direct[448..452].copy_from_slice(&2_u32.to_le_bytes());
+
+        let mut indirect = GxIndirectTevState {
+            gen_mode: 8 | (1 << 10) | (1 << 16),
+            xf_num_tex_gens: 8,
+            ..GxIndirectTevState::default()
+        };
+        indirect.commands[0] = 1 << 7;
+        indirect.iref = 3 << 3;
+        let (maps, coords) = tev_resource_requirements(&direct, Some(&indirect)).unwrap();
+        assert_eq!(
+            maps,
+            [true, false, false, false, false, false, false, true]
+        );
+        assert_eq!(
+            coords,
+            [false, false, false, true, false, true, true, false]
+        );
+
+        indirect.xf_num_tex_gens = 0;
+        let (maps, coords) = tev_resource_requirements(&direct, Some(&indirect)).unwrap();
+        assert_eq!(maps, [true, false, false, false, false, false, false, false]);
+        assert_eq!(coords, [false; MAX_TEV_TEXTURES]);
+
+        let (legacy_maps, legacy_coords) = tev_resource_requirements(&direct, None).unwrap();
+        assert_eq!(legacy_maps, [false, false, false, false, false, false, false, true]);
+        assert_eq!(legacy_coords, [false, false, false, false, false, false, true, false]);
     }
 
     #[test]

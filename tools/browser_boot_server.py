@@ -128,6 +128,13 @@ def open_disc(path: Path) -> DiscReader:
 class BrowserBootHandler(SimpleHTTPRequestHandler):
     disc: DiscReader
 
+    def end_headers(self) -> None:
+        # Debug harness assets keep stable names, so every local rebuild must
+        # be revalidated instead of reusing an older renderer module or Wasm.
+        if urlsplit(self.path).path != "/disc":
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def do_GET(self) -> None:
         request = urlsplit(self.path)
         if request.path != "/disc":

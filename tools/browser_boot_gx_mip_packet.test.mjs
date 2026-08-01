@@ -423,6 +423,59 @@ test("namespaces only genuine V7 chains while preflighting base companions", () 
   );
 });
 
+test("activates V7 and preserves F-Zero's exact 4x sampler word", () => {
+  const context = packetContext();
+  const mode0 = 0x0011c0d8;
+  const mode1 = 0x5000;
+  const texture = strictTexture(context, {
+    key: "fzero-anisotropic-city",
+    mode0,
+    mode1,
+    width: 64,
+    height: 64,
+  });
+  assert.equal(texture.strictV7Preflight.accepted, true);
+  assert.equal(texture.strictV7Preflight.classification, "genuine-mip");
+  assert.equal(texture.strictV7Preflight.maxAnisotropy, 4);
+
+  const packet = context.packGxFramePacketForRenderer(
+    2,
+    frameWithDraws([baseDraw([texture])]),
+  );
+  const view = new DataView(packet);
+  const drawOffset = view.getUint32(0x1c, true);
+  assert.equal(view.getUint16(0x04, true), 7);
+  assert.equal(view.getUint32(drawOffset + 0x34, true), mode0);
+  assert.equal(view.getUint32(packet.byteLength - 32, true), mode1);
+});
+
+test("activates V7 and preserves Rogue Leader's exact diagonal sampler word", () => {
+  const context = packetContext();
+  const mode0 = 0x0011c1d0;
+  const mode1 = 0x5000;
+  const texture = strictTexture(context, {
+    key: "rogue-diagonal-lod",
+    mode0,
+    mode1,
+    width: 64,
+    height: 64,
+  });
+  assert.equal(texture.strictV7Preflight.accepted, true);
+  assert.equal(texture.strictV7Preflight.classification, "genuine-mip");
+  assert.equal(texture.strictV7Preflight.diagonalLod, true);
+  assert.equal(texture.strictV7Preflight.maxAnisotropy, 4);
+
+  const packet = context.packGxFramePacketForRenderer(
+    2,
+    frameWithDraws([baseDraw([texture])]),
+  );
+  const view = new DataView(packet);
+  const drawOffset = view.getUint32(0x1c, true);
+  assert.equal(view.getUint16(0x04, true), 7);
+  assert.equal(view.getUint32(drawOffset + 0x34, true), mode0);
+  assert.equal(view.getUint32(packet.byteLength - 32, true), mode1);
+});
+
 test("reuses V6 residency for accepted base-only companions inside V7", () => {
   const context = packetContext();
   const mip = strictTexture(context, { key: "mip-resident" });

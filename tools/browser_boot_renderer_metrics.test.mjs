@@ -482,6 +482,41 @@ test("WebGPU diagnostic readback is excluded from workload counters", () => {
   assert.doesNotMatch(rendererSource.slice(start, end), /update_renderer_metrics/);
 });
 
+test("native GX anisotropy is explicit in WebGPU sampler diagnostics", () => {
+  for (const [publicField, rustField] of [
+    ["anisotropicSamplersCreated", "anisotropic_samplers_created"],
+    [
+      "maximumRequestedSamplerAnisotropy",
+      "maximum_requested_sampler_anisotropy",
+    ],
+  ]) {
+    assert.match(
+      rendererCoreSource,
+      new RegExp(`pub\\(crate\\) ${rustField}: u64`),
+    );
+    assert.match(
+      rendererSource,
+      new RegExp(`"${publicField}"[\\s\\S]{0,100}metrics\\.${rustField}`),
+    );
+  }
+  const samplerCreation = rendererSource.slice(
+    rendererSource.indexOf("for identity in sampler_identities"),
+    rendererSource.indexOf(
+      "drop(bind_group_timer)",
+      rendererSource.indexOf("for identity in sampler_identities"),
+    ),
+  );
+  assert.match(samplerCreation, /identity\.max_anisotropy > 1/);
+  assert.match(
+    samplerCreation,
+    /anisotropic_samplers_created[\s\S]*saturating_add\(1\)/,
+  );
+  assert.match(
+    samplerCreation,
+    /maximum_requested_sampler_anisotropy[\s\S]*\.max\(u64::from\(identity\.max_anisotropy\)\)/,
+  );
+});
+
 test("exact authoritative no-ops have distinct renderer compatibility counters", () => {
   for (const field of [
     "exact_raster_empty_draws",

@@ -144,9 +144,10 @@ function offset(xPlus342Div2, yPlus342Div2) {
   return xPlus342Div2 | (yPlus342Div2 << 10);
 }
 
-function indirectTevState(genMode = 0) {
+function indirectTevState(genMode = 0, xfNumTexGens = 0) {
   return {
     genMode,
+    xfNumTexGens,
     matrices: Array(9).fill(0),
     imask: 0,
     commands: Array(16).fill(0),
@@ -179,6 +180,7 @@ test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
   gxBpRegisters[0xf5] = 0x191a1b;
   gxBpRegisters[0x59] = offset(171, 171);
   gxXfRegisters[0x101a] = 0x43a00000;
+  gxXfRegisters[0x103f] = 3;
 
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.gxDrawPipelineState())),
@@ -199,7 +201,7 @@ test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
       fogRangeK: [0x010001, 0x010002, 0x010003, 0x010004, 0x010005],
       fogWords: [0x020001, 0x020002, 0x020003, 0x020004, 0x020005],
       viewportHalfWidthBits: 0x43a00000,
-      indirectTev: indirectTevState(2 << 14),
+      indirectTev: indirectTevState(2 << 14, 3),
     },
   );
 });

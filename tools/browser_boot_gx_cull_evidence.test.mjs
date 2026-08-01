@@ -1177,7 +1177,7 @@ test("producer gates exact cull work to the receiver's current managed subset", 
   assert.equal(
     candidate(0, 4, pipeline, [stage(0, 0)]),
     false,
-    "strict V7 preserves the anisotropy rejection",
+    "strict V7 rejects anisotropy with non-linear filters",
   );
   setTextureMode(0, 0, 1);
   const texture0 = context.gxTextureRegisters(0);
@@ -1200,7 +1200,13 @@ test("producer gates exact cull work to the receiver's current managed subset", 
   assert.equal(
     candidate(0, 4, pipeline, [stage(0, 0)]),
     false,
-    "anisotropic sampling exceeds the managed sampler contract",
+    "base-only anisotropy remains outside the certified WebGPU contract",
+  );
+  setTextureMode(0, 1, 6, 2);
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    true,
+    "F-Zero's 4x linear mip state enters managed native WebGPU sampling",
   );
   setTextureMode(0, 1, 4);
   assert.equal(

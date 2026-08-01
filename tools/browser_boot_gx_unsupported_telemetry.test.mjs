@@ -117,7 +117,7 @@ test("GX unsupported recorder retains the first event and sorts bounded counts",
   context.gxRecordUnsupported("z-freeze", 0, 1 << 19);
   context.cycles = 52;
   context.dispatches = 9;
-  context.gxRecordUnsupported("indirect-tev", 0x12, 0x1234, "stages=2");
+  context.gxRecordUnsupported("multisampling", 0, 1 << 9);
   context.gxRecordUnsupported("z-freeze", 0, 1 << 19);
 
   assert.equal(Object.isFrozen(context.gxFirstUnsupportedEvent), true);
@@ -133,12 +133,11 @@ test("GX unsupported recorder retains the first event and sorts bounded counts",
       dispatch: 7,
     },
     reasonCounts: [
-      { reason: "indirect-tev", count: 1 },
+      { reason: "multisampling", count: 1 },
       { reason: "z-freeze", count: 2 },
     ],
     addressCounts: [
-      { address: "0x00", count: 2 },
-      { address: "0x12", count: 1 },
+      { address: "0x00", count: 3 },
     ],
     reasonKeyLimit: 32,
     countLimit: 0xffff_ffff,
@@ -300,7 +299,7 @@ test("texture telemetry is emitted at strict, TMEM, and TLUT rejection sites", (
   configureTexture(sampler, { mode0: 1 << 19 });
   assert.equal(sampler.gxDecodeTexture(0), null);
   assert.deepEqual(plain(sampler.snapshotGxUnsupported().firstEvent), {
-    reason: "texture-preflight:unsupported-anisotropy",
+    reason: "texture-preflight:unsupported-anisotropy-filter-combination",
     address: "0x80",
     value: "0x00080000",
     detail: null,
@@ -339,11 +338,7 @@ test("draw, copy, bbox, report, and reset anchors preserve consumer gating", () 
     primitive.indexOf('gxRecordUnsupported("multisampling"')
       > primitive.indexOf("if (!decodeComplete || vertexCount === 0)"),
   );
-  assert.match(
-    primitive,
-    /const indirectStageCount[\s\S]*const indirectStage = stages\.find\([\s\S]*"indirect-tev"/,
-  );
-  assert.doesNotMatch(primitive, /indirectStageCount === 0/);
+  assert.doesNotMatch(primitive, /"indirect-tev"/);
 
   const bp = extractFunction("recordGxBpWrite");
   assert.ok(

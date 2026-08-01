@@ -111,8 +111,9 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   );
   for (const requirement of [
     "draw_depth_encoding",
-    "required_texture_maps",
-    "required_texture_coords",
+    "tev_resource_requirements",
+    "required_maps",
+    "required_coords",
     "gx_z_texture_state",
     "gx_fog_state",
     "prepare_managed_coverage_vertices",
@@ -183,7 +184,7 @@ test("authoritative no-op and depth routing precede all TEV gates", () => {
     "gx_early_depth_plan",
     "required_exact && early_depth != GxEarlyDepthPlan::FixedFunction",
     "GxEarlyDepthPlan::DepthOnly",
-    "required_texture_maps",
+    "tev_resource_requirements",
   ]);
   assert.match(
     draw,
