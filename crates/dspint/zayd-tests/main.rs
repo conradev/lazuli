@@ -4,15 +4,87 @@ mod file;
 
 use std::fmt::Write;
 
-use dspint::{Interpreter, Registers};
-use lazuli::modules::audio::NopAudioModule;
-use lazuli::modules::debug::NopDebugModule;
-use lazuli::modules::disk::NopDiskModule;
-use lazuli::modules::input::NopInputModule;
-use lazuli::modules::render::NopRenderModule;
-use lazuli::modules::vertex::NopVertexModule;
-use lazuli::system::{self, Modules, System};
+use dspint::{DspBus, DspControl, DspDma, DspMailbox, Interpreter, Registers};
 use libtest_mimic::{Arguments, Failed, Trial};
+
+struct TestBus {
+    control: DspControl,
+    dma: DspDma,
+    dsp_mailbox: DspMailbox,
+    cpu_mailbox: DspMailbox,
+    main_ram: Vec<u8>,
+    aram: Vec<u8>,
+}
+
+impl Default for TestBus {
+    fn default() -> Self {
+        Self {
+            control: DspControl {
+                reset_high: false,
+                ..DspControl::default()
+            },
+            dma: DspDma::default(),
+            dsp_mailbox: DspMailbox::default(),
+            cpu_mailbox: DspMailbox::default(),
+            main_ram: vec![0; 0x1000],
+            aram: vec![0; 0x0100_0000],
+        }
+    }
+}
+
+impl DspBus for TestBus {
+    fn dsp_control(&self) -> DspControl {
+        self.control
+    }
+
+    fn set_dsp_control(&mut self, control: DspControl) {
+        self.control = control;
+    }
+
+    fn dsp_dma(&self) -> DspDma {
+        self.dma
+    }
+
+    fn set_dsp_dma(&mut self, dma: DspDma) {
+        self.dma = dma;
+    }
+
+    fn dsp_mailbox(&self) -> DspMailbox {
+        self.dsp_mailbox
+    }
+
+    fn set_dsp_mailbox(&mut self, mailbox: DspMailbox) {
+        self.dsp_mailbox = mailbox;
+    }
+
+    fn cpu_mailbox(&self) -> DspMailbox {
+        self.cpu_mailbox
+    }
+
+    fn set_cpu_mailbox(&mut self, mailbox: DspMailbox) {
+        self.cpu_mailbox = mailbox;
+    }
+
+    fn main_ram(&self) -> &[u8] {
+        &self.main_ram
+    }
+
+    fn main_ram_mut(&mut self) -> &mut [u8] {
+        &mut self.main_ram
+    }
+
+    fn main_ram_write_completed(&mut self, _address: u32, _length: usize) {}
+
+    fn aram(&self) -> &[u8] {
+        &self.aram
+    }
+
+    fn aram_mut(&mut self) -> &mut [u8] {
+        &mut self.aram
+    }
+
+    fn request_cpu_interrupt(&mut self) {}
+}
 
 fn parse_code(mut words: &[u16]) -> Vec<dspint::Ins> {
     let mut ins = vec![];
@@ -37,11 +109,11 @@ struct FailedCase {
     divergences: Vec<(dspint::Reg, u16, u16)>,
 }
 
-fn run_case(sys: &mut System, case: file::TestCase) -> Result<(), FailedCase> {
+fn run_case(bus: &mut TestBus, case: file::TestCase) -> Result<(), FailedCase> {
     let mut dsp = Interpreter::default();
 
     // setup
-    sys.dsp.control.set_halt(false);
+    bus.control.halted = false;
     dsp.pc = 62;
     dsp.regs = case.initial_regs();
     dsp.mem.iram[62..][..case.instructions.len()].copy_from_slice(&case.instructions);
@@ -49,13 +121,13 @@ fn run_case(sys: &mut System, case: file::TestCase) -> Result<(), FailedCase> {
 
     // run until halt
     let code = parse_code(&case.instructions);
-    while !sys.dsp.control.halt() {
-        dsp.step(sys);
+    while !bus.control.halted {
+        dsp.step(bus);
     }
 
     // check
     let allow_status = std::env::var("IGNORE_STATUS").is_ok();
-    let expected = case.expected_regs();
+    let mut expected = case.expected_regs();
     let mut divergences = vec![];
     for i in 0..32 {
         let reg = dspint::Reg::new(i);
@@ -92,28 +164,10 @@ fn run_test(file: file::TestFile, quiet: bool) -> Result<(), Failed> {
     let total = file.cases.len();
     let mut failures = vec![];
 
-    let modules = Modules {
-        audio: Box::new(NopAudioModule),
-        debug: Box::new(NopDebugModule),
-        disk: Box::new(NopDiskModule),
-        input: Box::new(NopInputModule),
-        render: Box::new(NopRenderModule),
-        vertex: Box::new(NopVertexModule),
-    };
-
-    let mut system = System::new(
-        modules,
-        system::Config {
-            ipl: None,
-            sideload: None,
-            ipl_lle: false,
-            perform_efb_copies: false,
-            uart_escape: false,
-        },
-    );
+    let mut bus = TestBus::default();
 
     for (i, case) in file.cases.into_iter().enumerate() {
-        let Err(failure) = run_case(&mut system, case) else {
+        let Err(failure) = run_case(&mut bus, case) else {
             continue;
         };
 

@@ -2,17 +2,20 @@
 
 mod exec;
 
+mod bus;
+
 pub mod ins;
 
-use bitos::integer::{u3, u4, u15};
+use std::ops::Range;
+
+use bitos::integer::{u3, u4};
 use bitos::{BitUtils, bitos};
-use lazuli::Primitive;
-use lazuli::system::System;
-use lazuli::system::dspi::{DspDmaControl, DspDmaDirection, DspDmaTarget, Mailbox};
+pub use bus::{
+    DspBus, DspBusFault, DspBusOperation, DspControl, DspDma, DspDmaControl, DspDmaDirection,
+    DspDmaTarget, DspMailbox,
+};
 use strum::FromRepr;
-use tinyvec::ArrayVec;
 use util::boxed_array;
-use zerocopy::IntoBytes;
 
 use crate::ins::{ExtensionOpcode, Opcode};
 
@@ -23,6 +26,113 @@ const IRAM_LEN: usize = 0x1000;
 const IROM_LEN: usize = 0x1000;
 const DRAM_LEN: usize = 0x1000;
 const COEF_LEN: usize = 0x0800;
+const IFX_LEN: usize = 0x0100;
+const ARAM_LEN: usize = 0x0100_0000;
+const ARAM_ADDRESS_MASK: u32 = 0x00ff_ffff;
+const ACCEL_START_END_ADDRESS_MASK: u32 = 0x3fff_ffff;
+const ACCEL_CURRENT_ADDRESS_MASK: u32 = 0xbfff_ffff;
+const STACK_DEPTH: usize = 0x20;
+const STACK_MASK: u8 = 0x1f;
+
+#[inline(always)]
+fn read_be_u16(bytes: &[u8]) -> u16 {
+    let mut value = [0; 2];
+    let length = bytes.len().min(value.len());
+    value[..length].copy_from_slice(&bytes[..length]);
+    u16::from_be_bytes(value)
+}
+
+#[inline(always)]
+fn write_be_u16(value: u16, bytes: &mut [u8]) {
+    let value = value.to_be_bytes();
+    let length = bytes.len().min(value.len());
+    bytes[..length].copy_from_slice(&value[..length]);
+}
+
+fn main_ram_range(
+    bus: &dyn DspBus,
+    operation: DspBusOperation,
+    address: u32,
+    length: usize,
+) -> Result<Range<usize>, DspBusFault> {
+    let memory_length = bus.main_ram().len();
+    let start = address as usize;
+    let end = start.checked_add(length);
+    if end.is_none_or(|end| end > memory_length) {
+        return Err(DspBusFault {
+            operation,
+            address,
+            length: u32::try_from(length).unwrap_or(u32::MAX),
+            memory_length: u32::try_from(memory_length).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(start..end.unwrap())
+}
+
+#[cold]
+fn aram_fault(
+    operation: DspBusOperation,
+    address: u32,
+    length: u32,
+    memory_length: usize,
+) -> DspBusFault {
+    DspBusFault {
+        operation,
+        address: address & ARAM_ADDRESS_MASK,
+        length,
+        memory_length: u32::try_from(memory_length).unwrap_or(u32::MAX),
+    }
+}
+
+fn validate_aram(bus: &dyn DspBus) -> Result<(), DspBusFault> {
+    let memory_length = bus.aram().len();
+    if memory_length < ARAM_LEN {
+        return Err(aram_fault(
+            DspBusOperation::ValidateAram,
+            0,
+            ARAM_LEN as u32,
+            memory_length,
+        ));
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn read_aram_u8(bus: &dyn DspBus, address: u32) -> Result<u8, DspBusFault> {
+    let address = address & ARAM_ADDRESS_MASK;
+    bus.aram()
+        .get(address as usize)
+        .copied()
+        .ok_or_else(|| aram_fault(DspBusOperation::ReadAram, address, 1, bus.aram().len()))
+}
+
+#[inline(always)]
+fn read_aram_be_u16(bus: &dyn DspBus, address: u32) -> Result<u16, DspBusFault> {
+    let high = read_aram_u8(bus, address)?;
+    let low = read_aram_u8(bus, address.wrapping_add(1))?;
+    Ok(u16::from_be_bytes([high, low]))
+}
+
+#[inline(always)]
+fn write_aram_be_u16(bus: &mut dyn DspBus, address: u32, value: u16) -> Result<(), DspBusFault> {
+    let high_address = address & ARAM_ADDRESS_MASK;
+    let low_address = address.wrapping_add(1) & ARAM_ADDRESS_MASK;
+    let aram = bus.aram_mut();
+    let memory_length = aram.len();
+    if high_address as usize >= memory_length || low_address as usize >= memory_length {
+        return Err(aram_fault(
+            DspBusOperation::WriteAram,
+            high_address,
+            2,
+            memory_length,
+        ));
+    }
+
+    let [high, low] = value.to_be_bytes();
+    aram[high_address as usize] = high;
+    aram[low_address as usize] = low;
+    Ok(())
+}
 
 pub struct Memory {
     pub iram: Box<[u16; IRAM_LEN]>,
@@ -98,20 +208,35 @@ pub struct Product {
     pub high: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductView {
+    pub value: i64,
+    pub mid_carry: bool,
+    pub carry: bool,
+    pub overflow: bool,
+}
+
 impl Product {
-    pub fn get(&self) -> (bool, bool, i64) {
-        let (sum, carry) = self.mid1.overflowing_add(self.mid2);
-        let (c_high, carry) = self.high.overflowing_add(carry as u8);
-        let overflow = self.high as i8 >= 0 && ((c_high as i8) < 0);
+    pub fn resolve(&self) -> ProductView {
+        let mid = self.mid1 as u32 + self.mid2 as u32;
+        let mid_carry = mid.bit(16);
+        let high = self.high as u16 + mid_carry as u16;
+        let carry = high.bit(8);
+        let overflow = !self.high.bit(7) && high.bit(7);
 
         let bits = 0
             .with_bits(0, 16, self.low as i64)
-            .with_bits(16, 32, sum as i64)
-            .with_bits(32, 40, c_high as i64);
+            .with_bits(16, 32, mid as i64)
+            .with_bits(32, 40, high as i64);
 
         let value = (bits << 24) >> 24;
 
-        (carry, overflow, value)
+        ProductView {
+            value,
+            mid_carry,
+            carry,
+            overflow,
+        }
     }
 
     pub fn set(&mut self, value: i64) {
@@ -204,15 +329,63 @@ impl Reg {
     }
 }
 
+/// One of the DSP's hardware register stacks.
+///
+/// The current entry is always readable. Pushes and pops wrap through the
+/// fixed hardware storage instead of growing, becoming empty, or panicking.
+#[derive(Debug, Clone)]
+pub struct DspStack {
+    current: u16,
+    entries: [u16; STACK_DEPTH],
+    cursor: u8,
+}
+
+impl Default for DspStack {
+    fn default() -> Self {
+        Self {
+            current: 0,
+            entries: [0; STACK_DEPTH],
+            cursor: 0,
+        }
+    }
+}
+
+impl DspStack {
+    #[inline(always)]
+    pub fn peek(&self) -> u16 {
+        self.current
+    }
+
+    #[inline(always)]
+    fn peek_mut(&mut self) -> &mut u16 {
+        &mut self.current
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, value: u16) {
+        self.cursor = self.cursor.wrapping_add(1) & STACK_MASK;
+        self.entries[self.cursor as usize] = self.current;
+        self.current = value;
+    }
+
+    #[inline(always)]
+    pub fn pop(&mut self) -> u16 {
+        let value = self.current;
+        self.current = self.entries[self.cursor as usize];
+        self.cursor = self.cursor.wrapping_sub(1) & STACK_MASK;
+        value
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Registers {
     pub addressing: [u16; 4],
     pub indexing: [u16; 4],
     pub wrapping: [u16; 4],
-    pub call_stack: ArrayVec<[u16; 8]>,
-    pub data_stack: ArrayVec<[u16; 4]>,
-    pub loop_stack: ArrayVec<[u16; 4]>,
-    pub loop_count: ArrayVec<[u16; 4]>,
+    pub call_stack: DspStack,
+    pub data_stack: DspStack,
+    pub loop_stack: DspStack,
+    pub loop_count: DspStack,
     pub product: Product,
     pub acc40: [Acc40; 2],
     pub acc32: [i32; 2],
@@ -265,10 +438,10 @@ impl Registers {
             Reg::Wrap1 => self.wrapping[1],
             Reg::Wrap2 => self.wrapping[2],
             Reg::Wrap3 => self.wrapping[3],
-            Reg::CallStack => self.call_stack.last().copied().unwrap_or_default(),
-            Reg::DataStack => self.data_stack.last().copied().unwrap_or_default(),
-            Reg::LoopStack => self.loop_stack.last().copied().unwrap_or_default(),
-            Reg::LoopCount => self.loop_count.last().copied().unwrap_or_default(),
+            Reg::CallStack => self.call_stack.peek(),
+            Reg::DataStack => self.data_stack.peek(),
+            Reg::LoopStack => self.loop_stack.peek(),
+            Reg::LoopCount => self.loop_count.peek(),
             Reg::Acc40High0 => self.acc40[0].high as i8 as i16 as u16,
             Reg::Acc40High1 => self.acc40[1].high as i8 as i16 as u16,
             Reg::Config => self.config as u16,
@@ -290,10 +463,10 @@ impl Registers {
 
     pub fn get(&mut self, reg: Reg) -> u16 {
         match reg {
-            Reg::CallStack => self.call_stack.pop().unwrap_or_default(),
-            Reg::DataStack => self.data_stack.pop().unwrap_or_default(),
-            Reg::LoopStack => self.loop_stack.pop().unwrap_or_default(),
-            Reg::LoopCount => self.loop_count.pop().unwrap_or_default(),
+            Reg::CallStack => self.call_stack.pop(),
+            Reg::DataStack => self.data_stack.pop(),
+            Reg::LoopStack => self.loop_stack.pop(),
+            Reg::LoopCount => self.loop_count.pop(),
             _ => self.get_pure(reg),
         }
     }
@@ -357,6 +530,61 @@ impl Registers {
             }
             Reg::LoopStack => std::hint::cold_path(),
             _ => self.set(reg, value),
+        }
+    }
+}
+
+/// Register values observed in parallel by an extended opcode.
+///
+/// Hardware stacks are deliberately excluded: extended opcodes cannot address
+/// them, and copying four 32-word stacks in the interpreter hot loop would be
+/// needless work.
+#[derive(Clone, Copy)]
+pub(crate) struct ExtensionRegisters {
+    addressing: [u16; 4],
+    indexing: [u16; 4],
+    wrapping: [u16; 4],
+    acc40: [Acc40; 2],
+    acc32: [i32; 2],
+    status: Status,
+}
+
+impl ExtensionRegisters {
+    #[inline(always)]
+    fn capture(regs: &Registers) -> Self {
+        Self {
+            addressing: regs.addressing,
+            indexing: regs.indexing,
+            wrapping: regs.wrapping,
+            acc40: regs.acc40,
+            acc32: regs.acc32,
+            status: regs.status,
+        }
+    }
+
+    #[inline(always)]
+    fn get_pure(&self, reg: Reg) -> u16 {
+        let acc_saturate = |i: usize| {
+            let ml = self.acc40[i].get() as i32 as i64;
+            let hml = self.acc40[i].get();
+
+            if self.status.sign_extend_to_40() && ml != hml {
+                if hml >= 0 { 0x7fff } else { 0x8000 }
+            } else {
+                self.acc40[i].mid
+            }
+        };
+
+        match reg {
+            Reg::Acc32Low0 => self.acc32[0].bits(0, 16) as u16,
+            Reg::Acc32Low1 => self.acc32[1].bits(0, 16) as u16,
+            Reg::Acc32High0 => self.acc32[0].bits(16, 32) as u16,
+            Reg::Acc32High1 => self.acc32[1].bits(16, 32) as u16,
+            Reg::Acc40Low0 => self.acc40[0].low,
+            Reg::Acc40Low1 => self.acc40[1].low,
+            Reg::Acc40Mid0 => acc_saturate(0),
+            Reg::Acc40Mid1 => acc_saturate(1),
+            _ => unreachable!("extended opcode read unsupported register {reg:?}"),
         }
     }
 }
@@ -469,7 +697,8 @@ pub struct Accelerator {
     pub gain: i16,
     pub input: i16,
     pub previous_samples: [i16; 2],
-    pub has_data: bool,
+    pub reads_stopped: bool,
+    /// Compatibility mirror of the raw AMDM register; IFX storage remains authoritative.
     pub dma_masked: bool,
     pub overflow: AccelOverflow,
 }
@@ -546,8 +775,10 @@ pub struct Interpreter {
     pub accel: Accelerator,
     pub old_reset_high: bool,
 
+    ifx_regs: [u16; IFX_LEN],
     cached: Box<[Option<CachedIns>; 1 << 16]>,
-    early_exit: bool,
+    pending_stop: Option<ExecStopReason>,
+    pending_bus_fault: Option<DspBusFault>,
 }
 
 impl Default for Interpreter {
@@ -558,16 +789,35 @@ impl Default for Interpreter {
             mem: Default::default(),
             accel: Default::default(),
             old_reset_high: Default::default(),
+            ifx_regs: [0; IFX_LEN],
             cached: util::boxed_array(None),
-            early_exit: false,
+            pending_stop: None,
+            pending_bus_fault: None,
         }
     }
 }
 
-type OpcodeFn = for<'a, 'b> fn(&'a mut Interpreter, &'b mut System, Ins);
+/// Why an interpreter execution slice stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecStopReason {
+    InstructionBudgetExhausted,
+    Halted,
+    DspMailboxFull,
+    CpuMailboxEmpty,
+    BusFault(DspBusFault),
+}
+
+/// Result of one bounded interpreter execution slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecOutcome {
+    pub executed_instructions: u32,
+    pub stop_reason: ExecStopReason,
+}
+
+type OpcodeFn = for<'a, 'b> fn(&'a mut Interpreter, &'b mut dyn DspBus, Ins);
 
 static OPCODE_EXEC_LUT: [OpcodeFn; 1 << 8] = {
-    fn nop(_: &mut Interpreter, _: &mut System, _: Ins) {}
+    fn nop(_: &mut Interpreter, _: &mut dyn DspBus, _: Ins) {}
     let mut lut = [nop as OpcodeFn; 1 << 8];
 
     lut[Opcode::Abs as usize] = Interpreter::abs as OpcodeFn;
@@ -697,10 +947,11 @@ static OPCODE_EXEC_LUT: [OpcodeFn; 1 << 8] = {
     lut
 };
 
-type ExtensionFn = for<'a, 'b, 'c> fn(&'a mut Interpreter, &'b mut System, Ins, &'c Registers);
+type ExtensionFn =
+    for<'a, 'b, 'c> fn(&'a mut Interpreter, &'b mut dyn DspBus, Ins, &'c ExtensionRegisters);
 
 static EXTENSION_EXEC_LUT: [ExtensionFn; 1 << 8] = {
-    fn nop(_: &mut Interpreter, _: &mut System, _: Ins, _: &Registers) {}
+    fn nop(_: &mut Interpreter, _: &mut dyn DspBus, _: Ins, _: &ExtensionRegisters) {}
     let mut lut = [nop as ExtensionFn; 1 << 8];
 
     lut[ExtensionOpcode::Dr as usize] = Interpreter::ext_dr as ExtensionFn;
@@ -740,12 +991,14 @@ impl Interpreter {
     }
 
     #[inline(always)]
-    pub fn check_interrupts(&mut self, sys: &mut System) {
+    pub fn check_interrupts(&mut self, bus: &mut dyn DspBus) {
         // external interrupt does not care about status interrupt enable
-        if self.regs.status.external_interrupt_enable() && sys.dsp.control.cpu_to_dsp_interrupt() {
+        let mut control = bus.dsp_control();
+        if self.regs.status.external_interrupt_enable() && control.cpu_to_dsp_interrupt {
             std::hint::cold_path();
             tracing::warn!("DSP external interrupt raised");
-            sys.dsp.control.set_cpu_to_dsp_interrupt(false);
+            control.cpu_to_dsp_interrupt = false;
+            bus.set_dsp_control(control);
             self.raise_interrupt(Interrupt::External);
             return;
         }
@@ -764,37 +1017,32 @@ impl Interpreter {
 
     #[inline(always)]
     fn check_loop(&mut self) {
-        if self
-            .regs
-            .loop_stack
-            .last()
-            .is_some_and(|v| *v == self.pc - 1)
-        {
+        let loop_address = self.regs.loop_stack.peek();
+        let loop_counter = self.regs.loop_count.peek();
+        if loop_counter == 0 || loop_address != self.pc.wrapping_sub(1) {
+            return;
+        }
+
+        std::hint::cold_path();
+        let counter = self.regs.loop_count.peek_mut();
+        *counter = counter.wrapping_sub(1);
+
+        if *counter == 0 {
             std::hint::cold_path();
-
-            let counter = self.regs.loop_count.last_mut().unwrap();
-            *counter = counter.saturating_sub(1);
-
-            if *counter == 0 {
-                std::hint::cold_path();
-                self.regs.call_stack.pop();
-                self.regs.loop_stack.pop();
-                self.regs.loop_count.pop();
-            } else {
-                let addr = *self.regs.call_stack.last().unwrap();
-                self.pc = addr;
-            }
+            self.regs.call_stack.pop();
+            self.regs.loop_stack.pop();
+            self.regs.loop_count.pop();
+        } else {
+            self.pc = self.regs.call_stack.peek();
         }
     }
 
     /// Soft resets the DSP.
-    pub fn reset(&mut self, sys: &mut System) {
+    pub fn reset(&mut self, bus: &mut dyn DspBus) {
         self.regs = Default::default();
-        sys.dsp.dsp_mailbox = Mailbox::from_bits(0);
-        sys.dsp.cpu_mailbox = Mailbox::from_bits(0);
 
         self.cached.fill(None);
-        self.pc = if sys.dsp.control.reset_high() {
+        self.pc = if bus.dsp_control().reset_high {
             tracing::debug!("resetting at IROM (0x8000)");
             0x8000
         } else {
@@ -804,14 +1052,16 @@ impl Interpreter {
     }
 
     /// Checks for reset.
-    pub fn check_reset(&mut self, sys: &mut System) {
-        if sys.dsp.control.reset() || (sys.dsp.control.reset_high() != self.old_reset_high) {
+    pub fn check_reset(&mut self, bus: &mut dyn DspBus) -> Result<(), DspBusFault> {
+        let control = bus.dsp_control();
+        if control.reset || (control.reset_high != self.old_reset_high) {
             std::hint::cold_path();
 
             // DMA from main memory if resetting at low
-            if !sys.dsp.control.reset_high() {
+            if !control.reset_high {
                 tracing::debug!("DSP DMA stub from main memory");
-                let data = sys.mem.ram()[0x0100_0000..][..1024]
+                let range = main_ram_range(bus, DspBusOperation::ReadMainRam, 0x0100_0000, 1024)?;
+                let data = bus.main_ram()[range]
                     .chunks_exact(2)
                     .map(|c| u16::from_be_bytes([c[0], c[1]]));
 
@@ -821,26 +1071,28 @@ impl Interpreter {
             }
 
             tracing::debug!("DSP reset");
-            self.reset(sys);
+            self.reset(bus);
         }
 
-        sys.dsp.control.set_reset(false);
-        self.old_reset_high = sys.dsp.control.reset_high();
+        let mut control = bus.dsp_control();
+        control.reset = false;
+        self.old_reset_high = control.reset_high;
+        bus.set_dsp_control(control);
+        Ok(())
     }
 
     /// Performs the DSP DMA if the transfer is ongoing.
-    pub fn do_dma(&mut self, sys: &mut System) {
-        if sys.dsp.dsp_dma.control.transfer_ongoing() {
+    pub fn do_dma(&mut self, bus: &mut dyn DspBus) -> Result<(), DspBusFault> {
+        let dma = bus.dsp_dma();
+        if dma.control.transfer_ongoing() {
             std::hint::cold_path();
 
-            let ram_base = sys.dsp.dsp_dma.ram_base.with_bits(26, 32, 0);
-            let dsp_base = sys.dsp.dsp_dma.dsp_base;
-            let length = sys.dsp.dsp_dma.length;
+            let ram_base = dma.ram_base.with_bits(26, 32, 0);
+            let dsp_base = dma.dsp_base;
+            let length = dma.length;
+            let byte_length = usize::from(length / 2) * 2;
 
-            let (target, direction) = (
-                sys.dsp.dsp_dma.control.dsp_target(),
-                sys.dsp.dsp_dma.control.direction(),
-            );
+            let (target, direction) = (dma.control.dsp_target(), dma.control.direction());
 
             match (target, direction) {
                 (DspDmaTarget::Dmem, DspDmaDirection::FromRamToDsp) => {
@@ -848,12 +1100,13 @@ impl Interpreter {
                         "DSP DMA {length:04X} bytes from RAM {ram_base:08X} to DMEM {dsp_base:04X}",
                     );
 
+                    let source =
+                        main_ram_range(bus, DspBusOperation::ReadMainRam, ram_base, byte_length)?;
                     for word in 0..(length / 2) {
-                        let data = u16::read_be_bytes(
-                            &sys.mem.ram()[(ram_base + 2 * word as u32) as usize..],
-                        );
+                        let offset = source.start + usize::from(word) * 2;
+                        let data = read_be_u16(&bus.main_ram()[offset..offset + 2]);
 
-                        self.write_dmem(sys, dsp_base + word, data);
+                        self.write_dmem(bus, dsp_base + word, data);
                     }
                 }
                 (DspDmaTarget::Dmem, DspDmaDirection::FromDspToRam) => {
@@ -861,12 +1114,14 @@ impl Interpreter {
                         "DSP DMA {length:04X} bytes from DMEM {dsp_base:04X} to RAM {ram_base:08X}"
                     );
 
+                    let destination =
+                        main_ram_range(bus, DspBusOperation::WriteMainRam, ram_base, byte_length)?;
                     for word in 0..(length / 2) {
-                        let data = self.read_dmem(sys, dsp_base + word);
-                        data.write_be_bytes(
-                            &mut sys.mem.ram_mut()[(ram_base + 2 * word as u32) as usize..],
-                        );
+                        let data = self.read_dmem(bus, dsp_base + word);
+                        let offset = destination.start + usize::from(word) * 2;
+                        write_be_u16(data, &mut bus.main_ram_mut()[offset..offset + 2]);
                     }
+                    bus.main_ram_write_completed(ram_base, byte_length);
                 }
                 (DspDmaTarget::Imem, DspDmaDirection::FromRamToDsp) => {
                     std::hint::cold_path();
@@ -875,53 +1130,57 @@ impl Interpreter {
                         "DSP DMA {length:04X} bytes from RAM {ram_base:08X} to IMEM {dsp_base:04X} (ucode)"
                     );
 
+                    let source =
+                        main_ram_range(bus, DspBusOperation::ReadMainRam, ram_base, byte_length)?;
                     for word in 0..(length / 2) {
-                        let data = u16::read_be_bytes(
-                            &sys.mem.ram()[(ram_base + 2 * word as u32) as usize..],
-                        );
+                        let offset = source.start + usize::from(word) * 2;
+                        let data = read_be_u16(&bus.main_ram()[offset..offset + 2]);
 
                         self.write_imem(dsp_base + word, data);
                     }
-
-                    // clear cache
-                    self.cached.fill(None);
                 }
-                (DspDmaTarget::Imem, DspDmaDirection::FromDspToRam) => unimplemented!(),
+                (DspDmaTarget::Imem, DspDmaDirection::FromDspToRam) => {
+                    tracing::warn!(
+                        "DSP DMA {length:04X} bytes from IMEM {dsp_base:04X} to RAM \
+                         {ram_base:08X} is unsupported by hardware, ignoring"
+                    );
+                }
             };
 
-            sys.dsp.dsp_dma.length = 0;
-            sys.dsp.dsp_dma.control.set_transfer_ongoing(false);
+            // DMA targets include MMIO, so preserve any register side effects produced by the
+            // transfer rather than writing back the stale pre-transfer snapshot.
+            let mut live_dma = bus.dsp_dma();
+            live_dma.length = 0;
+            live_dma.control.set_transfer_ongoing(false);
+            bus.set_dsp_dma(live_dma);
         }
+        Ok(())
     }
 
-    fn increment_accel_curr(&mut self, overflow: AccelOverflow) {
-        self.accel.aram_curr += 1;
-        if self.accel.aram_curr > self.accel.aram_end {
-            self.accel.aram_curr = self.accel.aram_start;
-            self.accel.has_data = false;
-            self.accel.overflow = overflow;
-        }
+    fn set_accel_current_address(&mut self, address: u32) {
+        self.accel.aram_curr = address & ACCEL_CURRENT_ADDRESS_MASK;
     }
 
-    fn read_accel_raw(&mut self, sys: &mut System) -> u16 {
+    fn read_accel_value(&self, bus: &dyn DspBus) -> Result<u16, DspBusFault> {
         let format = self.accel.format;
-        let index = self.accel.aram_curr.with_bit(31, false);
+        let index = self.accel.aram_curr;
         let value = match format.sample() {
             SampleSize::Nibble => {
                 let address = index / 2;
-                let byte = sys.dsp.aram[address as usize] as u16;
+                let byte = read_aram_u8(bus, address)? as u16;
                 if index.is_multiple_of(2) {
                     byte >> 4
                 } else {
                     byte & 0xF
                 }
             }
-            SampleSize::Byte => sys.dsp.aram[index as usize] as u16,
+            SampleSize::Byte => read_aram_u8(bus, index)? as u16,
             SampleSize::Word => {
-                let address = index * 2;
-                u16::read_be_bytes(&sys.dsp.aram[address as usize..])
+                let address = index.wrapping_mul(2);
+                read_aram_be_u16(bus, address)?
             }
-            _ => panic!("reserved format"),
+            // Hardware produces garbage for the reserved size. Dolphin models that as zero.
+            SampleSize::Reserved => 0,
         };
 
         tracing::debug!(
@@ -931,7 +1190,48 @@ impl Interpreter {
             self.pc
         );
 
-        value
+        Ok(value)
+    }
+
+    fn read_accel_raw(&mut self, bus: &dyn DspBus) -> Result<u16, DspBusFault> {
+        let value = self.read_accel_value(bus)?;
+        let mut next = if self.accel.format.sample() == SampleSize::Reserved {
+            (self.accel.aram_curr & !3) | (self.accel.aram_curr.wrapping_add(1) & 3)
+        } else {
+            self.accel.aram_curr.wrapping_add(1)
+        };
+
+        // The normal hardware path only wraps after reading the exact end address. A current
+        // address already beyond the end keeps advancing.
+        if next.wrapping_sub(1) == self.accel.aram_end {
+            next = self.accel.aram_start;
+            self.accel.overflow = AccelOverflow::RawRead;
+        }
+        self.set_accel_current_address(next);
+        Ok(value)
+    }
+
+    fn write_accel_raw(&mut self, bus: &mut dyn DspBus, value: u16) -> Result<(), DspBusFault> {
+        // Hardware accepts raw writes only when the current-address high bit is set.
+        if self.accel.aram_curr & (1 << 31) == 0 {
+            tracing::debug!(
+                "accelerator ignored raw write to 0x{:08X} without the write-enable bit",
+                self.accel.aram_curr
+            );
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "accelerator writing 0x{value:04X} to ARAM 0x{:08X}",
+            self.accel.aram_curr
+        );
+
+        // Raw writes are always 16-bit regardless of the configured sample size.
+        let address = self.accel.aram_curr.wrapping_mul(2);
+        write_aram_be_u16(bus, address, value)?;
+        self.accel.aram_curr = self.accel.aram_curr.wrapping_add(1);
+        self.accel.overflow = AccelOverflow::RawWrite;
+        Ok(())
     }
 
     fn pcm_gain(&self, value: i32) -> i32 {
@@ -950,28 +1250,15 @@ impl Interpreter {
         self.accel.format.divisor().apply(acc) as i16
     }
 
-    fn adpcm_decode(&mut self, sys: &mut System) -> i16 {
-        assert_eq!(self.accel.format.sample(), SampleSize::Nibble);
-
-        if self.accel.aram_curr.is_multiple_of(16) {
-            let coeff_idx = self.read_accel_raw(sys) as u8;
-            self.increment_accel_curr(AccelOverflow::Sample);
-
-            let scale = self.read_accel_raw(sys) as u8;
-            self.increment_accel_curr(AccelOverflow::Sample);
-
-            self.accel.predictor.set_coefficients(u3::new(coeff_idx));
-            self.accel.predictor.set_scale_log2(u4::new(scale));
-        }
-
+    fn adpcm_decode(&self, raw_sample: u16) -> i16 {
         let predictor = self.accel.predictor;
         let coeff_idx = predictor.coefficients().value();
 
         let coeffs = self.accel.coefficients[coeff_idx as usize];
         let scale = 1 << predictor.scale_log2().value();
 
-        let data = ((self.read_accel_raw(sys) as i8) << 4) >> 4;
-        self.increment_accel_curr(AccelOverflow::Sample);
+        // ADPCM consumes the low nibble even when the configured access size is wider.
+        let data = (((raw_sample & 0xf) as i8) << 4) >> 4;
 
         let value = scale * data as i32;
         let prediction = coeffs.a as i32 * self.accel.previous_samples[0] as i32
@@ -981,37 +1268,69 @@ impl Interpreter {
         result.clamp(i16::MIN as i32, i16::MAX as i32) as i16
     }
 
-    fn read_accel_sample(&mut self, sys: &mut System) -> i16 {
-        if !self.accel.has_data {
-            self.accel.previous_samples[1] = self.accel.previous_samples[0];
-            self.accel.previous_samples[0] = 0;
-            return 0;
+    fn read_accel_sample(&mut self, bus: &dyn DspBus) -> Result<i16, DspBusFault> {
+        if self.accel.reads_stopped {
+            return Ok(0);
         }
 
-        let value = match self.accel.format.decoding() {
-            SampleDecoding::AramAdpcm => self.adpcm_decode(sys),
-            SampleDecoding::AcinPcm => self.pcm_decode(self.accel.input as i32),
-            SampleDecoding::AramPcm => {
-                let value = self.read_accel_raw(sys) as i16;
-                self.increment_accel_curr(AccelOverflow::Sample);
-                self.pcm_decode(value as i32)
-            }
-            SampleDecoding::AcinPcmInc => {
-                self.increment_accel_curr(AccelOverflow::Sample);
-                self.pcm_decode(self.accel.input as i32)
-            }
+        let decoding = self.accel.format.decoding();
+        let raw_sample = match decoding {
+            SampleDecoding::AramAdpcm | SampleDecoding::AramPcm => self.read_accel_value(bus)?,
+            SampleDecoding::AcinPcm | SampleDecoding::AcinPcmInc => self.accel.input as u16,
         };
 
+        let value = match decoding {
+            SampleDecoding::AramAdpcm => self.adpcm_decode(raw_sample),
+            SampleDecoding::AcinPcm => self.pcm_decode(raw_sample as i16 as i32),
+            SampleDecoding::AramPcm => self.pcm_decode(raw_sample as i16 as i32),
+            SampleDecoding::AcinPcmInc => self.pcm_decode(raw_sample as i16 as i32),
+        };
+
+        let mut next = self.accel.aram_curr;
+        let mut step_size = 2_u32;
+        let mut next_predictor = None;
+        match decoding {
+            SampleDecoding::AramAdpcm => {
+                next = next.wrapping_add(1);
+
+                // These aligned endpoint cases bypass ACCOV and predictor loading on hardware.
+                if self.accel.aram_end & 0xf == 0 && next == self.accel.aram_end {
+                    next = self.accel.aram_start.wrapping_add(1);
+                } else if self.accel.aram_end & 0xf == 1
+                    && next == self.accel.aram_end.wrapping_sub(1)
+                {
+                    next = self.accel.aram_start;
+                } else if next.is_multiple_of(16) {
+                    next_predictor = Some(read_aram_u8(bus, (next & !15) >> 1)?);
+                    next = next.wrapping_add(2);
+                    step_size += 2;
+                }
+            }
+            SampleDecoding::AcinPcm => (),
+            SampleDecoding::AramPcm | SampleDecoding::AcinPcmInc => {
+                next = next.wrapping_add(1);
+            }
+        }
+
+        if let Some(predictor) = next_predictor {
+            self.accel.predictor = AccelPredictor::from_bits(predictor as u16);
+        }
         self.accel.previous_samples[1] = self.accel.previous_samples[0];
         self.accel.previous_samples[0] = value;
 
-        value
+        if next == self.accel.aram_end.wrapping_add(step_size).wrapping_sub(1) {
+            next = self.accel.aram_start;
+            self.accel.reads_stopped = true;
+            self.accel.overflow = AccelOverflow::Sample;
+        }
+        self.set_accel_current_address(next);
+
+        Ok(value)
     }
 
-    pub fn read_mmio(&mut self, sys: &mut System, offset: u8) -> u16 {
+    pub fn read_mmio(&mut self, bus: &mut dyn DspBus, offset: u8) -> u16 {
         let Some(mmio) = Mmio::from_repr(offset) else {
-            println!("!!!!! reading from unknown MMIO 0x{offset:02X}");
-            return 0;
+            return self.ifx_regs[offset as usize];
         };
 
         match mmio {
@@ -1026,18 +1345,26 @@ impl Interpreter {
             }
 
             // DMA
-            Mmio::DmaControl => sys.dsp.dsp_dma.control.to_bits(),
-            Mmio::DmaLength => sys.dsp.dsp_dma.length,
-            Mmio::DmaDspAddr => sys.dsp.dsp_dma.dsp_base,
-            Mmio::DmaRamAddrHigh => (sys.dsp.dsp_dma.ram_base >> 16) as u16,
-            Mmio::DmaRamAddrLow => sys.dsp.dsp_dma.ram_base as u16,
+            Mmio::DmaControl => bus.dsp_dma().control.to_bits(),
+            Mmio::DmaLength => bus.dsp_dma().length,
+            Mmio::DmaDspAddr => bus.dsp_dma().dsp_base,
+            Mmio::DmaRamAddrHigh => (bus.dsp_dma().ram_base >> 16) as u16,
+            Mmio::DmaRamAddrLow => bus.dsp_dma().ram_base as u16,
+            Mmio::DmaMasked => self.ifx_regs[offset as usize],
+
+            // Interrupt request is a write-only action on hardware. Its generic IFX backing is
+            // initialized to zero and therefore reads as zero.
+            Mmio::InterruptRequest => self.ifx_regs[offset as usize],
 
             // Accelerator
-            Mmio::AccelRaw => {
-                let value = self.read_accel_raw(sys);
-                self.increment_accel_curr(AccelOverflow::RawRead);
-                value
-            }
+            Mmio::AccelFormat => self.accel.format.to_bits(),
+            Mmio::AccelRaw => match self.read_accel_raw(bus) {
+                Ok(value) => value,
+                Err(fault) => {
+                    self.pending_bus_fault.get_or_insert(fault);
+                    0
+                }
+            },
             Mmio::AccelStartAddrHigh => self.accel.aram_start.bits(16, 32) as u16,
             Mmio::AccelStartAddrLow => self.accel.aram_start.bits(0, 16) as u16,
             Mmio::AccelEndAddrHigh => self.accel.aram_end.bits(16, 32) as u16,
@@ -1047,44 +1374,58 @@ impl Interpreter {
             Mmio::AccelPredictor => self.accel.predictor.to_bits(),
             Mmio::AccelPrevSample0 => self.accel.previous_samples[0] as u16,
             Mmio::AccelPrevSample1 => self.accel.previous_samples[1] as u16,
-            Mmio::AccelSample => self.read_accel_sample(sys) as u16,
+            Mmio::AccelSample => match self.read_accel_sample(bus) {
+                Ok(value) => value as u16,
+                Err(fault) => {
+                    self.pending_bus_fault.get_or_insert(fault);
+                    0
+                }
+            },
             Mmio::AccelGain => self.accel.gain as u16,
             Mmio::AccelInput => self.accel.input as u16,
 
             // Mailboxes
             Mmio::DspMailboxHigh => {
-                if sys.dsp.dsp_mailbox.status() && self.is_waiting_for_dsp_mail() {
-                    self.early_exit = true;
+                let mailbox = bus.dsp_mailbox();
+                if mailbox.status() && self.is_waiting_for_dsp_mail() {
+                    self.pending_stop = Some(ExecStopReason::DspMailboxFull);
                 }
 
-                sys.dsp.dsp_mailbox.high_and_status()
+                mailbox.high_and_status()
             }
-            Mmio::DspMailboxLow => sys.dsp.dsp_mailbox.low(),
+            Mmio::DspMailboxLow => {
+                let mut mailbox = bus.dsp_mailbox();
+                let low = mailbox.low();
+                mailbox.set_status(false);
+                bus.set_dsp_mailbox(mailbox);
+                low
+            }
             Mmio::CpuMailboxHigh => {
-                if !sys.dsp.cpu_mailbox.status() && self.is_waiting_for_cpu_mail() {
-                    self.early_exit = true;
+                let mailbox = bus.cpu_mailbox();
+                if !mailbox.status() && self.is_waiting_for_cpu_mail() {
+                    self.pending_stop = Some(ExecStopReason::CpuMailboxEmpty);
                 }
 
-                sys.dsp.cpu_mailbox.high_and_status()
+                mailbox.high_and_status()
             }
             Mmio::CpuMailboxLow => {
-                if sys.dsp.cpu_mailbox.status() {
-                    tracing::trace!(
-                        "received from CPU mailbox: 0x{:08X}",
-                        sys.dsp.cpu_mailbox.data().value()
-                    );
-                    sys.dsp.cpu_mailbox.set_status(false);
+                let mut mailbox = bus.cpu_mailbox();
+                let low = mailbox.low();
+                if mailbox.status() {
+                    tracing::trace!("received from CPU mailbox: 0x{:08X}", mailbox.data());
                 }
-
-                sys.dsp.cpu_mailbox.low()
+                mailbox.set_status(false);
+                bus.set_cpu_mailbox(mailbox);
+                low
             }
-            _ => unimplemented!("read from {mmio:?}"),
+            _ => self.ifx_regs[offset as usize],
         }
     }
 
-    pub fn write_mmio(&mut self, sys: &mut System, offset: u8, value: u16) {
+    pub fn write_mmio(&mut self, bus: &mut dyn DspBus, offset: u8, value: u16) {
         let Some(mmio) = Mmio::from_repr(offset) else {
-            panic!("writing to unknown MMIO 0x{offset:02X}");
+            self.ifx_regs[offset as usize] = value;
+            return;
         };
 
         match mmio {
@@ -1099,113 +1440,141 @@ impl Interpreter {
             }
 
             // DMA
-            Mmio::DmaControl => sys.dsp.dsp_dma.control = DspDmaControl::from_bits(value),
-            Mmio::DmaLength => {
-                sys.dsp.dsp_dma.length = value;
-                if !self.accel.dma_masked {
-                    sys.dsp.dsp_dma.control.set_transfer_ongoing(true);
-                }
+            Mmio::DmaControl => {
+                let mut dma = bus.dsp_dma();
+                dma.control = DspDmaControl::from_bits(value);
+                bus.set_dsp_dma(dma);
             }
-            Mmio::DmaDspAddr => sys.dsp.dsp_dma.dsp_base = value,
+            Mmio::DmaLength => {
+                let mut dma = bus.dsp_dma();
+                dma.length = value;
+                if self.ifx_regs[Mmio::DmaMasked as usize] == 0 {
+                    dma.control.set_transfer_ongoing(true);
+                } else {
+                    // Hardware consumes a masked request without performing the transfer.
+                    dma.control.set_transfer_ongoing(false);
+                    dma.length = 0;
+                }
+                bus.set_dsp_dma(dma);
+            }
+            Mmio::DmaDspAddr => {
+                let mut dma = bus.dsp_dma();
+                dma.dsp_base = value;
+                bus.set_dsp_dma(dma);
+            }
             Mmio::DmaRamAddrHigh => {
-                sys.dsp.dsp_dma.ram_base = sys.dsp.dsp_dma.ram_base.with_bits(16, 32, value as u32)
+                let mut dma = bus.dsp_dma();
+                dma.ram_base = dma.ram_base.with_bits(16, 32, value as u32);
+                bus.set_dsp_dma(dma);
             }
             Mmio::DmaRamAddrLow => {
-                sys.dsp.dsp_dma.ram_base = sys.dsp.dsp_dma.ram_base.with_bits(0, 16, value as u32)
+                let mut dma = bus.dsp_dma();
+                dma.ram_base = dma.ram_base.with_bits(0, 16, value as u32);
+                bus.set_dsp_dma(dma);
+            }
+            Mmio::DmaMasked => {
+                self.ifx_regs[offset as usize] = value;
+                self.accel.dma_masked = value != 0;
             }
 
             // Interrupt
             Mmio::InterruptRequest => {
-                if value > 0 {
-                    sys.dsp.control.set_dsp_to_cpu_interrupt(true);
-                    sys.scheduler
-                        .schedule(0, lazuli::system::pi::check_interrupts);
-                } else {
-                    tracing::warn!("weird DSP interrupt request write of zero, ignoring")
+                if value & 1 != 0 {
+                    bus.request_cpu_interrupt();
+                } else if value != 0 {
+                    tracing::warn!("unknown DSP interrupt request 0x{value:04X}, ignoring")
                 }
             }
 
             // Accelerator
             Mmio::AccelFormat => self.accel.format = AccelFormat::from_bits(value),
             Mmio::AccelRaw => {
-                tracing::debug!(
-                    "accelerator writing 0x{value:04X} to ARAM 0x{:08X} (wraps at 0x{:08X})",
-                    self.accel.aram_curr,
-                    self.accel.aram_end
-                );
-
-                // TODO: this is probably wrong
-                value.write_be_bytes(
-                    sys.dsp.aram[self.accel.aram_curr.with_bit(31, false) as usize..]
-                        .as_mut_bytes(),
-                );
-
-                self.accel.aram_curr += 1;
-                if self.accel.aram_curr > self.accel.aram_end {
-                    todo!("should wrap");
+                if let Err(fault) = self.write_accel_raw(bus, value) {
+                    self.pending_bus_fault.get_or_insert(fault);
                 }
             }
             Mmio::AccelStartAddrHigh => {
                 self.accel.aram_start = self.accel.aram_start.with_bits(16, 32, value as u32)
+                    & ACCEL_START_END_ADDRESS_MASK
             }
             Mmio::AccelStartAddrLow => {
                 self.accel.aram_start = self.accel.aram_start.with_bits(0, 16, value as u32)
+                    & ACCEL_START_END_ADDRESS_MASK
             }
             Mmio::AccelEndAddrHigh => {
                 self.accel.aram_end = self.accel.aram_end.with_bits(16, 32, value as u32)
+                    & ACCEL_START_END_ADDRESS_MASK
             }
             Mmio::AccelEndAddrLow => {
                 self.accel.aram_end = self.accel.aram_end.with_bits(0, 16, value as u32)
+                    & ACCEL_START_END_ADDRESS_MASK
             }
             Mmio::AccelCurrAddrHigh => {
                 self.accel.aram_curr = self.accel.aram_curr.with_bits(16, 32, value as u32)
+                    & ACCEL_CURRENT_ADDRESS_MASK
             }
             Mmio::AccelCurrAddrLow => {
-                self.accel.aram_curr = self.accel.aram_curr.with_bits(0, 16, value as u32)
+                self.accel.aram_curr =
+                    self.accel.aram_curr.with_bits(0, 16, value as u32) & ACCEL_CURRENT_ADDRESS_MASK
             }
-            Mmio::AccelPredictor => self.accel.predictor = AccelPredictor::from_bits(value),
+            Mmio::AccelPredictor => {
+                self.accel.predictor = AccelPredictor::from_bits(value & 0x007f)
+            }
             Mmio::AccelPrevSample0 => {
                 self.accel.previous_samples[0] = value as i16;
             }
             Mmio::AccelPrevSample1 => {
                 self.accel.previous_samples[1] = value as i16;
-                self.accel.has_data = true;
+                self.accel.reads_stopped = false;
             }
+            Mmio::AccelSample => self.ifx_regs[offset as usize] = value,
             Mmio::AccelGain => self.accel.gain = value as i16,
             Mmio::AccelInput => self.accel.input = value as i16,
 
             // Mailboxes
             Mmio::DspMailboxHigh => {
-                sys.dsp.dsp_mailbox.set_high(u15::new(value));
+                let mut mailbox = bus.dsp_mailbox();
+                mailbox.set_high(value);
+                bus.set_dsp_mailbox(mailbox);
             }
             Mmio::DspMailboxLow => {
-                sys.dsp.dsp_mailbox.set_low(value);
-                sys.dsp.dsp_mailbox.set_status(true);
+                let mut mailbox = bus.dsp_mailbox();
+                mailbox.set_low(value);
+                mailbox.set_status(true);
+                bus.set_dsp_mailbox(mailbox);
             }
-            _ => unimplemented!("write to {mmio:?}"),
+            Mmio::CpuMailboxHigh => {
+                let mut mailbox = bus.cpu_mailbox();
+                mailbox.set_high(value);
+                bus.set_cpu_mailbox(mailbox);
+            }
+            Mmio::CpuMailboxLow => {
+                let mut mailbox = bus.cpu_mailbox();
+                mailbox.set_low(value);
+                mailbox.set_status(true);
+                bus.set_cpu_mailbox(mailbox);
+            }
+            _ => self.ifx_regs[offset as usize] = value,
         }
     }
 
     /// Reads from data memory.
-    pub fn read_dmem(&mut self, sys: &mut System, addr: u16) -> u16 {
-        match addr {
-            0x0000..0x1000 => self.mem.dram[addr as usize],
-            0x1000..0x1800 => self.mem.coef[addr as usize - 0x1000],
-            0xFF00.. => self.read_mmio(sys, addr as u8),
-            _ => panic!("out of range read from dmem"),
+    pub fn read_dmem(&mut self, bus: &mut dyn DspBus, addr: u16) -> u16 {
+        match addr >> 12 {
+            0x0 => self.mem.dram[addr as usize & (DRAM_LEN - 1)],
+            0x1 => self.mem.coef[addr as usize & (COEF_LEN - 1)],
+            0xf => self.read_mmio(bus, addr as u8),
+            _ => 0,
         }
     }
 
     /// Writes to data memory.
-    pub fn write_dmem(&mut self, sys: &mut System, addr: u16, value: u16) {
-        match addr {
-            0x0000..0x1000 => self.mem.dram[addr as usize] = value,
-            0x1000..0x1800 => {
-                std::hint::cold_path();
-                tracing::warn!("writing to coefficient data");
-            }
-            0xFF00.. => self.write_mmio(sys, addr as u8, value),
-            _ => panic!("out of range write to dmem"),
+    pub fn write_dmem(&mut self, bus: &mut dyn DspBus, addr: u16, value: u16) {
+        match addr >> 12 {
+            0x0 => self.mem.dram[addr as usize & (DRAM_LEN - 1)] = value,
+            0xf => self.write_mmio(bus, addr as u8, value),
+            // Coefficient ROM and all unmapped regions ignore writes.
+            _ => (),
         }
     }
 
@@ -1225,14 +1594,25 @@ impl Interpreter {
     /// Reads from instruction memory.
     #[inline(always)]
     pub fn read_imem(&mut self, addr: u16) -> u16 {
-        self.try_read_imem(addr).unwrap()
+        self.try_read_imem(addr).unwrap_or(0)
     }
 
     /// Writes to instruction memory.
     #[inline(always)]
     pub fn write_imem(&mut self, addr: u16, value: u16) {
         match addr {
-            0x0000..0x1000 => self.mem.iram[addr as usize] = value,
+            0x0000..0x1000 => {
+                self.mem.iram[addr as usize] = value;
+                self.cached[addr as usize] = None;
+
+                // A two-word instruction caches its immediate with the opcode, so changing only
+                // the second word must invalidate the instruction that starts immediately before
+                // it as well.
+                let predecessor = addr.wrapping_sub(1) as usize;
+                if self.cached[predecessor].is_some_and(|instruction| instruction.len == 2) {
+                    self.cached[predecessor] = None;
+                }
+            }
             _ => panic!("out of range write to imem"),
         }
     }
@@ -1326,15 +1706,15 @@ impl Interpreter {
             || self.is_waiting_for_dsp_mail_inner(-3)
     }
 
-    fn fetch_decode_and_cache(&mut self) -> CachedIns {
+    fn fetch_decode_and_cache(&mut self, address: u16) -> CachedIns {
         // fetch
-        let mut ins = Ins::new(self.read_imem(self.pc));
+        let mut ins = Ins::new(self.read_imem(address));
 
         // decode
         let decoded = ins.decoded();
         let extra = decoded
             .needs_extra
-            .then_some(self.read_imem(self.pc.wrapping_add(1)));
+            .then_some(self.read_imem(address.wrapping_add(1)));
 
         let len = if let Some(extra) = extra {
             ins.extra = extra;
@@ -1355,48 +1735,196 @@ impl Interpreter {
             main,
             extension,
         };
-        self.cached[self.pc as usize] = Some(cached);
+        self.cached[address as usize] = Some(cached);
 
         cached
     }
 
-    pub fn exec(&mut self, sys: &mut System, instructions: u32) {
-        self.early_exit = false;
-
-        let mut i = 0;
-        while i < instructions {
-            if self.early_exit || sys.dsp.control.halt() {
-                std::hint::cold_path();
-                break;
-            }
-
-            self.do_dma(sys);
-            self.check_loop();
-            self.check_interrupts(sys);
-
-            // have we cached this instruction already?
-            let ins = if let Some(cached) = self.cached[self.pc as usize] {
-                cached
-            } else {
-                std::hint::cold_path();
-                self.fetch_decode_and_cache()
-            };
-
-            // execute
-            if let Some(extension) = ins.extension {
-                let regs_previous = self.regs.clone();
-                (ins.main)(self, sys, ins.ins);
-                (extension)(self, sys, ins.ins, &regs_previous);
-            } else {
-                (ins.main)(self, sys, ins.ins);
-            }
-
-            self.pc = self.pc.wrapping_add(ins.len);
-            i += 1;
+    #[inline(always)]
+    fn cached_instruction_at(&mut self, address: u16) -> CachedIns {
+        if let Some(cached) = self.cached[address as usize] {
+            cached
+        } else {
+            std::hint::cold_path();
+            self.fetch_decode_and_cache(address)
         }
     }
 
-    pub fn step(&mut self, sys: &mut System) {
-        self.exec(sys, 1);
+    #[inline(always)]
+    fn skip_instruction(&mut self) {
+        let instruction = self.cached_instruction_at(self.pc);
+        self.pc = self.pc.wrapping_add(instruction.len);
+    }
+
+    pub fn exec(&mut self, bus: &mut dyn DspBus, instructions: u32) -> ExecOutcome {
+        self.pending_stop = None;
+        self.pending_bus_fault = None;
+
+        // Validate the complete physical ARAM mapping once per execution slice. All accelerator
+        // accesses below mask to this 16 MiB window, so a conforming host cannot fault midway
+        // through an instruction and the hot loop needs no rollback snapshots.
+        if let Err(fault) = validate_aram(bus) {
+            std::hint::cold_path();
+            return ExecOutcome {
+                executed_instructions: 0,
+                stop_reason: ExecStopReason::BusFault(fault),
+            };
+        }
+
+        if let Err(fault) = self.check_reset(bus) {
+            std::hint::cold_path();
+            return ExecOutcome {
+                executed_instructions: 0,
+                stop_reason: ExecStopReason::BusFault(fault),
+            };
+        }
+
+        let mut executed_instructions = 0;
+        while executed_instructions < instructions {
+            if bus.dsp_control().halted {
+                std::hint::cold_path();
+                return ExecOutcome {
+                    executed_instructions,
+                    stop_reason: ExecStopReason::Halted,
+                };
+            }
+
+            if let Err(fault) = self.do_dma(bus) {
+                std::hint::cold_path();
+                return ExecOutcome {
+                    executed_instructions,
+                    stop_reason: ExecStopReason::BusFault(fault),
+                };
+            }
+            if let Some(fault) = self.pending_bus_fault.take() {
+                std::hint::cold_path();
+                return ExecOutcome {
+                    executed_instructions,
+                    stop_reason: ExecStopReason::BusFault(fault),
+                };
+            }
+            self.check_interrupts(bus);
+
+            // Instruction handlers observe the post-fetch PC, like the hardware. This makes
+            // branch targets and return addresses natural values instead of pre-adjusted ones.
+            let ins = self.cached_instruction_at(self.pc);
+            self.pc = self.pc.wrapping_add(ins.len);
+
+            // execute
+            if let Some(extension) = ins.extension {
+                let regs_previous = ExtensionRegisters::capture(&self.regs);
+                (ins.main)(self, bus, ins.ins);
+                if let Some(fault) = self.pending_bus_fault.take() {
+                    std::hint::cold_path();
+                    return ExecOutcome {
+                        executed_instructions,
+                        stop_reason: ExecStopReason::BusFault(fault),
+                    };
+                }
+                (extension)(self, bus, ins.ins, &regs_previous);
+            } else {
+                (ins.main)(self, bus, ins.ins);
+            }
+
+            if let Some(fault) = self.pending_bus_fault.take() {
+                std::hint::cold_path();
+                return ExecOutcome {
+                    executed_instructions,
+                    stop_reason: ExecStopReason::BusFault(fault),
+                };
+            }
+
+            executed_instructions += 1;
+            self.check_loop();
+
+            // HALT retires, but hardware leaves the program counter on it.
+            if bus.dsp_control().halted {
+                std::hint::cold_path();
+                return ExecOutcome {
+                    executed_instructions,
+                    stop_reason: ExecStopReason::Halted,
+                };
+            }
+
+            if let Some(stop_reason) = self.pending_stop.take() {
+                std::hint::cold_path();
+                return ExecOutcome {
+                    executed_instructions,
+                    stop_reason,
+                };
+            }
+        }
+
+        ExecOutcome {
+            executed_instructions,
+            stop_reason: ExecStopReason::InstructionBudgetExhausted,
+        }
+    }
+
+    pub fn step(&mut self, bus: &mut dyn DspBus) -> ExecOutcome {
+        self.exec(bus, 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExtensionRegisters, Product, Registers};
+
+    #[test]
+    fn extension_snapshot_excludes_hardware_stack_storage() {
+        assert!(std::mem::size_of::<ExtensionRegisters>() * 2 < std::mem::size_of::<Registers>());
+    }
+
+    #[test]
+    fn product_resolution_preserves_the_carry_save_middle_lane() {
+        let no_carry = Product {
+            low: 0x0002,
+            mid1: 0x7FFE,
+            mid2: 0,
+            high: 0,
+        }
+        .resolve();
+        let latent_carry = Product {
+            low: 0x0002,
+            mid1: 0xFFFF,
+            mid2: 0x7FFF,
+            high: 0xFF,
+        }
+        .resolve();
+
+        assert_eq!(no_carry.value, 0x007F_FE00_02);
+        assert_eq!(latent_carry.value, no_carry.value);
+        assert!(!no_carry.mid_carry);
+        assert!(!no_carry.carry);
+        assert!(latent_carry.mid_carry);
+        assert!(latent_carry.carry);
+        assert!(!latent_carry.overflow);
+    }
+
+    #[test]
+    fn product_resolution_reports_overflow_and_the_clrp_sentinel() {
+        let overflow = Product {
+            low: 0,
+            mid1: 0xFFFF,
+            mid2: 1,
+            high: 0x7F,
+        }
+        .resolve();
+        assert_eq!(overflow.value, -(1 << 39));
+        assert!(overflow.mid_carry);
+        assert!(!overflow.carry);
+        assert!(overflow.overflow);
+
+        let cleared = Product {
+            low: 0,
+            mid1: 0xFFF0,
+            mid2: 0x0010,
+            high: 0xFF,
+        }
+        .resolve();
+        assert_eq!(cleared.value, 0);
+        assert!(cleared.mid_carry);
+        assert!(cleared.carry);
+        assert!(!cleared.overflow);
     }
 }
