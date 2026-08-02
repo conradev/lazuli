@@ -36,20 +36,20 @@ use crate::{
     GxDestinationAlphaState, GxEarlyDepthPlan, GxEfbCopyFormat, GxEfbDepthEncoding, GxEfbFormat,
     GxFogState, GxRasterCenterEvidence, GxRasterPoint28_4, GxRasterScissor, GxRasterSetup,
     GxRasterTriangle28_4, GxRasterWinding, GxSamplerState, GxTextureBaseFormat, GxTextureCopyPlan,
-    GxTextureCopyPlanError, GxTextureCopyPlane, GxXfbCopyParameters, GxZTextureFormat,
-    GxZTextureOperation, GxZTextureState, RendererFailureState, RendererHostTimings,
-    RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture, SurfacePixelOrder,
-    SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory, TextureAddressMode,
-    TextureBindingIdentity, TextureMipmapFilter, ViFieldDescriptor, ViFieldPairOutcome,
-    ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField, ViPresentationMode,
-    XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
+    GxTextureCopyPlanError, GxTextureCopyPlane, GxTextureCopyRamLayout, GxXfbCopyParameters,
+    GxZTextureFormat, GxZTextureOperation, GxZTextureState, RendererFailureState,
+    RendererHostTimings, RendererMetrics, RendererPhaseTiming, SamplerIdentity, SelectedTexture,
+    SurfacePixelOrder, SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory,
+    TextureAddressMode, TextureBindingIdentity, TextureMipmapFilter, ViFieldDescriptor,
+    ViFieldPairOutcome, ViFieldPairState, ViFieldParity, ViHostFrame, ViOwnedField,
+    ViPresentationMode, XfbCopyMetadata, XfbReadbackLayout, XfbScanoutPlan, clipped_copy_extent,
     compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
     gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state, gx_early_depth_plan,
     gx_efb_depth_encoding, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
-    gx_texture_copy_plan, gx_xfb_copy_parameters, gx_xfb_output_height, gx_z_texture_state,
-    merge_contiguous_draw_range, requested_surface_readback_layout, require_tev_texture,
-    reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture,
+    gx_texture_copy_plan, gx_texture_copy_ram_layout, gx_xfb_copy_parameters, gx_xfb_output_height,
+    gx_z_texture_state, merge_contiguous_draw_range, requested_surface_readback_layout,
+    require_tev_texture, reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture,
     xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
@@ -259,6 +259,7 @@ struct VertexOutput {
 @group(0) @binding(0) var efb_color: texture_2d<f32>;
 @group(0) @binding(1) var efb_depth: texture_depth_2d;
 @group(0) @binding(2) var<uniform> copy: EfbTextureCopyUniform;
+@group(1) @binding(0) var<storage, read_write> tiled_words: array<u32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
@@ -325,21 +326,28 @@ fn clamped_row(row: i32) -> i32 {
     return clamp(row, i32(copy.clamp_rows.x), i32(copy.clamp_rows.y));
 }
 
+fn clamped_column(column: i32) -> i32 {
+    let width = i32(textureDimensions(efb_color).x);
+    return clamp(column, 0, width - 1);
+}
+
 fn color_sample(base: vec2<u32>, row_offset: i32) -> vec4<u32> {
     if copy.options.y == 0u {
         return native_color(textureLoad(
             efb_color,
-            vec2<i32>(i32(base.x), clamped_row(i32(base.y) + row_offset)),
+            vec2<i32>(clamped_column(i32(base.x)), clamped_row(i32(base.y) + row_offset)),
             0,
         ));
     }
     let y0 = clamped_row(i32(base.y) + row_offset);
     let y1 = clamped_row(i32(base.y) + row_offset + 1);
+    let x0 = clamped_column(i32(base.x));
+    let x1 = clamped_column(i32(base.x) + 1);
     let sample = (
-        textureLoad(efb_color, vec2<i32>(i32(base.x), y0), 0)
-        + textureLoad(efb_color, vec2<i32>(i32(base.x + 1u), y0), 0)
-        + textureLoad(efb_color, vec2<i32>(i32(base.x), y1), 0)
-        + textureLoad(efb_color, vec2<i32>(i32(base.x + 1u), y1), 0)
+        textureLoad(efb_color, vec2<i32>(x0, y0), 0)
+        + textureLoad(efb_color, vec2<i32>(x1, y0), 0)
+        + textureLoad(efb_color, vec2<i32>(x0, y1), 0)
+        + textureLoad(efb_color, vec2<i32>(x1, y1), 0)
     ) * 0.25;
     return native_color(sample);
 }
@@ -347,8 +355,8 @@ fn color_sample(base: vec2<u32>, row_offset: i32) -> vec4<u32> {
 fn depth_sample(base: vec2<u32>, row_offset: i32) -> vec4<u32> {
     let center_offset = select(0u, 1u, copy.options.y != 0u);
     let coord = vec2<i32>(
-        i32(base.x + center_offset),
-        clamped_row(i32(base.y + center_offset) + row_offset),
+        clamped_column(i32(base.x) + i32(center_offset)),
+        clamped_row(i32(base.y) + i32(center_offset) + row_offset),
     );
     let depth = u32(clamp(textureLoad(efb_depth, coord, 0), 0.0, 1.0) * 16777215.0);
     return vec4<u32>((depth >> 16u) & 255u, (depth >> 8u) & 255u, depth & 255u, 255u);
@@ -442,6 +450,148 @@ fn target_texel(texel: vec4<u32>) -> vec4<u32> {
     }
 }
 
+fn tiled_block_width(format: u32) -> u32 {
+    if format == 0u || format == 1u || format == 2u
+        || format == 7u || format == 8u || format == 9u || format == 10u {
+        return 8u;
+    }
+    return 4u;
+}
+
+fn tiled_block_height(format: u32) -> u32 {
+    return select(4u, 8u, format == 0u);
+}
+
+fn tiled_block_bytes(format: u32) -> u32 {
+    return select(32u, 64u, format == 6u);
+}
+
+fn tiled_source(block_index: u32, local_x: u32, local_y: u32) -> vec4<u32> {
+    let format = copy.output_and_format.z;
+    let block_width = tiled_block_width(format);
+    let block_height = tiled_block_height(format);
+    let blocks_wide = (copy.output_and_format.x + block_width - 1u) / block_width;
+    let block_x = block_index % blocks_wide;
+    let block_y = block_index / blocks_wide;
+    let output = vec2<u32>(
+        block_x * block_width + local_x,
+        block_y * block_height + local_y,
+    );
+    let scale = select(1u, 2u, copy.options.y != 0u);
+    let source = copy.source_rect.xy + output * scale;
+    return filtered_sample(source);
+}
+
+// Produce one architected byte from the GX block-tiled destination. Padded
+// texels deliberately sample the original physical EFB instead of a logical
+// output-sized intermediate, matching the hardware tile encoder at right and
+// bottom partial blocks.
+fn tiled_byte(byte_index: u32) -> u32 {
+    let format = copy.output_and_format.z;
+    let block_bytes = tiled_block_bytes(format);
+    let block_index = byte_index / block_bytes;
+    let local_byte = byte_index % block_bytes;
+
+    switch format {
+        case 0u: {
+            let local_y = local_byte / 4u;
+            let local_x = (local_byte % 4u) * 2u;
+            let high = tiled_source(block_index, local_x, local_y).r & 0xf0u;
+            let low = tiled_source(block_index, local_x + 1u, local_y).r >> 4u;
+            return high | low;
+        }
+        case 1u: {
+            let texel = tiled_source(block_index, local_byte % 8u, local_byte / 8u);
+            return texel.r;
+        }
+        case 2u: {
+            let texel = tiled_source(block_index, local_byte % 8u, local_byte / 8u);
+            return (texel.a & 0xf0u) | (texel.r >> 4u);
+        }
+        case 3u: {
+            let pixel = local_byte / 2u;
+            let texel = tiled_source(block_index, pixel % 4u, pixel / 4u);
+            return select(texel.a, texel.r, (local_byte & 1u) != 0u);
+        }
+        case 4u: {
+            let pixel = local_byte / 2u;
+            let texel = tiled_source(block_index, pixel % 4u, pixel / 4u);
+            let packed = ((texel.r >> 3u) << 11u)
+                | ((texel.g >> 2u) << 5u)
+                | (texel.b >> 3u);
+            return select(packed >> 8u, packed & 255u, (local_byte & 1u) != 0u);
+        }
+        case 5u: {
+            let pixel = local_byte / 2u;
+            let texel = tiled_source(block_index, pixel % 4u, pixel / 4u);
+            var packed: u32;
+            if (texel.a & 0xe0u) == 0xe0u {
+                packed = 0x8000u
+                    | ((texel.r >> 3u) << 10u)
+                    | ((texel.g >> 3u) << 5u)
+                    | (texel.b >> 3u);
+            } else {
+                packed = ((texel.a >> 5u) << 12u)
+                    | ((texel.r >> 4u) << 8u)
+                    | ((texel.g >> 4u) << 4u)
+                    | (texel.b >> 4u);
+            }
+            return select(packed >> 8u, packed & 255u, (local_byte & 1u) != 0u);
+        }
+        case 6u: {
+            let plane_byte = local_byte % 32u;
+            let pixel = plane_byte / 2u;
+            let texel = tiled_source(block_index, pixel % 4u, pixel / 4u);
+            if local_byte < 32u {
+                return select(texel.a, texel.r, (plane_byte & 1u) != 0u);
+            }
+            return select(texel.g, texel.b, (plane_byte & 1u) != 0u);
+        }
+        case 7u: {
+            let texel = tiled_source(block_index, local_byte % 8u, local_byte / 8u);
+            return texel.a;
+        }
+        case 8u: {
+            let texel = tiled_source(block_index, local_byte % 8u, local_byte / 8u);
+            return texel.r;
+        }
+        case 9u: {
+            let texel = tiled_source(block_index, local_byte % 8u, local_byte / 8u);
+            return texel.g;
+        }
+        case 10u: {
+            let texel = tiled_source(block_index, local_byte % 8u, local_byte / 8u);
+            return texel.b;
+        }
+        case 11u: {
+            let pixel = local_byte / 2u;
+            let texel = tiled_source(block_index, pixel % 4u, pixel / 4u);
+            return select(texel.g, texel.r, (local_byte & 1u) != 0u);
+        }
+        case 12u: {
+            let pixel = local_byte / 2u;
+            let texel = tiled_source(block_index, pixel % 4u, pixel / 4u);
+            return select(texel.b, texel.g, (local_byte & 1u) != 0u);
+        }
+        default: {
+            return 0u;
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn cs_tiled_ram(@builtin(global_invocation_id) invocation: vec3<u32>) {
+    let word_index = invocation.x;
+    if word_index >= arrayLength(&tiled_words) {
+        return;
+    }
+    let byte_index = word_index * 4u;
+    tiled_words[word_index] = tiled_byte(byte_index)
+        | (tiled_byte(byte_index + 1u) << 8u)
+        | (tiled_byte(byte_index + 2u) << 16u)
+        | (tiled_byte(byte_index + 3u) << 24u);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let output = vec2<u32>(input.position.xy);
@@ -487,6 +637,7 @@ const DECODED_TEXTURE_CACHE_CAPACITY: usize = 128;
 const COPY_CLEAR_BINDING_CACHE_CAPACITY: usize = 64;
 const XFB_PRESENT_BIND_GROUP_CACHE_CAPACITY: usize = 32;
 const XFB_SURFACES_PER_DESTINATION: usize = 4;
+const EFB_TEXTURE_COPY_RAM_WORKGROUP_SIZE: u64 = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -973,9 +1124,35 @@ const fn texture_copy_source_format_code(format: GxEfbFormat) -> u32 {
     }
 }
 
+const fn texture_base_format_code(format: GxTextureBaseFormat) -> u32 {
+    match format {
+        GxTextureBaseFormat::I4 => 0,
+        GxTextureBaseFormat::I8 => 1,
+        GxTextureBaseFormat::Ia4 => 2,
+        GxTextureBaseFormat::Ia8 => 3,
+        GxTextureBaseFormat::Rgb565 => 4,
+        GxTextureBaseFormat::Rgb5a3 => 5,
+        GxTextureBaseFormat::Rgba8 => 6,
+    }
+}
+
 struct EfbTextureCopyResources {
     layout: wgpu::BindGroupLayout,
+    tiled_output_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
+    tiled_pipeline: wgpu::ComputePipeline,
+}
+
+struct PendingEfbTextureCopyReadback {
+    buffer: wgpu::Buffer,
+    destination: u32,
+    generation: u32,
+    width: u32,
+    height: u32,
+    copy_format: GxEfbCopyFormat,
+    base_format: GxTextureBaseFormat,
+    stride: u32,
+    layout: GxTextureCopyRamLayout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1352,6 +1529,7 @@ pub struct WebGpuRenderer {
     white_texture: CachedTexture,
     texture_cache: HashMap<String, CachedTexture>,
     efb_copy_cache: HashMap<u32, CachedTexture>,
+    pending_efb_texture_copy_readbacks: Vec<PendingEfbTextureCopyReadback>,
     xfb_cache: HashMap<u32, CachedXfb>,
     vi_field_pairs: ViFieldPairState<CachedXfbSurface>,
     last_presented_xfb: Option<PresentedXfb>,
@@ -2141,6 +2319,82 @@ async fn finish_presented_xfb_field_readback(
     Ok(pixels)
 }
 
+fn fail_efb_texture_copy_readback(failure_state: &RendererFailureState, detail: String) -> JsValue {
+    failure_state.record(detail.clone());
+    JsValue::from_str(&detail)
+}
+
+async fn finish_efb_texture_copy_readbacks(
+    pending: Vec<PendingEfbTextureCopyReadback>,
+    failure_state: &RendererFailureState,
+) -> Result<Array, JsValue> {
+    let receipts = Array::new();
+    for pending in pending {
+        ensure_renderer_healthy(failure_state)?;
+        let expected_len = usize::try_from(pending.layout.dense_bytes).map_err(|_| {
+            fail_efb_texture_copy_readback(
+                failure_state,
+                "WebGPU tiled EFB-copy RAM byte length exceeds wasm memory".to_owned(),
+            )
+        })?;
+        BufferMap::new(&pending.buffer).await.map_err(|error| {
+            fail_efb_texture_copy_readback(
+                failure_state,
+                format!("WebGPU tiled EFB-copy RAM map failed: {error}"),
+            )
+        })?;
+        let bytes = {
+            let mapped = pending.buffer.slice(..).get_mapped_range();
+            if mapped.len() != expected_len {
+                let actual_len = mapped.len();
+                drop(mapped);
+                pending.buffer.unmap();
+                return Err(fail_efb_texture_copy_readback(
+                    failure_state,
+                    format!(
+                        "WebGPU tiled EFB-copy RAM map returned {actual_len} bytes, expected {expected_len}"
+                    ),
+                ));
+            }
+            let bytes = mapped.to_vec();
+            drop(mapped);
+            pending.buffer.unmap();
+            bytes
+        };
+        let receipt = Object::new();
+        for (name, value) in [
+            ("destination", pending.destination),
+            ("generation", pending.generation),
+            ("width", pending.width),
+            ("height", pending.height),
+            ("copyFormat", texture_copy_format_code(pending.copy_format)),
+            ("baseFormat", texture_base_format_code(pending.base_format)),
+            ("stride", pending.stride),
+            ("rowBytes", pending.layout.row_bytes),
+            ("rowCount", pending.layout.block_rows),
+        ] {
+            Reflect::set(
+                &receipt,
+                &JsValue::from_str(name),
+                &JsValue::from_f64(f64::from(value)),
+            )?;
+        }
+        Reflect::set(
+            &receipt,
+            &JsValue::from_str("layout"),
+            &JsValue::from_str("gx-efb-copy-tiled-bytes-v1"),
+        )?;
+        Reflect::set(
+            &receipt,
+            &JsValue::from_str("bytes"),
+            &Uint8Array::from(bytes.as_slice()),
+        )?;
+        receipts.push(&receipt);
+    }
+    ensure_renderer_healthy(failure_state)?;
+    Ok(receipts)
+}
+
 fn interleave_presented_xfb_fields(
     top: &[u8],
     bottom: &[u8],
@@ -2200,6 +2454,7 @@ impl WebGpuRenderer {
         self.clear_segment();
         self.texture_cache.clear();
         self.efb_copy_cache.clear();
+        self.pending_efb_texture_copy_readbacks.clear();
         self.xfb_cache.clear();
         self.reset_efb_inner()
     }
@@ -2447,7 +2702,7 @@ impl WebGpuRenderer {
         )
     }
 
-    pub fn drain(&self) -> Promise {
+    pub fn drain(&mut self) -> Promise {
         self.record_wasm_bridge_call(0);
         if let Err(error) = self.ensure_healthy() {
             return Promise::reject(&error);
@@ -2457,11 +2712,13 @@ impl WebGpuRenderer {
         });
         let queue = self.queue.clone();
         let failure_state = self.failure_state.clone();
+        let pending = std::mem::take(&mut self.pending_efb_texture_copy_readbacks);
         future_to_promise(async move {
             ensure_renderer_healthy(&failure_state)?;
             QueueDrain::new(&queue).await;
             ensure_renderer_healthy(&failure_state)?;
-            Ok(JsValue::UNDEFINED)
+            let receipts = finish_efb_texture_copy_readbacks(pending, &failure_state).await?;
+            Ok(receipts.into())
         })
     }
 
@@ -2740,11 +2997,21 @@ impl WebGpuRenderer {
         } else {
             None
         };
-        if header.texture_copy_layout_v1 {
+        let texture_copy_ram_layout = if header.texture_copy_layout_v1 {
             let plan = texture_copy_plan.expect("validated texture-copy layout overlaps the EFB");
             debug_assert_eq!(header.output_width, plan.output_width);
             debug_assert_eq!(header.output_height, plan.output_height);
-        }
+            Some(
+                gx_texture_copy_ram_layout(
+                    plan.base_texture_format,
+                    plan.output_width,
+                    plan.output_height,
+                )
+                .ok_or_else(|| JsValue::from_str("GX EFB texture-copy RAM layout overflow"))?,
+            )
+        } else {
+            None
+        };
         self.record_wasm_bridge_call(
             packet_bytes
                 .len()
@@ -2951,6 +3218,7 @@ impl WebGpuRenderer {
                     header.copy_state,
                     header.clear,
                     texture_copy_plan,
+                    texture_copy_ram_layout.map(|layout| (header.stride, layout)),
                     &pre_clears,
                 ),
                 GxCopyKind::Xfb => self.copy_xfb_inner(
@@ -3687,6 +3955,7 @@ impl WebGpuRenderer {
             copy_state,
             clear,
             plan,
+            None,
             &[],
         )
     }
@@ -3703,6 +3972,7 @@ impl WebGpuRenderer {
         copy_state: GxCopyState,
         clear: bool,
         plan: Option<GxTextureCopyPlan>,
+        ram_materialization: Option<(u32, GxTextureCopyRamLayout)>,
         pre_clears: &[GxPreClear],
     ) -> Result<(), JsValue> {
         let clipped = clipped_copy_extent(source_x, source_y, width, height);
@@ -3712,6 +3982,20 @@ impl WebGpuRenderer {
             return Err(JsValue::from_str(
                 "GX EFB texture-copy plan changed after preflight",
             ));
+        }
+        if let Some((_, expected_layout)) = ram_materialization {
+            let checked_layout = checked_plan.and_then(|plan| {
+                gx_texture_copy_ram_layout(
+                    plan.base_texture_format,
+                    plan.output_width,
+                    plan.output_height,
+                )
+            });
+            if checked_layout != Some(expected_layout) {
+                return Err(JsValue::from_str(
+                    "GX EFB texture-copy RAM layout changed after preflight",
+                ));
+            }
         }
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
@@ -3794,6 +4078,63 @@ impl WebGpuRenderer {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        let pending_ram_readback = if let Some((stride, layout)) = ram_materialization {
+            let storage = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("browser GX tiled EFB-copy RAM storage"),
+                size: layout.dense_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("browser GX tiled EFB-copy RAM readback"),
+                size: layout.dense_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let tiled_output_bind_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("browser GX tiled EFB-copy RAM output bind group"),
+                    layout: &self.efb_texture_copy.tiled_output_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: storage.as_entire_binding(),
+                    }],
+                });
+            let workgroups = u32::try_from(
+                layout
+                    .word_count
+                    .div_ceil(EFB_TEXTURE_COPY_RAM_WORKGROUP_SIZE),
+            )
+            .map_err(|_| JsValue::from_str("GX EFB texture-copy dispatch exceeds WebGPU"))?;
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("browser GX tiled EFB-copy RAM materialization pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.efb_texture_copy.tiled_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_bind_group(1, &tiled_output_bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&storage, 0, &readback, 0, layout.dense_bytes);
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.buffers_created = metrics.buffers_created.saturating_add(2);
+                metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
+            });
+            Some(PendingEfbTextureCopyReadback {
+                buffer: readback,
+                destination,
+                generation,
+                width: plan.output_width,
+                height: plan.output_height,
+                copy_format: plan.copy_format,
+                base_format: plan.base_texture_format,
+                stride,
+                layout,
+            })
+        } else {
+            None
+        };
         if clear {
             update_renderer_metrics(&self.metrics, |metrics| {
                 metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
@@ -3813,6 +4154,9 @@ impl WebGpuRenderer {
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
+        if let Some(pending) = pending_ram_readback {
+            self.pending_efb_texture_copy_readbacks.push(pending);
+        }
         self.efb_copy_cache.insert(
             destination,
             CachedTexture {
@@ -4768,6 +5112,7 @@ impl WebGpuRenderer {
             white_texture,
             texture_cache: HashMap::new(),
             efb_copy_cache: HashMap::new(),
+            pending_efb_texture_copy_readbacks: Vec::new(),
             xfb_cache: HashMap::new(),
             vi_field_pairs: ViFieldPairState::default(),
             last_presented_xfb: None,
@@ -6843,7 +7188,7 @@ fn create_efb_texture_copy_resources(device: &wgpu::Device) -> EfbTextureCopyRes
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2,
@@ -6853,7 +7198,7 @@ fn create_efb_texture_copy_resources(device: &wgpu::Device) -> EfbTextureCopyRes
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Depth,
                     view_dimension: wgpu::TextureViewDimension::D2,
@@ -6863,7 +7208,7 @@ fn create_efb_texture_copy_resources(device: &wgpu::Device) -> EfbTextureCopyRes
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -6872,6 +7217,19 @@ fn create_efb_texture_copy_resources(device: &wgpu::Device) -> EfbTextureCopyRes
                 count: None,
             },
         ],
+    });
+    let tiled_output_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("browser GX tiled EFB-copy RAM output layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("browser GX EFB-to-texture copy shader"),
@@ -6910,7 +7268,28 @@ fn create_efb_texture_copy_resources(device: &wgpu::Device) -> EfbTextureCopyRes
         multiview_mask: None,
         cache: None,
     });
-    EfbTextureCopyResources { layout, pipeline }
+    let tiled_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("browser GX tiled EFB-copy RAM pipeline layout"),
+        bind_group_layouts: &[Some(&layout), Some(&tiled_output_layout)],
+        immediate_size: 0,
+    });
+    let tiled_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("browser GX tiled EFB-copy RAM pipeline"),
+        layout: Some(&tiled_pipeline_layout),
+        module: &shader,
+        entry_point: Some("cs_tiled_ram"),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants: &[],
+            zero_initialize_workgroup_memory: false,
+        },
+        cache: None,
+    });
+    EfbTextureCopyResources {
+        layout,
+        tiled_output_layout,
+        pipeline,
+        tiled_pipeline,
+    }
 }
 
 fn create_xfb_copy_resources(
@@ -7285,16 +7664,17 @@ mod tests {
         managed_vertices_with_sidecar_record_base, merge_contiguous_draw_range,
         prepare_managed_coverage_vertices, rgba8_mip_uploads,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
-        texture_copy_plan_for_source,
+        texture_base_format_code, texture_copy_format_code, texture_copy_plan_for_source,
     };
     use crate::clip::{GxClipError, GxExactGeometryError};
     use crate::packet::{GxCopyState, GxTriangleAction};
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS, managed_tex_coord_sidecar_fits};
     use crate::{
         ExactRequiredPreparationRejectionReason, GX_DEPTH24_MAX, GxBlendFactor, GxDepthCompression,
-        GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState, GxRasterCenterEvidence, GxSamplerState,
-        GxZTextureOperation, SamplerIdentity, TextureBindingIdentity, gx_destination_alpha_state,
-        gx_sampler_state, gx_z_texture_state,
+        GxEarlyDepthPlan, GxEfbCopyFormat, GxEfbDepthEncoding, GxFogState, GxRasterCenterEvidence,
+        GxSamplerState, GxTextureBaseFormat, GxZTextureOperation, SamplerIdentity,
+        TextureBindingIdentity, gx_destination_alpha_state, gx_sampler_state,
+        gx_texture_copy_ram_word_reference, gx_z_texture_state,
     };
 
     fn encoded_blend_mode(
@@ -7369,9 +7749,289 @@ mod tests {
         assert!(EFB_TEXTURE_COPY_SHADER.contains("@binding(1) var efb_depth: texture_depth_2d"));
         assert!(EFB_TEXTURE_COPY_SHADER.contains("fn filtered_sample(base: vec2<u32>)"));
         assert!(EFB_TEXTURE_COPY_SHADER.contains("target_texel(filtered_sample(source))"));
+        assert!(
+            EFB_TEXTURE_COPY_SHADER
+                .contains("@group(1) @binding(0) var<storage, read_write> tiled_words: array<u32>")
+        );
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("@compute @workgroup_size(64)"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("fn cs_tiled_ram("));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("arrayLength(&tiled_words)"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("fn clamped_column(column: i32)"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("textureDimensions(efb_color).x"));
         assert!(EFB_TEXTURE_COPY_SHADER.contains("i32(base.y) + row_offset"));
-        assert!(EFB_TEXTURE_COPY_SHADER.contains("i32(base.y + center_offset) + row_offset"),);
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("i32(base.y) + i32(center_offset) + row_offset"),);
         assert!(!EFB_TEXTURE_COPY_SHADER.contains("row_offset * i32(scale)"));
+
+        let tiled_encoder = EFB_TEXTURE_COPY_SHADER
+            .split_once("fn tiled_byte(byte_index: u32)")
+            .unwrap()
+            .1
+            .split_once("@compute @workgroup_size(64)")
+            .unwrap()
+            .0;
+        for format in 0..=12 {
+            assert!(
+                tiled_encoder.contains(&format!("case {format}u:")),
+                "missing tiled encoder mode {format}"
+            );
+        }
+        assert!(tiled_encoder.contains("return high | low"));
+        assert!(tiled_encoder.contains("(texel.a & 0xf0u) | (texel.r >> 4u)"));
+        assert!(tiled_encoder.contains("select(texel.a, texel.r"));
+        assert!(tiled_encoder.contains("select(texel.g, texel.r"));
+        assert!(tiled_encoder.contains("select(texel.b, texel.g"));
+        assert!(tiled_encoder.contains("packed >> 8u"));
+        assert!(tiled_encoder.contains("if local_byte < 32u"));
+        assert!(tiled_encoder.contains("select(texel.g, texel.b"));
+    }
+
+    #[test]
+    fn texture_copy_receipt_format_codes_match_the_browser_contract() {
+        for (format, code) in [
+            (GxEfbCopyFormat::R4, 0),
+            (GxEfbCopyFormat::R8_0x1, 1),
+            (GxEfbCopyFormat::Ra4, 2),
+            (GxEfbCopyFormat::Ra8, 3),
+            (GxEfbCopyFormat::Rgb565, 4),
+            (GxEfbCopyFormat::Rgb5a3, 5),
+            (GxEfbCopyFormat::Rgba8, 6),
+            (GxEfbCopyFormat::A8, 7),
+            (GxEfbCopyFormat::R8, 8),
+            (GxEfbCopyFormat::G8, 9),
+            (GxEfbCopyFormat::B8, 10),
+            (GxEfbCopyFormat::Rg8, 11),
+            (GxEfbCopyFormat::Gb8, 12),
+        ] {
+            assert_eq!(texture_copy_format_code(format), code);
+        }
+        for (format, code) in [
+            (GxTextureBaseFormat::I4, 0),
+            (GxTextureBaseFormat::I8, 1),
+            (GxTextureBaseFormat::Ia4, 2),
+            (GxTextureBaseFormat::Ia8, 3),
+            (GxTextureBaseFormat::Rgb565, 4),
+            (GxTextureBaseFormat::Rgb5a3, 5),
+            (GxTextureBaseFormat::Rgba8, 6),
+        ] {
+            assert_eq!(texture_base_format_code(format), code);
+        }
+    }
+
+    #[test]
+    fn tiled_ram_wgsl_modes_match_the_cpu_reference_goldens() {
+        let tiled_encoder = EFB_TEXTURE_COPY_SHADER
+            .split_once("fn tiled_byte(byte_index: u32)")
+            .unwrap()
+            .1
+            .split_once("@compute @workgroup_size(64)")
+            .unwrap()
+            .0;
+        let rgba = [0x12, 0x34, 0x56, 0x78];
+        let cases: [(GxEfbCopyFormat, u32, [u8; 4], &[&str]); 13] = [
+            (
+                GxEfbCopyFormat::R4,
+                0,
+                [0x11; 4],
+                &["local_byte / 4u", "(local_byte % 4u) * 2u", "high | low"],
+            ),
+            (
+                GxEfbCopyFormat::R8_0x1,
+                1,
+                [0x12; 4],
+                &["local_byte % 8u", "return texel.r"],
+            ),
+            (
+                GxEfbCopyFormat::Ra4,
+                2,
+                [0x71; 4],
+                &["(texel.a & 0xf0u) | (texel.r >> 4u)"],
+            ),
+            (
+                GxEfbCopyFormat::Ra8,
+                3,
+                [0x78, 0x12, 0x78, 0x12],
+                &["pixel = local_byte / 2u", "select(texel.a, texel.r"],
+            ),
+            (
+                GxEfbCopyFormat::Rgb565,
+                4,
+                [0x11, 0xaa, 0x11, 0xaa],
+                &["(texel.r >> 3u) << 11u", "(texel.g >> 2u) << 5u"],
+            ),
+            (
+                GxEfbCopyFormat::Rgb5a3,
+                5,
+                [0x31, 0x35, 0x31, 0x35],
+                &[
+                    "(texel.a & 0xe0u) == 0xe0u",
+                    "0x8000u",
+                    "(texel.a >> 5u) << 12u",
+                ],
+            ),
+            (
+                GxEfbCopyFormat::Rgba8,
+                6,
+                [0x78, 0x12, 0x78, 0x12],
+                &[
+                    "plane_byte = local_byte % 32u",
+                    "select(texel.a, texel.r",
+                    "select(texel.g, texel.b",
+                ],
+            ),
+            (GxEfbCopyFormat::A8, 7, [0x78; 4], &["return texel.a"]),
+            (GxEfbCopyFormat::R8, 8, [0x12; 4], &["return texel.r"]),
+            (GxEfbCopyFormat::G8, 9, [0x34; 4], &["return texel.g"]),
+            (GxEfbCopyFormat::B8, 10, [0x56; 4], &["return texel.b"]),
+            (
+                GxEfbCopyFormat::Rg8,
+                11,
+                [0x34, 0x12, 0x34, 0x12],
+                &["select(texel.g, texel.r"],
+            ),
+            (
+                GxEfbCopyFormat::Gb8,
+                12,
+                [0x56, 0x34, 0x56, 0x34],
+                &["select(texel.b, texel.g"],
+            ),
+        ];
+        for (format, code, expected, fragments) in cases {
+            assert_eq!(
+                gx_texture_copy_ram_word_reference(format, 0, 0, false, |_, _| rgba),
+                Some(expected),
+                "CPU golden for {format:?}"
+            );
+            let marker = format!("case {code}u:");
+            let body = tiled_encoder.split_once(&marker).unwrap().1;
+            let end = if code < 12 {
+                body.find(&format!("case {}u:", code + 1)).unwrap()
+            } else {
+                body.find("default:").unwrap()
+            };
+            let body = &body[..end];
+            for fragment in fragments {
+                assert!(
+                    body.contains(fragment),
+                    "WGSL mode {code} ({format:?}) is missing {fragment:?}"
+                );
+            }
+        }
+
+        let source_addressing = EFB_TEXTURE_COPY_SHADER
+            .split_once("fn tiled_source(")
+            .unwrap()
+            .1
+            .split_once("fn tiled_byte(")
+            .unwrap()
+            .0;
+        for fragment in [
+            "block_x = block_index % blocks_wide",
+            "block_y = block_index / blocks_wide",
+            "block_x * block_width + local_x",
+            "block_y * block_height + local_y",
+            "copy.source_rect.xy + output * scale",
+        ] {
+            assert!(source_addressing.contains(fragment));
+        }
+        assert!(!source_addressing.contains("min(output"));
+
+        let compute = EFB_TEXTURE_COPY_SHADER
+            .split_once("fn cs_tiled_ram(")
+            .unwrap()
+            .1
+            .split_once("@fragment")
+            .unwrap()
+            .0;
+        for fragment in [
+            "tiled_byte(byte_index)",
+            "tiled_byte(byte_index + 1u) << 8u",
+            "tiled_byte(byte_index + 2u) << 16u",
+            "tiled_byte(byte_index + 3u) << 24u",
+        ] {
+            assert!(compute.contains(fragment));
+        }
+    }
+
+    #[test]
+    fn tiled_ram_copy_is_encoded_before_the_terminal_clear_and_only_for_v1_packets() {
+        let source = include_str!("web.rs");
+        let copy_inner = source
+            .split_once("fn copy_texture_inner(")
+            .unwrap()
+            .1
+            .split_once("pub fn copy_xfb(")
+            .unwrap()
+            .0;
+        let semantic = copy_inner
+            .find("browser GX EFB-to-texture materialization pass")
+            .unwrap();
+        let tiled = copy_inner
+            .find("browser GX tiled EFB-copy RAM materialization pass")
+            .unwrap();
+        let readback = copy_inner.find("encoder.copy_buffer_to_buffer(").unwrap();
+        let terminal_clear = copy_inner.find("if clear {").unwrap();
+        assert!(semantic < tiled && tiled < readback && readback < terminal_clear);
+        assert!(copy_inner.contains("if let Some((stride, layout)) = ram_materialization"));
+        assert!(copy_inner.contains("pending_efb_texture_copy_readbacks.push(pending)"));
+
+        let legacy = source
+            .split_once("pub fn copy_texture(")
+            .unwrap()
+            .1
+            .split_once("fn copy_texture_inner(")
+            .unwrap()
+            .0;
+        assert!(legacy.contains("plan,\n            None,"));
+
+        let packet = source
+            .split_once("pub fn submit_gx_frame(")
+            .unwrap()
+            .1
+            .split_once("fn push_tev_draw_inner(")
+            .unwrap()
+            .0;
+        assert!(packet.contains("header.texture_copy_layout_v1"));
+        assert!(packet.contains("texture_copy_ram_layout.map(|layout| (header.stride, layout))"));
+    }
+
+    #[test]
+    fn drain_receipts_have_the_versioned_owned_byte_schema() {
+        let source = include_str!("web.rs");
+        let finish = source
+            .split_once("async fn finish_efb_texture_copy_readbacks(")
+            .unwrap()
+            .1
+            .split_once("fn interleave_presented_xfb_fields(")
+            .unwrap()
+            .0;
+        for field in [
+            "destination",
+            "generation",
+            "width",
+            "height",
+            "copyFormat",
+            "baseFormat",
+            "stride",
+            "rowBytes",
+            "rowCount",
+            "layout",
+            "bytes",
+        ] {
+            assert!(finish.contains(&format!("\"{field}\"")), "missing {field}");
+        }
+        assert!(finish.contains("gx-efb-copy-tiled-bytes-v1"));
+        assert!(finish.contains("Uint8Array::from(bytes.as_slice())"));
+
+        let drain = source
+            .split_once("pub fn drain(&mut self) -> Promise")
+            .unwrap()
+            .1
+            .split_once("pub fn has_presented_xfb")
+            .unwrap()
+            .0;
+        assert!(drain.contains("std::mem::take(&mut self.pending_efb_texture_copy_readbacks)"));
+        assert!(drain.contains("QueueDrain::new(&queue).await"));
+        assert!(drain.contains("finish_efb_texture_copy_readbacks(pending, &failure_state).await"));
     }
 
     #[test]

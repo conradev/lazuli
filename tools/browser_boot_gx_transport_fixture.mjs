@@ -194,6 +194,7 @@ export function makeContext({
     gxDecodePreDecodeHighWaterBytes: 0,
     gxDecodeRetryAtBufferedBytes: 1,
     gxDecodedCommands: 0,
+    gxDeferredDisplayListSegments: [],
     gxDisplayListBytes: 0,
     gxDisplayListErrors: 0,
     gxDisplayLists: 0,
@@ -212,6 +213,8 @@ export function makeContext({
     gxIndexedXfLoads: 0,
     gxPreflightCalls: 0,
     gxPrimitives: 0,
+    gxTextureCopyDecoderBarrierResumes: 0,
+    gxTextureCopyDecoderBarrierStops: 0,
     gxUnknownOpcodes: 0,
     gxVertices: 0,
     gxXfLoads: 0,
@@ -238,6 +241,7 @@ export function makeContext({
     piFifoState: { base: 0, end: 0, current: 0, wrap: false },
     piFifoWrap: 0x20000000,
     recordWorkerPhaseTiming() {},
+    rendererTextureCopyBarrierSequence: null,
     raiseException(registers, vector) {
       raisedExceptions.push({ registers, vector });
       const msr = context.view.getUint32(registers + context.msrOffset, true);

@@ -33,6 +33,18 @@ function extractFunction(name) {
   assert.fail(`unterminated ${name}`);
 }
 
+function rendererFrameRuntime(...additionalFunctions) {
+  return [
+    "appendRendererOperation",
+    "enqueueRendererOperation",
+    "requireTextureCopyReceiptArray",
+    "requireNoTextureCopyReceipts",
+    "prepareTextureCopyReceiptTransfer",
+    "handleRendererFrame",
+    ...additionalFunctions,
+  ].map(extractFunction).join("\n\n");
+}
+
 function workerHarness({ transferMessages = false } = {}) {
   const messages = [];
   const reports = [];
@@ -52,6 +64,7 @@ function workerHarness({ transferMessages = false } = {}) {
     rendererFrameResultMisses: 0,
     rendererFramesAcknowledged: 0,
     rendererFramesInFlight: new Set(),
+    rendererTextureCopyExpectations: new Map(),
     rendererViFrames: new Map(),
     rendererResidentTextureKeys: new Set(),
     gxSkippedCopyClears: [],
@@ -72,6 +85,16 @@ function workerHarness({ transferMessages = false } = {}) {
     // Packet-layout semantics are covered by browser_boot_gx_packet.test.mjs;
     // this harness isolates acknowledgement and transfer ordering.
     gxAttachTextureCopyLayoutV1(packet) { return packet; },
+    gxTextureCopyReceiptExpectation() { return null; },
+    gxPreflightTextureCopyReceipts(receipts, expectation) {
+      if (!Array.isArray(receipts) || receipts.length !== 0 || expectation !== null) {
+        throw new TypeError("invalid isolated texture-copy receipt state");
+      }
+      return null;
+    },
+    gxApplyTextureCopyReceipt(plan) {
+      if (plan !== null) throw new TypeError("unexpected texture-copy plan");
+    },
     hex32(value) { return `0x${value.toString(16).padStart(8, "0")}`; },
     finish(status, details) { reports.push({ status, details }); },
     postMessage(message, transfer = []) {
@@ -98,6 +121,7 @@ function workerHarness({ transferMessages = false } = {}) {
       "gxDrainSkippedCopyClears",
       "postGxFrame",
       "recordRendererFailure",
+      "gxRetireRendererFrame",
       "completeRendererFrame",
       "honorRendererBackpressure",
       "finishAfterRendererDrain",
@@ -228,6 +252,7 @@ test("packed renderer copies transfer one exact frame without dropping work", ()
     type: "renderer-frame-complete",
     rendererSequence: 1,
     residentTextureKeys: ["alpha"],
+    textureCopyReceipts: [],
   });
 
   assert.equal(context.rendererFramesInFlight.size, 0);
@@ -449,6 +474,7 @@ test("terminal reports wait for an in-flight renderer frame even while stopping"
   context.completeRendererFrame({
     type: "renderer-frame-complete",
     rendererSequence: 1,
+    textureCopyReceipts: [],
   });
   await terminal;
 
@@ -662,13 +688,9 @@ test("main thread acknowledges a frame only after the WebGPU drain resolves", as
     worker: { postMessage(message) { messages.push(message); } },
   };
   vm.createContext(context);
-  vm.runInContext(
-    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
-      .map(extractFunction)
-      .join("\n\n"),
-    context,
-    { filename: "browser_boot.renderer-sync.main.js" },
-  );
+  vm.runInContext(rendererFrameRuntime(), context, {
+    filename: "browser_boot.renderer-sync.main.js",
+  });
 
   const pending = context.handleRendererFrame(
     { rendererSequence: 4 },
@@ -676,11 +698,12 @@ test("main thread acknowledges a frame only after the WebGPU drain resolves", as
   );
   await Promise.resolve();
   assert.deepEqual(messages, []);
-  resolveDrain();
+  resolveDrain([]);
   await pending;
   assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
     type: "renderer-frame-complete",
     rendererSequence: 4,
+    textureCopyReceipts: [],
   }]);
 });
 
@@ -696,7 +719,7 @@ test("temporal XFB readback completes before its VI frame acknowledgement", asyn
     rendererOperationTail: Promise.resolve(),
     drainWebGpuRenderer() {
       calls.push("drain");
-      return Promise.resolve();
+      return Promise.resolve([]);
     },
     captureTemporalSelectedXfb(message, presentationResult) {
       calls.push(
@@ -709,13 +732,9 @@ test("temporal XFB readback completes before its VI frame acknowledgement", asyn
     worker: currentWorker,
   };
   vm.createContext(context);
-  vm.runInContext(
-    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
-      .map(extractFunction)
-      .join("\n\n"),
-    context,
-    { filename: "browser_boot.renderer-sync.temporal-xfb.js" },
-  );
+  vm.runInContext(rendererFrameRuntime(), context, {
+    filename: "browser_boot.renderer-sync.temporal-xfb.js",
+  });
 
   const pending = context.handleRendererFrame({
     type: "vi-present",
@@ -731,6 +750,7 @@ test("temporal XFB readback completes before its VI frame acknowledgement", asyn
   assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
     type: "renderer-frame-complete",
     rendererSequence: 9,
+    textureCopyReceipts: [],
     viPresentationResult: readyViPresentation(4, 7),
   }]);
 });
@@ -747,7 +767,7 @@ test("a replaced worker cannot leak a pending temporal capture into the next run
     Promise,
     rendererHostMetrics: rendererOperationMetrics(),
     rendererOperationTail: Promise.resolve(),
-    drainWebGpuRenderer() { return Promise.resolve(); },
+    drainWebGpuRenderer() { return Promise.resolve([]); },
     captureTemporalSelectedXfb(_message, _presented, frames) {
       return new Promise(resolve => {
         finishCapture = () => {
@@ -761,13 +781,9 @@ test("a replaced worker cannot leak a pending temporal capture into the next run
     worker: oldWorker,
   };
   vm.createContext(context);
-  vm.runInContext(
-    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
-      .map(extractFunction)
-      .join("\n\n"),
-    context,
-    { filename: "browser_boot.renderer-sync.temporal-worker-replacement.js" },
-  );
+  vm.runInContext(rendererFrameRuntime(), context, {
+    filename: "browser_boot.renderer-sync.temporal-worker-replacement.js",
+  });
 
   const pending = context.handleRendererFrame({
     type: "vi-present",
@@ -805,15 +821,9 @@ test("deferred WebGPU failures reject the frame instead of acknowledging it", as
     worker: { postMessage(message) { messages.push(message); } },
   };
   vm.createContext(context);
-  vm.runInContext(
-    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
-      .map(extractFunction)
-      .join("\n\n"),
-    context,
-    {
+  vm.runInContext(rendererFrameRuntime(), context, {
     filename: "browser_boot.renderer-sync.main.js",
-    },
-  );
+  });
 
   await context.handleRendererFrame({ rendererSequence: 5 }, () => {});
 
@@ -1013,7 +1023,7 @@ test("Rust encodes pre-clears and the GX frame before one EFB submission", () =>
 });
 
 test("typed GX pre-clears stay inside one acknowledged GX frame", async () => {
-  assert.match(
+  assert.doesNotMatch(
     source,
     /gxSkippedCopyClears\.push\(gxCopyClearOperation\(frame\)\)/,
   );
@@ -1051,7 +1061,7 @@ test("typed GX pre-clears stay inside one acknowledged GX frame", async () => {
       if (drainCalls === 1) {
         return new Promise(resolve => { releaseClearDrain = resolve; });
       }
-      return Promise.resolve();
+      return Promise.resolve([]);
     },
     handleRendererError(error) { throw error; },
     webGpuRenderer: {
@@ -1064,14 +1074,11 @@ test("typed GX pre-clears stay inside one acknowledged GX frame", async () => {
   };
   vm.createContext(context);
   vm.runInContext(
-    [
-      "appendRendererOperation",
-      "enqueueRendererOperation",
+    rendererFrameRuntime(
       "gxValidatePreClearWords",
       "submitGxFrame",
-      "handleRendererFrame",
       "handleWorkerMessage",
-    ].map(extractFunction).join("\n\n"),
+    ),
     context,
     { filename: "browser_boot.renderer-sync.efb-clear.js" },
   );
@@ -1115,7 +1122,7 @@ test("typed GX pre-clears stay inside one acknowledged GX frame", async () => {
     pending: 1,
     highWater: 1,
   });
-  releaseClearDrain();
+  releaseClearDrain([]);
   await frame;
 
   assert.deepEqual(calls, [
@@ -1130,6 +1137,7 @@ test("typed GX pre-clears stay inside one acknowledged GX frame", async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(messages)), [{
     type: "renderer-frame-complete",
     rendererSequence: 24,
+    textureCopyReceipts: [],
     residentTextureKeys: [],
   }]);
 });
@@ -1153,15 +1161,9 @@ test("a replaced worker cannot receive a stale WebGPU frame completion", async (
     worker: oldWorker,
   };
   vm.createContext(context);
-  vm.runInContext(
-    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
-      .map(extractFunction)
-      .join("\n\n"),
-    context,
-    {
+  vm.runInContext(rendererFrameRuntime(), context, {
     filename: "browser_boot.renderer-sync.replaced-worker.js",
-    },
-  );
+  });
 
   const pending = context.handleRendererFrame(
     { rendererSequence: 1 },
@@ -1170,7 +1172,7 @@ test("a replaced worker cannot receive a stale WebGPU frame completion", async (
   );
   await Promise.resolve();
   context.worker = newWorker;
-  resolveDrain();
+  resolveDrain([]);
   await pending;
 
   assert.deepEqual(oldMessages, []);
@@ -1196,18 +1198,14 @@ test("unawaited VI frames remain serialized behind WebGPU drains", async () => {
       if (drainCount === 1) {
         return new Promise(resolve => { releaseFirstDrain = resolve; });
       }
-      return Promise.resolve();
+      return Promise.resolve([]);
     },
     handleRendererError(error) { throw error; },
   };
   vm.createContext(context);
-  vm.runInContext(
-    ["appendRendererOperation", "enqueueRendererOperation", "handleRendererFrame"]
-      .map(extractFunction)
-      .join("\n\n"),
-    context,
-    { filename: "browser_boot.renderer-sync.vi-queue.js" },
-  );
+  vm.runInContext(rendererFrameRuntime(), context, {
+    filename: "browser_boot.renderer-sync.vi-queue.js",
+  });
 
   const first = context.handleRendererFrame({ rendererSequence: 1 }, () => {
     calls.push("top");
@@ -1222,14 +1220,14 @@ test("unawaited VI frames remain serialized behind WebGPU drains", async () => {
 
   assert.deepEqual(calls, ["top"]);
   assert.equal(drainCount, 1);
-  releaseFirstDrain();
+  releaseFirstDrain([]);
   await first;
   await second;
   assert.deepEqual(calls, ["top", "bottom"]);
   assert.equal(drainCount, 2);
   assert.deepEqual(JSON.parse(JSON.stringify(acknowledgements)), [
-    { type: "renderer-frame-complete", rendererSequence: 1 },
-    { type: "renderer-frame-complete", rendererSequence: 2 },
+    { type: "renderer-frame-complete", rendererSequence: 1, textureCopyReceipts: [] },
+    { type: "renderer-frame-complete", rendererSequence: 2, textureCopyReceipts: [] },
   ]);
 });
 
@@ -1254,20 +1252,13 @@ test("disc resets wait behind pending WebGPU presentation work", async () => {
       if (drainCount === 1) {
         return new Promise(resolve => { releaseFirstDrain = resolve; });
       }
-      return Promise.resolve();
+      return Promise.resolve([]);
     },
     handleRendererError(error) { throw error; },
   };
   vm.createContext(context);
   vm.runInContext(
-    [
-      "appendRendererOperation",
-      "enqueueRendererOperation",
-      "handleRendererFrame",
-      "resetPresentation",
-    ]
-      .map(extractFunction)
-      .join("\n\n"),
+    rendererFrameRuntime("resetPresentation"),
     context,
     { filename: "browser_boot.renderer-sync.reset-queue.js" },
   );
@@ -1282,7 +1273,7 @@ test("disc resets wait behind pending WebGPU presentation work", async () => {
 
   assert.deepEqual(calls, ["present"]);
   assert.equal(context.output.textContent, "STARTING");
-  releaseFirstDrain();
+  releaseFirstDrain([]);
   await presentation;
   await reset;
   assert.deepEqual(calls, ["present", "reset"]);
@@ -1406,7 +1397,7 @@ test("guest execution waits for renderer completion before another block", () =>
   assert.match(source, /postGxFrame\(1, frame\)/);
   assert.match(
     source,
-    /postRendererFrame\(\s*"gx-frame",\s*\{ packet, diagnostics, preClearWords \},\s*transfer\s*\)/,
+    /postRendererFrame\(\s*"gx-frame",\s*\{ packet, diagnostics, preClearWords, textureCopyExpectation \},\s*transfer\s*\)/,
   );
   assert.doesNotMatch(source, /postRendererFrame\("(?:xfb|texture)-copy"/);
   assert.match(source, /postRendererFrame\("vi-present", \{/);

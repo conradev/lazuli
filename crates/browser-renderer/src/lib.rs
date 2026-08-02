@@ -1134,6 +1134,244 @@ pub(crate) enum GxTextureBaseFormat {
     Rgba8,
 }
 
+/// Dense block-row layout of the tiled texture bytes produced by an EFB copy.
+///
+/// `row_bytes` and `dense_bytes` deliberately exclude the BP-programmed guest
+/// stride. The renderer materializes one tightly packed block row at a time;
+/// the browser transport applies guest stride when it writes those rows to
+/// emulated RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxTextureCopyRamLayout {
+    pub(crate) block_width: u32,
+    pub(crate) block_height: u32,
+    pub(crate) block_bytes: u32,
+    pub(crate) blocks_wide: u32,
+    pub(crate) block_rows: u32,
+    pub(crate) row_bytes: u32,
+    pub(crate) dense_bytes: u64,
+    pub(crate) words_per_row: u32,
+    pub(crate) word_count: u64,
+}
+
+/// Computes the exact tiled RAM footprint of a GX EFB texture copy.
+///
+/// GX always emits complete blocks, including the texels beyond a logical
+/// right or bottom edge. Consequently both dimensions round up to the base
+/// format's block geometry instead of clipping the final block.
+pub(crate) fn gx_texture_copy_ram_layout(
+    format: GxTextureBaseFormat,
+    width: u32,
+    height: u32,
+) -> Option<GxTextureCopyRamLayout> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (block_width, block_height, block_bytes) = match format {
+        GxTextureBaseFormat::I4 => (8, 8, 32),
+        GxTextureBaseFormat::I8 | GxTextureBaseFormat::Ia4 => (8, 4, 32),
+        GxTextureBaseFormat::Ia8 | GxTextureBaseFormat::Rgb565 | GxTextureBaseFormat::Rgb5a3 => {
+            (4, 4, 32)
+        }
+        GxTextureBaseFormat::Rgba8 => (4, 4, 64),
+    };
+    let blocks_wide = width
+        .checked_sub(1)?
+        .checked_div(block_width)?
+        .checked_add(1)?;
+    let block_rows = height
+        .checked_sub(1)?
+        .checked_div(block_height)?
+        .checked_add(1)?;
+    let row_bytes = blocks_wide.checked_mul(block_bytes)?;
+    let dense_bytes = u64::from(row_bytes).checked_mul(u64::from(block_rows))?;
+    let words_per_row = row_bytes.checked_div(4)?;
+    let word_count = dense_bytes.checked_div(4)?;
+    Some(GxTextureCopyRamLayout {
+        block_width,
+        block_height,
+        block_bytes,
+        blocks_wide,
+        block_rows,
+        row_bytes,
+        dense_bytes,
+        words_per_row,
+        word_count,
+    })
+}
+
+fn gx_texture_copy_ram_pixel_coordinate(
+    block_x: u32,
+    block_row: u32,
+    block_width: u32,
+    block_height: u32,
+    linear_pixel: u32,
+) -> Option<(u32, u32)> {
+    let x = block_x
+        .checked_mul(block_width)?
+        .checked_add(linear_pixel.checked_rem(block_width)?)?;
+    let y = block_row
+        .checked_mul(block_height)?
+        .checked_add(linear_pixel.checked_div(block_width)?)?;
+    Some((x, y))
+}
+
+fn gx_texture_copy_ram_sample(
+    sample_rgba: &mut impl FnMut(u32, u32) -> [u8; 4],
+    intensity_yuv: bool,
+    x: u32,
+    y: u32,
+) -> [u8; 4] {
+    let [mut red, mut green, mut blue, alpha] = sample_rgba(x, y);
+    if intensity_yuv {
+        [red, green, blue] = gx_texture_copy_intensity_yuv_reference([red, green, blue]);
+    }
+    [red, green, blue, alpha]
+}
+
+/// Encodes one four-byte word in architected guest byte order.
+///
+/// `word_x` addresses a word in the dense block row (not a source pixel), and
+/// `block_row` addresses a complete GX tile row. The sampler is intentionally
+/// unbounded by the logical copy extent: partial right and bottom tiles still
+/// sample their full hardware coordinates.
+pub(crate) fn gx_texture_copy_ram_word_reference(
+    copy_format: GxEfbCopyFormat,
+    word_x: u32,
+    block_row: u32,
+    intensity_yuv: bool,
+    mut sample_rgba: impl FnMut(u32, u32) -> [u8; 4],
+) -> Option<[u8; 4]> {
+    let base_format = copy_format.base_texture_format();
+    let layout = gx_texture_copy_ram_layout(base_format, 1, 1)?;
+    let words_per_block = layout.block_bytes.checked_div(4)?;
+    let block_x = word_x.checked_div(words_per_block)?;
+    let word_in_block = word_x.checked_rem(words_per_block)?;
+    let mut sample_linear = |linear_pixel| {
+        let (x, y) = gx_texture_copy_ram_pixel_coordinate(
+            block_x,
+            block_row,
+            layout.block_width,
+            layout.block_height,
+            linear_pixel,
+        )?;
+        Some(gx_texture_copy_ram_sample(
+            &mut sample_rgba,
+            intensity_yuv,
+            x,
+            y,
+        ))
+    };
+
+    match copy_format {
+        GxEfbCopyFormat::R4 => {
+            let first_pixel = word_in_block.checked_mul(8)?;
+            let mut bytes = [0; 4];
+            for (byte_index, byte) in bytes.iter_mut().enumerate() {
+                let first =
+                    first_pixel.checked_add(u32::try_from(byte_index).ok()?.checked_mul(2)?)?;
+                let second = first.checked_add(1)?;
+                *byte = (sample_linear(first)?[0] & 0xf0) | (sample_linear(second)?[0] >> 4);
+            }
+            Some(bytes)
+        }
+        GxEfbCopyFormat::R8_0x1
+        | GxEfbCopyFormat::A8
+        | GxEfbCopyFormat::R8
+        | GxEfbCopyFormat::G8
+        | GxEfbCopyFormat::B8 => {
+            let first_pixel = word_in_block.checked_mul(4)?;
+            let component = match copy_format {
+                GxEfbCopyFormat::A8 => 3,
+                GxEfbCopyFormat::G8 => 1,
+                GxEfbCopyFormat::B8 => 2,
+                _ => 0,
+            };
+            let mut bytes = [0; 4];
+            for (byte_index, byte) in bytes.iter_mut().enumerate() {
+                let pixel = first_pixel.checked_add(u32::try_from(byte_index).ok()?)?;
+                *byte = sample_linear(pixel)?[component];
+            }
+            Some(bytes)
+        }
+        GxEfbCopyFormat::Ra4 => {
+            let first_pixel = word_in_block.checked_mul(4)?;
+            let mut bytes = [0; 4];
+            for (byte_index, byte) in bytes.iter_mut().enumerate() {
+                let pixel = first_pixel.checked_add(u32::try_from(byte_index).ok()?)?;
+                let [red, _, _, alpha] = sample_linear(pixel)?;
+                *byte = (alpha & 0xf0) | (red >> 4);
+            }
+            Some(bytes)
+        }
+        GxEfbCopyFormat::Ra8 | GxEfbCopyFormat::Rg8 | GxEfbCopyFormat::Gb8 => {
+            let first_pixel = word_in_block.checked_mul(2)?;
+            let mut bytes = [0; 4];
+            for pixel_in_word in 0..2 {
+                let pixel = first_pixel.checked_add(pixel_in_word)?;
+                let [red, green, blue, alpha] = sample_linear(pixel)?;
+                let pair = match copy_format {
+                    GxEfbCopyFormat::Ra8 => [alpha, red],
+                    GxEfbCopyFormat::Rg8 => [green, red],
+                    GxEfbCopyFormat::Gb8 => [blue, green],
+                    _ => unreachable!(),
+                };
+                let output = usize::try_from(pixel_in_word).ok()?.checked_mul(2)?;
+                bytes[output..output + 2].copy_from_slice(&pair);
+            }
+            Some(bytes)
+        }
+        GxEfbCopyFormat::Rgb565 | GxEfbCopyFormat::Rgb5a3 => {
+            let first_pixel = word_in_block.checked_mul(2)?;
+            let mut bytes = [0; 4];
+            for pixel_in_word in 0..2 {
+                let pixel = first_pixel.checked_add(pixel_in_word)?;
+                let [red, green, blue, alpha] = sample_linear(pixel)?;
+                let packed = match copy_format {
+                    GxEfbCopyFormat::Rgb565 => {
+                        (u16::from(red >> 3) << 11)
+                            | (u16::from(green >> 2) << 5)
+                            | u16::from(blue >> 3)
+                    }
+                    GxEfbCopyFormat::Rgb5a3 if alpha & 0xe0 == 0xe0 => {
+                        0x8000
+                            | (u16::from(red >> 3) << 10)
+                            | (u16::from(green >> 3) << 5)
+                            | u16::from(blue >> 3)
+                    }
+                    GxEfbCopyFormat::Rgb5a3 => {
+                        (u16::from(alpha >> 5) << 12)
+                            | (u16::from(red >> 4) << 8)
+                            | (u16::from(green >> 4) << 4)
+                            | u16::from(blue >> 4)
+                    }
+                    _ => unreachable!(),
+                };
+                let output = usize::try_from(pixel_in_word).ok()?.checked_mul(2)?;
+                bytes[output..output + 2].copy_from_slice(&packed.to_be_bytes());
+            }
+            Some(bytes)
+        }
+        GxEfbCopyFormat::Rgba8 => {
+            let gb_plane = word_in_block >= 8;
+            let plane_word = word_in_block.checked_rem(8)?;
+            let first_pixel = plane_word.checked_mul(2)?;
+            let mut bytes = [0; 4];
+            for pixel_in_word in 0..2 {
+                let pixel = first_pixel.checked_add(pixel_in_word)?;
+                let [red, green, blue, alpha] = sample_linear(pixel)?;
+                let pair = if gb_plane {
+                    [green, blue]
+                } else {
+                    [alpha, red]
+                };
+                let output = usize::try_from(pixel_in_word).ok()?.checked_mul(2)?;
+                bytes[output..output + 2].copy_from_slice(&pair);
+            }
+            Some(bytes)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum GxTextureCopyPlane {
     Color,
@@ -3376,22 +3614,23 @@ mod tests {
         GxEarlyDepthPlan, GxEfbCopyFormat, GxEfbDepthDecodeError, GxEfbDepthEncoding, GxEfbFormat,
         GxFogDecodeError, GxFogProjection, GxFogState, GxFogType, GxRasterCenterEvidence,
         GxSamplerStateError, GxTextureBaseFormat, GxTextureCopyPlanError, GxTextureCopyPlane,
-        GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation, RendererFailureState,
-        RendererMetrics, RendererPhaseTiming, SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY,
-        SelectedTexture, SurfacePixelOrder, SurfaceReadbackRequestError,
-        SustainedPresentedSurfaceHistory, SustainedSurfaceHistoryError, TextureAddressMode,
-        TextureMipmapFilter, ViFieldDescriptor, ViFieldPairOutcome, ViFieldPairRejection,
-        ViFieldPairState, ViFieldParity, ViHostFrame, ViPresentationMode, WEBGPU_RASTER_CENTER_EFB,
-        XfbCopyMetadata, alpha_compare, alpha_test_passes, clipped_copy_extent,
-        compact_surface_readback_rows, compact_xfb_readback_rows, compact_xfb_scanout_rows,
-        decoded_texture_cache_hit, decoded_texture_is_available, expand_5_to_8, expand_6_to_8,
-        gx_alpha_test_outcome, gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask,
-        gx_copy_clear_rgba, gx_copy_filter_coefficients, gx_copy_filter_taps,
-        gx_depth24_from_units, gx_depth24_to_float, gx_destination_alpha_state,
-        gx_early_depth_plan, gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24,
-        gx_fog_reference, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
-        gx_texture_copy_color_reference, gx_texture_copy_depth_reference,
-        gx_texture_copy_intensity_yuv_reference, gx_texture_copy_plan,
+        GxTextureCopyRamLayout, GxZTextureDecodeError, GxZTextureFormat, GxZTextureOperation,
+        RendererFailureState, RendererMetrics, RendererPhaseTiming,
+        SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY, SelectedTexture, SurfacePixelOrder,
+        SurfaceReadbackRequestError, SustainedPresentedSurfaceHistory,
+        SustainedSurfaceHistoryError, TextureAddressMode, TextureMipmapFilter, ViFieldDescriptor,
+        ViFieldPairOutcome, ViFieldPairRejection, ViFieldPairState, ViFieldParity, ViHostFrame,
+        ViPresentationMode, WEBGPU_RASTER_CENTER_EFB, XfbCopyMetadata, alpha_compare,
+        alpha_test_passes, clipped_copy_extent, compact_surface_readback_rows,
+        compact_xfb_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
+        decoded_texture_is_available, expand_5_to_8, expand_6_to_8, gx_alpha_test_outcome,
+        gx_blend_factor_for_component, gx_blend_state, gx_copy_clear_mask, gx_copy_clear_rgba,
+        gx_copy_filter_coefficients, gx_copy_filter_taps, gx_depth24_from_units,
+        gx_depth24_to_float, gx_destination_alpha_state, gx_early_depth_plan,
+        gx_efb_depth_encoding, gx_efb_format, gx_float_to_depth24, gx_fog_reference, gx_fog_state,
+        gx_raster_center_evidence, gx_sampler_state, gx_texture_copy_color_reference,
+        gx_texture_copy_depth_reference, gx_texture_copy_intensity_yuv_reference,
+        gx_texture_copy_plan, gx_texture_copy_ram_layout, gx_texture_copy_ram_word_reference,
         gx_texture_copy_target_format, gx_xfb_copy_parameters, gx_xfb_output_height,
         gx_z_texture_reference, gx_z_texture_state, legacy_gx_sampler_identity,
         materialize_xfb_rgba8_reference, merge_contiguous_draw_range,
@@ -3604,6 +3843,363 @@ mod tests {
                 half_scale: true,
             })
         );
+    }
+
+    #[test]
+    fn texture_copy_ram_layout_matches_all_seven_base_format_geometries() {
+        let cases = [
+            (
+                GxTextureBaseFormat::I4,
+                GxTextureCopyRamLayout {
+                    block_width: 8,
+                    block_height: 8,
+                    block_bytes: 32,
+                    blocks_wide: 2,
+                    block_rows: 2,
+                    row_bytes: 64,
+                    dense_bytes: 128,
+                    words_per_row: 16,
+                    word_count: 32,
+                },
+            ),
+            (
+                GxTextureBaseFormat::I8,
+                GxTextureCopyRamLayout {
+                    block_width: 8,
+                    block_height: 4,
+                    block_bytes: 32,
+                    blocks_wide: 2,
+                    block_rows: 3,
+                    row_bytes: 64,
+                    dense_bytes: 192,
+                    words_per_row: 16,
+                    word_count: 48,
+                },
+            ),
+            (
+                GxTextureBaseFormat::Ia4,
+                GxTextureCopyRamLayout {
+                    block_width: 8,
+                    block_height: 4,
+                    block_bytes: 32,
+                    blocks_wide: 2,
+                    block_rows: 3,
+                    row_bytes: 64,
+                    dense_bytes: 192,
+                    words_per_row: 16,
+                    word_count: 48,
+                },
+            ),
+            (
+                GxTextureBaseFormat::Ia8,
+                GxTextureCopyRamLayout {
+                    block_width: 4,
+                    block_height: 4,
+                    block_bytes: 32,
+                    blocks_wide: 3,
+                    block_rows: 3,
+                    row_bytes: 96,
+                    dense_bytes: 288,
+                    words_per_row: 24,
+                    word_count: 72,
+                },
+            ),
+            (
+                GxTextureBaseFormat::Rgb565,
+                GxTextureCopyRamLayout {
+                    block_width: 4,
+                    block_height: 4,
+                    block_bytes: 32,
+                    blocks_wide: 3,
+                    block_rows: 3,
+                    row_bytes: 96,
+                    dense_bytes: 288,
+                    words_per_row: 24,
+                    word_count: 72,
+                },
+            ),
+            (
+                GxTextureBaseFormat::Rgb5a3,
+                GxTextureCopyRamLayout {
+                    block_width: 4,
+                    block_height: 4,
+                    block_bytes: 32,
+                    blocks_wide: 3,
+                    block_rows: 3,
+                    row_bytes: 96,
+                    dense_bytes: 288,
+                    words_per_row: 24,
+                    word_count: 72,
+                },
+            ),
+            (
+                GxTextureBaseFormat::Rgba8,
+                GxTextureCopyRamLayout {
+                    block_width: 4,
+                    block_height: 4,
+                    block_bytes: 64,
+                    blocks_wide: 3,
+                    block_rows: 3,
+                    row_bytes: 192,
+                    dense_bytes: 576,
+                    words_per_row: 48,
+                    word_count: 144,
+                },
+            ),
+        ];
+
+        for (format, expected) in cases {
+            assert_eq!(gx_texture_copy_ram_layout(format, 9, 9), Some(expected));
+        }
+    }
+
+    #[test]
+    fn texture_copy_ram_layout_rejects_zero_and_row_byte_overflow() {
+        let formats = [
+            GxTextureBaseFormat::I4,
+            GxTextureBaseFormat::I8,
+            GxTextureBaseFormat::Ia4,
+            GxTextureBaseFormat::Ia8,
+            GxTextureBaseFormat::Rgb565,
+            GxTextureBaseFormat::Rgb5a3,
+            GxTextureBaseFormat::Rgba8,
+        ];
+        for format in formats {
+            assert_eq!(gx_texture_copy_ram_layout(format, 0, 1), None);
+            assert_eq!(gx_texture_copy_ram_layout(format, 1, 0), None);
+            assert_eq!(gx_texture_copy_ram_layout(format, u32::MAX, 1), None);
+        }
+
+        let largest_i4_width = (u32::MAX / 32) * 8;
+        let layout =
+            gx_texture_copy_ram_layout(GxTextureBaseFormat::I4, largest_i4_width, u32::MAX)
+                .unwrap();
+        assert_eq!(layout.row_bytes, 4_294_967_264);
+        assert_eq!(layout.block_rows, 536_870_912);
+        assert_eq!(layout.dense_bytes, 2_305_842_992_033_824_768);
+        assert_eq!(layout.word_count, 576_460_748_008_456_192);
+        assert_eq!(
+            gx_texture_copy_ram_layout(GxTextureBaseFormat::I4, largest_i4_width + 1, u32::MAX,),
+            None
+        );
+    }
+
+    #[test]
+    fn texture_copy_ram_words_match_all_thirteen_encoder_modes() {
+        let rgba = [0x12, 0x34, 0x56, 0x78];
+        let cases = [
+            (GxEfbCopyFormat::R4, [0x11, 0x11, 0x11, 0x11]),
+            (GxEfbCopyFormat::R8_0x1, [0x12, 0x12, 0x12, 0x12]),
+            (GxEfbCopyFormat::Ra4, [0x71, 0x71, 0x71, 0x71]),
+            (GxEfbCopyFormat::Ra8, [0x78, 0x12, 0x78, 0x12]),
+            (GxEfbCopyFormat::Rgb565, [0x11, 0xaa, 0x11, 0xaa]),
+            (GxEfbCopyFormat::Rgb5a3, [0x31, 0x35, 0x31, 0x35]),
+            (GxEfbCopyFormat::Rgba8, [0x78, 0x12, 0x78, 0x12]),
+            (GxEfbCopyFormat::A8, [0x78, 0x78, 0x78, 0x78]),
+            (GxEfbCopyFormat::R8, [0x12, 0x12, 0x12, 0x12]),
+            (GxEfbCopyFormat::G8, [0x34, 0x34, 0x34, 0x34]),
+            (GxEfbCopyFormat::B8, [0x56, 0x56, 0x56, 0x56]),
+            (GxEfbCopyFormat::Rg8, [0x34, 0x12, 0x34, 0x12]),
+            (GxEfbCopyFormat::Gb8, [0x56, 0x34, 0x56, 0x34]),
+        ];
+
+        for (format, expected) in cases {
+            assert_eq!(
+                gx_texture_copy_ram_word_reference(format, 0, 0, false, |_, _| rgba),
+                Some(expected),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn texture_copy_ram_rgb5a3_switches_encoding_at_the_opaque_boundary() {
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgb5a3, 0, 0, false, |x, _| {
+                if x == 0 {
+                    [0x12, 0x34, 0x56, 0xdf]
+                } else {
+                    [0x12, 0x34, 0x56, 0xe0]
+                }
+            }),
+            Some([0x61, 0x35, 0x88, 0xca])
+        );
+    }
+
+    #[test]
+    fn r4_ram_words_pair_even_texels_into_the_high_nibble() {
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::R4, 0, 0, false, |x, _| {
+                [((x + 1) * 0x10) as u8, 0, 0, 0]
+            }),
+            Some([0x12, 0x34, 0x56, 0x78])
+        );
+    }
+
+    #[test]
+    fn texture_copy_ram_words_apply_intensity_conversion_before_swizzling() {
+        let rgba = [18, 52, 86, 120];
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgba8, 0, 0, true, |_, _| rgba),
+            Some([120, 55, 120, 55])
+        );
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgba8, 8, 0, true, |_, _| rgba),
+            Some([148, 111, 148, 111])
+        );
+    }
+
+    #[test]
+    fn texture_copy_ram_word_coordinates_traverse_each_block_geometry() {
+        let cases = [
+            (GxEfbCopyFormat::R4, 8, 8, 8, 8),
+            (GxEfbCopyFormat::R8, 8, 4, 8, 4),
+            (GxEfbCopyFormat::Ra4, 8, 4, 8, 4),
+            (GxEfbCopyFormat::Ra8, 4, 4, 8, 2),
+            (GxEfbCopyFormat::Rgb565, 4, 4, 8, 2),
+            (GxEfbCopyFormat::Rgb5a3, 4, 4, 8, 2),
+        ];
+        for (format, block_width, block_height, words_per_block, samples_per_word) in cases {
+            let mut first = Vec::new();
+            gx_texture_copy_ram_word_reference(format, 0, 0, false, |x, y| {
+                first.push((x, y));
+                [0; 4]
+            })
+            .unwrap();
+            assert_eq!(
+                first,
+                (0..samples_per_word).map(|x| (x, 0)).collect::<Vec<_>>(),
+                "{format:?} first word"
+            );
+
+            let mut last = Vec::new();
+            gx_texture_copy_ram_word_reference(format, words_per_block - 1, 0, false, |x, y| {
+                last.push((x, y));
+                [0; 4]
+            })
+            .unwrap();
+            let expected_last = match format.base_texture_format() {
+                GxTextureBaseFormat::I4 => (0..8).map(|x| (x, 7)).collect::<Vec<_>>(),
+                GxTextureBaseFormat::I8 | GxTextureBaseFormat::Ia4 => {
+                    (4..8).map(|x| (x, 3)).collect::<Vec<_>>()
+                }
+                GxTextureBaseFormat::Ia8
+                | GxTextureBaseFormat::Rgb565
+                | GxTextureBaseFormat::Rgb5a3 => [(2, 3), (3, 3)].into(),
+                GxTextureBaseFormat::Rgba8 => unreachable!(),
+            };
+            assert_eq!(last, expected_last, "{format:?} last word");
+
+            let mut next_block = Vec::new();
+            gx_texture_copy_ram_word_reference(format, words_per_block, 0, false, |x, y| {
+                next_block.push((x, y));
+                [0; 4]
+            })
+            .unwrap();
+            assert_eq!(
+                next_block,
+                (block_width..block_width + samples_per_word)
+                    .map(|x| (x, 0))
+                    .collect::<Vec<_>>(),
+                "{format:?} next block"
+            );
+
+            let mut next_row = Vec::new();
+            gx_texture_copy_ram_word_reference(format, 0, 1, false, |x, y| {
+                next_row.push((x, y));
+                [0; 4]
+            })
+            .unwrap();
+            assert_eq!(
+                next_row,
+                (0..samples_per_word)
+                    .map(|x| (x, block_height))
+                    .collect::<Vec<_>>(),
+                "{format:?} next block row"
+            );
+        }
+    }
+
+    #[test]
+    fn rgba8_ram_words_emit_ar_plane_then_gb_plane() {
+        let sample = |x, y| {
+            [
+                0x10 + x as u8,
+                0x20 + x as u8,
+                0x30 + y as u8,
+                0x40 + y as u8,
+            ]
+        };
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgba8, 0, 0, false, sample),
+            Some([0x40, 0x10, 0x40, 0x11])
+        );
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgba8, 7, 0, false, sample),
+            Some([0x43, 0x12, 0x43, 0x13])
+        );
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgba8, 8, 0, false, sample),
+            Some([0x20, 0x30, 0x21, 0x30])
+        );
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgba8, 15, 0, false, sample),
+            Some([0x22, 0x33, 0x23, 0x33])
+        );
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::Rgba8, 16, 0, false, sample),
+            Some([0x40, 0x14, 0x40, 0x15])
+        );
+    }
+
+    #[test]
+    fn partial_texture_copy_tiles_sample_beyond_logical_edges() {
+        let layout = gx_texture_copy_ram_layout(GxTextureBaseFormat::I8, 9, 5).unwrap();
+        assert_eq!((layout.blocks_wide, layout.block_rows), (2, 2));
+
+        let mut sampled = Vec::new();
+        let bytes = gx_texture_copy_ram_word_reference(
+            GxEfbCopyFormat::R8,
+            layout.words_per_row - 1,
+            layout.block_rows - 1,
+            false,
+            |x, y| {
+                sampled.push((x, y));
+                [x as u8, y as u8, 0, 0xff]
+            },
+        )
+        .unwrap();
+        assert_eq!(sampled, [(12, 7), (13, 7), (14, 7), (15, 7)]);
+        assert_eq!(bytes, [12, 13, 14, 15]);
+
+        let rgba_layout = gx_texture_copy_ram_layout(GxTextureBaseFormat::Rgba8, 5, 1).unwrap();
+        let mut rgba_sampled = Vec::new();
+        let rgba_bytes = gx_texture_copy_ram_word_reference(
+            GxEfbCopyFormat::Rgba8,
+            rgba_layout.words_per_row - 1,
+            0,
+            false,
+            |x, y| {
+                rgba_sampled.push((x, y));
+                [0, x as u8, y as u8, 0]
+            },
+        )
+        .unwrap();
+        assert_eq!(rgba_sampled, [(6, 3), (7, 3)]);
+        assert_eq!(rgba_bytes, [6, 3, 7, 3]);
+    }
+
+    #[test]
+    fn texture_copy_ram_word_rejects_coordinate_overflow_without_sampling() {
+        let mut sample_count = 0;
+        assert_eq!(
+            gx_texture_copy_ram_word_reference(GxEfbCopyFormat::R4, 0, u32::MAX, false, |_, _| {
+                sample_count += 1;
+                [0; 4]
+            },),
+            None
+        );
+        assert_eq!(sample_count, 0);
     }
 
     #[test]

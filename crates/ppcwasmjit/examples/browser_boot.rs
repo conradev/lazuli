@@ -1003,6 +1003,16 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererFrameSequence = 0;
     const rendererFramesInFlight = new Set();
     const rendererViFrames = new Map();
+    // Keep the architected RAM-write contract in the worker. The page only
+    // transports untrusted renderer receipts back across the message boundary.
+    const rendererTextureCopyExpectations = new Map();
+    // A texture-copy output is an architected RAM write. Once its packet is
+    // posted, the FIFO decoder may not execute a later command until the exact
+    // renderer sequence has returned, validated, and committed every RAM row.
+    let rendererTextureCopyBarrierSequence = null;
+    let rendererTextureCopyBarrierCycle = null;
+    let rendererTextureCopyBarriers = 0;
+    let rendererTextureCopyBarrierResumes = 0;
     let rendererBackpressureResume = null;
     let rendererBackpressureWaits = 0;
     let rendererFramesAcknowledged = 0;
@@ -1461,6 +1471,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     function postRendererFrame(type, frame, transfer = []) {
       const rendererSequence = ++rendererFrameSequence;
       rendererFramesInFlight.add(rendererSequence);
+      rendererTextureCopyExpectations.set(
+        rendererSequence,
+        frame.textureCopyExpectation ?? null
+      );
       if (type === "vi-present") rendererViFrames.set(rendererSequence, frame);
       if (type === "vi-present" && frame.sustainedPlayReceipt !== undefined) {
         smbSustainedViPending.set(rendererSequence, frame.sustainedPlayReceipt);
@@ -1483,10 +1497,39 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       } catch (error) {
         rendererFramesInFlight.delete(rendererSequence);
+        rendererTextureCopyExpectations.delete(rendererSequence);
         rendererViFrames.delete(rendererSequence);
         smbSustainedViPending.delete(rendererSequence);
         throw error;
       }
+      return rendererSequence;
+    }
+
+    function armRendererTextureCopyBarrier(rendererSequence) {
+      if (
+        !Number.isSafeInteger(rendererSequence)
+        || rendererSequence < 1
+        || rendererTextureCopyBarrierSequence !== null
+      ) {
+        throw new Error("GX texture-copy receipt barrier invariant failed");
+      }
+      rendererTextureCopyBarrierSequence = rendererSequence;
+      rendererTextureCopyBarrierCycle = cycles;
+      rendererTextureCopyBarriers += 1;
+    }
+
+    function releaseRendererTextureCopyBarrier(rendererSequence) {
+      if (rendererTextureCopyBarrierSequence !== rendererSequence) {
+        throw new Error("GX texture-copy receipt released out of order");
+      }
+      const barrierCycle = rendererTextureCopyBarrierCycle;
+      if (!Number.isSafeInteger(barrierCycle) || barrierCycle < 0) {
+        throw new Error("GX texture-copy receipt barrier cycle is invalid");
+      }
+      rendererTextureCopyBarrierSequence = null;
+      rendererTextureCopyBarrierCycle = null;
+      rendererTextureCopyBarrierResumes += 1;
+      return barrierCycle;
     }
 
     function gxStrictV7RenderKey(key) {
@@ -1905,12 +1948,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       const preClearWords = gxPackPreClearWords(gxSkippedCopyClears);
       const transfer = [packet];
       if (preClearWords.byteLength !== 0) transfer.push(preClearWords.buffer);
-      postRendererFrame(
+      const textureCopyExpectation = copyKind === 1
+        ? gxTextureCopyReceiptExpectation(frame)
+        : null;
+      const rendererSequence = postRendererFrame(
         "gx-frame",
-        { packet, diagnostics, preClearWords },
+        { packet, diagnostics, preClearWords, textureCopyExpectation },
         transfer
       );
+      if (textureCopyExpectation !== null) {
+        armRendererTextureCopyBarrier(rendererSequence);
+      }
       gxDrainSkippedCopyClears();
+      return rendererSequence;
     }
 
     function gxPackPreClearWords(preClears) {
@@ -3435,20 +3485,158 @@ const TEMPLATE: &str = r##"<!doctype html>
       return packet;
     }
 
+    function gxPreflightTextureCopyReceipts(receipts, expectation) {
+      if (!Array.isArray(receipts)) {
+        throw new TypeError("WebGPU renderer texture-copy receipts must be an Array");
+      }
+      const expectedCount = expectation === null ? 0 : 1;
+      if (receipts.length !== expectedCount) {
+        throw new Error(
+          `WebGPU renderer returned ${receipts.length} texture-copy receipts; expected ${expectedCount}`
+        );
+      }
+      if (expectation === null) return null;
+      const uint32 = (value, name, minimum = 0) => {
+        if (
+          !Number.isSafeInteger(value)
+          || value < minimum
+          || value > 0xffff_ffff
+        ) {
+          throw new TypeError(`texture-copy expectation ${name} is not a uint32`);
+        }
+        return value;
+      };
+      if (
+        expectation === null
+        || typeof expectation !== "object"
+        || Array.isArray(expectation)
+        || expectation.kind !== "output"
+        || expectation.layout !== "gx-efb-copy-tiled-bytes-v1"
+      ) {
+        throw new TypeError("texture-copy expectation is invalid");
+      }
+      const destination = uint32(expectation.destination, "destination");
+      uint32(expectation.generation, "generation", 1);
+      uint32(expectation.width, "width", 1);
+      uint32(expectation.height, "height", 1);
+      uint32(expectation.copyFormat, "copyFormat");
+      uint32(expectation.baseFormat, "baseFormat");
+      const stride = uint32(expectation.stride, "stride");
+      const rowBytes = uint32(expectation.rowBytes, "rowBytes", 1);
+      const rowCount = uint32(expectation.rowCount, "rowCount", 1);
+      const byteLength = rowBytes * rowCount;
+      if (
+        !Number.isSafeInteger(byteLength)
+        || expectation.byteLength !== byteLength
+      ) {
+        throw new TypeError("texture-copy expectation byteLength is invalid");
+      }
+
+      const receipt = receipts[0];
+      if (
+        receipt === null
+        || typeof receipt !== "object"
+        || Array.isArray(receipt)
+      ) {
+        throw new TypeError("WebGPU renderer texture-copy receipt is not an object");
+      }
+      for (const name of [
+        "destination", "generation", "width", "height", "copyFormat",
+        "baseFormat", "stride", "rowBytes", "rowCount",
+      ]) {
+        if (receipt[name] !== expectation[name]) {
+          throw new Error(`WebGPU renderer texture-copy receipt ${name} mismatch`);
+        }
+      }
+      if (receipt.layout !== expectation.layout) {
+        throw new Error("WebGPU renderer texture-copy receipt layout mismatch");
+      }
+      const materializedBytes = receipt.bytes;
+      if (
+        !(materializedBytes instanceof Uint8Array)
+        || !(materializedBytes.buffer instanceof ArrayBuffer)
+        || materializedBytes.byteOffset !== 0
+        || materializedBytes.byteLength !== materializedBytes.buffer.byteLength
+        || materializedBytes.byteLength !== byteLength
+      ) {
+        throw new TypeError("WebGPU renderer texture-copy receipt bytes are invalid");
+      }
+
+      const rows = [];
+      for (let row = 0; row < rowCount; row += 1) {
+        const address = destination + row * stride;
+        const end = address + rowBytes;
+        if (
+          !Number.isSafeInteger(address)
+          || address > 0xffff_ffff
+          || !Number.isSafeInteger(end)
+          || end > 0x1_0000_0000
+        ) {
+          throw new RangeError("WebGPU texture-copy receipt destination wraps uint32");
+        }
+        const pointer = ramPointer(address, rowBytes);
+        if (pointer === null) {
+          throw new RangeError("WebGPU texture-copy receipt destination is outside RAM");
+        }
+        rows.push({ pointer, sourceOffset: row * rowBytes });
+      }
+
+      let materializedHash = 0x811c9dc5;
+      for (const byte of materializedBytes) {
+        materializedHash = Math.imul(materializedHash ^ byte, 0x01000193) >>> 0;
+      }
+      return { expectation, materializedBytes, materializedHash, rows };
+    }
+
+    function gxApplyTextureCopyReceipt(plan) {
+      if (plan === null) return;
+      const { expectation, materializedBytes, materializedHash, rows } = plan;
+      invalidateDataReservationForExternalStridedWrite(
+        expectation.destination,
+        expectation.rowBytes,
+        expectation.stride,
+        expectation.rowCount
+      );
+      // Receipt rows are compact. Apply them in increasing row order so zero
+      // and undersized BP strides reproduce the hardware's overlapping writes.
+      for (const row of rows) {
+        bytes.set(
+          materializedBytes.subarray(
+            row.sourceOffset,
+            row.sourceOffset + expectation.rowBytes
+          ),
+          row.pointer
+        );
+      }
+      gxCommitTextureCopyMaterialization(expectation, materializedHash);
+    }
+
+    function gxRetireRendererFrame(rendererSequence) {
+      rendererFramesInFlight.delete(rendererSequence);
+      rendererTextureCopyExpectations.delete(rendererSequence);
+      rendererViFrames.delete(rendererSequence);
+      smbSustainedViPending.delete(rendererSequence);
+    }
+
     function completeRendererFrame(message) {
-      const rendererSequence = Number(message.rendererSequence);
+      const rendererSequence = Number(message?.rendererSequence);
       if (
         !Number.isSafeInteger(rendererSequence)
-        || !rendererFramesInFlight.delete(rendererSequence)
+        || !rendererFramesInFlight.has(rendererSequence)
+        || !rendererTextureCopyExpectations.has(rendererSequence)
       ) {
         rendererFrameResultMisses += 1;
+        rendererFrameFailures += 1;
+        recordRendererFailure("WebGPU renderer returned an unknown or duplicate frame result");
         return;
       }
       const viFrame = rendererViFrames.get(rendererSequence) ?? null;
-      rendererViFrames.delete(rendererSequence);
       const sustainedRequest = smbSustainedViPending.get(rendererSequence) ?? null;
-      smbSustainedViPending.delete(rendererSequence);
+      const textureCopyExpectation = rendererTextureCopyExpectations.get(
+        rendererSequence
+      );
       if (message.type === "renderer-frame-failed") {
+        gxRetireRendererFrame(rendererSequence);
         rendererFrameFailures += 1;
         recordRendererFailure(message.error);
         if (sustainedRequest !== null) {
@@ -3461,42 +3649,96 @@ const TEMPLATE: &str = r##"<!doctype html>
             smbSustainedViReceipts.at(-1)?.rendererSequence ?? null
           );
         }
-      } else {
-        if (viFrame !== null) {
-          if (!acceptViPresentationResult(
-            message.viPresentationResult,
-            viFrame,
-            rendererSequence
-          )) return;
-        } else if (message.viPresentationResult !== undefined) {
-          rendererFrameFailures += 1;
-          recordRendererFailure("non-VI renderer frame returned a VI result");
-          return;
-        }
+        return;
+      }
+      if (message.type !== "renderer-frame-complete") {
+        gxRetireRendererFrame(rendererSequence);
+        rendererFrameFailures += 1;
+        recordRendererFailure("WebGPU renderer returned an invalid frame result type");
+        return;
+      }
+
+      let textureCopyPlan;
+      let residentTextureKeys = null;
+      try {
+        textureCopyPlan = gxPreflightTextureCopyReceipts(
+          message.textureCopyReceipts,
+          textureCopyExpectation
+        );
         if (message.residentTextureKeys !== undefined) {
           if (
             !Array.isArray(message.residentTextureKeys)
             || message.residentTextureKeys.some(key => typeof key !== "string")
           ) {
-            rendererFrameFailures += 1;
-            recordRendererFailure("WebGPU renderer returned invalid texture residency");
-            return;
+            throw new TypeError(
+              "WebGPU renderer returned invalid texture residency"
+            );
           }
-          rendererResidentTextureKeys = new Set(message.residentTextureKeys);
+          residentTextureKeys = new Set(message.residentTextureKeys);
         }
-        rendererFramesAcknowledged += 1;
-        if (
-          sustainedRequest !== null
-          || message.sustainedPlayReceipt !== undefined
-        ) {
-          acceptSmbSustainedViReceipt(
-            message.sustainedPlayReceipt,
-            sustainedRequest,
-            rendererSequence
-          );
+        if (viFrame === null && message.viPresentationResult !== undefined) {
+          throw new TypeError("non-VI renderer frame returned a VI result");
         }
-        if (rendererFramesInFlight.size === 0) rendererBackpressureResume?.();
+      } catch (error) {
+        gxRetireRendererFrame(rendererSequence);
+        rendererFrameFailures += 1;
+        recordRendererFailure(error?.message ?? error);
+        return;
       }
+
+      if (
+        viFrame !== null
+        && !acceptViPresentationResult(
+          message.viPresentationResult,
+          viFrame,
+          rendererSequence
+        )
+      ) {
+        gxRetireRendererFrame(rendererSequence);
+        return;
+      }
+
+      try {
+        gxApplyTextureCopyReceipt(textureCopyPlan);
+      } catch (error) {
+        // The preflight above proves every typed-array range. This path is a
+        // fail-stop guard for an engine-level exception, not a recoverable ack.
+        gxRetireRendererFrame(rendererSequence);
+        rendererFrameFailures += 1;
+        recordRendererFailure(error?.message ?? error);
+        return;
+      }
+      if (residentTextureKeys !== null) {
+        rendererResidentTextureKeys = residentTextureKeys;
+      }
+      // RAM and copy provenance are visible before the sequence can disappear
+      // or renderer backpressure can resume guest execution.
+      gxRetireRendererFrame(rendererSequence);
+      rendererFramesAcknowledged += 1;
+      if (textureCopyExpectation !== null) {
+        try {
+          const barrierCycle = releaseRendererTextureCopyBarrier(rendererSequence);
+          // The validated scatter and direct-surface residency are now both
+          // visible. Resume the retained CALL_DL/FIFO suffix before guest CPU
+          // execution or VI presentation can observe the post-copy machine.
+          withScopedCycles(barrierCycle, resumeGxDecoderAfterTextureCopyReceipt);
+        } catch (error) {
+          rendererFrameFailures += 1;
+          recordRendererFailure(error?.message ?? error);
+          return;
+        }
+      }
+      if (
+        sustainedRequest !== null
+        || message.sustainedPlayReceipt !== undefined
+      ) {
+        acceptSmbSustainedViReceipt(
+          message.sustainedPlayReceipt,
+          sustainedRequest,
+          rendererSequence
+        );
+      }
+      if (rendererFramesInFlight.size === 0) rendererBackpressureResume?.();
     }
 
     function acceptViPresentationResult(result, frame, rendererSequence) {
@@ -6188,6 +6430,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     // plus a complete staging append while bounding corrupt-stream growth.
     const gxDecodeMaximumBufferedBytes = 16 * 1024 * 1024;
     let gxDecodeBuffer = [];
+    // CALL_DL suffixes retain their display-list decoding mode across an
+    // asynchronous texture-copy fence. They must run before the enclosing
+    // FIFO suffix once the architected RAM write is acknowledged.
+    const gxDeferredDisplayListSegments = [];
+    let gxTextureCopyDecoderBarrierStops = 0;
+    let gxTextureCopyDecoderBarrierResumes = 0;
     let gxDecodeCapacityWatermarkBytes = gxDecodeInitialCapacityWatermarkBytes;
     let gxDecodeRetryAtBufferedBytes = 1;
     let gxDecodeAttempts = 0;
@@ -6203,10 +6451,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     gxBpRegisters[0xf3] = 0x003f0000;
     gxBpRegisters[0xfe] = 0x00ffffff;
     const gxXfbCopies = [];
-    // Keep renderer residency separate from the rolling copy diagnostics.
-    // Sparse rendering leaves the most recently captured surface resident at
-    // each destination even after sixteen newer uncaptured guest copies have
-    // aged its diagnostic record out of gxXfbCopies.
+    // Keep renderer residency separate from the rolling copy diagnostics so
+    // the latest executed surface at each destination survives diagnostics
+    // aging out of gxXfbCopies.
     const gxXfbCopyDestinations = new Map();
     const gxTextureCopies = [];
     const gxPrimitiveSamples = [];
@@ -6223,11 +6470,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       gxTevTextureCacheByteLimit,
       texture => texture.pixels.byteLength
     );
-    // Each entry records the most recent captured EFB output at a destination.
-    // Direct-compatible entries certify a browser surface; incompatible ones
-    // are tombstones that prevent stale pre-copy RAM from being decoded.
-    // Sparse presentation skips most generations, so uncaptured copies retain
-    // the last browser-side provenance until recovery captures a replacement.
+    // Each entry records the most recent acknowledged, RAM-materialized EFB
+    // output at a destination. Direct-compatible entries may certify a browser
+    // surface while their exact materialized byte hash still matches RAM;
+    // other entries leave the architected tiled bytes available for decoding.
+    // Host presentation sampling never suppresses GX execution: every copy
+    // generation reaches this map only after its exact RAM receipt commits.
     const gxTextureCopyDestinations = new Map();
     const gxTextureCopyConsumers = new Map();
     const gxTextureFormatCounts = new Map();
@@ -6237,7 +6485,6 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxFrameDraws = [];
     let gxFrameDrawVertices = 0;
     let gxFrameSkippedPrimitives = 0;
-    let gxCollectFrameGeometry = true;
     let gxXfbCopyCount = 0;
     let gxTextureCopyCount = 0;
     let gxTextureCopyFramesPresented = 0;
@@ -6376,6 +6623,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     let viMissedHalfLines = 0;
     let viPiDeliveries = 0;
     let viPresentationCount = 0;
+    let viPresentationPairCount = 0;
+    let viPresentationGatedPairs = 0;
+    let viPresentationGatedFields = 0;
     let viHostPresentationCount = 0;
     let viFieldStagedCount = 0;
     let viFieldRejectedCount = 0;
@@ -6563,6 +6813,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     function drainGxFifoStagingForJit() {
       return withPublishedHookCycles(() => {
         const result = drainGxFifoStaging();
+        // A basic block has at most 64 instructions and no Gekko store emits
+        // more than 128 FIFO bytes, so the 64 KiB staging area cannot flush
+        // mid-block. A linked region can exceed it: force that region to its
+        // next dispatch boundary, leaving any suffix staged or decoder-owned
+        // while the runner awaits the receipt before device/DMA service or
+        // further guest execution.
         if (regionRunning) {
           view.setUint32(regionControl + regionExitRequestOffset, 1, true);
         }
@@ -8980,42 +9236,67 @@ const TEMPLATE: &str = r##"<!doctype html>
         frame.copyState.copyCommand,
         frame.copyState.pixelControl
       );
-      const packedStride = layout === null
+      const rowBytes = layout === null
         ? null
         : Math.ceil(width / layout.blockWidth) * layout.blockBytes;
+      const rowCount = layout === null
+        ? null
+        : Math.ceil(height / layout.blockHeight);
       return {
         kind: "output",
+        layout: "gx-efb-copy-tiled-bytes-v1",
+        destination: frame.destination >>> 0,
         generation,
         width,
         height,
+        copyFormat: layout?.copyFormat ?? null,
+        baseFormat: layout?.baseFormat ?? null,
         format: layout?.format ?? null,
         stride: frame.stride,
-        packedStride,
-        directCompatible: packedStride !== null && frame.stride === packedStride,
+        rowBytes,
+        rowCount,
+        byteLength: rowBytes === null ? null : rowBytes * rowCount,
+        packedStride: rowBytes,
+        directCompatible: rowBytes !== null && frame.stride === rowBytes,
       };
+    }
+
+    function gxTextureCopyReceiptExpectation(frame) {
+      const metadata = gxTextureCopyDestinationMetadata(frame, frame.index);
+      // Null means this ordered GX frame must not produce a RAM receipt (XFB
+      // frames are handled by the caller; clipped texture-copy no-ops land here).
+      return metadata.kind === "noop" ? null : Object.freeze(metadata);
     }
 
     function gxRecordTextureCopyGeneration(address, index, captured, frame) {
       const metadata = gxTextureCopyDestinationMetadata(frame, index);
       const hasOutput = metadata.kind === "output";
       if (!captured) {
-        if (gxTextureCopyDestinations.has(address)) {
-          gxTextureCopyCapturedSurfacesRetained += 1;
-        }
-        return hasOutput;
+        throw new Error("GX texture-copy geometry cannot be presentation-gated");
       }
       // A clipped or post-half-scale zero extent is an ordered hardware no-op,
       // so it neither clears nor replaces the last captured destination.
       if (!hasOutput) return false;
-      gxTextureCopyDestinations.delete(address);
-      // Retain non-direct outputs as tombstones. The EFB bytes were never
-      // materialized in WASM RAM, so a later consumer must fail closed rather
-      // than decode the stale bytes that preceded this captured copy.
-      gxTextureCopyDestinations.set(address, metadata);
+      // Captured output becomes visible only when its renderer receipt has
+      // passed exact-contract and RAM-range preflight and all rows are stored.
+      // Until that acknowledgement the worker is under renderer backpressure.
+      return true;
+    }
+
+    function gxCommitTextureCopyMaterialization(expectation, materializedHash) {
+      const metadata = {
+        ...expectation,
+        format: expectation.baseFormat,
+        packedStride: expectation.rowBytes,
+        directCompatible: expectation.stride === expectation.rowBytes,
+        materialized: true,
+        materializedHash,
+      };
+      gxTextureCopyDestinations.delete(expectation.destination);
+      gxTextureCopyDestinations.set(expectation.destination, metadata);
       if (gxTextureCopyDestinations.size > 64) {
         gxTextureCopyDestinations.delete(gxTextureCopyDestinations.keys().next().value);
       }
-      return true;
     }
 
     function gxRecordXfbCopyGeneration(frame) {
@@ -9035,13 +9316,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function gxShouldCollectNextXfb() {
-      const nextFrame = gxXfbCopyCount + 1;
-      return nextFrame <= 4
-        || nextFrame % runnerRenderEvery === 0
-        || nextFrame <= gxTextureCopyCaptureThroughXfb;
-    }
-
     function gxPrearmTextureCopyProducer(address) {
       if (
         !gxTextureCopyConsumers.has(address)
@@ -9049,12 +9323,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         return false;
       }
-      if (gxFrameSkippedPrimitives !== 0) {
-        gxTextureCopyProducerLateArms += 1;
-        return false;
-      }
       gxTextureCopyProducerPreArms += 1;
-      gxCollectFrameGeometry = true;
       return true;
     }
 
@@ -9064,23 +9333,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       // copy producer can arm geometry collection before drawing its source.
       gxRememberTextureCopyConsumer(address);
       if (!gxTextureCopyDestinations.has(address)) return false;
-      const nextXfbCopy = gxXfbCopyCount + 1;
-      const framesUntilSample = nextXfbCopy <= 4 || runnerRenderEvery <= 1
-        ? 0
-        : (runnerRenderEvery - (nextXfbCopy % runnerRenderEvery)) % runnerRenderEvery;
-      // A copied EFB surface only needs to be current when its consuming XFB
-      // frame will be presented. Re-arming on every texture lookup otherwise
-      // defeats renderEvery and makes sparse browser rendering fully sampled.
-      if (framesUntilSample > 4) {
-        gxTextureCopyCaptureDeferrals += 1;
-        return true;
-      }
       gxTextureCopyCaptureArms += 1;
-      gxTextureCopyCaptureThroughXfb = Math.max(
-        gxTextureCopyCaptureThroughXfb,
-        gxXfbCopyCount + 4
-      );
-      gxCollectFrameGeometry = true;
       return true;
     }
 
@@ -9331,7 +9584,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         case 6: textureFormat = 6; break;
       }
       if (textureFormat === undefined) return null;
-      return { ...gxTextureLayout(textureFormat), format: textureFormat };
+      return {
+        ...gxTextureLayout(textureFormat),
+        copyFormat,
+        baseFormat: textureFormat,
+        format: textureFormat,
+      };
     }
 
     function invalidateGxCopyReservation(frame) {
@@ -9517,21 +9775,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function gxTextureLowerMipCopyGeneration(address, mipChain) {
-      if (mipChain.levelCount <= 1) return null;
-      const lowerMipOffset = mipChain.levels[1].encodedOffset;
-      for (const [destination, metadata] of gxTextureCopyDestinations) {
-        const relativeAddress = (destination >>> 0) - (address >>> 0);
-        if (
-          relativeAddress >= lowerMipOffset
-          && relativeAddress < mipChain.encodedBytes
-        ) {
-          return { address: destination >>> 0, generation: metadata.generation };
-        }
-      }
-      return null;
-    }
-
     function gxDecodeTextureLevel(
       pixels,
       level,
@@ -9702,35 +9945,26 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       const address = imageSource.address;
       const textureCopy = gxTextureCopyDestinations.get(address);
+      let directTextureCopy = null;
       let textureCopyIndex;
       if (textureCopy !== undefined) {
         if (
           textureCopy.kind !== "output"
-          || !textureCopy.directCompatible
-          || textureCopy.width !== width
-          || textureCopy.height !== height
-          || textureCopy.format !== format
+          || textureCopy.materialized !== true
+          || !Number.isSafeInteger(textureCopy.materializedHash)
         ) {
           gxTextureDecodeErrors += 1;
           return null;
         }
-        if (mipChain.levelCount > 1) {
-          // The browser cache contains only the copied base surface. Decoding
-          // the chain from RAM would substitute the stale pre-copy base bytes,
-          // while the renderer deliberately cannot bind a one-level surface
-          // as a mipmapped texture. Fail before either source is consumed until
-          // WebGPU can assemble copied level 0 with decoded lower levels.
-          gxTextureDecodeErrors += 1;
-          return null;
+        if (
+          mipChain.levelCount === 1
+          && textureCopy.directCompatible
+          && textureCopy.width === width
+          && textureCopy.height === height
+          && textureCopy.format === format
+        ) {
+          directTextureCopy = textureCopy;
         }
-        textureCopyIndex = textureCopy.generation;
-      }
-      if (gxTextureLowerMipCopyGeneration(address, mipChain) !== null) {
-        // LZGX transport identifies only the base texture-copy generation. A
-        // copied EFB surface inside a lower level would otherwise be silently
-        // decoded as unrelated RAM and cached under incomplete provenance.
-        gxTextureDecodeErrors += 1;
-        return null;
       }
       for (const level of mipChain.levels) {
         gxMarkTextureCopyConsumer((address + level.encodedOffset) >>> 0);
@@ -9753,6 +9987,25 @@ const TEMPLATE: &str = r##"<!doctype html>
         textureHashBatch?.sourceHashes.set(sourceHashKey, hash);
       } else {
         gxTextureSourceHashMemoHits += 1;
+      }
+      if (directTextureCopy !== null) {
+        const baseEncodedBytes = mipChain.levels[0].encodedBytes;
+        let baseHash;
+        if (baseEncodedBytes === encodedBytes) {
+          baseHash = hash;
+        } else {
+          baseHash = 0x811c9dc5;
+          for (let offset = 0; offset < baseEncodedBytes; offset += 1) {
+            baseHash = Math.imul(baseHash ^ source[offset], 0x01000193) >>> 0;
+          }
+        }
+        if (baseHash === directTextureCopy.materializedHash) {
+          textureCopyIndex = directTextureCopy.generation;
+        } else {
+          // A CPU/DMA write changed the architected bytes after capture. Drop
+          // direct-surface provenance and decode current RAM instead.
+          gxTextureCopyDestinations.delete(address);
+        }
       }
       const paletteEntries = format === 8 ? 16 : format === 9 ? 256 : format === 10 ? 16384 : 0;
       let paletteOffset = 0;
@@ -11551,12 +11804,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       vertexSize,
       textureHashBatch = null
     ) {
-      if (!gxCollectFrameGeometry) {
-        gxSkippedGeometryPrimitives += 1;
-        gxSkippedGeometryVertices += vertexCount;
-        gxFrameSkippedPrimitives += 1;
-        return;
-      }
+      // GX execution is never presentation-throttled. Every segment retains
+      // exact source geometry because a later BP52 command can make it an
+      // architecturally observable EFB texture or XFB copy.
       const topology = (opcode >>> 3) & 7;
       const drawStateSerial = textureHashBatch === null
         ? null
@@ -12047,7 +12297,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxXfbCopyCount += 1;
         const recorded = {
           ...frameDiagnostics,
-          captured: gxCollectFrameGeometry,
+          captured: true,
           geometry: {
             drawCalls: frame.geometry.drawCalls,
             vertices: frame.geometry.vertices,
@@ -12056,54 +12306,36 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxXfbCopies.push(recorded);
         gxRecordXfbCopyGeneration(recorded);
         if (gxXfbCopies.length > 16) gxXfbCopies.shift();
-        if (!gxCollectFrameGeometry) {
-          gxFramesSkipped += 1;
-          if (frame.clear) gxSkippedCopyClears.push(gxCopyClearOperation(frame));
-          else gxUncollectedNonClearingFrames += 1;
-        } else {
-          postGxFrame(2, frame);
-          gxXfbFramesCaptured += 1;
-        }
+        // renderEvery is a host-presentation policy only. Every XFB copy still
+        // executes in FIFO order so EFB state, clears, and copy generations
+        // remain architecturally complete.
+        postGxFrame(2, frame);
+        gxXfbFramesCaptured += 1;
         gxFrameDraws = [];
         gxFrameDrawVertices = 0;
         gxFrameSkippedPrimitives = 0;
-        gxCollectFrameGeometry = gxShouldCollectNextXfb();
       } else {
         gxTextureCopyCount += 1;
-        const collectedGeometry = gxCollectFrameGeometry;
-        const knownConsumer = gxTextureCopyConsumers.has(frame.destination);
-        const hasTextureCopyOutput = gxRecordTextureCopyGeneration(
-          frame.destination, gxTextureCopyCount, collectedGeometry, frame
+        gxRecordTextureCopyGeneration(
+          frame.destination, gxTextureCopyCount, true, frame
         );
         const boundAsTexture = gxTextureCopyIsBound(frame.destination);
         gxTextureCopies.push({
           ...frameDiagnostics,
           boundAsTexture,
-          captured: collectedGeometry,
+          captured: true,
           geometry: {
             drawCalls: frame.geometry.drawCalls,
             vertices: frame.geometry.vertices,
           },
         });
         if (gxTextureCopies.length > 16) gxTextureCopies.shift();
-        if (collectedGeometry) {
-          postGxFrame(1, frame);
-          gxTextureCopyFramesPresented += 1;
-        } else if (frame.clear && hasTextureCopyOutput) {
-          gxSkippedCopyClears.push(gxCopyClearOperation(frame));
-        }
+        postGxFrame(1, frame);
+        gxTextureCopyFramesPresented += 1;
         gxFrameDraws = [];
         gxFrameDrawVertices = 0;
         gxFrameSkippedPrimitives = 0;
-        gxCollectFrameGeometry = gxShouldCollectNextXfb();
         if (boundAsTexture) gxMarkTextureCopyConsumer(frame.destination);
-        if (knownConsumer && !collectedGeometry) {
-          // A producer setup that arrived after skipped primitives cannot be
-          // reconstructed. Collect the next EFB segment from its boundary so
-          // the following generation replaces the stale RAM fallback.
-          gxTextureCopyProducerRecoveryArms += 1;
-          gxCollectFrameGeometry = true;
-        }
       }
     }
 
@@ -12134,6 +12366,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         sourceHashes: new Map(),
         paletteHashes: new Map(),
       };
+      if (rendererTextureCopyBarrierSequence !== null) return 0;
       let offset = start;
       let retryAtBufferedBytes = 1;
       while (offset < end) {
@@ -12204,7 +12437,18 @@ const TEMPLATE: &str = r##"<!doctype html>
                 true,
                 textureHashBatch
               );
-              if (consumed !== displayList.length) gxDisplayListErrors += 1;
+              if (consumed !== displayList.length) {
+                if (rendererTextureCopyBarrierSequence === null) {
+                  gxDisplayListErrors += 1;
+                } else {
+                  gxDeferredDisplayListSegments.push(
+                    Object.freeze({
+                      bytes: Uint8Array.from(displayList.subarray(consumed)),
+                      inDisplayList: true,
+                    })
+                  );
+                }
+              }
             }
           }
         } else if (opcode === 0x61) {
@@ -12225,6 +12469,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
         gxDecodedCommands += 1;
         offset += commandBytes;
+        if (rendererTextureCopyBarrierSequence !== null) {
+          gxTextureCopyDecoderBarrierStops += 1;
+          break;
+        }
       }
       if (!inDisplayList) gxDecodeRetryAtBufferedBytes = retryAtBufferedBytes;
       return offset - start;
@@ -12256,6 +12504,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function decodeGxFifo() {
+      if (rendererTextureCopyBarrierSequence !== null) {
+        gxDecodeBlockedSkips += 1;
+        return;
+      }
       const bufferedBytes = gxFifoBufferedBytes();
       if (bufferedBytes < gxDecodeRetryAtBufferedBytes) {
         gxDecodeBlockedSkips += 1;
@@ -12275,6 +12527,42 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.fifoDecode, decodeStartedAt);
+      }
+    }
+
+    function resumeGxDecoderAfterTextureCopyReceipt() {
+      if (rendererTextureCopyBarrierSequence !== null) {
+        throw new Error("GX decoder resumed before texture-copy receipt commit");
+      }
+      gxTextureCopyDecoderBarrierResumes += 1;
+      while (gxDeferredDisplayListSegments.length !== 0) {
+        const segment = gxDeferredDisplayListSegments.shift();
+        if (segment?.inDisplayList !== true || !(segment.bytes instanceof Uint8Array)) {
+          throw new Error("deferred GX display-list continuation is invalid");
+        }
+        const consumed = decodeGxCommands(
+          segment.bytes,
+          0,
+          segment.bytes.length,
+          segment.inDisplayList
+        );
+        if (consumed === segment.bytes.length) continue;
+        if (rendererTextureCopyBarrierSequence === null) {
+          gxDisplayListErrors += 1;
+          continue;
+        }
+        gxDeferredDisplayListSegments.unshift(Object.freeze({
+          bytes: segment.bytes.slice(consumed),
+          inDisplayList: true,
+        }));
+        return;
+      }
+      decodeGxFifo();
+      while (
+        rendererTextureCopyBarrierSequence === null
+        && cpFifoState.distance !== 0
+      ) {
+        if (serviceCommandProcessorFifo() === 0) break;
       }
     }
 
@@ -12393,6 +12681,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       byteBudget = commandProcessorServiceBudgetBytes
     ) {
       commandProcessorServiceCalls += 1;
+      if (rendererTextureCopyBarrierSequence !== null) return 0;
       commandProcessorMaximumRawDistance = Math.max(
         commandProcessorMaximumRawDistance,
         cpFifoState.distance
@@ -12475,6 +12764,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         commandProcessorReadBytes += chunkBytes;
         consumedBytes += chunkBytes;
         remainingBudget -= chunkBytes;
+        if (rendererTextureCopyBarrierSequence !== null) break;
       }
       refreshCommandProcessorInterruptLevel("fifo-after-consume");
       return consumedBytes;
@@ -12682,8 +12972,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function resetGxCommandProcessorDecoder() {
-      commandProcessorDecoderDiscardedBytes += gxDecodeBuffer.length;
+      commandProcessorDecoderDiscardedBytes += gxDecodeBuffer.length
+        + gxDeferredDisplayListSegments.reduce(
+          (total, segment) => total + (segment.bytes?.byteLength ?? 0),
+          0
+        );
       gxDecodeBuffer.length = 0;
+      gxDeferredDisplayListSegments.length = 0;
       gxDecodeRetryAtBufferedBytes = 1;
       commandProcessorDecoderResets += 1;
     }
@@ -20577,6 +20872,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       address,
       scanoutState
     ) {
+      const claimHostPresentationGate = () => {
+        viPresentationPairCount += 1;
+        const submitToHost = viHostPresentationCount < 4
+          || viPresentationPairCount % runnerRenderEvery === 0;
+        if (!submitToHost) viPresentationGatedPairs += 1;
+        return submitToHost;
+      };
       check(field === "top" || field === "bottom", "invalid VI field parity");
       const presentationMode = dimensions.rowRepeat === 2
         ? "interlaced"
@@ -20608,6 +20910,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           presentationMode,
           pairEpoch: allocateViPairEpoch(),
           pairCompleting: true,
+          submitToHost: claimHostPresentationGate(),
           fields: { [field]: member },
         };
       }
@@ -20635,6 +20938,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           presentationMode,
           pairEpoch: pending.pairEpoch,
           pairCompleting: true,
+          submitToHost: pending.submitToHost,
           fields: {
             [pending.field]: pending.member,
             [field]: member,
@@ -20645,11 +20949,19 @@ const TEMPLATE: &str = r##"<!doctype html>
       // the incomplete producer pair and opens a newer epoch rather than
       // allowing two same-parity fields to form a host frame.
       const pairEpoch = allocateViPairEpoch();
-      viPendingFieldPair = { pairEpoch, field, signature, member };
+      const submitToHost = claimHostPresentationGate();
+      viPendingFieldPair = {
+        pairEpoch,
+        field,
+        signature,
+        member,
+        submitToHost,
+      };
       return {
         presentationMode,
         pairEpoch,
         pairCompleting: false,
+        submitToHost,
         fields: { [field]: member },
       };
     }
@@ -20848,59 +21160,73 @@ const TEMPLATE: &str = r##"<!doctype html>
             address,
             scanoutState
           );
-          const temporalXfbCapture = fieldPair.pairCompleting
-            ? claimSmbTemporalXfbCapture()
-            : null;
-          const sustainedPlayReceipt = claimSmbSustainedViReceipt(fieldPair);
           if (resolved !== null) {
             resolved.frame.displayed = true;
             resolved.frame.displayedAtCycle = scheduledCycle;
             resolved.frame.displayedField = target.field;
             resolved.frame.displayedRow = resolved.row;
           }
-          postRendererFrame("vi-present", {
-            scheduledCycle,
-            field: target.field,
-            presentationMode: fieldPair.presentationMode,
-            pairEpoch: fieldPair.pairEpoch,
-            pairCompleting: fieldPair.pairCompleting,
-            pairFields: fieldPair.fields,
-            address,
-            width: dimensions.width,
-            height: dimensions.height,
-            copyIndex: resolved?.frame.index ?? 0,
-            copyRow: resolved?.row ?? 0,
-            pictureConfiguration: dimensions.pictureConfiguration,
-            wordsPerLine: dimensions.wordsPerLine,
-            standardWordsPerLine: dimensions.standardWordsPerLine,
-            activeLines: dimensions.activeLines,
-            nonInterlaced: dimensions.nonInterlaced,
-            fieldStrideBytes: dimensions.fieldStrideBytes,
-            sourceRowStep,
-            fieldHeight: dimensions.fieldHeight,
-            rowRepeat: dimensions.rowRepeat,
-            scanoutPolicy: dimensions.scanoutPolicy,
-            ...(temporalXfbCapture === null ? {} : { temporalXfbCapture }),
-            ...(sustainedPlayReceipt === null ? {} : { sustainedPlayReceipt }),
-          });
-          gxFramesPresented += 1;
-          viPresentationCount += 1;
-          viLastPresentationCycle = scheduledCycle;
-          viLastPresentationField = target.field;
-          viLastPresentationAddress = address;
-          viLastPresentationCopyIndex = resolved?.frame.index ?? 0;
-          viLastPresentationCopyRow = resolved?.row ?? 0;
-          deviceEvents.set("viField", (deviceEvents.get("viField") ?? 0) + 1);
-          traceVi("present", observedCycles, {
-            scheduledCycle,
-            field: target.field,
-            presentationMode: fieldPair.presentationMode,
-            pairEpoch: fieldPair.pairEpoch,
-            pairCompleting: fieldPair.pairCompleting,
-            address: hex32(address),
-            copyIndex: resolved?.frame.index ?? null,
-            copyRow: resolved?.row ?? null,
-          });
+          if (fieldPair.submitToHost) {
+            const temporalXfbCapture = fieldPair.pairCompleting
+              ? claimSmbTemporalXfbCapture()
+              : null;
+            const sustainedPlayReceipt = claimSmbSustainedViReceipt(fieldPair);
+            postRendererFrame("vi-present", {
+              scheduledCycle,
+              field: target.field,
+              presentationMode: fieldPair.presentationMode,
+              pairEpoch: fieldPair.pairEpoch,
+              pairCompleting: fieldPair.pairCompleting,
+              pairFields: fieldPair.fields,
+              address,
+              width: dimensions.width,
+              height: dimensions.height,
+              copyIndex: resolved?.frame.index ?? 0,
+              copyRow: resolved?.row ?? 0,
+              pictureConfiguration: dimensions.pictureConfiguration,
+              wordsPerLine: dimensions.wordsPerLine,
+              standardWordsPerLine: dimensions.standardWordsPerLine,
+              activeLines: dimensions.activeLines,
+              nonInterlaced: dimensions.nonInterlaced,
+              fieldStrideBytes: dimensions.fieldStrideBytes,
+              sourceRowStep,
+              fieldHeight: dimensions.fieldHeight,
+              rowRepeat: dimensions.rowRepeat,
+              scanoutPolicy: dimensions.scanoutPolicy,
+              ...(temporalXfbCapture === null ? {} : { temporalXfbCapture }),
+              ...(sustainedPlayReceipt === null ? {} : { sustainedPlayReceipt }),
+            });
+            gxFramesPresented += 1;
+            viPresentationCount += 1;
+            viLastPresentationCycle = scheduledCycle;
+            viLastPresentationField = target.field;
+            viLastPresentationAddress = address;
+            viLastPresentationCopyIndex = resolved?.frame.index ?? 0;
+            viLastPresentationCopyRow = resolved?.row ?? 0;
+            deviceEvents.set("viField", (deviceEvents.get("viField") ?? 0) + 1);
+            traceVi("present", observedCycles, {
+              scheduledCycle,
+              field: target.field,
+              presentationMode: fieldPair.presentationMode,
+              pairEpoch: fieldPair.pairEpoch,
+              pairCompleting: fieldPair.pairCompleting,
+              address: hex32(address),
+              copyIndex: resolved?.frame.index ?? null,
+              copyRow: resolved?.row ?? null,
+            });
+          } else {
+            // Scanout timing and pair state still advance; only the host canvas
+            // update is sampled. Both halves share one immutable gate decision.
+            viPresentationGatedFields += 1;
+            traceVi("presentation-gated", observedCycles, {
+              scheduledCycle,
+              field: target.field,
+              presentationMode: fieldPair.presentationMode,
+              pairEpoch: fieldPair.pairEpoch,
+              pairCompleting: fieldPair.pairCompleting,
+              renderEvery: runnerRenderEvery,
+            });
+          }
         }
         if (
           viTiming?.displayEnabled
@@ -24022,8 +24348,17 @@ const TEMPLATE: &str = r##"<!doctype html>
               highWater: rendererFrameHighWater,
               waits: rendererBackpressureWaits,
               resultMisses: rendererFrameResultMisses,
+              textureCopyBarrier: {
+                pendingSequence: rendererTextureCopyBarrierSequence,
+                pendingCycle: rendererTextureCopyBarrierCycle,
+                armed: rendererTextureCopyBarriers,
+                resumed: rendererTextureCopyBarrierResumes,
+              },
               viFields: {
                 submitted: viPresentationCount,
+                pairsObserved: viPresentationPairCount,
+                gatedPairs: viPresentationGatedPairs,
+                gatedFields: viPresentationGatedFields,
                 staged: viFieldStagedCount,
                 presented: viHostPresentationCount,
                 rejected: viFieldRejectedCount,
@@ -24114,6 +24449,9 @@ const TEMPLATE: &str = r##"<!doctype html>
           decoder: {
             commands: gxDecodedCommands,
             bufferedBytes: gxFifoBufferedBytes(),
+            deferredDisplayListSegments: gxDeferredDisplayListSegments.length,
+            textureCopyBarrierStops: gxTextureCopyDecoderBarrierStops,
+            textureCopyBarrierResumes: gxTextureCopyDecoderBarrierResumes,
             capacityWatermarkBytes: gxDecodeCapacityWatermarkBytes,
             maximumBufferedBytes: gxDecodeMaximumBufferedBytes,
             retryAtBufferedBytes: gxDecodeRetryAtBufferedBytes,
@@ -24417,6 +24755,9 @@ const TEMPLATE: &str = r##"<!doctype html>
             lastEventCycle: viLastEventCycle,
             lastEventInterval: viLastEventInterval,
             presentationCount: viPresentationCount,
+            presentationPairsObserved: viPresentationPairCount,
+            presentationGatedPairs: viPresentationGatedPairs,
+            presentationGatedFields: viPresentationGatedFields,
             hostPresentationCount: viHostPresentationCount,
             stagedFieldCount: viFieldStagedCount,
             rejectedFieldCount: viFieldRejectedCount,
@@ -25045,6 +25386,14 @@ const TEMPLATE: &str = r##"<!doctype html>
 
         const observedCycles = cycles + executedCycles;
         drainGxFifoStagingAtCycle(observedCycles);
+        // A BP52 texture copy is an architected RAM producer. Fence at this
+        // dispatch boundary before disk DMA, MMIO/device service, PC commit,
+        // idle acceleration, VI presentation, or another guest block. Receipt
+        // completion may resume retained FIFO bytes and post another barrier,
+        // so honorRendererBackpressure drains the full ordered chain.
+        if (rendererFramesInFlight.size !== 0 || rendererFailure !== null) {
+          await honorRendererBackpressure();
+        }
         const diskWait = dueDiskTransferPromise(observedCycles);
         if (diskWait !== null) await diskWait;
         serviceMmio(observedCycles);
@@ -25190,7 +25539,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     try {
       await initBrowserRenderer();
       webGpuRenderer = await WebGpuRenderer.create(display);
-      await webGpuRenderer.drain();
+      requireNoTextureCopyReceipts(
+        await webGpuRenderer.drain(),
+        "WebGPU renderer initialization"
+      );
       webGpuRenderer.check_health();
       document.body.dataset.renderer = "wgpu-webgpu";
     } catch (error) {
@@ -27438,7 +27790,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       output.textContent = "STARTING";
       return enqueueRendererOperation(async phases => {
         webGpuRenderer.reset();
-        await drainWebGpuRenderer(phases);
+        requireNoTextureCopyReceipts(
+          await drainWebGpuRenderer(phases),
+          "WebGPU renderer reset"
+        );
         webGpuRenderer.reset_diagnostics();
       }).catch(handleRendererError);
     }
@@ -28021,13 +28376,76 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       return { residentTextureKeys };
     }
+    function requireTextureCopyReceiptArray(receipts, operation) {
+      if (!Array.isArray(receipts)) {
+        throw new TypeError(`${operation} did not return a texture-copy receipt Array`);
+      }
+      return receipts;
+    }
+    function requireNoTextureCopyReceipts(receipts, operation) {
+      requireTextureCopyReceiptArray(receipts, operation);
+      if (receipts.length !== 0) {
+        throw new Error(
+          `${operation} returned ${receipts.length} unexpected texture-copy receipts`
+        );
+      }
+      return receipts;
+    }
+    function prepareTextureCopyReceiptTransfer(receipts) {
+      requireTextureCopyReceiptArray(receipts, "WebGPU renderer frame drain");
+      const transfer = [];
+      const seenBuffers = new Set();
+      const transported = receipts.map((receipt, index) => {
+        if (
+          receipt === null
+          || typeof receipt !== "object"
+          || Array.isArray(receipt)
+        ) {
+          throw new TypeError(`texture-copy receipt ${index} is not an object`);
+        }
+        const receiptBytes = receipt.bytes;
+        if (
+          !(receiptBytes instanceof Uint8Array)
+          || !(receiptBytes.buffer instanceof ArrayBuffer)
+          || receiptBytes.byteOffset !== 0
+          || receiptBytes.byteLength !== receiptBytes.buffer.byteLength
+          || seenBuffers.has(receiptBytes.buffer)
+        ) {
+          throw new TypeError(
+            `texture-copy receipt ${index} does not own one unique Uint8Array buffer`
+          );
+        }
+        seenBuffers.add(receiptBytes.buffer);
+        transfer.push(receiptBytes.buffer);
+        // Strip renderer-owned prototypes and any non-contract fields before
+        // structured cloning. Scalar semantics remain worker-validated.
+        return {
+          destination: receipt.destination,
+          generation: receipt.generation,
+          width: receipt.width,
+          height: receipt.height,
+          copyFormat: receipt.copyFormat,
+          baseFormat: receipt.baseFormat,
+          stride: receipt.stride,
+          rowBytes: receipt.rowBytes,
+          rowCount: receipt.rowCount,
+          layout: receipt.layout,
+          bytes: receiptBytes,
+        };
+      });
+      return { receipts: transported, transfer };
+    }
     async function drainWebGpuRenderer(phases = rendererHostMetrics.wall?.phases ?? null) {
       const drainStartedAt = phases === null
         ? null
         : beginRendererPhaseTiming(phases.queueDrain);
       try {
-        await webGpuRenderer.drain();
+        const receipts = requireTextureCopyReceiptArray(
+          await webGpuRenderer.drain(),
+          "WebGPU renderer drain"
+        );
         webGpuRenderer.check_health();
+        return receipts;
       } finally {
         if (phases !== null) {
           recordRendererPhaseTiming(phases.queueDrain, drainStartedAt);
@@ -28135,7 +28553,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           return fail(error);
         }
         return (async () => {
-          await drainWebGpuRenderer(phases);
+          const textureCopyReceipts = await drainWebGpuRenderer(phases);
           if (!isCurrentWorker()) return { ok: false, value: null };
           if (message.type === "vi-present" && value?.presented === true) {
             lastPresentedViProjection = {
@@ -28166,9 +28584,13 @@ const TEMPLATE: &str = r##"<!doctype html>
             ? null
             : captureSmbSustainedViReceipt(message, value);
           if (Number.isSafeInteger(rendererSequence)) {
+            const receiptTransport = prepareTextureCopyReceiptTransfer(
+              textureCopyReceipts
+            );
             const completion = {
               type: "renderer-frame-complete",
               rendererSequence,
+              textureCopyReceipts: receiptTransport.receipts,
             };
             if (Array.isArray(value?.residentTextureKeys)) {
               completion.residentTextureKeys = value.residentTextureKeys;
@@ -28179,7 +28601,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             if (message.type === "vi-present") {
               completion.viPresentationResult = { ...value };
             }
-            sourceWorker?.postMessage(completion);
+            sourceWorker?.postMessage(completion, receiptTransport.transfer);
           }
           return { ok: true, value };
         })().catch(fail);
@@ -28196,9 +28618,15 @@ const TEMPLATE: &str = r##"<!doctype html>
           return { ok: false, value: null };
         }
         return drainWebGpuRenderer(phases).then(
-          () => worker === sourceWorker
-            ? { ok: true, value }
-            : { ok: false, value: null },
+          receipts => {
+            requireNoTextureCopyReceipts(
+              receipts,
+              "non-frame WebGPU renderer operation"
+            );
+            return worker === sourceWorker
+              ? { ok: true, value }
+              : { ok: false, value: null };
+          },
           error => {
             if (worker === sourceWorker) handleRendererError(error);
             return { ok: false, value: null };

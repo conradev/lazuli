@@ -29,7 +29,13 @@ function extractFunction(name) {
 }
 
 function evaluateFunctions(names, bindings = {}) {
-  const context = { ...bindings };
+  const context = {
+    runnerRenderEvery: 1,
+    viHostPresentationCount: 0,
+    viPresentationGatedPairs: 0,
+    viPresentationPairCount: 0,
+    ...bindings,
+  };
   vm.createContext(context);
   vm.runInContext(names.map(extractFunction).join("\n\n"), context, {
     filename: "browser_boot.vi-mmio.js",

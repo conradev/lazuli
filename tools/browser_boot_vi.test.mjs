@@ -29,7 +29,16 @@ function extractFunction(name) {
 }
 
 function evaluateFunctions(names, bindings = {}) {
-  const context = { ...bindings };
+  const context = {
+    ArrayBuffer,
+    rendererTextureCopyExpectations: new Map(),
+    Uint8Array,
+    runnerRenderEvery: 1,
+    viHostPresentationCount: 0,
+    viPresentationGatedPairs: 0,
+    viPresentationPairCount: 0,
+    ...bindings,
+  };
   vm.createContext(context);
   vm.runInContext(names.map(extractFunction).join("\n\n"), context, {
     filename: "browser_boot.vi.js",
@@ -529,6 +538,8 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
       "enqueueRendererOperation",
       "gxValidatePreClearWords",
       "submitGxFrame",
+      "requireTextureCopyReceiptArray",
+      "prepareTextureCopyReceiptTransfer",
       "validateViPresentationResult",
       "handleRendererFrame",
       "handleRendererOperation",
@@ -539,7 +550,7 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
       Uint8Array,
       Uint32Array,
       document: { body: { dataset: {} } },
-      drainWebGpuRenderer() { return Promise.resolve(); },
+      drainWebGpuRenderer() { return Promise.resolve([]); },
       handleRendererError(error) { throw error; },
       output: { textContent: "" },
       rendererHostMetrics: {
@@ -593,6 +604,7 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
   assert.deepEqual(JSON.parse(JSON.stringify(workerMessages)), [{
     type: "renderer-frame-complete",
     rendererSequence: 19,
+    textureCopyReceipts: [],
     residentTextureKeys: ["texture-a"],
   }]);
 
@@ -642,6 +654,7 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
   assert.deepEqual(JSON.parse(JSON.stringify(workerMessages.at(-1))), {
     type: "renderer-frame-complete",
     rendererSequence: 20,
+    textureCopyReceipts: [],
     viPresentationResult: {
       accepted: true,
       presented: true,

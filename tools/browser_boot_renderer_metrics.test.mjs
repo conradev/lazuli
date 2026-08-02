@@ -309,7 +309,7 @@ test("sampled renderer queue and drain phases account exact captured-epoch wall 
     rendererHostMetrics: { operations: {} },
     rendererOperationTail: new Promise(resolve => { release = resolve; }),
     webGpuRenderer: {
-      drain: () => Promise.resolve(),
+      drain: () => Promise.resolve([]),
       check_health: () => { healthChecks += 1; },
     },
   };
@@ -322,6 +322,7 @@ test("sampled renderer queue and drain phases account exact captured-epoch wall 
       "newRendererWallPhases",
       "appendRendererOperation",
       "enqueueRendererOperation",
+      "requireTextureCopyReceiptArray",
       "drainWebGpuRenderer",
     ].map(extractFunction).join("\n\n"),
     context,
