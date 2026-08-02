@@ -11,7 +11,7 @@ import { identifyLocalDiscImage } from "./browser_boot_disc_identity.mjs";
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import { decodeCompositorPng } from "./browser_boot_compositor_png.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
   SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
   verifySmbSustainedPlay,
   verifySmbSustainedPlayPrefix,
@@ -41,7 +41,7 @@ import {
   verifyPublicSmbScreencastReport,
 } from "./browser_public_smb_screencast_oracle.mjs";
 
-export const PUBLIC_SMB_SCREENCAST_SCHEMA = "lazuli-public-smb-screencast-v5";
+export const PUBLIC_SMB_SCREENCAST_SCHEMA = "lazuli-public-smb-screencast-v6";
 export const PUBLIC_SMB_SCREENCAST_PROTOCOL = "cdp-page-screencast-v1";
 export const PUBLIC_SMB_SCREENCAST_FRAMES = 64;
 export const PUBLIC_SMB_MIN_WINDOW_VI_RECEIPTS = 64;
@@ -712,9 +712,9 @@ export function derivePublicSmbTerminalProof(report) {
       "terminal report does not prove exact smb-sustained-play completion",
     );
   }
-  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4) {
+  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V5) {
     throw captureFailure(
-      `terminal report requires ${SMB_SUSTAINED_PLAY_SCHEMA_V4}`,
+      `terminal report requires ${SMB_SUSTAINED_PLAY_SCHEMA_V5}`,
     );
   }
   let sustainedPlay;
@@ -790,9 +790,9 @@ function beginObservedSmbSustainedWindow(
     || report.scenario?.status !== "running"
     || report.scenario?.currentStep !== "sustained-play-presented"
   ) return false;
-  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4) {
+  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V5) {
     throw captureFailure(
-      `observed sustained-play window requires ${SMB_SUSTAINED_PLAY_SCHEMA_V4}`,
+      `observed sustained-play window requires ${SMB_SUSTAINED_PLAY_SCHEMA_V5}`,
     );
   }
   let prefix;

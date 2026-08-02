@@ -29,7 +29,7 @@ import {
   SUPER_MONKEY_BALL_READY_CHECKPOINT,
 } from "./browser_boot_checkpoint_v3.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
   verifySmbSustainedPlay,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
@@ -49,13 +49,13 @@ import {
 } from "./browser_game_compatibility_oracle.mjs";
 
 export const BROWSER_GAME_COMPATIBILITY_IAB_CAPTURE_SCHEMA =
-  "lazuli-browser-game-compatibility-iab-capture-v2";
+  "lazuli-browser-game-compatibility-iab-capture-v3";
 export const BROWSER_GAME_COMPATIBILITY_IAB_POLICY_SCHEMA =
-  "lazuli-browser-game-compatibility-iab-policy-v2";
+  "lazuli-browser-game-compatibility-iab-policy-v3";
 export const BROWSER_GAME_COMPATIBILITY_IAB_PROJECTION_SCHEMA =
-  "lazuli-browser-game-compatibility-iab-projection-v2";
+  "lazuli-browser-game-compatibility-iab-projection-v3";
 export const BROWSER_GAME_COMPATIBILITY_IAB_SESSION_SCHEMA =
-  "lazuli-browser-game-compatibility-iab-session-v2";
+  "lazuli-browser-game-compatibility-iab-session-v3";
 
 export const CANONICAL_SMB_COMPATIBILITY_GAME = Object.freeze({
   key: "super-monkey-ball-usa",
@@ -425,7 +425,7 @@ function compatibilityPolicy(corpus, games, captures) {
     suite: [CANONICAL_SMB_COMPATIBILITY_GAME.key, ...games.map(game => game.key)],
     smb: {
       scenario: CANONICAL_SMB_COMPATIBILITY_GAME.scenario,
-      sustainedSchema: SMB_SUSTAINED_PLAY_SCHEMA_V4,
+      sustainedSchema: SMB_SUSTAINED_PLAY_SCHEMA_V5,
       temporalFlicker: "reject-black-white-monochrome-near-extreme",
     },
     thresholds: {
@@ -562,7 +562,7 @@ async function verifySmbCapture(
   );
   exact(
     report.sustainedPlay?.schema,
-    SMB_SUSTAINED_PLAY_SCHEMA_V4,
+    SMB_SUSTAINED_PLAY_SCHEMA_V5,
     `${path}.snapshot.report.sustainedPlay.schema`,
   );
   let oracle;
@@ -582,7 +582,7 @@ async function verifySmbCapture(
     scenario: CANONICAL_SMB_COMPATIBILITY_GAME.scenario,
     reportSha256: await canonicalSha256(report, `${path}.snapshot.report`),
     sustained: Object.freeze({
-      schema: SMB_SUSTAINED_PLAY_SCHEMA_V4,
+      schema: SMB_SUSTAINED_PLAY_SCHEMA_V5,
       received: oracle.received,
       drained: oracle.drained,
       presented: oracle.presented,

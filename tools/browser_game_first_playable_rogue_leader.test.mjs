@@ -167,10 +167,10 @@ test("Rogue Leader derives and verifies an exact retained control-response recei
     consumption.kind,
     "rogue-leader-xwing-left-control-response-v1",
   );
-  assert.equal(consumption.cycle, 140);
+  assert.equal(consumption.cycle, 1_400);
   assert.equal(consumption.controllerAppliedSequence, 3);
-  assert.equal(consumption.hostPublication.scheduledCycle, 120);
-  assert.equal(consumption.hostPublication.observedCycle, 130);
+  assert.equal(consumption.hostPublication.scheduledCycle, 1_200);
+  assert.equal(consumption.hostPublication.observedCycle, 1_300);
   assert.equal(consumption.hostPublication.buttons, 0x0001);
   assert.equal(consumption.hostPublication.sequence, 3);
   assert.equal(
@@ -1141,8 +1141,8 @@ test("Rogue Leader accepts released current input, auxiliary changes, and no phy
   reports.postReport.guestGame.lastActiveGameplayInput.input.buttons = 1;
 
   const consumption = project(game, reports);
-  assert.equal(consumption.cycle, 140);
-  assert.equal(consumption.post.presentationCycle, 190);
+  assert.equal(consumption.cycle, 1_400);
+  assert.equal(consumption.post.presentationCycle, 1_900);
   assert.equal(consumption.receipt.input.buttons, 1);
   assert.equal(consumption.receipt.responseTransition.xChanged, true);
 

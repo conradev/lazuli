@@ -18,8 +18,8 @@ import {
 } from "./browser_public_smb_screencast.mjs";
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V3,
   SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   smbSustainedPlayReport,
@@ -177,12 +177,25 @@ function beginSustainedWindow(collector, overrides = {}) {
 }
 
 function runningSustainedReport(receipts) {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5);
   // Running prefix snapshots precede terminal surface-history publication.
   delete report.rendering.sustainedPresentedSurfaces;
   report.status = "running";
   report.stage = "execute";
   report.cycles -= 1_000;
+  const dsp = report.audioCompatibility.dspLle;
+  dsp.budgetedInstructions = Math.floor(report.cycles / 12);
+  dsp.pendingCpuCycles = report.cycles % 12;
+  dsp.slices = Math.floor(dsp.budgetedInstructions / 64);
+  dsp.executedInstructions = dsp.budgetedInstructions - dsp.slices;
+  dsp.lastServiceCycle = report.cycles;
+  dsp.lastExecutionCycle = report.cycles;
+  dsp.nextExecutionCycle = report.cycles + 768 - dsp.pendingCpuCycles;
+  dsp.stopReasonCounts = {
+    "instruction-budget": dsp.slices - 1,
+    "cpu-mailbox-empty": 1,
+  };
+  report.mmioState.dspAudioDma.nextCycle = report.cycles + 80_928;
   report.scenario.status = "running";
   report.scenario.completedCycle = null;
   report.scenario.stepIndex = 14;
@@ -206,7 +219,7 @@ test("terminal wait actively snapshots and retries before the first completed pa
     Object.hasOwn(ready.rendering, "sustainedPresentedSurfaces"),
     false,
   );
-  const terminal = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const terminal = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5);
   terminal.execution.scheduler.renderEvery = 1;
   const runningState = {
     dataset: { renderer: "wgpu-webgpu", status: "running" },
@@ -516,7 +529,7 @@ test("sustained window discards earlier frames and retains 64 later frames", asy
 });
 
 test("terminal proof requires exact paired sustained play at default cadence", () => {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5);
   report.execution.scheduler.renderEvery = 1;
   const proof = derivePublicSmbTerminalProof(report);
   assert.equal(proof.status, "paused");
@@ -542,11 +555,11 @@ test("terminal proof requires exact paired sustained play at default cadence", (
     /default renderEvery 1/,
   );
 
-  const legacy = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V3);
+  const legacy = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
   legacy.execution.scheduler.renderEvery = 1;
   assert.throws(
     () => derivePublicSmbTerminalProof(legacy),
-    /requires lazuli-smb-sustained-play-v4/,
+    /requires lazuli-smb-sustained-play-v5/,
   );
 
   const fakeTwoStepReport = structuredClone(report);
@@ -593,7 +606,7 @@ test("stopScreencast failure still closes the collector and drains acknowledgeme
 });
 
 test("public SMB run URL remains the exact queryless outer root", () => {
-  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v5");
+  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v6");
   assert.equal(
     configuredPublicSmbCaptureUrl("https://gekko.free/"),
     "https://gekko.free/",

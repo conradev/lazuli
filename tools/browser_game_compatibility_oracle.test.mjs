@@ -91,6 +91,7 @@ function environment(surface = "local-debug") {
 function report(offset = 0, overrides = {}) {
   const width = 640;
   const height = 448;
+  const cycles = 100_000_000 + offset * 1_000_000_000;
   const generation = 3 + offset;
   const pairEpoch = 8 + offset;
   const serial = 2 + offset * 70;
@@ -106,7 +107,7 @@ function report(offset = 0, overrides = {}) {
         url: "http://127.0.0.1:8765/disc",
       },
     },
-    cycles: 100_000_000 + offset * 1_000_000_000,
+    cycles,
     dispatches: 500_000 + offset * 1_000_000,
     instructions: 14_000_000 + offset * 20_000_000,
     execution: {
@@ -129,6 +130,8 @@ function report(offset = 0, overrides = {}) {
     },
     deviceEvents: {
       diskRead: 30 + offset,
+      dspAudioDmaStart: 1 + offset,
+      dspAudioDmaBlock: 100 + offset * 1_000,
       serialPoll: 21 + offset * 140,
       viField: 11 + offset * 140,
     },
@@ -151,7 +154,34 @@ function report(offset = 0, overrides = {}) {
       unknownOutputCommands: 0,
     },
     audioCompatibility: {
-      dspFirstUnsupported: null,
+      dspLle: {
+        backend: "lle-wasm",
+        abi: 1,
+        slices: 1_000 + offset * 10_000,
+        budgetedInstructions: Math.floor(cycles / 12),
+        executedInstructions: 60_000 + offset * 600_000,
+        lastExecutionCycle: cycles,
+        pendingCpuCycles: cycles % 12,
+        lastServiceCycle: cycles,
+        nextExecutionCycle: cycles + 768 - (cycles % 12),
+        lastStopReason: {
+          code: 3,
+          name: "cpu-mailbox-empty",
+        },
+        stopReasonCounts: {
+          "instruction-budget": 900 + offset * 9_000,
+          "cpu-mailbox-empty": 100 + offset * 1_000,
+        },
+        pc: 0x0100,
+        cpuMailboxWrites: 4 + offset * 10,
+        cpuMailboxReads: 4 + offset * 10,
+        cpuMailboxHighWrites: 1 + offset,
+        mailboxReadAccesses: 5 + offset * 10,
+        dspMailboxWrites: 4 + offset * 10,
+        dspMailboxReads: 4 + offset * 10,
+        dspInterruptAssertions: 2 + offset,
+        fault: null,
+      },
       dtkFirstUnsupported: null,
     },
     gxFifo: {
@@ -199,6 +229,15 @@ function report(offset = 0, overrides = {}) {
       },
     },
     mmioState: {
+      dspAudioDma: {
+        enabled: true,
+        configuredBlocks: 16,
+        remainingBlocks: 8,
+        blocksLeft: 7,
+        cyclesPerBlock: 80_928,
+        nextInterruptCycle: null,
+        nextCycle: 100_000_000 + offset * 1_000_000_000 + 80_928,
+      },
       viInterruptModel: {
         hostPresentationCount: 2 + offset * 70,
         lastHostPresentationAddress: `0x${(0x0041_ce80 + offset * 0x1000)
@@ -294,7 +333,7 @@ function makeInvisible(value, { blackAndWhite = false } = {}) {
 test("strict snapshot accepts private local WebGPU evidence", () => {
   assert.equal(
     GAME_COMPATIBILITY_RUNTIME_SCHEMA,
-    "lazuli-game-compatibility-runtime-v2",
+    "lazuli-game-compatibility-runtime-v3",
   );
   const verified = verifyGameCompatibilitySnapshot({
     ...sample(),
@@ -308,6 +347,9 @@ test("strict snapshot accepts private local WebGPU evidence", () => {
       cycles: 100_000_000,
       diskReads: 30,
       dispatches: 500_000,
+      dspBudgetedInstructions: 8_333_333,
+      dspServiceCycles: 100_000_000,
+      dspSlices: 1_000,
       gxCommands: 529,
       hostPresentations: 2,
       instructions: 14_000_000,
@@ -378,7 +420,8 @@ test("snapshot fails closed on renderer, device, queue, GX, and XFB faults", () 
       /expected zero/,
     ],
     [value => { value.report.deviceEvents.diskDeviceError = 1; }, /diskDeviceError/],
-    [value => { value.report.deviceEvents.dspUcodeBootRejected = 1; }, /dspUcodeBootRejected/],
+    [value => { value.report.deviceEvents.dspAudioDmaStart = 0; }, /dspAudioDmaStart/],
+    [value => { value.report.deviceEvents.dspAudioDmaBlock = 0; }, /dspAudioDmaBlock/],
     [value => { value.report.exceptions.counts["0x0300"] = 1; }, /0x0300/],
     [value => { value.report.diskCommands.lastError = "0x00000001"; }, /lastError/],
     [value => { value.report.controller.queueOverflows = 1; }, /queueOverflows/],
@@ -399,7 +442,7 @@ test("snapshot fails closed on renderer, device, queue, GX, and XFB faults", () 
   }
 });
 
-test("runtime v2 fails closed on pending barriers and unsupported hardware", () => {
+test("runtime v3 fails closed on pending barriers and incompatible hardware", () => {
   const cases = [
     [
       value => { delete value.report.execution.scheduler.rendererSync.textureCopyBarrier; },
@@ -460,15 +503,126 @@ test("runtime v2 fails closed on pending barriers and unsupported hardware", () 
       value => { delete value.report.audioCompatibility; },
       /audioCompatibility.*expected an object/,
     ],
+    [value => { delete value.report.audioCompatibility.dspLle; }, /dspLle.*expected an object/],
+    [value => { value.report.audioCompatibility.dspLle.backend = "hle"; }, /dspLle\.backend/],
+    [value => { value.report.audioCompatibility.dspLle.abi = 2; }, /dspLle\.abi/],
+    [value => { value.report.audioCompatibility.dspLle.slices = 0; }, /dspLle\.slices/],
     [
-      value => {
-        value.report.audioCompatibility.dspFirstUnsupported = { code: 4 };
-      },
-      /dspFirstUnsupported.*expected null/,
+      value => { value.report.audioCompatibility.dspLle.budgetedInstructions = 0; },
+      /dspLle\.budgetedInstructions/,
     ],
     [
-      value => { delete value.report.audioCompatibility.dspFirstUnsupported; },
-      /dspFirstUnsupported.*expected null/,
+      value => { value.report.audioCompatibility.dspLle.executedInstructions = 0; },
+      /dspLle\.executedInstructions/,
+    ],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.slices = Math.floor(dsp.budgetedInstructions / 64) + 1;
+      },
+      /at least 64 budgeted instructions/,
+    ],
+    [
+      value => {
+        value.report.audioCompatibility.dspLle.executedInstructions =
+          value.report.audioCompatibility.dspLle.budgetedInstructions + 1;
+      },
+      /no more executed instructions/,
+    ],
+    [value => { value.report.audioCompatibility.dspLle.pendingCpuCycles = -1; }, /pendingCpuCycles/],
+    [value => { value.report.audioCompatibility.dspLle.pendingCpuCycles = 768; }, /0 through 767/],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastServiceCycle -= 1; },
+      /exact cumulative budget and pending-cycle accounting/,
+    ],
+    [
+      value => { value.report.cycles += 1; },
+      /lastExecutionCycle <= lastServiceCycle === report\.cycles/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastExecutionCycle += 1; },
+      /lastExecutionCycle/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastExecutionCycle = 0; },
+      /last execution cycle to match the cumulative instruction budget/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.nextExecutionCycle -= 1; },
+      /next coherent 768-CPU-cycle DSP boundary/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastStopReason.code = 4; },
+      /non-fault DSP stop reason from 0 through 3/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastStopReason.name = "halted"; },
+      /lastStopReason\.name/,
+    ],
+    [value => { value.report.audioCompatibility.dspLle.fault = {}; }, /dspLle\.fault/],
+    [value => { value.report.audioCompatibility.dspLle.pc = "0x0100"; }, /dspLle\.pc/],
+    [value => { value.report.audioCompatibility.dspLle.pc = 0x1_0000; }, /unsigned 16-bit/],
+    [value => { value.report.audioCompatibility.dspLle.cpuMailboxWrites = 0; }, /cpuMailboxWrites/],
+    [value => { value.report.audioCompatibility.dspLle.cpuMailboxReads = 0; }, /cpuMailboxReads/],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.cpuMailboxReads = dsp.cpuMailboxWrites + 1;
+      },
+      /no more DSP consumes than CPU mailbox commits/,
+    ],
+    [value => { value.report.audioCompatibility.dspLle.dspMailboxWrites = 0; }, /dspMailboxWrites/],
+    [value => { value.report.audioCompatibility.dspLle.dspMailboxReads = 0; }, /dspMailboxReads/],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.dspMailboxReads = dsp.dspMailboxWrites + 1;
+      },
+      /no more consuming reads than DSP mailbox writes/,
+    ],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.dspMailboxWrites = dsp.dspMailboxReads + 2;
+      },
+      /at most one unread value in the single-slot DSP mailbox/,
+    ],
+    [value => { value.report.audioCompatibility.dspLle.cpuMailboxHighWrites = -1; }, /cpuMailboxHighWrites/],
+    [value => { value.report.audioCompatibility.dspLle.mailboxReadAccesses = 3; }, /mailboxReadAccesses/],
+    [value => { value.report.audioCompatibility.dspLle.dspInterruptAssertions = -1; }, /dspInterruptAssertions/],
+    [
+      value => { value.report.audioCompatibility.dspLle.stopReasonCounts.future = 1; },
+      /stopReasonCounts\.future/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.stopReasonCounts["instruction-budget"] -= 1; },
+      /stopReasonCounts.*expected 1000/,
+    ],
+    [value => { value.report.mmioState.dspAudioDma.enabled = false; }, /dspAudioDma\.enabled/],
+    [value => { value.report.mmioState.dspAudioDma.configuredBlocks = 0; }, /configuredBlocks/],
+    [value => { value.report.mmioState.dspAudioDma.remainingBlocks = 17; }, /remainingBlocks/],
+    [value => { value.report.mmioState.dspAudioDma.blocksLeft = 8; }, /blocksLeft/],
+    [value => { value.report.mmioState.dspAudioDma.cyclesPerBlock = 0; }, /cyclesPerBlock/],
+    [value => { value.report.mmioState.dspAudioDma.nextCycle = value.report.cycles; }, /nextCycle/],
+    [
+      value => { value.report.audioCompatibility.dspFirstUnsupported = null; },
+      /legacy HLE evidence to be absent/,
+    ],
+    [
+      value => { value.report.mmioState.dspUcodeHash = "0xe2136399"; },
+      /legacy HLE evidence to be absent/,
+    ],
+    [
+      value => { value.report.mmioState.dspTrace = []; },
+      /dspTrace.*legacy HLE evidence to be absent/,
+    ],
+    [
+      value => { value.report.deviceEvents.dspAxVoiceFallback = 1; },
+      /dspAxVoiceFallback.*legacy or unknown DSP event evidence to be absent/,
+    ],
+    [
+      value => { value.report.deviceEvents.dspAxVoiceRender = 1; },
+      /dspAxVoiceRender.*legacy or unknown DSP event evidence to be absent/,
     ],
     [
       value => {
@@ -487,7 +641,7 @@ test("runtime v2 fails closed on pending barriers and unsupported hardware", () 
   }
 });
 
-test("runtime v2 requires canonical clear GX unsupported telemetry", () => {
+test("runtime v3 requires canonical clear GX unsupported telemetry", () => {
   const cases = [
     [value => { delete value.report.gxFifo.decoder.unsupported; }, /unsupported.*expected an object/],
     [value => { value.report.gxFifo.decoder.unsupported = null; }, /unsupported.*expected an object/],
@@ -667,6 +821,9 @@ test("window requires 120 fields, 64 completed viewport frames, and every gamepl
       cycles: 1_000_000_000,
       diskReads: 1,
       dispatches: 1_000_000,
+      dspBudgetedInstructions: 83_333_333,
+      dspServiceCycles: 1_000_000_000,
+      dspSlices: 10_000,
       gxCommands: 1_000,
       hostPresentations: 70,
       instructions: 20_000_000,
@@ -714,11 +871,29 @@ test("window rejects stalls, regressions, resets, and static selected XFBs", () 
       /expected primitives to advance/,
     ],
     [
+      value => {
+        const firstDsp = value[0].report.audioCompatibility.dspLle;
+        const lastDsp = value[1].report.audioCompatibility.dspLle;
+        lastDsp.slices = firstDsp.slices;
+        lastDsp.stopReasonCounts = { ...firstDsp.stopReasonCounts };
+      },
+      /expected dspSlices to advance/,
+    ],
+    [
       value => { value[1].report.deviceEvents.serialPoll = 20; },
       /siPolls regressed/,
     ],
     [
-      value => { value[1].report.cycles = value[0].report.cycles; },
+      value => {
+        value[1].report.cycles = value[0].report.cycles;
+        const dsp = value[1].report.audioCompatibility.dspLle;
+        dsp.budgetedInstructions = Math.floor(value[1].report.cycles / 12);
+        dsp.pendingCpuCycles = value[1].report.cycles % 12;
+        dsp.lastExecutionCycle = value[1].report.cycles;
+        dsp.lastServiceCycle = value[1].report.cycles;
+        dsp.nextExecutionCycle =
+          value[1].report.cycles + 768 - dsp.pendingCpuCycles;
+      },
       /strict forward progress/,
     ],
     [
@@ -758,6 +933,9 @@ test("first-visible gate tolerates boot frames then sustains direct WebGPU outpu
       cycles: 1_000_000_000,
       diskReads: 1,
       dispatches: 1_000_000,
+      dspBudgetedInstructions: 83_333_334,
+      dspServiceCycles: 1_000_000_000,
+      dspSlices: 10_000,
       gxCommands: 1_000,
       hostPresentations: 70,
       instructions: 20_000_000,
@@ -844,16 +1022,12 @@ test("first-visible gate rejects renderer, GX, decoder, exact-path, and DSP faul
       /exactRequiredRejectedDraws.*expected zero/,
     ],
     [
-      value => { value[0].report.deviceEvents.dspZeldaCommandRejected = 1; },
-      /dspZeldaCommandRejected.*expected zero/,
-    ],
-    [
       value => {
-        value[0].report.audioCompatibility.dspFirstUnsupported = {
-          reason: "opcode",
+        value[0].report.audioCompatibility.dspLle.fault = {
+          operation: 1,
         };
       },
-      /dspFirstUnsupported.*expected null/,
+      /dspLle\.fault.*expected null/,
     ],
   ];
   for (const [mutate, pattern] of cases) {

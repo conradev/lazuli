@@ -7,8 +7,8 @@ import test from "node:test";
 
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V3,
   SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   PUBLIC_SMB_SUSTAINED_SCHEMA,
@@ -132,16 +132,16 @@ test("public sustained CLI requires exact commit and release pins", () => {
 
 test("public sustained envelope pins release, loaders, WebGPU, and canonical SMB", () => {
   const evidence = validEnvelope();
-  assert.equal(PUBLIC_SMB_SUSTAINED_SCHEMA, "lazuli-public-smb-sustained-v4");
+  assert.equal(PUBLIC_SMB_SUSTAINED_SCHEMA, "lazuli-public-smb-sustained-v5");
   assert.strictEqual(validatePublicSmbSustainedEnvelope(evidence), evidence);
 });
 
-test("public sustained envelope rejects the superseded v3 schema", () => {
+test("public sustained envelope rejects the superseded v4 schema", () => {
   const evidence = validEnvelope();
-  evidence.schema = "lazuli-public-smb-sustained-v3";
+  evidence.schema = "lazuli-public-smb-sustained-v4";
   assert.throws(
     () => validatePublicSmbSustainedEnvelope(evidence),
-    /\$\.schema: expected lazuli-public-smb-sustained-v4/,
+    /\$\.schema: expected lazuli-public-smb-sustained-v5/,
   );
 });
 
@@ -221,7 +221,7 @@ test("public sustained evidence delegates the terminal report to the strict orac
       source: { kind: "local-file" },
     },
     rendering: { backend: "wgpu-webgpu", error: null },
-    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V4 },
+    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V5 },
   };
   assert.throws(
     () => validatePublicSmbSustainedEvidence(evidence),
@@ -238,11 +238,11 @@ test("public sustained evidence requires per-surface rejection v4 evidence", () 
       source: { kind: "local-file" },
     },
     rendering: { backend: "wgpu-webgpu", error: null },
-    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V3 },
+    sustainedPlay: { schema: SMB_SUSTAINED_PLAY_SCHEMA_V4 },
   };
   assert.throws(
     () => validatePublicSmbSustainedEvidence(evidence),
-    /report\.sustainedPlay\.schema: expected lazuli-smb-sustained-play-v4/,
+    /report\.sustainedPlay\.schema: expected lazuli-smb-sustained-play-v5/,
   );
 });
 

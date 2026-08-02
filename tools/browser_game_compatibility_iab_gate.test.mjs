@@ -20,7 +20,7 @@ import {
   sha256Hex,
 } from "../web/release.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   smbSustainedPlayReport,
@@ -178,6 +178,11 @@ function publicSnapshot(game, report, captureIdentity) {
   const headless = report.headlessCapture;
   delete report.headlessCapture;
   report.disc.source = { kind: "local-file" };
+  const dsp = report.audioCompatibility?.dspLle;
+  if (dsp !== undefined) {
+    dsp.lastExecutionCycle = report.cycles;
+    dsp.nextExecutionCycle = report.cycles + 768 - dsp.pendingCpuCycles;
+  }
   return {
     environment: {
       captureIdentity: structuredClone(captureIdentity),
@@ -217,7 +222,7 @@ function capture(game, activeRelease, ordinal, sessionId) {
 }
 
 function smbCapture(activeRelease, sessionId) {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5);
   delete report.headlessCapture;
   report.disc.source = { kind: "local-file" };
   const observedPair = observed(activeRelease, 1);
@@ -303,7 +308,7 @@ test("v2 gate certifies canonical SMB plus the exact seven-game corpus", async (
   assert.equal(first.smb.disc.identifier, "GMBE8P");
   assert.equal(first.smb.disc.revision, 0);
   assert.equal(first.smb.image.sha256, CANONICAL_SMB_COMPATIBILITY_GAME.image.sha256);
-  assert.equal(first.smb.sustained.schema, SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  assert.equal(first.smb.sustained.schema, SMB_SUSTAINED_PLAY_SCHEMA_V5);
   assert.equal(first.smb.sustained.complete, true);
   assert.deepEqual(first.smb.temporal, {
     captured: 60,
@@ -363,7 +368,7 @@ test("v2 gate fails closed for missing or wrong canonical SMB", async () => {
     ],
     [
       value => { value.smb.snapshot.report.sustainedPlay.schema = "lazuli-smb-sustained-play-v3"; },
-      /sustainedPlay\.schema.*v4/,
+      /sustainedPlay\.schema.*v5/,
     ],
   ];
   for (const [mutate, pattern] of cases) {

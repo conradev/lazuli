@@ -15,13 +15,13 @@ const LEVEL_INDEX = 0;
 const SUBLEVEL_INDEX = 0;
 const CRAFT_HANDLE = 42;
 
-const PRE_CYCLE = 100;
-const PRE_BASELINE_CYCLE = 90;
-const RETAINED_BASELINE_CYCLE = 110;
-const PUBLICATION_SCHEDULED_CYCLE = 120;
-const PUBLICATION_OBSERVED_CYCLE = 130;
-const RECEIPT_CYCLE = 140;
-const POST_CYCLE = 200;
+const PRE_CYCLE = 1_000;
+const PRE_BASELINE_CYCLE = 900;
+const RETAINED_BASELINE_CYCLE = 1_100;
+const PUBLICATION_SCHEDULED_CYCLE = 1_200;
+const PUBLICATION_OBSERVED_CYCLE = 1_300;
+const RECEIPT_CYCLE = 1_400;
+const POST_CYCLE = 2_000;
 
 function hex32(value) {
   return `0x${value.toString(16).padStart(8, "0")}`;
@@ -287,8 +287,22 @@ export function makeRogueLeaderFirstPlayableReportPair(game) {
   const reports = makeGameFirstPlayableReportPair(game, "left");
   reports.preReport.cycles = PRE_CYCLE;
   reports.postReport.cycles = POST_CYCLE;
-  reports.preReport.mmioState.viInterruptModel.lastHostPresentationCycle = 90;
-  reports.postReport.mmioState.viInterruptModel.lastHostPresentationCycle = 190;
+  for (const report of [reports.preReport, reports.postReport]) {
+    const dsp = report.audioCompatibility.dspLle;
+    dsp.budgetedInstructions = Math.floor(report.cycles / 12);
+    dsp.pendingCpuCycles = report.cycles % 12;
+    dsp.slices = Math.floor(dsp.budgetedInstructions / 64);
+    dsp.executedInstructions = dsp.budgetedInstructions - dsp.slices;
+    dsp.stopReasonCounts = {
+      "instruction-budget": dsp.slices - 1,
+      "cpu-mailbox-empty": 1,
+    };
+    dsp.lastExecutionCycle = report.cycles;
+    dsp.lastServiceCycle = report.cycles;
+    dsp.nextExecutionCycle = report.cycles + 768 - dsp.pendingCpuCycles;
+  }
+  reports.preReport.mmioState.viInterruptModel.lastHostPresentationCycle = 900;
+  reports.postReport.mmioState.viInterruptModel.lastHostPresentationCycle = 1_900;
   reports.postReport.headlessCapture.reuse.previous.cycles = PRE_CYCLE;
   reports.postReport.headlessCapture.reuse.action.extendCycles =
     POST_CYCLE - PRE_CYCLE;

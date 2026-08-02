@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: GPL-3.0-only
 
+import { verifyDspLleEvidence } from "./browser_dsp_lle_evidence.mjs";
+
 export const GAME_COMPATIBILITY_RUNTIME_SCHEMA =
-  "lazuli-game-compatibility-runtime-v2";
+  "lazuli-game-compatibility-runtime-v3";
 
 const GX_UNSUPPORTED_TELEMETRY_SCHEMA = "lazuli-gx-unsupported-v1";
 const GX_UNSUPPORTED_REASON_KEY_LIMIT = 32;
@@ -24,9 +26,6 @@ const CRITICAL_EXCEPTION_VECTORS = [
 const DEVICE_FAILURE_EVENTS = [
   "diskDeviceError",
   "diskRequestError",
-  "dspAxCommandRejected",
-  "dspUcodeBootRejected",
-  "dspZeldaCommandRejected",
 ];
 const EXACT_REQUIRED_REJECTION_REASON_KEYS = [
   "exactPreparation",
@@ -110,6 +109,9 @@ const PROGRESS_COUNTERS = [
   "siPolls",
   "diskReads",
   "controllerAppliedSequence",
+  "dspServiceCycles",
+  "dspSlices",
+  "dspBudgetedInstructions",
 ];
 function oracleFailure(path, message) {
   throw new Error(`invalid game compatibility evidence at ${path}: ${message}`);
@@ -396,17 +398,12 @@ function verifyDeviceHealth(report) {
     "$.report.serialInterface.unknownOutputCommands",
   );
 
-  const audio = requiredObject(
-    report.audioCompatibility,
-    "$.report.audioCompatibility",
-  );
+  verifyDspLleEvidence(report, {
+    fail: oracleFailure,
+    root: "$.report",
+  });
   requireExact(
-    audio.dspFirstUnsupported,
-    null,
-    "$.report.audioCompatibility.dspFirstUnsupported",
-  );
-  requireExact(
-    audio.dtkFirstUnsupported,
+    report.audioCompatibility.dtkFirstUnsupported,
     null,
     "$.report.audioCompatibility.dtkFirstUnsupported",
   );
@@ -797,6 +794,10 @@ function progressProjection(
     cycles: report.cycles,
     diskReads: report.deviceEvents.diskRead,
     dispatches: report.dispatches,
+    dspBudgetedInstructions:
+      report.audioCompatibility.dspLle.budgetedInstructions,
+    dspServiceCycles: report.audioCompatibility.dspLle.lastServiceCycle,
+    dspSlices: report.audioCompatibility.dspLle.slices,
     gxCommands: report.gxFifo.decoder.commands,
     hostPresentations: presentationCount,
     instructions: report.instructions,
@@ -940,6 +941,9 @@ export function verifyGameCompatibilityWindow({
     "rendererPresents",
     "siPolls",
     "xfbCopies",
+    "dspServiceCycles",
+    "dspSlices",
+    "dspBudgetedInstructions",
   ]) {
     if (delta[name] <= 0) {
       oracleFailure("$.snapshots", `expected ${name} to advance`);

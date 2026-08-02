@@ -14,8 +14,8 @@ import {
 } from "./browser_public_smb_screencast.mjs";
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V3,
   SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
   smbSustainedPlayReport,
@@ -120,7 +120,7 @@ function captureState(publicUrl, active, status) {
 }
 
 function terminalProof() {
-  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4);
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5);
   report.execution.scheduler.renderEvery = 1;
   return derivePublicSmbTerminalProof(report);
 }
@@ -239,7 +239,7 @@ function validReport() {
   const receiptPrefix = terminal.report.sustainedPlay.receipts.slice(0, 16);
   const prefixIdentity = canonicalIdentity(receiptPrefix);
   return {
-    schema: "lazuli-public-smb-screencast-v5",
+    schema: "lazuli-public-smb-screencast-v6",
     mode: "sustained-public-viewport",
     alignment: "sustained-window-bounded",
     rendererControl: {
@@ -324,7 +324,7 @@ function validReport() {
 
 test("strict passive oracle accepts diverse non-serial public viewport summaries", () => {
   const report = validReport();
-  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v5");
+  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v6");
   const oracle = verifyPublicSmbScreencastReport(report);
   assert.strictEqual(report.oracle, oracle);
   assert.equal(report.oraclePassed, true);
@@ -342,29 +342,29 @@ test("strict passive oracle accepts diverse non-serial public viewport summaries
   });
 });
 
-test("strict passive oracle rejects the superseded v3 outer schema", () => {
+test("strict passive oracle rejects the superseded v5 outer schema", () => {
   const report = validReport();
-  report.schema = "lazuli-public-smb-screencast-v3";
+  report.schema = "lazuli-public-smb-screencast-v5";
   assert.throws(
     () => verifyPublicSmbScreencastReport(report),
     error => (
       error instanceof PublicSmbScreencastValidationError
       && error.path === "$.schema"
-      && /lazuli-public-smb-screencast-v5/.test(error.message)
+      && /lazuli-public-smb-screencast-v6/.test(error.message)
     ),
   );
 });
 
-test("strict passive oracle rejects superseded sustained-play v3 evidence", () => {
+test("strict passive oracle rejects superseded sustained-play v4 evidence", () => {
   const report = validReport();
-  report.terminal.report.sustainedPlay.schema = SMB_SUSTAINED_PLAY_SCHEMA_V3;
+  report.terminal.report.sustainedPlay.schema = SMB_SUSTAINED_PLAY_SCHEMA_V4;
   rebindTerminalReport(report.terminal);
   assert.throws(
     () => verifyPublicSmbScreencastReport(report),
     error => (
       error instanceof PublicSmbScreencastValidationError
       && error.path === "$.terminal.report.sustainedPlay.schema"
-      && /lazuli-smb-sustained-play-v4/.test(error.message)
+      && /lazuli-smb-sustained-play-v5/.test(error.message)
     ),
   );
 });

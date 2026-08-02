@@ -13,7 +13,7 @@ import {
 } from "./browser_boot_gameplay_transcript.mjs";
 import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
 import {
-  SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
   verifySmbSustainedPlay,
 } from "./browser_boot_smb_sustained_play.mjs";
 import {
@@ -29,7 +29,7 @@ import {
   waitForPublicRunner,
 } from "./browser_public_cdp.mjs";
 
-export const PUBLIC_SMB_SUSTAINED_SCHEMA = "lazuli-public-smb-sustained-v4";
+export const PUBLIC_SMB_SUSTAINED_SCHEMA = "lazuli-public-smb-sustained-v5";
 export const PUBLIC_SMB_SUSTAINED_SCENARIO = "smb-sustained-play";
 
 const IMMUTABLE_FRONTEND_PATH = /^\/assets\/frontend-[0-9a-f]{64}\.html$/;
@@ -262,10 +262,10 @@ export function validatePublicSmbSustainedEvidence(evidence) {
   if (report.rendering?.error !== undefined && report.rendering.error !== null) {
     evidenceFailure("$.report.rendering.error", "expected no renderer error");
   }
-  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4) {
+  if (report.sustainedPlay?.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V5) {
     evidenceFailure(
       "$.report.sustainedPlay.schema",
-      `expected ${SMB_SUSTAINED_PLAY_SCHEMA_V4}`,
+      `expected ${SMB_SUSTAINED_PLAY_SCHEMA_V5}`,
     );
   }
   const derived = verifySmbSustainedPlay(report);

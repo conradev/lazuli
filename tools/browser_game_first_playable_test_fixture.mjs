@@ -135,6 +135,8 @@ export function makeGameFirstPlayableReport(game, offset) {
     },
     deviceEvents: {
       diskRead: 30 + offset,
+      dspAudioDmaStart: 1 + offset,
+      dspAudioDmaBlock: 100 + offset * 1_000,
       serialPoll: 21 + offset * 140,
       viField: 11 + offset * 140,
     },
@@ -159,7 +161,34 @@ export function makeGameFirstPlayableReport(game, offset) {
       unknownOutputCommands: 0,
     },
     audioCompatibility: {
-      dspFirstUnsupported: null,
+      dspLle: {
+        backend: "lle-wasm",
+        abi: 1,
+        slices: 1_000 + offset * 10_000,
+        budgetedInstructions: Math.floor(cycles / 12),
+        executedInstructions: 60_000 + offset * 600_000,
+        lastExecutionCycle: cycles,
+        pendingCpuCycles: cycles % 12,
+        lastServiceCycle: cycles,
+        nextExecutionCycle: cycles + 768 - (cycles % 12),
+        lastStopReason: {
+          code: 3,
+          name: "cpu-mailbox-empty",
+        },
+        stopReasonCounts: {
+          "instruction-budget": 900 + offset * 9_000,
+          "cpu-mailbox-empty": 100 + offset * 1_000,
+        },
+        pc: 0x0100,
+        cpuMailboxWrites: 4 + offset * 10,
+        cpuMailboxReads: 4 + offset * 10,
+        cpuMailboxHighWrites: 1 + offset,
+        mailboxReadAccesses: 5 + offset * 10,
+        dspMailboxWrites: 4 + offset * 10,
+        dspMailboxReads: 4 + offset * 10,
+        dspInterruptAssertions: 2 + offset,
+        fault: null,
+      },
       dtkFirstUnsupported: null,
     },
     gxFifo: {
@@ -207,6 +236,15 @@ export function makeGameFirstPlayableReport(game, offset) {
       },
     },
     mmioState: {
+      dspAudioDma: {
+        enabled: true,
+        configuredBlocks: 16,
+        remainingBlocks: 8,
+        blocksLeft: 7,
+        cyclesPerBlock: 80_928,
+        nextInterruptCycle: null,
+        nextCycle: cycles + 80_928,
+      },
       viInterruptModel: {
         hostPresentationCount: 2 + offset * 70,
         lastHostPresentationCycle: cycles - 1_000,
