@@ -1075,6 +1075,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let smbReadyPlayAnchor = null;
     let wariowareLastActiveGameplayInput = null;
     let luigisMansionLastActiveGameplayInput = null;
+    let luigisMansionGxPostTexMtx18Load = null;
     let windWakerLastActiveGameplayInput = null;
     let meleeLastActiveGameplayInput = null;
     let fzeroLastActiveGameplayInput = null;
@@ -1474,6 +1475,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             type,
             packet: frame.packet,
             diagnostics: frame.diagnostics,
+            preClearWords: frame.preClearWords ?? new Uint32Array(),
             rendererSequence,
           }, transfer);
         } else {
@@ -1672,6 +1674,114 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function gxCompactNativeTriangleFans(frame) {
+      const geometry = frame?.geometry;
+      if (
+        geometry === null
+        || typeof geometry !== "object"
+        || !Array.isArray(geometry.draws)
+      ) return frame;
+
+      // V7 evidence tails are indexed by the authentic producer draw order.
+      // Keep any genuine-mip candidate byte-for-byte in that original shape;
+      // fan compaction is currently a V6-only transport optimization.
+      for (const draw of geometry.draws) {
+        const textures = draw?.textures;
+        if (!Array.isArray(textures)) continue;
+        if (textures.some(texture => (
+          texture?.strictV7Preflight?.accepted === true
+          && texture.strictV7Preflight.classification === "genuine-mip"
+        ))) return frame;
+      }
+
+      const compacted = [];
+      let run = [];
+      let changed = false;
+      let transportVertices = 0;
+      const eligible = draw => (
+        draw !== null
+        && typeof draw === "object"
+        && draw.topology === 4
+        && (draw.vertexCount === 3 || draw.vertexCount === 4)
+        && Object.prototype.toString.call(draw.vertices) === "[object Float32Array]"
+        && draw.vertices.length === draw.vertexCount * 36
+        && !Object.hasOwn(draw, "postCullEvidence")
+        && !Object.hasOwn(draw, "exactClipInput")
+        && draw.exactGeometryRequired !== true
+      );
+      const sameState = (left, right) => (
+        left.pipeline === right.pipeline
+        && left.textures === right.textures
+        && left.tevState === right.tevState
+      );
+      const flush = () => {
+        if (run.length === 0) return;
+        if (run.length === 1) {
+          compacted.push(run[0]);
+          transportVertices += run[0].vertexCount;
+          run = [];
+          return;
+        }
+
+        const vertexCount = run.reduce(
+          (total, draw) => total + 3 * (draw.vertexCount - 2),
+          0
+        );
+        const vertices = new Float32Array(vertexCount * 36);
+        let outputVertex = 0;
+        let sourceVertices = 0;
+        for (const draw of run) {
+          sourceVertices += draw.vertexCount;
+          for (let triangle = 0; triangle < draw.vertexCount - 2; triangle += 1) {
+            for (const sourceVertex of [0, triangle + 1, triangle + 2]) {
+              const sourceOffset = sourceVertex * 36;
+              vertices.set(
+                draw.vertices.subarray(sourceOffset, sourceOffset + 36),
+                outputVertex * 36
+              );
+              outputVertex += 1;
+            }
+          }
+        }
+        compacted.push({
+          ...run[0],
+          topology: 2,
+          vertexCount,
+          vertices,
+        });
+        gxFanCompactionSourceDraws += run.length;
+        gxFanCompactionOutputDraws += 1;
+        gxFanCompactionExpandedVertices += vertexCount - sourceVertices;
+        transportVertices += vertexCount;
+        changed = true;
+        run = [];
+      };
+
+      for (const draw of geometry.draws) {
+        if (!eligible(draw)) {
+          flush();
+          compacted.push(draw);
+          transportVertices += draw?.vertexCount ?? 0;
+          continue;
+        }
+        if (run.length !== 0 && !sameState(run[0], draw)) flush();
+        run.push(draw);
+      }
+      flush();
+      if (!changed) return frame;
+
+      gxFanCompactionFrames += 1;
+      return {
+        ...frame,
+        geometry: {
+          ...geometry,
+          drawCalls: compacted.length,
+          vertices: transportVertices,
+          draws: compacted,
+        },
+      };
+    }
+
     function packGxFramePacketForRenderer(
       copyKind,
       frame,
@@ -1695,6 +1805,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function postGxFrame(copyKind, frame) {
+      frame = gxCompactNativeTriangleFans(frame);
       const diagnostics = {
         copyKind,
         index: frame.index,
@@ -1720,7 +1831,68 @@ const TEMPLATE: &str = r##"<!doctype html>
       } finally {
         recordWorkerPhaseTiming(workerHostTimings.gxPacketPacking, packingStartedAt);
       }
-      postRendererFrame("gx-frame", { packet, diagnostics }, [packet]);
+      const preClearWords = gxPackPreClearWords(gxSkippedCopyClears);
+      const transfer = [packet];
+      if (preClearWords.byteLength !== 0) transfer.push(preClearWords.buffer);
+      postRendererFrame(
+        "gx-frame",
+        { packet, diagnostics, preClearWords },
+        transfer
+      );
+      gxDrainSkippedCopyClears();
+    }
+
+    function gxPackPreClearWords(preClears) {
+      if (!Array.isArray(preClears)) {
+        throw new TypeError("GX frame pre-clears are invalid");
+      }
+      const wordsPerClear = 12;
+      const words = new Uint32Array(preClears.length * wordsPerClear);
+      const integer = (value, name, maximum = 0xffffffff) => {
+        if (!Number.isSafeInteger(value)) {
+          throw new TypeError(`GX frame pre-clear ${name} must be a safe integer`);
+        }
+        if (value < 0 || value > maximum) {
+          throw new RangeError(
+            `GX frame pre-clear ${name} must be between 0 and ${maximum}`
+          );
+        }
+        return value;
+      };
+      for (let index = 0; index < preClears.length; index += 1) {
+        const clear = preClears[index];
+        if (clear === null || typeof clear !== "object" || Array.isArray(clear)) {
+          throw new TypeError(`GX frame pre-clear ${index} must be an object`);
+        }
+        const copyState = clear.copyState;
+        if (
+          copyState === null
+          || typeof copyState !== "object"
+          || Array.isArray(copyState)
+          || !Array.isArray(copyState.clearRgba)
+          || copyState.clearRgba.length !== 4
+        ) {
+          throw new TypeError(`GX frame pre-clear ${index} copy state is invalid`);
+        }
+        const offset = index * wordsPerClear;
+        for (const [word, [value, name, maximum]] of [
+          [clear.sourceX, "sourceX", 0xffffffff],
+          [clear.sourceY, "sourceY", 0xffffffff],
+          [clear.sourceWidth, "sourceWidth", 0xffffffff],
+          [clear.sourceHeight, "sourceHeight", 0xffffffff],
+          [copyState.zMode, "zMode", 0x00ffffff],
+          [copyState.blendMode, "blendMode", 0x00ffffff],
+          [copyState.pixelControl, "pixelControl", 0x00ffffff],
+          [copyState.clearRgba[0], "clearRgba[0]", 0xff],
+          [copyState.clearRgba[1], "clearRgba[1]", 0xff],
+          [copyState.clearRgba[2], "clearRgba[2]", 0xff],
+          [copyState.clearRgba[3], "clearRgba[3]", 0xff],
+          [copyState.clearDepth, "clearDepth", 0x00ffffff],
+        ].entries()) {
+          words[offset + word] = integer(value, `${index}.${name}`, maximum);
+        }
+      }
+      return words;
     }
 
     function gxFramePacketInteger(value, name, maximum = 0xffffffff) {
@@ -5330,6 +5502,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     const searchParams = new URLSearchParams(globalThis.runnerSearch);
     const wariowareNextMicrogameQueryName = "wariowareNextMicrogame";
     const wariowareNextMicrogameQueryValue = "0x63";
+    const luigisMansionGxLoadTexMtxImmPc = 0x801fa288;
+    const luigisMansionGxPostTexMtx18Id = 118;
+    const luigisMansionGxTexMtxWordCount = 12;
     const wariowareNextMicrogameSetterPc = 0x80046050;
     const wariowareNextMicrogameActivationPc = 0x80046174;
     const wariowareNextMicrogameActivationCallers = [
@@ -5378,6 +5553,111 @@ const TEMPLATE: &str = r##"<!doctype html>
       0x38000000,
       0x93e1000c,
     ];
+    function exactLuigisMansionRevisionZero(disc = boot) {
+      return disc?.identifier === "GLME01"
+        && disc.discId === 0
+        && disc.version === 0;
+    }
+    function classifyFloat32Word(word) {
+      if ((word & 0x7f800000) !== 0x7f800000) return "finite";
+      return (word & 0x007fffff) === 0 ? "infinity" : "nan";
+    }
+    function observeLuigisMansionGxLoadTexMtxImm(
+      currentPc,
+      probe = luigisMansionGxPostTexMtx18Load,
+      readRegister = readGpr,
+      readPointer = guestEffectivePointer,
+      memory = view,
+      disc = boot,
+      observedCycles = cycles
+    ) {
+      if (
+        (probe !== null && probe.firstNonFiniteLoad !== null)
+        || !exactLuigisMansionRevisionZero(disc)
+        || currentPc !== luigisMansionGxLoadTexMtxImmPc
+        || readRegister(4) !== luigisMansionGxPostTexMtx18Id
+      ) return probe;
+
+      const sourceAddress = readRegister(3);
+      if (!isUint32(sourceAddress)) return probe;
+      const byteLength = luigisMansionGxTexMtxWordCount * 4;
+      const pointer = readPointer(sourceAddress, byteLength);
+      if (pointer === null) return probe;
+      const rawWords = Array.from(
+        { length: luigisMansionGxTexMtxWordCount },
+        (_unused, index) => memory.getUint32(pointer + index * 4, false)
+      );
+      const classifications = rawWords.map(classifyFloat32Word);
+      const nonFiniteWordIndices = [];
+      for (let index = 0; index < classifications.length; index += 1) {
+        if (classifications[index] !== "finite") {
+          nonFiniteWordIndices.push(index);
+        }
+      }
+      const observedQualifyingLoadCount =
+        (probe?.observedQualifyingLoadCount ?? 0) + 1;
+      const load = {
+        ordinal: observedQualifyingLoadCount,
+        cycle: observedCycles,
+        pc: currentPc,
+        sourceAddress,
+        matrixId: luigisMansionGxPostTexMtx18Id,
+        rawWords,
+        classifications,
+        allFinite: nonFiniteWordIndices.length === 0,
+        finiteWordCount: rawWords.length - nonFiniteWordIndices.length,
+        nonFiniteWordIndices,
+      };
+      return {
+        observedQualifyingLoadCount,
+        firstLoad: probe?.firstLoad ?? load,
+        firstNonFiniteLoad: nonFiniteWordIndices.length === 0
+          ? null
+          : load,
+      };
+    }
+    function snapshotLuigisMansionGxPostTexMtx18Load(
+      probe = luigisMansionGxPostTexMtx18Load
+    ) {
+      if (probe === null) return null;
+      const snapshotLoad = load => load === null
+        ? null
+        : {
+            ordinal: load.ordinal,
+            cycle: load.cycle,
+            pc: hex32(load.pc),
+            function: "GXLoadTexMtxImm",
+            matrix: "GX_PTTEXMTX18",
+            matrixId: load.matrixId,
+            sourceAddress: hex32(load.sourceAddress),
+            wordCount: load.rawWords.length,
+            byteOrder: "big-endian",
+            rawWords: load.rawWords.map(hex32),
+            classifications: [...load.classifications],
+            allFinite: load.allFinite,
+            finiteWordCount: load.finiteWordCount,
+            nonFiniteWordIndices: [...load.nonFiniteWordIndices],
+          };
+      return {
+        observedQualifyingLoadCount: probe.observedQualifyingLoadCount,
+        firstLoad: snapshotLoad(probe.firstLoad),
+        firstNonFiniteLoad: snapshotLoad(probe.firstNonFiniteLoad),
+      };
+    }
+    function luigisMansionGxLoadTexMtxImmProbeRegionSafe(
+      region,
+      probe = luigisMansionGxPostTexMtx18Load,
+      disc = boot
+    ) {
+      if (
+        (probe !== null && probe.firstNonFiniteLoad !== null)
+        || !exactLuigisMansionRevisionZero(disc)
+      ) return true;
+      const pcs = region?.pcs;
+      return Array.isArray(pcs)
+        && pcs.length !== 0
+        && !pcs.includes(luigisMansionGxLoadTexMtxImmPc);
+    }
     function exactWarioWareRevisionZero(disc = boot) {
       return disc?.identifier === "GZWE01"
         && disc.discId === 0
@@ -5724,6 +6004,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const yieldRunnerTask = createRunnerYieldScheduler();
     const recentPcs = [];
     const regionsByPc = new Map();
+    let instructionDependencyFreeLinkedRegions = new WeakSet();
     const regionCandidateHits = new Map();
     const regionFusionHits = new Map();
     const regionFusionHitThreshold = 8;
@@ -5879,6 +6160,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const gxTextureCopyConsumers = new Map();
     const gxTextureFormatCounts = new Map();
     const gxTevModeCounts = new Map();
+    const gxPrimitiveSampleStride = 256;
     const gxTmem = new Uint8Array(1024 * 1024);
     let gxFrameDraws = [];
     let gxFrameDrawVertices = 0;
@@ -5916,10 +6198,25 @@ const TEMPLATE: &str = r##"<!doctype html>
     let gxUnknownOpcodes = 0;
     let gxTextureDecodes = 0;
     let gxTextureCacheHits = 0;
+    let gxTextureSourceHashComputations = 0;
+    let gxTextureSourceHashMemoHits = 0;
+    let gxTexturePaletteHashComputations = 0;
+    let gxTexturePaletteHashMemoHits = 0;
+    let gxDrawStateSnapshots = 0;
+    let gxDrawStateMemoHits = 0;
+    let gxVertexTransformContextSnapshots = 0;
+    let gxVertexTransformContextMemoHits = 0;
+    let gxVertexTransformCacheSnapshots = 0;
+    let gxVertexTransformCacheMemoHits = 0;
+    let gxFanCompactionFrames = 0;
+    let gxFanCompactionSourceDraws = 0;
+    let gxFanCompactionOutputDraws = 0;
+    let gxFanCompactionExpandedVertices = 0;
     let gxTextureDecodedBytes = 0;
     let gxTextureDecodeErrors = 0;
     let gxTevTextureCacheHits = 0;
     let gxTexgenTransforms = 0;
+    let gxTexgenNonFiniteTransforms = 0;
     let gxTexgenFallbacks = 0;
     let gxTexturedDraws = 0;
     let gxTlutLoads = 0;
@@ -7648,13 +7945,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       return gxFifoScratch.getFloat32(0, false);
     }
 
-    function gxXfMatrixRow(baseAddress, rowIndex) {
+    function gxXfMatrixRow(baseAddress, rowIndex, preserveNonFinite = false) {
       const address = baseAddress + rowIndex * 4;
       if (address < 0 || address + 3 >= gxXfRegisters.length) return null;
       const row = Array.from({ length: 4 }, (_unused, index) =>
         gxXfFloat(address + index)
       );
-      return row.every(Number.isFinite) ? row : null;
+      return preserveNonFinite || row.every(Number.isFinite) ? row : null;
     }
 
     function gxDot4(row, vector) {
@@ -7669,14 +7966,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       return [vector[0] / length, vector[1] / length, vector[2] / length];
     }
 
-    function gxTransformPosition(position, matrixIndex) {
+    function gxTransformPosition(position, matrixIndex, context = null) {
       if ((matrixIndex + 2) * 4 + 3 >= 0x100) return null;
-      const matrix = Array.from({ length: 12 }, (_unused, index) =>
-        gxXfFloat(matrixIndex * 4 + index)
-      );
-      if (matrix.some(value => !Number.isFinite(value)) || matrix.every(value => value === 0)) {
-        return null;
-      }
+      const matrix = context === null
+        ? Array.from({ length: 12 }, (_unused, index) =>
+            gxXfFloat(matrixIndex * 4 + index)
+          )
+        : gxVertexTransformPositionMatrix(context, matrixIndex);
+      if (
+        matrix === null
+        || matrix.some(value => !Number.isFinite(value))
+        || matrix.every(value => value === 0)
+      ) return null;
       const x = Math.fround(position[0]);
       const y = Math.fround(position[1]);
       const z = Math.fround(position[2]);
@@ -7798,16 +8099,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       return transformed.every(Number.isFinite) ? transformed : null;
     }
 
-    function gxTransformNormalVector(vector, matrixIndex) {
+    function gxTransformNormalVector(vector, matrixIndex, context = null) {
       if (vector === null || vector === undefined) return null;
       const base = 0x400 + (matrixIndex % 32) * 3;
       if (base + 8 >= gxXfRegisters.length) return null;
-      const matrix = Array.from({ length: 9 }, (_unused, index) =>
-        gxXfFloat(base + index)
-      );
-      if (matrix.some(value => !Number.isFinite(value)) || matrix.every(value => value === 0)) {
-        return null;
-      }
+      const matrix = context === null
+        ? Array.from({ length: 9 }, (_unused, index) =>
+            gxXfFloat(base + index)
+          )
+        : gxVertexTransformNormalMatrix(context, matrixIndex);
+      if (
+        matrix === null
+        || matrix.some(value => !Number.isFinite(value))
+        || matrix.every(value => value === 0)
+      ) return null;
       const x = Math.fround(vector[0]);
       const y = Math.fround(vector[1]);
       const z = Math.fround(vector[2]);
@@ -7826,8 +8131,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       return transformed;
     }
 
-    function gxTransformNormal(vector, matrixIndex) {
-      const transformed = gxTransformNormalVector(vector, matrixIndex);
+    function gxTransformNormal(vector, matrixIndex, context = null) {
+      const transformed = gxTransformNormalVector(vector, matrixIndex, context);
       if (transformed === null) return null;
       let lengthSquared = Math.fround(
         transformed[0] * transformed[0]
@@ -7845,16 +8150,28 @@ const TEMPLATE: &str = r##"<!doctype html>
       return transformed.map(value => Math.fround(value / length));
     }
 
-    function gxTransformTexCoord(attributes, matrixIndex, texgenIndex) {
+    function gxTransformTexCoord(
+      attributes,
+      matrixIndex,
+      texgenIndex,
+      context = null
+    ) {
       if (texgenIndex < 0 || texgenIndex >= 8) return null;
-      const texgenCount = gxXfRegisters[0x103f] & 0xf;
+      const texgenCount = context === null
+        ? gxXfRegisters[0x103f] & 0xf
+        : context.texgenCount;
       if (texgenIndex >= texgenCount) return null;
-      const info = gxXfRegisters[0x1040 + texgenIndex] >>> 0;
+      const info = context === null
+        ? gxXfRegisters[0x1040 + texgenIndex] >>> 0
+        : context.texgenInfo[texgenIndex];
       const projection = (info >>> 1) & 1;
       const inputForm = (info >>> 2) & 1;
       const texgenType = (info >>> 4) & 3;
       const sourceRow = (info >>> 7) & 0x1f;
-      let source;
+      // Flipper starts each source row at AB11's default coordinate. Missing
+      // optional vertex attributes leave that value intact; they are not a
+      // renderer fallback or a malformed texgen.
+      let source = [0, 0, 1];
       if (sourceRow === 0) source = attributes.position;
       if (sourceRow === 1) source = attributes.normal;
       if (sourceRow === 2) {
@@ -7865,16 +8182,22 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (sourceRow >= 5 && sourceRow <= 12) {
         source = attributes.rawTextureCoords[sourceRow - 5];
       }
-      if (source === null || source === undefined) return null;
+      if (source === null || source === undefined) source = [0, 0, 1];
 
       const input = inputForm === 0
         ? [source[0] ?? 0, source[1] ?? 0, 1, 1]
         : [source[0] ?? 0, source[1] ?? 0, source[2] ?? 0, 1];
       let transformed;
       if (texgenType === 0) {
-        const row0 = gxXfMatrixRow(0, matrixIndex);
-        const row1 = gxXfMatrixRow(0, matrixIndex + 1);
-        const row2 = gxXfMatrixRow(0, matrixIndex + 2);
+        const row0 = context === null
+          ? gxXfMatrixRow(0, matrixIndex, true)
+          : gxVertexTransformTexgenRow(context, matrixIndex, false);
+        const row1 = context === null
+          ? gxXfMatrixRow(0, matrixIndex + 1, true)
+          : gxVertexTransformTexgenRow(context, matrixIndex + 1, false);
+        const row2 = context === null
+          ? gxXfMatrixRow(0, matrixIndex + 2, true)
+          : gxVertexTransformTexgenRow(context, matrixIndex + 2, false);
         if (row0 === null || row1 === null || row2 === null) return null;
         transformed = [gxDot4(row0, input), gxDot4(row1, input), gxDot4(row2, input)];
       } else if (texgenType === 1) {
@@ -7887,15 +8210,26 @@ const TEMPLATE: &str = r##"<!doctype html>
       let result = projection === 0
         ? [transformed[0], transformed[1], 1]
         : transformed;
-      if ((gxXfRegisters[0x1012] & 1) !== 0) {
-        const postInfo = gxXfRegisters[0x1050 + texgenIndex] >>> 0;
+      const dualTexTransform = context === null
+        ? (gxXfRegisters[0x1012] & 1) !== 0
+        : context.dualTexTransform;
+      if (dualTexTransform) {
+        const postInfo = context === null
+          ? gxXfRegisters[0x1050 + texgenIndex] >>> 0
+          : context.texgenPostInfo[texgenIndex];
         if ((postInfo & 0x100) !== 0) {
           result = gxNormalize3(result);
         }
         const postIndex = postInfo & 0x3f;
-        const post0 = gxXfMatrixRow(0x500, postIndex);
-        const post1 = gxXfMatrixRow(0x500, (postIndex + 1) & 0x3f);
-        const post2 = gxXfMatrixRow(0x500, (postIndex + 2) & 0x3f);
+        const post0 = context === null
+          ? gxXfMatrixRow(0x500, postIndex, true)
+          : gxVertexTransformTexgenRow(context, postIndex, true);
+        const post1 = context === null
+          ? gxXfMatrixRow(0x500, (postIndex + 1) & 0x3f, true)
+          : gxVertexTransformTexgenRow(context, (postIndex + 1) & 0x3f, true);
+        const post2 = context === null
+          ? gxXfMatrixRow(0x500, (postIndex + 2) & 0x3f, true)
+          : gxVertexTransformTexgenRow(context, (postIndex + 2) & 0x3f, true);
         if (post0 === null || post1 === null || post2 === null) {
           return null;
         }
@@ -7909,16 +8243,22 @@ const TEMPLATE: &str = r##"<!doctype html>
         ];
       }
       const scaleRegister = 0x30 + texgenIndex * 2;
+      const scaleS = context === null
+        ? (gxBpRegisters[scaleRegister] & 0xffff) + 1
+        : context.texgenScales[texgenIndex][0];
+      const scaleT = context === null
+        ? (gxBpRegisters[scaleRegister + 1] & 0xffff) + 1
+        : context.texgenScales[texgenIndex][1];
       result = [
         Math.fround(
-          Math.fround(result[0]) * ((gxBpRegisters[scaleRegister] & 0xffff) + 1)
+          Math.fround(result[0]) * scaleS
         ),
         Math.fround(
-          Math.fround(result[1]) * ((gxBpRegisters[scaleRegister + 1] & 0xffff) + 1)
+          Math.fround(result[1]) * scaleT
         ),
         result[2],
       ];
-      if (!result.every(Number.isFinite)) return null;
+      if (!result.every(Number.isFinite)) gxTexgenNonFiniteTransforms += 1;
       gxTexgenTransforms += 1;
       return result;
     }
@@ -8182,6 +8522,114 @@ const TEMPLATE: &str = r##"<!doctype html>
       return Object.values(light).flat().every(Number.isFinite) ? light : null;
     }
 
+    function gxPrepareVertexTransformContext() {
+      gxVertexTransformContextSnapshots += 1;
+      return {
+        projection: Array.from({ length: 6 }, (_unused, index) =>
+          gxXfFloat(0x1020 + index)
+        ),
+        projectionType: gxXfRegisters[0x1026] >>> 0,
+        viewport: Array.from({ length: 6 }, (_unused, index) =>
+          gxXfFloat(0x101a + index)
+        ),
+        scissorOffset: gxBpRegisters[0x59] >>> 0,
+        positionMatrices: Array(64),
+        normalMatrices: Array(32),
+        texgenRows: Array(66),
+        texgenPostRows: Array(64),
+        texgenCount: gxXfRegisters[0x103f] & 0xf,
+        dualTexTransform: (gxXfRegisters[0x1012] & 1) !== 0,
+        texgenInfo: Array.from(
+          { length: 8 },
+          (_unused, index) => gxXfRegisters[0x1040 + index] >>> 0
+        ),
+        texgenPostInfo: Array.from(
+          { length: 8 },
+          (_unused, index) => gxXfRegisters[0x1050 + index] >>> 0
+        ),
+        texgenScales: Array.from({ length: 8 }, (_unused, index) => [
+          (gxBpRegisters[0x30 + index * 2] & 0xffff) + 1,
+          (gxBpRegisters[0x31 + index * 2] & 0xffff) + 1,
+        ]),
+        material: Array.from(
+          { length: 2 },
+          (_unused, channel) => gxXfColorU8(0x100c + channel)
+        ),
+        ambient: Array.from(
+          { length: 2 },
+          (_unused, channel) => gxXfColorU8(0x100a + channel)
+        ),
+        colorControl: Array.from(
+          { length: 2 },
+          (_unused, channel) => gxXfRegisters[0x100e + channel] >>> 0
+        ),
+        alphaControl: Array.from(
+          { length: 2 },
+          (_unused, channel) => gxXfRegisters[0x1010 + channel] >>> 0
+        ),
+        lights: Array(8),
+      };
+    }
+
+    function gxVertexTransformPositionMatrix(context, matrixIndex) {
+      const cached = context.positionMatrices[matrixIndex];
+      if (cached !== undefined) {
+        gxVertexTransformCacheMemoHits += 1;
+        return cached;
+      }
+      const matrix = Array.from({ length: 12 }, (_unused, index) =>
+        gxXfFloat(matrixIndex * 4 + index)
+      );
+      context.positionMatrices[matrixIndex] = (
+        matrix.every(Number.isFinite)
+        && matrix.some(value => value !== 0)
+      ) ? matrix : null;
+      gxVertexTransformCacheSnapshots += 1;
+      return context.positionMatrices[matrixIndex];
+    }
+
+    function gxVertexTransformNormalMatrix(context, matrixIndex) {
+      const cacheIndex = matrixIndex % 32;
+      const cached = context.normalMatrices[cacheIndex];
+      if (cached !== undefined) {
+        gxVertexTransformCacheMemoHits += 1;
+        return cached;
+      }
+      const base = 0x400 + cacheIndex * 3;
+      const matrix = Array.from({ length: 9 }, (_unused, index) =>
+        gxXfFloat(base + index)
+      );
+      context.normalMatrices[cacheIndex] = (
+        matrix.every(Number.isFinite)
+        && matrix.some(value => value !== 0)
+      ) ? matrix : null;
+      gxVertexTransformCacheSnapshots += 1;
+      return context.normalMatrices[cacheIndex];
+    }
+
+    function gxVertexTransformTexgenRow(context, rowIndex, post) {
+      const rows = post ? context.texgenPostRows : context.texgenRows;
+      const cached = rows[rowIndex];
+      if (cached !== undefined) {
+        gxVertexTransformCacheMemoHits += 1;
+        return cached;
+      }
+      rows[rowIndex] = gxXfMatrixRow(post ? 0x500 : 0, rowIndex, true);
+      gxVertexTransformCacheSnapshots += 1;
+      return rows[rowIndex];
+    }
+
+    function gxVertexTransformLight(context, lightIndex) {
+      const cached = context.lights[lightIndex];
+      if (cached !== undefined) {
+        gxVertexTransformCacheMemoHits += 1;
+        return cached;
+      }
+      context.lights[lightIndex] = gxXfLight(lightIndex);
+      gxVertexTransformCacheSnapshots += 1;
+      return context.lights[lightIndex];
+    }
+
     function gxDot3(left, right) {
       return gxCullAdd(
         gxCullAdd(
@@ -8298,7 +8746,14 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function gxLightChannelComponent(
-      control, component, material, ambient, vertexColor, position, normal
+      control,
+      component,
+      material,
+      ambient,
+      vertexColor,
+      position,
+      normal,
+      context = null
     ) {
       const materialValue = (control & 1) !== 0 ? vertexColor[component] : material[component];
       if ((control & 2) === 0) return materialValue;
@@ -8316,7 +8771,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         );
         if (normalIsRequired && normal === null) return null;
         const effectiveNormal = normal ?? [Number.NaN, Number.NaN, Number.NaN];
-        const light = gxXfLight(lightIndex);
+        const light = context === null
+          ? gxXfLight(lightIndex)
+          : gxVertexTransformLight(context, lightIndex);
         if (light === null) return null;
         const lightPosition = gxLightPosition(
           control, light, position, effectiveNormal
@@ -8364,7 +8821,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) >> 8;
     }
 
-    function gxLightRasterChannels(position, normal, colors) {
+    function gxLightRasterChannels(position, normal, colors, context = null) {
       if (
         !Array.isArray(colors)
         || colors.length < 2
@@ -8387,26 +8844,34 @@ const TEMPLATE: &str = r##"<!doctype html>
       const channels = [];
       for (let channel = 0; channel < 2; channel += 1) {
         const vertexColor = colors[channel];
-        const material = gxXfColorU8(0x100c + channel);
-        const ambient = gxXfColorU8(0x100a + channel);
-        const colorControl = gxXfRegisters[0x100e + channel] >>> 0;
-        const alphaControl = gxXfRegisters[0x1010 + channel] >>> 0;
+        const material = context === null
+          ? gxXfColorU8(0x100c + channel)
+          : context.material[channel];
+        const ambient = context === null
+          ? gxXfColorU8(0x100a + channel)
+          : context.ambient[channel];
+        const colorControl = context === null
+          ? gxXfRegisters[0x100e + channel] >>> 0
+          : context.colorControl[channel];
+        const alphaControl = context === null
+          ? gxXfRegisters[0x1010 + channel] >>> 0
+          : context.alphaControl[channel];
         const bytes = [
           gxLightChannelComponent(
             colorControl, 0, material, ambient, vertexColor,
-            transformedPosition, transformedNormal
+            transformedPosition, transformedNormal, context
           ),
           gxLightChannelComponent(
             colorControl, 1, material, ambient, vertexColor,
-            transformedPosition, transformedNormal
+            transformedPosition, transformedNormal, context
           ),
           gxLightChannelComponent(
             colorControl, 2, material, ambient, vertexColor,
-            transformedPosition, transformedNormal
+            transformedPosition, transformedNormal, context
           ),
           gxLightChannelComponent(
             alphaControl, 3, material, ambient, vertexColor,
-            transformedPosition, transformedNormal
+            transformedPosition, transformedNormal, context
           ),
         ];
         if (bytes.some(value => value === null)) return null;
@@ -9080,7 +9545,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function gxDecodeTexture(textureMap) {
+    function gxDecodeTexture(textureMap, textureHashBatch = null) {
       const registers = gxTextureRegisters(textureMap);
       const image0 = gxBpRegisters[registers.image0];
       const rawMode0 = gxBpRegisters[registers.mode0];
@@ -9145,8 +9610,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         return null;
       }
       const source = bytes.subarray(pointer, pointer + encodedBytes);
-      let hash = 0x811c9dc5;
-      for (const byte of source) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+      const sourceHashKey = `${pointer}:${encodedBytes}`;
+      let hash = textureHashBatch?.sourceHashes.get(sourceHashKey);
+      if (hash === undefined) {
+        hash = 0x811c9dc5;
+        for (const byte of source) {
+          hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+        }
+        gxTextureSourceHashComputations += 1;
+        textureHashBatch?.sourceHashes.set(sourceHashKey, hash);
+      } else {
+        gxTextureSourceHashMemoHits += 1;
+      }
       const paletteEntries = format === 8 ? 16 : format === 9 ? 256 : format === 10 ? 16384 : 0;
       let paletteOffset = 0;
       let paletteFormat = 0;
@@ -9160,12 +9635,23 @@ const TEMPLATE: &str = r##"<!doctype html>
           gxTextureDecodeErrors += 1;
           return null;
         }
-        paletteHash = 0x811c9dc5;
-        for (let offset = 0; offset < paletteBytes; offset += 1) {
-          paletteHash = Math.imul(
-            paletteHash ^ gxTmem[paletteOffset + offset],
-            0x01000193
-          ) >>> 0;
+        const paletteHashKey = `${gxTlutLoads}:${paletteOffset}:${paletteBytes}`;
+        const memoizedPaletteHash = textureHashBatch?.paletteHashes.get(
+          paletteHashKey
+        );
+        if (memoizedPaletteHash === undefined) {
+          paletteHash = 0x811c9dc5;
+          for (let offset = 0; offset < paletteBytes; offset += 1) {
+            paletteHash = Math.imul(
+              paletteHash ^ gxTmem[paletteOffset + offset],
+              0x01000193
+            ) >>> 0;
+          }
+          gxTexturePaletteHashComputations += 1;
+          textureHashBatch?.paletteHashes.set(paletteHashKey, paletteHash);
+        } else {
+          paletteHash = memoizedPaletteHash;
+          gxTexturePaletteHashMemoHits += 1;
         }
       }
       const key = [
@@ -9359,11 +9845,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       return new Uint8Array(buffer);
     }
 
-    function gxTevTextures(stages) {
+    function gxTevTextures(stages, textureHashBatch = null) {
       const textures = Array(8).fill(null);
       for (const stage of stages) {
         if (!stage.textureEnabled || textures[stage.textureMap] !== null) continue;
-        const texture = gxDecodeTexture(stage.textureMap);
+        const texture = gxDecodeTexture(stage.textureMap, textureHashBatch);
         if (texture === null) {
           throw new Error(
             `GX TEV stage ${stage.index} requires undecodable texture map ${stage.textureMap}`
@@ -9541,6 +10027,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         && coords.every(coord =>
           coord !== null && coord.length >= 2 && coord.every(Number.isFinite)
         );
+    }
+
+    function gxTevCoordsTransportable(coords, vertexCount) {
+      return Array.isArray(coords) && coords.length === vertexCount
+        && coords.every(coord => Array.isArray(coord) && coord.length >= 3);
     }
 
     function gxTevCoordsEquivalent(left, right) {
@@ -9745,13 +10236,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       return gxProjectViewPosition(gxTransformPosition(position, matrixIndex));
     }
 
-    function gxProjectViewPosition(viewPosition) {
+    function gxProjectViewPosition(viewPosition, context = null) {
       if (viewPosition === null) return null;
       const [viewX, viewY, viewZ] = viewPosition;
-      const projection = Array.from({ length: 6 }, (_unused, index) =>
-        gxXfFloat(0x1020 + index)
-      );
-      const projectionType = gxXfRegisters[0x1026] >>> 0;
+      const projection = context === null
+        ? Array.from({ length: 6 }, (_unused, index) =>
+            gxXfFloat(0x1020 + index)
+          )
+        : context.projection;
+      const projectionType = context === null
+        ? gxXfRegisters[0x1026] >>> 0
+        : context.projectionType;
       let clipX;
       let clipY;
       let clipZ;
@@ -9772,13 +10267,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (![clipX, clipY, clipZ, clipW].every(Number.isFinite) || clipW === 0) {
         return null;
       }
-      const viewport = Array.from({ length: 6 }, (_unused, index) =>
-        gxXfFloat(0x101a + index)
-      );
+      const viewport = context === null
+        ? Array.from({ length: 6 }, (_unused, index) =>
+            gxXfFloat(0x101a + index)
+          )
+        : context.viewport;
       if (viewport.some(value => !Number.isFinite(value)) || viewport[0] === 0 || viewport[1] === 0) {
         return null;
       }
-      const scissorOffset = gxBpRegisters[0x59];
+      const scissorOffset = context === null
+        ? gxBpRegisters[0x59]
+        : context.scissorOffset;
       const scissorX = scissorOffset & 0x3ff;
       const scissorY = (scissorOffset >>> 10) & 0x3ff;
       const projected = [
@@ -10429,7 +10928,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     ) {
       if (
         gxSourceTriangleCount(topology, vertexCount) === 0
-        || pipeline.cullMode === 3
+        // Dolphin issue 13489 uses these exact SMB1/SMB2 FIFO logs to
+        // demonstrate that host CPU culling removes visible menu draws while
+        // the normal GPU path renders them. Keep raw face modes on direct
+        // WebGPU; cull-all is likewise never a managed-coverage candidate.
+        || pipeline.cullMode !== 0
         || !Array.isArray(texturedStages)
         || (pipeline.pixelControl & 7) === 2
         || ((pipeline.zTextureMode >>> 2) & 3) !== 0
@@ -10524,7 +11027,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function gxManagedCoverageVerticesCandidate(topology, vertices) {
       if (
-        !Array.isArray(vertices)
+        !(Array.isArray(vertices) || vertices instanceof Float32Array)
         || vertices.length === 0
         || vertices.length % 36 !== 0
       ) {
@@ -10681,7 +11184,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function gxDecodeVertex(source, cursor, vatIndex) {
+    function gxDecodeVertex(
+      source,
+      cursor,
+      vatIndex,
+      transformContext = null
+    ) {
       const descriptorLow = gxCpRegisters[0x50];
       const vat0 = gxCpRegisters[0x70 + vatIndex];
       const vat1 = gxCpRegisters[0x80 + vatIndex];
@@ -10786,17 +11294,32 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (rawTextureCoords[texture].length === 1) rawTextureCoords[texture].push(0);
         }
       }
-      const viewPosition = gxTransformPosition(position, positionMatrix);
-      const projected = gxProjectViewPosition(viewPosition);
-      const normal = gxTransformNormal(normalAttribute.normal, positionMatrix);
+      const viewPosition = gxTransformPosition(
+        position,
+        positionMatrix,
+        transformContext
+      );
+      const projected = gxProjectViewPosition(viewPosition, transformContext);
+      const normal = gxTransformNormal(
+        normalAttribute.normal,
+        positionMatrix,
+        transformContext
+      );
       const tangent = gxTransformNormalVector(
-        normalAttribute.tangent, positionMatrix
+        normalAttribute.tangent,
+        positionMatrix,
+        transformContext
       );
       const binormal = gxTransformNormalVector(
-        normalAttribute.binormal, positionMatrix
+        normalAttribute.binormal,
+        positionMatrix,
+        transformContext
       );
       const rasterColors = gxLightRasterChannels(
-        viewPosition, normal, colors
+        viewPosition,
+        normal,
+        colors,
+        transformContext
       );
       if (rasterColors === null) {
         gxLightingRejectedVertices += 1;
@@ -10811,7 +11334,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         rawTextureCoords,
       };
       const texCoords = textureMatrices.map((matrixIndex, texgenIndex) =>
-        gxTransformTexCoord(texgenAttributes, matrixIndex, texgenIndex)
+        gxTransformTexCoord(
+          texgenAttributes,
+          matrixIndex,
+          texgenIndex,
+          transformContext
+        )
       );
       return {
         cursor,
@@ -10883,7 +11411,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       return textureResult === null ? [] : selectedTexCoords.flat();
     }
 
-    function recordGxPrimitive(opcode, source, payloadOffset, vertexCount, vertexSize) {
+    function recordGxPrimitive(
+      opcode,
+      source,
+      payloadOffset,
+      vertexCount,
+      vertexSize,
+      textureHashBatch = null
+    ) {
       if (!gxCollectFrameGeometry) {
         gxSkippedGeometryPrimitives += 1;
         gxSkippedGeometryVertices += vertexCount;
@@ -10891,17 +11426,72 @@ const TEMPLATE: &str = r##"<!doctype html>
         return;
       }
       const topology = (opcode >>> 3) & 7;
-      const pipeline = gxDrawPipelineState();
-      const stageCount = Math.min(16, ((gxBpRegisters[0x00] >>> 10) & 0xf) + 1);
-      const stages = Array.from({ length: stageCount }, (_unused, stageIndex) =>
-        gxTevStageState(stageIndex)
+      const drawStateSerial = textureHashBatch === null
+        ? null
+        : gxCpLoads + gxXfLoads + gxIndexedXfLoads + gxBpLoads;
+      let drawState = (
+        drawStateSerial === null
+        || textureHashBatch.drawState?.serial !== drawStateSerial
+      )
+        ? null
+        : textureHashBatch.drawState;
+      if (drawState === null) {
+        const pipeline = gxDrawPipelineState();
+        const stageCount = Math.min(
+          16,
+          ((gxBpRegisters[0x00] >>> 10) & 0xf) + 1
+        );
+        const stages = Array.from(
+          { length: stageCount },
+          (_unused, stageIndex) => gxTevStageState(stageIndex)
+        );
+        const texturedStages = stages.filter(stage => stage.textureEnabled);
+        drawState = {
+          serial: drawStateSerial,
+          pipeline,
+          stageCount,
+          stages,
+          texturedStages,
+          textures: null,
+          tevState: null,
+          vertexTransformContext: null,
+        };
+        gxDrawStateSnapshots += 1;
+        if (textureHashBatch !== null) {
+          textureHashBatch.drawState = drawState;
+        }
+      } else {
+        gxDrawStateMemoHits += 1;
+      }
+      const {
+        pipeline,
+        stageCount,
+        stages,
+        texturedStages,
+      } = drawState;
+      let vertexTransformContext = drawState.vertexTransformContext;
+      if (vertexTransformContext === null) {
+        vertexTransformContext = gxPrepareVertexTransformContext();
+        drawState.vertexTransformContext = vertexTransformContext;
+      } else {
+        gxVertexTransformContextMemoHits += 1;
+      }
+      const capturePrimitiveSample = (
+        gxPrimitiveSamples.length < 16
+        || gxPrimitives % gxPrimitiveSampleStride === 0
       );
-      const texturedStages = stages.filter(stage => stage.textureEnabled);
-      const vertices = [];
+      // Emit directly into the Worker-bound f32 layout. The former boxed
+      // number array doubled both allocation and copying in Luigi's opening,
+      // where one frame can contain tens of thousands of tiny fan draws.
+      const sourceVertices = new Float32Array(vertexCount * 36);
       const texCoordSets = Array.from({ length: 8 }, () => []);
-      const rawTextureCoordSets = Array.from({ length: 8 }, () => []);
-      const rasterColorSets = Array.from({ length: 2 }, () => []);
-      const normalSet = [];
+      const rawTextureCoordSets = capturePrimitiveSample
+        ? Array.from({ length: 8 }, () => [])
+        : null;
+      const rasterColorSets = capturePrimitiveSample
+        ? Array.from({ length: 2 }, () => [])
+        : null;
+      const normalSet = capturePrimitiveSample ? [] : null;
       const sourcePositions = [];
       const positionMatrixIndices = [];
       let textureMatrices = null;
@@ -10910,7 +11500,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       let legacyProjectionNullVertices = 0;
       for (let vertex = 0; vertex < vertexCount; vertex += 1) {
         const start = payloadOffset + vertex * vertexSize;
-        const decoded = gxDecodeVertex(source, start, opcode & 7);
+        const decoded = gxDecodeVertex(
+          source,
+          start,
+          opcode & 7,
+          vertexTransformContext
+        );
         if (decoded.cursor !== start + vertexSize) gxVertexDecodeErrors += 1;
         if (decoded.skipped) {
           gxDroppedVertices += 1;
@@ -10941,27 +11536,47 @@ const TEMPLATE: &str = r##"<!doctype html>
           continue;
         }
         const [raster0, raster1] = decoded.rasterColors;
-        vertices.push(
-          projected[0], projected[1], projected[2], projected[3],
-          ...raster0,
-          ...raster1
-        );
+        const output = vertex * 36;
+        sourceVertices[output] = projected[0];
+        sourceVertices[output + 1] = projected[1];
+        sourceVertices[output + 2] = projected[2];
+        sourceVertices[output + 3] = projected[3];
+        sourceVertices[output + 4] = raster0[0];
+        sourceVertices[output + 5] = raster0[1];
+        sourceVertices[output + 6] = raster0[2];
+        sourceVertices[output + 7] = raster0[3];
+        sourceVertices[output + 8] = raster1[0];
+        sourceVertices[output + 9] = raster1[1];
+        sourceVertices[output + 10] = raster1[2];
+        sourceVertices[output + 11] = raster1[3];
         for (let texgen = 0; texgen < 8; texgen += 1) {
           const texCoord = decoded.texCoords[texgen];
           texCoordSets[texgen].push(texCoord);
-          rawTextureCoordSets[texgen].push(decoded.rawTextureCoords[texgen]);
-          vertices.push(...(texCoord ?? [0, 0, 1]));
+          if (capturePrimitiveSample) {
+            rawTextureCoordSets[texgen].push(decoded.rawTextureCoords[texgen]);
+          }
+          const texCoordOutput = output + 12 + texgen * 3;
+          if (texCoord === null) {
+            sourceVertices[texCoordOutput] = 0;
+            sourceVertices[texCoordOutput + 1] = 0;
+            sourceVertices[texCoordOutput + 2] = 1;
+          } else {
+            sourceVertices[texCoordOutput] = texCoord[0];
+            sourceVertices[texCoordOutput + 1] = texCoord[1];
+            sourceVertices[texCoordOutput + 2] = texCoord[2];
+          }
         }
-        rasterColorSets[0].push(raster0);
-        rasterColorSets[1].push(raster1);
-        normalSet.push(decoded.normal);
-        textureMatrices = decoded.textureMatrices;
+        if (capturePrimitiveSample) {
+          rasterColorSets[0].push(raster0);
+          rasterColorSets[1].push(raster1);
+          normalSet.push(decoded.normal);
+          textureMatrices = decoded.textureMatrices;
+        }
       }
-      if (!decodeComplete || vertices.length === 0) {
+      if (!decodeComplete || vertexCount === 0) {
         gxDroppedVertices += legacyProjectionNullVertices;
         return;
       }
-      const sourceVertices = new Float32Array(vertices);
       let exactClipInput = null;
       if (exactGeometryRequired) {
         exactClipInput = gxManagedCoverageExactClipInput(
@@ -10983,13 +11598,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       for (const stage of stages) {
         if (!stage.textureEnabled) continue;
         const coords = texCoordSets[stage.texCoordIndex];
-        if (!gxTevCoordsValid(coords, vertexCount) || coords.some(coord => coord.length < 3)) {
+        if (!gxTevCoordsTransportable(coords, vertexCount)) {
           throw new Error(
             `GX TEV stage ${stage.index} requires invalid texcoord ${stage.texCoordIndex}`
           );
         }
       }
-      const textures = gxTevTextures(stages);
+      if (drawState.textures === null) {
+        drawState.textures = gxTevTextures(stages, textureHashBatch);
+        drawState.tevState = gxPackTevState(stages);
+      }
+      const { textures, tevState } = drawState;
       const collectCullSources = gxManagedCoverageStateCandidate(
         topology,
         vertexCount,
@@ -11005,10 +11624,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       gxTevModeCounts.set(tevMode, (gxTevModeCounts.get(tevMode) ?? 0) + 1);
       const texCoordIndex = texturedStages[0]?.texCoordIndex ?? 0;
       const selectedTexCoords = texCoordSets[texCoordIndex];
-      const postCullEvidence = (
+      const collectCullVertices = (
         !exactGeometryRequired
         && collectCullSources
-        && gxManagedCoverageVerticesCandidate(topology, vertices)
+        && gxManagedCoverageVerticesCandidate(topology, sourceVertices)
+      );
+      const postCullEvidence = (
+        collectCullVertices
       )
         ? gxManagedCoveragePostCullEvidence(
           topology,
@@ -11022,6 +11644,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         !exactGeometryRequired
         && collectCullSources
         && postCullEvidence === null
+        && sourceVertices.every(Number.isFinite)
       ) {
         exactClipInput = gxManagedCoverageExactClipInput(
           topology,
@@ -11039,7 +11662,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         // and duplicate one boxed JavaScript number per vertex component.
         vertices: sourceVertices,
         textures,
-        tevState: gxPackTevState(stages),
+        tevState,
         pipeline,
         ...(postCullEvidence === null ? {} : { postCullEvidence }),
         ...(exactClipInput === null ? {} : { exactClipInput }),
@@ -11051,55 +11674,66 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxExactRequiredVertices += vertexCount;
       }
       const vatIndex = opcode & 7;
-      const primitiveSample = {
-        cycle: cycles,
-        dispatch: dispatches,
-        opcode: "0x" + opcode.toString(16).padStart(2, "0"),
-        topology: draw.topology,
-        vat: vatIndex,
-        vertexSize,
-        vertexCount,
-        vcdLow: hex32(gxCpRegisters[0x50]),
-        vcdHigh: hex32(gxCpRegisters[0x60]),
-        vat0: hex32(gxCpRegisters[0x70 + vatIndex]),
-        vat1: hex32(gxCpRegisters[0x80 + vatIndex]),
-        vat2: hex32(gxCpRegisters[0x90 + vatIndex]),
-        vertices: vertices.slice(0, 32),
-        texCoordIndex,
-        texCoords: selectedTexCoords.slice(0, 4),
-        rasterColors: rasterColorSets.map(colors => colors.slice(0, 4)),
-        normals: normalSet.slice(0, 4),
-        generatedTexCoords: texCoordSets.map(coords => coords.slice(0, 4)),
-        rawTextureCoords: rawTextureCoordSets.map(coords => coords.slice(0, 4)),
-        textureMatrices,
-        textures: textures.map(gxTextureSummary),
-        tev: {
-          stageCount,
-          stages: stages.map(stage => ({
-            index: stage.index,
-            order: hex32(stage.order),
-            textureMap: stage.textureMap,
-            texCoordIndex: stage.texCoordIndex,
-            textureEnabled: stage.textureEnabled,
-            colorChannel: stage.colorChannel,
-            colorCombiner: hex32(stage.colorCombiner),
-            alphaCombiner: hex32(stage.alphaCombiner),
-            konstColorSelector: stage.konstColorSelector,
-            konstAlphaSelector: stage.konstAlphaSelector,
-          })),
-          order0: hex32(gxBpRegisters[0x28]),
-          color0: hex32(gxBpRegisters[0xc0]),
-          alpha0: hex32(gxBpRegisters[0xc1]),
-          colorRegisters: gxTevColorRegisters.map(register => register.slice()),
-          konstRegisters: gxTevKonstRegisters.map(register => register.slice()),
-          ksel: Array.from({ length: 8 }, (_unused, index) =>
-            hex32(gxBpRegisters[0xf6 + index])
-          ),
-        },
-      };
-      if (gxPrimitiveSamples.length < 16) gxPrimitiveSamples.push(primitiveSample);
-      gxRecentPrimitiveSamples.push(primitiveSample);
-      if (gxRecentPrimitiveSamples.length > 16) gxRecentPrimitiveSamples.shift();
+      // Full primitive telemetry duplicates draw-local arrays and TEV state.
+      // Capturing it for every primitive becomes the dominant cost in scenes
+      // made from thousands of tiny display-list draws. Preserve the first
+      // sixteen boot samples, then retain a bounded rolling sample no more
+      // than 255 primitives behind the live stream.
+      if (capturePrimitiveSample) {
+        const primitiveSample = {
+          cycle: cycles,
+          dispatch: dispatches,
+          opcode: "0x" + opcode.toString(16).padStart(2, "0"),
+          topology: draw.topology,
+          vat: vatIndex,
+          vertexSize,
+          vertexCount,
+          vcdLow: hex32(gxCpRegisters[0x50]),
+          vcdHigh: hex32(gxCpRegisters[0x60]),
+          vat0: hex32(gxCpRegisters[0x70 + vatIndex]),
+          vat1: hex32(gxCpRegisters[0x80 + vatIndex]),
+          vat2: hex32(gxCpRegisters[0x90 + vatIndex]),
+          vertices: Array.from(sourceVertices.subarray(0, 32)),
+          texCoordIndex,
+          texCoords: selectedTexCoords.slice(0, 4),
+          rasterColors: rasterColorSets.map(colors => colors.slice(0, 4)),
+          normals: normalSet.slice(0, 4),
+          generatedTexCoords: texCoordSets.map(coords => coords.slice(0, 4)),
+          rawTextureCoords: rawTextureCoordSets.map(coords => coords.slice(0, 4)),
+          textureMatrices,
+          textures: textures.map(gxTextureSummary),
+          tev: {
+            stageCount,
+            stages: stages.map(stage => ({
+              index: stage.index,
+              order: hex32(stage.order),
+              textureMap: stage.textureMap,
+              texCoordIndex: stage.texCoordIndex,
+              textureEnabled: stage.textureEnabled,
+              colorChannel: stage.colorChannel,
+              colorCombiner: hex32(stage.colorCombiner),
+              alphaCombiner: hex32(stage.alphaCombiner),
+              konstColorSelector: stage.konstColorSelector,
+              konstAlphaSelector: stage.konstAlphaSelector,
+            })),
+            order0: hex32(gxBpRegisters[0x28]),
+            color0: hex32(gxBpRegisters[0xc0]),
+            alpha0: hex32(gxBpRegisters[0xc1]),
+            colorRegisters: gxTevColorRegisters.map(register => register.slice()),
+            konstRegisters: gxTevKonstRegisters.map(register => register.slice()),
+            ksel: Array.from({ length: 8 }, (_unused, index) =>
+              hex32(gxBpRegisters[0xf6 + index])
+            ),
+          },
+        };
+        if (gxPrimitiveSamples.length < 16) {
+          gxPrimitiveSamples.push(primitiveSample);
+        }
+        gxRecentPrimitiveSamples.push(primitiveSample);
+        if (gxRecentPrimitiveSamples.length > 16) {
+          gxRecentPrimitiveSamples.shift();
+        }
+      }
     }
 
     function gxSparseRegisters(registers) {
@@ -11295,7 +11929,6 @@ const TEMPLATE: &str = r##"<!doctype html>
           if (frame.clear) gxSkippedCopyClears.push(gxCopyClearOperation(frame));
           else gxUncollectedNonClearingFrames += 1;
         } else {
-          gxFlushSkippedCopyClears();
           postGxFrame(2, frame);
           gxXfbFramesCaptured += 1;
         }
@@ -11322,12 +11955,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         });
         if (gxTextureCopies.length > 16) gxTextureCopies.shift();
         if (collectedGeometry) {
-          gxFlushSkippedCopyClears();
           postGxFrame(1, frame);
           gxTextureCopyFramesPresented += 1;
         } else if (frame.clear) {
-          gxFlushSkippedCopyClears();
-          postMessage({ type: "gx-clear", clear: gxCopyClearOperation(frame) });
+          gxSkippedCopyClears.push(gxCopyClearOperation(frame));
         }
         gxFrameDraws = [];
         gxFrameDrawVertices = 0;
@@ -11354,14 +11985,23 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
-    function gxFlushSkippedCopyClears() {
-      for (const clear of gxSkippedCopyClears) {
-        postMessage({ type: "gx-clear", clear });
-      }
+    function gxDrainSkippedCopyClears() {
+      const clears = gxSkippedCopyClears;
       gxSkippedCopyClears = [];
+      return clears;
     }
 
-    function decodeGxCommands(source, start, end, inDisplayList = false) {
+    function decodeGxCommands(
+      source,
+      start,
+      end,
+      inDisplayList = false,
+      textureHashBatch = null
+    ) {
+      textureHashBatch ??= {
+        sourceHashes: new Map(),
+        paletteHashes: new Map(),
+      };
       let offset = start;
       let retryAtBufferedBytes = 1;
       while (offset < end) {
@@ -11425,7 +12065,13 @@ const TEMPLATE: &str = r##"<!doctype html>
               gxDisplayListErrors += 1;
             } else {
               const displayList = bytes.subarray(pointer, pointer + size);
-              const consumed = decodeGxCommands(displayList, 0, displayList.length, true);
+              const consumed = decodeGxCommands(
+                displayList,
+                0,
+                displayList.length,
+                true,
+                textureHashBatch
+              );
               if (consumed !== displayList.length) gxDisplayListErrors += 1;
             }
           }
@@ -11436,7 +12082,14 @@ const TEMPLATE: &str = r##"<!doctype html>
           const vertexSize = gxVertexSize(opcode & 7);
           gxPrimitives += 1;
           gxVertices += vertices;
-          recordGxPrimitive(opcode, source, offset + 3, vertices, vertexSize);
+          recordGxPrimitive(
+            opcode,
+            source,
+            offset + 3,
+            vertices,
+            vertexSize,
+            textureHashBatch
+          );
         }
         gxDecodedCommands += 1;
         offset += commandBytes;
@@ -14958,6 +15611,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function compiledRegionIsExecutable(region) {
+      if (instructionDependencyFreeLinkedRegions.has(region)) return true;
       // A linked Wasm region cannot reproduce the guest's instruction fetch
       // between member blocks. In particular, validating more than two pages
       // in one ITLB set can evict an earlier way before the region starts.
@@ -14998,6 +15652,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       for (const [regionKey, region] of regionsByPc) {
         if (invalidatedRegions.has(region)) regionsByPc.delete(regionKey);
+      }
+      for (const region of invalidatedRegions) {
+        instructionDependencyFreeLinkedRegions.delete(region);
       }
       resetInstructionLinkingState();
       accelerations.set(
@@ -15123,6 +15780,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       for (const [key, region] of regionsByPc) {
         if (invalidatedRegions.has(region)) regionsByPc.delete(key);
       }
+      for (const region of invalidatedRegions) {
+        instructionDependencyFreeLinkedRegions.delete(region);
+      }
 
       accelerations.set(
         "instructionCacheInvalidationLines",
@@ -15200,6 +15860,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       for (const [key, region] of regionsByPc) {
         if (invalidatedRegions.has(region)) regionsByPc.delete(key);
       }
+      for (const region of invalidatedRegions) {
+        instructionDependencyFreeLinkedRegions.delete(region);
+      }
 
       if (invalidatedBlockKeys.size !== 0 || invalidatedRegions.size !== 0) {
         resetInstructionLinkingState();
@@ -15275,6 +15938,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const invalidatedRegions = new Set(regionsByPc.values()).size;
       blocks.clear();
       regionsByPc.clear();
+      instructionDependencyFreeLinkedRegions = new WeakSet();
       resetInstructionLinkingState();
       accelerations.set(
         "instructionAddressSpaceInvalidations",
@@ -15770,7 +16434,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       const sceneIdAddress = 0x804d80a0;
       const menuModeAddress = 0x804d80c4;
       const openMapIdAddress = 0x804d80c8;
-      const executingEventAddress = 0x804d8378;
+      const eventSlotBasePointerAddress = 0x804d8370;
+      const eventSlotCountAddress = 0x804d8374;
+      const eventIteratorScratchPointerAddress = 0x804d8378;
+      const eventBlockingCountAddress = 0x804d837c;
+      const eventSlotStride = 0x58;
+      const eventActiveSlotLimit = 16;
       const gameModeAddress = 0x804d8728;
       const currentPlayerPositionAddress = 0x803a3ca0;
       const currentRoomInfoAddress = 0x803a3cac;
@@ -15779,6 +16448,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       const playerVtable = 0x80359d48;
       const foyerRoomInfo = 0x02000102;
       const gamePadPointerAddress = 0x804d8078;
+      const openingArchiveStateAddress = 0x804d8d18;
+      const openingDrawReadyAddress = 0x804d8cf0;
+      const openingTimelinePointerAddress = 0x804d8ce0;
+      const openingFinishedAddress = 0x804d8ce8;
+      const openingSkippedAddress = 0x804d8ce9;
+      const openingStateAddress = 0x804d8d18;
+      const openingLoaderActiveCountAddress = 0x8039ce38;
+      const openingLoaderCurrentFileAddress = 0x8039ce40;
+      const fatalArchiveDvdFlagAddress = 0x804d8028;
+      const driveErrorAddress = 0x804d80ac;
+      const audioSubframesRemainingAddress = 0x804d9364;
+      const audioDspStatusAddress = 0x804d9382;
 
       const rootValue = guestU32(playerRootPointerAddress);
       const rootMapped = luigisMansionMappedPointer(rootValue, 12);
@@ -15800,7 +16481,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const playerValue = objectSlotAddress === null
         ? null
         : guestU32(objectSlotAddress);
-      const playerMapped = luigisMansionMappedPointer(playerValue, 0x7d8);
+      const playerMapped = luigisMansionMappedPointer(playerValue, 0x1070);
       const actualPlayerVtable = playerMapped ? guestU32(playerValue) : null;
       const playerValid = playerMapped && actualPlayerVtable === playerVtable;
 
@@ -15809,12 +16490,46 @@ const TEMPLATE: &str = r##"<!doctype html>
       const playerRoomInfoAddress = playerValid ? playerValue + 0xb4 : null;
       const playerGamePadPointerAddress = playerValid ? playerValue + 0x794 : null;
       const playerControllerPointerAddress = playerValid ? playerValue + 0x7d4 : null;
+      const playerInputGateHealthAddress = playerValid
+        ? playerValue + 0xfc
+        : null;
+      const playerInputGateState1042Address = playerValid
+        ? playerValue + 0x1042
+        : null;
+      const playerInputGateState1058Address = playerValid
+        ? playerValue + 0x1058
+        : null;
+      const playerInputGateTimer105cAddress = playerValid
+        ? playerValue + 0x105c
+        : null;
+      const playerInputGateState106cAddress = playerValid
+        ? playerValue + 0x106c
+        : null;
       const playerGamePadValue = playerGamePadPointerAddress === null
         ? null
         : guestU32(playerGamePadPointerAddress);
       const playerControllerValue = playerControllerPointerAddress === null
         ? null
         : guestU32(playerControllerPointerAddress);
+      const playerInputGateHealth = playerInputGateHealthAddress === null
+        ? null
+        : guestS16(playerInputGateHealthAddress);
+      const playerInputGateState1042 =
+        playerInputGateState1042Address === null
+          ? null
+          : guestU8(playerInputGateState1042Address);
+      const playerInputGateState1058 =
+        playerInputGateState1058Address === null
+          ? null
+          : guestU8(playerInputGateState1058Address);
+      const playerInputGateTimer105c =
+        playerInputGateTimer105cAddress === null
+          ? null
+          : guestF32(playerInputGateTimer105cAddress);
+      const playerInputGateState106c =
+        playerInputGateState106cAddress === null
+          ? null
+          : guestF32(playerInputGateState106cAddress);
       const controllerMapped = luigisMansionMappedPointer(
         playerControllerValue,
         0x1e0
@@ -15847,7 +16562,46 @@ const TEMPLATE: &str = r##"<!doctype html>
       const sceneId = guestU32(sceneIdAddress);
       const menuMode = guestU32(menuModeAddress);
       const openMapId = guestU32(openMapIdAddress);
-      const executingEventValue = guestU32(executingEventAddress);
+      const eventSlotBaseValue = guestU32(eventSlotBasePointerAddress);
+      const eventSlotCount = guestS16(eventSlotCountAddress);
+      // This is the event loop's current-slot scratch pointer. Retail leaves
+      // the last visited slot here, so it has no active-event semantics.
+      const eventIteratorScratchValue = guestU32(
+        eventIteratorScratchPointerAddress
+      );
+      // This byte only counts the blocking subset of events (flag 0x100);
+      // universal activity comes from bit zero in every validated slot.
+      const eventBlockingCount = guestU8(eventBlockingCountAddress);
+      const eventTableValid = eventSlotCount === 0
+        || (
+          Number.isSafeInteger(eventSlotCount)
+          && eventSlotCount > 0
+          && luigisMansionMappedPointer(
+            eventSlotBaseValue,
+            eventSlotCount * eventSlotStride
+          )
+        );
+      let eventActiveCount = eventTableValid ? 0 : null;
+      const eventActiveSlots = [];
+      if (eventTableValid && eventSlotCount > 0) {
+        for (let index = 0; index < eventSlotCount; index += 1) {
+          const slotAddress = eventSlotBaseValue + index * eventSlotStride;
+          const flags = guestU32(slotAddress);
+          if ((flags & 0x1) === 0) continue;
+          eventActiveCount += 1;
+          if (eventActiveSlots.length >= eventActiveSlotLimit) continue;
+          eventActiveSlots.push({
+            index,
+            address: hex32(slotAddress),
+            flagsAddress: hex32(slotAddress),
+            flags,
+            idAddress: hex32(slotAddress + 0x38),
+            id: guestS16(slotAddress + 0x38),
+            tickAddress: hex32(slotAddress + 0x3c),
+            tick: guestU32(slotAddress + 0x3c),
+          });
+        }
+      }
       const gameMode = guestU32(gameModeAddress);
       const padHeld = gamePadMapped ? guestU32(gamePadValue + 0x18) : null;
       const padTrigger = gamePadMapped ? guestU32(gamePadValue + 0x1c) : null;
@@ -15866,17 +16620,66 @@ const TEMPLATE: &str = r##"<!doctype html>
         controllerPreviousMainStickMagnitudeAddress === null
           ? null
           : guestF32(controllerPreviousMainStickMagnitudeAddress);
+      const openingTimelineValue = guestU32(openingTimelinePointerAddress);
+      const openingTimelineMapped = luigisMansionMappedPointer(
+        openingTimelineValue,
+        0x2c
+      );
+      const openingAnimationPointer = openingTimelineMapped
+        ? guestU32(openingTimelineValue + 0x24)
+        : null;
+      const openingAnimationMapped = luigisMansionMappedPointer(
+        openingAnimationPointer,
+        0x214
+      );
+      const openingDurationPointer = openingAnimationMapped
+        ? guestU32(openingAnimationPointer + 0x20c)
+        : null;
+      const openingRatePointer = openingAnimationMapped
+        ? guestU32(openingAnimationPointer + 0x210)
+        : null;
+      const openingDurationMapped = luigisMansionMappedPointer(
+        openingDurationPointer,
+        2
+      );
+      const openingRateMapped = luigisMansionMappedPointer(
+        openingRatePointer,
+        4
+      );
+      const openingLoaderCurrentFileValue = guestU32(
+        openingLoaderCurrentFileAddress
+      );
+      const openingLoaderCurrentFileMapped = luigisMansionMappedPointer(
+        openingLoaderCurrentFileValue,
+        0x78
+      );
       const finitePosition = position => position !== null
         && Number.isFinite(position.x)
         && Number.isFinite(position.y)
         && Number.isFinite(position.z);
-      const controlsEnabled = playerValid
+      const inputGateOpen = playerValid
+        && playerInputGateState106c === 0
+        && playerInputGateHealth > 0
+        && playerInputGateState1042 === 0
+        && playerInputGateState1058 === 0
+        // The retail ordered comparison suppresses input only when this value
+        // is greater than zero; an unordered NaN follows the not-greater path.
+        && !(0 < playerInputGateTimer105c);
+      const expectedInputSourceValue = inputGateOpen ? playerGamePadValue : 0;
+      const inputPipelineReady = playerValid
         && gamePadMapped
         && controllerMapped
         && playerGamePadValue === gamePadValue
-        && controllerInputSourceValue === gamePadValue
         && padPort === 0
         && padError === 0;
+      const inputGateCoherent = playerValid
+        && controllerMapped
+        && controllerInputSourceValue === expectedInputSourceValue;
+      const controllerAcceptingPad = inputPipelineReady
+        && inputGateOpen
+        && expectedInputSourceValue === gamePadValue
+        && inputGateCoherent;
+      const controlsEnabled = controllerAcceptingPad;
       const neutralInput = padHeld === 0
         && padTrigger === 0
         && padMainStickX === 0
@@ -15886,7 +16689,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const mainGameScene = sceneId === 2;
       const menuClosed = menuMode === 0;
       const mansionOpen = openMapId === 2;
-      const eventInactive = executingEventValue === 0;
+      const eventInactive = eventTableValid && eventActiveCount === 0;
       const gameplayMode = gameMode === 2;
       const foyerActive = currentRoomInfoValue === foyerRoomInfo;
       const controllableFoyer = mainGameScene
@@ -15910,14 +16713,99 @@ const TEMPLATE: &str = r##"<!doctype html>
         openMapIdAddress: hex32(openMapIdAddress),
         openMapId,
         mansionOpen,
-        executingEventAddress: hex32(executingEventAddress),
-        executingEvent: executingEventValue === 0
-          ? null
-          : hex32(executingEventValue),
+        eventManager: {
+          slotBasePointerAddress: hex32(eventSlotBasePointerAddress),
+          slotBase: hex32(eventSlotBaseValue),
+          slotCountAddress: hex32(eventSlotCountAddress),
+          slotCount: eventSlotCount,
+          slotStride: eventSlotStride,
+          tableValid: eventTableValid,
+          iteratorScratchPointerAddress:
+            hex32(eventIteratorScratchPointerAddress),
+          iteratorScratchPointer: eventIteratorScratchValue === 0
+            ? null
+            : hex32(eventIteratorScratchValue),
+          iteratorScratchHasActiveEventSemantics: false,
+          blockingCountAddress: hex32(eventBlockingCountAddress),
+          blockingCount: eventBlockingCount,
+          activeSlotLimit: eventActiveSlotLimit,
+          activeCount: eventActiveCount,
+          activeSlotsTruncated: eventTableValid
+            ? eventActiveCount > eventActiveSlotLimit
+            : null,
+          activeSlots: eventActiveSlots,
+        },
         eventInactive,
         gameModeAddress: hex32(gameModeAddress),
         gameMode,
         gameplayMode,
+        opening: {
+          archiveStateAddress: hex32(openingArchiveStateAddress),
+          archiveState: guestU32(openingArchiveStateAddress),
+          drawReadyAddress: hex32(openingDrawReadyAddress),
+          drawReady: guestU8(openingDrawReadyAddress),
+          stateAddress: hex32(openingStateAddress),
+          state: guestU32(openingStateAddress),
+          finishedAddress: hex32(openingFinishedAddress),
+          finished: guestU8(openingFinishedAddress),
+          skippedAddress: hex32(openingSkippedAddress),
+          skipped: guestU8(openingSkippedAddress),
+          loaderActiveCountAddress: hex32(openingLoaderActiveCountAddress),
+          loaderActiveCount: guestU32(openingLoaderActiveCountAddress),
+          loaderCurrentFileAddress: hex32(openingLoaderCurrentFileAddress),
+          loaderCurrentFile: openingLoaderCurrentFileMapped
+            ? {
+                address: hex32(openingLoaderCurrentFileValue),
+                commandState: guestU32(openingLoaderCurrentFileValue + 0x0c),
+                currentTransfer: guestU32(
+                  openingLoaderCurrentFileValue + 0x1c
+                ),
+                transferred: guestU32(openingLoaderCurrentFileValue + 0x20),
+                fileOffset: hex32(guestU32(
+                  openingLoaderCurrentFileValue + 0x30
+                )),
+                fileLength: guestU32(openingLoaderCurrentFileValue + 0x34),
+                callback: hex32(guestU32(
+                  openingLoaderCurrentFileValue + 0x74
+                )),
+              }
+            : null,
+          fatalArchiveDvdFlagAddress: hex32(fatalArchiveDvdFlagAddress),
+          fatalArchiveDvdFlag: guestU8(fatalArchiveDvdFlagAddress),
+          driveErrorAddress: hex32(driveErrorAddress),
+          driveError: guestU32(driveErrorAddress),
+          audioSubframesRemainingAddress: hex32(
+            audioSubframesRemainingAddress
+          ),
+          audioSubframesRemaining: guestU32(audioSubframesRemainingAddress),
+          audioDspStatusAddress: hex32(audioDspStatusAddress),
+          audioDspStatus: guestU8(audioDspStatusAddress),
+          timeline: {
+            pointerAddress: hex32(openingTimelinePointerAddress),
+            address: openingTimelineMapped ? hex32(openingTimelineValue) : null,
+            time: openingTimelineMapped
+              ? guestF32(openingTimelineValue)
+              : null,
+            previousTime: openingTimelineMapped
+              ? guestF32(openingTimelineValue + 4)
+              : null,
+            flags: openingTimelineMapped
+              ? hex32(guestU32(openingTimelineValue + 8))
+              : null,
+            activeEvents: openingTimelineMapped
+              ? guestU32(openingTimelineValue + 0x0c)
+              : null,
+            animation: openingAnimationMapped
+              ? hex32(openingAnimationPointer)
+              : null,
+            duration: openingDurationMapped
+              ? guestU16(openingDurationPointer)
+              : null,
+            rate: openingRateMapped
+              ? guestF32(openingRatePointer)
+              : null,
+          },
+        },
         currentRoomInfoAddress: hex32(currentRoomInfoAddress),
         currentRoomInfo: hex32(currentRoomInfoValue),
         foyerActive,
@@ -15973,18 +16861,38 @@ const TEMPLATE: &str = r##"<!doctype html>
         controller: {
           address: controllerMapped ? hex32(playerControllerValue) : null,
           inputSourceAddress: hex32(controllerInputSourceAddress),
-          inputSource: luigisMansionMappedPointer(controllerInputSourceValue, 0x77)
-            ? hex32(controllerInputSourceValue)
-            : null,
+          inputSource: controllerInputSourceValue === 0
+            ? null
+            : hex32(controllerInputSourceValue),
           mainStickMagnitudeAddress: hex32(controllerMainStickMagnitudeAddress),
           mainStickMagnitude: controllerMainStickMagnitude,
           previousMainStickMagnitudeAddress:
             hex32(controllerPreviousMainStickMagnitudeAddress),
           previousMainStickMagnitude: controllerPreviousMainStickMagnitude,
         },
+        inputGate: {
+          healthAddress: hex32(playerInputGateHealthAddress),
+          health: playerInputGateHealth,
+          state1042Address: hex32(playerInputGateState1042Address),
+          state1042: playerInputGateState1042,
+          state1058Address: hex32(playerInputGateState1058Address),
+          state1058: playerInputGateState1058,
+          timer105cAddress: hex32(playerInputGateTimer105cAddress),
+          timer105c: playerInputGateTimer105c,
+          state106cAddress: hex32(playerInputGateState106cAddress),
+          state106c: playerInputGateState106c,
+          open: inputGateOpen,
+        },
+        expectedInputSource: expectedInputSourceValue === 0
+          ? null
+          : hex32(expectedInputSourceValue),
+        inputGateCoherent,
+        inputPipelineReady,
+        controllerAcceptingPad,
         controlsEnabled,
         neutralInput,
         controllableFoyer,
+        gxPostTexMtx18Load: snapshotLuigisMansionGxPostTexMtx18Load(),
         lastActiveGameplayInput: luigisMansionLastActiveGameplayInput,
       };
     }
@@ -22827,6 +23735,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       for (const [index, regionPc] of pcs.entries()) {
         const block = compiledBlock(regionPc);
         check(block !== undefined, "cannot link an uncompiled region block");
+        check(
+          !blockHasInstructionPageDependencies(block),
+          "cannot link a region block with instruction-page dependencies"
+        );
         compilerView.setUint32(inputPointer + index * 8, regionPc, true);
         compilerView.setUint32(inputPointer + index * 8 + 4, block.maximum, true);
       }
@@ -22853,12 +23765,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         lazuli: { memory },
         lazuli_blocks: blockImports,
       });
-      return {
+      const region = {
         instance,
         pcs,
         instructionAddressSpaceKey,
         instructionAddressSpaceGeneration,
       };
+      instructionDependencyFreeLinkedRegions.add(region);
+      return region;
     }
 
     function maybeLinkHotRegion(compiler, inputPointer, currentPc) {
@@ -23095,7 +24009,12 @@ const TEMPLATE: &str = r##"<!doctype html>
             exactRequiredCaptureMisses: gxExactRequiredCaptureMisses,
             vertexDecodeErrors: gxVertexDecodeErrors,
             texgenTransforms: gxTexgenTransforms,
+            texgenNonFiniteTransforms: gxTexgenNonFiniteTransforms,
             texgenFallbacks: gxTexgenFallbacks,
+            vertexTransformContextSnapshots: gxVertexTransformContextSnapshots,
+            vertexTransformContextMemoHits: gxVertexTransformContextMemoHits,
+            vertexTransformCacheSnapshots: gxVertexTransformCacheSnapshots,
+            vertexTransformCacheMemoHits: gxVertexTransformCacheMemoHits,
             pendingFrameDrawCalls: gxFrameDraws.length,
             pendingFrameVertices: gxFrameDrawVertices,
             pendingFrameSkippedPrimitives: gxFrameSkippedPrimitives,
@@ -23104,6 +24023,18 @@ const TEMPLATE: &str = r##"<!doctype html>
               draws: gxTexturedDraws,
               decodes: gxTextureDecodes,
               cacheHits: gxTextureCacheHits,
+              sourceHashComputations: gxTextureSourceHashComputations,
+              sourceHashMemoHits: gxTextureSourceHashMemoHits,
+              paletteHashComputations: gxTexturePaletteHashComputations,
+              paletteHashMemoHits: gxTexturePaletteHashMemoHits,
+              drawStateSnapshots: gxDrawStateSnapshots,
+              drawStateMemoHits: gxDrawStateMemoHits,
+              fanCompaction: {
+                frames: gxFanCompactionFrames,
+                sourceDraws: gxFanCompactionSourceDraws,
+                outputDraws: gxFanCompactionOutputDraws,
+                expandedVertices: gxFanCompactionExpandedVertices,
+              },
               cacheEntries: gxTextureCache.size,
               cacheBytes: gxTextureCache.weight,
               cacheByteLimit: gxTextureCache.maximumWeight,
@@ -23140,6 +24071,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             textureCopyCapturedSurfacesRetained: gxTextureCopyCapturedSurfacesRetained,
             textureCopies: gxTextureCopies,
             xfbCopies: gxXfbCopies,
+            primitiveSampleStride: gxPrimitiveSampleStride,
             primitiveSamples: gxPrimitiveSamples,
             recentPrimitiveSamples: gxRecentPrimitiveSamples,
             lastPrimitiveSample: gxRecentPrimitiveSamples.at(-1) ?? null,
@@ -23784,6 +24716,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           await finishTerminalControllerScenario();
           continue;
         }
+        // The pending-probe region fence below keeps this GX function entry
+        // as an exact pre-execution dispatch boundary. r3/r4 and all matrix
+        // bytes are therefore observed before GXLoadTexMtxImm writes its FIFO.
+        luigisMansionGxPostTexMtx18Load =
+          observeLuigisMansionGxLoadTexMtxImm(pc);
         observeWarioWareNextMicrogameSelection(pc);
         applyWarioWareNextMicrogameOverride(pc);
         stage = "compile";
@@ -23888,6 +24825,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             wariowareNextMicrogameOverride,
             wariowareActiveMicrogameId
           )
+          && luigisMansionGxLoadTexMtxImmProbeRegionSafe(retainedRegion)
           && compiledRegionIsExecutable(retainedRegion)
           ? retainedRegion
           : undefined;
@@ -25171,6 +26109,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         "projectionZeroClipW",
         "projectionArithmeticOverflow",
         "invalidPreparedScissor",
+        "uncertifiedFaceCull",
       ]);
     const smbSustainedExactRequiredRejectionKeys = Object.freeze([
       "exactRequiredRejectedDraws",
@@ -26305,29 +27244,28 @@ const TEMPLATE: &str = r##"<!doctype html>
       captureSelectedXfb,
       captureTerminal: captureRendererTerminal,
     });
-    function gxClearEfb(clear) {
-      const {
-        sourceX,
-        sourceY,
-        sourceWidth,
-        sourceHeight,
-        copyState,
-      } = clear;
-      const [red, green, blue, alpha] = copyState.clearRgba;
-      webGpuRenderer.clear_efb_copy(
-        sourceX,
-        sourceY,
-        sourceWidth,
-        sourceHeight,
-        copyState.zMode,
-        copyState.blendMode,
-        copyState.pixelControl,
-        red,
-        green,
-        blue,
-        alpha,
-        copyState.clearDepth,
-      );
+    function gxValidatePreClearWords(words) {
+      if (!(words instanceof Uint32Array)) {
+        throw new TypeError("GX frame message pre-clear words are invalid");
+      }
+      const wordsPerClear = 12;
+      if (words.length % wordsPerClear !== 0) {
+        throw new RangeError("GX frame message has a partial pre-clear record");
+      }
+      const limits = [
+        0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+        0x00ffffff, 0x00ffffff, 0x00ffffff,
+        0xff, 0xff, 0xff, 0xff,
+        0x00ffffff,
+      ];
+      for (let index = 0; index < words.length; index += 1) {
+        if (words[index] > limits[index % wordsPerClear]) {
+          throw new RangeError(
+            `GX frame message pre-clear word ${index} exceeds ${limits[index % wordsPerClear]}`
+          );
+        }
+      }
+      return words;
     }
     const source = document.querySelector("#runner-source").textContent;
     const debugSurface = document.querySelector(".shell").dataset.surface === "debug";
@@ -26928,11 +27866,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         throw new TypeError("GX frame message diagnostics are invalid");
       }
+      const preClearWords = gxValidatePreClearWords(
+        message.preClearWords ?? new Uint32Array()
+      );
       rendererHostMetrics.workerMessages.gxFrames += 1;
       rendererHostMetrics.workerMessages.drawCalls += drawCalls;
-      rendererHostMetrics.workerMessages.receivedArrayBufferBytes += packet.byteLength;
+      rendererHostMetrics.workerMessages.receivedArrayBufferBytes +=
+        packet.byteLength + preClearWords.byteLength;
       const residentTextureKeys = Array.from(
-        webGpuRenderer.submit_gx_frame(new Uint8Array(packet)) ?? [],
+        webGpuRenderer.submit_gx_frame(
+          new Uint8Array(packet),
+          preClearWords
+        ) ?? [],
         key => String(key)
       );
       if (copyKind === 1) {
@@ -27188,8 +28133,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       } else if (message?.type === "dataset") {
         document.body.dataset[message.name] = message.value;
         if (message.name === "status") runnerStatus.textContent = message.value;
-      } else if (message?.type === "gx-clear") {
-        return handleRendererOperation(() => gxClearEfb(message.clear), sourceWorker);
       } else if (message?.type === "gx-frame") {
         return handleRendererFrame(message, () => submitGxFrame(message), sourceWorker);
       } else if (message?.type === "vi-present") {

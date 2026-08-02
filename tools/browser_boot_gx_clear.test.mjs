@@ -166,11 +166,20 @@ test("the exact copy clear consumes the transported EFB color format", () => {
     clear,
     /gx_copy_clear_rgba\(state\.pixel_control, state\.clear_rgba\)/,
   );
-  assert.match(
-    clear,
-    /CopyClearUniform::new\(rgba, state\.clear_depth, depth_encoding\)/,
-  );
+  assert.match(clear, /let key = CopyClearBindingKey \{/);
+  assert.match(clear, /self\.copy_clear\.binding\(&self\.device, key\)/);
+  assert.doesNotMatch(clear, /queue\.write_buffer/);
   assert.match(clear, /gx_efb_depth_encoding\(state\.pixel_control\)/);
+
+  const bindings = rendererSection(
+    "impl CopyClearResources",
+    "struct XfbCopyUniform",
+  );
+  assert.match(bindings, /CopyClearUniform::new\(/);
+  assert.match(bindings, /create_buffer_init/);
+  assert.match(bindings, /usage: wgpu::BufferUsages::UNIFORM/);
+  assert.doesNotMatch(bindings, /COPY_DST|queue\.write_buffer/);
+  assert.match(bindings, /COPY_CLEAR_BINDING_CACHE_CAPACITY/);
 
   const format = sourceSection(
     rendererCoreSource,

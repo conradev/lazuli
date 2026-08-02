@@ -527,6 +527,7 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
     [
       "appendRendererOperation",
       "enqueueRendererOperation",
+      "gxValidatePreClearWords",
       "submitGxFrame",
       "validateViPresentationResult",
       "handleRendererFrame",
@@ -536,9 +537,9 @@ test("main thread submits GX XFB frames before separate VI presentation", async 
     {
       ArrayBuffer,
       Uint8Array,
+      Uint32Array,
       document: { body: { dataset: {} } },
       drainWebGpuRenderer() { return Promise.resolve(); },
-      gxClearEfb() {},
       handleRendererError(error) { throw error; },
       output: { textContent: "" },
       rendererHostMetrics: {

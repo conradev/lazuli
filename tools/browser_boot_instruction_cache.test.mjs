@@ -81,6 +81,7 @@ function makeInvalidationContext(translateInstructionRange) {
     accelerations: new Map(),
     blocks: new Map(),
     instructionAddressSpaceKey: "current",
+    instructionDependencyFreeLinkedRegions: new WeakSet(),
     linkingResets: 0,
     regionsByPc: new Map(),
     resetInstructionLinkingState() {
@@ -263,6 +264,8 @@ test("an invalidated member evicts its complete linked region", () => {
   context.regionsByPc.set("foreign:90001000", invalidatedRegion);
   context.regionsByPc.set("foreign:90002000", invalidatedRegion);
   context.regionsByPc.set("current:80003000", retainedRegion);
+  context.instructionDependencyFreeLinkedRegions.add(invalidatedRegion);
+  context.instructionDependencyFreeLinkedRegions.add(retainedRegion);
 
   context.invalidateInstructionCacheLine(0x80001004);
 
@@ -271,6 +274,14 @@ test("an invalidated member evicts its complete linked region", () => {
     "region-peer",
   ]);
   assert.deepEqual([...context.regionsByPc.values()], [retainedRegion]);
+  assert.equal(
+    context.instructionDependencyFreeLinkedRegions.has(invalidatedRegion),
+    false,
+  );
+  assert.equal(
+    context.instructionDependencyFreeLinkedRegions.has(retainedRegion),
+    true,
+  );
 });
 
 test("an unmapped virtual line still evicts current-namespace code", () => {

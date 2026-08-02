@@ -81,6 +81,7 @@ const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS = [
   "projectionZeroClipW",
   "projectionArithmeticOverflow",
   "invalidPreparedScissor",
+  "uncertifiedFaceCull",
 ];
 const DECODER_FAILURE_COUNTERS = [
   "displayListErrors",

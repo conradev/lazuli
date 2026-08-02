@@ -24,7 +24,7 @@ pub(crate) const SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY: usize = 60;
 pub(crate) const GX_DEPTH16_MAX: u32 = 0x0000_ffff;
 pub(crate) const GX_DEPTH24_MAX: u32 = 0x00ff_ffff;
 pub(crate) const EXACT_REQUIRED_REJECTION_REASON_COUNT: usize = 14;
-pub(crate) const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT: usize = 40;
+pub(crate) const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT: usize = 41;
 /// Flipper's canonical single-sample raster point, in EFB pixel coordinates.
 #[cfg(test)]
 pub(crate) const GX_NON_AA_RASTER_CENTER_EFB: f32 = 7.0 / 12.0;
@@ -149,6 +149,7 @@ pub(crate) enum ExactRequiredPreparationRejectionReason {
     ProjectionZeroClipW,
     ProjectionArithmeticOverflow,
     InvalidPreparedScissor,
+    UncertifiedFaceCull,
 }
 
 impl ExactRequiredPreparationRejectionReason {
@@ -193,6 +194,7 @@ impl ExactRequiredPreparationRejectionReason {
         Self::ProjectionZeroClipW,
         Self::ProjectionArithmeticOverflow,
         Self::InvalidPreparedScissor,
+        Self::UncertifiedFaceCull,
     ];
 
     pub(crate) const fn index(self) -> usize {
@@ -241,6 +243,7 @@ impl ExactRequiredPreparationRejectionReason {
             Self::ProjectionZeroClipW => "projectionZeroClipW",
             Self::ProjectionArithmeticOverflow => "projectionArithmeticOverflow",
             Self::InvalidPreparedScissor => "invalidPreparedScissor",
+            Self::UncertifiedFaceCull => "uncertifiedFaceCull",
         }
     }
 }
@@ -298,7 +301,7 @@ pub(crate) struct ExactRequiredRejectionSnapshot {
 }
 
 const _: () = assert!(
-    std::mem::size_of::<ExactRequiredRejectionSnapshot>() == 55 * std::mem::size_of::<u64>()
+    std::mem::size_of::<ExactRequiredRejectionSnapshot>() == 56 * std::mem::size_of::<u64>()
 );
 
 impl ExactRequiredRejectionSnapshot {
@@ -3631,6 +3634,7 @@ mod tests {
                 "projectionZeroClipW",
                 "projectionArithmeticOverflow",
                 "invalidPreparedScissor",
+                "uncertifiedFaceCull",
             ],
         );
         for (index, reason) in Reason::ALL.into_iter().enumerate() {
@@ -3715,19 +3719,19 @@ mod tests {
 
         assert_eq!(
             std::mem::size_of::<ExactRequiredRejectionSnapshot>(),
-            55 * 8
+            56 * 8
         );
         assert!(previous.is_coherent());
         assert!(current.is_coherent());
         assert!(interval.is_coherent());
-        assert_eq!(interval.aggregate(), 53);
+        assert_eq!(interval.aggregate(), 54);
         assert_eq!(
             interval.reason(ExactRequiredRejectionReason::ExactPreparation),
-            40,
+            41,
         );
         for reason in ExactRequiredRejectionReason::ALL {
             let expected = if reason == ExactRequiredRejectionReason::ExactPreparation {
-                40
+                41
             } else {
                 1
             };

@@ -108,6 +108,23 @@ function requireU16(value, path) {
   return value;
 }
 
+function requireU8(value, path) {
+  const integer = requireU32(value, path);
+  if (integer > 0xff) fail(path, "expected an unsigned 8-bit integer");
+  return integer;
+}
+
+function requireS16(value, path) {
+  if (
+    !Number.isSafeInteger(value)
+    || value < -0x8000
+    || value > 0x7fff
+  ) {
+    fail(path, "expected a signed 16-bit integer");
+  }
+  return value;
+}
+
 function requireFinite(value, path) {
   if (!Number.isFinite(value)) fail(path, "expected a finite number");
   return value;
@@ -169,12 +186,78 @@ function projectLuigisMansionState(report, path, requireNeutral) {
   requireExact(guest.openMapIdAddress, "0x804d80c8", `${path}.guestGame.openMapIdAddress`);
   requireExact(guest.openMapId, 2, `${path}.guestGame.openMapId`);
   requireExact(guest.mansionOpen, true, `${path}.guestGame.mansionOpen`);
+  const eventPath = `${path}.guestGame.eventManager`;
+  const eventManager = requireObject(guest.eventManager, eventPath);
   requireExact(
-    guest.executingEventAddress,
-    "0x804d8378",
-    `${path}.guestGame.executingEventAddress`,
+    eventManager.slotBasePointerAddress,
+    "0x804d8370",
+    `${eventPath}.slotBasePointerAddress`,
   );
-  requireExact(guest.executingEvent, null, `${path}.guestGame.executingEvent`);
+  requireHexU32(
+    eventManager.slotBase,
+    `${eventPath}.slotBase`,
+  );
+  requireExact(
+    eventManager.slotCountAddress,
+    "0x804d8374",
+    `${eventPath}.slotCountAddress`,
+  );
+  const eventSlotCount = requireS16(
+    eventManager.slotCount,
+    `${eventPath}.slotCount`,
+  );
+  requireExact(eventManager.slotStride, 0x58, `${eventPath}.slotStride`);
+  requireExact(eventManager.tableValid, true, `${eventPath}.tableValid`);
+  if (eventSlotCount < 0) {
+    fail(`${eventPath}.slotCount`, "validated event table cannot have negative count");
+  }
+  if (eventSlotCount > 0) {
+    requireMappedMem1(
+      eventManager.slotBase,
+      `${eventPath}.slotBase`,
+      eventSlotCount * eventManager.slotStride,
+    );
+  }
+  requireExact(
+    eventManager.iteratorScratchPointerAddress,
+    "0x804d8378",
+    `${eventPath}.iteratorScratchPointerAddress`,
+  );
+  if (eventManager.iteratorScratchPointer !== null) {
+    requireHexU32(
+      eventManager.iteratorScratchPointer,
+      `${eventPath}.iteratorScratchPointer`,
+    );
+  }
+  requireExact(
+    eventManager.iteratorScratchHasActiveEventSemantics,
+    false,
+    `${eventPath}.iteratorScratchHasActiveEventSemantics`,
+  );
+  requireExact(
+    eventManager.blockingCountAddress,
+    "0x804d837c",
+    `${eventPath}.blockingCountAddress`,
+  );
+  requireU8(eventManager.blockingCount, `${eventPath}.blockingCount`);
+  requirePositiveInteger(
+    eventManager.activeSlotLimit,
+    `${eventPath}.activeSlotLimit`,
+  );
+  requireExact(eventManager.activeCount, 0, `${eventPath}.activeCount`);
+  requireExact(
+    eventManager.activeSlotsTruncated,
+    false,
+    `${eventPath}.activeSlotsTruncated`,
+  );
+  if (!Array.isArray(eventManager.activeSlots)) {
+    fail(`${eventPath}.activeSlots`, "expected an array");
+  }
+  requireExact(
+    eventManager.activeSlots.length,
+    0,
+    `${eventPath}.activeSlots.length`,
+  );
   requireExact(guest.eventInactive, true, `${path}.guestGame.eventInactive`);
   requireExact(guest.gameModeAddress, "0x804d8728", `${path}.guestGame.gameModeAddress`);
   requireExact(guest.gameMode, 2, `${path}.guestGame.gameMode`);
@@ -232,7 +315,11 @@ function projectLuigisMansionState(report, path, requireNeutral) {
 
   const playerPath = `${path}.guestGame.player`;
   const player = requireObject(guest.player, playerPath);
-  const playerAddress = requireMappedMem1(player.address, `${playerPath}.address`, 0x7d8);
+  const playerAddress = requireMappedMem1(
+    player.address,
+    `${playerPath}.address`,
+    0x1070,
+  );
   requireExact(player.vtableAddress, player.address, `${playerPath}.vtableAddress`);
   requireExact(player.vtable, hexU32(PLAYER_VTABLE), `${playerPath}.vtable`);
   requireExact(player.valid, true, `${playerPath}.valid`);
@@ -286,6 +373,64 @@ function projectLuigisMansionState(report, path, requireNeutral) {
     0x1e0,
   );
 
+  const inputGatePath = `${path}.guestGame.inputGate`;
+  const inputGate = requireObject(guest.inputGate, inputGatePath);
+  requireExact(
+    inputGate.healthAddress,
+    hexU32(playerAddress + 0xfc),
+    `${inputGatePath}.healthAddress`,
+  );
+  const inputGateHealth = requireS16(
+    inputGate.health,
+    `${inputGatePath}.health`,
+  );
+  if (inputGateHealth <= 0) {
+    fail(`${inputGatePath}.health`, "expected positive player health");
+  }
+  requireExact(
+    inputGate.state1042Address,
+    hexU32(playerAddress + 0x1042),
+    `${inputGatePath}.state1042Address`,
+  );
+  requireExact(
+    requireU8(inputGate.state1042, `${inputGatePath}.state1042`),
+    0,
+    `${inputGatePath}.state1042`,
+  );
+  requireExact(
+    inputGate.state1058Address,
+    hexU32(playerAddress + 0x1058),
+    `${inputGatePath}.state1058Address`,
+  );
+  requireExact(
+    requireU8(inputGate.state1058, `${inputGatePath}.state1058`),
+    0,
+    `${inputGatePath}.state1058`,
+  );
+  requireExact(
+    inputGate.timer105cAddress,
+    hexU32(playerAddress + 0x105c),
+    `${inputGatePath}.timer105cAddress`,
+  );
+  const inputGateTimer105c = requireFinite(
+    inputGate.timer105c,
+    `${inputGatePath}.timer105c`,
+  );
+  if (0 < inputGateTimer105c) {
+    fail(`${inputGatePath}.timer105c`, "expected a non-positive gate timer");
+  }
+  requireExact(
+    inputGate.state106cAddress,
+    hexU32(playerAddress + 0x106c),
+    `${inputGatePath}.state106cAddress`,
+  );
+  requireExact(
+    requireFinite(inputGate.state106c, `${inputGatePath}.state106c`),
+    0,
+    `${inputGatePath}.state106c`,
+  );
+  requireExact(inputGate.open, true, `${inputGatePath}.open`);
+
   const padPath = `${path}.guestGame.pad`;
   const pad = requireObject(guest.pad, padPath);
   requireExact(pad.pointerAddress, "0x804d8078", `${padPath}.pointerAddress`);
@@ -333,7 +478,16 @@ function projectLuigisMansionState(report, path, requireNeutral) {
     hexU32(playerController + 0x1b0),
     `${controllerPath}.inputSourceAddress`,
   );
-  requireExact(controller.inputSource, pad.address, `${controllerPath}.inputSource`);
+  requireExact(
+    guest.expectedInputSource,
+    pad.address,
+    `${path}.guestGame.expectedInputSource`,
+  );
+  requireExact(
+    controller.inputSource,
+    guest.expectedInputSource,
+    `${controllerPath}.inputSource`,
+  );
   requireExact(
     controller.mainStickMagnitudeAddress,
     hexU32(playerController + 0x1c0),
@@ -351,6 +505,21 @@ function projectLuigisMansionState(report, path, requireNeutral) {
   const previousControllerMagnitude = requireFinite(
     controller.previousMainStickMagnitude,
     `${controllerPath}.previousMainStickMagnitude`,
+  );
+  requireExact(
+    guest.inputPipelineReady,
+    true,
+    `${path}.guestGame.inputPipelineReady`,
+  );
+  requireExact(
+    guest.inputGateCoherent,
+    true,
+    `${path}.guestGame.inputGateCoherent`,
+  );
+  requireExact(
+    guest.controllerAcceptingPad,
+    true,
+    `${path}.guestGame.controllerAcceptingPad`,
   );
   requireExact(guest.controlsEnabled, true, `${path}.guestGame.controlsEnabled`);
   requireExact(guest.controllableFoyer, true, `${path}.guestGame.controllableFoyer`);

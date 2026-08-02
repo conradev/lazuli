@@ -67,6 +67,7 @@ export const SMB_SUSTAINED_EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS =
     "projectionZeroClipW",
     "projectionArithmeticOverflow",
     "invalidPreparedScissor",
+    "uncertifiedFaceCull",
   ]);
 
 const EXACT_REQUIRED_REJECTION_KEYS = [

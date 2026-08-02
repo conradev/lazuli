@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { devNull, tmpdir } from "node:os";
 import { join } from "node:path";
+import process from "node:process";
 import test from "node:test";
 
 import {
@@ -154,6 +155,118 @@ test("local verifier rejects missing, extra, wrong-sized, and wrong-hash images"
     /does not exactly match/,
   );
 });
+
+test("local verifier accepts manifest-named symlinks to external regular images", async () => {
+  const corpus = fixtureCorpus();
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "lazuli-game-corpus-"));
+  const directory = join(fixtureRoot, "games");
+  const backingDirectory = join(fixtureRoot, "external-images");
+  await mkdir(directory);
+  await mkdir(backingDirectory);
+  const target = join(backingDirectory, corpus.games[0].file);
+  const path = join(directory, corpus.games[0].file);
+  await writeFile(target, Buffer.alloc(corpus.games[0].bytes));
+  await symlink(target, path);
+
+  const identified = [];
+  const games = await verifyLocalGameCompatibilityCorpus(corpus, {
+    directory,
+    identify: async imagePath => {
+      identified.push(imagePath);
+      return corpus.games[0].image;
+    },
+  });
+
+  assert.deepEqual(identified, [path]);
+  assert.equal(games[0].bytes, corpus.games[0].bytes);
+  assert.equal(games[0].image.sha256, corpus.games[0].image.sha256);
+});
+
+test("local verifier rejects extra CISO symlinks through the exact manifest set", async () => {
+  const corpus = fixtureCorpus();
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "lazuli-game-corpus-"));
+  const directory = join(fixtureRoot, "games");
+  const target = join(fixtureRoot, "backing.ciso");
+  await mkdir(directory);
+  await writeFile(target, Buffer.alloc(corpus.games[0].bytes));
+  await symlink(target, join(directory, corpus.games[0].file));
+  await symlink(target, join(directory, "Unexpected.ciso"));
+  let identifyCalls = 0;
+
+  await assert.rejects(
+    verifyLocalGameCompatibilityCorpus(corpus, {
+      directory,
+      identify: async () => {
+        identifyCalls += 1;
+        return corpus.games[0].image;
+      },
+    }),
+    /does not exactly match.*Unexpected\.ciso/,
+  );
+  assert.equal(identifyCalls, 0);
+});
+
+test("local verifier rejects broken and directory symlinks before identity", async t => {
+  for (const fixture of [
+    {
+      name: "broken target",
+      prepare: async fixtureRoot => join(fixtureRoot, "missing.ciso"),
+    },
+    {
+      name: "directory target",
+      prepare: async fixtureRoot => {
+        const target = join(fixtureRoot, "image-directory");
+        await mkdir(target);
+        return target;
+      },
+    },
+  ]) {
+    await t.test(fixture.name, async () => {
+      const corpus = fixtureCorpus();
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "lazuli-game-corpus-"));
+      const directory = join(fixtureRoot, "games");
+      await mkdir(directory);
+      const target = await fixture.prepare(fixtureRoot);
+      await symlink(target, join(directory, corpus.games[0].file));
+      let identifyCalls = 0;
+
+      await assert.rejects(
+        verifyLocalGameCompatibilityCorpus(corpus, {
+          directory,
+          identify: async () => {
+            identifyCalls += 1;
+            return corpus.games[0].image;
+          },
+        }),
+        /does not resolve to a regular file/,
+      );
+      assert.equal(identifyCalls, 0);
+    });
+  }
+});
+
+test(
+  "local verifier rejects symlinks to special files before identity",
+  { skip: process.platform === "win32" },
+  async () => {
+    const corpus = fixtureCorpus();
+    const directory = await mkdtemp(join(tmpdir(), "lazuli-game-corpus-"));
+    await symlink(devNull, join(directory, corpus.games[0].file));
+    let identifyCalls = 0;
+
+    await assert.rejects(
+      verifyLocalGameCompatibilityCorpus(corpus, {
+        directory,
+        identify: async () => {
+          identifyCalls += 1;
+          return corpus.games[0].image;
+        },
+      }),
+      /does not resolve to a regular file/,
+    );
+    assert.equal(identifyCalls, 0);
+  },
+);
 
 test("local verifier emits priority-ordered private image evidence", async () => {
   const second = fixtureGame({

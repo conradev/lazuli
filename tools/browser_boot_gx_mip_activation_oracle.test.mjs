@@ -278,6 +278,10 @@ function producerDraw(strictV7Preflight) {
     gxExactRequiredVertices: 0,
     gxExactRequiredCaptureMisses: 0,
     gxTexturedDraws: 0,
+    gxDrawStateSnapshots: 0,
+    gxDrawStateMemoHits: 0,
+    gxVertexTransformContextSnapshots: 0,
+    gxVertexTransformContextMemoHits: 0,
     statusDataset: {},
     gxTevModeCounts: new Map(),
     gxFrameDraws: [],
@@ -294,6 +298,10 @@ function producerDraw(strictV7Preflight) {
     gxTevStageState() {
       return stage;
     },
+    gxPrepareVertexTransformContext() {
+      context.gxVertexTransformContextSnapshots += 1;
+      return {};
+    },
     gxDecodeVertex(_source, start) {
       return { ...decodedVertices[start], cursor: start + 1 };
     },
@@ -301,6 +309,10 @@ function producerDraw(strictV7Preflight) {
       return coords.length === count && coords.every(coord =>
         Array.isArray(coord) && coord.length >= 3
       );
+    },
+    gxTevCoordsTransportable(coords, count) {
+      return Array.isArray(coords) && coords.length === count
+        && coords.every(coord => Array.isArray(coord) && coord.length >= 3);
     },
     gxTevTextures() {
       const textures = Array(8).fill(null);

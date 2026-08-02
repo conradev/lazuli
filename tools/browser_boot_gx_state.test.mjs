@@ -262,7 +262,7 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     gxFrameDrawVertices: 0,
     gxFrameSkippedPrimitives: 0,
     gxFramesSkipped: 0,
-    gxFlushSkippedCopyClears() {},
+    gxDrainSkippedCopyClears() { return []; },
     invalidateGxCopyReservation() {},
     gxSkippedFrameClearColor: null,
     gxSkippedCopyClears: [],
@@ -346,14 +346,12 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
 });
 
 test("distinct skipped regional clears retain their source order", () => {
-  const messages = [];
   const clearContext = {
     gxSkippedCopyClears: [],
-    postMessage(message) { messages.push(message); },
   };
   vm.createContext(clearContext);
   vm.runInContext(
-    ["gxCopyClearOperation", "gxFlushSkippedCopyClears"]
+    ["gxCopyClearOperation", "gxDrainSkippedCopyClears"]
       .map(extractFunction)
       .join("\n\n"),
     clearContext,
@@ -379,28 +377,22 @@ test("distinct skipped regional clears retain their source order", () => {
       clearContext.gxCopyClearOperation(frame),
     );
   }
-  clearContext.gxFlushSkippedCopyClears();
+  const clears = clearContext.gxDrainSkippedCopyClears();
 
-  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [
+  assert.deepEqual(JSON.parse(JSON.stringify(clears)), [
     {
-      type: "gx-clear",
-      clear: {
-        sourceX: 4,
-        sourceY: 5,
-        sourceWidth: 6,
-        sourceHeight: 7,
-        copyState: { clearRgba: [1, 2, 3, 4] },
-      },
+      sourceX: 4,
+      sourceY: 5,
+      sourceWidth: 6,
+      sourceHeight: 7,
+      copyState: { clearRgba: [1, 2, 3, 4] },
     },
     {
-      type: "gx-clear",
-      clear: {
-        sourceX: 40,
-        sourceY: 50,
-        sourceWidth: 60,
-        sourceHeight: 70,
-        copyState: { clearRgba: [5, 6, 7, 8] },
-      },
+      sourceX: 40,
+      sourceY: 50,
+      sourceWidth: 60,
+      sourceHeight: 70,
+      copyState: { clearRgba: [5, 6, 7, 8] },
     },
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(clearContext.gxSkippedCopyClears)), []);
@@ -610,7 +602,10 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
 
 test("the main thread submits packets without rebuilding a per-draw bridge graph", () => {
   const submit = extractFunction("submitGxFrame");
-  assert.match(submit, /submit_gx_frame\(new Uint8Array\(packet\)\)/);
+  assert.match(
+    submit,
+    /submit_gx_frame\(\s*new Uint8Array\(packet\),\s*preClearWords\s*\)/,
+  );
   assert.doesNotMatch(
     submit,
     /begin_segment|push_tev_draw|has_decoded_texture|copy_texture|copy_xfb/,

@@ -30,6 +30,7 @@ function extractFunction(name) {
 }
 
 function workerContext() {
+  const gxBpRegisters = new Uint32Array(0x100);
   const gxXfRegisters = new Uint32Array(0x1100);
   const context = {
     Array,
@@ -38,7 +39,11 @@ function workerContext() {
     Math,
     Number,
     Uint32Array,
+    gxBpRegisters,
     gxFifoScratch: new DataView(new ArrayBuffer(4)),
+    gxVertexTransformContextSnapshots: 0,
+    gxVertexTransformCacheSnapshots: 0,
+    gxVertexTransformCacheMemoHits: 0,
     gxXfRegisters,
   };
   vm.createContext(context);
@@ -54,6 +59,8 @@ function workerContext() {
     "gxTransformNormal",
     "gxXfColorU8",
     "gxXfLight",
+    "gxPrepareVertexTransformContext",
+    "gxVertexTransformLight",
     "gxDot3",
     "gxVectorSubtract",
     "gxLightNormalize3",
@@ -210,6 +217,14 @@ test("adds ambient and masked diffuse light with GX clamping", () => {
     [[0, 0, 0, 0], [0, 0, 0, 0]],
   );
   assertVector(lit[0], Array(4).fill(192 / 255));
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const cachedLit = context.gxLightRasterChannels(
+    [0, 0, 1],
+    [0, 0, 1],
+    [[0, 0, 0, 0], [0, 0, 0, 0]],
+    transformContext,
+  );
+  assert.deepEqual(cachedLit, lit);
 
   const backFacing = context.gxLightRasterChannels(
     [0, 0, 4],
@@ -217,6 +232,16 @@ test("adds ambient and masked diffuse light with GX clamping", () => {
     [[0, 0, 0, 0], [0, 0, 0, 0]],
   );
   assertVector(backFacing[0], Array(4).fill(63 / 255));
+  const cachedBackFacing = context.gxLightRasterChannels(
+    [0, 0, 4],
+    [0, 0, 1],
+    [[0, 0, 0, 0], [0, 0, 0, 0]],
+    transformContext,
+  );
+  assert.deepEqual(cachedBackFacing, backFacing);
+  assert.equal(context.gxVertexTransformContextSnapshots, 1);
+  assert.equal(context.gxVertexTransformCacheSnapshots, 1);
+  assert.ok(context.gxVertexTransformCacheMemoHits >= 7);
 
   context.gxXfRegisters[0x100e] = 2 | (2 << 7);
   context.gxXfRegisters[0x1010] = 2 | (2 << 7);
@@ -236,6 +261,23 @@ test("adds ambient and masked diffuse light with GX clamping", () => {
     [[0, 0, 0, 0], [0, 0, 0, 0]],
   );
   assertVector(saturated[0], [1, 1, 1, 1]);
+});
+
+test("vertex transform light cache retains a null snapshot after XF repair", () => {
+  const context = workerContext();
+  const lightBase = 0x603;
+  context.gxXfRegisters[lightBase + 1] = 0x7fc00000;
+  const transformContext = context.gxPrepareVertexTransformContext();
+
+  assert.equal(context.gxVertexTransformLight(transformContext, 0), null);
+  setLight(context, 0, {
+    color: 0xffffffff,
+    position: [0, 0, 1],
+  });
+  assert.equal(context.gxVertexTransformLight(transformContext, 0), null);
+  assert.equal(transformContext.lights[0], null);
+  assert.equal(context.gxVertexTransformCacheSnapshots, 1);
+  assert.equal(context.gxVertexTransformCacheMemoHits, 1);
 });
 
 test("truncates f32 light accumulation before GX integer material modulation", () => {

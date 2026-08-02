@@ -274,6 +274,7 @@ fn fs_main() -> FragmentOutput {
 ";
 
 const DECODED_TEXTURE_CACHE_CAPACITY: usize = 128;
+const COPY_CLEAR_BINDING_CACHE_CAPACITY: usize = 64;
 const XFB_PRESENT_BIND_GROUP_CACHE_CAPACITY: usize = 32;
 const XFB_SURFACES_PER_DESTINATION: usize = 4;
 
@@ -558,9 +559,66 @@ impl XfbPresentUniform {
 }
 
 struct CopyClearResources {
-    uniform: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    layout: wgpu::BindGroupLayout,
+    bindings: VecDeque<CachedCopyClearBinding>,
     pipelines: Vec<wgpu::RenderPipeline>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopyClearBindingKey {
+    rgba: [u8; 4],
+    depth: u32,
+    depth_encoding: GxEfbDepthEncoding,
+}
+
+struct CachedCopyClearBinding {
+    key: CopyClearBindingKey,
+    _uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl CopyClearResources {
+    fn binding(
+        &mut self,
+        device: &wgpu::Device,
+        key: CopyClearBindingKey,
+    ) -> (wgpu::BindGroup, bool) {
+        if let Some(index) = self.bindings.iter().position(|binding| binding.key == key) {
+            let binding = self
+                .bindings
+                .remove(index)
+                .expect("located GX copy-clear binding disappeared");
+            let result = binding.bind_group.clone();
+            self.bindings.push_back(binding);
+            return (result, false);
+        }
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("browser GX immutable copy-clear uniform"),
+            contents: bytemuck::bytes_of(&CopyClearUniform::new(
+                key.rgba,
+                key.depth,
+                key.depth_encoding,
+            )),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser GX immutable copy-clear bind group"),
+            layout: &self.layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        if self.bindings.len() == COPY_CLEAR_BINDING_CACHE_CAPACITY {
+            self.bindings.pop_front();
+        }
+        self.bindings.push_back(CachedCopyClearBinding {
+            key,
+            _uniform: uniform,
+            bind_group: bind_group.clone(),
+        });
+        (bind_group, true)
+    }
 }
 
 #[repr(C)]
@@ -1167,6 +1225,59 @@ fn public_copy_clear_state(
         copy_scale: 0,
         copy_filter: [0; 2],
     }))
+}
+
+const GX_PRE_CLEAR_WORDS: usize = 12;
+
+#[derive(Clone, Copy)]
+struct GxPreClear {
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    state: GxCopyState,
+}
+
+fn gx_pre_clears(words: &[u32]) -> Result<Vec<GxPreClear>, JsValue> {
+    if !words.len().is_multiple_of(GX_PRE_CLEAR_WORDS) {
+        return Err(JsValue::from_str(
+            "GX pre-clear transport has a partial record",
+        ));
+    }
+    words
+        .chunks_exact(GX_PRE_CLEAR_WORDS)
+        .enumerate()
+        .map(|(index, words)| {
+            let channel = |word: usize, name: &str| {
+                u8::try_from(words[word]).map_err(|_| {
+                    JsValue::from_str(&format!("GX pre-clear {index} {name} exceeds one byte"))
+                })
+            };
+            let clear_rgba = [
+                channel(7, "red")?,
+                channel(8, "green")?,
+                channel(9, "blue")?,
+                channel(10, "alpha")?,
+            ];
+            let state = public_copy_clear_state(
+                true, words[4], words[5], words[6], 0x0800, clear_rgba, words[11],
+            )?
+            .expect("requested GX pre-clear has state");
+            let mask = gx_copy_clear_mask(state.z_mode, state.blend_mode, state.pixel_control);
+            if mask.depth {
+                gx_efb_depth_encoding(state.pixel_control).map_err(|error| {
+                    JsValue::from_str(&format!("GX pre-clear {index}: {error}"))
+                })?;
+            }
+            Ok(GxPreClear {
+                source_x: words[0],
+                source_y: words[1],
+                source_width: words[2],
+                source_height: words[3],
+                state,
+            })
+        })
+        .collect()
 }
 
 fn renderer_metrics_object(
@@ -1884,7 +1995,7 @@ impl WebGpuRenderer {
     }
 
     fn encode_copy_clear(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         rectangle: ScissorRect,
         state: GxCopyState,
@@ -1900,15 +2011,32 @@ impl WebGpuRenderer {
         } else {
             GxEfbDepthEncoding::Z24
         };
-        let uniform = CopyClearUniform::new(rgba, state.clear_depth, depth_encoding);
-        self.queue
-            .write_buffer(&self.copy_clear.uniform, 0, bytemuck::bytes_of(&uniform));
+        let key = CopyClearBindingKey {
+            rgba: if mask.color || mask.alpha {
+                rgba
+            } else {
+                [0, 0, 0, 255]
+            },
+            depth: if mask.depth {
+                state.clear_depth
+            } else {
+                GX_DEPTH24_MAX
+            },
+            depth_encoding,
+        };
+        let (bind_group, created) = self.copy_clear.binding(&self.device, key);
+        if created {
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.buffers_created = metrics.buffers_created.saturating_add(1);
+                metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(1);
+            });
+        }
         encode_copy_clear_pass(
             encoder,
             &self.efb_color_view,
             &self.efb_depth_view,
             &self.copy_clear.pipelines[mask.index()],
-            &self.copy_clear.bind_group,
+            &bind_group,
             rectangle,
             "browser GX post-copy clear pass",
         );
@@ -2219,15 +2347,27 @@ impl WebGpuRenderer {
     /// Submit one completely validated GX segment and its terminal EFB copy.
     ///
     /// Bridge telemetry records every call at entry, but parsing and resource
-    /// preflight finish before rendering state changes, so a malformed Worker
-    /// packet cannot leave a partial WebGPU frame behind.
-    pub fn submit_gx_frame(&mut self, source_packet: Uint8Array) -> Result<Array, JsValue> {
+    /// preflight and command encoding finish before the queue submission, so a
+    /// rejected Worker packet cannot leave a partial EFB frame behind.
+    pub fn submit_gx_frame(
+        &mut self,
+        source_packet: Uint8Array,
+        source_pre_clears: Option<Uint32Array>,
+    ) -> Result<Array, JsValue> {
         // Keep the existing `packetParse` diagnostic as one inclusive packet-
         // preparation phase: JS-to-Wasm copying, structural parsing, texture
         // preflight, and vertex flattening all happen before renderer mutation.
         let packet_parse_timer = self.host_phase_timer(RendererHostPhase::PacketParse);
         let packet_bytes = source_packet.to_vec();
-        self.record_wasm_bridge_call(packet_bytes.len());
+        let pre_clear_words = source_pre_clears
+            .map(|source| source.to_vec())
+            .unwrap_or_default();
+        self.record_wasm_bridge_call(
+            packet_bytes
+                .len()
+                .saturating_add(pre_clear_words.len().saturating_mul(size_of::<u32>())),
+        );
+        let pre_clears = gx_pre_clears(&pre_clear_words)?;
         let packet = GxFramePacket::parse(&packet_bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let header = *packet.header();
@@ -2341,8 +2481,9 @@ impl WebGpuRenderer {
                 .texture_pixel_bytes
                 .saturating_add(payload_bytes as u64);
         });
-        // This inclusive frame-level phase contains the draw loop, terminal
-        // copy encoding, and synchronous queue submission.
+        // This inclusive frame-level phase contains the draw loop, ordered
+        // pre-clear and terminal-copy encoding, and synchronous queue
+        // submission.
         let gx_frame_execution_timer = self.host_phase_timer(RendererHostPhase::GxFrameExecution);
         let render = (|| {
             self.begin_segment_inner()?;
@@ -2421,6 +2562,7 @@ impl WebGpuRenderer {
                     header.destination,
                     header.generation,
                     header.clear.then_some(header.copy_state),
+                    &pre_clears,
                 ),
                 GxCopyKind::Xfb => self.copy_xfb_inner(
                     header.source_x,
@@ -2434,6 +2576,7 @@ impl WebGpuRenderer {
                     header.generation,
                     header.copy_state,
                     header.clear,
+                    &pre_clears,
                 ),
             }
         })();
@@ -3144,6 +3287,7 @@ impl WebGpuRenderer {
             destination,
             generation,
             copy_clear,
+            &[],
         )
     }
 
@@ -3157,12 +3301,13 @@ impl WebGpuRenderer {
         destination: u32,
         generation: u32,
         copy_clear: Option<GxCopyState>,
+        pre_clears: &[GxPreClear],
     ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.copy_texture_calls = metrics.copy_texture_calls.saturating_add(1);
         });
-        let mut encoder = self.flush_geometry();
+        let mut encoder = self.flush_geometry_with_pre_clears(pre_clears)?;
         let Some((width, height)) = clipped_copy_extent(source_x, source_y, width, height) else {
             self.queue.submit([encoder.finish()]);
             update_renderer_metrics(&self.metrics, |metrics| {
@@ -3313,6 +3458,7 @@ impl WebGpuRenderer {
             generation,
             copy_state,
             clear,
+            &[],
         )
     }
 
@@ -3330,6 +3476,7 @@ impl WebGpuRenderer {
         generation: u32,
         copy_state: GxCopyState,
         clear: bool,
+        pre_clears: &[GxPreClear],
     ) -> Result<(), JsValue> {
         self.ensure_healthy()?;
         update_renderer_metrics(&self.metrics, |metrics| {
@@ -3375,7 +3522,7 @@ impl WebGpuRenderer {
                 ));
             }
         }
-        let mut encoder = self.flush_geometry();
+        let mut encoder = self.flush_geometry_with_pre_clears(pre_clears)?;
         let Some((width, source_height)) =
             clipped_copy_extent(source_x, source_y, width, source_height)
         else {
@@ -4271,14 +4418,44 @@ impl WebGpuRenderer {
     }
 
     fn flush_geometry(&mut self) -> wgpu::CommandEncoder {
+        self.flush_geometry_with_pre_clears(&[])
+            .expect("empty GX pre-clear batch cannot fail")
+    }
+
+    fn flush_geometry_with_pre_clears(
+        &mut self,
+        pre_clears: &[GxPreClear],
+    ) -> Result<wgpu::CommandEncoder, JsValue> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("browser GX geometry encoder"),
             });
+        for clear in pre_clears {
+            update_renderer_metrics(&self.metrics, |metrics| {
+                metrics.clear_efb_calls = metrics.clear_efb_calls.saturating_add(1);
+            });
+            if let Some((width, height)) = clipped_copy_extent(
+                clear.source_x,
+                clear.source_y,
+                clear.source_width,
+                clear.source_height,
+            ) {
+                self.encode_copy_clear(
+                    &mut encoder,
+                    ScissorRect {
+                        x: clear.source_x,
+                        y: clear.source_y,
+                        width,
+                        height,
+                    },
+                    clear.state,
+                )?;
+            }
+        }
         if self.commands.is_empty() {
             self.clear_segment();
-            return encoder;
+            return Ok(encoder);
         }
         let tev_vertex_buffer = (!self.tev_vertices.is_empty()).then(|| {
             update_renderer_metrics(&self.metrics, |metrics| {
@@ -4465,7 +4642,7 @@ impl WebGpuRenderer {
         self.commands.clear();
         self.tev_draw_binding_indices.clear();
         self.tev_draw_bindings.clear();
-        encoder
+        Ok(encoder)
     }
 
     fn clear_segment(&mut self) {
@@ -6374,23 +6551,6 @@ fn create_copy_clear_resources(device: &wgpu::Device) -> CopyClearResources {
             count: None,
         }],
     });
-    let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("browser GX copy-clear uniform"),
-        contents: bytemuck::bytes_of(&CopyClearUniform::new(
-            [0; 4],
-            GX_DEPTH24_MAX,
-            GxEfbDepthEncoding::Z24,
-        )),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("browser GX copy-clear bind group"),
-        layout: &layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform.as_entire_binding(),
-        }],
-    });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("browser GX copy-clear shader"),
         source: wgpu::ShaderSource::Wgsl(COPY_CLEAR_SHADER.into()),
@@ -6446,11 +6606,20 @@ fn create_copy_clear_resources(device: &wgpu::Device) -> CopyClearResources {
             })
         })
         .collect();
-    CopyClearResources {
-        uniform,
-        bind_group,
+    let mut resources = CopyClearResources {
+        layout,
+        bindings: VecDeque::with_capacity(COPY_CLEAR_BINDING_CACHE_CAPACITY),
         pipelines,
-    }
+    };
+    resources.binding(
+        device,
+        CopyClearBindingKey {
+            rgba: [0, 0, 0, 255],
+            depth: GX_DEPTH24_MAX,
+            depth_encoding: GxEfbDepthEncoding::Z24,
+        },
+    );
+    resources
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6598,12 +6767,14 @@ mod tests {
         prepare_managed_coverage_vertices, rgba8_mip_uploads,
         source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
     };
+    use crate::clip::{GxClipError, GxExactGeometryError};
     use crate::packet::GxTriangleAction;
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS, managed_tex_coord_sidecar_fits};
     use crate::{
-        GX_DEPTH24_MAX, GxBlendFactor, GxDepthCompression, GxEarlyDepthPlan, GxEfbDepthEncoding,
-        GxFogState, GxRasterCenterEvidence, GxSamplerState, GxZTextureOperation, SamplerIdentity,
-        TextureBindingIdentity, gx_destination_alpha_state, gx_sampler_state, gx_z_texture_state,
+        ExactRequiredPreparationRejectionReason, GX_DEPTH24_MAX, GxBlendFactor, GxDepthCompression,
+        GxEarlyDepthPlan, GxEfbDepthEncoding, GxFogState, GxRasterCenterEvidence, GxSamplerState,
+        GxZTextureOperation, SamplerIdentity, TextureBindingIdentity, gx_destination_alpha_state,
+        gx_sampler_state, gx_z_texture_state,
     };
 
     fn encoded_blend_mode(
@@ -6720,6 +6891,11 @@ mod tests {
 
     #[test]
     fn required_exact_preparation_is_authoritative_when_qualification_fails() {
+        let face_cull_failure = || {
+            GxExactPreparationFailure::Geometry(GxExactGeometryError::Clip(
+                GxClipError::UncertifiedFaceCull(1),
+            ))
+        };
         let qualified = || QualifiedExactDraw {
             scissor: Some(ScissorRect {
                 x: 0,
@@ -6735,26 +6911,33 @@ mod tests {
             required: false,
             required_managed_safe: false,
             qualified: None,
-            preparation_failure: Some(GxExactPreparationFailure::InvalidPreparedScissor),
+            preparation_failure: Some(face_cull_failure()),
         };
         assert!(!optional_unqualified.is_required());
         assert_eq!(
+            optional_unqualified
+                .preparation_failure
+                .unwrap()
+                .telemetry_reason(),
+            ExactRequiredPreparationRejectionReason::UncertifiedFaceCull,
+        );
+        assert_eq!(
             optional_unqualified.authoritative_noop(),
             None,
-            "v5 optional exact input retains its native fallback",
+            "optional face-cull input delegates to direct WebGPU",
         );
 
         let required_unqualified = PreparedExactDraw {
             required: true,
             required_managed_safe: false,
             qualified: None,
-            preparation_failure: Some(GxExactPreparationFailure::InvalidPreparedScissor),
+            preparation_failure: Some(face_cull_failure()),
         };
         assert!(required_unqualified.is_required());
         assert_eq!(
             required_unqualified.authoritative_noop(),
             Some(ExactAuthoritativeNoop::RequiredRejected),
-            "v6 required input must suppress unsupported raw geometry",
+            "required face-cull input remains fail-closed",
         );
 
         let required_qualified = PreparedExactDraw {

@@ -278,7 +278,7 @@ fn plane_order_retains_duplicate_boundary_transitions() {
 }
 
 #[test]
-fn culling_precedes_backface_reorder_and_ordered_clipping() {
+fn face_cull_modes_are_not_exact_cpu_authority() {
     let front = [
         [0.0, 0.0, -0.5, 1.0, 0.0],
         [2.0, 0.0, -0.5, 1.0, 2.0],
@@ -291,24 +291,35 @@ fn culling_precedes_backface_reorder_and_ordered_clipping() {
         gx_post_clip_triangle(back, 0, -264.0).unwrap(),
         front_triangles
     );
-    assert!(gx_post_clip_triangle(front, 1, -264.0).unwrap().is_empty());
-    assert!(
-        gx_post_clip_triangle(
-            [
-                [2.0, 0.0, -0.5, 1.0, 0.0],
-                [2.0, 1.0, -0.5, 1.0, 2.0],
-                [2.0, -1.0, -0.5, 1.0, 4.0],
-            ],
-            0,
-            -264.0,
-        )
-        .unwrap()
-        .is_empty()
+    assert_eq!(
+        gx_post_clip_triangle(front, 1, -264.0),
+        Err(GxClipError::UncertifiedFaceCull(1)),
     );
+    assert_eq!(
+        gx_post_clip_triangle(back, 2, -264.0),
+        Err(GxClipError::UncertifiedFaceCull(2)),
+    );
+    assert!(
+        gx_post_clip_triangle(front, 3, -264.0).unwrap().is_empty(),
+        "raw cull-all remains an authoritative empty result",
+    );
+    let trivially_rejected = [
+        [2.0, 0.0, -0.5, 1.0, 0.0],
+        [2.0, 1.0, -0.5, 1.0, 2.0],
+        [2.0, -1.0, -0.5, 1.0, 4.0],
+    ];
+    for cull_mode in [0, 1, 2, 3] {
+        assert!(
+            gx_post_clip_triangle(trivially_rejected, cull_mode, -264.0)
+                .unwrap()
+                .is_empty(),
+            "Dolphin trivially rejects before cull mode {cull_mode} classification",
+        );
+    }
 }
 
 #[test]
-fn clip_bypass_retains_trivial_rejection_culling_and_backface_order() {
+fn clip_bypass_retains_trivial_rejection_and_no_cull_backface_order() {
     let raster = |components| GxRasterClipVertex::new(components, [0; 8]);
     let crossing_near = [
         raster([-0.5, -0.5, -1.5, 1.0]),
@@ -348,43 +359,51 @@ fn clip_bypass_retains_trivial_rejection_culling_and_backface_order() {
         [crossing_near],
         "backfaces are normalized to the same post-cull edge order",
     );
+    assert_eq!(
+        gx_bypass_clip_raster_triangle(crossing_near, 1, -264.0, false),
+        Err(GxClipError::UncertifiedFaceCull(1)),
+        "face classification delegates to the direct GPU path",
+    );
     assert!(
-        gx_bypass_clip_raster_triangle(crossing_near, 1, -264.0, false)
+        gx_bypass_clip_raster_triangle(uniform_near, 1, -264.0, false)
             .unwrap()
             .is_empty(),
-        "culling remains ahead of the polygon-clip bypass",
+        "enabled trivial rejection precedes the conservative face-cull gate",
+    );
+    assert_eq!(
+        gx_bypass_clip_raster_triangle(uniform_near, 1, -264.0, true),
+        Err(GxClipError::UncertifiedFaceCull(1)),
+        "disabling trivial rejection still delegates face classification",
     );
 }
 
 #[test]
-fn viewport_sign_and_all_cull_modes_match_the_js_oracle() {
+fn viewport_sign_only_normalizes_the_certified_no_cull_subset() {
     let front = [
         [0.0, 0.0, -0.5, 1.0],
         [1.0, 0.0, -0.5, 1.0],
         [0.0, 1.0, -0.5, 1.0],
     ];
     let back = [front[0], front[2], front[1]];
-    let expected_negative = [[true, true], [false, true], [true, false], [false, false]];
-    for (cull_mode, expected) in expected_negative.into_iter().enumerate() {
-        let negative = [
-            !gx_post_clip_triangle(front, cull_mode as u8, -1.0)
+    for viewport_height in [-1.0, 1.0] {
+        let normalized_front = gx_post_clip_triangle(front, 0, viewport_height).unwrap();
+        let normalized_back = gx_post_clip_triangle(back, 0, viewport_height).unwrap();
+        assert_eq!(normalized_front, normalized_back);
+        for cull_mode in [1, 2] {
+            assert_eq!(
+                gx_post_clip_triangle(front, cull_mode, viewport_height),
+                Err(GxClipError::UncertifiedFaceCull(cull_mode)),
+            );
+            assert_eq!(
+                gx_post_clip_triangle(back, cull_mode, viewport_height),
+                Err(GxClipError::UncertifiedFaceCull(cull_mode)),
+            );
+        }
+        assert!(
+            gx_post_clip_triangle(front, 3, viewport_height)
                 .unwrap()
                 .is_empty(),
-            !gx_post_clip_triangle(back, cull_mode as u8, -1.0)
-                .unwrap()
-                .is_empty(),
-        ];
-        assert_eq!(negative, expected);
-
-        let positive = [
-            !gx_post_clip_triangle(front, cull_mode as u8, 1.0)
-                .unwrap()
-                .is_empty(),
-            !gx_post_clip_triangle(back, cull_mode as u8, 1.0)
-                .unwrap()
-                .is_empty(),
-        ];
-        assert_eq!(positive, [expected[1], expected[0]]);
+        );
     }
 
     let collinear = [
@@ -394,14 +413,13 @@ fn viewport_sign_and_all_cull_modes_match_the_js_oracle() {
     ];
     assert_eq!(gx_clip_normal_z(&collinear).unwrap().to_bits(), 0);
     assert_eq!(
-        gx_post_clip_triangle(collinear, 1, -1.0).unwrap().len(),
+        gx_post_clip_triangle(collinear, 0, -1.0).unwrap().len(),
         1,
-        "normal <= 0 classifies collinear and signed zero as back-facing"
+        "no-cull normalization retains the literal signed-zero face result"
     );
-    assert!(
-        gx_post_clip_triangle(collinear, 2, -1.0)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        gx_post_clip_triangle(collinear, 2, -1.0),
+        Err(GxClipError::UncertifiedFaceCull(2)),
     );
 }
 

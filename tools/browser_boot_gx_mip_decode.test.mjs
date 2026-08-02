@@ -82,6 +82,11 @@ function decodeContext({ byteLength = 0x4000 } = {}) {
     gxCollectFrameGeometry: false,
     gxTextureDecodes: 0,
     gxTextureCacheHits: 0,
+    gxTextureSourceHashComputations: 0,
+    gxTextureSourceHashMemoHits: 0,
+    gxTexturePaletteHashComputations: 0,
+    gxTexturePaletteHashMemoHits: 0,
+    gxTlutLoads: 0,
     gxTextureDecodedBytes: 0,
     gxTextureDecodeErrors: 0,
     gxMarkTextureCopyConsumer(address) {
@@ -316,6 +321,45 @@ test("hashes every encoded level while min-LOD-only changes reuse decoded storag
   assert.equal(changedMinLod.mode1, 0x300f);
   assert.equal(context.gxTextureDecodes, 2);
   assert.equal(context.gxTextureCacheHits, 1);
+});
+
+test("one synchronous GX decode batch memoizes source and palette fingerprints", () => {
+  const { context, bytes } = decodeContext();
+  const address = 0x100;
+  configureTexture(context, { address, format: 8 });
+  const chain = textureChain(context, { format: 8 });
+  fillLevelBytes(bytes, address, chain, [0x11, 0x22, 0x33, 0x44]);
+  context.gxTmem.fill(0x7f, 0, 32);
+  const batch = {
+    sourceHashes: new Map(),
+    paletteHashes: new Map(),
+  };
+
+  const first = context.gxDecodeTexture(0, batch);
+  const second = context.gxDecodeTexture(0, batch);
+
+  assert.equal(second.key, first.key);
+  assert.strictEqual(second.mipPixels, first.mipPixels);
+  assert.equal(context.gxTextureSourceHashComputations, 1);
+  assert.equal(context.gxTextureSourceHashMemoHits, 1);
+  assert.equal(context.gxTexturePaletteHashComputations, 1);
+  assert.equal(context.gxTexturePaletteHashMemoHits, 1);
+  assert.equal(context.gxTextureDecodes, 1);
+  assert.equal(context.gxTextureCacheHits, 1);
+
+  bytes[address + chain.levels[1].encodedOffset] ^= 0xff;
+  context.gxTmem[1] ^= 0xff;
+  context.gxTlutLoads += 1;
+  const nextBatch = {
+    sourceHashes: new Map(),
+    paletteHashes: new Map(),
+  };
+  const changed = context.gxDecodeTexture(0, nextBatch);
+
+  assert.notEqual(changed.key, first.key);
+  assert.equal(context.gxTextureSourceHashComputations, 2);
+  assert.equal(context.gxTexturePaletteHashComputations, 2);
+  assert.equal(context.gxTextureDecodes, 2);
 });
 
 test("uses one palette identity and TLUT across every paletted mip level", () => {

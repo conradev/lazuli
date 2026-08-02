@@ -117,13 +117,16 @@ export const projectionNullOracleXfb = Object.freeze({
   stride: rasterCenterOracleXfb.stride,
 });
 
-function projectionNullDraw(visibleNativeCarrier) {
+function projectionNullDraw(visibleNativeCarrier, reverseNativeWinding) {
   const nativePositions = visibleNativeCarrier
     ? projectionNullVisibleNativeCarrierPositions
     : projectionNullSourceVector.nativeCarrierPositions;
+  const orderedPositions = reverseNativeWinding
+    ? [nativePositions[0], nativePositions[2], nativePositions[1]]
+    : nativePositions;
   return {
     topology: 2,
-    vertices: nativePositions.map(
+    vertices: orderedPositions.map(
       ([x, y, depth24]) => ({
         x,
         y,
@@ -147,13 +150,21 @@ function projectionNullDraw(visibleNativeCarrier) {
 export function buildProjectionNullOraclePacket(
   generation = PROJECTION_NULL_HASH_GENERATION,
   {
+    cullMode = 0,
     exactClipRequired = true,
+    reverseNativeWinding = false,
     xfClipDisable = projectionNullExactState.xfClipDisable,
     visibleNativeCarrier = false,
   } = {},
 ) {
+  if (!Number.isInteger(cullMode) || cullMode < 0 || cullMode > 3) {
+    throw new RangeError("cullMode must be an integer from 0 through 3");
+  }
   if (typeof exactClipRequired !== "boolean") {
     throw new TypeError("exactClipRequired must be a boolean");
+  }
+  if (typeof reverseNativeWinding !== "boolean") {
+    throw new TypeError("reverseNativeWinding must be a boolean");
   }
   if (
     !Number.isInteger(xfClipDisable) ||
@@ -166,7 +177,7 @@ export function buildProjectionNullOraclePacket(
     throw new TypeError("visibleNativeCarrier must be a boolean");
   }
   const base = buildRasterCenterOraclePacket(
-    [projectionNullDraw(visibleNativeCarrier)],
+    [projectionNullDraw(visibleNativeCarrier, reverseNativeWinding)],
     generation,
   );
   if (base.length !== BASE_PACKET_BYTES) {
@@ -191,6 +202,7 @@ export function buildProjectionNullOraclePacket(
       : DRAW_FLAG_EXACT_CLIP_INPUT,
     true,
   );
+  packet[DRAW_OFFSET + 0x01] = cullMode;
   view.setFloat32(
     DRAW_OFFSET + 0xac,
     projectionNullExactState.viewport[0],
@@ -201,7 +213,7 @@ export function buildProjectionNullOraclePacket(
   view.setUint32(exact + 0x00, 1, true);
   view.setUint32(
     exact + 0x04,
-    projectionNullExactState.bpGenMode,
+    projectionNullExactState.bpGenMode | (cullMode << 14),
     true,
   );
   view.setUint32(

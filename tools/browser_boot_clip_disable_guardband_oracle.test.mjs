@@ -64,6 +64,7 @@ function diagnostics() {
       unsupportedClipDisable7: 0,
       unsupportedClipDisableOther: 0,
       invalidPreparedScissor: 0,
+      uncertifiedFaceCull: 0,
     },
     managedCoverageDraws: 0,
     managedCoverageTriangles: 0,

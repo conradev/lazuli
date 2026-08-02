@@ -125,6 +125,9 @@ impl GxExactPreparationFailure {
             Self::Geometry(GxExactGeometryError::Clip(GxClipError::InvalidCullMode(_))) => {
                 Reason::ClipInvalidCullMode
             }
+            Self::Geometry(GxExactGeometryError::Clip(GxClipError::UncertifiedFaceCull(_))) => {
+                Reason::UncertifiedFaceCull
+            }
             Self::Geometry(GxExactGeometryError::Clip(GxClipError::InvalidViewportHeight)) => {
                 Reason::ClipInvalidViewportHeight
             }

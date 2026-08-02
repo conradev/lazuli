@@ -1,15 +1,21 @@
 //! Ordered f32 homogeneous clipping for exact GX triangle coverage.
 //!
-//! This mirrors Dolphin's software clipper operation by operation.  The
-//! unusual positive-Z mask and W-plane walk are intentional compatibility
-//! behavior, as are culling before clipping and retaining duplicate boundary
-//! vertices during the literal polygon walk.
+//! This mirrors Dolphin's software clipper operation by operation for the
+//! certified no-cull subset.  The unusual positive-Z mask and W-plane walk are
+//! intentional compatibility behavior, as is retaining duplicate boundary
+//! vertices during the literal polygon walk.  Dolphin-order trivial rejection
+//! remains authoritative before raw face classification; surviving face-cull
+//! modes remain outside this exact CPU authority because Dolphin issue 13489
+//! demonstrates that optional CPU culling removes visible Super Monkey Ball
+//! menu draws which survive the normal GPU path.
 
 use std::fmt;
 
 mod geometry;
 mod project;
 
+#[cfg(all(target_arch = "wasm32", test))]
+pub(crate) use geometry::GxExactGeometryError;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use geometry::{GxExactPreparationFailure, gx_exact_draw_raster_geometry};
 
@@ -41,6 +47,7 @@ pub(crate) enum GxClipError {
     UnsupportedTopology(u8),
     NoSourceTriangles,
     InvalidCullMode(u8),
+    UncertifiedFaceCull(u8),
     InvalidViewportHeight,
     NonFiniteVertex,
     ArithmeticOverflow,
@@ -58,6 +65,12 @@ impl fmt::Display for GxClipError {
             Self::NoSourceTriangles => write!(formatter, "GX clip input has no source triangles"),
             Self::InvalidCullMode(cull_mode) => {
                 write!(formatter, "invalid GX clip cull mode {cull_mode}")
+            }
+            Self::UncertifiedFaceCull(cull_mode) => {
+                write!(
+                    formatter,
+                    "GX clip cull mode {cull_mode} requires GPU face classification"
+                )
             }
             Self::InvalidViewportHeight => {
                 write!(
@@ -411,7 +424,6 @@ fn gx_post_cull_raster_triangle<const COMPONENTS: usize>(
     {
         return Err(GxClipError::NonFiniteVertex);
     }
-
     let masks = [
         gx_clip_mask(&triangle[0].components)?,
         gx_clip_mask(&triangle[1].components)?,
@@ -419,6 +431,13 @@ fn gx_post_cull_raster_triangle<const COMPONENTS: usize>(
     ];
     if !disable_trivial_rejection && masks[0] & masks[1] & masks[2] != 0 {
         return Ok(None);
+    }
+
+    match cull_mode {
+        0 => {}
+        1 | 2 => return Err(GxClipError::UncertifiedFaceCull(cull_mode)),
+        3 => return Ok(None),
+        _ => unreachable!("validated GX cull mode"),
     }
 
     let component_triangle = [
@@ -430,10 +449,6 @@ fn gx_post_cull_raster_triangle<const COMPONENTS: usize>(
     let mut backface = normal <= 0.0;
     if viewport_height > 0.0 {
         backface = !backface;
-    }
-    let survives = cull_mode == 0 || (cull_mode == 1 && backface) || (cull_mode == 2 && !backface);
-    if !survives {
-        return Ok(None);
     }
 
     let ordered = if backface {
@@ -520,14 +535,17 @@ fn gx_post_clip_triangle<const COMPONENTS: usize>(
         return Ok(Vec::new());
     }
 
+    match cull_mode {
+        0 => {}
+        1 | 2 => return Err(GxClipError::UncertifiedFaceCull(cull_mode)),
+        3 => return Ok(Vec::new()),
+        _ => unreachable!("validated GX cull mode"),
+    }
+
     let normal = gx_clip_normal_z(&triangle)?;
     let mut backface = normal <= 0.0;
     if viewport_height > 0.0 {
         backface = !backface;
-    }
-    let survives = cull_mode == 0 || (cull_mode == 1 && backface) || (cull_mode == 2 && !backface);
-    if !survives {
-        return Ok(Vec::new());
     }
 
     let ordered = if backface {

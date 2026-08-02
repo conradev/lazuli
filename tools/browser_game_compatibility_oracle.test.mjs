@@ -51,6 +51,7 @@ const EXACT_REQUIRED_PREPARATION_REJECTION_REASON_KEYS = [
   "projectionZeroClipW",
   "projectionArithmeticOverflow",
   "invalidPreparedScissor",
+  "uncertifiedFaceCull",
 ];
 
 const zeroCountMap = keys =>

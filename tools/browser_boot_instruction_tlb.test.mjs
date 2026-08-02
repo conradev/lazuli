@@ -113,6 +113,7 @@ function makeContext({
     bytes: new Uint8Array(buffer),
     dataTlbSets: createTlbSets(),
     instructionAddressSpaceKey: "current",
+    instructionDependencyFreeLinkedRegions: new WeakSet(),
     instructionFetchOverride: null,
     instructionMsr: 0x20,
     instructionSdr1: 0,
@@ -256,6 +257,22 @@ test("browser runtime exposes the tlbie set invalidation contract", () => {
     source,
     /const region = retainedRegion !== undefined[\s\S]{0,120}warioWareNextMicrogameOverrideRegionSafe\(\s*retainedRegion,\s*wariowareNextMicrogameOverride,\s*wariowareActiveMicrogameId\s*\)[\s\S]{0,120}compiledRegionIsExecutable\(retainedRegion\)/,
     "linked regions pass the dependency gate before execution",
+  );
+});
+
+test("linked-region certification is issued only after dependency checks", () => {
+  const link = extractFunction("linkCompiledRegion");
+  assert.match(
+    link,
+    /check\(\s*!blockHasInstructionPageDependencies\(block\),\s*"cannot link a region block with instruction-page dependencies"\s*\)/,
+  );
+  assert.match(
+    link,
+    /instructionDependencyFreeLinkedRegions\.add\(region\)/,
+  );
+  assert.match(
+    extractFunction("compiledRegionIsExecutable"),
+    /instructionDependencyFreeLinkedRegions\.has\(region\)/,
   );
 });
 
@@ -520,6 +537,50 @@ runtimeTest("linked regions conservatively reject every hashed-page member", () 
   assert.equal(context.compiledRegionIsExecutable(region), false);
 });
 
+runtimeTest("certified dependency-free linked regions use the constant-time gate", () => {
+  const context = makeContext();
+  const first = 0x8001_2000;
+  const second = 0x8001_3000;
+  addBlock(context, "first", { effectiveStart: first });
+  addBlock(context, "second", { effectiveStart: second });
+  const region = {
+    instructionAddressSpaceKey: "current",
+    pcs: [first, second],
+  };
+  context.instructionDependencyFreeLinkedRegions.add(region);
+
+  context.compiledBlock = () => {
+    assert.fail("a certified linked region must not rescan member blocks");
+  };
+  assert.equal(context.compiledRegionIsExecutable(region), true);
+});
+
+runtimeTest("member invalidation evicts every certified region alias and proof", () => {
+  const context = makeContext();
+  const first = 0x8001_2000;
+  const second = 0x8001_3000;
+  const firstBlock = addBlock(context, "first", { effectiveStart: first });
+  addBlock(context, "second", { effectiveStart: second });
+  const region = {
+    instructionAddressSpaceKey: "current",
+    pcs: [first, second],
+  };
+  context.regionsByPc.set(blockKey("current", first), region);
+  context.regionsByPc.set(blockKey("current", second), region);
+  context.instructionDependencyFreeLinkedRegions.add(region);
+
+  assert.equal(
+    context.invalidateCompiledBlock(firstBlock, "pre-execution-validation"),
+    true,
+  );
+  assert.equal(context.regionsByPc.size, 0);
+  assert.equal(
+    context.instructionDependencyFreeLinkedRegions.has(region),
+    false,
+  );
+  assert.equal(context.compiledRegionIsExecutable(region), false);
+});
+
 runtimeTest("tlbsync preserves TLB residency and compiled code while recording synchronization", () => {
   const context = makeContext({
     diagnostics: [
@@ -619,6 +680,8 @@ runtimeTest("tlbie set eviction spans retained namespaces and removes every stal
   context.regionsByPc.set("foreign:90012000", staleRegion);
   context.regionsByPc.set("foreign:90013000", staleRegion);
   context.regionsByPc.set("current:80013000", retainedRegion);
+  context.instructionDependencyFreeLinkedRegions.add(staleRegion);
+  context.instructionDependencyFreeLinkedRegions.add(retainedRegion);
 
   assert.equal(context.invalidateInstructionTranslationSet(0xdead_2004), 3);
 
@@ -629,6 +692,14 @@ runtimeTest("tlbie set eviction spans retained namespaces and removes every stal
   ]);
   assert.deepEqual([...context.regionsByPc.keys()], ["current:80013000"]);
   assert.deepEqual([...new Set(context.regionsByPc.values())], [retainedRegion]);
+  assert.equal(
+    context.instructionDependencyFreeLinkedRegions.has(staleRegion),
+    false,
+  );
+  assert.equal(
+    context.instructionDependencyFreeLinkedRegions.has(retainedRegion),
+    true,
+  );
   assert.equal(context.linkingResets, 1);
   assert.deepEqual(Object.fromEntries(context.accelerations), {
     instructionTlbInvalidations: 5,

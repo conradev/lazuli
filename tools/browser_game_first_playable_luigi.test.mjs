@@ -112,10 +112,36 @@ test("Luigi guest-consumption evidence rejects every missing causal link", async
     {
       name: "event active",
       mutate({ preReport }) {
-        preReport.guestGame.executingEvent = "0x80400000";
+        preReport.guestGame.eventManager.slotBase = "0x80430000";
+        preReport.guestGame.eventManager.slotCount = 1;
+        preReport.guestGame.eventManager.activeCount = 1;
+        preReport.guestGame.eventManager.activeSlots = [{
+          index: 0,
+          address: "0x80430000",
+          flagsAddress: "0x80430000",
+          flags: 1,
+          idAddress: "0x80430038",
+          id: 7,
+          tickAddress: "0x8043003c",
+          tick: 123,
+        }];
         preReport.guestGame.eventInactive = false;
+        preReport.guestGame.controllableFoyer = false;
       },
-      pattern: /preReport\.guestGame\.executingEvent/,
+      pattern: /preReport\.guestGame\.eventManager\.activeCount/,
+    },
+    {
+      name: "invalid event table",
+      mutate({ preReport }) {
+        preReport.guestGame.eventManager.slotBase = "0x817fffd0";
+        preReport.guestGame.eventManager.slotCount = 2;
+        preReport.guestGame.eventManager.tableValid = false;
+        preReport.guestGame.eventManager.activeCount = null;
+        preReport.guestGame.eventManager.activeSlotsTruncated = null;
+        preReport.guestGame.eventInactive = false;
+        preReport.guestGame.controllableFoyer = false;
+      },
+      pattern: /preReport\.guestGame\.eventManager\.tableValid/,
     },
     {
       name: "wrong map",
@@ -142,13 +168,18 @@ test("Luigi guest-consumption evidence rejects every missing causal link", async
       pattern: /preReport\.guestGame\.player\.vtable/,
     },
     {
-      name: "controller input lock",
+      name: "player input gate closed",
       mutate({ preReport }) {
+        preReport.guestGame.inputGate.state1042 = 1;
+        preReport.guestGame.inputGate.open = false;
+        preReport.guestGame.expectedInputSource = null;
         preReport.guestGame.controller.inputSource = null;
+        preReport.guestGame.inputGateCoherent = true;
+        preReport.guestGame.controllerAcceptingPad = false;
         preReport.guestGame.controlsEnabled = false;
         preReport.guestGame.controllableFoyer = false;
       },
-      pattern: /preReport\.guestGame\.controller\.inputSource/,
+      pattern: /preReport\.guestGame\.inputGate\.state1042/,
     },
     {
       name: "non-neutral baseline",

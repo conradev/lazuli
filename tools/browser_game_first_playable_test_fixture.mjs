@@ -69,6 +69,7 @@ function exactRequiredPreparationRejectionReasons() {
     projectionZeroClipW: 0,
     projectionArithmeticOverflow: 0,
     invalidPreparedScissor: 0,
+    uncertifiedFaceCull: 0,
   };
 }
 

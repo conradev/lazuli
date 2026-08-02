@@ -465,6 +465,36 @@ test("appends one exact GX clip-input chunk in canonical LZGX v5 layout", () => 
   assert.deepEqual(bytes.subarray(0, exactOffset), expectedPrefix);
 });
 
+test("mixed V5 keeps non-finite native STQ outside the exact sidecar", () => {
+  const context = packetContext();
+  const frame = exactClipXfbFrame();
+  const exactDraw = frame.geometry.draws[0];
+  const nativeVertices = new Float32Array(exactDraw.vertices);
+  nativeVertices[12] = Number.NaN;
+  nativeVertices[13] = Number.POSITIVE_INFINITY;
+  const nativeDraw = {
+    ...exactDraw,
+    vertices: nativeVertices,
+  };
+  delete nativeDraw.exactClipInput;
+  frame.geometry.draws.push(nativeDraw);
+  frame.geometry.drawCalls = 2;
+  frame.geometry.vertices = 6;
+
+  const packet = context.packGxFramePacketV5(2, frame);
+  const view = new DataView(packet);
+  const nativeDrawOffset = 160 + 176;
+  const vertexOffset = view.getUint32(0x28, true);
+  const nativeVertexOffset =
+    vertexOffset + view.getUint32(nativeDrawOffset + 0x08, true);
+
+  assert.equal(view.getUint16(0x04, true), 5);
+  assert.equal(view.getUint16(160 + 0x02, true), 2);
+  assert.equal(view.getUint16(nativeDrawOffset + 0x02, true), 0);
+  assert.equal(view.getUint32(nativeVertexOffset + 12 * 4, true), 0x7fc00000);
+  assert.equal(view.getUint32(nativeVertexOffset + 13 * 4, true), 0x7f800000);
+});
+
 test("places legacy actions before aligned exact chunks in mixed LZGX v5", () => {
   const context = packetContext();
   const actionFrame = evidencedXfbFrame();

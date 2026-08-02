@@ -253,9 +253,21 @@ test("projection-null packet options preserve v6 defaults and model v5 optional 
   );
   assert.throws(
     () => buildProjectionNullOraclePacket(generation, {
+      cullMode: 4,
+    }),
+    /cullMode must be an integer from 0 through 3/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
       exactClipRequired: "yes",
     }),
     /exactClipRequired must be a boolean/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      reverseNativeWinding: 1,
+    }),
+    /reverseNativeWinding must be a boolean/,
   );
   assert.throws(
     () => buildProjectionNullOraclePacket(generation, {
@@ -268,6 +280,50 @@ test("projection-null packet options preserve v6 defaults and model v5 optional 
       visibleNativeCarrier: 1,
     }),
     /visibleNativeCarrier must be a boolean/,
+  );
+});
+
+test("projection-null packet can certify both direct WebGPU face-cull modes", () => {
+  const draw = projectionNullPacketLayout.drawOffset;
+  const exact = projectionNullPacketLayout.exactChunkOffset;
+  const vertex = (packet, index) =>
+    Array.from(
+      { length: 4 },
+      (_component, component) =>
+        f32(
+          packet,
+          projectionNullPacketLayout.vertexOffset +
+            index * projectionNullPacketLayout.vertexBytes +
+            component * 4,
+        ),
+    );
+  const back = buildProjectionNullOraclePacket(41, {
+    cullMode: 1,
+    exactClipRequired: false,
+    visibleNativeCarrier: true,
+  });
+  const front = buildProjectionNullOraclePacket(42, {
+    cullMode: 2,
+    exactClipRequired: false,
+    reverseNativeWinding: true,
+    visibleNativeCarrier: true,
+  });
+
+  assert.equal(back[draw + 0x01], 1);
+  assert.equal(front[draw + 0x01], 2);
+  assert.equal(u32(back, exact + 0x04), 1 << 14);
+  assert.equal(u32(front, exact + 0x04), 2 << 14);
+  assert.deepEqual(
+    [0, 1, 2].map((index) => vertex(back, index)),
+    projectionNullVisibleNativeCarrierPositions,
+  );
+  assert.deepEqual(
+    [0, 1, 2].map((index) => vertex(front, index)),
+    [
+      projectionNullVisibleNativeCarrierPositions[0],
+      projectionNullVisibleNativeCarrierPositions[2],
+      projectionNullVisibleNativeCarrierPositions[1],
+    ],
   );
 });
 

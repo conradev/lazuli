@@ -210,7 +210,7 @@ export async function verifyLocalGameCompatibilityCorpus(
   const root = resolve(directory);
   const entries = await readdir(root, { withFileTypes: true });
   const actualFiles = entries
-    .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith(".ciso"))
+    .filter(entry => entry.name.toLowerCase().endsWith(".ciso"))
     .map(entry => entry.name)
     .sort();
   const expectedFiles = corpus.games.map(game => game.file).sort();
@@ -228,8 +228,21 @@ export async function verifyLocalGameCompatibilityCorpus(
     (left, right) => left.priority - right.priority,
   )) {
     const path = resolve(root, game.file);
-    const metadata = await stat(path);
-    if (!metadata.isFile() || metadata.size !== game.bytes) {
+    let metadata;
+    try {
+      metadata = await stat(path);
+    } catch (error) {
+      throw new Error(
+        `local game image does not resolve to a regular file for ${game.file}`,
+        { cause: error },
+      );
+    }
+    if (!metadata.isFile()) {
+      throw new Error(
+        `local game image does not resolve to a regular file for ${game.file}`,
+      );
+    }
+    if (metadata.size !== game.bytes) {
       throw new Error(
         `local game image size mismatch for ${game.file}: `
           + `expected ${game.bytes}, got ${metadata.size}`,

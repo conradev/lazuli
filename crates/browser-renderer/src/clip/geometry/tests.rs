@@ -324,21 +324,38 @@ fn strip_fans_retain_their_original_source_triples() {
 }
 
 #[test]
-fn fully_rejected_geometry_is_an_authoritative_empty_result() {
+fn only_certified_rejections_are_authoritative_empty_results() {
     let source = source_vertices(3);
     let front = [
         [-0.5, -0.5, -0.5, 1.0],
         [0.5, -0.5, -0.5, 1.0],
         [-0.5, 0.5, -0.5, 1.0],
     ];
-    let culled = gx_exact_raster_geometry(2, 1, &source, &front, exact_state(1)).unwrap();
-    assert_eq!(culled.triangle_count(), 0);
-    assert!(culled.vertices().is_empty());
-    assert!(culled.source_indices().is_empty());
+    assert_eq!(
+        gx_exact_raster_geometry(2, 1, &source, &front, exact_state(1)),
+        Err(GxExactGeometryError::Clip(
+            GxClipError::UncertifiedFaceCull(1)
+        )),
+    );
+    let culled_all = gx_exact_raster_geometry(2, 3, &source, &front, exact_state(3)).unwrap();
+    assert_eq!(culled_all.triangle_count(), 0);
+    assert!(culled_all.vertices().is_empty());
+    assert!(culled_all.source_indices().is_empty());
 
     let behind = [[0.0, 0.0, 0.0, -1.0]; 3];
-    let clipped = gx_exact_raster_geometry(2, 0, &source, &behind, exact_state(0)).unwrap();
-    assert_eq!(clipped.triangle_count(), 0);
+    for cull_mode in [0, 1, 2, 3] {
+        let clipped =
+            gx_exact_raster_geometry(2, cull_mode, &source, &behind, exact_state(cull_mode))
+                .unwrap();
+        assert_eq!(clipped.triangle_count(), 0);
+    }
+
+    let zero_matrix_clip = [[0.0, 0.0, -1.0, -0.0]; 3];
+    let zero_matrix =
+        gx_exact_raster_geometry(2, 2, &source, &zero_matrix_clip, exact_state(2)).unwrap();
+    assert_eq!(zero_matrix.triangle_count(), 0);
+    assert!(zero_matrix.vertices().is_empty());
+    assert!(zero_matrix.source_indices().is_empty());
 
     let mut invisible_scissor = exact_state(0);
     invisible_scissor.bp_scissor_top_left = (1042 << 12) | 342;
@@ -1025,6 +1042,12 @@ fn exact_preparation_failure_telemetry_is_exhaustive_and_bounded() {
         (
             GxExactPreparationFailure::InvalidPreparedScissor,
             Reason::InvalidPreparedScissor,
+        ),
+        (
+            geometry(GxExactGeometryError::Clip(
+                GxClipError::UncertifiedFaceCull(1),
+            )),
+            Reason::UncertifiedFaceCull,
         ),
     ];
 

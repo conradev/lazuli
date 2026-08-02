@@ -63,7 +63,11 @@ function workerContext() {
     gxTevColorRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
     gxTevKonstRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
     gxTexgenFallbacks: 0,
+    gxTexgenNonFiniteTransforms: 0,
     gxTexgenTransforms: 0,
+    gxVertexTransformContextSnapshots: 0,
+    gxVertexTransformCacheSnapshots: 0,
+    gxVertexTransformCacheMemoHits: 0,
     gxXfRegisters,
     ramPointer(address, length) {
       return address + length <= bytes.byteLength ? address : null;
@@ -82,6 +86,53 @@ function workerContext() {
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function luigisMansionMatrixProbeContext() {
+  const memory = new ArrayBuffer(0x200);
+  const registers = new Uint32Array(32);
+  const context = {
+    Array,
+    ArrayBuffer,
+    DataView,
+    Number,
+    Uint32Array,
+    boot: {
+      identifier: "GLME01",
+      discId: 0,
+      version: 0,
+    },
+    cycles: 123456,
+    luigisMansionGxLoadTexMtxImmPc: 0x801fa288,
+    luigisMansionGxPostTexMtx18Id: 118,
+    luigisMansionGxPostTexMtx18Load: null,
+    luigisMansionGxTexMtxWordCount: 12,
+    registers,
+    view: new DataView(memory),
+    guestEffectivePointer(address, length) {
+      return address + length <= memory.byteLength ? address : null;
+    },
+    readGpr(index) {
+      return registers[index];
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      "isUint32",
+      "exactLuigisMansionRevisionZero",
+      "classifyFloat32Word",
+      "observeLuigisMansionGxLoadTexMtxImm",
+      "snapshotLuigisMansionGxPostTexMtx18Load",
+      "luigisMansionGxLoadTexMtxImmProbeRegionSafe",
+      "hex32",
+    ].map(extractFunction).join("\n\n"),
+    context,
+    {
+      filename: "browser_boot.luigi-gx-matrix-probe.js",
+    },
+  );
+  return context;
 }
 
 function assertVector(actual, expected, epsilon = 1e-7) {
@@ -111,6 +162,279 @@ function setXfMatrixRows(context, baseAddress, rowIndex, rows) {
     }
   }
 }
+
+test("Luigi GX_PTTEXMTX18 probe retains first and first non-finite loads", () => {
+  const context = luigisMansionMatrixProbeContext();
+  const firstSourceAddress = 0x40;
+  const secondSourceAddress = 0x80;
+  const nonFiniteSourceAddress = 0xc0;
+  const firstWords = Array(12).fill(0);
+  const secondWords = Array(12).fill(0x3f800000);
+  const nonFiniteWords = [
+    0x00000000,
+    0x80000000,
+    0x3f800000,
+    0x00800000,
+    0x7f7fffff,
+    0xff7fffff,
+    0x00000001,
+    0x80000001,
+    0x7f800000,
+    0xff800000,
+    0x7fc00001,
+    0xff800001,
+  ];
+  context.registers[4] = 118;
+  for (const [address, words] of [
+    [firstSourceAddress, firstWords],
+    [secondSourceAddress, secondWords],
+    [nonFiniteSourceAddress, nonFiniteWords],
+  ]) {
+    words.forEach((word, index) => {
+      context.view.setUint32(address + index * 4, word, false);
+    });
+  }
+
+  context.registers[3] = firstSourceAddress;
+  let probe = context.observeLuigisMansionGxLoadTexMtxImm(0x801fa288);
+  assert.equal(probe.observedQualifyingLoadCount, 1);
+  assert.equal(probe.firstLoad.ordinal, 1);
+  assert.deepEqual(Array.from(probe.firstLoad.rawWords), firstWords);
+  assert.equal(probe.firstLoad.allFinite, true);
+  assert.equal(probe.firstNonFiniteLoad, null);
+
+  context.cycles += 1;
+  context.registers[3] = secondSourceAddress;
+  probe = context.observeLuigisMansionGxLoadTexMtxImm(
+    0x801fa288,
+    probe,
+  );
+  assert.equal(probe.observedQualifyingLoadCount, 2);
+  assert.equal(probe.firstLoad.sourceAddress, firstSourceAddress);
+  assert.equal(probe.firstNonFiniteLoad, null);
+
+  context.cycles += 1;
+  context.registers[3] = nonFiniteSourceAddress;
+  probe = context.observeLuigisMansionGxLoadTexMtxImm(
+    0x801fa288,
+    probe,
+  );
+  assert.equal(probe.observedQualifyingLoadCount, 3);
+  assert.equal(probe.firstLoad.sourceAddress, firstSourceAddress);
+  assert.equal(probe.firstNonFiniteLoad.ordinal, 3);
+  assert.deepEqual(
+    Array.from(probe.firstNonFiniteLoad.rawWords),
+    nonFiniteWords,
+  );
+  assert.deepEqual(
+    Array.from(probe.firstNonFiniteLoad.nonFiniteWordIndices),
+    [8, 9, 10, 11],
+  );
+
+  const snapshot =
+    context.snapshotLuigisMansionGxPostTexMtx18Load(probe);
+  assert.deepEqual(plain(snapshot), {
+    observedQualifyingLoadCount: 3,
+    firstLoad: {
+      ordinal: 1,
+      cycle: 123456,
+      pc: "0x801fa288",
+      function: "GXLoadTexMtxImm",
+      matrix: "GX_PTTEXMTX18",
+      matrixId: 118,
+      sourceAddress: "0x00000040",
+      wordCount: 12,
+      byteOrder: "big-endian",
+      rawWords: firstWords.map(word =>
+        "0x" + word.toString(16).padStart(8, "0")
+      ),
+      classifications: Array(12).fill("finite"),
+      allFinite: true,
+      finiteWordCount: 12,
+      nonFiniteWordIndices: [],
+    },
+    firstNonFiniteLoad: {
+      ordinal: 3,
+      cycle: 123458,
+      pc: "0x801fa288",
+      function: "GXLoadTexMtxImm",
+      matrix: "GX_PTTEXMTX18",
+      matrixId: 118,
+      sourceAddress: "0x000000c0",
+      wordCount: 12,
+      byteOrder: "big-endian",
+      rawWords: nonFiniteWords.map(word =>
+        "0x" + word.toString(16).padStart(8, "0")
+      ),
+      classifications: [
+        "finite",
+        "finite",
+        "finite",
+        "finite",
+        "finite",
+        "finite",
+        "finite",
+        "finite",
+        "infinity",
+        "infinity",
+        "nan",
+        "nan",
+      ],
+      allFinite: false,
+      finiteWordCount: 8,
+      nonFiniteWordIndices: [8, 9, 10, 11],
+    },
+  });
+  const serialized = JSON.stringify(snapshot);
+  assert.doesNotMatch(serialized, /null/);
+
+  context.cycles += 1;
+  context.registers[3] = secondSourceAddress;
+  context.view.setUint32(secondSourceAddress, 0x7fc00000, false);
+  assert.equal(
+    context.observeLuigisMansionGxLoadTexMtxImm(
+      0x801fa288,
+      probe,
+    ),
+    probe,
+    "loads after the first non-finite witness leave bounded state unchanged",
+  );
+  assert.equal(probe.observedQualifyingLoadCount, 3);
+});
+
+test("Luigi matrix probe guards reads and fences regions through non-finite capture", () => {
+  const context = luigisMansionMatrixProbeContext();
+  for (let index = 0; index < 12; index += 1) {
+    context.view.setUint32(0x40 + index * 4, 0x3f800000, false);
+    context.view.setUint32(0x80 + index * 4, 0x3f800000, false);
+  }
+  const otherDisc = {
+    identifier: "GZLE01",
+    discId: 0,
+    version: 0,
+  };
+  context.registers[3] = 0x40;
+  context.registers[4] = 117;
+  assert.equal(
+    context.observeLuigisMansionGxLoadTexMtxImm(0x801fa288),
+    null,
+  );
+  context.registers[4] = 118;
+  assert.equal(
+    context.observeLuigisMansionGxLoadTexMtxImm(0x801fa284),
+    null,
+  );
+  assert.equal(
+    context.observeLuigisMansionGxLoadTexMtxImm(
+      0x801fa288,
+      null,
+      context.readGpr,
+      context.guestEffectivePointer,
+      context.view,
+      otherDisc,
+      1,
+    ),
+    null,
+  );
+  context.registers[3] = 0x1f0;
+  assert.equal(
+    context.observeLuigisMansionGxLoadTexMtxImm(0x801fa288),
+    null,
+    "an unreadable 48-byte source is not counted",
+  );
+
+  const pendingRegion = {
+    pcs: [0x801fa200, 0x801fa288, 0x801fa2f0],
+  };
+  assert.equal(
+    context.luigisMansionGxLoadTexMtxImmProbeRegionSafe(
+      pendingRegion,
+      null,
+      context.boot,
+    ),
+    false,
+  );
+
+  context.registers[3] = 0x40;
+  let probe = context.observeLuigisMansionGxLoadTexMtxImm(0x801fa288);
+  assert.equal(probe.observedQualifyingLoadCount, 1);
+  assert.equal(
+    context.luigisMansionGxLoadTexMtxImmProbeRegionSafe(
+      pendingRegion,
+      probe,
+      context.boot,
+    ),
+    false,
+    "a benign first load keeps exact-entry fencing active",
+  );
+
+  context.view.setUint32(0x80, 0x7f800000, false);
+  context.registers[3] = 0x80;
+  probe = context.observeLuigisMansionGxLoadTexMtxImm(
+    0x801fa288,
+    probe,
+  );
+  assert.equal(probe.observedQualifyingLoadCount, 2);
+  assert.equal(probe.firstNonFiniteLoad.ordinal, 2);
+  assert.equal(
+    context.luigisMansionGxLoadTexMtxImmProbeRegionSafe(
+      pendingRegion,
+      probe,
+      context.boot,
+    ),
+    true,
+    "the fence retires after the first non-finite load is captured",
+  );
+  assert.equal(
+    context.luigisMansionGxLoadTexMtxImmProbeRegionSafe(
+      { pcs: [0x801fa200, 0x801fa2f0] },
+      null,
+      context.boot,
+    ),
+    true,
+  );
+  assert.equal(
+    context.luigisMansionGxLoadTexMtxImmProbeRegionSafe(
+      pendingRegion,
+      null,
+      otherDisc,
+    ),
+    true,
+  );
+});
+
+test("Luigi matrix-probe source guard observes before execution without mutation", () => {
+  const observe = extractFunction(
+    "observeLuigisMansionGxLoadTexMtxImm",
+  );
+  assert.match(
+    source,
+    /luigisMansionGxPostTexMtx18Load =\s+observeLuigisMansionGxLoadTexMtxImm\(pc\);\s+observeWarioWareNextMicrogameSelection\(pc\);\s+applyWarioWareNextMicrogameOverride\(pc\);\s+stage = "compile";/,
+  );
+  assert.match(
+    source,
+    /warioWareNextMicrogameOverrideRegionSafe\([\s\S]*?\)\s+&& luigisMansionGxLoadTexMtxImmProbeRegionSafe\(retainedRegion\)\s+&& compiledRegionIsExecutable/,
+  );
+  assert.match(
+    source,
+    /gxPostTexMtx18Load: snapshotLuigisMansionGxPostTexMtx18Load\(\)/,
+  );
+  assert.match(
+    observe,
+    /memory\.getUint32\(pointer \+ index \* 4, false\)/,
+  );
+  assert.match(
+    extractFunction("classifyFloat32Word"),
+    /\(word & 0x7f800000\) !== 0x7f800000/,
+  );
+  assert.doesNotMatch(
+    [
+      observe,
+      extractFunction("snapshotLuigisMansionGxPostTexMtx18Load"),
+    ].join("\n"),
+    /set(?:Uint32|Float32)|writeGpr|Number\.NaN|Math\.fround/,
+  );
+});
 
 test("decodes direct signed normals with GX fixed-point scaling", () => {
   const context = workerContext();
@@ -247,16 +571,296 @@ test("normal-source projective texgen scales post-transform ST but preserves Q",
   const unscaled = context.gxTransformTexCoord(attributes, matrixIndex, 0);
   assertVector(unscaled, [2, 6, 13]);
   assert.notDeepEqual(plain(unscaled), [2 / 13, 6 / 13, 1]);
+  const unscaledContext = context.gxPrepareVertexTransformContext();
+  assertVector(
+    context.gxTransformTexCoord(attributes, matrixIndex, 0, unscaledContext),
+    unscaled,
+  );
 
   context.gxXfRegisters[0x1012] = 1;
   context.gxXfRegisters[0x1050] = postIndex;
   context.gxBpRegisters[0x30] = 2;
   context.gxBpRegisters[0x31] = 4;
   const scaled = context.gxTransformTexCoord(attributes, matrixIndex, 0);
+  const scaledContext = context.gxPrepareVertexTransformContext();
+  const cachedScaled = context.gxTransformTexCoord(
+    attributes,
+    matrixIndex,
+    0,
+    scaledContext,
+  );
+  const reusedScaled = context.gxTransformTexCoord(
+    attributes,
+    matrixIndex,
+    0,
+    scaledContext,
+  );
   // Post-transform STQ is [15, -7, 27]. SU_SSIZE/SU_TSIZE then scale only
   // S/T by their low-16-bit values plus one.
   assertVector(scaled, [45, -35, 27]);
+  assertVector(cachedScaled, scaled);
+  assertVector(reusedScaled, scaled);
+  assert.deepEqual(plain(cachedScaled), plain(scaled));
+  assert.deepEqual(plain(reusedScaled), plain(scaled));
   assert.notDeepEqual(plain(scaled), [45 / 27, -35 / 27, 1]);
+  assert.ok(context.gxVertexTransformCacheSnapshots >= 9);
+  assert.ok(context.gxVertexTransformCacheMemoHits >= 6);
+});
+
+test("missing optional texgen sources retain Flipper's AB11 default", () => {
+  const context = workerContext();
+  context.gxXfRegisters[0x103f] = 1;
+  // Vec3 output, ABC1 input, transform texgen, absent source row 1 (normal).
+  context.gxXfRegisters[0x1040] = 0x86;
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  const attributes = {
+    position: [11, 12, 13],
+    normal: null,
+    tangent: null,
+    binormal: null,
+    colors: [[10, 20, 30, 40], [50, 60, 70, 80]],
+    rawTextureCoords: Array(8).fill(null),
+  };
+
+  const direct = context.gxTransformTexCoord(attributes, 0, 0);
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const cached = context.gxTransformTexCoord(
+    attributes,
+    0,
+    0,
+    transformContext,
+  );
+
+  assert.deepEqual(plain(direct), [0, 0, 1]);
+  assert.deepEqual(plain(cached), plain(direct));
+  assert.equal(context.gxTexgenFallbacks, 0);
+});
+
+test("non-finite post texgen values remain transportable WebGPU STQ", () => {
+  const context = workerContext();
+  const postIndex = 54;
+  context.gxXfRegisters[0x103f] = 1;
+  // Vec3 output, ABC1 input, transform texgen, source row 0 (position).
+  context.gxXfRegisters[0x1040] = 0x06;
+  context.gxXfRegisters[0x1012] = 1;
+  context.gxXfRegisters[0x1050] = postIndex;
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  setXfMatrixRows(context, 0x500, postIndex, [
+    [Number.NaN, 0, 0, 0],
+    [0, Number.POSITIVE_INFINITY, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  const attributes = {
+    position: [1, 2, 3],
+    normal: null,
+    tangent: null,
+    binormal: null,
+    colors: [[0, 0, 0, 0], [0, 0, 0, 0]],
+    rawTextureCoords: Array(8).fill(null),
+  };
+
+  assert.equal(context.gxXfMatrixRow(0x500, postIndex), null);
+  const direct = context.gxTransformTexCoord(attributes, 0, 0);
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const cached = context.gxTransformTexCoord(
+    attributes,
+    0,
+    0,
+    transformContext,
+  );
+
+  for (const result of [direct, cached]) {
+    assert.ok(Number.isNaN(result[0]));
+    assert.equal(result[1], Number.POSITIVE_INFINITY);
+    assert.equal(result[2], 3);
+  }
+  assert.equal(context.gxTexgenNonFiniteTransforms, 2);
+  assert.equal(context.gxTevCoordsValid([direct], 1), false);
+  assert.equal(context.gxTevCoordsTransportable([direct], 1), true);
+  assert.equal(context.gxTevCoordsTransportable([null], 1), false);
+});
+
+test("cached texgen retains the final non-post matrix rows 63 through 65", () => {
+  const context = workerContext();
+  const matrixIndex = 63;
+  context.gxXfRegisters[0x103f] = 1;
+  // Vec3 output, ABC1 input, transform texgen, source row 0 (position).
+  context.gxXfRegisters[0x1040] = 0x06;
+  setXfMatrixRows(context, 0, matrixIndex, [
+    [1, 0, 0, 10],
+    [0, 1, 0, 20],
+    [0, 0, 1, 30],
+  ]);
+  const attributes = {
+    position: [2, 3, 4],
+    normal: null,
+    tangent: null,
+    binormal: null,
+    colors: [[0, 0, 0, 0], [0, 0, 0, 0]],
+    rawTextureCoords: Array(8).fill(null),
+  };
+
+  const direct = context.gxTransformTexCoord(
+    attributes,
+    matrixIndex,
+    0,
+  );
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const cached = context.gxTransformTexCoord(
+    attributes,
+    matrixIndex,
+    0,
+    transformContext,
+  );
+  const reused = context.gxTransformTexCoord(
+    attributes,
+    matrixIndex,
+    0,
+    transformContext,
+  );
+
+  assert.deepEqual(plain(direct), [12, 23, 34]);
+  assert.deepEqual(plain(cached), plain(direct));
+  assert.deepEqual(plain(reused), plain(direct));
+  assert.deepEqual(
+    plain(transformContext.texgenRows.slice(63, 66)),
+    [
+      [1, 0, 0, 10],
+      [0, 1, 0, 20],
+      [0, 0, 1, 30],
+    ],
+  );
+  assert.equal(context.gxVertexTransformCacheSnapshots, 3);
+  assert.equal(context.gxVertexTransformCacheMemoHits, 3);
+});
+
+test("cached dual texgen wraps post matrix 62 through rows 62, 63, and 0", () => {
+  const context = workerContext();
+  context.gxXfRegisters[0x103f] = 1;
+  // Vec3 output, ABC1 input, transform texgen, source row 0 (position).
+  context.gxXfRegisters[0x1040] = 0x06;
+  context.gxXfRegisters[0x1012] = 1;
+  context.gxXfRegisters[0x1050] = 62;
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  setXfMatrixRows(context, 0x500, 62, [
+    [1, 0, 0, 10],
+    [0, 1, 0, 20],
+  ]);
+  setXfMatrixRows(context, 0x500, 0, [
+    [0, 0, 1, 30],
+  ]);
+  const attributes = {
+    position: [2, 3, 4],
+    normal: null,
+    tangent: null,
+    binormal: null,
+    colors: [[0, 0, 0, 0], [0, 0, 0, 0]],
+    rawTextureCoords: Array(8).fill(null),
+  };
+
+  const direct = context.gxTransformTexCoord(attributes, 0, 0);
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const cached = context.gxTransformTexCoord(
+    attributes,
+    0,
+    0,
+    transformContext,
+  );
+  const reused = context.gxTransformTexCoord(
+    attributes,
+    0,
+    0,
+    transformContext,
+  );
+
+  assert.deepEqual(plain(direct), [12, 23, 34]);
+  assert.deepEqual(plain(cached), plain(direct));
+  assert.deepEqual(plain(reused), plain(direct));
+  assert.deepEqual(plain(transformContext.texgenPostRows[62]), [1, 0, 0, 10]);
+  assert.deepEqual(plain(transformContext.texgenPostRows[63]), [0, 1, 0, 20]);
+  assert.deepEqual(plain(transformContext.texgenPostRows[0]), [0, 0, 1, 30]);
+  assert.equal(context.gxVertexTransformCacheSnapshots, 6);
+  assert.equal(context.gxVertexTransformCacheMemoHits, 6);
+});
+
+test("vertex transform caches retain null matrices and raw texgen-row snapshots", () => {
+  const context = workerContext();
+  const transformContext = context.gxPrepareVertexTransformContext();
+
+  assert.equal(
+    context.gxVertexTransformPositionMatrix(transformContext, 0),
+    null,
+  );
+  setXfMatrixRows(context, 0, 0, [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+  ]);
+  assert.equal(
+    context.gxVertexTransformPositionMatrix(transformContext, 0),
+    null,
+  );
+
+  assert.equal(
+    context.gxVertexTransformNormalMatrix(transformContext, 0),
+    null,
+  );
+  [
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
+  ].forEach((value, index) => setXfFloat(context, 0x400 + index, value));
+  assert.equal(
+    context.gxVertexTransformNormalMatrix(transformContext, 0),
+    null,
+  );
+
+  const texgenRow = 10;
+  context.gxXfRegisters[texgenRow * 4] = 0x7fc00000;
+  const cachedTexgenRow = context.gxVertexTransformTexgenRow(
+    transformContext,
+    texgenRow,
+    false,
+  );
+  assert.ok(Number.isNaN(cachedTexgenRow[0]));
+  setXfMatrixRows(context, 0, texgenRow, [[1, 2, 3, 4]]);
+  assert.equal(
+    context.gxVertexTransformTexgenRow(transformContext, texgenRow, false),
+    cachedTexgenRow,
+  );
+
+  const postRow = 11;
+  context.gxXfRegisters[0x500 + postRow * 4] = 0x7fc00000;
+  const cachedPostRow = context.gxVertexTransformTexgenRow(
+    transformContext,
+    postRow,
+    true,
+  );
+  assert.ok(Number.isNaN(cachedPostRow[0]));
+  setXfMatrixRows(context, 0x500, postRow, [[5, 6, 7, 8]]);
+  assert.equal(
+    context.gxVertexTransformTexgenRow(transformContext, postRow, true),
+    cachedPostRow,
+  );
+
+  assert.equal(transformContext.positionMatrices[0], null);
+  assert.equal(transformContext.normalMatrices[0], null);
+  assert.equal(transformContext.texgenRows[texgenRow], cachedTexgenRow);
+  assert.equal(transformContext.texgenPostRows[postRow], cachedPostRow);
+  assert.equal(context.gxVertexTransformCacheSnapshots, 4);
+  assert.equal(context.gxVertexTransformCacheMemoHits, 4);
 });
 
 test("BP texture-coordinate scales use low 16 bits and f32 multiplication", () => {
@@ -331,6 +935,25 @@ test("vertex decode retains two independent raster color channels", () => {
   assert.deepEqual(plain(decoded.position), [1, 2, 3]);
   assert.equal(decoded.positionMatrix, 0);
   assert.equal(decoded.texCoords.length, 8);
+
+  const transformContext = context.gxPrepareVertexTransformContext();
+  const prepared = context.gxDecodeVertex(
+    sourceBytes,
+    0,
+    0,
+    transformContext,
+  );
+  const reused = context.gxDecodeVertex(
+    sourceBytes,
+    0,
+    0,
+    transformContext,
+  );
+  assert.deepEqual(plain(prepared), plain(decoded));
+  assert.deepEqual(plain(reused), plain(decoded));
+  assert.equal(context.gxVertexTransformContextSnapshots, 1);
+  assert.equal(context.gxVertexTransformCacheSnapshots, 1);
+  assert.equal(context.gxVertexTransformCacheMemoHits, 1);
 });
 
 test("packs the exact 464-byte WebGPU TEV uniform layout", () => {
@@ -482,7 +1105,11 @@ test("BP TEV writes keep konst physical slots and rotate color slots", () => {
 test("worker draw capture routes XF attributes through the TEV transport", () => {
   const capture = extractFunction("recordGxPrimitive");
   assert.match(capture, /gxPackTevState\s*\(/);
-  assert.match(capture, /const sourceVertices = new Float32Array\(vertices\)/);
+  assert.match(
+    capture,
+    /const sourceVertices = new Float32Array\(vertexCount \* 36\)/,
+  );
+  assert.doesNotMatch(capture, /const vertices = \[\]/);
   assert.match(capture, /vertices:\s*sourceVertices/);
   assert.match(capture, /const \[raster0, raster1\] = decoded\.rasterColors/);
   assert.match(capture, /rasterColorSets\[0\]\.push\(raster0\)/);

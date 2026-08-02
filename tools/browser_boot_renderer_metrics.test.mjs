@@ -51,18 +51,24 @@ test("GX frames cross the renderer bridge as one exact packet view", () => {
     Number,
     String,
     Uint8Array,
+    Uint32Array,
     document: { body: { dataset: {} } },
     rendererHostMetrics: {
       workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
     },
     webGpuRenderer: {
-      submit_gx_frame(packet) {
-        submissions.push(packet);
+      submit_gx_frame(packet, preClearWords) {
+        submissions.push({ packet, preClearWords });
       },
     },
   };
   vm.createContext(context);
-  vm.runInContext(extractFunction("submitGxFrame"), context);
+  vm.runInContext(
+    ["gxValidatePreClearWords", "submitGxFrame"]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+  );
 
   const xfbPacket = new ArrayBuffer(1920);
   context.submitGxFrame({
@@ -70,10 +76,11 @@ test("GX frames cross the renderer bridge as one exact packet view", () => {
     diagnostics: { copyKind: 2, index: 0x11223344, drawCalls: 2, vertices: 3 },
   });
   assert.equal(submissions.length, 1);
-  assert.ok(submissions[0] instanceof Uint8Array);
-  assert.strictEqual(submissions[0].buffer, xfbPacket);
-  assert.equal(submissions[0].byteOffset, 0);
-  assert.equal(submissions[0].byteLength, 1920);
+  assert.ok(submissions[0].packet instanceof Uint8Array);
+  assert.strictEqual(submissions[0].packet.buffer, xfbPacket);
+  assert.equal(submissions[0].packet.byteOffset, 0);
+  assert.equal(submissions[0].packet.byteLength, 1920);
+  assert.deepEqual([...submissions[0].preClearWords], []);
   assert.deepEqual(context.rendererHostMetrics.workerMessages, {
     gxFrames: 1,
     drawCalls: 2,
@@ -86,17 +93,22 @@ test("GX frames cross the renderer bridge as one exact packet view", () => {
   });
 
   const texturePacket = new ArrayBuffer(128);
+  const preClearWords = new Uint32Array([
+    7, 9, 11, 13, 0x17, 0x5a9, 3, 4, 5, 6, 0xff, 0x123456,
+  ]);
   context.submitGxFrame({
     packet: texturePacket,
     diagnostics: { copyKind: 1, index: 7, drawCalls: 0, vertices: 0 },
+    preClearWords,
   });
   assert.equal(submissions.length, 2);
-  assert.strictEqual(submissions[1].buffer, texturePacket);
-  assert.equal(submissions[1].byteLength, 128);
+  assert.strictEqual(submissions[1].packet.buffer, texturePacket);
+  assert.equal(submissions[1].packet.byteLength, 128);
+  assert.strictEqual(submissions[1].preClearWords, preClearWords);
   assert.deepEqual(context.rendererHostMetrics.workerMessages, {
     gxFrames: 2,
     drawCalls: 2,
-    receivedArrayBufferBytes: 2048,
+    receivedArrayBufferBytes: 2096,
   });
   assert.equal(context.document.body.dataset.gxTextureCopies, "7");
 
@@ -572,10 +584,11 @@ test("required exact preparation failures expose one bounded subtype map", () =>
     "projectionZeroClipW",
     "projectionArithmeticOverflow",
     "invalidPreparedScissor",
+    "uncertifiedFaceCull",
   ];
   assert.match(
     rendererCoreSource,
-    /EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT: usize = 40/,
+    /EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT: usize = 41/,
   );
   assert.match(
     rendererCoreSource,
@@ -682,7 +695,7 @@ test("required exact preparation failures expose one bounded subtype map", () =>
   );
   assert.match(
     rendererCoreSource,
-    /size_of::<ExactRequiredRejectionSnapshot>\(\),\s*55 \* 8/,
+    /size_of::<ExactRequiredRejectionSnapshot>\(\),\s*56 \* 8/,
   );
 });
 
