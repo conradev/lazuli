@@ -1029,6 +1029,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     // Keep the architected RAM-write contract in the worker. The page only
     // transports untrusted renderer receipts back across the message boundary.
     const rendererTextureCopyExpectations = new Map();
+    const rendererEfbPeekExpectations = new Map();
     // A texture-copy output is an architected RAM write. Once its packet is
     // posted, the FIFO decoder may not execute a later command until the exact
     // renderer sequence has returned, validated, and committed every RAM row.
@@ -1044,6 +1045,18 @@ const TEMPLATE: &str = r##"<!doctype html>
     let rendererFrameResultMisses = 0;
     let rendererFailure = null;
     let rendererResidentTextureKeys = new Set();
+    let efbPeekRequestSequence = 0;
+    let pendingEfbPeek = null;
+    let completedEfbPeek = null;
+    let efbPeekYieldRequested = false;
+    let efbPeekOrderingYields = 0;
+    let efbPeekRequests = 0;
+    let efbPeekCompletions = 0;
+    let efbPeekRetries = 0;
+    let efbPeekDepthReads = 0;
+    let efbPeekColorReads = 0;
+    let efbPeekOutOfBoundsReads = 0;
+    let efbPeekCombinedReads = 0;
     const exiIplImageBytes = 2 * 1024 * 1024;
     const exiSramBase = 0x00800000;
     const exiSramBytes = 0x44;
@@ -1523,7 +1536,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         rendererFramesInFlight.size
       );
       try {
-        if (type === "gx-frame") {
+        if (type === "gx-frame" || type === "gx-peek") {
           postMessage({
             type,
             packet: frame.packet,
@@ -1899,7 +1912,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       ) {
         throw new TypeError("GX texture-copy layout requires a complete LZGX packet");
       }
-      copyKind = gxFramePacketInteger(copyKind, "copyKind", 2);
+      copyKind = gxFramePacketInteger(copyKind, "copyKind", 3);
       const view = new DataView(packet);
       const packetKind = view.getUint32(0x10, true);
       if (packetKind !== copyKind) {
@@ -1908,9 +1921,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (view.getUint32(0x0c, true) !== 0) {
         throw new Error("GX texture-copy layout requires canonical zero packet flags");
       }
-      if (copyKind === 2) return packet;
+      if (copyKind === 2 || copyKind === 3) return packet;
       if (copyKind !== 1) {
-        throw new RangeError("GX texture-copy layout copyKind must be 1 or 2");
+        throw new RangeError("GX texture-copy layout copyKind must be 1, 2, or 3");
       }
       if (
         view.getUint32(0x5c, true) !== 0
@@ -2215,11 +2228,23 @@ const TEMPLATE: &str = r##"<!doctype html>
       const textureCopyExpectation = copyKind === 1
         ? gxTextureCopyReceiptExpectation(frame)
         : null;
-      const rendererSequence = postRendererFrame(
-        "gx-frame",
-        { packet, diagnostics, preClearWords, textureCopyExpectation },
-        transfer
-      );
+      const rendererSequence = copyKind === 3
+        ? postRendererFrame(
+          "gx-peek",
+          { packet, diagnostics, preClearWords, textureCopyExpectation },
+          transfer
+        )
+        : postRendererFrame(
+          "gx-frame",
+          { packet, diagnostics, preClearWords, textureCopyExpectation },
+          transfer
+        );
+      if (copyKind === 3) {
+        rendererEfbPeekExpectations.set(
+          rendererSequence,
+          frame.efbPeekExpectation
+        );
+      }
       if (textureCopyExpectation !== null) {
         armRendererTextureCopyBarrier(rendererSequence);
       }
@@ -2430,9 +2455,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     // A compact tail can certify homogeneous cull/reorder decisions while raw
     // topology, cull state, and vertices remain unchanged for native fallback.
     function packGxFramePacketV4(copyKind, frame, residentTextureKeys = null) {
-      copyKind = gxFramePacketInteger(copyKind, "copyKind", 2);
-      if (copyKind !== 1 && copyKind !== 2) {
-        throw new RangeError("GX frame packet copyKind must be 1 or 2");
+      copyKind = gxFramePacketInteger(copyKind, "copyKind", 3);
+      if (copyKind !== 1 && copyKind !== 2 && copyKind !== 3) {
+        throw new RangeError("GX frame packet copyKind must be 1, 2, or 3");
       }
       if (frame === null || typeof frame !== "object") {
         throw new TypeError("GX frame packet frame must be an object");
@@ -2894,7 +2919,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const destination = gxFramePacketInteger(frame.destination, "frame.destination");
       const stride = copyKind === 2
         ? gxFramePacketInteger(frame.stride, "frame.stride")
-        : 0;
+        : copyKind === 3
+          ? gxFramePacketInteger(frame.stride, "frame.stride", 2)
+          : 0;
       if (sourceWidth === 0 || sourceHeight === 0) {
         throw new RangeError("GX frame packet source dimensions must be nonzero");
       }
@@ -2975,6 +3002,30 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if ((copyKind === 2) !== ((copyCommand & 0x4000) !== 0)) {
         throw new Error("GX frame packet copyKind conflicts with copy command");
+      }
+      if (
+        copyKind === 3
+        && (
+          sourceX >= 640
+          || sourceY >= 528
+          || sourceWidth !== 1
+          || sourceHeight !== 1
+          || outputWidth !== 0
+          || outputHeight !== 0
+          || destination > 1
+          || generation === 0
+          || frame.clear
+          || rgba.some(component => component !== 0)
+          || terminalZMode !== 0
+          || terminalBlendMode !== 0
+          || copyCommand !== 0
+          || clearDepth !== 0
+          || copyScale !== 0
+          || copyFilter0 !== 0
+          || copyFilter1 !== 0
+        )
+      ) {
+        throw new Error("GX frame packet EFB peek terminal is noncanonical");
       }
 
       const packet = new ArrayBuffer(packetBytes);
@@ -3906,9 +3957,44 @@ const TEMPLATE: &str = r##"<!doctype html>
       gxCommitTextureCopyMaterialization(expectation, materializedHash);
     }
 
+    function gxPreflightEfbPeekReceipt(receipt, expectation) {
+      if (expectation === null) {
+        if (receipt !== undefined) {
+          throw new Error("non-peek WebGPU frame returned an EFB peek receipt");
+        }
+        return null;
+      }
+      if (
+        receipt === null
+        || typeof receipt !== "object"
+        || Array.isArray(receipt)
+        || !Number.isSafeInteger(receipt.requestSequence)
+        || receipt.requestSequence !== expectation.requestSequence
+        || !Number.isSafeInteger(receipt.value)
+        || receipt.value < 0
+        || receipt.value > 0xffff_ffff
+      ) {
+        throw new TypeError("WebGPU renderer EFB peek receipt is invalid");
+      }
+      if (
+        pendingEfbPeek === null
+        || pendingEfbPeek.requestSequence !== expectation.requestSequence
+        || completedEfbPeek !== null
+      ) {
+        throw new Error("WebGPU renderer returned a stale or duplicate EFB peek receipt");
+      }
+      return {
+        ...expectation,
+        value: receipt.value >>> 0,
+      };
+    }
+
     function gxRetireRendererFrame(rendererSequence) {
       rendererFramesInFlight.delete(rendererSequence);
       rendererTextureCopyExpectations.delete(rendererSequence);
+      if (typeof rendererEfbPeekExpectations !== "undefined") {
+        rendererEfbPeekExpectations.delete(rendererSequence);
+      }
       rendererViFrames.delete(rendererSequence);
       smbSustainedViPending.delete(rendererSequence);
     }
@@ -3930,6 +4016,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       const textureCopyExpectation = rendererTextureCopyExpectations.get(
         rendererSequence
       );
+      const efbPeekExpectation = typeof rendererEfbPeekExpectations === "undefined"
+        ? null
+        : rendererEfbPeekExpectations.get(rendererSequence) ?? null;
       if (message.type === "renderer-frame-failed") {
         gxRetireRendererFrame(rendererSequence);
         rendererFrameFailures += 1;
@@ -3954,11 +4043,16 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       let textureCopyPlan;
+      let efbPeekCompletion;
       let residentTextureKeys = null;
       try {
         textureCopyPlan = gxPreflightTextureCopyReceipts(
           message.textureCopyReceipts,
           textureCopyExpectation
+        );
+        efbPeekCompletion = gxPreflightEfbPeekReceipt(
+          message.efbPeekReceipt,
+          efbPeekExpectation
         );
         if (message.residentTextureKeys !== undefined) {
           if (
@@ -4005,6 +4099,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       if (residentTextureKeys !== null) {
         rendererResidentTextureKeys = residentTextureKeys;
+      }
+      if (efbPeekCompletion !== null) {
+        // Publish the completed scalar before retiring the renderer sequence
+        // or waking CPU backpressure. The unchanged load can then retry once.
+        completedEfbPeek = efbPeekCompletion;
+        pendingEfbPeek = null;
+        efbPeekCompletions += 1;
       }
       // RAM and copy provenance are visible before the sequence can disappear
       // or renderer backpressure can resume guest execution.
@@ -6616,7 +6717,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const regionCandidateHits = new Map();
     const regionFusionHits = new Map();
     const regionFusionHitThreshold = 8;
-    const maximumFusedRegionBlocks = 96;
+    const maximumFusedRegionBlocks = 256;
     const blockPattern = Object.freeze({
       idleBasic: 2,
       idleVolatileRead: 3,
@@ -7092,10 +7193,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       switch (name) {
         case "user_0_16":
           return Number(result) === 1;
-        case "user_0_3": case "user_0_7": size = 1; break;
-        case "user_0_4": case "user_0_8": size = 2; break;
-        case "user_0_5": case "user_0_9": size = 4; break;
-        case "user_0_6": case "user_0_10": size = 8; break;
+        case "user_0_3": size = 1; break;
+        case "user_0_4": size = 2; break;
+        case "user_0_5": size = 4; break;
+        case "user_0_6": size = 8; break;
+        case "user_0_7": size = 1; break;
+        case "user_0_8": size = 2; break;
+        case "user_0_9": size = 4; break;
+        case "user_0_10": size = 8; break;
         case "user_0_11": case "user_0_12": size = Number(result); break;
         case "user_0_27":
           if (Number(result) !== 1) return false;
@@ -7108,6 +7213,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         default: return false;
       }
       if (![1, 2, 4, 8].includes(size)) return false;
+      if (
+        ["user_0_3", "user_0_4", "user_0_5", "user_0_6"].includes(name)
+        && Number(result) !== 1
+      ) return false;
 
       const address = Number(arguments_[1]) >>> 0;
       const write = [
@@ -7161,14 +7270,24 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
 
-    function drainGxFifoStagingAtCycle(observedCycles) {
+    function drainGxFifoStagingAtCycle(observedCycles, force = false) {
+      const pendingBytes = view.getUint32(gxFifoStagingMeta, true);
+      if (pendingBytes === 0) return false;
+      // A partial write-gather line is not architecturally visible to PI or
+      // CP. Retain it across regular dispatch boundaries until the final byte
+      // can commit one 32-byte burst. Slow hooks and snapshots force a drain
+      // separately so routing changes and diagnostic receipts stay ordered.
+      if (
+        !force
+        && pendingBytes <= gxFifoStagingCapacity
+        && gxWriteGatherPendingBytes + pendingBytes < gxWriteGatherBurstBytes
+      ) return false;
       return withScopedCycles(observedCycles, drainGxFifoStaging);
     }
 
     function invokeJitHook(target, name, arguments_) {
       return withPublishedHookCycles(() => {
-        const drainedFifo = view.getUint32(gxFifoStagingMeta, true) !== 0;
-        drainGxFifoStaging();
+        const producedLinkedBurst = drainGxFifoStaging();
         hookCalls.set(name, (hookCalls.get(name) ?? 0) + 1);
         if (!regionRunning) return target[name]?.(...arguments_) ?? 0;
 
@@ -7177,9 +7296,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (hookCanContinue) {
           regionContinuableHookCalls += 1;
         }
-        // A successful pre-hook FIFO drain can create a new PE deadline that
-        // was absent when this region's cycle budget was chosen.
-        if (drainedFifo || !hookCanContinue) {
+        // A linked write-gather burst can create a new CP interrupt or PE
+        // deadline that was absent when this region's budget was chosen.
+        // Moving only a partial or unlinked line cannot, so it may continue.
+        if (producedLinkedBurst || !hookCanContinue) {
           view.setUint32(regionControl + regionExitRequestOffset, 1, true);
         }
         return result;
@@ -9120,6 +9240,80 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (status === 0) return 0;
       if (status === 1) return directBytes;
       return status === 2 ? 1 : 2;
+    }
+
+    function gxPrepareVertexDecodePlan(vatIndex) {
+      const descriptorLow = gxCpRegisters[0x50];
+      const vat0 = gxCpRegisters[0x70 + vatIndex];
+      const vat1 = gxCpRegisters[0x80 + vatIndex];
+      const vat2 = gxCpRegisters[0x90 + vatIndex];
+      const matrixIndexA = gxCpRegisters[0x30] >>> 0;
+      const matrixIndexB = gxCpRegisters[0x40] >>> 0;
+      const positionElements = (vat0 & 1) + 2;
+      const positionFormat = (vat0 >>> 1) & 7;
+      const positionComponentBytes = gxComponentBytes(positionFormat);
+      const normalElements = (vat0 >>> 9) & 1;
+      const normalFormat = (vat0 >>> 10) & 7;
+      const textureFormats = [
+        [(vat0 >>> 21) & 1, (vat0 >>> 22) & 7, (vat0 >>> 25) & 0x1f],
+        [vat1 & 1, (vat1 >>> 1) & 7, (vat1 >>> 4) & 0x1f],
+        [(vat1 >>> 9) & 1, (vat1 >>> 10) & 7, (vat1 >>> 13) & 0x1f],
+        [(vat1 >>> 18) & 1, (vat1 >>> 19) & 7, (vat1 >>> 22) & 0x1f],
+        [(vat1 >>> 27) & 1, (vat1 >>> 28) & 7, vat2 & 0x1f],
+        [(vat2 >>> 5) & 1, (vat2 >>> 6) & 7, (vat2 >>> 9) & 0x1f],
+        [(vat2 >>> 14) & 1, (vat2 >>> 15) & 7, (vat2 >>> 18) & 0x1f],
+        [(vat2 >>> 23) & 1, (vat2 >>> 24) & 7, (vat2 >>> 27) & 0x1f],
+      ];
+      return {
+        descriptorLow,
+        positionMatrix: matrixIndexA & 0x3f,
+        textureMatrices: [
+          (matrixIndexA >>> 6) & 0x3f,
+          (matrixIndexA >>> 12) & 0x3f,
+          (matrixIndexA >>> 18) & 0x3f,
+          (matrixIndexA >>> 24) & 0x3f,
+          matrixIndexB & 0x3f,
+          (matrixIndexB >>> 6) & 0x3f,
+          (matrixIndexB >>> 12) & 0x3f,
+          (matrixIndexB >>> 18) & 0x3f,
+        ],
+        position: {
+          status: gxAttributeStatus(0),
+          elements: positionElements,
+          format: positionFormat,
+          componentBytes: positionComponentBytes,
+          directBytes: positionElements * positionComponentBytes,
+          scale: positionFormat === 4 ? 1 : 2 ** -((vat0 >>> 4) & 0x1f),
+        },
+        normal: {
+          status: gxAttributeStatus(1),
+          elements: normalElements,
+          format: normalFormat,
+          separateIndices: normalElements !== 0 && (vat0 & 0x80000000) !== 0,
+        },
+        colors: Array.from({ length: 2 }, (_unused, colorIndex) => {
+          const format = (vat0 >>> (14 + colorIndex * 4)) & 7;
+          return {
+            status: gxAttributeStatus(2 + colorIndex),
+            format,
+            directBytes: [2, 3, 4, 2, 3, 4][format] ?? 0,
+          };
+        }),
+        textures: textureFormats.map(([elements, format, fraction], texture) => {
+          const componentCount = elements + 1;
+          const componentBytes = gxComponentBytes(format);
+          return {
+            status: gxAttributeStatus(4 + texture),
+            elements,
+            format,
+            fraction,
+            componentCount,
+            componentBytes,
+            directBytes: componentCount * componentBytes,
+            scale: format === 4 ? 1 : 2 ** -fraction,
+          };
+        }),
+      };
     }
 
     function viXfbAddressFromRaw(value, topValue) {
@@ -12318,25 +12512,15 @@ const TEMPLATE: &str = r##"<!doctype html>
       cursor,
       vatIndex,
       transformContext = null,
-      commitNormalCache = false
+      commitNormalCache = false,
+      decodePlan = null
     ) {
-      const descriptorLow = gxCpRegisters[0x50];
-      const vat0 = gxCpRegisters[0x70 + vatIndex];
-      const vat1 = gxCpRegisters[0x80 + vatIndex];
-      const vat2 = gxCpRegisters[0x90 + vatIndex];
-      let positionMatrix = gxCpRegisters[0x30] & 0x3f;
-      const matrixIndexA = gxCpRegisters[0x30] >>> 0;
-      const matrixIndexB = gxCpRegisters[0x40] >>> 0;
-      const textureMatrices = [
-        (matrixIndexA >>> 6) & 0x3f,
-        (matrixIndexA >>> 12) & 0x3f,
-        (matrixIndexA >>> 18) & 0x3f,
-        (matrixIndexA >>> 24) & 0x3f,
-        matrixIndexB & 0x3f,
-        (matrixIndexB >>> 6) & 0x3f,
-        (matrixIndexB >>> 12) & 0x3f,
-        (matrixIndexB >>> 18) & 0x3f,
-      ];
+      decodePlan ??= gxPrepareVertexDecodePlan(vatIndex);
+      const { descriptorLow } = decodePlan;
+      let positionMatrix = decodePlan.positionMatrix;
+      // Matrix-index attributes are vertex data. Copy the CP defaults before
+      // applying them so one vertex cannot mutate the shared VAT plan.
+      const textureMatrices = decodePlan.textureMatrices.slice();
       for (let matrix = 0; matrix < 9; matrix += 1) {
         if ((descriptorLow & (1 << matrix)) === 0) continue;
         if (matrix === 0) positionMatrix = source[cursor] & 0x3f;
@@ -12344,10 +12528,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         cursor += 1;
       }
 
-      const positionStatus = gxAttributeStatus(0);
-      const positionElements = (vat0 & 1) + 2;
-      const positionFormat = (vat0 >>> 1) & 7;
-      const positionBytes = positionElements * gxComponentBytes(positionFormat);
+      const {
+        status: positionStatus,
+        elements: positionElements,
+        format: positionFormat,
+        componentBytes: positionComponentBytes,
+        directBytes: positionBytes,
+        scale: positionScale,
+      } = decodePlan.position;
       const positionSource = gxAttributeSource(
         source, cursor, positionStatus, 0, positionBytes
       );
@@ -12356,28 +12544,30 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (positionSource.source === null && !positionIndexSkipped) {
         return { cursor, skipped: true };
       }
-      const positionScale = positionFormat === 4 ? 1 : 2 ** -((vat0 >>> 4) & 0x1f);
       const position = [0, 0, 0];
       if (!positionIndexSkipped) {
         for (let component = 0; component < positionElements; component += 1) {
           position[component] = gxReadComponent(
             positionSource.source,
-            positionSource.offset + component * gxComponentBytes(positionFormat),
+            positionSource.offset + component * positionComponentBytes,
             positionFormat
           ) * positionScale;
         }
       }
 
-      const normalStatus = gxAttributeStatus(1);
-      const normalElements = (vat0 >>> 9) & 1;
-      const normalFormat = (vat0 >>> 10) & 7;
+      const {
+        status: normalStatus,
+        elements: normalElements,
+        format: normalFormat,
+        separateIndices: normalSeparateIndices,
+      } = decodePlan.normal;
       const normalAttribute = gxDecodeNormalAttribute(
         source,
         cursor,
         normalStatus,
         normalElements,
         normalFormat,
-        normalElements !== 0 && (vat0 & 0x80000000) !== 0
+        normalSeparateIndices
       );
       cursor = normalAttribute.cursor;
       if (normalAttribute.skipped && !positionIndexSkipped) {
@@ -12393,9 +12583,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
       const colors = Array.from({ length: 2 }, () => [0xff, 0xff, 0xff, 0xff]);
       for (let colorIndex = 0; colorIndex < 2; colorIndex += 1) {
-        const status = gxAttributeStatus(2 + colorIndex);
-        const format = (vat0 >>> (14 + colorIndex * 4)) & 7;
-        const directBytes = [2, 3, 4, 2, 3, 4][format] ?? 0;
+        const { status, format, directBytes } = decodePlan.colors[colorIndex];
         const colorSource = gxAttributeSource(
           source, cursor, status, 2 + colorIndex, directBytes
         );
@@ -12405,33 +12593,26 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
       }
 
-      const textureAttributes = [
-        [(vat0 >>> 21) & 1, (vat0 >>> 22) & 7, (vat0 >>> 25) & 0x1f],
-        [vat1 & 1, (vat1 >>> 1) & 7, (vat1 >>> 4) & 0x1f],
-        [(vat1 >>> 9) & 1, (vat1 >>> 10) & 7, (vat1 >>> 13) & 0x1f],
-        [(vat1 >>> 18) & 1, (vat1 >>> 19) & 7, (vat1 >>> 22) & 0x1f],
-        [(vat1 >>> 27) & 1, (vat1 >>> 28) & 7, vat2 & 0x1f],
-        [(vat2 >>> 5) & 1, (vat2 >>> 6) & 7, (vat2 >>> 9) & 0x1f],
-        [(vat2 >>> 14) & 1, (vat2 >>> 15) & 7, (vat2 >>> 18) & 0x1f],
-        [(vat2 >>> 23) & 1, (vat2 >>> 24) & 7, (vat2 >>> 27) & 0x1f],
-      ];
       const rawTextureCoords = Array(8).fill(null);
       for (let texture = 0; texture < 8; texture += 1) {
-        const status = gxAttributeStatus(4 + texture);
-        const [elements, format, fraction] = textureAttributes[texture];
-        const componentCount = elements + 1;
-        const directBytes = componentCount * gxComponentBytes(format);
+        const {
+          status,
+          format,
+          componentCount,
+          componentBytes,
+          directBytes,
+          scale,
+        } = decodePlan.textures[texture];
         const textureSource = gxAttributeSource(
           source, cursor, status, 4 + texture, directBytes
         );
         cursor = textureSource.cursor;
         if (textureSource.source !== null) {
-          const scale = format === 4 ? 1 : 2 ** -fraction;
           rawTextureCoords[texture] = Array.from(
             { length: componentCount }, (_unused, component) =>
             gxReadComponent(
               textureSource.source,
-              textureSource.offset + component * gxComponentBytes(format),
+              textureSource.offset + component * componentBytes,
               format
             ) * scale
           );
@@ -12626,6 +12807,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           tevResourceDependencies,
           textures: null,
           tevState: null,
+          vertexDecodePlans: Array(8),
           vertexTransformContext: null,
         };
         gxDrawStateSnapshots += 1;
@@ -12648,6 +12830,15 @@ const TEMPLATE: &str = r##"<!doctype html>
         drawState.vertexTransformContext = vertexTransformContext;
       } else {
         gxVertexTransformContextMemoHits += 1;
+      }
+      const vatIndex = opcode & 7;
+      let vertexDecodePlan = drawState.vertexDecodePlans[vatIndex];
+      if (
+        vertexDecodePlan === undefined
+        && typeof gxPrepareVertexDecodePlan === "function"
+      ) {
+        vertexDecodePlan = gxPrepareVertexDecodePlan(vatIndex);
+        drawState.vertexDecodePlans[vatIndex] = vertexDecodePlan;
       }
       const capturePrimitiveSample = (
         gxPrimitiveSamples.length < 16
@@ -12679,9 +12870,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         const decoded = gxDecodeVertex(
           source,
           start,
-          opcode & 7,
+          vatIndex,
           vertexTransformContext,
-          vertex === inputVertexCount - 1
+          vertex === inputVertexCount - 1,
+          vertexDecodePlan
         );
         if (decoded.cursor !== start + vertexSize) gxVertexDecodeErrors += 1;
         if (decoded.skipped) {
@@ -12894,7 +13086,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
       const draw = {
         topology,
-        vat: opcode & 7,
+        vat: vatIndex,
         vertexCount,
         // Renderer frames cross a Worker boundary. Keep the GPU-bound payload
         // in its final f32 representation so structured cloning does not walk
@@ -12912,7 +13104,6 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxExactRequiredDraws += 1;
         gxExactRequiredVertices += vertexCount;
       }
-      const vatIndex = opcode & 7;
       // Full primitive telemetry duplicates draw-local arrays and TEV state.
       // Capturing it for every primitive becomes the dominant cost in scenes
       // made from thousands of tiny display-list draws. Preserve the first
@@ -14139,7 +14330,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function drainGxFifoStaging() {
       const pendingBytes = view.getUint32(gxFifoStagingMeta, true);
-      if (pendingBytes === 0) return;
+      if (pendingBytes === 0) return false;
       if (pendingBytes > gxFifoStagingCapacity) {
         throw new Error(`GX FIFO staging overflow: ${pendingBytes}`);
       }
@@ -14167,6 +14358,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         gxFifoStagingBytes += pendingBytes;
         gxFifoStagingQuantizedStores += quantizedStores;
         if (producedLinkedBurst) serviceCommandProcessorFifo();
+        return producedLinkedBurst;
       } finally {
         recordWorkerPhaseTiming(
           workerHostTimings.fifoStagingDrainInclusive,
@@ -15848,6 +16040,131 @@ const TEMPLATE: &str = r##"<!doctype html>
             )
           : 0
       );
+      if (
+        (physical & 0xf8000000) === 0x08000000
+        && physical < 0x0c000000
+        && size === 4
+        && (physical & 3) === 0
+      ) {
+        const x = (physical & 0x0fff) >>> 2;
+        const y = (physical >>> 12) & 0x03ff;
+        const combined = (physical & 0x00800000) !== 0;
+        const plane = (physical & 0x00400000) !== 0 ? 1 : 0;
+        if (combined || x >= 640 || y >= 528) {
+          view.setUint32(pointer, 0, true);
+          if (combined) {
+            efbPeekCombinedReads += 1;
+            if (typeof gxRecordUnsupported === "function") {
+              gxRecordUnsupported(
+                "efb-peek-combined-plane",
+                0x43,
+                gxBpRegisters[0x43] >>> 0,
+                `physical=${hex32(physical)}`
+              );
+            }
+          } else {
+            efbPeekOutOfBoundsReads += 1;
+          }
+          return 1;
+        }
+
+        const rawAlphaReadMode = view.getUint16(mmio + 0x1008, false) & 3;
+        // Dolphin treats the otherwise-invalid fourth PE alpha mode as Read00
+        // after surfacing a diagnostic. Keep the renderer packet canonical.
+        const alphaReadMode = rawAlphaReadMode <= 2 ? rawAlphaReadMode : 0;
+        const key = {
+          effective: logical,
+          physical: physical >>> 0,
+          x,
+          y,
+          plane,
+          pixelControl: gxBpRegisters[0x43] >>> 0,
+          alphaReadMode,
+        };
+        const matches = candidate => candidate !== null
+          && candidate.physical === key.physical
+          && candidate.x === key.x
+          && candidate.y === key.y
+          && candidate.plane === key.plane
+          && candidate.pixelControl === key.pixelControl
+          && candidate.alphaReadMode === key.alphaReadMode;
+
+        if (completedEfbPeek !== null) {
+          if (!matches(completedEfbPeek)) {
+            throw new Error("completed WebGPU EFB peek does not match retried load");
+          }
+          view.setUint32(pointer, completedEfbPeek.value, true);
+          completedEfbPeek = null;
+          efbPeekRetries += 1;
+          if (plane === 1) efbPeekDepthReads += 1;
+          else efbPeekColorReads += 1;
+          return 1;
+        }
+
+        // The hook already drained FIFO staging at this exact instruction
+        // cycle. If that produced an earlier renderer terminal, leave the load
+        // unchanged and let normal backpressure retire the complete chain
+        // before a retry packages this peek and its still-pending GX draws.
+        if (
+          rendererFramesInFlight.size !== 0
+          || rendererTextureCopyBarrierSequence !== null
+        ) {
+          efbPeekOrderingYields += 1;
+          efbPeekYieldRequested = true;
+          return 2;
+        }
+        if (pendingEfbPeek !== null) {
+          throw new Error("WebGPU EFB peek request is pending without renderer work");
+        }
+
+        const expectation = {
+          ...key,
+          requestSequence: ++efbPeekRequestSequence,
+          cycle: cycles,
+        };
+        const frame = {
+          index: expectation.requestSequence,
+          capturedAtCycle: cycles,
+          sourceX: x,
+          sourceY: y,
+          width: 1,
+          sourceHeight: 1,
+          height: 1,
+          destination: plane,
+          stride: alphaReadMode,
+          copyToXfb: false,
+          clear: false,
+          copyState: {
+            zMode: 0,
+            blendMode: 0,
+            pixelControl: expectation.pixelControl,
+            copyCommand: 0,
+            clearRgba: [0, 0, 0, 0],
+            clearDepth: 0,
+            copyScale: 0,
+            copyFilter: [0, 0],
+          },
+          geometry: {
+            drawCalls: gxFrameDraws.length,
+            vertices: gxFrameDrawVertices,
+            draws: gxFrameDraws,
+          },
+          efbPeekExpectation: expectation,
+        };
+        pendingEfbPeek = expectation;
+        try {
+          postGxFrame(3, frame);
+        } catch (error) {
+          pendingEfbPeek = null;
+          throw error;
+        }
+        gxFrameDraws = [];
+        gxFrameDrawVertices = 0;
+        gxFrameSkippedPrimitives = 0;
+        efbPeekRequests += 1;
+        efbPeekYieldRequested = true;
+        return 2;
+      }
       if (physical >= 0x0c002000 && physical < 0x0c003000) {
         const videoInterfaceRead = readVideoInterfaceRegister(
           physical,
@@ -24759,6 +25076,186 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function decodeStringHashLoop(currentPc) {
+      const tailPc = currentPc >>> 0;
+      const load = probeInstructionWord(tailPc);
+      if (
+        load === null
+        || (load >>> 26) !== 34
+        || ((load >>> 21) & 31) !== 6
+        || (load & 0xffff) !== 0
+      ) return null;
+
+      const pointerRegister = (load >>> 16) & 31;
+      if (pointerRegister !== 3 && pointerRegister !== 4) return null;
+      if (tailPc < 0x2c) return null;
+      const divisorRegister = pointerRegister === 3 ? 4 : 3;
+      const loopStart = tailPc - 0x2c;
+      if ((loopStart >>> 12) !== (tailPc >>> 12)) return null;
+      const expectedWords = [
+        0x7cc60774,
+        0x54e0402e,
+        0x7ce60214,
+        0x7cc53816,
+        0x7c063850,
+        0x5400f87e,
+        0x7c003214,
+        0x5400463e,
+        (0x7c0001d6 | (divisorRegister << 11)) >>> 0,
+        0x7ce03850,
+        (0x38000001 | (pointerRegister << 21) | (pointerRegister << 16)) >>> 0,
+        load,
+        0x7cc00775,
+        0x4082ffcc,
+      ];
+      for (let index = 0; index < expectedWords.length; index += 1) {
+        const observed = index === 11
+          ? load
+          : probeInstructionWord((loopStart + index * 4) >>> 0);
+        if (observed !== expectedWords[index]) return null;
+      }
+      return { divisorRegister, expectedWords, loopStart, pointerRegister };
+    }
+
+    function compiledBlockInstructionWordsAreCurrent(block) {
+      if (
+        block === undefined
+        || !Number.isInteger(block.effectiveStart)
+        || !Number.isInteger(block.effectiveBytes)
+        || block.effectiveBytes <= 0
+        || (block.effectiveBytes & 3) !== 0
+        || !Array.isArray(block.instructionWords)
+        || block.instructionWords.length !== block.effectiveBytes >>> 2
+      ) return false;
+      return block.instructionWords.every((word, index) =>
+        word === probeInstructionWord((block.effectiveStart + index * 4) >>> 0)
+      );
+    }
+
+    function compiledBlockStartsWithInstructionWords(block, start, expectedWords) {
+      if (
+        !compiledBlockInstructionWordsAreCurrent(block)
+        || (block.effectiveStart >>> 0) !== (start >>> 0)
+        || block.instructionWords.length < expectedWords.length
+      ) return false;
+      return expectedWords.every((word, index) =>
+        block.instructionWords[index] === word
+      );
+    }
+
+    function stringHashCompiledBlocksMatch(loop, currentPc) {
+      const tailBlock = compiledBlock(currentPc);
+      if (!compiledBlockStartsWithInstructionWords(
+        tailBlock,
+        currentPc,
+        loop.expectedWords.slice(11)
+      )) return false;
+      const bodyBlock = compiledBlock(loop.loopStart);
+      return bodyBlock === undefined || compiledBlockStartsWithInstructionWords(
+        bodyBlock,
+        loop.loopStart,
+        loop.expectedWords
+      );
+    }
+
+    function stringHashDataPointer(address, size) {
+      if (
+        !Number.isSafeInteger(address)
+        || address < 0
+        || address > 0xffffffff
+        || !Number.isSafeInteger(size)
+        || size <= 0
+        || size > 0x100000000 - address
+      ) return null;
+      const resolved = resolveDataRange(address >>> 0, size, false, false);
+      if (
+        resolved.kind !== "mapped"
+        || !Array.isArray(resolved.translations)
+        || resolved.translations.length === 0
+        || resolved.translations.some(translation =>
+          translation.source !== "real" && translation.source !== "bat"
+        )
+      ) return null;
+      return physicalRamPointer(resolved.physical, size)
+        ?? physicalLockedCachePointer(resolved.physical, size);
+    }
+
+    function stringHashStep(hash, byte) {
+      const signedByte = (byte << 24) >> 24;
+      const combined = ((((hash >>> 0) << 8) >>> 0) + signedByte) >>> 0;
+      return (combined % 0x01ffffd9) >>> 0;
+    }
+
+    function preflightStringHashLoop(pointer, initialHash) {
+      const start = pointer >>> 0;
+      let hash = initialHash >>> 0;
+      for (let byteCount = 0; byteCount < 4096; byteCount += 1) {
+        if (byteCount > 0xffffffff - start) return null;
+        const source = stringHashDataPointer(start + byteCount, 1);
+        if (source === null) return null;
+        const byte = view.getUint8(source);
+        if (byte === 0) return { byteCount, hash };
+        hash = stringHashStep(hash, byte);
+      }
+      return null;
+    }
+
+    function hashStringPrefix(pointer, initialHash, byteCount) {
+      let hash = initialHash >>> 0;
+      for (let offset = 0; offset < byteCount; offset += 1) {
+        const source = stringHashDataPointer((pointer + offset) >>> 0, 1);
+        if (source === null) return null;
+        const byte = view.getUint8(source);
+        if (byte === 0) return null;
+        hash = stringHashStep(hash, byte);
+      }
+      return hash;
+    }
+
+    function fastForwardStringHashLoop(currentPc, maximumExecuted) {
+      const loop = decodeStringHashLoop(currentPc);
+      if (loop === null) return false;
+      const block = compiledBlock(currentPc);
+      if (block === undefined || blockHasInstructionPageDependencies(block)) return false;
+      if (!stringHashCompiledBlocksMatch(loop, currentPc)) return false;
+      if (
+        readGpr(5) !== 0x00001381
+        || readGpr(loop.divisorRegister) !== 0x01ffffd9
+      ) return false;
+
+      const pointer = readGpr(loop.pointerRegister);
+      const initialHash = readGpr(7);
+      const preflight = preflightStringHashLoop(pointer, initialHash);
+      if (preflight === null || preflight.byteCount === 0) return false;
+      const skipped = loopSkipBudget(preflight.byteCount, 25, maximumExecuted);
+      if (skipped === 0) return false;
+
+      const hash = skipped === preflight.byteCount
+        ? preflight.hash
+        : hashStringPrefix(pointer, initialHash, skipped);
+      if (hash === null) return false;
+
+      // Revalidate the complete skipped span after the bounded scan. Only
+      // real/BAT mappings qualify, so no page-table history can change before
+      // the original load observes its byte.
+      const source = stringHashDataPointer(pointer, skipped);
+      if (source === null) return false;
+
+      writeGpr(loop.pointerRegister, pointer + skipped);
+      writeGpr(7, hash);
+      instructions += skipped * 14;
+      cycles += skipped * 25;
+      accelerations.set(
+        "stringHashBytes",
+        (accelerations.get("stringHashBytes") ?? 0) + skipped
+      );
+      accelerations.set(
+        "stringHashRuns",
+        (accelerations.get("stringHashRuns") ?? 0) + 1
+      );
+      return true;
+    }
+
     function decodeMemset32ByteLoop(currentPc) {
       const firstStore = probeInstructionWord(currentPc);
       const decrement = probeInstructionWord((currentPc + 4) >>> 0);
@@ -24822,6 +25319,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function fastForwardRecognizedLoop(currentPc, maximumExecuted) {
+      if (fastForwardStringHashLoop(currentPc, maximumExecuted)) return;
+
       const cacheInstruction = fetchWord(currentPc);
       if (isCacheLineLoop(currentPc)) {
         const groups = view.getUint32(cpu + ctrOffset, true);
@@ -24913,6 +25412,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 
     function isRecognizedLoopPc(candidatePc) {
       return isSemanticIdlePattern(compiledBlock(candidatePc)?.pattern)
+        || decodeStringHashLoop(candidatePc) !== null
         || isCacheLineLoop(candidatePc)
         || decodeMemset32ByteLoop(candidatePc) !== null
         || isMusyxAramQueueFullWaitBackedge(candidatePc)
@@ -25314,6 +25814,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         return { fault: fetched.kind === "mapped" ? staged.fault : fetched };
       }
 
+      const stagedWords = Array.from(
+        { length: wordCount },
+        (_unused, index) => compilerView.getUint32(inputPointer + index * 4, true)
+      );
+
       const succeeded = compiler.ppcwasmjit_compile(inputPointer, wordCount);
       if (succeeded !== 1) {
         const pointer = compiler.ppcwasmjit_error_pointer();
@@ -25329,6 +25834,10 @@ const TEMPLATE: &str = r##"<!doctype html>
       check(length !== 0, "browser JIT returned an empty module");
       const maximum = compiler.ppcwasmjit_maximum_executed() >>> 0;
       const effectiveBytes = Math.max(4, (maximum & 0xffff) * 4);
+      check(
+        effectiveBytes <= stagedWords.length * 4,
+        "compiled block exceeds its staged instruction prefix"
+      );
       const retained = captureInstructionPageDependencies(pc, effectiveBytes);
       if (retained.fault !== null) return { fault: retained.fault };
       return {
@@ -25337,6 +25846,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         wasm: new Uint8Array(compiler.memory.buffer, pointer, length).slice(),
         effectiveStart: pc >>> 0,
         effectiveBytes,
+        instructionWords: stagedWords.slice(0, effectiveBytes >>> 2),
         instructionPageDependencies: retained.dependencies,
       };
     }
@@ -25470,6 +25980,20 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
     }
 
+    function logBrowserBootReport(status, details, report) {
+      const label = "BROWSER_BOOT_" + status.toUpperCase();
+      if (details.stage === "snapshot") {
+        console.log(
+          label,
+          `snapshot pc=${details.pc} instructions=${details.instructions}`
+            + ` cycles=${details.cycles} dispatches=${details.dispatches}`
+            + ` compiledBlocks=${details.compiledBlocks}`
+        );
+        return;
+      }
+      console.log(label, report);
+    }
+
     function finish(status, details) {
       const report = {
         status,
@@ -25506,6 +26030,28 @@ const TEMPLATE: &str = r##"<!doctype html>
                 pendingCycle: rendererTextureCopyBarrierCycle,
                 armed: rendererTextureCopyBarriers,
                 resumed: rendererTextureCopyBarrierResumes,
+              },
+              efbPeek: {
+                requests: efbPeekRequests,
+                completions: efbPeekCompletions,
+                retries: efbPeekRetries,
+                orderingYields: efbPeekOrderingYields,
+                depthReads: efbPeekDepthReads,
+                colorReads: efbPeekColorReads,
+                outOfBoundsReads: efbPeekOutOfBoundsReads,
+                combinedReads: efbPeekCombinedReads,
+                pending: pendingEfbPeek === null ? null : {
+                  requestSequence: pendingEfbPeek.requestSequence,
+                  physical: hex32(pendingEfbPeek.physical),
+                  x: pendingEfbPeek.x,
+                  y: pendingEfbPeek.y,
+                  plane: pendingEfbPeek.plane,
+                  cycle: pendingEfbPeek.cycle,
+                },
+                completed: completedEfbPeek === null ? null : {
+                  requestSequence: completedEfbPeek.requestSequence,
+                  value: hex32(completedEfbPeek.value),
+                },
               },
               viFields: {
                 submitted: viPresentationCount,
@@ -26179,12 +26725,12 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
       statusDataset.status = status;
       output.textContent = JSON.stringify(report, null, 2);
-      console.log("BROWSER_BOOT_" + status.toUpperCase(), report);
+      logBrowserBootReport(status, details, report);
     }
 
     async function honorRunnerControl() {
       if (runnerStopRequested) {
-        await finishAfterRendererDrain("progress", {
+        await finishQuiescentAfterRendererDrain("progress", {
           stage: "operator-stop",
           pc: hex32(pc),
           instructions,
@@ -26201,7 +26747,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       });
       runnerResume = null;
       if (runnerStopRequested) {
-        await finishAfterRendererDrain("progress", {
+        await finishQuiescentAfterRendererDrain("progress", {
           stage: "operator-stop",
           pc: hex32(pc),
           instructions,
@@ -26257,7 +26803,22 @@ const TEMPLATE: &str = r##"<!doctype html>
       finish(status, details);
     }
 
+    async function finishQuiescentAfterRendererDrain(status, details) {
+      drainGxFifoStagingAtCycle(cycles, true);
+      await finishAfterRendererDrain(status, details);
+    }
+
     function publishRunnerSnapshot() {
+      // Regular dispatch boundaries may retain an incomplete write-gather
+      // suffix. Fold it into the hardware carry before reporting so snapshots
+      // preserve their zero-staged-byte quiescence contract. The regular
+      // boundary only defers a suffix that cannot complete a burst, so this
+      // forced drain cannot create a new CP or renderer deadline.
+      const producedLinkedBurst = drainGxFifoStagingAtCycle(cycles, true);
+      check(
+        !producedLinkedBurst,
+        "snapshot staging drain unexpectedly produced a linked FIFO burst"
+      );
       const diagnosticsRequestId = runnerSnapshotRequestId;
       runnerSnapshotRequested = false;
       runnerSnapshotRequestId = null;
@@ -26353,7 +26914,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         const scenarioStatus = serviceControllerScenario(controllerScenario, cycles);
         if (scenarioStatus !== "complete" && scenarioStatus !== "failed") return;
         const failed = scenarioStatus === "failed";
-        await finishAfterRendererDrain(failed ? "stopped" : "paused", {
+        await finishQuiescentAfterRendererDrain(failed ? "stopped" : "paused", {
           stage: failed ? "scenario-failed" : "scenario-complete",
           pc: hex32(pc),
           error: failed ? controllerScenario.failure.reason : undefined,
@@ -26381,7 +26942,7 @@ const TEMPLATE: &str = r##"<!doctype html>
             : null;
         if (reachedLimit !== null) {
           runnerPaused = true;
-          finish("paused", {
+          await finishQuiescentAfterRendererDrain("paused", {
             stage: reachedLimit,
             pc: "0x" + pc.toString(16).padStart(8, "0"),
             instructions,
@@ -26561,7 +27122,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           }
         }
 
-        if (executedBlocks === 0) {
+        if (executedBlocks === 0 && !efbPeekYieldRequested) {
           stage = "execute";
           fastForwardRecognizedLoop(pc, block.maximum);
           view.setUint32(regionControl + regionCyclePrefixOffset, 0, true);
@@ -26605,6 +27166,28 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (rendererFramesInFlight.size !== 0 || rendererFailure !== null) {
           await honorRendererBackpressure();
         }
+        if (efbPeekYieldRequested) {
+          if (
+            pendingEfbPeek !== null
+            || (
+              completedEfbPeek !== null
+              && completedEfbPeek.cycle !== observedCycles
+            )
+          ) {
+            throw new Error("WebGPU EFB peek yield retired out of cycle order");
+          }
+          // The generated slow-load yield flushes the current pre-instruction
+          // PC/register image and returns only work completed before the load.
+          // Commit that prefix, then redispatch the unchanged instruction.
+          instructions += executedInstructions;
+          cycles = observedCycles;
+          dispatches += executedBlocks;
+          pc = view.getUint32(cpu + pcOffset, true);
+          efbPeekYieldRequested = false;
+          runnerBlocksUntilYield = runnerBlockChunk;
+          runnerYieldDeadline = Date.now() + runnerSliceMs;
+          continue;
+        }
         const diskWait = dueDiskTransferPromise(observedCycles);
         if (diskWait !== null) await diskWait;
         serviceMmio(observedCycles);
@@ -26612,7 +27195,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         cycles = observedCycles;
         dispatches += executedBlocks;
         if (stopOnFirstDsi && firstDsi !== null) {
-          await finishAfterRendererDrain("stopped", {
+          await finishQuiescentAfterRendererDrain("stopped", {
             stage: "first-dsi",
             pc: firstDsi.pc,
             instructions,
@@ -26677,7 +27260,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         }
 
         if (pc === 0) {
-          await finishAfterRendererDrain("stopped", {
+          await finishQuiescentAfterRendererDrain("stopped", {
             stage: "terminal-pc",
             pc: "0x00000000",
             instructions,
@@ -26688,7 +27271,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           throw Symbol.for("reported");
         }
         if (samePcCount >= 256 && diskTransfer === null && aramTransfer === null) {
-          await finishAfterRendererDrain("progress", {
+          await finishQuiescentAfterRendererDrain("progress", {
             stage: "stable-loop",
             pc: "0x" + pc.toString(16).padStart(8, "0"),
             instructions,
@@ -29671,7 +30254,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const drawCalls = Number(diagnostics.drawCalls);
       const vertices = Number(diagnostics.vertices);
       if (
-        (copyKind !== 1 && copyKind !== 2)
+        (copyKind !== 1 && copyKind !== 2 && copyKind !== 3)
         || !Number.isSafeInteger(index)
         || index < 0
         || !Number.isSafeInteger(drawCalls)
@@ -29697,12 +30280,72 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       if (copyKind === 1) {
         document.body.dataset.gxTextureCopies = String(index);
-      } else {
+      } else if (copyKind === 2) {
         document.body.dataset.xfbCopies = String(index);
         document.body.dataset.gxDrawCalls = String(drawCalls);
         document.body.dataset.gxVertices = String(vertices);
       }
       return { residentTextureKeys };
+    }
+    function handleEfbPeekFrame(message, sourceWorker = worker) {
+      const rendererSequence = Number(message.rendererSequence);
+      const isCurrentWorker = () => worker === sourceWorker;
+      const fail = error => {
+        if (!isCurrentWorker()) return { ok: false, value: null };
+        const detail = String(error?.message ?? error);
+        if (Number.isSafeInteger(rendererSequence)) {
+          sourceWorker?.postMessage({
+            type: "renderer-frame-failed",
+            rendererSequence,
+            error: detail,
+          });
+        }
+        handleRendererError(error, false);
+        return { ok: false, value: null };
+      };
+      return enqueueRendererOperation(() => {
+        if (!isCurrentWorker()) return { ok: false, value: null };
+        let submission;
+        try {
+          submission = submitGxFrame(message);
+        } catch (error) {
+          return fail(error);
+        }
+        return (async () => {
+          const receipts = await webGpuRenderer.drain_efb_peeks();
+          webGpuRenderer.check_health();
+          if (!Array.isArray(receipts) || receipts.length !== 1) {
+            throw new Error(
+              "WebGPU EFB peek drain must return exactly one receipt"
+            );
+          }
+          const receipt = receipts[0];
+          if (
+            receipt === null
+            || typeof receipt !== "object"
+            || Array.isArray(receipt)
+            || !Number.isSafeInteger(Number(receipt.requestSequence))
+            || !Number.isSafeInteger(Number(receipt.value))
+          ) {
+            throw new TypeError("WebGPU EFB peek drain returned an invalid receipt");
+          }
+          if (!isCurrentWorker()) return { ok: false, value: null };
+          const completion = {
+            type: "renderer-frame-complete",
+            rendererSequence,
+            textureCopyReceipts: [],
+            efbPeekReceipt: {
+              requestSequence: Number(receipt.requestSequence),
+              value: Number(receipt.value),
+            },
+          };
+          if (Array.isArray(submission?.residentTextureKeys)) {
+            completion.residentTextureKeys = submission.residentTextureKeys;
+          }
+          sourceWorker?.postMessage(completion);
+          return { ok: true, value: completion.efbPeekReceipt };
+        })().catch(fail);
+      });
     }
     function requireTextureCopyReceiptArray(receipts, operation) {
       if (!Array.isArray(receipts)) {
@@ -30080,6 +30723,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (message.name === "status") runnerStatus.textContent = message.value;
       } else if (message?.type === "gx-frame") {
         return handleRendererFrame(message, () => submitGxFrame(message), sourceWorker);
+      } else if (message?.type === "gx-peek") {
+        return handleEfbPeekFrame(message, sourceWorker);
       } else if (message?.type === "vi-present") {
         const frame = message.frame;
         return handleRendererFrame(message, () => validateViPresentationResult(

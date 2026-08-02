@@ -629,6 +629,7 @@ test("a final position-index skip still commits its normal cache", () => {
     0,
     null,
     true,
+    context.gxPrepareVertexDecodePlan(0),
   );
 
   assert.equal(decoded.cursor, 4);
@@ -658,6 +659,7 @@ test("a position sentinel consumes trailing attributes after an invalid normal",
     0,
     null,
     true,
+    context.gxPrepareVertexDecodePlan(0),
   );
 
   assert.equal(decoded.cursor, 8);
@@ -717,7 +719,7 @@ test("commits only the final primitive normal tuple and preserves absent lanes",
   const capture = extractFunction("recordGxPrimitive");
   assert.match(
     capture,
-    /gxDecodeVertex\([\s\S]*?vertexTransformContext,\s*vertex === inputVertexCount - 1\s*\)/,
+    /gxDecodeVertex\([\s\S]*?vertexTransformContext,\s*vertex === inputVertexCount - 1,\s*vertexDecodePlan\s*\)/,
   );
 });
 
@@ -1493,14 +1495,23 @@ test("BP texture-coordinate scales use low 16 bits and f32 multiplication", () =
 
 test("vertex decode retains two independent raster color channels", () => {
   const context = workerContext();
-  // Direct XYZ position, direct color 0, direct color 1.
-  context.gxCpRegisters[0x50] = (1 << 9) | (1 << 13) | (1 << 15);
-  context.gxCpRegisters[0x70] = 1 | (4 << 1) | (5 << 14) | (5 << 18);
+  // Direct XYZ position, NBT, color 0, color 1, and signed-16 ST.
+  context.gxCpRegisters[0x50] =
+    (1 << 9) | (1 << 11) | (1 << 13) | (1 << 15);
+  context.gxCpRegisters[0x60] = 1;
+  context.gxCpRegisters[0x70] =
+    1 | (4 << 1) | (1 << 9) | (1 << 10)
+    | (5 << 14) | (5 << 18) | (1 << 21) | (3 << 22) | (4 << 25);
 
   setXfMatrixRows(context, 0, 0, [
     [1, 0, 0, 0],
     [0, 1, 0, 0],
     [0, 0, 1, 0],
+  ]);
+  setXfNormalMatrix(context, 0, [
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
   ]);
   [1, 0, 1, 0, 1, 0].forEach((value, index) => {
     setXfFloat(context, 0x1020 + index, value);
@@ -1510,23 +1521,36 @@ test("vertex decode retains two independent raster color channels", () => {
     setXfFloat(context, 0x101a + index, value);
   });
 
-  const sourceBytes = new Uint8Array(20);
+  const sourceBytes = new Uint8Array(33);
   const sourceView = new DataView(sourceBytes.buffer);
   [1, 2, 3].forEach((value, index) => {
     sourceView.setFloat32(index * 4, value, false);
   });
-  sourceBytes.set([1, 2, 3, 4], 12);
-  sourceBytes.set([201, 202, 203, 204], 16);
+  sourceBytes.set([
+    64, 0, 0,
+    0, 64, 0,
+    0, 0, 64,
+  ], 12);
+  sourceBytes.set([1, 2, 3, 4], 21);
+  sourceBytes.set([201, 202, 203, 204], 25);
+  sourceView.setInt16(29, 16, false);
+  sourceView.setInt16(31, -32, false);
 
   const decoded = context.gxDecodeVertex(sourceBytes, 0, 0);
+  const decodePlan = context.gxPrepareVertexDecodePlan(0);
   assert.equal(decoded.cursor, sourceBytes.byteLength);
   assert.deepEqual(plain(decoded.colors), [
     [1, 2, 3, 4],
     [201, 202, 203, 204],
   ]);
   assert.deepEqual(plain(decoded.position), [1, 2, 3]);
+  assert.deepEqual(plain(decoded.rawNormal), [1, 0, 0]);
+  assert.deepEqual(plain(decoded.rawTangent), [0, 1, 0]);
+  assert.deepEqual(plain(decoded.rawBinormal), [0, 0, 1]);
+  assert.deepEqual(plain(decoded.rawTextureCoords[0]), [1, -2]);
   assert.equal(decoded.positionMatrix, 0);
   assert.equal(decoded.texCoords.length, 8);
+  assert.equal(context.gxVertexSize(0), sourceBytes.byteLength);
 
   const transformContext = context.gxPrepareVertexTransformContext();
   const prepared = context.gxDecodeVertex(
@@ -1534,18 +1558,91 @@ test("vertex decode retains two independent raster color channels", () => {
     0,
     0,
     transformContext,
+    false,
+    decodePlan,
   );
   const reused = context.gxDecodeVertex(
     sourceBytes,
     0,
     0,
     transformContext,
+    false,
+    decodePlan,
   );
   assert.deepEqual(plain(prepared), plain(decoded));
   assert.deepEqual(plain(reused), plain(decoded));
   assert.equal(context.gxVertexTransformContextSnapshots, 1);
   assert.equal(context.gxVertexTransformCacheSnapshots, 2);
   assert.equal(context.gxVertexTransformCacheMemoHits, 2);
+});
+
+test("reused vertex decode plans isolate per-vertex matrix indexes", () => {
+  const context = workerContext();
+  context.gxCpRegisters[0x30] =
+    1 | (2 << 6) | (3 << 12) | (4 << 18) | (5 << 24);
+  context.gxCpRegisters[0x40] = 6 | (7 << 6) | (8 << 12) | (9 << 18);
+  // Direct PNMTXIDX and TEX0MTXIDX followed by a direct XYZ position.
+  context.gxCpRegisters[0x50] = (1 << 0) | (1 << 1) | (1 << 9);
+  context.gxCpRegisters[0x70] = 1 | (4 << 1);
+  for (const matrixIndex of [5, 6]) {
+    setXfMatrixRows(context, 0, matrixIndex, [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+    ]);
+    setXfNormalMatrix(context, matrixIndex, [
+      1, 0, 0,
+      0, 1, 0,
+      0, 0, 1,
+    ]);
+  }
+  [1, 0, 1, 0, 1, 0].forEach((value, index) => {
+    setXfFloat(context, 0x1020 + index, value);
+  });
+  context.gxXfRegisters[0x1026] = 1;
+  [320, 264, 1, 320, 264, 0].forEach((value, index) => {
+    setXfFloat(context, 0x101a + index, value);
+  });
+
+  const vertexSize = context.gxVertexSize(0);
+  assert.equal(vertexSize, 14);
+  const sourceBytes = new Uint8Array(vertexSize * 2);
+  const sourceView = new DataView(sourceBytes.buffer);
+  sourceBytes.set([5, 10], 0);
+  [1, 2, 3].forEach((value, index) => {
+    sourceView.setFloat32(2 + index * 4, value, false);
+  });
+  sourceBytes.set([6, 11], vertexSize);
+  [4, 5, 6].forEach((value, index) => {
+    sourceView.setFloat32(vertexSize + 2 + index * 4, value, false);
+  });
+
+  const decodePlan = context.gxPrepareVertexDecodePlan(0);
+  const defaultTextureMatrices = decodePlan.textureMatrices.slice();
+  const first = context.gxDecodeVertex(
+    sourceBytes,
+    0,
+    0,
+    null,
+    false,
+    decodePlan,
+  );
+  const second = context.gxDecodeVertex(
+    sourceBytes,
+    vertexSize,
+    0,
+    null,
+    false,
+    decodePlan,
+  );
+
+  assert.equal(first.cursor, vertexSize);
+  assert.equal(second.cursor, vertexSize * 2);
+  assert.equal(first.positionMatrix, 5);
+  assert.equal(second.positionMatrix, 6);
+  assert.deepEqual(plain(first.textureMatrices), [10, 3, 4, 5, 6, 7, 8, 9]);
+  assert.deepEqual(plain(second.textureMatrices), [11, 3, 4, 5, 6, 7, 8, 9]);
+  assert.deepEqual(plain(decodePlan.textureMatrices), plain(defaultTextureMatrices));
 });
 
 test("packs the exact 464-byte WebGPU TEV uniform layout", () => {

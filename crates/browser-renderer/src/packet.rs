@@ -13,7 +13,10 @@ use crate::tev::{
     direct_texture_requires_gen_mode, required_texture_maps,
     required_texture_maps_with_indirect,
 };
-use crate::{GxTextureCopyPlanError, clipped_copy_extent, gx_texture_copy_plan};
+use crate::{
+    EFB_HEIGHT, EFB_WIDTH, GxEfbFormat, GxTextureCopyPlanError, clipped_copy_extent,
+    gx_efb_depth_encoding, gx_efb_format, gx_texture_copy_plan,
+};
 
 pub(crate) const GX_PACKET_MAGIC: [u8; 4] = *b"LZGX";
 pub(crate) const GX_PACKET_VERSION: u16 = 4;
@@ -56,6 +59,7 @@ const FOG_RANGE_ADJUSTMENT_ENABLE: u32 = 1 << 10;
 pub(crate) enum GxCopyKind {
     Texture,
     Xfb,
+    Peek,
 }
 
 impl GxCopyKind {
@@ -63,12 +67,78 @@ impl GxCopyKind {
         match value {
             1 => Ok(Self::Texture),
             2 => Ok(Self::Xfb),
+            3 => Ok(Self::Peek),
             _ => Err(GxPacketError::InvalidField {
-                field: "copy kind",
+                field: "terminal kind",
                 value: u64::from(value),
             }),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxEfbPeekPlane {
+    Color,
+    Depth,
+}
+
+impl GxEfbPeekPlane {
+    fn parse(value: u32) -> Result<Self, GxPacketError> {
+        match value {
+            0 => Ok(Self::Color),
+            1 => Ok(Self::Depth),
+            _ => Err(GxPacketError::InvalidField {
+                field: "EFB peek plane",
+                value: u64::from(value),
+            }),
+        }
+    }
+
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Color => 0,
+            Self::Depth => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxEfbPeekAlphaMode {
+    Read00,
+    ReadFf,
+    ReadNone,
+}
+
+impl GxEfbPeekAlphaMode {
+    fn parse(value: u32) -> Result<Self, GxPacketError> {
+        match value {
+            0 => Ok(Self::Read00),
+            1 => Ok(Self::ReadFf),
+            2 => Ok(Self::ReadNone),
+            _ => Err(GxPacketError::InvalidField {
+                field: "EFB peek alpha-read mode",
+                value: u64::from(value),
+            }),
+        }
+    }
+
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Read00 => 0,
+            Self::ReadFf => 1,
+            Self::ReadNone => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxEfbPeekState {
+    pub(crate) source_x: u32,
+    pub(crate) source_y: u32,
+    pub(crate) request_sequence: u32,
+    pub(crate) plane: GxEfbPeekPlane,
+    pub(crate) alpha_mode: GxEfbPeekAlphaMode,
+    pub(crate) pixel_control: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +184,7 @@ pub(crate) struct GxPacketHeader {
     pub(crate) texture_copy_layout_v1: bool,
     pub(crate) indirect_tev_state_v1: bool,
     pub(crate) copy_state: GxCopyState,
+    pub(crate) efb_peek: Option<GxEfbPeekState>,
     pub(crate) total_vertex_count: u32,
 }
 
@@ -467,10 +538,23 @@ impl<'a> GxFramePacket<'a> {
                 "copy clear flag must match the raw copy command",
             ));
         }
-        if (copy_kind == GxCopyKind::Xfb) != (copy_command & 0x4000 != 0) {
-            return Err(GxPacketError::NonCanonical(
-                "copy kind must match the raw copy command",
-            ));
+        match copy_kind {
+            GxCopyKind::Texture if copy_command & 0x4000 != 0 => {
+                return Err(GxPacketError::NonCanonical(
+                    "copy kind must match the raw copy command",
+                ));
+            }
+            GxCopyKind::Xfb if copy_command & 0x4000 == 0 => {
+                return Err(GxPacketError::NonCanonical(
+                    "copy kind must match the raw copy command",
+                ));
+            }
+            GxCopyKind::Peek if copy_command != 0 => {
+                return Err(GxPacketError::NonCanonical(
+                    "EFB peek cannot carry a copy command",
+                ));
+            }
+            _ => {}
         }
 
         if source_width == 0 || source_height == 0 {
@@ -479,13 +563,14 @@ impl<'a> GxFramePacket<'a> {
                 value: 0,
             });
         }
-        match (copy_kind, texture_copy_layout_v1) {
+        let efb_peek = match (copy_kind, texture_copy_layout_v1) {
             (GxCopyKind::Texture, false) => {
                 if output_width != 0 || output_height != 0 || stride != 0 {
                     return Err(GxPacketError::NonCanonical(
                         "texture copies must have zero output width, output height, and stride",
                     ));
                 }
+                None
             }
             (GxCopyKind::Texture, true) => {
                 if !stride.is_multiple_of(32) || stride > 0x1fff_ffe0 {
@@ -514,6 +599,7 @@ impl<'a> GxFramePacket<'a> {
                     output_height,
                     plan.output_height,
                 )?;
+                None
             }
             (GxCopyKind::Xfb, true) => {
                 return Err(GxPacketError::NonCanonical(
@@ -534,8 +620,80 @@ impl<'a> GxFramePacket<'a> {
                         value: u64::from(maximum_output_dimension),
                     });
                 }
+                None
             }
-        }
+            (GxCopyKind::Peek, true) => {
+                return Err(GxPacketError::NonCanonical(
+                    "EFB peeks cannot carry texture-copy layout provenance",
+                ));
+            }
+            (GxCopyKind::Peek, false) => {
+                if source_width != 1 || source_height != 1 {
+                    return Err(GxPacketError::NonCanonical(
+                        "EFB peek source extent must be exactly one pixel",
+                    ));
+                }
+                if source_x >= EFB_WIDTH || source_y >= EFB_HEIGHT {
+                    return Err(GxPacketError::InvalidField {
+                        field: "EFB peek source coordinate",
+                        value: (u64::from(source_y) << 32) | u64::from(source_x),
+                    });
+                }
+                if output_width != 0 || output_height != 0 {
+                    return Err(GxPacketError::NonCanonical(
+                        "EFB peeks must have zero output width and height",
+                    ));
+                }
+                if generation == 0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "EFB peek request sequence",
+                        value: 0,
+                    });
+                }
+                if copy_flags != 0
+                    || terminal_z_mode != 0
+                    || terminal_blend_mode != 0
+                    || copy_command != 0
+                    || clear_rgba != [0; 4]
+                    || clear_depth != 0
+                    || copy_scale != 0
+                    || copy_filter != [0; 2]
+                {
+                    return Err(GxPacketError::NonCanonical(
+                        "EFB peeks cannot carry copy or clear state",
+                    ));
+                }
+                let plane = GxEfbPeekPlane::parse(destination)?;
+                let alpha_mode = GxEfbPeekAlphaMode::parse(stride)?;
+                match plane {
+                    GxEfbPeekPlane::Color => match gx_efb_format(pixel_control) {
+                        GxEfbFormat::Rgb8Z24 | GxEfbFormat::Rgba6Z24 | GxEfbFormat::Rgb565Z16 => {}
+                        GxEfbFormat::Z24 | GxEfbFormat::OtherNoAlpha => {
+                            return Err(GxPacketError::InvalidField {
+                                field: "EFB peek color format",
+                                value: u64::from(pixel_control & 7),
+                            });
+                        }
+                    },
+                    GxEfbPeekPlane::Depth => {
+                        gx_efb_depth_encoding(pixel_control).map_err(|_| {
+                            GxPacketError::InvalidField {
+                                field: "EFB peek depth encoding",
+                                value: u64::from(pixel_control & 0x3f),
+                            }
+                        })?;
+                    }
+                }
+                Some(GxEfbPeekState {
+                    source_x,
+                    source_y,
+                    request_sequence: generation,
+                    plane,
+                    alpha_mode,
+                    pixel_control,
+                })
+            }
+        };
 
         let expected_draw_bytes =
             checked_mul(draw_count, u32::from(draw_record_bytes), "draw table size")?;
@@ -646,6 +804,7 @@ impl<'a> GxFramePacket<'a> {
             texture_copy_layout_v1,
             indirect_tev_state_v1,
             copy_state,
+            efb_peek,
             total_vertex_count,
         };
 
@@ -2054,6 +2213,25 @@ mod tests {
         bytes
     }
 
+    fn empty_efb_peek() -> Vec<u8> {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x10, 3);
+        put_u32(&mut bytes, 0x4c, 320);
+        put_u32(&mut bytes, 0x50, 240);
+        put_u32(&mut bytes, 0x54, 1);
+        put_u32(&mut bytes, 0x58, 1);
+        put_u32(&mut bytes, 0x64, 1);
+        put_u32(&mut bytes, 0x68, 2);
+        put_u32(&mut bytes, 0x6c, 0x1122_3344);
+        put_u32(&mut bytes, 0x70, 0);
+        bytes[0x74..0x78].fill(0);
+        for offset in [0x80, 0x84, 0x8c, 0x90, 0x94, 0x98, 0x9c] {
+            put_u32(&mut bytes, offset, 0);
+        }
+        put_u32(&mut bytes, 0x88, 0x41);
+        bytes
+    }
+
     fn single_draw_v2_texture_copy() -> Vec<u8> {
         const PACKET_BYTES: usize = 752;
         const DRAW_OFFSET: usize = 160;
@@ -2690,6 +2868,133 @@ mod tests {
         );
         assert_eq!(packet.draws().len(), 0);
         assert_eq!(packet.textures().len(), 0);
+    }
+
+    #[test]
+    fn parses_canonical_one_pixel_efb_peek_terminal() {
+        let bytes = empty_efb_peek();
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(packet.header().copy_kind, GxCopyKind::Peek);
+        assert_eq!(
+            packet.header().efb_peek,
+            Some(GxEfbPeekState {
+                source_x: 320,
+                source_y: 240,
+                request_sequence: 0x1122_3344,
+                plane: GxEfbPeekPlane::Depth,
+                alpha_mode: GxEfbPeekAlphaMode::ReadNone,
+                pixel_control: 0x41,
+            })
+        );
+        assert!(!packet.header().clear);
+        assert!(!packet.header().texture_copy_layout_v1);
+    }
+
+    #[test]
+    fn efb_peek_terminal_fields_are_strict_and_fail_closed() {
+        for (offset, value, expected) in [
+            (
+                0x54,
+                2,
+                GxPacketError::NonCanonical("EFB peek source extent must be exactly one pixel"),
+            ),
+            (
+                0x5c,
+                1,
+                GxPacketError::NonCanonical("EFB peeks must have zero output width and height"),
+            ),
+            (
+                0x64,
+                2,
+                GxPacketError::InvalidField {
+                    field: "EFB peek plane",
+                    value: 2,
+                },
+            ),
+            (
+                0x68,
+                3,
+                GxPacketError::InvalidField {
+                    field: "EFB peek alpha-read mode",
+                    value: 3,
+                },
+            ),
+            (
+                0x6c,
+                0,
+                GxPacketError::InvalidField {
+                    field: "EFB peek request sequence",
+                    value: 0,
+                },
+            ),
+            (
+                0x8c,
+                1,
+                GxPacketError::NonCanonical("EFB peek cannot carry a copy command"),
+            ),
+            (
+                0x90,
+                1,
+                GxPacketError::NonCanonical("EFB peeks cannot carry copy or clear state"),
+            ),
+        ] {
+            let mut bytes = empty_efb_peek();
+            put_u32(&mut bytes, offset, value);
+            assert_eq!(GxFramePacket::parse(&bytes).unwrap_err(), expected);
+        }
+
+        let mut out_of_bounds = empty_efb_peek();
+        put_u32(&mut out_of_bounds, 0x4c, EFB_WIDTH);
+        assert!(matches!(
+            GxFramePacket::parse(&out_of_bounds),
+            Err(GxPacketError::InvalidField {
+                field: "EFB peek source coordinate",
+                ..
+            })
+        ));
+
+        let mut layout = empty_efb_peek();
+        put_u32(&mut layout, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        assert_eq!(
+            GxFramePacket::parse(&layout).unwrap_err(),
+            GxPacketError::NonCanonical("EFB peeks cannot carry texture-copy layout provenance")
+        );
+    }
+
+    #[test]
+    fn efb_peek_validates_color_format_and_z16_encoding() {
+        let mut color = empty_efb_peek();
+        put_u32(&mut color, 0x64, 0);
+        put_u32(&mut color, 0x88, 1);
+        assert_eq!(
+            GxFramePacket::parse(&color).unwrap().header().efb_peek,
+            Some(GxEfbPeekState {
+                source_x: 320,
+                source_y: 240,
+                request_sequence: 0x1122_3344,
+                plane: GxEfbPeekPlane::Color,
+                alpha_mode: GxEfbPeekAlphaMode::ReadNone,
+                pixel_control: 1,
+            })
+        );
+        put_u32(&mut color, 0x88, 3);
+        assert_eq!(
+            GxFramePacket::parse(&color).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "EFB peek color format",
+                value: 3,
+            }
+        );
+
+        let mut invalid_z16 = empty_efb_peek();
+        put_u32(&mut invalid_z16, 0x88, 2 | (4 << 3));
+        assert_eq!(
+            GxFramePacket::parse(&invalid_z16).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "EFB peek depth encoding",
+                value: 2 | (4 << 3),
+            }
+        );
     }
 
     #[test]

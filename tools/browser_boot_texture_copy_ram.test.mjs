@@ -151,6 +151,7 @@ function workerHarness({ ramBytes = 512, transferMessages = false } = {}) {
       "recordRendererFailure",
       "gxPreflightTextureCopyReceipts",
       "gxApplyTextureCopyReceipt",
+      "gxPreflightEfbPeekReceipt",
       "gxRetireRendererFrame",
       "completeRendererFrame",
       "gxCommitTextureCopyMaterialization",

@@ -331,6 +331,9 @@ semanticTest("loop recognizers do not throw while a staged prefix ends at a fetc
   const probes = [];
   const directFetches = [];
   const context = {
+    fastForwardStringHashLoop() {
+      return false;
+    },
     fetchInstructionWord(effective) {
       const address = effective >>> 0;
       probes.push(address);

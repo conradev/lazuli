@@ -29,6 +29,7 @@ function schedulerContext() {
   const context = {
     blockPattern: { none: 0, idleBasic: 2, idleVolatileRead: 3 },
     blocks: new Map(),
+    decodeStringHashLoop: () => null,
     isCacheLineLoop: () => false,
     decodeMemset32ByteLoop: () => null,
     isMusyxAramQueueFullWaitBackedge: () => false,
@@ -95,12 +96,14 @@ test("structural loop recognition remains available before compilation", () => {
   context.decodeMemset32ByteLoop = pc => pc === 0x5000 ? {} : null;
   context.isMusyxAramQueueFullWaitBackedge = pc => pc === 0x6000;
   context.isAiSrcInitSampleCounterWaitCandidate = pc => pc === 0x7000;
+  context.decodeStringHashLoop = pc => pc === 0x8000 ? {} : null;
 
   assert.equal(context.isRecognizedLoopPc(0x4000), true);
   assert.equal(context.isRecognizedLoopPc(0x5000), true);
   assert.equal(context.isRecognizedLoopPc(0x6000), true);
   assert.equal(context.isRecognizedLoopPc(0x7000), true);
-  assert.equal(context.isRecognizedLoopPc(0x8000), false);
+  assert.equal(context.isRecognizedLoopPc(0x8000), true);
+  assert.equal(context.isRecognizedLoopPc(0x9000), false);
 });
 
 test("lazy CPU stability witnesses do not hash across changing PCs", () => {

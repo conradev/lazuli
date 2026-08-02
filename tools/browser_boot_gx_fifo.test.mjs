@@ -548,7 +548,9 @@ test("FIFO optimization preserves the existing semantic drain boundaries", () =>
     true,
   );
 
-  const execution = source.indexOf("if (executedBlocks === 0)");
+  const execution = source.indexOf(
+    "if (executedBlocks === 0 && !efbPeekYieldRequested)",
+  );
   const observedCycles = source.indexOf("const observedCycles = cycles + executedCycles;", execution);
   const executionDrain = source.indexOf("drainGxFifoStagingAtCycle(observedCycles);", observedCycles);
   const mmioService = source.indexOf("serviceMmio(observedCycles);", executionDrain);

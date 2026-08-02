@@ -65,6 +65,7 @@ function workerHarness({ transferMessages = false } = {}) {
     rendererFramesAcknowledged: 0,
     rendererFramesInFlight: new Set(),
     rendererTextureCopyExpectations: new Map(),
+    rendererEfbPeekExpectations: new Map(),
     rendererViFrames: new Map(),
     rendererResidentTextureKeys: new Set(),
     gxSkippedCopyClears: [],
@@ -122,6 +123,7 @@ function workerHarness({ transferMessages = false } = {}) {
       "gxDrainSkippedCopyClears",
       "postGxFrame",
       "recordRendererFailure",
+      "gxPreflightEfbPeekReceipt",
       "gxRetireRendererFrame",
       "completeRendererFrame",
       "honorRendererBackpressure",
@@ -1805,5 +1807,8 @@ test("guest execution waits for renderer completion before another block", () =>
     source,
     /webGpuRenderer\.present_xfb\([\s\S]*?frame\.temporalXfbCapture !== undefined,\s*frame\.sustainedPlayReceipt !== undefined\s*\)/,
   );
-  assert.match(source, /await finishAfterRendererDrain\("stopped", \{\s*stage: "terminal-pc"/);
+  assert.match(
+    source,
+    /await finishQuiescentAfterRendererDrain\("stopped", \{\s*stage: "terminal-pc"/,
+  );
 });

@@ -115,7 +115,7 @@ test("GX frames cross the renderer bridge as one exact packet view", () => {
   assert.throws(
     () => context.submitGxFrame({
       packet: new ArrayBuffer(16),
-      diagnostics: { copyKind: 3, index: 0, drawCalls: 0, vertices: 0 },
+      diagnostics: { copyKind: 4, index: 0, drawCalls: 0, vertices: 0 },
     }),
     /diagnostics are invalid/,
   );

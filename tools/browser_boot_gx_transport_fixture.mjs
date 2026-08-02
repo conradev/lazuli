@@ -72,6 +72,7 @@ const decoderFunctions = [
 ];
 
 const transportFunctions = [
+  "withScopedCycles",
   "commandProcessorBreakpointLevel",
   "readCommandProcessorStatus",
   "commandProcessorInterruptInputs",
@@ -96,6 +97,7 @@ const transportFunctions = [
   "resetGxCommandProcessorDecoder",
   "appendGxFifoBytes",
   "drainGxFifoStaging",
+  "drainGxFifoStagingAtCycle",
   "resetCommandProcessorFifoFromPi",
   "commandProcessorPairValue",
   "writeCommandProcessorPairValue",

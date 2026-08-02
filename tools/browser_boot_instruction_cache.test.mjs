@@ -409,6 +409,7 @@ test("accelerated icbi batches every skipped line through range invalidation", (
     cycles: 0,
     decodeMemset32ByteLoop: () => null,
     fetchWord: () => 0x7c001fac,
+    fastForwardStringHashLoop: () => false,
     gprOffsets: Array.from({ length: 32 }, (_unused, index) => 0x20 + index * 4),
     instructions: 0,
     invalidateInstructionCacheRange: (...arguments_) => calls.push(arguments_),

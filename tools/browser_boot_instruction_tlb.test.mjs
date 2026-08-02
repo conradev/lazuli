@@ -250,7 +250,7 @@ test("browser runtime exposes the tlbie set invalidation contract", () => {
   );
   assert.match(
     source,
-    /const retained = captureInstructionPageDependencies\(pc,\s*effectiveBytes\)[\s\S]{0,320}instructionPageDependencies:\s*retained\.dependencies/,
+    /const retained = captureInstructionPageDependencies\(pc,\s*effectiveBytes\)[\s\S]{0,480}instructionPageDependencies:\s*retained\.dependencies/,
     "compiled blocks retain the pages fetched while staging their Wasm",
   );
   assert.match(

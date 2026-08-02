@@ -40,6 +40,53 @@ test("browser reports expose the CPU-state signature", () => {
   );
 });
 
+test("snapshot console reports retain only a compact scalar summary", () => {
+  const calls = [];
+  const context = {
+    console: {
+      log(...args) { calls.push(args); },
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(extractFunction("logBrowserBootReport"), context, {
+    filename: "browser_boot.report-log.js",
+  });
+  const details = {
+    stage: "snapshot",
+    pc: "0x80001234",
+    instructions: 123,
+    cycles: 456,
+    dispatches: 78,
+    compiledBlocks: 9,
+  };
+  const report = { sentinel: { retained: true } };
+
+  for (let index = 0; index < 128; index += 1) {
+    context.logBrowserBootReport("progress", details, report);
+  }
+
+  assert.equal(calls.length, 128);
+  for (const args of calls) {
+    assert.deepEqual(args, [
+      "BROWSER_BOOT_PROGRESS",
+      "snapshot pc=0x80001234 instructions=123 cycles=456 dispatches=78 compiledBlocks=9",
+    ]);
+    assert.ok(args.every(value => typeof value === "string"));
+    assert.ok(!args.includes(report));
+  }
+
+  context.logBrowserBootReport("progress", { stage: "operator-stop" }, report);
+  assert.equal(calls.at(-1)[0], "BROWSER_BOOT_PROGRESS");
+  assert.equal(calls.at(-1)[1], report);
+});
+
+test("finish keeps full report serialization but delegates console publication", () => {
+  const finish = extractFunction("finish");
+  assert.match(finish, /output\.textContent = JSON\.stringify\(report, null, 2\);/);
+  assert.match(finish, /logBrowserBootReport\(status, details, report\);/);
+  assert.doesNotMatch(finish, /console\.log/);
+});
+
 test("the optional public diagnostics control captures into the hidden report sink", () => {
   const snapshots = [];
   const button = {

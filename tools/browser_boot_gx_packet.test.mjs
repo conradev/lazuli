@@ -1069,7 +1069,7 @@ test("rejects malformed or non-canonical packet inputs", () => {
 
   assert.throws(
     () => context.packGxFramePacketV4(3, emptyTextureFrame()),
-    /copyKind must be 1 or 2|copyKind must be an integer/,
+    /frame\.stride must be an integer from 0 through 2|EFB peek terminal is noncanonical/,
   );
 
   const unsafeGeneration = emptyTextureFrame();

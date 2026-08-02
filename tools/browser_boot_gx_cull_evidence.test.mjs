@@ -233,6 +233,8 @@ function recoveryContext({
   const textureCalls = [];
   const transformContexts = [];
   const decodedTransformContexts = [];
+  const preparedVertexDecodePlans = [];
+  const decodedVertexDecodePlans = [];
   const normalCacheCommitFlags = [];
   const stage = {
     index: 0,
@@ -309,11 +311,27 @@ function recoveryContext({
       transformContexts.push(prepared);
       return prepared;
     },
+    gxPrepareVertexDecodePlan(vatIndex) {
+      const prepared = {
+        vatIndex,
+        ordinal: preparedVertexDecodePlans.length,
+      };
+      preparedVertexDecodePlans.push(prepared);
+      return prepared;
+    },
     gxManagedCoverageStateCandidate() {
       return collectCullSources;
     },
-    gxDecodeVertex(_source, start, _vat, transformContext, commitNormalCache) {
+    gxDecodeVertex(
+      _source,
+      start,
+      _vat,
+      transformContext,
+      commitNormalCache,
+      vertexDecodePlan,
+    ) {
       decodedTransformContexts.push(transformContext);
+      decodedVertexDecodePlans.push(vertexDecodePlan);
       normalCacheCommitFlags.push(commitNormalCache);
       const decoded = decodedVertices[start];
       return { ...decoded, cursor: start + 1 };
@@ -381,10 +399,12 @@ function recoveryContext({
   return {
     context,
     decodedTransformContexts,
+    decodedVertexDecodePlans,
     exactCalls,
     exactFailureCalls,
     normalCacheCommitFlags,
     postCullCalls,
+    preparedVertexDecodePlans,
     textureCalls,
     transformContexts,
   };
@@ -473,6 +493,37 @@ test("one decode batch invalidates interned draw state on every GX register clas
       serialComponent,
     );
   }
+});
+
+test("one draw state caches vertex decode plans by VAT and CP serial", () => {
+  const decodedVertices = [recoveryDecodedVertex(0, [0, 0, 0, 1])];
+  const {
+    context,
+    decodedVertexDecodePlans,
+    preparedVertexDecodePlans,
+  } = recoveryContext({ decodedVertices });
+  const batch = {
+    sourceHashes: new Map(),
+    paletteHashes: new Map(),
+  };
+
+  context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+  context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+  context.recordGxPrimitive(0x81, new Uint8Array(1), 0, 1, 1, batch);
+  context.gxCpLoads += 1;
+  context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+
+  assert.deepEqual(
+    preparedVertexDecodePlans.map(plan => plan.vatIndex),
+    [0, 1, 0],
+  );
+  assert.strictEqual(decodedVertexDecodePlans[0], preparedVertexDecodePlans[0]);
+  assert.strictEqual(decodedVertexDecodePlans[1], preparedVertexDecodePlans[0]);
+  assert.strictEqual(decodedVertexDecodePlans[2], preparedVertexDecodePlans[1]);
+  assert.strictEqual(decodedVertexDecodePlans[3], preparedVertexDecodePlans[2]);
+  assert.notStrictEqual(decodedVertexDecodePlans[0], decodedVertexDecodePlans[3]);
+  assert.equal(context.gxDrawStateSnapshots, 2);
+  assert.equal(context.gxDrawStateMemoHits, 2);
 });
 
 test("separate decode batches never share vertex transform context", () => {

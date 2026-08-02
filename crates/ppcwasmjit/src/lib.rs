@@ -921,6 +921,19 @@ for (const [register, bits0, bits1] of records(expectedRecords)) {
     }
 
     #[test]
+    fn validates_256_block_linked_region() {
+        let blocks = (0..256)
+            .map(|index| RegionBlock {
+                pc: 0x8000_1000 + index * 4,
+                maximum_cycles: 4,
+            })
+            .collect::<Vec<_>>();
+        let region = link_region(&blocks).unwrap();
+
+        Validator::new().validate_all(&region).unwrap();
+    }
+
+    #[test]
     fn executes_balanced_linked_region_with_unsorted_blocks() {
         if Command::new("node").arg("--version").output().is_err() {
             eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");

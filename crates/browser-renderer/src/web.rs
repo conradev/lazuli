@@ -17,7 +17,8 @@ use wgpu::util::DeviceExt;
 
 use crate::clip::{GxExactPreparationFailure, gx_exact_draw_raster_geometry};
 use crate::packet::{
-    GxCopyKind, GxCopyState, GxFramePacket, GxIndirectTevState, GxTriangleAction,
+    GxCopyKind, GxCopyState, GxEfbPeekState, GxFramePacket, GxIndirectTevState,
+    GxTriangleAction,
 };
 use crate::raster::{
     GxRasterAttributePlaneF32, gx_non_aa_raster_color_rgba8, gx_normalized_raster_channel_u8,
@@ -50,11 +51,12 @@ use crate::{
     compact_surface_readback_rows, compact_xfb_scanout_rows, decoded_texture_cache_hit,
     decoded_texture_is_available, gx_blend_factor_for_component, gx_blend_state,
     gx_copy_clear_mask, gx_copy_clear_rgba, gx_destination_alpha_state, gx_early_depth_plan,
-    gx_efb_depth_encoding, gx_fog_state, gx_raster_center_evidence, gx_sampler_state,
-    gx_texture_copy_plan, gx_texture_copy_ram_layout, gx_xfb_copy_parameters, gx_xfb_output_height,
-    gx_z_texture_state, merge_contiguous_draw_range, requested_surface_readback_layout,
-    require_tev_texture, reusable_xfb_surface_index, rgba8_mip_chain_byte_len, select_mip_texture,
-    xfb_copy_matches_selection, xfb_readback_layout, xfb_scanout_plan, xfb_surface_extent_matches,
+    gx_efb_depth_encoding, gx_efb_format, gx_fog_state, gx_raster_center_evidence,
+    gx_sampler_state, gx_texture_copy_plan, gx_texture_copy_ram_layout, gx_xfb_copy_parameters,
+    gx_xfb_output_height, gx_z_texture_state, merge_contiguous_draw_range,
+    requested_surface_readback_layout, require_tev_texture, reusable_xfb_surface_index,
+    rgba8_mip_chain_byte_len, select_mip_texture, xfb_copy_matches_selection, xfb_readback_layout,
+    xfb_scanout_plan, xfb_surface_extent_matches,
 };
 
 #[wasm_bindgen]
@@ -594,6 +596,33 @@ fn cs_tiled_ram(@builtin(global_invocation_id) invocation: vec3<u32>) {
         | (tiled_byte(byte_index + 1u) << 8u)
         | (tiled_byte(byte_index + 2u) << 16u)
         | (tiled_byte(byte_index + 3u) << 24u);
+}
+
+@compute @workgroup_size(1)
+fn cs_efb_peek() {
+    let coord = vec2<i32>(copy.source_rect.xy);
+    if copy.options.x != 0u {
+        // Depth32Float already holds the architected EFB code normalized over
+        // its inclusive range. Read it once: applying GX Z16 compression here
+        // would incorrectly compress the stored code a second time.
+        let maximum = select(16777215.0, 65535.0, copy.output_and_format.w == 2u);
+        tiled_words[0] = u32(floor(
+            clamp(textureLoad(efb_depth, coord, 0), 0.0, 1.0) * maximum
+        ));
+        return;
+    }
+
+    let texel = native_color(textureLoad(efb_color, coord, 0));
+    var alpha = texel.a;
+    switch copy.options.z {
+        case 0u: { alpha = 0u; }
+        case 1u: { alpha = 255u; }
+        default: { alpha = texel.a; }
+    }
+    tiled_words[0] = (alpha << 24u)
+        | (texel.r << 16u)
+        | (texel.g << 8u)
+        | texel.b;
 }
 
 @fragment
@@ -1168,6 +1197,22 @@ impl EfbTextureCopyUniform {
             gamma: [plan.gamma.reciprocal(), 0.0, 0.0, 0.0],
         }
     }
+
+    fn for_efb_peek(state: GxEfbPeekState) -> Self {
+        Self {
+            source_rect: [state.source_x, state.source_y, 1, 1],
+            output_and_format: [
+                1,
+                1,
+                0,
+                texture_copy_source_format_code(gx_efb_format(state.pixel_control)),
+            ],
+            filter_coefficients: [0; 4],
+            options: [state.plane.code(), 0, state.alpha_mode.code(), 0],
+            clamp_rows: [state.source_y, state.source_y, 0, 0],
+            gamma: [1.0, 0.0, 0.0, 0.0],
+        }
+    }
 }
 
 const fn texture_copy_format_code(format: GxEfbCopyFormat) -> u32 {
@@ -1214,6 +1259,7 @@ struct EfbTextureCopyResources {
     tiled_output_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     tiled_pipeline: wgpu::ComputePipeline,
+    peek_pipeline: wgpu::ComputePipeline,
 }
 
 struct PendingEfbTextureCopyReadback {
@@ -1226,6 +1272,11 @@ struct PendingEfbTextureCopyReadback {
     base_format: GxTextureBaseFormat,
     stride: u32,
     layout: GxTextureCopyRamLayout,
+}
+
+struct PendingEfbPeekReadback {
+    buffer: wgpu::Buffer,
+    state: GxEfbPeekState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1634,6 +1685,7 @@ pub struct WebGpuRenderer {
     texture_cache: HashMap<String, CachedTexture>,
     efb_copy_cache: HashMap<u32, CachedTexture>,
     pending_efb_texture_copy_readbacks: Vec<PendingEfbTextureCopyReadback>,
+    pending_efb_peek_readbacks: Vec<PendingEfbPeekReadback>,
     xfb_cache: HashMap<u32, CachedXfb>,
     vi_field_pairs: ViFieldPairState<CachedXfbSurface>,
     last_presented_xfb: Option<PresentedXfb>,
@@ -2507,6 +2559,69 @@ async fn finish_efb_texture_copy_readbacks(
     Ok(receipts)
 }
 
+async fn finish_efb_peek_readbacks(
+    pending: Vec<PendingEfbPeekReadback>,
+    failure_state: &RendererFailureState,
+) -> Result<Array, JsValue> {
+    let receipts = Array::new();
+    for pending in pending {
+        ensure_renderer_healthy(failure_state)?;
+        BufferMap::new(&pending.buffer).await.map_err(|error| {
+            fail_efb_texture_copy_readback(
+                failure_state,
+                format!("WebGPU one-pixel EFB peek map failed: {error}"),
+            )
+        })?;
+        let value = {
+            let mapped = pending.buffer.slice(..).get_mapped_range();
+            if mapped.len() != size_of::<u32>() {
+                let actual_len = mapped.len();
+                drop(mapped);
+                pending.buffer.unmap();
+                return Err(fail_efb_texture_copy_readback(
+                    failure_state,
+                    format!(
+                        "WebGPU one-pixel EFB peek map returned {actual_len} bytes, expected 4"
+                    ),
+                ));
+            }
+            let value = u32::from_le_bytes(
+                mapped[..size_of::<u32>()]
+                    .try_into()
+                    .expect("validated four-byte EFB peek result"),
+            );
+            drop(mapped);
+            pending.buffer.unmap();
+            value
+        };
+        let receipt = Object::new();
+        for (name, value) in [
+            ("generation", pending.state.request_sequence),
+            ("requestSequence", pending.state.request_sequence),
+            ("x", pending.state.source_x),
+            ("y", pending.state.source_y),
+            ("plane", pending.state.plane.code()),
+            ("alphaMode", pending.state.alpha_mode.code()),
+            ("pixelControl", pending.state.pixel_control),
+            ("value", value),
+        ] {
+            Reflect::set(
+                &receipt,
+                &JsValue::from_str(name),
+                &JsValue::from_f64(f64::from(value)),
+            )?;
+        }
+        Reflect::set(
+            &receipt,
+            &JsValue::from_str("layout"),
+            &JsValue::from_str("gx-efb-peek-u32-v1"),
+        )?;
+        receipts.push(&receipt);
+    }
+    ensure_renderer_healthy(failure_state)?;
+    Ok(receipts)
+}
+
 fn interleave_presented_xfb_fields(
     top: &[u8],
     bottom: &[u8],
@@ -2567,6 +2682,7 @@ impl WebGpuRenderer {
         self.texture_cache.clear();
         self.efb_copy_cache.clear();
         self.pending_efb_texture_copy_readbacks.clear();
+        self.pending_efb_peek_readbacks.clear();
         self.xfb_cache.clear();
         self.reset_efb_inner()
     }
@@ -2830,6 +2946,28 @@ impl WebGpuRenderer {
             QueueDrain::new(&queue).await;
             ensure_renderer_healthy(&failure_state)?;
             let receipts = finish_efb_texture_copy_readbacks(pending, &failure_state).await?;
+            Ok(receipts.into())
+        })
+    }
+
+    /// Resolve only ordered one-pixel EFB peek receipts.
+    ///
+    /// This is deliberately separate from `drain`: texture-copy RAM receipts
+    /// retain their existing batching contract while a cooperatively yielded
+    /// CPU load can await exactly the EFB requests that caused that yield.
+    pub fn drain_efb_peeks(&mut self) -> Promise {
+        self.record_wasm_bridge_call(0);
+        if let Err(error) = self.ensure_healthy() {
+            return Promise::reject(&error);
+        }
+        let queue = self.queue.clone();
+        let failure_state = self.failure_state.clone();
+        let pending = std::mem::take(&mut self.pending_efb_peek_readbacks);
+        future_to_promise(async move {
+            ensure_renderer_healthy(&failure_state)?;
+            QueueDrain::new(&queue).await;
+            ensure_renderer_healthy(&failure_state)?;
+            let receipts = finish_efb_peek_readbacks(pending, &failure_state).await?;
             Ok(receipts.into())
         })
     }
@@ -3347,6 +3485,12 @@ impl WebGpuRenderer {
                     header.generation,
                     header.copy_state,
                     header.clear,
+                    &pre_clears,
+                ),
+                GxCopyKind::Peek => self.peek_efb_inner(
+                    header
+                        .efb_peek
+                        .expect("validated EFB peek terminal carries typed state"),
                     &pre_clears,
                 ),
             }
@@ -4046,6 +4190,86 @@ impl WebGpuRenderer {
         }
         self.commands.push(DrawCommand { vertices, state });
         Ok(())
+    }
+
+    fn peek_efb_inner(
+        &mut self,
+        state: GxEfbPeekState,
+        pre_clears: &[GxPreClear],
+    ) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        let mut encoder = self.flush_geometry_with_pre_clears(pre_clears)?;
+        let uniform = EfbTextureCopyUniform::for_efb_peek(state);
+        let uniform_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("browser GX immutable one-pixel EFB peek uniform"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let storage = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("browser GX one-pixel EFB peek storage"),
+            size: size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("browser GX one-pixel EFB peek readback"),
+            size: size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let source_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser GX immutable one-pixel EFB peek source bind group"),
+            layout: &self.efb_texture_copy.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.efb_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.efb_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let output_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser GX one-pixel EFB peek output bind group"),
+            layout: &self.efb_texture_copy.tiled_output_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: storage.as_entire_binding(),
+            }],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("browser GX ordered one-pixel EFB peek pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.efb_texture_copy.peek_pipeline);
+            pass.set_bind_group(0, &source_bind_group, &[]);
+            pass.set_bind_group(1, &output_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&storage, 0, &readback, 0, size_of::<u32>() as u64);
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.buffers_created = metrics.buffers_created.saturating_add(3);
+            metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(2);
+        });
+        self.queue.submit([encoder.finish()]);
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
+        });
+        self.pending_efb_peek_readbacks
+            .push(PendingEfbPeekReadback {
+                buffer: readback,
+                state,
+            });
+        self.ensure_healthy()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5261,6 +5485,7 @@ impl WebGpuRenderer {
             texture_cache: HashMap::new(),
             efb_copy_cache: HashMap::new(),
             pending_efb_texture_copy_readbacks: Vec::new(),
+            pending_efb_peek_readbacks: Vec::new(),
             xfb_cache: HashMap::new(),
             vi_field_pairs: ViFieldPairState::default(),
             last_presented_xfb: None,
@@ -7433,11 +7658,23 @@ fn create_efb_texture_copy_resources(device: &wgpu::Device) -> EfbTextureCopyRes
         },
         cache: None,
     });
+    let peek_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("browser GX one-pixel EFB peek pipeline"),
+        layout: Some(&tiled_pipeline_layout),
+        module: &shader,
+        entry_point: Some("cs_efb_peek"),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants: &[],
+            zero_initialize_workgroup_memory: false,
+        },
+        cache: None,
+    });
     EfbTextureCopyResources {
         layout,
         tiled_output_layout,
         pipeline,
         tiled_pipeline,
+        peek_pipeline,
     }
 }
 
@@ -7817,7 +8054,10 @@ mod tests {
         texture_copy_plan_for_source,
     };
     use crate::clip::{GxClipError, GxExactGeometryError};
-    use crate::packet::{GxCopyState, GxIndirectTevState, GxTriangleAction};
+    use crate::packet::{
+        GxCopyState, GxEfbPeekAlphaMode, GxEfbPeekPlane, GxEfbPeekState, GxIndirectTevState,
+        GxTriangleAction,
+    };
     use crate::tev::{MAX_TEV_TEXTURES, TEV_VERTEX_FLOATS, managed_tex_coord_sidecar_fits};
     use crate::{
         ExactRequiredPreparationRejectionReason, GX_DEPTH24_MAX, GxBlendFactor, GxDepthCompression,
@@ -7906,6 +8146,14 @@ mod tests {
         );
         assert!(EFB_TEXTURE_COPY_SHADER.contains("@compute @workgroup_size(64)"));
         assert!(EFB_TEXTURE_COPY_SHADER.contains("fn cs_tiled_ram("));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("@compute @workgroup_size(1)"));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("fn cs_efb_peek()"));
+        assert!(
+            EFB_TEXTURE_COPY_SHADER
+                .contains("select(16777215.0, 65535.0, copy.output_and_format.w == 2u)")
+        );
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("u32(floor("));
+        assert!(EFB_TEXTURE_COPY_SHADER.contains("(alpha << 24u)"));
         assert!(EFB_TEXTURE_COPY_SHADER.contains("arrayLength(&tiled_words)"));
         assert!(EFB_TEXTURE_COPY_SHADER.contains("fn clamped_column(column: i32)"));
         assert!(EFB_TEXTURE_COPY_SHADER.contains("textureDimensions(efb_color).x"));
@@ -7934,6 +8182,42 @@ mod tests {
         assert!(tiled_encoder.contains("packed >> 8u"));
         assert!(tiled_encoder.contains("if local_byte < 32u"));
         assert!(tiled_encoder.contains("select(texel.g, texel.b"));
+    }
+
+    #[test]
+    fn efb_peek_uniform_carries_typed_terminal_state_without_depth_reencoding() {
+        let z24 = EfbTextureCopyUniform::for_efb_peek(GxEfbPeekState {
+            source_x: 320,
+            source_y: 240,
+            request_sequence: 7,
+            plane: GxEfbPeekPlane::Depth,
+            alpha_mode: GxEfbPeekAlphaMode::ReadNone,
+            pixel_control: 1,
+        });
+        assert_eq!(z24.source_rect, [320, 240, 1, 1]);
+        assert_eq!(z24.output_and_format, [1, 1, 0, 1]);
+        assert_eq!(z24.options, [1, 0, 2, 0]);
+
+        let z16 = EfbTextureCopyUniform::for_efb_peek(GxEfbPeekState {
+            source_x: 4,
+            source_y: 5,
+            request_sequence: 8,
+            plane: GxEfbPeekPlane::Depth,
+            alpha_mode: GxEfbPeekAlphaMode::Read00,
+            pixel_control: 2 | (3 << 3),
+        });
+        assert_eq!(z16.output_and_format[3], 2);
+        assert_eq!(z16.options, [1, 0, 0, 0]);
+
+        let color = EfbTextureCopyUniform::for_efb_peek(GxEfbPeekState {
+            source_x: 9,
+            source_y: 10,
+            request_sequence: 9,
+            plane: GxEfbPeekPlane::Color,
+            alpha_mode: GxEfbPeekAlphaMode::ReadFf,
+            pixel_control: 0,
+        });
+        assert_eq!(color.options, [0, 0, 1, 0]);
     }
 
     #[test]
@@ -8183,6 +8467,79 @@ mod tests {
         assert!(drain.contains("std::mem::take(&mut self.pending_efb_texture_copy_readbacks)"));
         assert!(drain.contains("QueueDrain::new(&queue).await"));
         assert!(drain.contains("finish_efb_texture_copy_readbacks(pending, &failure_state).await"));
+    }
+
+    #[test]
+    fn ordered_efb_peek_uses_a_four_byte_compute_readback_after_geometry() {
+        let source = include_str!("web.rs");
+        let peek = source
+            .split_once("fn peek_efb_inner(")
+            .unwrap()
+            .1
+            .split_once("pub fn copy_texture(")
+            .unwrap()
+            .0;
+        let flush = peek
+            .find("flush_geometry_with_pre_clears(pre_clears)")
+            .unwrap();
+        let compute = peek
+            .find("browser GX ordered one-pixel EFB peek pass")
+            .unwrap();
+        let readback = peek.find("encoder.copy_buffer_to_buffer(").unwrap();
+        let submit = peek.find("self.queue.submit([encoder.finish()])").unwrap();
+        let pending = peek.find("pending_efb_peek_readbacks").unwrap();
+        assert!(flush < compute && compute < readback && readback < submit && submit < pending);
+        assert!(peek.contains("size: size_of::<u32>() as u64"));
+        assert!(peek.contains("wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC"));
+        assert!(peek.contains("wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ"));
+        assert!(peek.contains("pass.dispatch_workgroups(1, 1, 1)"));
+    }
+
+    #[test]
+    fn efb_peek_receipts_have_an_independent_versioned_drain_contract() {
+        let source = include_str!("web.rs");
+        let finish = source
+            .split_once("async fn finish_efb_peek_readbacks(")
+            .unwrap()
+            .1
+            .split_once("fn interleave_presented_xfb_fields(")
+            .unwrap()
+            .0;
+        for field in [
+            "generation",
+            "requestSequence",
+            "x",
+            "y",
+            "plane",
+            "alphaMode",
+            "pixelControl",
+            "value",
+            "layout",
+        ] {
+            assert!(finish.contains(&format!("\"{field}\"")), "missing {field}");
+        }
+        assert!(finish.contains("gx-efb-peek-u32-v1"));
+        assert!(finish.contains("u32::from_le_bytes("));
+
+        let drain = source
+            .split_once("pub fn drain_efb_peeks(&mut self) -> Promise")
+            .unwrap()
+            .1
+            .split_once("pub fn has_presented_xfb")
+            .unwrap()
+            .0;
+        assert!(drain.contains("std::mem::take(&mut self.pending_efb_peek_readbacks)"));
+        assert!(drain.contains("QueueDrain::new(&queue).await"));
+        assert!(drain.contains("finish_efb_peek_readbacks(pending, &failure_state).await"));
+
+        let legacy_drain = source
+            .split_once("pub fn drain(&mut self) -> Promise")
+            .unwrap()
+            .1
+            .split_once("pub fn drain_efb_peeks")
+            .unwrap()
+            .0;
+        assert!(!legacy_drain.contains("pending_efb_peek_readbacks"));
     }
 
     #[test]
