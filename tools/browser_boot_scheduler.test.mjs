@@ -290,6 +290,7 @@ test("runtime deadlines distinguish future work from work due at the published c
     nextAudioSampleCycle: () => null,
     nextDecrementerCycle: null,
     nextDiskAudioCycle: null,
+    nextDspExecutionCycle: null,
     nextDspAudioDmaCycle: null,
     nextDspAudioDmaInterruptCycle: null,
     nextSerialPollCycle: null,
@@ -352,6 +353,7 @@ test("only basic semantic idles project audio deadlines to interrupt-producing w
     nextAudioSampleCycle: () => 105,
     nextDecrementerCycle: null,
     nextDiskAudioCycle: null,
+    nextDspExecutionCycle: null,
     nextDspAudioDmaCompletionCycle: () => 160,
     nextDspAudioDmaCycle: 110,
     nextDspAudioDmaInterruptCycle: 120,
@@ -403,6 +405,14 @@ test("only basic semantic idles project audio deadlines to interrupt-producing w
     120,
     "a basic self-branch may skip intermediate audio-only transitions",
   );
+
+  context.nextDspExecutionCycle = 108;
+  assert.equal(
+    context.nextRuntimeEventCycle(false, true),
+    108,
+    "audio coalescing must retain the interpreter's exact DSP deadline",
+  );
+  context.nextDspExecutionCycle = null;
 
   context.nextDspAudioDmaInterruptCycle = null;
   assert.equal(

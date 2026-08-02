@@ -87,7 +87,7 @@ function makeContext() {
     diskTransfer: null,
     serialTransfer: null,
     peFinishCycle: null,
-    dspScheduledMail: null,
+    nextDspExecutionCycle: Number.POSITIVE_INFINITY,
     nextDspAudioDmaInterruptCycle: null,
     nextDspAudioDmaCycle: null,
     aramTransfer: null,
@@ -367,8 +367,10 @@ test("DTK diagnostics explicitly identify hardware-state-only output", () => {
   assert.match(source, /output: "hardware-state-only"/);
   assert.match(
     source,
-    /audioCompatibility:\s*\{\s*dspFirstUnsupported: snapshotDspFirstUnsupported\(\),\s*dtkFirstUnsupported: snapshotDtkFirstUnsupported\(\),/,
+    /audioCompatibility:\s*\{\s*dspLle:\s*\{/,
   );
+  assert.match(source, /fault: dspLastFault,/);
+  assert.match(source, /dtkFirstUnsupported: snapshotDtkFirstUnsupported\(\),/);
 });
 
 test("audio-disabled DTK commands are configuration failures, not unsupported", () => {

@@ -9,6 +9,7 @@ import {
   SMB_SUSTAINED_PLAY_SCHEMA_V2,
   SMB_SUSTAINED_PLAY_SCHEMA_V3,
   SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
   SmbSustainedPlayValidationError,
   deriveSmbSustainedPlayOracle,
   verifySmbSustainedPlay,
@@ -53,7 +54,7 @@ function syncSurfacePopulations(surface) {
 function sustainedPrefixReport(
   receipts = 16,
   pending = 0,
-  schema = SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  schema = SMB_SUSTAINED_PLAY_SCHEMA_V5,
 ) {
   const report = smbSustainedPlayReport(schema);
   report.status = "running";
@@ -71,7 +72,7 @@ function sustainedPrefixReport(
   return report;
 }
 
-test("live v3 and v4 prefixes validate exact partial pairing and chronology", () => {
+test("live v3 and v5 prefixes validate exact partial pairing and chronology", () => {
   const empty = sustainedPrefixReport(0, 0);
   assert.deepEqual(verifySmbSustainedPlayPrefix(empty), {
     acceptedReceipts: 0,
@@ -132,7 +133,7 @@ test("live v3 and v4 prefixes validate exact partial pairing and chronology", ()
 
   const prematureHistory = sustainedPrefixReport();
   prematureHistory.rendering.sustainedPresentedSurfaces =
-    smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V4)
+    smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5)
       .rendering.sustainedPresentedSurfaces;
   assert.throws(
     () => verifySmbSustainedPlayPrefix(prematureHistory),
@@ -267,6 +268,50 @@ test("v4 binds zero exact-required rejection deltas to all 60 surfaces", () => {
     .every(ordinals => ordinals.length === 0));
   assert.ok(Object.values(exactRequired.preparationReasonOrdinals)
     .every(ordinals => ordinals.length === 0));
+});
+
+test("v5 makes active DSP LLE evidence mandatory for canonical SMB", () => {
+  const report = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5);
+  assert.equal(verifySmbSustainedPlay(report).complete, true);
+
+  const cases = [
+    [
+      value => { delete value.audioCompatibility; },
+      "$.audioCompatibility",
+    ],
+    [
+      value => { value.audioCompatibility.dspLle.backend = "hle"; },
+      "$.audioCompatibility.dspLle.backend",
+    ],
+    [
+      value => { value.audioCompatibility.dspLle.fault = { operation: 1 }; },
+      "$.audioCompatibility.dspLle.fault",
+    ],
+    [
+      value => { value.deviceEvents.dspAxVoiceFallback = 1; },
+      "$.deviceEvents.dspAxVoiceFallback",
+    ],
+    [
+      value => { value.deviceEvents.dspAxVoiceRender = 1; },
+      "$.deviceEvents.dspAxVoiceRender",
+    ],
+    [
+      value => { value.mmioState.dspTrace = []; },
+      "$.mmioState.dspTrace",
+    ],
+    [
+      value => {
+        value.audioCompatibility.dspLle.cpuMailboxReads =
+          value.audioCompatibility.dspLle.cpuMailboxWrites + 1;
+      },
+      "$.audioCompatibility.dspLle.cpuMailboxReads",
+    ],
+  ];
+  for (const [mutate, path] of cases) {
+    const invalid = smbSustainedPlayReport(SMB_SUSTAINED_PLAY_SCHEMA_V5);
+    mutate(invalid);
+    expectFailure(invalid, path);
+  }
 });
 
 test("v4 rejects forged exact-required sums, maps, and count types", () => {

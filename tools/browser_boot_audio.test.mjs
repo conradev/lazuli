@@ -274,7 +274,12 @@ test("DSP audio DMA control and blocks-left registers use explicit MMIO hooks", 
   context.pcOffset = 0;
   context.dispatches = 0;
   vm.runInContext(
-    [extractFunction("readInteger"), extractFunction("writeInteger")].join("\n\n"),
+    [
+      "readInteger",
+      "writeDspControl",
+      "writeDspControlRegister",
+      "writeInteger",
+    ].map(extractFunction).join("\n\n"),
     context,
     { filename: "browser_boot.audio-mmio.js" },
   );
@@ -295,10 +300,10 @@ test("DSP audio DMA is a runtime scheduler candidate and is included in reports"
     decrementerPending: false,
     diskTransfer: null,
     nextDiskAudioCycle: null,
-    dspScheduledMail: null,
     ensureViSchedule() {},
     nextAudioSampleCycle: () => null,
     nextDecrementerCycle: null,
+    nextDspExecutionCycle: null,
     nextDspAudioDmaCycle: 125,
     nextDspAudioDmaInterruptCycle: 110,
     nextSerialPollCycle: null,
@@ -329,16 +334,11 @@ test("AID status participates in DSP interrupt masking and W1C acknowledgement",
   const context = {
     cpu: 0x8000,
     deviceEvents: new Map(),
-    dspScheduledMail: null,
-    initializeDspAudioSystem() {},
     mmio: 0,
     msrOffset: 0,
-    pushDspMail() {},
-    resetDspAudioDma() {},
-    resetDspMailbox() {},
     serviceAramDma() {},
     serviceDspAudioDma() {},
-    traceDsp() {},
+    serviceDspInterpreter() {},
     view: new DataView(memory),
   };
   context.raiseException = registers => {
@@ -378,16 +378,11 @@ test("DSP level interrupt re-enters with overlapping sources until every source 
   const context = {
     cpu: 0x8000,
     deviceEvents: new Map(),
-    dspScheduledMail: null,
-    initializeDspAudioSystem() {},
     mmio: 0,
     msrOffset: 0,
-    pushDspMail() {},
-    resetDspAudioDma() {},
-    resetDspMailbox() {},
     serviceAramDma() {},
     serviceDspAudioDma() {},
-    traceDsp() {},
+    serviceDspInterpreter() {},
     view: new DataView(memory),
   };
   context.raiseException = registers => {
@@ -445,33 +440,28 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
     cpFifoState: { control: 0, distance: 0 },
     cycles: 1_000,
     deviceEvents: new Map(),
-    dspScheduledMail: null,
     ensureViSchedule() {},
-    initializeDspAudioSystem() {},
     invalidateDataReservationForExternalWrite() {},
     mmio,
     msrOffset: 0,
-    pushDspMail() {},
     ram: 0,
     ramSize: mmio,
     ramPointer(address, size) {
       return address + size <= mmio ? address : null;
     },
-    resetDspAudioDma() {},
-    resetDspMailbox() {},
     serviceAudioInterface() {},
     serviceCommandProcessorFifo() {},
     serviceCommandProcessorInterrupt() {},
     serviceDecrementer() {},
     serviceDisk() {},
     serviceDspAudioDma() {},
+    serviceDspInterpreter() {},
     serviceExternalInterface() {},
     servicePixelEngine() {},
     serviceSerial() {},
     serviceViDueEvents() {},
     serviceVideoInterrupt() {},
     serviceVideoPresentation() {},
-    traceDsp() {},
     translateDataRange(address) {
       return address >= 0xc0000000
         ? (address - 0xc0000000) >>> 0
@@ -496,6 +486,7 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
       "serviceDsp",
       "serviceMmio",
       "writeDspControl",
+      "writeDspControlRegister",
       "writeInteger",
     ].map(extractFunction).join("\n\n"),
     context,
@@ -593,40 +584,4 @@ test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned
   assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0020);
   assert.equal(context.deviceEvents.get("aramDmaComplete"), 2);
   assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
-});
-
-test("CPU mailbox commits raw payload only after the low-half write", () => {
-  const delivered = [];
-  const memory = new ArrayBuffer(0x6000);
-  const context = {
-    dspCpuMailbox: 0,
-    handleDspCpuMail(mail) {
-      delivered.push(mail >>> 0);
-    },
-    mmio: 0,
-    view: new DataView(memory),
-  };
-  vm.createContext(context);
-  vm.runInContext(
-    [
-      extractFunction("writeDspMailboxHigh"),
-      extractFunction("writeDspMailboxLow"),
-    ].join("\n\n"),
-    context,
-    { filename: "browser_boot.audio-cpu-mailbox.js" },
-  );
-
-  context.writeDspMailboxHigh(0);
-  assert.equal(context.view.getUint16(0x5000, false), 0);
-  assert.deepEqual(delivered, []);
-  context.writeDspMailboxLow(5);
-  assert.deepEqual(delivered, [5]);
-  assert.equal(context.view.getUint16(0x5000, false), 0);
-
-  context.writeDspMailboxHigh(0x80f3);
-  assert.equal(context.view.getUint16(0x5000, false), 0x00f3);
-  assert.deepEqual(delivered, [5]);
-  context.writeDspMailboxLow(0xa001);
-  assert.deepEqual(delivered, [5, 0x80f3a001]);
-  assert.equal(context.view.getUint16(0x5000, false), 0x00f3);
 });

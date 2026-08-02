@@ -5546,7 +5546,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     function snapshotSmbSustainedPlay(scenario = controllerScenario) {
       if (scenario?.id !== "smb-sustained-play") return null;
       return {
-        schema: "lazuli-smb-sustained-play-v4",
+        schema: "lazuli-smb-sustained-play-v5",
         capacity: smbSustainedViReceiptCapacity,
         posted: smbSustainedViReceiptsPosted,
         pending: smbSustainedViPending.size,
@@ -6827,7 +6827,6 @@ const TEMPLATE: &str = r##"<!doctype html>
     let exiPiAssertions = 0;
     let exiPiDeassertions = 0;
     let exiExternalInterruptDeliveries = 0;
-    const dspTrace = [];
     const accelerations = new Map();
     let lastIdleAudioCoalescedJump = null;
     const exceptionCounts = new Map();
@@ -7103,6 +7102,10 @@ const TEMPLATE: &str = r##"<!doctype html>
     const viCpuCyclesPerSecond = 486_000_000;
     const viSiPollHalfLines = 15;
     const timeBaseRatio = 12;
+    const dspCpuCyclesPerInstruction = 12;
+    const dspMinimumExecutionInstructions = 64;
+    const dspExecutionQuantumCpuCycles =
+      dspCpuCyclesPerInstruction * dspMinimumExecutionInstructions;
     let viTiming = null;
     let viTimingSignature = null;
     let viComparatorSignature = null;
@@ -7178,18 +7181,23 @@ const TEMPLATE: &str = r##"<!doctype html>
     let aiSampleCounter = 0;
     let aiLastCycle = 0;
     let aiInterruptDelivered = false;
-    const dspMailQueue = [];
-    let dspCurrentMail = null;
-    let dspCpuMailbox = 0;
-    let dspRomParameter = null;
-    let dspUcodeUpload = emptyDspUcodeUpload();
-    let dspUcodeHash = null;
-    let dspMode = "rom";
-    let dspUcodeBooted = false;
-    let dspFirstUnsupported = null;
-    let dspAxCommandState = emptyDspAxCommandState();
-    let dspZeldaCommandState = emptyDspZeldaCommandState();
-    let dspScheduledMail = null;
+    let dspLastServiceCycle = 0;
+    let dspPendingCpuCycles = 0;
+    let nextDspExecutionCycle = dspExecutionQuantumCpuCycles;
+    let dspExecutionSlices = 0;
+    let dspBudgetedInstructions = 0;
+    let dspExecutedInstructions = 0;
+    let dspLastExecutionCycle = null;
+    let dspLastStopReason = { code: 0, name: "instruction-budget" };
+    const dspStopReasonCounts = new Map();
+    let dspCpuMailboxCommits = 0;
+    let dspCpuMailboxHighWrites = 0;
+    let dspCpuMailboxConsumedByDsp = 0;
+    let dspMailboxReads = 0;
+    let dspMailboxConsumes = 0;
+    let dspMailboxProduced = 0;
+    let dspInterruptAssertions = 0;
+    let dspLastFault = null;
     const dspAudioDmaEnableInterruptLatencyCycles = 200;
     let dspAudioDmaRemainingBlocks = 0;
     let nextDspAudioDmaCycle = null;
@@ -14431,1192 +14439,6 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
-    function traceDsp(event, details = {}) {
-      if (dspTrace.length >= 48) return;
-      dspTrace.push({
-        event,
-        pc: "0x" + (pc >>> 0).toString(16).padStart(8, "0"),
-        cycles,
-        ...details,
-      });
-    }
-
-    function latchDspFirstUnsupported(stage, reason, code = null) {
-      if (dspFirstUnsupported !== null) return;
-      // Slow hooks publish the issuing instruction's cycle, while the cached
-      // PC is committed only at a dispatch boundary. Keep that distinction
-      // explicit instead of claiming instruction-precise PC provenance.
-      dspFirstUnsupported = {
-        instructionCycle: cycles,
-        dispatchPc: pc >>> 0,
-        stage,
-        mode: dspMode,
-        reason,
-        ucodeHash:
-          dspUcodeHash === null ? null : dspUcodeHash >>> 0,
-        code: code === null ? null : code >>> 0,
-      };
-    }
-
-    function snapshotDspFirstUnsupported() {
-      if (dspFirstUnsupported === null) return null;
-      return {
-        instructionCycle: dspFirstUnsupported.instructionCycle,
-        dispatchPc: hex32(dspFirstUnsupported.dispatchPc),
-        stage: dspFirstUnsupported.stage,
-        mode: dspFirstUnsupported.mode,
-        reason: dspFirstUnsupported.reason,
-        ucodeHash:
-          dspFirstUnsupported.ucodeHash === null
-            ? null
-            : hex32(dspFirstUnsupported.ucodeHash),
-        code: dspFirstUnsupported.code,
-      };
-    }
-
-    function loadNextDspMail() {
-      if (dspCurrentMail !== null || dspMailQueue.length === 0) return;
-      const entry = dspMailQueue.shift();
-      dspCurrentMail = entry.mail >>> 0;
-      view.setUint16(mmio + 0x5004, (dspCurrentMail >>> 16) | 0x8000, false);
-      view.setUint16(mmio + 0x5006, dspCurrentMail & 0xffff, false);
-      if (entry.interrupt) {
-        view.setUint16(mmio + 0x500a, view.getUint16(mmio + 0x500a, false) | 0x80, false);
-      }
-    }
-
-    function pushDspMail(mail, interrupt = false, source = "dsp") {
-      dspMailQueue.push({ mail: (mail | 0x80000000) >>> 0, interrupt });
-      loadNextDspMail();
-      traceDsp("mail-produced", { mail: hex32(mail), interrupt, source });
-      deviceEvents.set("dspMailProduced", (deviceEvents.get("dspMailProduced") ?? 0) + 1);
-    }
-
-    function consumeDspMail() {
-      if (dspCurrentMail === null) return;
-      const consumedMail = dspCurrentMail;
-      traceDsp("mail-consumed", { mail: hex32(consumedMail) });
-      dspCurrentMail = null;
-      view.setUint16(mmio + 0x5004, 0, false);
-      view.setUint16(mmio + 0x5006, 0, false);
-      deviceEvents.set("dspMailConsumed", (deviceEvents.get("dspMailConsumed") ?? 0) + 1);
-      if (
-        dspMode === "ax"
-        && dspAxCommandState.phase === "yield-pending"
-        && consumedMail === 0xdcd10002
-      ) {
-        dspAxCommandState.phase = "task-wait";
-        traceDsp("ax-yield-consumed", { mail: hex32(consumedMail) });
-        deviceEvents.set(
-          "dspAxYieldConsumed",
-          (deviceEvents.get("dspAxYieldConsumed") ?? 0) + 1
-        );
-      }
-      loadNextDspMail();
-    }
-
-    function emptyDspUcodeUpload() {
-      return {
-        ramAddress: null,
-        length: null,
-        imemAddress: null,
-        dmemLength: null,
-        startPc: null,
-        malformed: false,
-        malformedReason: null,
-      };
-    }
-
-    function emptyDspAxCommandState() {
-      return {
-        phase: "waiting-size",
-        sizeWords: 0,
-        address: null,
-        listCount: 0,
-        wordCount: 0,
-        commandCount: 0,
-        commandSample: [],
-        writeCount: 0,
-        clearedBytes: 0,
-        rejected: false,
-        reason: null,
-        lastTaskMail: null,
-      };
-    }
-
-    function emptyDspZeldaCommandState() {
-      return {
-        phase: "waiting",
-        expectedWords: 0,
-        commandWordCount: 0,
-        words: [],
-        rejected: false,
-        reason: null,
-        lastCommand: null,
-        lastSync: null,
-        setup: null,
-        render: emptyDspZeldaRenderState(),
-      };
-    }
-
-    function emptyDspZeldaRenderState() {
-      return {
-        active: false,
-        awaitingTaskMail: false,
-        requestedFrames: 0,
-        currentFrame: 0,
-        currentVoice: 0,
-        outputVolume: 0,
-        outputLeftAddress: null,
-        outputRightAddress: null,
-        clearedBytes: 0,
-        renderBatch: 0,
-        voiceSyncMaps: [],
-        voiceParameterBlocksInspected: 0,
-        voiceParameterBlockReadBytes: 0,
-        voiceRenderableParameterBlocks: 0,
-        voiceSkippedParameterBlocks: 0,
-        voiceSourceTypesSeen: [],
-        voiceChannelIdsSeen: [],
-        voiceSnapshots: new Array(64).fill(null),
-      };
-    }
-
-    function dspUcodeHashEctor(source) {
-      let hash = 0;
-      for (const value of source) {
-        hash = (hash ^ value) >>> 0;
-        hash = ((hash << 3) | (hash >>> 29)) >>> 0;
-      }
-      return hash >>> 0;
-    }
-
-    function classifyDspUcode(hash) {
-      switch (hash >>> 0) {
-        case 0x3ad3b7ac:
-        case 0x3daf59b9:
-        case 0x4e8a8b21:
-        case 0x07f88145:
-        case 0xe2136399:
-        case 0x3389a79e:
-          return "ax";
-        case 0x86840740: // Zelda WW - US
-        case 0x2fcdf1ec:
-        case 0x42f64ac4:
-          return "zelda";
-        default:
-          return null;
-      }
-    }
-
-    function captureDspRomParameter(parameter, value) {
-      const pair = parameter >>> 0;
-      const payload = value >>> 0;
-      traceDsp("ucode-parameter", {
-        parameter: hex32(pair),
-        value: hex32(payload),
-      });
-
-      let field;
-      let captured;
-      switch (pair) {
-        case 0x80f3a001:
-          field = "ramAddress";
-          captured = payload;
-          break;
-        case 0x80f3a002:
-          field = "length";
-          captured = payload & 0xffff;
-          break;
-        case 0x80f3b002:
-          field = "dmemLength";
-          captured = payload & 0xffff;
-          break;
-        case 0x80f3c002:
-          field = "imemAddress";
-          captured = payload & 0xffff;
-          break;
-        case 0x80f3d001:
-          field = "startPc";
-          captured = payload & 0xffff;
-          break;
-        default:
-          dspUcodeUpload.malformed = true;
-          dspUcodeUpload.malformedReason = "unknown-parameter";
-          return false;
-      }
-
-      if (dspUcodeUpload[field] !== null) {
-        dspUcodeUpload.malformed = true;
-        dspUcodeUpload.malformedReason = "duplicate-" + field;
-        return false;
-      }
-      dspUcodeUpload[field] = captured;
-      return true;
-    }
-
-    function rejectDspUcodeBoot(reason, details = {}) {
-      latchDspFirstUnsupported("ucode", reason);
-      dspMode = "rom";
-      dspUcodeBooted = false;
-      dspAxCommandState = emptyDspAxCommandState();
-      dspZeldaCommandState = emptyDspZeldaCommandState();
-      dspScheduledMail = null;
-      traceDsp("ucode-boot-rejected", { reason, ...details });
-      deviceEvents.set(
-        "dspUcodeBootRejected",
-        (deviceEvents.get("dspUcodeBootRejected") ?? 0) + 1
-      );
-      dspUcodeUpload = emptyDspUcodeUpload();
-    }
-
-    function bootDspUcode() {
-      const upload = dspUcodeUpload;
-      dspUcodeHash = null;
-      if (upload.malformed) {
-        rejectDspUcodeBoot(upload.malformedReason ?? "malformed-upload");
-        return false;
-      }
-      const missing = [
-        "ramAddress",
-        "length",
-        "imemAddress",
-        "dmemLength",
-        "startPc",
-      ].filter(field => upload[field] === null);
-      if (missing.length !== 0) {
-        rejectDspUcodeBoot("missing-parameters", { missing });
-        return false;
-      }
-      if (upload.length === 0) {
-        rejectDspUcodeBoot("empty-iram");
-        return false;
-      }
-
-      const source = ramPointer(upload.ramAddress, upload.length);
-      if (source === null) {
-        rejectDspUcodeBoot("iram-out-of-bounds", {
-          ramAddress: hex32(upload.ramAddress),
-          length: upload.length,
-        });
-        return false;
-      }
-      const hash = dspUcodeHashEctor(
-        bytes.subarray(source, source + upload.length)
-      );
-      dspUcodeHash = hash;
-      const mode = classifyDspUcode(hash);
-      if (mode === null) {
-        rejectDspUcodeBoot("unknown-hash", { hash: hex32(hash) });
-        return false;
-      }
-
-      dspMode = mode;
-      dspUcodeBooted = true;
-      dspAxCommandState = emptyDspAxCommandState();
-      dspZeldaCommandState = emptyDspZeldaCommandState();
-      traceDsp("ucode-boot", {
-        hash: hex32(hash),
-        mode,
-        ramAddress: hex32(upload.ramAddress),
-        length: upload.length,
-        imemAddress: upload.imemAddress,
-        dmemLength: upload.dmemLength,
-        startPc: upload.startPc,
-      });
-      pushDspMail(0xdcd10000, true, mode + "-ucode");
-      if (mode === "zelda") {
-        pushDspMail(0xf3551111, false, "zelda-ucode-handshake");
-      }
-      deviceEvents.set("dspUcodeBoot", (deviceEvents.get("dspUcodeBoot") ?? 0) + 1);
-      dspUcodeUpload = emptyDspUcodeUpload();
-      return true;
-    }
-
-    function rejectDspAxCommand(reason, details = {}) {
-      latchDspFirstUnsupported("protocol", reason);
-      dspAxCommandState.phase = "halted";
-      dspAxCommandState.rejected = true;
-      dspAxCommandState.reason = reason;
-      dspScheduledMail = null;
-      traceDsp("ax-command-rejected", { reason, ...details });
-      deviceEvents.set(
-        "dspAxCommandRejected",
-        (deviceEvents.get("dspAxCommandRejected") ?? 0) + 1
-      );
-      return false;
-    }
-
-    function dspAxCommandArity(command) {
-      switch (command) {
-        case 0x00: return 2;
-        case 0x01: return 5;
-        case 0x02: return 2;
-        case 0x03: return 0;
-        case 0x04:
-        case 0x05: return 4;
-        case 0x06:
-        case 0x07: return 2;
-        case 0x08: return 10;
-        case 0x09: return 2;
-        case 0x0a:
-        case 0x0b:
-        case 0x0c: return 0;
-        case 0x0d: return 3;
-        case 0x0e: return 4;
-        case 0x0f: return 0;
-        case 0x10: return 4;
-        case 0x11: return 2;
-        case 0x12: return 4;
-        case 0x13: return 12;
-        default: return null;
-      }
-    }
-
-    function dspAxAddress(high, low) {
-      return (((high & 0xffff) << 16) | (low & 0xffff)) >>> 0;
-    }
-
-    function dspAxParseFailure(reason, details = {}) {
-      return { ok: false, reason, details };
-    }
-
-    function dspAxSilentWriteRange(address, size, command) {
-      const logical = address >>> 0;
-      const pointer = ramPointer(logical, size);
-      if (pointer === null) {
-        return dspAxParseFailure("write-out-of-bounds", {
-          command,
-          address: hex32(logical),
-          size,
-        });
-      }
-      return {
-        ok: true,
-        write: {
-          command,
-          address: logical,
-          physical: (pointer - ram) >>> 0,
-          pointer,
-          size,
-        },
-      };
-    }
-
-    function collectDspAxSilentWrites(command, arguments_, writes) {
-      const ranges = [];
-      switch (command) {
-        case 0x04:
-        case 0x05: {
-          const address = dspAxAddress(arguments_[0], arguments_[1]);
-          if (address !== 0) ranges.push([address, 3 * 5 * 32 * 4]);
-          break;
-        }
-        case 0x06:
-          ranges.push([
-            dspAxAddress(arguments_[0], arguments_[1]),
-            3 * 5 * 32 * 4,
-          ]);
-          break;
-        case 0x0e:
-          ranges.push([
-            dspAxAddress(arguments_[0], arguments_[1]),
-            5 * 32 * 4,
-          ]);
-          ranges.push([
-            dspAxAddress(arguments_[2], arguments_[3]),
-            5 * 32 * 2 * 2,
-          ]);
-          break;
-        case 0x10:
-          ranges.push([
-            dspAxAddress(arguments_[0], arguments_[1]),
-            2 * 5 * 32 * 4,
-          ]);
-          break;
-        case 0x13:
-          ranges.push([
-            dspAxAddress(arguments_[0], arguments_[1]),
-            3 * 5 * 32 * 4,
-          ]);
-          ranges.push([
-            dspAxAddress(arguments_[2], arguments_[3]),
-            5 * 32 * 4,
-          ]);
-          break;
-        default:
-          break;
-      }
-
-      for (const [address, size] of ranges) {
-        const result = dspAxSilentWriteRange(address, size, command);
-        if (!result.ok) return result;
-        writes.push(result.write);
-      }
-      return { ok: true };
-    }
-
-    function parseDspAxCommandLists(initialAddress, initialSizeWords) {
-      const maximumListWords = 511;
-      const maximumLists = 32;
-      const maximumTotalWords = 8192;
-      const seenPhysicalAddresses = new Set();
-      const writes = [];
-      const commandSample = [];
-      let address = initialAddress >>> 0;
-      let sizeWords = initialSizeWords;
-      let listCount = 0;
-      let wordCount = 0;
-      let commandCount = 0;
-
-      while (true) {
-        if (
-          !Number.isSafeInteger(sizeWords)
-          || sizeWords <= 0
-          || sizeWords > maximumListWords
-        ) {
-          return dspAxParseFailure("invalid-list-size", {
-            address: hex32(address),
-            sizeWords,
-          });
-        }
-        if (listCount >= maximumLists) {
-          return dspAxParseFailure("list-limit", {
-            address: hex32(address),
-            maximumLists,
-          });
-        }
-        if (wordCount + sizeWords > maximumTotalWords) {
-          return dspAxParseFailure("word-limit", {
-            address: hex32(address),
-            wordCount: wordCount + sizeWords,
-            maximumTotalWords,
-          });
-        }
-
-        const byteLength = sizeWords * 2;
-        const pointer = ramPointer(address, byteLength);
-        if (pointer === null) {
-          return dspAxParseFailure("list-out-of-bounds", {
-            address: hex32(address),
-            sizeWords,
-          });
-        }
-        const physical = (pointer - ram) >>> 0;
-        if (seenPhysicalAddresses.has(physical)) {
-          return dspAxParseFailure("list-cycle", {
-            address: hex32(address),
-            physical: hex32(physical),
-          });
-        }
-        seenPhysicalAddresses.add(physical);
-        listCount += 1;
-        wordCount += sizeWords;
-
-        let index = 0;
-        let chained = false;
-        while (index < sizeWords) {
-          const command = view.getUint16(pointer + index * 2, false);
-          index += 1;
-          const arity = dspAxCommandArity(command);
-          if (arity === null) {
-            latchDspFirstUnsupported("command", "unknown-command", command);
-            return dspAxParseFailure("unknown-command", {
-              command,
-              list: listCount - 1,
-              word: index - 1,
-            });
-          }
-          if (command === 0x12 && dspUcodeHash === 0x4e8a8b21) {
-            latchDspFirstUnsupported(
-              "command",
-              "unsupported-command-for-ucode",
-              command
-            );
-            return dspAxParseFailure("unsupported-command-for-ucode", {
-              command,
-              hash: hex32(dspUcodeHash),
-            });
-          }
-          if (index + arity > sizeWords) {
-            return dspAxParseFailure("truncated-command", {
-              command,
-              list: listCount - 1,
-              word: index - 1,
-              arity,
-              remaining: sizeWords - index,
-            });
-          }
-
-          const arguments_ = [];
-          for (let argument = 0; argument < arity; argument += 1) {
-            arguments_.push(
-              view.getUint16(pointer + (index + argument) * 2, false)
-            );
-          }
-          index += arity;
-          commandCount += 1;
-          if (commandSample.length < 32) commandSample.push(command);
-
-          const writeResult = collectDspAxSilentWrites(
-            command,
-            arguments_,
-            writes
-          );
-          if (!writeResult.ok) return writeResult;
-
-          if (command === 0x0f) {
-            return {
-              ok: true,
-              address: initialAddress >>> 0,
-              sizeWords: initialSizeWords,
-              listCount,
-              wordCount,
-              commandCount,
-              commandSample,
-              writes,
-            };
-          }
-          if (command === 0x0d) {
-            address = dspAxAddress(arguments_[0], arguments_[1]);
-            sizeWords = arguments_[2];
-            chained = true;
-            break;
-          }
-        }
-        if (!chained) {
-          return dspAxParseFailure("missing-end", {
-            address: hex32(address),
-            sizeWords,
-          });
-        }
-      }
-    }
-
-    function applyDspAxSilentWrites(writes) {
-      let clearedBytes = 0;
-      for (const write of writes) {
-        invalidateDataReservationForExternalWrite(
-          write.physical,
-          write.size
-        );
-        bytes.fill(0, write.pointer, write.pointer + write.size);
-        clearedBytes += write.size;
-        traceDsp("ax-silent-write", {
-          command: write.command,
-          address: hex32(write.address),
-          size: write.size,
-        });
-      }
-      return clearedBytes;
-    }
-
-    function beginDspAxCommandList(sizeWords) {
-      if (
-        !Number.isSafeInteger(sizeWords)
-        || sizeWords <= 0
-        || sizeWords >= 512
-      ) {
-        return rejectDspAxCommand("invalid-list-size", { sizeWords });
-      }
-      dspAxCommandState = {
-        ...emptyDspAxCommandState(),
-        phase: "waiting-address",
-        sizeWords,
-      };
-      traceDsp("ax-command-list-size", { sizeWords });
-      return true;
-    }
-
-    function executeDspAxCommandList(address) {
-      const result = parseDspAxCommandLists(
-        address,
-        dspAxCommandState.sizeWords
-      );
-      if (!result.ok) {
-        return rejectDspAxCommand(result.reason, result.details);
-      }
-
-      const clearedBytes = applyDspAxSilentWrites(result.writes);
-      dspAxCommandState.phase = "yield-pending";
-      dspAxCommandState.address = result.address;
-      dspAxCommandState.listCount = result.listCount;
-      dspAxCommandState.wordCount = result.wordCount;
-      dspAxCommandState.commandCount = result.commandCount;
-      dspAxCommandState.commandSample = result.commandSample;
-      dspAxCommandState.writeCount = result.writes.length;
-      dspAxCommandState.clearedBytes = clearedBytes;
-      dspAxCommandState.rejected = false;
-      dspAxCommandState.reason = null;
-      dspScheduledMail = {
-        mail: 0xdcd10002,
-        completionCycle: cycles + 2500,
-      };
-      traceDsp("ax-command-list", {
-        address: hex32(result.address),
-        sizeWords: result.sizeWords,
-        lists: result.listCount,
-        words: result.wordCount,
-        commands: result.commandCount,
-        writes: result.writes.length,
-        clearedBytes,
-      });
-      deviceEvents.set(
-        "dspAxCommandList",
-        (deviceEvents.get("dspAxCommandList") ?? 0) + 1
-      );
-      deviceEvents.set(
-        "dspAxCommand",
-        (deviceEvents.get("dspAxCommand") ?? 0) + result.commandCount
-      );
-      deviceEvents.set(
-        "dspAxSilentWrite",
-        (deviceEvents.get("dspAxSilentWrite") ?? 0) + result.writes.length
-      );
-      deviceEvents.set(
-        "dspAxSilentBytes",
-        (deviceEvents.get("dspAxSilentBytes") ?? 0) + clearedBytes
-      );
-      return true;
-    }
-
-    function handleDspAxMail(mail) {
-      const payload = mail >>> 0;
-      switch (dspAxCommandState.phase) {
-        case "waiting-size":
-          if (((payload & 0xffff0000) >>> 0) !== 0xbabe0000) {
-            return rejectDspAxCommand("expected-list-size", {
-              mail: hex32(payload),
-            });
-          }
-          return beginDspAxCommandList(payload & 0xffff);
-
-        case "waiting-address":
-          return executeDspAxCommandList(payload);
-
-        case "yield-pending":
-          return rejectDspAxCommand("task-before-yield-consumed", {
-            mail: hex32(payload),
-            scheduled: dspScheduledMail !== null,
-            currentMail: hex32(dspCurrentMail),
-          });
-
-        case "task-wait": {
-          dspAxCommandState.lastTaskMail = payload;
-          const action = payload & 0xffff;
-          const canonicalMail = (0xcdd10000 | action) >>> 0;
-          if (action === 0x0000) {
-            dspAxCommandState.phase = "waiting-size";
-            pushDspMail(0xdcd10001, true, "ax-task-resume");
-            traceDsp("ax-task-resume", {
-              mail: hex32(payload),
-              canonicalMail: hex32(canonicalMail),
-            });
-            deviceEvents.set(
-              "dspAxTaskResume",
-              (deviceEvents.get("dspAxTaskResume") ?? 0) + 1
-            );
-            return true;
-          }
-          if (action === 0x0001) {
-            latchDspFirstUnsupported(
-              "task",
-              "unsupported-task-switch",
-              action
-            );
-            return rejectDspAxCommand("unsupported-task-switch", {
-              mail: hex32(payload),
-              canonicalMail: hex32(canonicalMail),
-            });
-          }
-          if (action === 0x0002) {
-            traceDsp("ax-task-reset", {
-              mail: hex32(payload),
-              canonicalMail: hex32(canonicalMail),
-            });
-            resetDspMailbox();
-            return true;
-          }
-          if (action === 0x0003) {
-            dspAxCommandState.phase = "waiting-size";
-            traceDsp("ax-task-continue", {
-              mail: hex32(payload),
-              canonicalMail: hex32(canonicalMail),
-            });
-            deviceEvents.set(
-              "dspAxTaskContinue",
-              (deviceEvents.get("dspAxTaskContinue") ?? 0) + 1
-            );
-            return true;
-          }
-          latchDspFirstUnsupported(
-            "task",
-            "unsupported-task-mail",
-            action
-          );
-          return rejectDspAxCommand("unsupported-task-mail", {
-            mail: hex32(payload),
-            canonicalMail: hex32(canonicalMail),
-          });
-        }
-
-        case "halted":
-          return false;
-
-        default:
-          return rejectDspAxCommand("invalid-state", {
-            phase: dspAxCommandState.phase,
-          });
-      }
-    }
-
-    function rejectDspZeldaCommand(reason, details = {}) {
-      latchDspFirstUnsupported("protocol", reason);
-      dspZeldaCommandState.phase = "halted";
-      dspZeldaCommandState.expectedWords = 0;
-      dspZeldaCommandState.commandWordCount = 0;
-      dspZeldaCommandState.words.length = 0;
-      dspZeldaCommandState.rejected = true;
-      dspZeldaCommandState.reason = reason;
-      dspZeldaCommandState.render.active = false;
-      traceDsp("zelda-command-rejected", { reason, ...details });
-      deviceEvents.set(
-        "dspZeldaCommandRejected",
-        (deviceEvents.get("dspZeldaCommandRejected") ?? 0) + 1
-      );
-      return false;
-    }
-
-    function validateDspZeldaOutputRange(address, size) {
-      return Number.isSafeInteger(size)
-        && size > 0
-        && ramPointer(address, size) !== null;
-    }
-
-    function clearDspZeldaSilentFrame() {
-      const render = dspZeldaCommandState.render;
-      const frameBytes = 0x50 * 2;
-      const frameOffset = render.currentFrame * frameBytes;
-      const leftAddress = (render.outputLeftAddress + frameOffset) >>> 0;
-      const rightAddress = (render.outputRightAddress + frameOffset) >>> 0;
-      const left = ramPointer(leftAddress, frameBytes);
-      const right = ramPointer(rightAddress, frameBytes);
-      if (left === null || right === null) {
-        return rejectDspZeldaCommand("output-frame-out-of-bounds", {
-          frame: render.currentFrame,
-          leftAddress: hex32(leftAddress),
-          rightAddress: hex32(rightAddress),
-        });
-      }
-
-      invalidateDataReservationForExternalWrite((left - ram) >>> 0, frameBytes);
-      invalidateDataReservationForExternalWrite((right - ram) >>> 0, frameBytes);
-      bytes.fill(0, left, left + frameBytes);
-      bytes.fill(0, right, right + frameBytes);
-      render.clearedBytes += frameBytes * 2;
-      traceDsp("zelda-silent-frame", {
-        frame: render.currentFrame,
-        leftAddress: hex32(leftAddress),
-        rightAddress: hex32(rightAddress),
-        bytes: frameBytes * 2,
-      });
-      deviceEvents.set(
-        "dspZeldaSilentFrame",
-        (deviceEvents.get("dspZeldaSilentFrame") ?? 0) + 1
-      );
-      return true;
-    }
-
-    function finishDspZeldaRenderFrame() {
-      const render = dspZeldaCommandState.render;
-      if (!clearDspZeldaSilentFrame()) return false;
-
-      const completedFrame = render.currentFrame;
-      pushDspMail(0xdcd10004, true, "zelda-render-sync");
-      pushDspMail(
-        (0xf355ff00 | completedFrame) >>> 0,
-        false,
-        "zelda-render-frame-ack"
-      );
-      render.currentFrame += 1;
-      render.currentVoice = 0;
-      dspZeldaCommandState.lastSync = (0xff00 | completedFrame) & 0xffff;
-      deviceEvents.set(
-        "dspZeldaRenderFrame",
-        (deviceEvents.get("dspZeldaRenderFrame") ?? 0) + 1
-      );
-
-      if (render.currentFrame === render.requestedFrames) {
-        render.active = false;
-        render.awaitingTaskMail = true;
-        dspZeldaCommandState.phase = "task-wait";
-        pushDspMail(0xdcd10005, true, "zelda-render-frame-end");
-        traceDsp("zelda-render-complete", {
-          frames: render.requestedFrames,
-          clearedBytes: render.clearedBytes,
-        });
-        deviceEvents.set(
-          "dspZeldaRenderComplete",
-          (deviceEvents.get("dspZeldaRenderComplete") ?? 0) + 1
-        );
-      } else {
-        dspZeldaCommandState.phase = "waiting";
-      }
-      return true;
-    }
-
-    function handleDspZeldaMail(mail) {
-      const payload = mail >>> 0;
-      if (dspZeldaCommandState.phase === "halted") return false;
-
-      if (
-        (
-          dspZeldaCommandState.phase === "waiting"
-          || dspZeldaCommandState.phase === "task-wait"
-        )
-        && ((payload & 0xffff0000) >>> 0) === 0xcdd10000
-      ) {
-        if (payload === 0xcdd10000) {
-          dspZeldaCommandState.phase = "halted";
-          dspZeldaCommandState.render.active = false;
-          dspZeldaCommandState.render.awaitingTaskMail = false;
-          traceDsp("zelda-task-halt", { mail: hex32(payload) });
-          deviceEvents.set(
-            "dspZeldaTaskHalt",
-            (deviceEvents.get("dspZeldaTaskHalt") ?? 0) + 1
-          );
-          return true;
-        }
-        if (payload === 0xcdd10001) {
-          latchDspFirstUnsupported(
-            "task",
-            "unsupported-task-switch",
-            payload & 0xffff
-          );
-          return rejectDspZeldaCommand("unsupported-task-switch", {
-            mail: hex32(payload),
-          });
-        }
-        if (payload === 0xcdd10002) {
-          resetDspMailbox();
-          return true;
-        }
-        if (payload !== 0xcdd10003) {
-          latchDspFirstUnsupported(
-            "task",
-            "unsupported-task-mail",
-            payload & 0xffff
-          );
-          return rejectDspZeldaCommand("unsupported-task-mail", {
-            mail: hex32(payload),
-          });
-        }
-        dspZeldaCommandState.render.awaitingTaskMail = false;
-        dspZeldaCommandState.phase = "waiting";
-        dspZeldaCommandState.rejected = false;
-        dspZeldaCommandState.reason = null;
-        traceDsp("zelda-task-continue", { mail: hex32(payload) });
-        deviceEvents.set(
-          "dspZeldaTaskContinue",
-          (deviceEvents.get("dspZeldaTaskContinue") ?? 0) + 1
-        );
-        return true;
-      }
-      if (dspZeldaCommandState.phase === "task-wait") {
-        return rejectDspZeldaCommand("expected-task-mail", {
-          mail: hex32(payload),
-        });
-      }
-
-      if (dspZeldaCommandState.phase === "rendering") {
-        const render = dspZeldaCommandState.render;
-        const group = payload >>> 16;
-        const expectedGroup = render.currentVoice >>> 4;
-        if (
-          !render.active
-          || group !== expectedGroup
-          || group > 3
-        ) {
-          latchDspFirstUnsupported(
-            "protocol",
-            "unsupported-render-sync",
-            group
-          );
-          return rejectDspZeldaCommand("unsupported-render-sync", {
-            sync: hex32(payload),
-            group,
-            expectedGroup,
-          });
-        }
-        if (!inspectDspZeldaVoiceGroup(group, payload & 0xffff)) {
-          return false;
-        }
-        render.currentVoice += 16;
-        traceDsp("zelda-render-sync", {
-          frame: render.currentFrame,
-          group,
-          activeVoiceMap:
-            "0x" + (payload & 0xffff).toString(16).padStart(4, "0"),
-        });
-        deviceEvents.set(
-          "dspZeldaRenderSync",
-          (deviceEvents.get("dspZeldaRenderSync") ?? 0) + 1
-        );
-        if (render.currentVoice === dspZeldaCommandState.setup.voicesPerFrame) {
-          return finishDspZeldaRenderFrame();
-        }
-        dspZeldaCommandState.phase = "waiting";
-        return true;
-      }
-
-      if (dspZeldaCommandState.phase === "waiting") {
-        // The standard Zelda/JAudio protocol starts each command with the
-        // raw number of following 32-bit words. During rendering, a zero
-        // count transfers the next per-16-voice synchronization bitmap.
-        if (payload === 0 && dspZeldaCommandState.render.active) {
-          dspZeldaCommandState.phase = "rendering";
-          return true;
-        }
-        if (dspZeldaCommandState.render.active) {
-          return rejectDspZeldaCommand("command-during-render", {
-            count: hex32(payload),
-            frame: dspZeldaCommandState.render.currentFrame,
-            voice: dspZeldaCommandState.render.currentVoice,
-          });
-        }
-        if (payload !== 5 && payload !== 3) {
-          latchDspFirstUnsupported(
-            "protocol",
-            "unsupported-count",
-            payload
-          );
-          return rejectDspZeldaCommand("unsupported-count", {
-            count: hex32(payload),
-          });
-        }
-        dspZeldaCommandState.phase = "writing";
-        dspZeldaCommandState.expectedWords = payload;
-        dspZeldaCommandState.commandWordCount = payload;
-        dspZeldaCommandState.words.length = 0;
-        dspZeldaCommandState.rejected = false;
-        dspZeldaCommandState.reason = null;
-        return true;
-      }
-
-      if (dspZeldaCommandState.phase !== "writing") {
-        return rejectDspZeldaCommand("invalid-state", {
-          phase: dspZeldaCommandState.phase,
-        });
-      }
-
-      dspZeldaCommandState.words.push(payload);
-      dspZeldaCommandState.expectedWords -= 1;
-      if (dspZeldaCommandState.expectedWords !== 0) return true;
-
-      const words = dspZeldaCommandState.words.slice();
-      const commandWordCount = dspZeldaCommandState.commandWordCount;
-      const commandMail = words[0] >>> 0;
-      if ((commandMail & 0x80000000) === 0) {
-        return rejectDspZeldaCommand("malformed-command", {
-          command: hex32(commandMail),
-        });
-      }
-      const command = (commandMail >>> 24) & 0x7f;
-      const expectedCommandWords = command === 0x01
-        ? 5
-        : command === 0x02
-          ? 3
-          : null;
-      if (expectedCommandWords === null) {
-        latchDspFirstUnsupported(
-          "command",
-          "unsupported-command",
-          command
-        );
-        return rejectDspZeldaCommand("unsupported-command", {
-          command,
-          commandMail: hex32(commandMail),
-        });
-      }
-      if (commandWordCount !== expectedCommandWords) {
-        return rejectDspZeldaCommand("malformed-command-envelope", {
-          command,
-          commandMail: hex32(commandMail),
-          words: commandWordCount,
-          expectedWords: expectedCommandWords,
-        });
-      }
-
-      const sync = (commandMail >>> 16) & 0xffff;
-      dspZeldaCommandState.phase = "waiting";
-      dspZeldaCommandState.expectedWords = 0;
-      dspZeldaCommandState.commandWordCount = 0;
-      dspZeldaCommandState.words.length = 0;
-      dspZeldaCommandState.lastCommand = commandMail;
-      dspZeldaCommandState.lastSync = sync;
-      traceDsp("zelda-command", {
-        command,
-        commandMail: hex32(commandMail),
-        sync: "0x" + sync.toString(16).padStart(4, "0"),
-      });
-      deviceEvents.set(
-        "dspZeldaCommand",
-        (deviceEvents.get("dspZeldaCommand") ?? 0) + 1
-      );
-
-      if (command === 0x01) {
-        dspZeldaCommandState.setup = {
-          voicesPerFrame: commandMail & 0xffff,
-          vpbBaseAddress: words[1] >>> 0,
-          coefficientAddress: words[2] >>> 0,
-          afcCoeffAddress: words[3] >>> 0,
-          reverbPbBaseAddress: words[4] >>> 0,
-        };
-        traceDsp("zelda-setup", {
-          voicesPerFrame: dspZeldaCommandState.setup.voicesPerFrame,
-          vpbBaseAddress: hex32(dspZeldaCommandState.setup.vpbBaseAddress),
-          coefficientAddress: hex32(
-            dspZeldaCommandState.setup.coefficientAddress
-          ),
-          afcCoeffAddress: hex32(dspZeldaCommandState.setup.afcCoeffAddress),
-          reverbPbBaseAddress: hex32(
-            dspZeldaCommandState.setup.reverbPbBaseAddress
-          ),
-        });
-        deviceEvents.set(
-          "dspZeldaSetup",
-          (deviceEvents.get("dspZeldaSetup") ?? 0) + 1
-        );
-
-        // Dolphin's standard Zelda protocol acknowledges setup commands in
-        // this exact order: interrupting DSP_SYNC, then the non-interrupt
-        // F355 token carrying the command's sync value.
-        pushDspMail(0xdcd10004, true, "zelda-command-sync");
-        pushDspMail((0xf3550000 | sync) >>> 0, false, "zelda-command-ack");
-        return true;
-      }
-
-      const setup = dspZeldaCommandState.setup;
-      if (setup === null) {
-        return rejectDspZeldaCommand("render-before-setup");
-      }
-      if (setup.voicesPerFrame !== 0x40) {
-        return rejectDspZeldaCommand("unsupported-voice-count", {
-          voicesPerFrame: setup.voicesPerFrame,
-        });
-      }
-      const requestedFrames = (commandMail >>> 16) & 0xff;
-      if (requestedFrames === 0) {
-        return rejectDspZeldaCommand("empty-render");
-      }
-      const outputBytes = requestedFrames * 0x50 * 2;
-      const outputLeftAddress = words[1] >>> 0;
-      const outputRightAddress = words[2] >>> 0;
-      if (
-        !validateDspZeldaOutputRange(outputLeftAddress, outputBytes)
-        || !validateDspZeldaOutputRange(outputRightAddress, outputBytes)
-      ) {
-        return rejectDspZeldaCommand("output-out-of-bounds", {
-          frames: requestedFrames,
-          bytesPerChannel: outputBytes,
-          leftAddress: hex32(outputLeftAddress),
-          rightAddress: hex32(outputRightAddress),
-        });
-      }
-      dspZeldaCommandState.render = {
-        active: true,
-        awaitingTaskMail: false,
-        requestedFrames,
-        currentFrame: 0,
-        currentVoice: 0,
-        outputVolume: commandMail & 0xffff,
-        outputLeftAddress,
-        outputRightAddress,
-        clearedBytes: 0,
-      };
-      traceDsp("zelda-render-command", {
-        frames: requestedFrames,
-        voicesPerFrame: setup.voicesPerFrame,
-        outputVolume: dspZeldaCommandState.render.outputVolume,
-        outputLeftAddress: hex32(outputLeftAddress),
-        outputRightAddress: hex32(outputRightAddress),
-        bytesPerChannel: outputBytes,
-      });
-      deviceEvents.set(
-        "dspZeldaRenderCommand",
-        (deviceEvents.get("dspZeldaRenderCommand") ?? 0) + 1
-      );
-
-      // Dolphin's standard Zelda protocol acknowledges commands in this
-      // family only after each requested audio frame has completed. The
-      // renderer therefore waits for the first zero-count synchronization
-      // pair and deliberately emits no command-02 ACK here.
-      return true;
-    }
-
-    function resetDspMailbox() {
-      dspMailQueue.length = 0;
-      dspCurrentMail = null;
-      dspCpuMailbox = 0;
-      dspRomParameter = null;
-      dspUcodeUpload = emptyDspUcodeUpload();
-      dspUcodeHash = null;
-      dspMode = "rom";
-      dspUcodeBooted = false;
-      dspAxCommandState = emptyDspAxCommandState();
-      dspZeldaCommandState = emptyDspZeldaCommandState();
-      dspScheduledMail = null;
-      view.setUint16(mmio + 0x5000, 0, false);
-      view.setUint16(mmio + 0x5002, 0, false);
-      view.setUint16(mmio + 0x5004, 0, false);
-      view.setUint16(mmio + 0x5006, 0, false);
-      pushDspMail(0x8071feed, false, "reset");
-      deviceEvents.set("dspReset", (deviceEvents.get("dspReset") ?? 0) + 1);
-    }
-
-    function initializeDspAudioSystem() {
-      dspMailQueue.length = 0;
-      dspCurrentMail = null;
-      dspRomParameter = null;
-      dspUcodeUpload = emptyDspUcodeUpload();
-      dspUcodeHash = null;
-      dspMode = "init";
-      dspUcodeBooted = false;
-      dspAxCommandState = emptyDspAxCommandState();
-      dspZeldaCommandState = emptyDspZeldaCommandState();
-      dspScheduledMail = null;
-      view.setUint16(mmio + 0x5004, 0, false);
-      view.setUint16(mmio + 0x5006, 0, false);
-      pushDspMail(0x80544348, false, "init-audio-system");
-      deviceEvents.set(
-        "dspInitAudioSystem",
-        (deviceEvents.get("dspInitAudioSystem") ?? 0) + 1
-      );
-    }
-
-    function handleDspCpuMail(mail) {
-      deviceEvents.set("dspCpuMail", (deviceEvents.get("dspCpuMail") ?? 0) + 1);
-      if (dspMode === "init") return;
-      if (!dspUcodeBooted) {
-        if (dspRomParameter === null) {
-          if (((mail & 0xffff0000) >>> 0) === 0x80f30000) {
-            dspRomParameter = mail >>> 0;
-          } else {
-            pushDspMail(0xfeee0000 | (mail & 0xffff));
-          }
-        } else {
-          const parameter = dspRomParameter;
-          dspRomParameter = null;
-          captureDspRomParameter(parameter, mail);
-          if (parameter === 0x80f3d001) bootDspUcode();
-        }
-      } else if (dspMode === "ax") {
-        handleDspAxMail(mail);
-      } else if (dspMode === "zelda") {
-        handleDspZeldaMail(mail);
-      }
-    }
-
     function resetFifoRegisterState() {
       cpFifoState.control = 0;
       cpFifoState.base = 0;
@@ -16313,6 +15135,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (physical === 0x0c005038 && size === 4) {
         publishDspAudioDmaBlocksLeft();
       }
+      const overlapsDspReceiveMailbox =
+        physical < 0x0c005008 && physical + size > 0x0c005004;
+      if (
+        overlapsDspReceiveMailbox
+        && dspRegisterRangeOffset(physical, size, 0x0c005004) === null
+      ) {
+        return reject("device", "dsp-receive-mailbox-register-rejected");
+      }
       const lockedSource = physicalLockedCachePointer(physical, size);
       const source = physicalRamPointer(physical, size)
         ?? physicalMmioPointer(physical, size)
@@ -16361,7 +15191,12 @@ const TEMPLATE: &str = r##"<!doctype html>
         lockedCacheReads += 1;
         lockedCacheReadBytes += size;
       }
-      if (physical === 0x0c005006 && size === 2) consumeDspMail();
+      if (overlapsDspReceiveMailbox) {
+        check(
+          finishDspReceiveMailboxRead(physical, size),
+          "validated DSP receive-mailbox read was rejected"
+        );
+      }
       if (size === 4 && physical >= 0x0c006404 && physical <= 0x0c00642c) {
         const channelOffset = physical - 0x0c006404;
         const registerOffset = channelOffset % 12;
@@ -16910,45 +15745,95 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
-    function writeDspControl(value) {
+    function writeDspControl(value, writtenMask = 0xffff) {
       const current = view.getUint16(mmio + 0x500a, false);
       const written = value & 0xffff;
+      const mask = writtenMask & 0xffff;
       const interruptStatuses = 0x00a8;
-      const hardwareOwned = interruptStatuses | 0x0200;
-      const status = (current & hardwareOwned) & ~(written & interruptStatuses);
-      let next = (written & ~hardwareOwned) | status;
-      if ((written & 1) !== 0) {
-        resetDspMailbox();
-        resetDspAudioDma();
-        next &= ~1;
-      }
-      if ((current & 0x0800) !== 0 && (next & 0x0800) === 0) {
-        initializeDspAudioSystem();
-      }
+      const dmaState = 0x0200;
+      const writable = 0x0d57;
+      const status = (current & interruptStatuses)
+        & ~(written & mask & interruptStatuses);
+      const guestControl = (current & writable & ~mask)
+        | (written & writable & mask);
+      const next = guestControl | status | (current & dmaState);
       view.setUint16(mmio + 0x500a, next, false);
-      traceDsp("control-write", {
-        current: "0x" + current.toString(16).padStart(4, "0"),
-        written: "0x" + written.toString(16).padStart(4, "0"),
-        next: "0x" + next.toString(16).padStart(4, "0"),
-      });
     }
 
-    function writeDspMailboxHigh(value) {
-      dspCpuMailbox = (((value & 0xffff) << 16) | (dspCpuMailbox & 0xffff)) >>> 0;
-      view.setUint16(mmio + 0x5000, value & 0x7fff, false);
+    function writeDspControlRegister(physical, value, size) {
+      if (physical === 0x0c005008 && size === 4) {
+        // Retail code can use one aligned word store whose low half lands on
+        // DSPCSR. The high half occupies an unmapped register lane.
+        writeDspControl(value & 0xffff);
+        return true;
+      }
+      const offset = physical - 0x0c00500a;
+      if (offset === 0 && size === 2) {
+        writeDspControl(value);
+        return true;
+      }
+      if ((offset === 0 || offset === 1) && size === 1) {
+        const shift = offset === 0 ? 8 : 0;
+        writeDspControl((value & 0xff) << shift, 0xff << shift);
+        return true;
+      }
+      return false;
     }
 
-    function writeDspMailboxLow(value) {
-      dspCpuMailbox = ((dspCpuMailbox & 0xffff0000) | (value & 0xffff)) >>> 0;
+    function dspRegisterRangeOffset(physical, size, registerPhysical) {
+      const offset = physical - registerPhysical;
+      return Number.isInteger(offset)
+        && [1, 2, 4].includes(size)
+        && offset >= 0
+        && offset + size <= 4
+        ? offset
+        : null;
+    }
+
+    function writeDspSendMailbox(physical, value, size) {
+      const offset = dspRegisterRangeOffset(physical, size, 0x0c005000);
+      if (offset === null) return false;
+      const previousStatus = view.getUint16(mmio + 0x5000, false) & 0x8000;
+      const target = mmio + 0x5000 + offset;
+      switch (size) {
+        case 1: view.setUint8(target, value); break;
+        case 2: view.setUint16(target, value, false); break;
+        case 4: view.setUint32(target, value >>> 0, false); break;
+      }
+      const overlapsLowHalf = offset < 4 && offset + size > 2;
+      const high = view.getUint16(mmio + 0x5000, false) & 0x7fff;
       view.setUint16(
         mmio + 0x5000,
-        ((dspCpuMailbox >>> 16) & 0x7fff) | 0x8000,
+        high | (overlapsLowHalf ? 0x8000 : previousStatus),
         false
       );
-      view.setUint16(mmio + 0x5002, dspCpuMailbox & 0xffff, false);
-      handleDspCpuMail(dspCpuMailbox >>> 0);
-      dspCpuMailbox &= 0x7fffffff;
-      view.setUint16(mmio + 0x5000, (dspCpuMailbox >>> 16) & 0x7fff, false);
+      if (overlapsLowHalf) {
+        dspCpuMailboxCommits += 1;
+        deviceEvents.set(
+          "dspCpuMailboxCommit",
+          (deviceEvents.get("dspCpuMailboxCommit") ?? 0) + 1
+        );
+      } else {
+        dspCpuMailboxHighWrites += 1;
+      }
+      return true;
+    }
+
+    function finishDspReceiveMailboxRead(physical, size) {
+      const offset = dspRegisterRangeOffset(physical, size, 0x0c005004);
+      if (offset === null) return false;
+      dspMailboxReads += 1;
+      if (offset >= 4 || offset + size <= 2) return true;
+      const high = view.getUint16(mmio + 0x5004, false);
+      view.setUint16(mmio + 0x5004, high & 0x7fff, false);
+      if ((high & 0x8000) !== 0) {
+        dspMailboxConsumes += 1;
+        deviceEvents.set(
+          "dspMailboxConsume",
+          (deviceEvents.get("dspMailboxConsume") ?? 0) + 1
+        );
+      }
+      return true;
     }
 
     function writeInteger(address, value, size) {
@@ -17115,23 +16000,16 @@ const TEMPLATE: &str = r##"<!doctype html>
         view.setUint32(mmio + 0x6c08, aiSampleCounter, false);
         return 1;
       }
-      if (physical === 0x0c005000 && size === 2) {
-        writeDspMailboxHigh(value);
-        return 1;
+      if (physical < 0x0c005004 && physical + size > 0x0c005000) {
+        if (writeDspSendMailbox(physical, value, size)) return 1;
+        return reject("device", "dsp-send-mailbox-register-rejected");
       }
-      if (physical === 0x0c005002 && size === 2) {
-        writeDspMailboxLow(value);
-        return 1;
+      if (physical < 0x0c005008 && physical + size > 0x0c005004) {
+        return reject("device", "dsp-receive-mailbox-write-rejected");
       }
-      if (physical === 0x0c005008 && size === 4) {
-        // Retail code can use one aligned word store whose low half lands on
-        // DSPCSR. The high half occupies an unmapped register lane.
-        writeDspControl(value & 0xffff);
-        return 1;
-      }
-      if (physical === 0x0c00500a && size === 2) {
-        writeDspControl(value);
-        return 1;
+      if (physical < 0x0c00500c && physical + size > 0x0c00500a) {
+        if (writeDspControlRegister(physical, value, size)) return 1;
+        return reject("device", "dsp-control-register-rejected");
       }
       if (physical === 0x0c005034 && size === 4) {
         view.setUint16(mmio + 0x5034, (value >>> 16) & 0xffff, false);
@@ -22916,14 +21794,121 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function dspStopReasonName(code) {
+      switch (code) {
+        case 0: return "instruction-budget";
+        case 1: return "halted";
+        case 2: return "dsp-mailbox-full";
+        case 3: return "cpu-mailbox-empty";
+        case 4: return "bus-fault";
+        case 5: return "not-initialized";
+        case 6: return "memory-not-sealed";
+        default: return "unknown-" + code;
+      }
+    }
+
+    function serviceDspInterpreter(observedCycles) {
+      check(
+        Number.isSafeInteger(observedCycles)
+          && observedCycles >= dspLastServiceCycle,
+        "DSP service cycle is not monotonic"
+      );
+      dspPendingCpuCycles += observedCycles - dspLastServiceCycle;
+      dspLastServiceCycle = observedCycles;
+      if (dspPendingCpuCycles < dspExecutionQuantumCpuCycles) {
+        nextDspExecutionCycle =
+          observedCycles + dspExecutionQuantumCpuCycles - dspPendingCpuCycles;
+        return false;
+      }
+
+      const budget = Math.floor(
+        dspPendingCpuCycles / dspCpuCyclesPerInstruction
+      );
+      check(
+        budget >= dspMinimumExecutionInstructions && budget <= 0xffffffff,
+        "DSP instruction budget is outside the wasm ABI"
+      );
+      // Lazuli drops the complete supplied slice after every call, including
+      // an early halt/mailbox stop. Only the sub-instruction CPU remainder is
+      // retained for the next 64-instruction threshold.
+      dspPendingCpuCycles -= budget * dspCpuCyclesPerInstruction;
+      check(
+        dspPendingCpuCycles >= 0
+          && dspPendingCpuCycles < dspCpuCyclesPerInstruction,
+        "DSP scheduler retained a complete instruction"
+      );
+      nextDspExecutionCycle =
+        observedCycles + dspExecutionQuantumCpuCycles - dspPendingCpuCycles;
+
+      const cpuMailboxFullBefore =
+        (view.getUint16(mmio + 0x5000, false) & 0x8000) !== 0;
+      const dspMailboxFullBefore =
+        (view.getUint16(mmio + 0x5004, false) & 0x8000) !== 0;
+      const dspInterruptBefore =
+        (view.getUint16(mmio + 0x500a, false) & 0x0080) !== 0;
+      const executed = browserDsp.browser_dsp_exec(budget) >>> 0;
+      const stopCode = browserDsp.browser_dsp_stop_reason() >>> 0;
+      const stopName = dspStopReasonName(stopCode);
+      const dspPc = browserDsp.browser_dsp_pc() >>> 0;
+
+      dspExecutionSlices += 1;
+      dspBudgetedInstructions += budget;
+      dspExecutedInstructions += executed;
+      dspLastExecutionCycle = observedCycles;
+      dspLastStopReason = { code: stopCode, name: stopName };
+      dspStopReasonCounts.set(
+        stopName,
+        (dspStopReasonCounts.get(stopName) ?? 0) + 1
+      );
+
+      const cpuMailboxFullAfter =
+        (view.getUint16(mmio + 0x5000, false) & 0x8000) !== 0;
+      const dspMailboxFullAfter =
+        (view.getUint16(mmio + 0x5004, false) & 0x8000) !== 0;
+      const dspInterruptAfter =
+        (view.getUint16(mmio + 0x500a, false) & 0x0080) !== 0;
+      if (cpuMailboxFullBefore && !cpuMailboxFullAfter) {
+        dspCpuMailboxConsumedByDsp += 1;
+      }
+      if (!dspMailboxFullBefore && dspMailboxFullAfter) {
+        dspMailboxProduced += 1;
+      }
+      if (!dspInterruptBefore && dspInterruptAfter) {
+        dspInterruptAssertions += 1;
+      }
+
+      const inconsistent = executed > budget
+        || (stopCode === 0 && executed !== budget);
+      if (stopCode === 4) {
+        dspLastFault = {
+          operation: browserDsp.browser_dsp_fault_operation() >>> 0,
+          address: browserDsp.browser_dsp_fault_address() >>> 0,
+          length: browserDsp.browser_dsp_fault_length() >>> 0,
+          memoryLength: browserDsp.browser_dsp_fault_memory_length() >>> 0,
+          pc: dspPc,
+        };
+      }
+      if (inconsistent || stopCode < 0 || stopCode > 3) {
+        const fault = dspLastFault === null
+          ? ""
+          : ` operation=${dspLastFault.operation}`
+            + ` address=${hex32(dspLastFault.address)}`
+            + ` length=${dspLastFault.length}`
+            + ` memoryLength=${dspLastFault.memoryLength}`;
+        throw new Error(
+          `browser DSP stopped fatally: reason=${stopName}`
+            + ` code=${stopCode} pc=0x${dspPc.toString(16).padStart(4, "0")}`
+            + ` executed=${executed} budget=${budget}${fault}`
+        );
+      }
+      dspLastFault = null;
+      return true;
+    }
+
     function serviceDsp(observedCycles) {
       serviceDspAudioDma(observedCycles);
       serviceAramDma(observedCycles);
-      if (dspScheduledMail !== null && observedCycles >= dspScheduledMail.completionCycle) {
-        pushDspMail(dspScheduledMail.mail, true);
-        dspScheduledMail = null;
-        deviceEvents.set("dspScheduledReply", (deviceEvents.get("dspScheduledReply") ?? 0) + 1);
-      }
+      serviceDspInterpreter(observedCycles);
 
       const control = view.getUint16(mmio + 0x500a, false);
       const active = (((control >>> 1) & control & 0x00a8) !== 0);
@@ -25618,7 +24603,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         nextDiskAudioCycle,
         serialTransfer?.completionCycle ?? null,
         peFinishCycle,
-        dspScheduledMail?.completionCycle ?? null,
+        nextDspExecutionCycle,
         nextDspAudioDmaInterruptCycle,
         coalesceIdleAudio
           ? nextDspAudioDmaCompletionCycle()
@@ -26404,7 +25389,28 @@ const TEMPLATE: &str = r##"<!doctype html>
           },
         },
         audioCompatibility: {
-          dspFirstUnsupported: snapshotDspFirstUnsupported(),
+          dspLle: {
+            backend: "lle-wasm",
+            abi: browserDsp.browser_dsp_abi_version() >>> 0,
+            slices: dspExecutionSlices,
+            budgetedInstructions: dspBudgetedInstructions,
+            executedInstructions: dspExecutedInstructions,
+            pendingCpuCycles: dspPendingCpuCycles,
+            lastServiceCycle: dspLastServiceCycle,
+            nextExecutionCycle: nextDspExecutionCycle,
+            lastExecutionCycle: dspLastExecutionCycle,
+            lastStopReason: dspLastStopReason,
+            stopReasonCounts: Object.fromEntries(dspStopReasonCounts),
+            pc: browserDsp.browser_dsp_pc() >>> 0,
+            fault: dspLastFault,
+            cpuMailboxWrites: dspCpuMailboxCommits,
+            cpuMailboxReads: dspCpuMailboxConsumedByDsp,
+            dspMailboxWrites: dspMailboxProduced,
+            dspMailboxReads: dspMailboxConsumes,
+            cpuMailboxHighWrites: dspCpuMailboxHighWrites,
+            mailboxReadAccesses: dspMailboxReads,
+            dspInterruptAssertions,
+          },
           dtkFirstUnsupported: snapshotDtkFirstUnsupported(),
         },
         controller: {
@@ -26605,135 +25611,6 @@ const TEMPLATE: &str = r##"<!doctype html>
           peTokenValue,
           peTokenSignal,
           peTokenInterruptDelivered,
-          dspCurrentMail: hex32(dspCurrentMail),
-          dspQueuedMails: dspMailQueue.length,
-          dspScheduledMail,
-          dspMode,
-          dspUcodeHash: dspUcodeHash === null ? null : hex32(dspUcodeHash),
-          dspAxCommand: {
-            phase: dspAxCommandState.phase,
-            sizeWords: dspAxCommandState.sizeWords,
-            address:
-              dspAxCommandState.address === null
-                ? null
-                : hex32(dspAxCommandState.address),
-            listCount: dspAxCommandState.listCount,
-            wordCount: dspAxCommandState.wordCount,
-            commandCount: dspAxCommandState.commandCount,
-            commandSample: dspAxCommandState.commandSample.map(
-              command =>
-                "0x" + command.toString(16).padStart(2, "0")
-            ),
-            writeCount: dspAxCommandState.writeCount,
-            clearedBytes: dspAxCommandState.clearedBytes,
-            rejected: dspAxCommandState.rejected,
-            reason: dspAxCommandState.reason,
-            lastTaskMail:
-              dspAxCommandState.lastTaskMail === null
-                ? null
-                : hex32(dspAxCommandState.lastTaskMail),
-          },
-          dspZeldaCommand: {
-            phase: dspZeldaCommandState.phase,
-            expectedWords: dspZeldaCommandState.expectedWords,
-            commandWordCount: dspZeldaCommandState.commandWordCount,
-            bufferedWords: dspZeldaCommandState.words.length,
-            rejected: dspZeldaCommandState.rejected,
-            reason: dspZeldaCommandState.reason,
-            lastCommand:
-              dspZeldaCommandState.lastCommand === null
-                ? null
-                : hex32(dspZeldaCommandState.lastCommand),
-            lastSync:
-              dspZeldaCommandState.lastSync === null
-                ? null
-                : "0x" +
-                  dspZeldaCommandState.lastSync.toString(16).padStart(4, "0"),
-            setup:
-              dspZeldaCommandState.setup === null
-                ? null
-                : {
-                    voicesPerFrame:
-                      dspZeldaCommandState.setup.voicesPerFrame,
-                    vpbBaseAddress: hex32(
-                      dspZeldaCommandState.setup.vpbBaseAddress
-                    ),
-                    coefficientAddress: hex32(
-                      dspZeldaCommandState.setup.coefficientAddress
-                    ),
-                    afcCoeffAddress: hex32(
-                      dspZeldaCommandState.setup.afcCoeffAddress
-                    ),
-                    reverbPbBaseAddress: hex32(
-                      dspZeldaCommandState.setup.reverbPbBaseAddress
-                    ),
-                  },
-            render: {
-              active: dspZeldaCommandState.render.active,
-              renderBatch: dspZeldaCommandState.render.renderBatch,
-              awaitingTaskMail:
-                dspZeldaCommandState.render.awaitingTaskMail,
-              requestedFrames:
-                dspZeldaCommandState.render.requestedFrames,
-              currentFrame: dspZeldaCommandState.render.currentFrame,
-              currentVoice: dspZeldaCommandState.render.currentVoice,
-              outputVolume: dspZeldaCommandState.render.outputVolume,
-              outputLeftAddress:
-                dspZeldaCommandState.render.outputLeftAddress === null
-                  ? null
-                  : hex32(
-                      dspZeldaCommandState.render.outputLeftAddress
-                    ),
-              outputRightAddress:
-                dspZeldaCommandState.render.outputRightAddress === null
-                  ? null
-                  : hex32(
-                      dspZeldaCommandState.render.outputRightAddress
-                    ),
-              clearedBytes: dspZeldaCommandState.render.clearedBytes,
-              voiceSyncMaps:
-                dspZeldaCommandState.render.voiceSyncMaps.map(entry => ({
-                  batch: entry.batch,
-                  frame: entry.frame,
-                  group: entry.group,
-                  activeVoiceMap:
-                    "0x" + entry.activeVoiceMap
-                      .toString(16).padStart(4, "0"),
-                })),
-              voiceParameterBlocksInspected:
-                dspZeldaCommandState.render.voiceParameterBlocksInspected,
-              voiceParameterBlockReadBytes:
-                dspZeldaCommandState.render.voiceParameterBlockReadBytes,
-              voiceRenderableParameterBlocks:
-                dspZeldaCommandState.render.voiceRenderableParameterBlocks,
-              voiceSkippedParameterBlocks:
-                dspZeldaCommandState.render.voiceSkippedParameterBlocks,
-              voiceSourceTypesSeen:
-                [...dspZeldaCommandState.render.voiceSourceTypesSeen],
-              voiceChannelIdsSeen:
-                dspZeldaCommandState.render.voiceChannelIdsSeen.map(
-                  id => "0x" + id.toString(16).padStart(4, "0")
-                ),
-              voiceSnapshots:
-                dspZeldaCommandState.render.voiceSnapshots
-                  .filter(snapshot => snapshot !== null)
-                  .map(snapshot => ({
-                    ...snapshot,
-                    vpbAddress: hex32(snapshot.vpbAddress),
-                    currentAramAddress: hex32(
-                      snapshot.currentAramAddress
-                    ),
-                    loopAddress: hex32(snapshot.loopAddress),
-                    baseAddress: hex32(snapshot.baseAddress),
-                    channels: snapshot.channels.map(channel => ({
-                      ...channel,
-                      id:
-                        "0x" + channel.id.toString(16).padStart(4, "0"),
-                    })),
-                  })),
-            },
-          },
-          dspTrace,
           dspAudioDma: {
             enabled: (view.getUint16(mmio + 0x5036, false) & 0x8000) !== 0,
             configuredBlocks: view.getUint16(mmio + 0x5036, false) & 0x7fff,
@@ -26915,8 +25792,11 @@ const TEMPLATE: &str = r##"<!doctype html>
       // treat a cleared bit as a held reset button and eventually call
       // OSResetSystem, so power-on must expose the released state.
       view.setUint32(mmio + 0x3000, 0x00010000, false);
+      // Native Lazuli powers the DSP interface on with RESET_HIGH asserted.
+      // The first timed interpreter slice observes this edge, resets into
+      // IROM, and produces the hardware greeting itself.
+      view.setUint16(mmio + 0x500a, 0x0800, false);
       view.setUint16(mmio + 0x5016, 1, false);
-      pushDspMail(0x8071feed, false, "initialize");
       deviceEvents.set("dspInitialize", (deviceEvents.get("dspInitialize") ?? 0) + 1);
       initializeTranslationLookasideBuffers();
       initializePageTableRegisters();
@@ -26977,6 +25857,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       async function finishTerminalControllerScenario() {
         const scenarioStatus = serviceControllerScenario(controllerScenario, cycles);
         if (scenarioStatus !== "complete" && scenarioStatus !== "failed") return;
+        if (dspLastServiceCycle !== cycles) return;
         const failed = scenarioStatus === "failed";
         await finishQuiescentAfterRendererDrain(failed ? "stopped" : "paused", {
           stage: failed ? "scenario-failed" : "scenario-complete",
@@ -26991,7 +25872,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       for (;;) {
-        if (runnerSnapshotRequested) publishRunnerSnapshot();
+        // A yielded WebGPU EFB peek can retire a CPU prefix before the
+        // unchanged load redispatches and normal MMIO service runs. Keep a
+        // snapshot request queued until every timed device, including DSP,
+        // has observed the published CPU cycle.
+        if (runnerSnapshotRequested && dspLastServiceCycle === cycles) {
+          publishRunnerSnapshot();
+        }
         while (rendererFramesInFlight.size !== 0 || rendererFailure !== null) {
           await honorRendererBackpressure();
           if (runnerStopRequested) break;
@@ -29467,7 +28354,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           && terminalReport?.stage === "scenario-complete"
           && terminalReport?.scenario?.status === "complete"
           && terminalReport?.sustainedPlay?.schema
-            === "lazuli-smb-sustained-play-v4";
+            === "lazuli-smb-sustained-play-v5";
         const sustainedPresentedSurfaces =
           sustainedPlayTerminal
             ? await readSmbSustainedPresentedSurfaceHistory()

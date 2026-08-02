@@ -15,11 +15,15 @@ import {
   SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
   verifySmbSustainedPresentedSurfaceHistory,
 } from "./browser_boot_smb_sustained_surface_history.mjs";
+import {
+  verifyDspLleEvidence,
+} from "./browser_dsp_lle_evidence.mjs";
 
 export const SMB_SUSTAINED_PLAY_SCHEMA_V1 = "lazuli-smb-sustained-play-v1";
 export const SMB_SUSTAINED_PLAY_SCHEMA_V2 = "lazuli-smb-sustained-play-v2";
 export const SMB_SUSTAINED_PLAY_SCHEMA_V3 = "lazuli-smb-sustained-play-v3";
 export const SMB_SUSTAINED_PLAY_SCHEMA_V4 = "lazuli-smb-sustained-play-v4";
+export const SMB_SUSTAINED_PLAY_SCHEMA_V5 = "lazuli-smb-sustained-play-v5";
 export const SMB_SUSTAINED_VI_RECEIPT_CAPACITY = 120;
 
 const HEX_32 = /^0x[0-9a-f]{8}$/;
@@ -78,6 +82,15 @@ function fail(code, path, ordinal, expected, actual, previous = null) {
     actual,
     previous,
   );
+}
+
+function verifySmbDspLle(report) {
+  return verifyDspLleEvidence(report, {
+    root: "$",
+    fail: (path, message) => {
+      fail("dsp-lle", path, null, message, null);
+    },
+  });
 }
 
 function requireObject(value, path, ordinal = null) {
@@ -827,6 +840,7 @@ export function verifySmbSustainedPlayPrefix(report) {
   if (
     sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V3
     && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4
+    && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V5
   ) {
     fail(
       "invariant",
@@ -835,9 +849,13 @@ export function verifySmbSustainedPlayPrefix(report) {
       [
         SMB_SUSTAINED_PLAY_SCHEMA_V3,
         SMB_SUSTAINED_PLAY_SCHEMA_V4,
+        SMB_SUSTAINED_PLAY_SCHEMA_V5,
       ],
       sustained.schema,
     );
+  }
+  if (sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V5) {
+    verifySmbDspLle(report);
   }
   exact(
     sustained.capacity,
@@ -925,7 +943,8 @@ export function deriveSmbSustainedPlayOracle(report) {
   const sustained = requireObject(report.sustainedPlay, "$.sustainedPlay");
   const pairedReceipts = sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V2
     || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3
-    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4;
+    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V5;
   if (!pairedReceipts && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V1) {
     fail(
       "invariant",
@@ -936,6 +955,7 @@ export function deriveSmbSustainedPlayOracle(report) {
         SMB_SUSTAINED_PLAY_SCHEMA_V2,
         SMB_SUSTAINED_PLAY_SCHEMA_V3,
         SMB_SUSTAINED_PLAY_SCHEMA_V4,
+        SMB_SUSTAINED_PLAY_SCHEMA_V5,
       ],
       sustained.schema,
     );
@@ -943,7 +963,8 @@ export function deriveSmbSustainedPlayOracle(report) {
   if (pairedReceipts) {
     validateV2CompatibilityTelemetry(
       report,
-      sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4,
+      sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V4
+        && sustained.schema !== SMB_SUSTAINED_PLAY_SCHEMA_V5,
     );
   }
   const readyPlayAnchor = requireObject(
@@ -1008,10 +1029,12 @@ export function deriveSmbSustainedPlayOracle(report) {
   if (
     sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V3
     || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+    || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V5
   ) {
     exact(
       report.rendering?.sustainedPresentedSurfaces?.schema,
       sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+        || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V5
         ? SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2
         : SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
       "$.rendering.sustainedPresentedSurfaces.schema",
@@ -1020,7 +1043,10 @@ export function deriveSmbSustainedPlayOracle(report) {
       report.rendering?.sustainedPresentedSurfaces,
       sustained.receipts,
     );
-    if (sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4) {
+    if (
+      sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+      || sustained.schema === SMB_SUSTAINED_PLAY_SCHEMA_V5
+    ) {
       exact(
         report.rendering.metrics.webgpu.exactRequiredRejectedDraws,
         0,
@@ -1093,6 +1119,9 @@ export function verifySmbSustainedPlay(report) {
   exact(report?.scenario?.failure, null, "$.scenario.failure");
   exact(report?.scenario?.currentStep, null, "$.scenario.currentStep");
   exact(report?.scenario?.stepIndex, 15, "$.scenario.stepIndex");
+  if (report?.sustainedPlay?.schema === SMB_SUSTAINED_PLAY_SCHEMA_V5) {
+    verifySmbDspLle(report);
+  }
   verifySmbTemporalSelectedXfb(report?.rendering?.temporalSelectedXfb);
   verifySmbTemporalPresentedSurfaces(report?.rendering?.temporalSelectedXfb);
   const derived = deriveSmbSustainedPlayOracle(report);

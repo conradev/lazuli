@@ -8,6 +8,7 @@ import {
   SMB_SUSTAINED_PLAY_SCHEMA_V2,
   SMB_SUSTAINED_PLAY_SCHEMA_V3,
   SMB_SUSTAINED_PLAY_SCHEMA_V4,
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
   SMB_SUSTAINED_VI_RECEIPT_CAPACITY,
   deriveSmbSustainedPlayOracle,
 } from "./browser_boot_smb_sustained_play.mjs";
@@ -236,6 +237,60 @@ function addSustainedPresentedSurfaceHistory(report, schema) {
   };
 }
 
+function addDspLleEvidence(report) {
+  const pendingCpuCycles = report.cycles % 12;
+  const budgetedInstructions = Math.floor(report.cycles / 12);
+  const slices = Math.floor(budgetedInstructions / 64);
+  report.deviceEvents = {
+    ...report.deviceEvents,
+    dspAudioDmaStart: 4,
+    dspAudioDmaBlock: 120,
+  };
+  report.audioCompatibility = {
+    dspLle: {
+      backend: "lle-wasm",
+      abi: 1,
+      slices,
+      budgetedInstructions,
+      executedInstructions: budgetedInstructions - slices,
+      pendingCpuCycles,
+      lastServiceCycle: report.cycles,
+      nextExecutionCycle: report.cycles + 768 - pendingCpuCycles,
+      lastExecutionCycle: report.cycles,
+      lastStopReason: {
+        code: 3,
+        name: "cpu-mailbox-empty",
+      },
+      stopReasonCounts: {
+        "instruction-budget": slices - 1,
+        "cpu-mailbox-empty": 1,
+      },
+      pc: 0x0100,
+      fault: null,
+      cpuMailboxWrites: 128,
+      cpuMailboxReads: 128,
+      dspMailboxWrites: 128,
+      dspMailboxReads: 128,
+      cpuMailboxHighWrites: 32,
+      mailboxReadAccesses: 160,
+      dspInterruptAssertions: 64,
+    },
+    dtkFirstUnsupported: null,
+  };
+  report.mmioState = {
+    ...report.mmioState,
+    dspAudioDma: {
+      enabled: true,
+      configuredBlocks: 16,
+      remainingBlocks: 8,
+      blocksLeft: 7,
+      cyclesPerBlock: 80_928,
+      nextInterruptCycle: null,
+      nextCycle: report.cycles + 80_928,
+    },
+  };
+}
+
 export function smbSustainedPlayReport(
   schema = SMB_SUSTAINED_PLAY_SCHEMA_V1,
 ) {
@@ -287,6 +342,7 @@ export function smbSustainedPlayReport(
         schema === SMB_SUSTAINED_PLAY_SCHEMA_V2
         || schema === SMB_SUSTAINED_PLAY_SCHEMA_V3
         || schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+        || schema === SMB_SUSTAINED_PLAY_SCHEMA_V5
       )
         ? pairedReceipt(index)
         : receipt(index),
@@ -300,11 +356,17 @@ export function smbSustainedPlayReport(
       report,
       SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V1,
     );
-  } else if (schema === SMB_SUSTAINED_PLAY_SCHEMA_V4) {
+  } else if (
+    schema === SMB_SUSTAINED_PLAY_SCHEMA_V4
+    || schema === SMB_SUSTAINED_PLAY_SCHEMA_V5
+  ) {
     addSustainedPresentedSurfaceHistory(
       report,
       SMB_SUSTAINED_PRESENTED_SURFACE_SCHEMA_V2,
     );
+  }
+  if (schema === SMB_SUSTAINED_PLAY_SCHEMA_V5) {
+    addDspLleEvidence(report);
   }
   report.sustainedPlay.oracle = deriveSmbSustainedPlayOracle(report);
   return report;
