@@ -593,7 +593,7 @@ test("stopScreencast failure still closes the collector and drains acknowledgeme
 });
 
 test("public SMB run URL remains the exact queryless outer root", () => {
-  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v4");
+  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v5");
   assert.equal(
     configuredPublicSmbCaptureUrl("https://gekko.free/"),
     "https://gekko.free/",

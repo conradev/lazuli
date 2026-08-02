@@ -40,9 +40,11 @@
   <iframe id="app" title="Gekko" hidden></iframe>
   <noscript>JavaScript is required. <a href="/source/">Source and legal notices</a></noscript>
   <script type="module">
-    // Keep this bootstrap self-contained: an incumbent schema-1 worker can
-    // cache the new shell before the schema-2 worker finishes installing.
-    const EXPECTED_RELEASE_SCHEMA = 2;
+    // Keep this bootstrap self-contained: an incumbent stored worker can
+    // cache the new shell before the schema-3 worker finishes installing.
+    const documentId = crypto.randomUUID();
+    document.body.dataset.documentId = documentId;
+    const EXPECTED_RELEASE_SCHEMA = 3;
     const status = document.querySelector("#status");
     const detail = document.querySelector("#detail");
     const app = document.querySelector("#app");
@@ -121,6 +123,12 @@
       return value.pathname === "/" && value.search === "" && value.hash === "";
     }
 
+    function exposeSelectedRelease(release, frontendUrl) {
+      document.body.dataset.releaseId = release.releaseId;
+      document.body.dataset.sourceCommit = release.source.commit;
+      document.body.dataset.frontendUrl = frontendUrl.href;
+    }
+
     async function launch() {
       const worker = await registerWorker();
       if (worker === null) throw new Error("this browser does not support offline applications");
@@ -134,6 +142,7 @@
       const url = new URL(release.frontend.url, location.href);
       url.search = "";
       url.hash = "";
+      exposeSelectedRelease(release, url);
       app.addEventListener("load", () => {
         status.hidden = true;
         app.hidden = false;

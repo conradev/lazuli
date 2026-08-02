@@ -11,7 +11,7 @@ import {
   verifySmbSustainedPlay,
 } from "./browser_boot_smb_sustained_play.mjs";
 
-const REPORT_SCHEMA = "lazuli-public-smb-screencast-v4";
+const REPORT_SCHEMA = "lazuli-public-smb-screencast-v5";
 const FRAME_COUNT = 64;
 const MIN_WINDOW_VI_RECEIPTS = 64;
 const WIDTH = 1024;
@@ -165,18 +165,20 @@ function releaseIdentity(value, path) {
   exactKeys(value, [
     "backend",
     "commit",
+    "dsp",
     "frontend",
     "releaseId",
     "renderer",
     "schema",
   ], path);
-  exact(value.schema, 2, `${path}.schema`);
+  exact(value.schema, 3, `${path}.schema`);
   hash(value.commit, `${path}.commit`, 40);
   hash(value.releaseId, `${path}.releaseId`);
   asset(value.frontend, `${path}.frontend`, ".html");
   exactKeys(value.renderer, ["javascript", "wasm"], `${path}.renderer`);
   asset(value.renderer.javascript, `${path}.renderer.javascript`, ".js");
   asset(value.renderer.wasm, `${path}.renderer.wasm`, ".wasm");
+  asset(value.dsp, `${path}.dsp`, ".wasm");
   exactKeys(value.backend, ["bytes", "sha256", "url"], `${path}.backend`);
   positiveInteger(value.backend.bytes, `${path}.backend.bytes`);
   hash(value.backend.sha256, `${path}.backend.sha256`);

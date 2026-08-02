@@ -12,7 +12,7 @@ import {
 
 function activeRelease() {
   return {
-    schema: 2,
+    schema: 3,
     releaseId: "1".repeat(64),
     commit: "2".repeat(40),
     frontend: {
@@ -20,13 +20,18 @@ function activeRelease() {
       sha256: "b".repeat(64),
       bytes: 1_000,
     },
+    dsp: {
+      url: `/assets/browser-dsp-${"c".repeat(64)}.wasm`,
+      sha256: "c".repeat(64),
+      bytes: 2_000,
+    },
   };
 }
 
 function validEvidence() {
   const release = activeRelease();
   return {
-    schema: "lazuli-public-warioware-smoke-v1",
+    schema: "lazuli-public-warioware-smoke-v2",
     dataset: { renderer: "wgpu-webgpu", status: "running" },
     devtoolsExceptions: [],
     discImage: {
@@ -209,6 +214,24 @@ test("public WarioWare smoke rejects a mutable frontend path", () => {
   assert.throws(
     () => validatePublicWarioWareSmokeEvidence(evidence),
     /\$\.frameUrl: expected a content-addressed immutable frontend path/,
+  );
+});
+
+test("public WarioWare smoke requires the schema-3 DSP identity", () => {
+  const missing = validEvidence();
+  delete missing.release.dsp;
+  missing.terminalRelease = structuredClone(missing.release);
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(missing),
+    /\$\.release\.dsp/,
+  );
+
+  const stale = validEvidence();
+  stale.release.schema = 2;
+  stale.terminalRelease.schema = 2;
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(stale),
+    /\$\.release\.schema: expected release schema 3/,
   );
 });
 

@@ -21,6 +21,7 @@ import {
 } from "./sw.js";
 import {
   LEGACY_RELEASE_SCHEMA,
+  PREVIOUS_RELEASE_SCHEMA,
   RELEASE_SCHEMA,
   WASM_CHUNK_SIZE,
   releaseIdentityPayload,
@@ -67,7 +68,7 @@ test("worker status identifies the release schema during upgrades", async () => 
   assert.deepEqual(await response.json(), { releaseSchema: RELEASE_SCHEMA });
 });
 
-test("active release endpoint fails closed until a validated schema-2 release is active", async () => {
+test("active release endpoint fails closed until a validated schema-3 release is active", async () => {
   assert.equal(ACTIVE_RECORD_PATH, "/.gekko/active-release");
   const storage = new MemoryCacheStorage();
 
@@ -99,7 +100,7 @@ test("active release endpoint fails closed until a validated schema-2 release is
   assert.equal((await activeReleaseResponse(storage, ORIGIN)).status, 503);
 });
 
-test("active release GET exposes only the validated schema-2 manifest", async () => {
+test("active release GET exposes only the validated schema-3 manifest", async () => {
   const storage = new MemoryCacheStorage();
   const candidate = await makeRelease(7);
   await stageRelease(candidate.release, {
@@ -178,6 +179,7 @@ async function makeRelease(seed) {
   const frontendBytes = new TextEncoder().encode(`<p>release ${seed}</p>`);
   const rendererJavascriptBytes = new TextEncoder().encode("export default function init() {}\n");
   const rendererWasmBytes = new TextEncoder().encode("shared renderer wasm");
+  const dspWasmBytes = new TextEncoder().encode("shared browser DSP wasm");
   const backendBytes = new Uint8Array(WASM_CHUNK_SIZE + 3);
   backendBytes.fill(seed);
   const chunks = [
@@ -203,6 +205,7 @@ async function makeRelease(seed) {
       javascript: await asset(rendererJavascriptBytes, "browser-renderer", "js"),
       wasm: await asset(rendererWasmBytes, "browser-renderer-wasm", "wasm"),
     },
+    dsp: await asset(dspWasmBytes, "browser-dsp", "wasm"),
     backend: {
       url: "/ppcwasmjit.wasm",
       sha256: await sha256Hex(backendBytes),
@@ -216,17 +219,27 @@ async function makeRelease(seed) {
     [release.frontend.url, frontendBytes],
     [release.renderer.javascript.url, rendererJavascriptBytes],
     [release.renderer.wasm.url, rendererWasmBytes],
+    [release.dsp.url, dspWasmBytes],
     ...release.backend.chunks.map((chunk, index) => [chunk.url, chunks[index]]),
   ]);
-  return { release, responses, backendBytes };
+  return { release, responses, backendBytes, dspWasmBytes };
 }
 
 async function legacyRelease(release) {
   const legacy = structuredClone(release);
   legacy.schema = LEGACY_RELEASE_SCHEMA;
   delete legacy.renderer;
+  delete legacy.dsp;
   legacy.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(legacy)));
   return legacy;
+}
+
+async function previousRelease(release) {
+  const previous = structuredClone(release);
+  previous.schema = PREVIOUS_RELEASE_SCHEMA;
+  delete previous.dsp;
+  previous.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(previous)));
+  return previous;
 }
 
 function fetchAssets(responses, failPath = null) {
@@ -259,11 +272,14 @@ async function withWorkerGlobals(cacheStorage, fetcher, callback) {
   }
 }
 
-test("keeps a verified schema-1 release readable until schema 2 commits", async () => {
+test("keeps verified schema-1 and schema-2 releases readable until schema 3 commits", async () => {
   const candidate = await makeRelease(6);
   const legacy = await legacyRelease(candidate.release);
+  const previous = await previousRelease(candidate.release);
   await validateStoredRelease(legacy);
+  await validateStoredRelease(previous);
   await assert.rejects(validateRelease(legacy), /unsupported schema/);
+  await assert.rejects(validateRelease(previous), /unsupported schema/);
 
   const storage = new MemoryCacheStorage();
   const cacheName = `gekko-release-${legacy.releaseId}-legacy`;
@@ -275,6 +291,18 @@ test("keeps a verified schema-1 release readable until schema 2 commits", async 
   const active = await readActiveRelease(storage, ORIGIN);
   assert.equal(active.release.releaseId, legacy.releaseId);
   assert.equal(active.release.schema, LEGACY_RELEASE_SCHEMA);
+
+  const previousStorage = new MemoryCacheStorage();
+  const previousCacheName = `gekko-release-${previous.releaseId}-previous`;
+  const previousMetadata = await previousStorage.open(META_CACHE);
+  await previousMetadata.put(
+    `${ORIGIN}/.gekko/active-release`,
+    new Response(JSON.stringify({ release: previous, cacheName: previousCacheName })),
+  );
+  assert.equal(
+    (await readActiveRelease(previousStorage, ORIGIN)).release.schema,
+    PREVIOUS_RELEASE_SCHEMA,
+  );
 
   const legacyCache = await storage.open(cacheName);
   for (const releaseAsset of [legacy.frontend, ...legacy.backend.chunks]) {
@@ -292,9 +320,13 @@ test("keeps a verified schema-1 release readable until schema 2 commits", async 
       new Response(candidate.responses.get(rendererAsset.url)),
     );
   }
+  await inactiveCache.put(
+    `${ORIGIN}${candidate.release.dsp.url}`,
+    new Response(candidate.responses.get(candidate.release.dsp.url)),
+  );
   await assert.rejects(
     backendResponse(active, storage, ORIGIN),
-    /release schema 2 is required/,
+    /release schema 3 is required/,
   );
   const legacyAssetRequests = [];
   const legacyAsset = await cachedReleaseAsset(
@@ -319,6 +351,7 @@ test("keeps a verified schema-1 release readable until schema 2 commits", async 
         legacy.frontend.url,
         ...legacy.backend.chunks.map(chunk => chunk.url),
         ...Object.values(candidate.release.renderer).map(asset => asset.url),
+        candidate.release.dsp.url,
       ];
       for (const path of blockedPaths) {
         const response = await handleFetch(new Request(`${ORIGIN}${path}`));
@@ -331,7 +364,7 @@ test("keeps a verified schema-1 release readable until schema 2 commits", async 
   await assert.rejects(
     stageRelease(candidate.release, {
       cacheStorage: storage,
-      fetcher: fetchAssets(candidate.responses, candidate.release.renderer.wasm.url),
+      fetcher: fetchAssets(candidate.responses, candidate.release.dsp.url),
       origin: ORIGIN,
       cacheSuffix: "failed-upgrade",
     }),
@@ -366,10 +399,10 @@ test("commits a verified release only after every asset is cached", async () => 
     .filter(index => index >= 0);
   assert.ok(metadataWrite > Math.max(...assetWrites), "active pointer must be the final write");
   const releaseCache = storage.caches.get(record.cacheName);
-  for (const rendererAsset of Object.values(first.release.renderer)) {
+  for (const releaseAsset of [...Object.values(first.release.renderer), first.release.dsp]) {
     assert.ok(
-      releaseCache.entries.has(`${ORIGIN}${rendererAsset.url}`),
-      `${rendererAsset.url} must be cached before commit`,
+      releaseCache.entries.has(`${ORIGIN}${releaseAsset.url}`),
+      `${releaseAsset.url} must be cached before commit`,
     );
   }
 
@@ -399,10 +432,16 @@ test("a failed stage preserves the last known good release", async () => {
     cacheSuffix: "first",
   });
   const second = await makeRelease(2);
+  const changedDspBytes = new TextEncoder().encode("changed browser DSP wasm");
+  second.release.dsp = await asset(changedDspBytes, "browser-dsp", "wasm");
+  second.responses.set(second.release.dsp.url, changedDspBytes);
+  second.release.releaseId = await sha256Hex(
+    JSON.stringify(releaseIdentityPayload(second.release)),
+  );
   await assert.rejects(
     stageRelease(second.release, {
       cacheStorage: storage,
-      fetcher: fetchAssets(second.responses, second.release.backend.chunks[1].url),
+      fetcher: fetchAssets(second.responses, second.release.dsp.url),
       origin: ORIGIN,
       cacheSuffix: "second",
     }),
@@ -457,6 +496,7 @@ test("does not intercept unknown navigation routes", async () => {
         "/warioware",
         "/smb",
         "/games/foo",
+        "/browser_dsp.wasm",
       ];
       for (const path of paths) {
         const response = await handleFetch(new Request(`${ORIGIN}${path}`));
@@ -467,7 +507,7 @@ test("does not intercept unknown navigation routes", async () => {
   );
 });
 
-test("serves only the active schema-2 browser code through public routes", async () => {
+test("serves only the active schema-3 browser code through public routes", async () => {
   const storage = new MemoryCacheStorage();
   const candidate = await makeRelease(7);
   await stageRelease(candidate.release, {
@@ -496,6 +536,12 @@ test("serves only the active schema-2 browser code through public routes", async
           candidate.responses.get(rendererAsset.url),
         );
       }
+      const dsp = await handleFetch(new Request(`${ORIGIN}${candidate.release.dsp.url}`));
+      assert.equal(dsp.status, 200);
+      assert.deepEqual(
+        new Uint8Array(await dsp.arrayBuffer()),
+        candidate.dspWasmBytes,
+      );
     },
   );
   assert.deepEqual(networkRequests, []);
@@ -531,4 +577,13 @@ test("rejects a release without its renderer pair", async () => {
     JSON.stringify(releaseIdentityPayload(candidate.release)),
   );
   await assert.rejects(validateRelease(candidate.release), /renderer wasm is missing/);
+});
+
+test("rejects a schema-3 release without its DSP artifact", async () => {
+  const candidate = await makeRelease(8);
+  delete candidate.release.dsp;
+  candidate.release.releaseId = await sha256Hex(
+    JSON.stringify(releaseIdentityPayload(candidate.release)),
+  );
+  await assert.rejects(validateRelease(candidate.release), /DSP wasm is missing/);
 });

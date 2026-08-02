@@ -27,7 +27,7 @@ const FRAME_URL =
 
 function releaseIdentity() {
   return {
-    schema: 2,
+    schema: 3,
     releaseId: RELEASE_ID,
     commit: COMMIT,
     frontend: {
@@ -39,6 +39,7 @@ function releaseIdentity() {
       javascript: { url: "/renderer.js", sha256: "4".repeat(64), bytes: 2_000 },
       wasm: { url: "/renderer.wasm", sha256: "5".repeat(64), bytes: 3_000 },
     },
+    dsp: { url: "/assets/browser-dsp-" + "7".repeat(64) + ".wasm", sha256: "7".repeat(64), bytes: 3_500 },
     backend: { url: "/backend.wasm", sha256: "6".repeat(64), bytes: 4_000 },
   };
 }
@@ -131,16 +132,16 @@ test("public sustained CLI requires exact commit and release pins", () => {
 
 test("public sustained envelope pins release, loaders, WebGPU, and canonical SMB", () => {
   const evidence = validEnvelope();
-  assert.equal(PUBLIC_SMB_SUSTAINED_SCHEMA, "lazuli-public-smb-sustained-v3");
+  assert.equal(PUBLIC_SMB_SUSTAINED_SCHEMA, "lazuli-public-smb-sustained-v4");
   assert.strictEqual(validatePublicSmbSustainedEnvelope(evidence), evidence);
 });
 
-test("public sustained envelope rejects the superseded v2 schema", () => {
+test("public sustained envelope rejects the superseded v3 schema", () => {
   const evidence = validEnvelope();
-  evidence.schema = "lazuli-public-smb-sustained-v2";
+  evidence.schema = "lazuli-public-smb-sustained-v3";
   assert.throws(
     () => validatePublicSmbSustainedEnvelope(evidence),
-    /\$\.schema: expected lazuli-public-smb-sustained-v3/,
+    /\$\.schema: expected lazuli-public-smb-sustained-v4/,
   );
 });
 
@@ -150,6 +151,11 @@ test("public sustained envelope rejects release and navigation drift", () => {
       "expected commit",
       value => { value.release.commit = "f".repeat(40); },
       /\$\.release\.commit/,
+    ],
+    [
+      "DSP asset",
+      value => { delete value.release.dsp; },
+      /\$\.release\.dsp/,
     ],
     [
       "terminal release",

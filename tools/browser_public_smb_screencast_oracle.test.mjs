@@ -36,7 +36,7 @@ function asset(name, extension, digit, bytes = 1000) {
 
 function release() {
   return {
-    schema: 2,
+    schema: 3,
     releaseId: "1".repeat(64),
     commit: "2".repeat(40),
     frontend: asset("frontend", "html", "3"),
@@ -44,6 +44,7 @@ function release() {
       javascript: asset("browser-renderer", "js", "4"),
       wasm: asset("browser-renderer-wasm", "wasm", "5"),
     },
+    dsp: asset("browser-dsp", "wasm", "7"),
     backend: {
       url: "/ppcwasmjit.wasm",
       sha256: "6".repeat(64),
@@ -238,7 +239,7 @@ function validReport() {
   const receiptPrefix = terminal.report.sustainedPlay.receipts.slice(0, 16);
   const prefixIdentity = canonicalIdentity(receiptPrefix);
   return {
-    schema: "lazuli-public-smb-screencast-v4",
+    schema: "lazuli-public-smb-screencast-v5",
     mode: "sustained-public-viewport",
     alignment: "sustained-window-bounded",
     rendererControl: {
@@ -323,7 +324,7 @@ function validReport() {
 
 test("strict passive oracle accepts diverse non-serial public viewport summaries", () => {
   const report = validReport();
-  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v4");
+  assert.equal(PUBLIC_SMB_SCREENCAST_SCHEMA, "lazuli-public-smb-screencast-v5");
   const oracle = verifyPublicSmbScreencastReport(report);
   assert.strictEqual(report.oracle, oracle);
   assert.equal(report.oraclePassed, true);
@@ -349,7 +350,7 @@ test("strict passive oracle rejects the superseded v3 outer schema", () => {
     error => (
       error instanceof PublicSmbScreencastValidationError
       && error.path === "$.schema"
-      && /lazuli-public-smb-screencast-v4/.test(error.message)
+      && /lazuli-public-smb-screencast-v5/.test(error.message)
     ),
   );
 });

@@ -146,7 +146,7 @@ test("headless capture pins the validated active deployed release twice", async 
     Error,
     JSON,
     async validateRelease(release) {
-      assert.equal(release.schema, 2);
+      assert.equal(release.schema, 3);
       assert.equal(Object.hasOwn(release, "cacheName"), false);
       return release;
     },
@@ -157,7 +157,7 @@ test("headless capture pins the validated active deployed release twice", async 
     extractFunction("validateObservedActiveRelease"),
   ].join("\n\n"), context);
   const release = {
-    schema: 2,
+    schema: 3,
     releaseId: "a".repeat(64),
     source: { commit: "b".repeat(40) },
     frontend: { url: `/assets/frontend-${"c".repeat(64)}.html`, sha256: "c".repeat(64), bytes: 10 },
@@ -165,6 +165,7 @@ test("headless capture pins the validated active deployed release twice", async 
       javascript: { url: `/assets/renderer-${"d".repeat(64)}.js`, sha256: "d".repeat(64), bytes: 20 },
       wasm: { url: `/assets/renderer-${"e".repeat(64)}.wasm`, sha256: "e".repeat(64), bytes: 30 },
     },
+    dsp: { url: `/assets/browser-dsp-${"1".repeat(64)}.wasm`, sha256: "1".repeat(64), bytes: 35 },
     backend: {
       url: "/ppcwasmjit.wasm",
       sha256: "f".repeat(64),
@@ -190,6 +191,7 @@ test("headless capture pins the validated active deployed release twice", async 
     "commit",
     "frontend",
     "renderer",
+    "dsp",
     "backend",
   ]);
   assert.equal(Object.hasOwn(identity.backend, "chunks"), false);

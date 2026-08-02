@@ -281,6 +281,7 @@ function compactActiveRelease(release) {
       javascript: compactReleaseAsset(release.renderer.javascript),
       wasm: compactReleaseAsset(release.renderer.wasm),
     },
+    dsp: compactReleaseAsset(release.dsp),
     backend: {
       url: release.backend.url,
       sha256: release.backend.sha256,

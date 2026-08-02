@@ -41,7 +41,7 @@ import {
   verifyPublicSmbScreencastReport,
 } from "./browser_public_smb_screencast_oracle.mjs";
 
-export const PUBLIC_SMB_SCREENCAST_SCHEMA = "lazuli-public-smb-screencast-v4";
+export const PUBLIC_SMB_SCREENCAST_SCHEMA = "lazuli-public-smb-screencast-v5";
 export const PUBLIC_SMB_SCREENCAST_PROTOCOL = "cdp-page-screencast-v1";
 export const PUBLIC_SMB_SCREENCAST_FRAMES = 64;
 export const PUBLIC_SMB_MIN_WINDOW_VI_RECEIPTS = 64;

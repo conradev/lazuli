@@ -99,9 +99,13 @@ function program(context, mmAddress, aramAddress) {
   context.view.setUint32(context.mmio + 0x5024, aramAddress >>> 0, false);
 }
 
-test("runtime keeps one separate 16 MiB ARAM store and latches metadata without a payload copy", () => {
+test("runtime aliases ARAM from shared wasm memory and latches metadata without a payload copy", () => {
   const start = extractFunction("startAramDma");
-  assert.match(source, /const aram = new Uint8Array\(0x01000000\);/);
+  assert.match(
+    source,
+    /const aram = new Uint8Array\(memory\.buffer, __ARAM_PTR__, __ARAM_SIZE__\);/,
+  );
+  assert.doesNotMatch(source, /const aram = new Uint8Array\(0x01000000\);/);
   assert.doesNotMatch(start, /\.slice\(|new Uint8Array|Array\.from/);
   assert.match(start, /bytes\.subarray/);
   assert.match(start, /aram\.subarray/);

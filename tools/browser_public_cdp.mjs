@@ -185,6 +185,7 @@ export function compactPublicActiveRelease(release) {
       javascript: compactAsset(release.renderer.javascript),
       wasm: compactAsset(release.renderer.wasm),
     },
+    dsp: compactAsset(release.dsp),
     backend: compactAsset(release.backend),
   };
 }

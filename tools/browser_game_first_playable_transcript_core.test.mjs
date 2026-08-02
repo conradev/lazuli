@@ -32,6 +32,132 @@ function projectFixtureGuestConsumption({ button, game, publication }) {
   });
 }
 
+function publicSnapshot(game, report) {
+  const capture = report.headlessCapture;
+  delete report.headlessCapture;
+  report.disc.source = { kind: "local-file" };
+  return {
+    environment: {
+      surface: "public-root",
+      dataset: structuredClone(capture.dataset),
+      devtoolsExceptions: [],
+      discImage: {
+        algorithm: "sha256",
+        format: game.image.format,
+        sha256: game.image.sha256,
+      },
+    },
+    report,
+  };
+}
+
+test("generic core derives directly from public-root pre/post snapshots", async () => {
+  const corpus = await readGameCompatibilityCorpus();
+  const game = corpus.games[1];
+  const reports = makeGameFirstPlayableReportPair(game, "left");
+  const preSnapshot = publicSnapshot(game, reports.preReport);
+  const postSnapshot = publicSnapshot(game, reports.postReport);
+  const transcript = deriveGameFirstPlayableTranscriptCore({
+    button: "left",
+    corpus,
+    gameKey: game.key,
+    guestProjector: projectFixtureGuestConsumption,
+    preSnapshot,
+    postSnapshot,
+  });
+
+  assert.equal(transcript.surface, "public-root");
+  assert.equal(transcript.input.name, "left");
+  assert.equal(transcript.input.mode, "guest-consumed");
+  assert.equal(Object.hasOwn(preSnapshot.report, "headlessCapture"), false);
+  assert.equal(Object.hasOwn(postSnapshot.report, "headlessCapture"), false);
+  assert.strictEqual(
+    verifyGameFirstPlayableTranscriptCore({
+      button: "left",
+      corpus,
+      gameKey: game.key,
+      guestProjector: projectFixtureGuestConsumption,
+      preSnapshot,
+      postSnapshot,
+      transcript,
+    }),
+    transcript,
+  );
+});
+
+test("public-root snapshot mode rejects incomplete, mixed, and drifting evidence", async () => {
+  const corpus = await readGameCompatibilityCorpus();
+  const game = corpus.games[1];
+  const makeSnapshots = () => {
+    const reports = makeGameFirstPlayableReportPair(game, "left");
+    return {
+      reports,
+      preSnapshot: publicSnapshot(game, reports.preReport),
+      postSnapshot: publicSnapshot(game, reports.postReport),
+    };
+  };
+
+  {
+    const { preSnapshot } = makeSnapshots();
+    assert.throws(
+      () => deriveGameFirstPlayableTranscriptCore({
+        button: "left",
+        corpus,
+        gameKey: game.key,
+        guestProjector: projectFixtureGuestConsumption,
+        preSnapshot,
+      }),
+      /expected both preSnapshot and postSnapshot/,
+    );
+  }
+  {
+    const { postSnapshot, preSnapshot, reports } = makeSnapshots();
+    assert.throws(
+      () => deriveGameFirstPlayableTranscriptCore({
+        button: "left",
+        corpus,
+        gameKey: game.key,
+        guestProjector: projectFixtureGuestConsumption,
+        preReport: reports.preReport,
+        preSnapshot,
+        postSnapshot,
+      }),
+      /exactly one complete pre\/post report pair or public-root snapshot pair/,
+    );
+  }
+  {
+    const { postSnapshot, preSnapshot } = makeSnapshots();
+    preSnapshot.report.disc.source.size = 1;
+    postSnapshot.report.disc.source.size = 2;
+    assert.throws(
+      () => deriveGameFirstPlayableTranscriptCore({
+        button: "left",
+        corpus,
+        gameKey: game.key,
+        guestProjector: projectFixtureGuestConsumption,
+        preSnapshot,
+        postSnapshot,
+      }),
+      /disc source changed across the observed worker run/,
+    );
+  }
+  {
+    const { postSnapshot, preSnapshot } = makeSnapshots();
+    postSnapshot.environment.dataset.renderer = "canvas-2d";
+    assert.throws(
+      () => deriveGameFirstPlayableTranscriptCore({
+        button: "left",
+        corpus,
+        gameKey: game.key,
+        guestProjector: projectFixtureGuestConsumption,
+        preSnapshot,
+        postSnapshot,
+      }),
+      /dataset\.renderer.*wgpu-webgpu/,
+    );
+  }
+});
+
 test("generic core accepts per-game guest-consumption projectors", async () => {
   const corpus = await readGameCompatibilityCorpus();
   const expectedIdentifiers = new Set([

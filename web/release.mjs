@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-export const RELEASE_SCHEMA = 2;
+export const RELEASE_SCHEMA = 3;
+export const PREVIOUS_RELEASE_SCHEMA = 2;
 export const LEGACY_RELEASE_SCHEMA = 1;
 export const WASM_CHUNK_SIZE = 1024 * 1024;
 
@@ -28,12 +29,21 @@ export function releaseIdentityPayload(release) {
     backend: release.backend,
   };
   if (release.schema < 2) return identity;
-  return {
+  const withRenderer = {
     schema: identity.schema,
     source: identity.source,
     frontend: identity.frontend,
     renderer: release.renderer,
     backend: identity.backend,
+  };
+  if (release.schema < 3) return withRenderer;
+  return {
+    schema: withRenderer.schema,
+    source: withRenderer.source,
+    frontend: withRenderer.frontend,
+    renderer: withRenderer.renderer,
+    dsp: release.dsp,
+    backend: withRenderer.backend,
   };
 }
 
@@ -77,6 +87,11 @@ async function validateReleaseSchema(release, schema) {
       "renderer assets are not distinct",
     );
   }
+  if (schema >= 3) {
+    checkAsset(release.dsp, "DSP wasm");
+    check(release.dsp.url.endsWith(".wasm"), "DSP wasm URL is invalid");
+    check(release.dsp.url !== release.renderer.wasm.url, "DSP and renderer wasm are not distinct");
+  }
   check(release.backend !== null && typeof release.backend === "object", "backend is missing");
   check(release.backend.url === "/ppcwasmjit.wasm", "backend URL is invalid");
   check(HASH_PATTERN.test(release.backend.sha256), "backend hash is invalid");
@@ -110,7 +125,9 @@ export function validateRelease(release) {
 
 export function validateStoredRelease(release) {
   check(
-    release?.schema === RELEASE_SCHEMA || release?.schema === LEGACY_RELEASE_SCHEMA,
+    release?.schema === RELEASE_SCHEMA
+      || release?.schema === PREVIOUS_RELEASE_SCHEMA
+      || release?.schema === LEGACY_RELEASE_SCHEMA,
     "unsupported stored schema",
   );
   return validateReleaseSchema(release, release.schema);
@@ -120,6 +137,7 @@ export function releaseAssets(release) {
   return [
     release.frontend,
     ...(release.schema >= 2 ? [release.renderer.javascript, release.renderer.wasm] : []),
+    ...(release.schema >= 3 ? [release.dsp] : []),
     ...release.backend.chunks,
   ];
 }

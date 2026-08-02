@@ -477,6 +477,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-dsp"
+version = "0.1.0"
+dependencies = [
+ "dspint",
+]
+
+[[package]]
 name = "browser-renderer"
 version = "0.1.0"
 dependencies = [
@@ -4021,6 +4028,7 @@ dependencies = [
 name = "ppcwasmjit"
 version = "0.1.0"
 dependencies = [
+ "browser-dsp",
  "clifwasm",
  "cranelift-codegen",
  "disks",

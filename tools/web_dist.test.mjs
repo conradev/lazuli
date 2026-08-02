@@ -6,13 +6,16 @@ import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
 import { assertGenericFrontend } from "./build_web.mjs";
+import { sha256Hex, validateRelease } from "../web/release.mjs";
 
 test("generated public artifact contains only the release surface", async () => {
   const directory = new URL("../web/dist/", import.meta.url);
   const release = JSON.parse(await readFile(new URL("release.json", directory), "utf8"));
+  await validateRelease(release);
   const [
     frontend,
     rendererJavascript,
+    dspWasm,
     sourcePage,
     thirdPartyNotices,
     vendoredFontLicense,
@@ -22,6 +25,7 @@ test("generated public artifact contains only the release surface", async () => 
       new URL(`.${release.renderer.javascript.url}`, directory),
       "utf8",
     ),
+    readFile(new URL(`.${release.dsp.url}`, directory)),
     readFile(new URL("source/index.html", directory), "utf8"),
     readFile(new URL("THIRD-PARTY-NOTICES.txt", directory)),
     readFile(
@@ -73,12 +77,16 @@ test("generated public artifact contains only the release surface", async () => 
   );
   assert.ok(frontend.includes(release.renderer.javascript.url));
   assert.ok(!frontend.includes("/browser_renderer.js"));
+  assert.ok(frontend.includes(release.dsp.url));
+  assert.ok(!frontend.includes("/browser_dsp.wasm"));
+  assert.equal(dspWasm.byteLength, release.dsp.bytes);
+  assert.equal(await sha256Hex(dspWasm), release.dsp.sha256);
   assert.ok(rendererJavascript.includes(release.renderer.wasm.url));
   assert.ok(!rendererJavascript.includes("browser_renderer_bg.wasm"));
   assert.deepEqual(thirdPartyNotices, vendoredFontLicense);
   assert.match(
     sourcePage,
-    /Lazuli's code is GPL-3\.0-only\. This release also includes Apache-2\.0 alternative IPL font data\./,
+    /Lazuli's code is GPL-3\.0-only\. This release also includes Apache-2\.0 alternative IPL font data and Dolphin's free replacement DSP ROM images\./,
   );
   assert.match(
     sourcePage,
@@ -88,6 +96,7 @@ test("generated public artifact contains only the release surface", async () => 
     sourcePage,
     /href="\/THIRD-PARTY-NOTICES\.txt">Apache-2\.0 and attribution<\/a>/,
   );
+  assert.match(sourcePage, /DSP ROM attribution[\s\S]*upstream source and contributor history/);
   assert.equal(release.source.license.expression, "GPL-3.0-only");
   assert.doesNotMatch(
     JSON.stringify(release),
@@ -102,4 +111,5 @@ test("generated public artifact contains only the release surface", async () => 
   assert.ok(!rootFiles.includes("font_western.bin"));
   assert.ok(!rootFiles.includes("browser_renderer.js"));
   assert.ok(!rootFiles.includes("browser_renderer_bg.wasm"));
+  assert.ok(!rootFiles.includes("browser_dsp.wasm"));
 });

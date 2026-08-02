@@ -300,6 +300,90 @@ function requireReuseContinuity(preReport, postReport, button, preCapture, postC
   }
 }
 
+function normalizeTranscriptEvidence({
+  button,
+  game,
+  postReport,
+  postSnapshot,
+  preReport,
+  preSnapshot,
+}) {
+  const hasReports = preReport !== undefined || postReport !== undefined;
+  const hasSnapshots = preSnapshot !== undefined || postSnapshot !== undefined;
+  if (hasReports === hasSnapshots) {
+    transcriptFailure(
+      "$.[evidence]",
+      "expected exactly one complete pre/post report pair or public-root snapshot pair",
+    );
+  }
+
+  if (hasReports) {
+    if (preReport === undefined || postReport === undefined) {
+      transcriptFailure("$.[evidence]", "expected both preReport and postReport");
+    }
+    const preCapture = captureForReport(preReport, "$.preReport");
+    const postCapture = captureForReport(postReport, "$.postReport");
+    const discImage = discImageFromPreCapture(preCapture, game);
+    requireReuseContinuity(
+      preReport,
+      postReport,
+      button,
+      preCapture,
+      postCapture,
+    );
+    return {
+      postReport,
+      postSnapshot: {
+        environment: privateEnvironment(postCapture, discImage),
+        report: postReport,
+      },
+      preReport,
+      preSnapshot: {
+        environment: privateEnvironment(preCapture, discImage),
+        report: preReport,
+      },
+    };
+  }
+
+  if (preSnapshot === undefined || postSnapshot === undefined) {
+    transcriptFailure("$.[evidence]", "expected both preSnapshot and postSnapshot");
+  }
+  const normalizedPre = requiredObject(preSnapshot, "$.preSnapshot");
+  const normalizedPost = requiredObject(postSnapshot, "$.postSnapshot");
+  const publicPreReport = requiredObject(normalizedPre.report, "$.preSnapshot.report");
+  const publicPostReport = requiredObject(normalizedPost.report, "$.postSnapshot.report");
+  requireExact(
+    normalizedPre.environment?.surface,
+    "public-root",
+    "$.preSnapshot.environment.surface",
+  );
+  requireExact(
+    normalizedPost.environment?.surface,
+    "public-root",
+    "$.postSnapshot.environment.surface",
+  );
+  if (
+    canonicalStringify(discSourceIdentity(
+      publicPreReport,
+      "$.preSnapshot.report.disc.source",
+    )) !== canonicalStringify(discSourceIdentity(
+      publicPostReport,
+      "$.postSnapshot.report.disc.source",
+    ))
+  ) {
+    transcriptFailure(
+      "$.postSnapshot.report.disc.source",
+      "disc source changed across the observed worker run",
+    );
+  }
+  return {
+    postReport: publicPostReport,
+    postSnapshot: normalizedPost,
+    preReport: publicPreReport,
+    preSnapshot: normalizedPre,
+  };
+}
+
 function projectPublication(postReport, preReport, expectedButton) {
   const controller = requiredObject(
     postReport.controller,
@@ -476,7 +560,9 @@ export function deriveGameFirstPlayableTranscriptCore({
   gameKey,
   guestProjector = null,
   postReport,
+  postSnapshot,
   preReport,
+  preSnapshot,
 }) {
   const game = gameForKey(corpus, gameKey);
   const mask = gameFirstPlayableButtonMask(button);
@@ -486,38 +572,30 @@ export function deriveGameFirstPlayableTranscriptCore({
       "first-playable evidence requires a guest-consumption projector",
     );
   }
-  const preCapture = captureForReport(preReport, "$.preReport");
-  const postCapture = captureForReport(postReport, "$.postReport");
-  const discImage = discImageFromPreCapture(preCapture, game);
-  requireReuseContinuity(
-    preReport,
-    postReport,
+  const normalized = normalizeTranscriptEvidence({
     button,
-    preCapture,
-    postCapture,
-  );
+    game,
+    postReport,
+    postSnapshot,
+    preReport,
+    preSnapshot,
+  });
+  postReport = normalized.postReport;
+  preReport = normalized.preReport;
   requireExact(preReport.scenario, null, "$.preReport.scenario");
   requireExact(postReport.scenario, null, "$.postReport.scenario");
 
-  const preSnapshot = {
-    environment: privateEnvironment(preCapture, discImage),
-    report: preReport,
-  };
-  const postSnapshot = {
-    environment: privateEnvironment(postCapture, discImage),
-    report: postReport,
-  };
   const preVerified = verifyGameCompatibilitySnapshot({
-    ...preSnapshot,
+    ...normalized.preSnapshot,
     game,
   });
   const postVerified = verifyGameCompatibilitySnapshot({
-    ...postSnapshot,
+    ...normalized.postSnapshot,
     game,
   });
   const window = verifyGameCompatibilityWindow({
     game,
-    snapshots: [preSnapshot, postSnapshot],
+    snapshots: [normalized.preSnapshot, normalized.postSnapshot],
     sustainedViFields: corpus.evidence.sustainedViFields,
     viewportFrames: corpus.evidence.viewportFrames,
   });
@@ -575,7 +653,7 @@ export function deriveGameFirstPlayableTranscriptCore({
       image: Object.freeze({ ...game.image }),
       milestone: Object.freeze({ ...game.milestone }),
     }),
-    surface: "local-debug",
+    surface: window.surface,
     reports: Object.freeze({ pre, post }),
     input: Object.freeze({
       name: button,
@@ -601,7 +679,9 @@ export function verifyGameFirstPlayableTranscriptCore({
   gameKey,
   guestProjector = null,
   postReport,
+  postSnapshot,
   preReport,
+  preSnapshot,
   transcript,
 }) {
   requiredObject(transcript, "$.transcript");
@@ -611,7 +691,9 @@ export function verifyGameFirstPlayableTranscriptCore({
     gameKey,
     guestProjector,
     postReport,
+    postSnapshot,
     preReport,
+    preSnapshot,
   });
   const difference = firstDifference(derived, transcript);
   if (difference !== null) {

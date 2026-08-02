@@ -20,8 +20,9 @@ import {
   waitForPublicSnapshot,
 } from "./browser_public_cdp.mjs";
 
-const EVIDENCE_SCHEMA = "lazuli-public-warioware-smoke-v1";
+const EVIDENCE_SCHEMA = "lazuli-public-warioware-smoke-v2";
 const IMMUTABLE_FRONTEND_PATH = /^\/assets\/frontend-[0-9a-f]{64}\.html$/;
+const IMMUTABLE_DSP_PATH = /^\/assets\/browser-dsp-([0-9a-f]{64})\.wasm$/;
 const PRODUCTION_ORIGIN = "https://gekko.free";
 const WARIOWARE_DISC_IDENTIFIER = "GZWE01";
 
@@ -346,9 +347,22 @@ export function validatePublicWarioWareSmokeEvidence(evidence) {
   if (JSON.stringify(release) !== JSON.stringify(terminalRelease)) {
     evidenceFailure("$.terminalRelease", "active release changed during the smoke run");
   }
+  if (release.schema !== 3) {
+    evidenceFailure("$.release.schema", "expected release schema 3");
+  }
   const frontend = requiredObject(release.frontend, "$.release.frontend");
   if (typeof frontend.url !== "string" || !IMMUTABLE_FRONTEND_PATH.test(frontend.url)) {
     evidenceFailure("$.release.frontend.url", "expected an immutable frontend asset path");
+  }
+  const dsp = requiredObject(release.dsp, "$.release.dsp");
+  const dspMatch = typeof dsp.url === "string" ? dsp.url.match(IMMUTABLE_DSP_PATH) : null;
+  if (
+    dspMatch === null
+    || dsp.sha256 !== dspMatch[1]
+    || !Number.isSafeInteger(dsp.bytes)
+    || dsp.bytes <= 0
+  ) {
+    evidenceFailure("$.release.dsp", "expected the content-addressed browser DSP artifact");
   }
   if (frameUrl.href !== expectedPublicFrameUrl(publicUrl.href, release)) {
     evidenceFailure("$.frameUrl", "does not match the active release frontend identity");

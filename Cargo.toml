@@ -17,6 +17,7 @@ members = [
     "crates/cores",
     "crates/renderer",
     "crates/browser-renderer",
+    "crates/browser-dsp",
     "crates/modules",
 
     # binaries
@@ -42,6 +43,7 @@ default-members = [
     "crates/cores",
     "crates/renderer",
     "crates/browser-renderer",
+    "crates/browser-dsp",
     "crates/modules",
 
     # binaries
@@ -127,6 +129,7 @@ opt-level = 2
 
 [workspace.dependencies]
 # workspace crates
+browser-dsp = { path = "./crates/browser-dsp" }
 util = { path = "./crates/util" }
 disks = { path = "./crates/disks" }
 gekko = { path = "./crates/gekko" }

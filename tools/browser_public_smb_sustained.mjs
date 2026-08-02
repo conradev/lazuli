@@ -29,10 +29,11 @@ import {
   waitForPublicRunner,
 } from "./browser_public_cdp.mjs";
 
-export const PUBLIC_SMB_SUSTAINED_SCHEMA = "lazuli-public-smb-sustained-v3";
+export const PUBLIC_SMB_SUSTAINED_SCHEMA = "lazuli-public-smb-sustained-v4";
 export const PUBLIC_SMB_SUSTAINED_SCENARIO = "smb-sustained-play";
 
 const IMMUTABLE_FRONTEND_PATH = /^\/assets\/frontend-[0-9a-f]{64}\.html$/;
+const IMMUTABLE_DSP_PATH = /^\/assets\/browser-dsp-([0-9a-f]{64})\.wasm$/;
 const PRODUCTION_ORIGIN = "https://gekko.free";
 
 function evidenceFailure(path, detail) {
@@ -76,6 +77,9 @@ function exactJson(actual, expected, path, detail) {
 
 function validateReleaseIdentity(release, expected, path) {
   requiredObject(release, path);
+  if (release.schema !== 3) {
+    evidenceFailure(`${path}.schema`, "expected release schema 3");
+  }
   if (release.commit !== expected.commit) {
     evidenceFailure(`${path}.commit`, `expected ${expected.commit}`);
   }
@@ -88,6 +92,16 @@ function validateReleaseIdentity(release, expected, path) {
     || !IMMUTABLE_FRONTEND_PATH.test(frontend.url)
   ) {
     evidenceFailure(`${path}.frontend.url`, "expected a content-addressed frontend path");
+  }
+  const dsp = requiredObject(release.dsp, `${path}.dsp`);
+  const dspMatch = typeof dsp.url === "string" ? dsp.url.match(IMMUTABLE_DSP_PATH) : null;
+  if (
+    dspMatch === null
+    || dsp.sha256 !== dspMatch[1]
+    || !Number.isSafeInteger(dsp.bytes)
+    || dsp.bytes <= 0
+  ) {
+    evidenceFailure(`${path}.dsp`, "expected the content-addressed browser DSP artifact");
   }
   return release;
 }

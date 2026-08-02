@@ -4,19 +4,19 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::{env, fs};
 
+use browser_dsp::{
+    ABI_VERSION as DSP_ABI_VERSION, ARAM_BYTES as ARAM_SIZE, ARAM_OFFSET as ARAM_PTR,
+    MAIN_RAM_BYTES as RAM_SIZE, MAIN_RAM_OFFSET as RAM_PTR, MEMORY_INITIAL_PAGES,
+    MEMORY_MAXIMUM_PAGES, MMIO_BYTES as MMIO_SIZE, MMIO_OFFSET as MMIO_PTR,
+};
 use disks::binrw::BinRead;
 use disks::cso::{Cso, CsoReader};
 use disks::iso;
 use gekko::{GPR, Reg, SPR};
 use ppcwasmjit::gx_fifo_hook_runtime;
 
-const MEMORY_PAGES: usize = 416;
 const CPU_PTR: usize = 0x1000;
 const FASTMEM_LUT_PTR: usize = 0x1_0000;
-const RAM_PTR: usize = 0x10_0000;
-const RAM_SIZE: usize = 0x0180_0000;
-const MMIO_PTR: usize = RAM_PTR + RAM_SIZE;
-const MMIO_SIZE: usize = 1 << FASTMEM_PAGE_SHIFT;
 const LOCKED_CACHE_PTR: usize = MMIO_PTR + MMIO_SIZE;
 const LOCKED_CACHE_SIZE: usize = 16 * 1024;
 const GX_FIFO_STAGING_META_PTR: usize = LOCKED_CACHE_PTR + LOCKED_CACHE_SIZE;
@@ -226,6 +226,7 @@ fn main() {
         .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/wasm32-unknown-unknown/release/ppcwasmjit.wasm"));
+    let dsp_path = compiler_path.with_file_name("browser_dsp.wasm");
     let dol_path = arguments.next().map(PathBuf::from);
     let disc_path = arguments.next().map(PathBuf::from);
     let has_boot_asset = dol_path.is_some();
@@ -280,6 +281,8 @@ fn main() {
     fs::create_dir_all(&output_directory).expect("failed to create browser harness directory");
     let compiler_output = output_directory.join("ppcwasmjit.wasm");
     copy_browser_asset(&compiler_path, &compiler_output, "browser JIT compiler");
+    let dsp_output = output_directory.join("browser_dsp.wasm");
+    copy_browser_asset(&dsp_path, &dsp_output, "browser DSP");
     if let Some(dol_path) = &dol_path {
         let dol_output = output_directory.join("boot.dol");
         copy_browser_asset(dol_path, &dol_output, "boot DOL");
@@ -328,13 +331,23 @@ fn main() {
             &disc.stream_buffer_size.to_string(),
         )
         .replace("__TV_MODE__", &disc.tv_mode.to_string())
-        .replace("__MEMORY_PAGES__", &MEMORY_PAGES.to_string())
+        .replace(
+            "__MEMORY_INITIAL_PAGES__",
+            &MEMORY_INITIAL_PAGES.to_string(),
+        )
+        .replace(
+            "__MEMORY_MAXIMUM_PAGES__",
+            &MEMORY_MAXIMUM_PAGES.to_string(),
+        )
+        .replace("__DSP_ABI_VERSION__", &DSP_ABI_VERSION.to_string())
         .replace("__CPU_PTR__", &CPU_PTR.to_string())
         .replace("__FASTMEM_PTR__", &FASTMEM_LUT_PTR.to_string())
         .replace("__RAM_PTR__", &RAM_PTR.to_string())
         .replace("__RAM_SIZE__", &RAM_SIZE.to_string())
         .replace("__MMIO_PTR__", &MMIO_PTR.to_string())
         .replace("__MMIO_SIZE__", &MMIO_SIZE.to_string())
+        .replace("__ARAM_PTR__", &ARAM_PTR.to_string())
+        .replace("__ARAM_SIZE__", &ARAM_SIZE.to_string())
         .replace("__LOCKED_CACHE_PTR__", &LOCKED_CACHE_PTR.to_string())
         .replace("__LOCKED_CACHE_SIZE__", &LOCKED_CACHE_SIZE.to_string())
         .replace("__GX_FIFO_HOOK_RUNTIME__", &hex(&gx_fifo_runtime))
@@ -940,7 +953,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       </div>
       <label class="button primary file-picker disc-picker">
         Open ISO or CISO
-        <input id="disc-file" type="file" aria-label="Open ISO or CISO" accept=".iso,.ciso,.cso,application/octet-stream">
+        <input id="disc-file" data-testid="disc-upload" type="file" aria-label="Open ISO or CISO" accept=".iso,.ciso,.cso,application/octet-stream">
       </label>
       <label class="button file-picker ipl-picker">
         <span id="ipl-picker-label">Use local IPL</span>
@@ -962,13 +975,13 @@ const TEMPLATE: &str = r##"<!doctype html>
       </div>
       <!-- LAZULI DEBUG UI END -->
       <div id="controller-controls" aria-label="Controller">
-        <button id="controller-left" type="button" aria-label="Left">←</button>
-        <button id="controller-up" type="button" aria-label="Up">↑</button>
-        <button id="controller-down" type="button" aria-label="Down">↓</button>
-        <button id="controller-right" type="button" aria-label="Right">→</button>
-        <button id="controller-a" type="button">A</button>
-        <button id="controller-b" type="button">B</button>
-        <button id="controller-start" type="button">Start</button>
+        <button id="controller-left" data-testid="controller-left" type="button" aria-label="Left">←</button>
+        <button id="controller-up" data-testid="controller-up" type="button" aria-label="Up">↑</button>
+        <button id="controller-down" data-testid="controller-down" type="button" aria-label="Down">↓</button>
+        <button id="controller-right" data-testid="controller-right" type="button" aria-label="Right">→</button>
+        <button id="controller-a" data-testid="controller-a" type="button">A</button>
+        <button id="controller-b" data-testid="controller-b" type="button">B</button>
+        <button id="controller-start" data-testid="controller-start" type="button">Start</button>
       </div>
       <p class="key-help">Arrows · Z / X · Enter</p>
     </div>
@@ -989,7 +1002,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           <button id="apply-throttle" type="button">Apply rest</button>
           <input id="runner-render-every" type="number" aria-label="Render interval" min="1" max="1000" step="1" value="1">
           <button id="apply-presentation" type="button">Apply render interval</button>
-          <button id="snapshot-runner" type="button">Snapshot</button>
+          <button id="snapshot-runner" data-testid="diagnostics-capture" type="button">Snapshot</button>
           <button id="stop-runner" type="button">Stop</button>
         </div>
         <pre id="result" data-testid="browser-boot-result">RUNNING</pre>
@@ -6109,20 +6122,27 @@ const TEMPLATE: &str = r##"<!doctype html>
       return cache;
     }
 
-    const compilerWasmPromise = fetchBinary(
+    let compilerWasmPromise = fetchBinary(
       globalThis.compilerWasmUrl, "browser JIT compiler"
+    );
+    let browserDspWasmPromise = fetchBinary(
+      globalThis.browserDspWasmUrl, "browser DSP"
     );
     const discSourceConfigPromise = configuredDiscSource();
     const configuredExiIplImagePromise = configuredExiIplImage();
     let [
       compilerWasm,
+      browserDspWasm,
       discSourceConfig,
       configuredExiIpl,
     ] = await Promise.all([
       compilerWasmPromise,
+      browserDspWasmPromise,
       discSourceConfigPromise,
       configuredExiIplImagePromise,
     ]);
+    compilerWasmPromise = null;
+    browserDspWasmPromise = null;
     let discSource = null;
     let boot;
     if (discSourceConfig.kind === "boot-assets") {
@@ -6171,7 +6191,51 @@ const TEMPLATE: &str = r##"<!doctype html>
       [0x00000000, 0x00000000],
       [0xfff0001f, 0xfff00001],
     ];
-    const memory = new WebAssembly.Memory({ initial: __MEMORY_PAGES__ });
+    // The DSP allocator must bootstrap from the exact imported-memory minimum. It may grow only
+    // while constructing the interpreter; seal the memory at its maximum before creating a view.
+    const memory = new WebAssembly.Memory({
+      initial: __MEMORY_INITIAL_PAGES__,
+      maximum: __MEMORY_MAXIMUM_PAGES__,
+    });
+    const { instance: browserDspInstance } = await WebAssembly.instantiate(
+      browserDspWasm,
+      {
+        lazuli: { memory },
+        lazuli_dsp: {
+          main_ram_write_completed: invalidateDataReservationForExternalWrite,
+        },
+      }
+    );
+    browserDspWasm = null;
+    const browserDsp = browserDspInstance.exports;
+    check(browserDsp.browser_dsp_abi_version() === __DSP_ABI_VERSION__, "browser DSP ABI mismatch");
+    check(
+      browserDsp.browser_dsp_memory_initial_pages() === __MEMORY_INITIAL_PAGES__,
+      "browser DSP initial-memory layout mismatch"
+    );
+    check(
+      browserDsp.browser_dsp_memory_maximum_pages() === __MEMORY_MAXIMUM_PAGES__,
+      "browser DSP maximum-memory layout mismatch"
+    );
+    check(browserDsp.browser_dsp_main_ram_offset() === __RAM_PTR__, "browser DSP MEM1 offset mismatch");
+    check(browserDsp.browser_dsp_main_ram_bytes() === __RAM_SIZE__, "browser DSP MEM1 size mismatch");
+    check(browserDsp.browser_dsp_mmio_offset() === __MMIO_PTR__, "browser DSP MMIO offset mismatch");
+    check(browserDsp.browser_dsp_mmio_bytes() === __MMIO_SIZE__, "browser DSP MMIO size mismatch");
+    check(browserDsp.browser_dsp_aram_offset() === __ARAM_PTR__, "browser DSP ARAM offset mismatch");
+    check(browserDsp.browser_dsp_aram_bytes() === __ARAM_SIZE__, "browser DSP ARAM size mismatch");
+    check(browserDsp.browser_dsp_init() === 1, "browser DSP initialization failed");
+    const initializedMemoryPages = memory.buffer.byteLength / 65536;
+    check(
+      Number.isSafeInteger(initializedMemoryPages)
+        && initializedMemoryPages >= __MEMORY_INITIAL_PAGES__
+        && initializedMemoryPages <= __MEMORY_MAXIMUM_PAGES__,
+      "browser DSP initialization escaped the machine memory contract"
+    );
+    memory.grow(__MEMORY_MAXIMUM_PAGES__ - initializedMemoryPages);
+    check(
+      memory.buffer.byteLength === __MEMORY_MAXIMUM_PAGES__ * 65536,
+      "browser machine memory was not sealed"
+    );
     const bytes = new Uint8Array(memory.buffer);
     const view = new DataView(memory.buffer);
     const cpu = __CPU_PTR__;
@@ -7130,7 +7194,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let dspAudioDmaRemainingBlocks = 0;
     let nextDspAudioDmaCycle = null;
     let nextDspAudioDmaInterruptCycle = null;
-    const aram = new Uint8Array(0x01000000);
+    const aram = new Uint8Array(memory.buffer, __ARAM_PTR__, __ARAM_SIZE__);
     let aramTransfer = null;
     let diskReadBytes = 0;
     let diskReadHash = 0x811c9dc5;
@@ -27326,6 +27390,12 @@ const TEMPLATE: &str = r##"<!doctype html>
   <script type="module">
     import initBrowserRenderer, { WebGpuRenderer } from "/browser_renderer.js";
 
+    const documentId = crypto.randomUUID();
+    document.body.dataset.documentId = documentId;
+    const captureDiagnosticsButton = document.querySelector("#capture-diagnostics");
+    if (captureDiagnosticsButton !== null) {
+      captureDiagnosticsButton.dataset.testid = "diagnostics-capture";
+    }
     const output = document.querySelector("#result") ?? { textContent: "" };
     const display = document.querySelector("#display");
     const runnerStatus = document.querySelector("#runner-status");
@@ -29602,9 +29672,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         : null;
     const discStatus = document.querySelector("#disc-status");
     const iplStatus = document.querySelector("#ipl-status");
-    const captureDiagnosticsButton = document.querySelector("#capture-diagnostics");
     let worker = null;
     let workerUrl = null;
+    let workerRunSequence = 0;
     let terminalPublicationSequence = 0;
     let captureDiagnosticsRequestSequence = 0;
     let captureDiagnosticsPendingRequestId = null;
@@ -29734,11 +29804,14 @@ const TEMPLATE: &str = r##"<!doctype html>
         `globalThis.iplSourceConfig = ${JSON.stringify(workerIplConfig)};`,
         `globalThis.dolUrl = ${JSON.stringify(new URL("/boot.dol", location.href).href)};`,
         `globalThis.compilerWasmUrl = ${JSON.stringify(new URL("/ppcwasmjit.wasm", location.href).href)};`,
+        `globalThis.browserDspWasmUrl = ${JSON.stringify(new URL("/browser_dsp.wasm", location.href).href)};`,
       ].join("\n");
       workerUrl = URL.createObjectURL(new Blob([bootstrap, "\n", source], {
         type: "text/javascript",
       }));
       worker = new Worker(workerUrl, { type: "module", name: "lazuli-cycle-runner" });
+      workerRunSequence += 1;
+      document.body.dataset.workerRunId = String(workerRunSequence);
       worker.addEventListener("message", handleWorkerMessage);
       worker.addEventListener("error", handleWorkerError);
       if (discConfig.kind === "file") {

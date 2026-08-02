@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  RELEASE_SCHEMA,
   WASM_CHUNK_SIZE,
   releaseIdentityPayload,
   sha256Hex,
@@ -31,7 +32,7 @@ async function activeRelease() {
     bytes,
   });
   const release = {
-    schema: 2,
+    schema: RELEASE_SCHEMA,
     releaseId: "0".repeat(64),
     source: {
       repository: "https://github.com/conradev/lazuli",
@@ -49,6 +50,7 @@ async function activeRelease() {
       javascript: asset("renderer", "js", 2345),
       wasm: asset("renderer-wasm", "wasm", 3456),
     },
+    dsp: asset("browser-dsp", "wasm", 4567),
     backend: {
       url: "/ppcwasmjit.wasm",
       sha256: hash,
@@ -110,6 +112,7 @@ test("public release pins the outer path and immutable iframe identity", async (
     status: 200,
   }, options);
   assert.equal(identity.frontend.url, release.frontend.url);
+  assert.deepEqual(identity.dsp, release.dsp);
   assert.equal(identity.commit, release.source.commit);
   assert.equal(identity.releaseId, release.releaseId);
 
