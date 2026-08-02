@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-// Pure, deterministic reference for the narrow AX GameCube voice path needed
-// to turn a linked parameter-block list into one 5 ms main L/R PCM buffer.
+// Pure, deterministic reference for the AX GameCube voice path needed to mix a
+// linked parameter-block list into the nine 5 ms MAIN/AUXA/AUXB L/R/surround
+// signed-32 accumulator planes.
 //
 // The layout and arithmetic follow Dolphin's AXStructs.h, AXVoice.h,
 // DSPAccelerator.{h,cpp}, and AX.cpp. This module intentionally does not model
-// the DSP mailbox/command-list protocol, AUX or surround routing, depop/effect
-// buffers, PB updates, ITD/filters, PCM8, DROM polyphase coefficients, AI DMA,
-// or a host audio sink. Polyphase SRC requests use Dolphin's coefficient-free
-// linear fallback. Main L/R accumulators default to zero and may be supplied as
-// exact 160-sample Int32Array snapshots. The reference clones only those
-// bounded accumulator inputs and individual parameter blocks; it never clones
-// MRAM.
+// the DSP mailbox/command-list protocol, effect-buffer processing, ITD/filters,
+// PCM8, DROM polyphase coefficients, AI DMA, or a host audio sink.
+// Polyphase SRC requests use Dolphin's coefficient-free linear fallback. All
+// nine accumulators default to zero and may be supplied as exact, independent
+// 160-sample Int32Array snapshots. The reference clones only those bounded
+// accumulator inputs, individual parameter blocks, and fixed 128-byte update
+// tables; it never clones all of MRAM.
 
-export const AX_REFERENCE_SCHEMA = "lazuli-ax-gc-voice-reference-v1";
+export const AX_REFERENCE_SCHEMA = "lazuli-ax-gc-voice-reference-v6";
 export const AX_OLD_UCODE_HASH = 0x4e8a8b21;
 export const AX_FZERO_UCODE_HASH = 0x07f88145;
 export const AX_INITIAL_MAIN_BUFFER_CONTRACT =
   "optional-int32x160-zero-default";
+export const AX_INITIAL_ACCUMULATOR_CONTRACT =
+  "optional-complete-nine-plane-int32x160-zero-default";
 
 export const AX_SAMPLE_FORMAT = Object.freeze({
   DSP_ADPCM: 0x0000,
@@ -33,29 +36,57 @@ export const AX_SRC_TYPE = Object.freeze({
   NEAREST: 2,
 });
 
+// Raw newer-GameCube AXPB::mixer_control bits. 0x4000 selects the AUXB
+// surround input in DPL2 mode on the DSP. Like Dolphin HLE, this reference
+// accepts it but it has no observable effect while ITD is unsupported.
+export const AX_MIXER_CONTROL = Object.freeze({
+  MAIN_LEFT: 0x0001,
+  MAIN_RIGHT: 0x0002,
+  MAIN_SURROUND: 0x0004,
+  MAIN_RAMP: 0x0008,
+  AUXA_LEFT: 0x0010,
+  AUXA_RIGHT: 0x0020,
+  AUXA_LEFT_RIGHT_RAMP: 0x0040,
+  AUXA_SURROUND: 0x0080,
+  AUXA_SURROUND_RAMP: 0x0100,
+  AUXB_LEFT: 0x0200,
+  AUXB_RIGHT: 0x0400,
+  AUXB_LEFT_RIGHT_RAMP: 0x0800,
+  AUXB_SURROUND: 0x1000,
+  AUXB_SURROUND_RAMP: 0x2000,
+  DPL2_AUXB_SURROUND_INPUT: 0x4000,
+});
+
 export const AX_REFERENCE_LIMITS = Object.freeze({
   frames: 160,
   samplesPerMillisecond: 32,
   milliseconds: 5,
   channels: 2,
+  accumulatorPlanes: 9,
   sampleRateHz: 32_000,
   maximumParameterBlocks: 64,
   hardMaximumParameterBlocks: 1_024,
+  logicalParameterBlockWords: 122,
+  maximumParameterBlockUpdates: 32,
+  parameterBlockUpdateBytes: 128,
 });
 
 export const AX_REFERENCE_NON_GOALS = Object.freeze([
   "DSP mailbox and AX command-list parsing",
-  "AUX, surround, depop, and effect-buffer processing",
-  "parameter-block updates",
+  "effect-buffer processing",
   "initial-time-delay and low-pass filtering",
   "PCM8 and DROM-coefficient polyphase resampling",
-  "non-zero CMD_SETUP accumulator initialization",
   "AI DMA and host audio output",
 ]);
 
-// Logical u16 word offsets in Dolphin's AXPB. The 0x4e8a8b21 layout omits
-// words 93..96 (PBLowPassFilter), moving LOOP_COUNTER and padding four words
-// earlier in guest memory.
+// Logical u16 word offsets in Dolphin's semantic AXPB. Melee's 0x4e8a8b21
+// and F-Zero's 0x07f88145 layouts are three distinct physical ABIs. Melee
+// omits words 93..96 (PBLowPassFilter), moves LOOP_COUNTER four words earlier,
+// and transfers its complete 0xc0-byte record. F-Zero has a ten-word
+// intermediate filter area at physical words 93..102, LOOP_COUNTER at 103,
+// and a 0xec-byte CPU record whose final 0x1c bytes are outside its exact
+// 0xd0-byte DSP DMA. The full newer layout uses the four-word LPF,
+// LOOP_COUNTER at 97, and transfers its complete 0xf4-byte record.
 export const AX_PB_WORD = Object.freeze({
   NEXT_HIGH: 0,
   NEXT_LOW: 1,
@@ -71,13 +102,36 @@ export const AX_PB_WORD = Object.freeze({
   MAIN_LEFT_DELTA: 10,
   MAIN_RIGHT_VOLUME: 11,
   MAIN_RIGHT_DELTA: 12,
+  AUXA_LEFT_VOLUME: 13,
+  AUXA_LEFT_DELTA: 14,
+  AUXA_RIGHT_VOLUME: 15,
+  AUXA_RIGHT_DELTA: 16,
+  AUXB_LEFT_VOLUME: 17,
+  AUXB_LEFT_DELTA: 18,
+  AUXB_RIGHT_VOLUME: 19,
+  AUXB_RIGHT_DELTA: 20,
+  AUXB_SURROUND_VOLUME: 21,
+  AUXB_SURROUND_DELTA: 22,
+  MAIN_SURROUND_VOLUME: 23,
+  MAIN_SURROUND_DELTA: 24,
+  AUXA_SURROUND_VOLUME: 25,
+  AUXA_SURROUND_DELTA: 26,
 
   INITIAL_TIME_DELAY_ON: 27,
   UPDATE_COUNT_0: 34,
   UPDATE_COUNT_4: 38,
+  UPDATE_DATA_HIGH: 39,
+  UPDATE_DATA_LOW: 40,
 
   DPOP_MAIN_LEFT: 41,
+  DPOP_AUXA_LEFT: 42,
+  DPOP_AUXB_LEFT: 43,
   DPOP_MAIN_RIGHT: 44,
+  DPOP_AUXA_RIGHT: 45,
+  DPOP_AUXB_RIGHT: 46,
+  DPOP_MAIN_SURROUND: 47,
+  DPOP_AUXA_SURROUND: 48,
+  DPOP_AUXB_SURROUND: 49,
   VOLUME_ENVELOPE_CURRENT: 50,
   VOLUME_ENVELOPE_DELTA: 51,
 
@@ -111,13 +165,115 @@ export const AX_PB_WORD = Object.freeze({
   LOOP_COUNTER: 97,
 });
 
-const AX_PB_LOGICAL_WORDS = 122;
-const AX_PB_OLD_PHYSICAL_WORDS = AX_PB_LOGICAL_WORDS - 4;
+const AX_PB_LOGICAL_WORDS =
+  AX_REFERENCE_LIMITS.logicalParameterBlockWords;
+const AX_PB_OLD_PHYSICAL_WORDS = 0xc0 / 2;
+// F-Zero's retail AXRNA 1.02 code links and indexes 64 records at +0xec,
+// while ucode 0x07f88145 programs DSBL=0xd0 for both PB DMA directions.
+const AX_PB_FZERO_LAYOUT_WORDS = 0xec / 2;
+const AX_PB_FZERO_DMA_WORDS = 0xd0 / 2;
 const U32_MAX = 0xffff_ffff;
-const MAIN_LEFT = 1;
-const MAIN_RIGHT = 2;
-const MAIN_LEFT_RAMP = 4;
-const MAIN_RIGHT_RAMP = 8;
+const ACCUMULATOR_BUSES = Object.freeze(["main", "auxA", "auxB"]);
+const ACCUMULATOR_CHANNELS = Object.freeze([
+  "left",
+  "right",
+  "surround",
+]);
+
+// Dolphin AXPB::mixer stores these word pairs in an order that intentionally
+// differs from both the PBDpop structure and the processing order.
+const MIX_ROUTES = Object.freeze([
+  Object.freeze({
+    key: "main.left",
+    bus: "main",
+    channel: "left",
+    enableBit: AX_MIXER_CONTROL.MAIN_LEFT,
+    rampBit: AX_MIXER_CONTROL.MAIN_RAMP,
+    volumeWord: AX_PB_WORD.MAIN_LEFT_VOLUME,
+    deltaWord: AX_PB_WORD.MAIN_LEFT_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_MAIN_LEFT,
+  }),
+  Object.freeze({
+    key: "main.right",
+    bus: "main",
+    channel: "right",
+    enableBit: AX_MIXER_CONTROL.MAIN_RIGHT,
+    rampBit: AX_MIXER_CONTROL.MAIN_RAMP,
+    volumeWord: AX_PB_WORD.MAIN_RIGHT_VOLUME,
+    deltaWord: AX_PB_WORD.MAIN_RIGHT_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_MAIN_RIGHT,
+  }),
+  Object.freeze({
+    key: "main.surround",
+    bus: "main",
+    channel: "surround",
+    enableBit: AX_MIXER_CONTROL.MAIN_SURROUND,
+    rampBit: AX_MIXER_CONTROL.MAIN_RAMP,
+    volumeWord: AX_PB_WORD.MAIN_SURROUND_VOLUME,
+    deltaWord: AX_PB_WORD.MAIN_SURROUND_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_MAIN_SURROUND,
+  }),
+  Object.freeze({
+    key: "auxA.left",
+    bus: "auxA",
+    channel: "left",
+    enableBit: AX_MIXER_CONTROL.AUXA_LEFT,
+    rampBit: AX_MIXER_CONTROL.AUXA_LEFT_RIGHT_RAMP,
+    volumeWord: AX_PB_WORD.AUXA_LEFT_VOLUME,
+    deltaWord: AX_PB_WORD.AUXA_LEFT_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_AUXA_LEFT,
+  }),
+  Object.freeze({
+    key: "auxA.right",
+    bus: "auxA",
+    channel: "right",
+    enableBit: AX_MIXER_CONTROL.AUXA_RIGHT,
+    rampBit: AX_MIXER_CONTROL.AUXA_LEFT_RIGHT_RAMP,
+    volumeWord: AX_PB_WORD.AUXA_RIGHT_VOLUME,
+    deltaWord: AX_PB_WORD.AUXA_RIGHT_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_AUXA_RIGHT,
+  }),
+  Object.freeze({
+    key: "auxA.surround",
+    bus: "auxA",
+    channel: "surround",
+    enableBit: AX_MIXER_CONTROL.AUXA_SURROUND,
+    rampBit: AX_MIXER_CONTROL.AUXA_SURROUND_RAMP,
+    volumeWord: AX_PB_WORD.AUXA_SURROUND_VOLUME,
+    deltaWord: AX_PB_WORD.AUXA_SURROUND_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_AUXA_SURROUND,
+  }),
+  Object.freeze({
+    key: "auxB.left",
+    bus: "auxB",
+    channel: "left",
+    enableBit: AX_MIXER_CONTROL.AUXB_LEFT,
+    rampBit: AX_MIXER_CONTROL.AUXB_LEFT_RIGHT_RAMP,
+    volumeWord: AX_PB_WORD.AUXB_LEFT_VOLUME,
+    deltaWord: AX_PB_WORD.AUXB_LEFT_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_AUXB_LEFT,
+  }),
+  Object.freeze({
+    key: "auxB.right",
+    bus: "auxB",
+    channel: "right",
+    enableBit: AX_MIXER_CONTROL.AUXB_RIGHT,
+    rampBit: AX_MIXER_CONTROL.AUXB_LEFT_RIGHT_RAMP,
+    volumeWord: AX_PB_WORD.AUXB_RIGHT_VOLUME,
+    deltaWord: AX_PB_WORD.AUXB_RIGHT_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_AUXB_RIGHT,
+  }),
+  Object.freeze({
+    key: "auxB.surround",
+    bus: "auxB",
+    channel: "surround",
+    enableBit: AX_MIXER_CONTROL.AUXB_SURROUND,
+    rampBit: AX_MIXER_CONTROL.AUXB_SURROUND_RAMP,
+    volumeWord: AX_PB_WORD.AUXB_SURROUND_VOLUME,
+    deltaWord: AX_PB_WORD.AUXB_SURROUND_DELTA,
+    dpopWord: AX_PB_WORD.DPOP_AUXB_SURROUND,
+  }),
+]);
 
 class AxReferenceRejection extends Error {
   constructor(reason, details = {}) {
@@ -138,7 +294,7 @@ function requireBytes(value, name) {
   }
 }
 
-function requireMainAccumulator(value, name) {
+function requireAccumulator(value, name) {
   if (value === undefined) return;
   if (!(value instanceof Int32Array)) {
     throw new TypeError(`${name} must be an Int32Array`);
@@ -150,10 +306,95 @@ function requireMainAccumulator(value, name) {
   }
 }
 
-function cloneMainAccumulator(value) {
+function cloneAccumulator(value) {
   return value === undefined
     ? new Int32Array(AX_REFERENCE_LIMITS.frames)
     : new Int32Array(value);
+}
+
+function requireAccumulatorBus(value, name) {
+  if (value === null || typeof value !== "object") {
+    throw new TypeError(`${name} must be an object`);
+  }
+  for (const channel of ACCUMULATOR_CHANNELS) {
+    if (!Object.hasOwn(value, channel)) {
+      throw new TypeError(`${name}.${channel} is required`);
+    }
+    requireAccumulator(value[channel], `${name}.${channel}`);
+  }
+}
+
+function requireInitialAccumulators(
+  initialAccumulators,
+  initialMainLeft,
+  initialMainRight,
+) {
+  if (initialAccumulators === undefined) {
+    requireAccumulator(initialMainLeft, "initialMainLeft");
+    requireAccumulator(initialMainRight, "initialMainRight");
+    return;
+  }
+  if (initialMainLeft !== undefined || initialMainRight !== undefined) {
+    throw new TypeError(
+      "initialAccumulators cannot be combined with legacy main accumulators",
+    );
+  }
+  if (initialAccumulators === null || typeof initialAccumulators !== "object") {
+    throw new TypeError("initialAccumulators must be an object");
+  }
+  if (!Object.hasOwn(initialAccumulators, "frames")) {
+    throw new TypeError("initialAccumulators.frames is required");
+  }
+  if (initialAccumulators.frames !== AX_REFERENCE_LIMITS.frames) {
+    throw new RangeError(
+      `initialAccumulators.frames must equal ${AX_REFERENCE_LIMITS.frames}`,
+    );
+  }
+
+  const planes = [];
+  for (const bus of ACCUMULATOR_BUSES) {
+    if (!Object.hasOwn(initialAccumulators, bus)) {
+      throw new TypeError(`initialAccumulators.${bus} is required`);
+    }
+    const value = initialAccumulators[bus];
+    requireAccumulatorBus(value, `initialAccumulators.${bus}`);
+    for (const channel of ACCUMULATOR_CHANNELS) {
+      const plane = value[channel];
+      for (const previous of planes) {
+        if (plane.buffer === previous) {
+          throw new TypeError(
+            "initialAccumulators planes must not alias",
+          );
+        }
+      }
+      planes.push(plane.buffer);
+    }
+  }
+}
+
+function cloneAccumulators({
+  initialAccumulators,
+  initialMainLeft,
+  initialMainRight,
+}) {
+  const nested = initialAccumulators !== undefined;
+  const result = { frames: AX_REFERENCE_LIMITS.frames };
+  for (const bus of ACCUMULATOR_BUSES) {
+    const channels = {};
+    for (const channel of ACCUMULATOR_CHANNELS) {
+      let source;
+      if (nested) {
+        source = initialAccumulators[bus][channel];
+      } else if (bus === "main" && channel === "left") {
+        source = initialMainLeft;
+      } else if (bus === "main" && channel === "right") {
+        source = initialMainRight;
+      }
+      channels[channel] = cloneAccumulator(source);
+    }
+    result[bus] = Object.freeze(channels);
+  }
+  return Object.freeze(result);
 }
 
 function requireU32(value, name) {
@@ -200,30 +441,79 @@ function pbUsesOldLayout(ucodeHash) {
   return (ucodeHash >>> 0) === AX_OLD_UCODE_HASH;
 }
 
-function pbPhysicalWord(logicalWord, oldLayout) {
-  if (
-    oldLayout
-    && logicalWord >= AX_PB_WORD.LOW_PASS_FILTER_ON
-    && logicalWord <= AX_PB_WORD.LOW_PASS_FILTER_END
-  ) {
-    return null;
+function pbLayoutWords(ucodeHash) {
+  const hash = ucodeHash >>> 0;
+  if (hash === AX_OLD_UCODE_HASH) return AX_PB_OLD_PHYSICAL_WORDS;
+  if (hash === AX_FZERO_UCODE_HASH) return AX_PB_FZERO_LAYOUT_WORDS;
+  return AX_PB_LOGICAL_WORDS;
+}
+
+function pbDmaWords(ucodeHash) {
+  return (ucodeHash >>> 0) === AX_FZERO_UCODE_HASH
+    ? AX_PB_FZERO_DMA_WORDS
+    : pbLayoutWords(ucodeHash);
+}
+
+function pbPhysicalWord(logicalWord, ucodeHash) {
+  const hash = ucodeHash >>> 0;
+  if (hash === AX_OLD_UCODE_HASH) {
+    if (
+      logicalWord >= AX_PB_WORD.LOW_PASS_FILTER_ON
+      && logicalWord <= AX_PB_WORD.LOW_PASS_FILTER_END
+    ) {
+      return null;
+    }
+    if (logicalWord <= AX_PB_WORD.LOW_PASS_FILTER_END) {
+      return logicalWord;
+    }
+    const physicalWord = logicalWord - 4;
+    return physicalWord < AX_PB_OLD_PHYSICAL_WORDS
+      ? physicalWord
+      : null;
   }
-  if (oldLayout && logicalWord > AX_PB_WORD.LOW_PASS_FILTER_END) {
-    return logicalWord - 4;
+  if (hash === AX_FZERO_UCODE_HASH) {
+    if (logicalWord <= AX_PB_WORD.LOW_PASS_FILTER_ON) {
+      return logicalWord;
+    }
+    if (logicalWord === AX_PB_WORD.LOOP_COUNTER) return 103;
+    return null;
   }
   return logicalWord;
 }
 
-export function axParameterBlockByteLength(ucodeHash) {
-  requireU32(ucodeHash, "ucodeHash");
-  return (
-    pbUsesOldLayout(ucodeHash)
-      ? AX_PB_OLD_PHYSICAL_WORDS
-      : AX_PB_LOGICAL_WORDS
-  ) * 2;
+function pbLogicalWord(physicalWord, ucodeHash) {
+  const hash = ucodeHash >>> 0;
+  if (hash === AX_OLD_UCODE_HASH) {
+    return physicalWord < AX_PB_WORD.LOW_PASS_FILTER_ON
+      ? physicalWord
+      : physicalWord + 4;
+  }
+  if (hash === AX_FZERO_UCODE_HASH) {
+    if (physicalWord <= AX_PB_WORD.LOW_PASS_FILTER_ON) {
+      return physicalWord;
+    }
+    return physicalWord === 103 ? AX_PB_WORD.LOOP_COUNTER : null;
+  }
+  return physicalWord;
 }
 
-function physicalMramAddress(address, length, mramLength) {
+export function axParameterBlockByteLength(ucodeHash) {
+  requireU32(ucodeHash, "ucodeHash");
+  return pbLayoutWords(ucodeHash) * 2;
+}
+
+export function axParameterBlockDmaByteLength(ucodeHash) {
+  requireU32(ucodeHash, "ucodeHash");
+  return pbDmaWords(ucodeHash) * 2;
+}
+
+function physicalMramAddress(
+  address,
+  length,
+  mramLength,
+  rejectionReason = "parameter-block-out-of-bounds",
+  rejectionDetails = {},
+) {
   const logical = address >>> 0;
   // Dolphin masks both high address bits before selecting MEM1, so physical,
   // 0x4..., cached 0x8..., and uncached 0xC... pointers alias exactly.
@@ -234,7 +524,8 @@ function physicalMramAddress(address, length, mramLength) {
     || physical >= mramLength
     || physical > mramLength - length
   ) {
-    reject("parameter-block-out-of-bounds", {
+    reject(rejectionReason, {
+      ...rejectionDetails,
       address: logical,
       length,
       mramLength,
@@ -252,27 +543,142 @@ function writeBigEndianU16(bytes, offset, value) {
   bytes[offset + 1] = value & 0xff;
 }
 
-function decodeParameterBlock(mram, logicalAddress, physicalAddress, oldLayout) {
+function decodeParameterBlock(
+  mram,
+  logicalAddress,
+  physicalAddress,
+  ucodeHash,
+  parameterBlockDmaBytes,
+) {
+  const physicalData = new Uint8Array(
+    mram.subarray(
+      physicalAddress,
+      physicalAddress + parameterBlockDmaBytes,
+    ),
+  );
   const words = new Uint16Array(AX_PB_LOGICAL_WORDS);
   for (let logicalWord = 0; logicalWord < words.length; logicalWord += 1) {
-    const physicalWord = pbPhysicalWord(logicalWord, oldLayout);
+    const physicalWord = pbPhysicalWord(logicalWord, ucodeHash);
     if (physicalWord === null) continue;
     words[logicalWord] = readBigEndianU16(
-      mram,
-      physicalAddress + physicalWord * 2,
+      physicalData,
+      physicalWord * 2,
     );
   }
   return {
     logicalAddress: logicalAddress >>> 0,
     physicalAddress,
+    physicalData,
     words,
   };
 }
 
-function parameterBlockWrite(block, oldLayout, parameterBlockBytes) {
-  const data = new Uint8Array(parameterBlockBytes);
+function readStagedMramBytes(
+  mram,
+  physicalAddress,
+  byteLength,
+  stagedWrites,
+) {
+  const bytes = new Uint8Array(
+    mram.subarray(physicalAddress, physicalAddress + byteLength),
+  );
+  const readEnd = physicalAddress + byteLength;
+  for (const write of stagedWrites) {
+    const writeEnd = write.physicalAddress + write.byteLength;
+    const overlapStart = Math.max(physicalAddress, write.physicalAddress);
+    const overlapEnd = Math.min(readEnd, writeEnd);
+    if (overlapStart >= overlapEnd) continue;
+    bytes.set(
+      write.data.subarray(
+        overlapStart - write.physicalAddress,
+        overlapEnd - write.physicalAddress,
+      ),
+      overlapStart - physicalAddress,
+    );
+  }
+  return bytes;
+}
+
+function loadParameterBlockUpdates({
+  block,
+  context,
+  mram,
+  stagedWrites,
+}) {
+  const { words } = block;
+  const logicalAddress = blockAddress(
+    words,
+    AX_PB_WORD.UPDATE_DATA_HIGH,
+    AX_PB_WORD.UPDATE_DATA_LOW,
+  );
+  const byteLength = AX_REFERENCE_LIMITS.parameterBlockUpdateBytes;
+  const physicalAddress = physicalMramAddress(
+    logicalAddress,
+    byteLength,
+    mram.length,
+    "parameter-block-update-table-out-of-bounds",
+    { parameterBlock: block.logicalAddress },
+  );
+  const bytes = readStagedMramBytes(
+    mram,
+    physicalAddress,
+    byteLength,
+    stagedWrites,
+  );
+  const updates = new Uint16Array(
+    AX_REFERENCE_LIMITS.maximumParameterBlockUpdates * 2,
+  );
+  for (let index = 0; index < updates.length; index += 1) {
+    updates[index] = readBigEndianU16(bytes, index * 2);
+  }
+  context.parameterBlockUpdateTables += 1;
+  context.parameterBlockUpdateReadBytes += byteLength;
+  return updates;
+}
+
+function applyParameterBlockUpdates(
+  block,
+  millisecond,
+  updates,
+  context,
+) {
+  const { words } = block;
+  let startIndex = 0;
+  for (let index = 0; index < millisecond; index += 1) {
+    startIndex += words[AX_PB_WORD.UPDATE_COUNT_0 + index];
+  }
+
+  const count = words[AX_PB_WORD.UPDATE_COUNT_0 + millisecond];
+  const maximumUpdates = AX_REFERENCE_LIMITS.maximumParameterBlockUpdates;
+  if (
+    startIndex >= maximumUpdates
+    || count > maximumUpdates - startIndex
+  ) {
+    if (count !== 0) context.parameterBlockUpdateSlicesSkipped += 1;
+    return;
+  }
+  if (count === 0) return;
+
+  const endIndex = startIndex + count;
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const updateOffset = updates[index * 2];
+    const updateValue = updates[index * 2 + 1];
+    context.parameterBlockUpdateEntriesVisited += 1;
+    if (updateOffset >= context.parameterBlockDmaWords) {
+      context.parameterBlockUpdateOffsetsIgnored += 1;
+      continue;
+    }
+    writeBigEndianU16(block.physicalData, updateOffset * 2, updateValue);
+    const logicalWord = pbLogicalWord(updateOffset, context.ucodeHash);
+    if (logicalWord !== null) words[logicalWord] = updateValue;
+    context.parameterBlockUpdateWordWrites += 1;
+  }
+}
+
+function parameterBlockWrite(block, ucodeHash) {
+  const data = new Uint8Array(block.physicalData);
   for (let logicalWord = 0; logicalWord < block.words.length; logicalWord += 1) {
-    const physicalWord = pbPhysicalWord(logicalWord, oldLayout);
+    const physicalWord = pbPhysicalWord(logicalWord, ucodeHash);
     if (physicalWord === null) continue;
     writeBigEndianU16(
       data,
@@ -301,22 +707,11 @@ function isPcm16Format(format) {
 function validateParameterBlock(block, oldLayout) {
   const { words } = block;
 
-  for (
-    let word = AX_PB_WORD.UPDATE_COUNT_0;
-    word <= AX_PB_WORD.UPDATE_COUNT_4;
-    word += 1
-  ) {
-    if (words[word] !== 0) {
-      reject("unsupported-parameter-block-updates", {
-        parameterBlock: block.logicalAddress,
-        millisecond: word - AX_PB_WORD.UPDATE_COUNT_0,
-        count: words[word],
-      });
-    }
-  }
-
   const mixerControl = words[AX_PB_WORD.MIXER_CONTROL];
-  const supportedMixerMask = oldLayout ? 0x0008 : 0x000b;
+  // The old ucode uses bits 0..4 for its compact non-DPL2/DPL2 routing
+  // scheme. Newer GC ucodes use bits 0..14; bit 14 is the known DPL2 AUXB
+  // input selector and bit 15 remains unsupported.
+  const supportedMixerMask = oldLayout ? 0x001f : 0x7fff;
   const unsupportedMixerBits = mixerControl & ~supportedMixerMask;
   if (unsupportedMixerBits !== 0) {
     reject("unsupported-mixer-control", {
@@ -334,7 +729,7 @@ function validateParameterBlock(block, oldLayout) {
       parameterBlock: block.logicalAddress,
     });
   }
-  if (!oldLayout && words[AX_PB_WORD.LOW_PASS_FILTER_ON] !== 0) {
+  if (words[AX_PB_WORD.LOW_PASS_FILTER_ON] !== 0) {
     reject("unsupported-low-pass-filter", {
       parameterBlock: block.logicalAddress,
     });
@@ -375,72 +770,6 @@ function validateParameterBlock(block, oldLayout) {
       });
     }
   }
-}
-
-function collectParameterBlocks({
-  mram,
-  headAddress,
-  oldLayout,
-  parameterBlockBytes,
-  maximumParameterBlocks,
-}) {
-  const blocks = [];
-  const physicalAddresses = new Set();
-  const ranges = [];
-  let address = headAddress >>> 0;
-  while (address !== 0) {
-    if (blocks.length >= maximumParameterBlocks) {
-      reject("parameter-block-limit", {
-        maximumParameterBlocks,
-        nextAddress: address,
-      });
-    }
-    const physicalAddress = physicalMramAddress(
-      address,
-      parameterBlockBytes,
-      mram.length,
-    );
-    if (physicalAddresses.has(physicalAddress)) {
-      reject("parameter-block-cycle", {
-        address,
-        physicalAddress,
-      });
-    }
-    for (const range of ranges) {
-      if (
-        physicalAddress < range.end
-        && range.start < physicalAddress + parameterBlockBytes
-      ) {
-        reject("parameter-block-overlap", {
-          address,
-          physicalAddress,
-          conflictingAddress: range.address,
-          conflictingPhysicalAddress: range.start,
-        });
-      }
-    }
-    physicalAddresses.add(physicalAddress);
-    ranges.push({
-      address,
-      start: physicalAddress,
-      end: physicalAddress + parameterBlockBytes,
-    });
-
-    const block = decodeParameterBlock(
-      mram,
-      address,
-      physicalAddress,
-      oldLayout,
-    );
-    validateParameterBlock(block, oldLayout);
-    blocks.push(block);
-    address = blockAddress(
-      block.words,
-      AX_PB_WORD.NEXT_HIGH,
-      AX_PB_WORD.NEXT_LOW,
-    );
-  }
-  return blocks;
 }
 
 function readAramByte(context, address, parameterBlock) {
@@ -716,20 +1045,48 @@ function sourceSamples(block, count, context) {
   return resampleLinear(block, count, context);
 }
 
-function mainMixerControl(mixerControl, oldLayout) {
-  if (oldLayout) {
-    const ramp = (mixerControl & 0x0008) !== 0;
-    return MAIN_LEFT
-      | MAIN_RIGHT
-      | (ramp ? MAIN_LEFT_RAMP | MAIN_RIGHT_RAMP : 0);
+function mixerRoutes(mixerControl, oldLayout) {
+  if (!oldLayout) {
+    return MIX_ROUTES.map(route => Object.freeze({
+      route,
+      enabled: (mixerControl & route.enableBit) !== 0,
+      ramp: (mixerControl & route.rampBit) !== 0,
+    }));
   }
-  return (
-    ((mixerControl & 0x0001) !== 0 ? MAIN_LEFT : 0)
-    | ((mixerControl & 0x0002) !== 0 ? MAIN_RIGHT : 0)
-    | ((mixerControl & 0x0008) !== 0
-      ? MAIN_LEFT_RAMP | MAIN_RIGHT_RAMP
-      : 0)
-  );
+
+  const enabled = new Set(["main.left", "main.right"]);
+  const dpl2 = (mixerControl & 0x0010) !== 0;
+  if (dpl2) {
+    if ((mixerControl & 0x0006) === 0) {
+      enabled.add("auxB.left");
+      enabled.add("auxB.right");
+    }
+    if ((mixerControl & 0x0007) === 1) {
+      enabled.add("auxA.left");
+      enabled.add("auxA.right");
+      enabled.add("auxA.surround");
+    }
+  } else {
+    if ((mixerControl & 0x0001) !== 0) {
+      enabled.add("auxA.left");
+      enabled.add("auxA.right");
+    }
+    if ((mixerControl & 0x0002) !== 0) {
+      enabled.add("auxB.left");
+      enabled.add("auxB.right");
+    }
+    if ((mixerControl & 0x0004) !== 0) {
+      enabled.add("main.surround");
+      if (enabled.has("auxA.left")) enabled.add("auxA.surround");
+      if (enabled.has("auxB.left")) enabled.add("auxB.surround");
+    }
+  }
+  const ramp = (mixerControl & 0x0008) !== 0;
+  return MIX_ROUTES.map(route => Object.freeze({
+    route,
+    enabled: enabled.has(route.key),
+    ramp,
+  }));
 }
 
 function mixChannel({
@@ -755,26 +1112,45 @@ function mixChannel({
   words[dpopWord] = dpop & 0xffff;
 }
 
-function processParameterBlock(block, left, right, oldLayout, context) {
+function processParameterBlock(
+  block,
+  updates,
+  accumulators,
+  oldLayout,
+  context,
+) {
   const { words } = block;
-  if (words[AX_PB_WORD.RUNNING] !== 1) return;
-  context.voicesProcessed += 1;
-  if (words[AX_PB_WORD.SAMPLE_FORMAT] === AX_SAMPLE_FORMAT.DSP_ADPCM) {
-    context.adpcmVoices += 1;
-  } else {
-    context.pcm16Voices += 1;
-  }
-
-  const control = mainMixerControl(
-    words[AX_PB_WORD.MIXER_CONTROL],
-    oldLayout,
-  );
+  let voiceProcessed = false;
+  let usedAdpcm = false;
+  let usedPcm16 = false;
   for (
     let millisecond = 0;
     millisecond < AX_REFERENCE_LIMITS.milliseconds;
     millisecond += 1
   ) {
-    if (words[AX_PB_WORD.RUNNING] !== 1) break;
+    applyParameterBlockUpdates(
+      block,
+      millisecond,
+      updates,
+      context,
+    );
+    validateParameterBlock(block, oldLayout);
+    if (words[AX_PB_WORD.RUNNING] !== 1) continue;
+    if (!voiceProcessed) {
+      voiceProcessed = true;
+      context.voicesProcessed += 1;
+    }
+    if (words[AX_PB_WORD.SAMPLE_FORMAT] === AX_SAMPLE_FORMAT.DSP_ADPCM) {
+      if (!usedAdpcm) {
+        usedAdpcm = true;
+        context.adpcmVoices += 1;
+      }
+    } else if (!usedPcm16) {
+      usedPcm16 = true;
+      context.pcm16Voices += 1;
+    }
+    context.voiceSubframesProcessed += 1;
+
     const samples = sourceSamples(
       block,
       AX_REFERENCE_LIMITS.samplesPerMillisecond,
@@ -797,26 +1173,21 @@ function processParameterBlock(block, left, right, oldLayout, context) {
 
     const offset =
       millisecond * AX_REFERENCE_LIMITS.samplesPerMillisecond;
-    if ((control & MAIN_LEFT) !== 0) {
+    const routes = mixerRoutes(
+      words[AX_PB_WORD.MIXER_CONTROL],
+      oldLayout,
+    );
+    for (const { route, enabled, ramp } of routes) {
+      if (!enabled) continue;
+      const plane = accumulators[route.bus][route.channel];
       mixChannel({
         block,
-        buffer: left.subarray(offset, offset + samples.length),
+        buffer: plane.subarray(offset, offset + samples.length),
         samples,
-        volumeWord: AX_PB_WORD.MAIN_LEFT_VOLUME,
-        deltaWord: AX_PB_WORD.MAIN_LEFT_DELTA,
-        dpopWord: AX_PB_WORD.DPOP_MAIN_LEFT,
-        ramp: (control & MAIN_LEFT_RAMP) !== 0,
-      });
-    }
-    if ((control & MAIN_RIGHT) !== 0) {
-      mixChannel({
-        block,
-        buffer: right.subarray(offset, offset + samples.length),
-        samples,
-        volumeWord: AX_PB_WORD.MAIN_RIGHT_VOLUME,
-        deltaWord: AX_PB_WORD.MAIN_RIGHT_DELTA,
-        dpopWord: AX_PB_WORD.DPOP_MAIN_RIGHT,
-        ramp: (control & MAIN_RIGHT_RAMP) !== 0,
+        volumeWord: route.volumeWord,
+        deltaWord: route.deltaWord,
+        dpopWord: route.dpopWord,
+        ramp,
       });
     }
   }
@@ -931,14 +1302,18 @@ export function renderAxVoiceReference({
   aram,
   headAddress,
   ucodeHash,
+  initialAccumulators,
   initialMainLeft,
   initialMainRight,
   maximumParameterBlocks = AX_REFERENCE_LIMITS.maximumParameterBlocks,
 }) {
   requireBytes(mram, "mram");
   requireBytes(aram, "aram");
-  requireMainAccumulator(initialMainLeft, "initialMainLeft");
-  requireMainAccumulator(initialMainRight, "initialMainRight");
+  requireInitialAccumulators(
+    initialAccumulators,
+    initialMainLeft,
+    initialMainRight,
+  );
   if (
     aram.length === 0
     || !Number.isInteger(Math.log2(aram.length))
@@ -959,19 +1334,18 @@ export function renderAxVoiceReference({
   }
 
   const oldLayout = pbUsesOldLayout(normalizedUcodeHash);
-  const parameterBlockBytes = axParameterBlockByteLength(
+  const parameterBlockLayoutBytes = axParameterBlockByteLength(
+    normalizedUcodeHash,
+  );
+  const parameterBlockDmaBytes = axParameterBlockDmaByteLength(
     normalizedUcodeHash,
   );
   try {
-    const blocks = collectParameterBlocks({
-      mram,
-      headAddress: normalizedHeadAddress,
-      oldLayout,
-      parameterBlockBytes,
-      maximumParameterBlocks,
+    const accumulators = cloneAccumulators({
+      initialAccumulators,
+      initialMainLeft,
+      initialMainRight,
     });
-    const left = cloneMainAccumulator(initialMainLeft);
-    const right = cloneMainAccumulator(initialMainRight);
     const context = {
       aram,
       aramMask: aram.length - 1,
@@ -982,20 +1356,99 @@ export function renderAxVoiceReference({
       voicesProcessed: 0,
       adpcmVoices: 0,
       pcm16Voices: 0,
+      voiceSubframesProcessed: 0,
       polyphaseFallbackSubframes: 0,
+      parameterBlockUpdateTables: 0,
+      parameterBlockUpdateReadBytes: 0,
+      parameterBlockUpdateEntriesVisited: 0,
+      parameterBlockUpdateWordWrites: 0,
+      parameterBlockUpdateOffsetsIgnored: 0,
+      parameterBlockUpdateSlicesSkipped: 0,
+      parameterBlockDmaWords: parameterBlockDmaBytes / 2,
+      ucodeHash: normalizedUcodeHash,
     };
 
-    for (const block of blocks) {
-      processParameterBlock(block, left, right, oldLayout, context);
+    const blocks = [];
+    const parameterBlockWritesMutable = [];
+    const physicalAddresses = new Set();
+    const parameterBlockRanges = [];
+    let address = normalizedHeadAddress;
+    while (address !== 0) {
+      if (blocks.length >= maximumParameterBlocks) {
+        reject("parameter-block-limit", {
+          maximumParameterBlocks,
+          nextAddress: address,
+        });
+      }
+      const physicalAddress = physicalMramAddress(
+        address,
+        parameterBlockDmaBytes,
+        mram.length,
+      );
+      if (physicalAddresses.has(physicalAddress)) {
+        reject("parameter-block-cycle", {
+          address,
+          physicalAddress,
+        });
+      }
+      for (const range of parameterBlockRanges) {
+        if (
+          physicalAddress < range.end
+          && range.start < physicalAddress + parameterBlockDmaBytes
+        ) {
+          reject("parameter-block-overlap", {
+            address,
+            physicalAddress,
+            conflictingAddress: range.address,
+            conflictingPhysicalAddress: range.start,
+          });
+        }
+      }
+      physicalAddresses.add(physicalAddress);
+      parameterBlockRanges.push({
+        address,
+        start: physicalAddress,
+        end: physicalAddress + parameterBlockDmaBytes,
+      });
+
+      const block = decodeParameterBlock(
+        mram,
+        address,
+        physicalAddress,
+        normalizedUcodeHash,
+        parameterBlockDmaBytes,
+      );
+      const updates = loadParameterBlockUpdates({
+        block,
+        context,
+        mram,
+        stagedWrites: parameterBlockWritesMutable,
+      });
+      processParameterBlock(
+        block,
+        updates,
+        accumulators,
+        oldLayout,
+        context,
+      );
+      blocks.push(block);
+      parameterBlockWritesMutable.push(parameterBlockWrite(
+        block,
+        normalizedUcodeHash,
+      ));
+      address = blockAddress(
+        block.words,
+        AX_PB_WORD.NEXT_HIGH,
+        AX_PB_WORD.NEXT_LOW,
+      );
     }
 
-    const rendered = buildOutput(left, right);
+    const rendered = buildOutput(
+      accumulators.main.left,
+      accumulators.main.right,
+    );
     const parameterBlockWrites = Object.freeze(
-      blocks.map(block => parameterBlockWrite(
-        block,
-        oldLayout,
-        parameterBlockBytes,
-      )),
+      parameterBlockWritesMutable,
     );
     const writebacks = Object.freeze(
       blocks.map(parameterBlockWriteback),
@@ -1003,18 +1456,43 @@ export function renderAxVoiceReference({
     const telemetry = Object.freeze({
       schema: AX_REFERENCE_SCHEMA,
       ucodeHash: hex32(normalizedUcodeHash),
-      parameterBlockLayoutBytes: parameterBlockBytes,
+      parameterBlockLayoutBytes,
       parameterBlocks: blocks.length,
       parameterBlockWriteBytes:
-        parameterBlockWrites.length * parameterBlockBytes,
+        parameterBlockWrites.reduce(
+          (total, write) => total + write.byteLength,
+          0,
+        ),
       initialMainBuffers:
-        initialMainLeft === undefined && initialMainRight === undefined
+        initialAccumulators === undefined
+          && initialMainLeft === undefined
+          && initialMainRight === undefined
           ? "zero"
           : "explicit",
       initialMainBufferContract: AX_INITIAL_MAIN_BUFFER_CONTRACT,
+      initialAccumulators: initialAccumulators !== undefined
+        ? "nested"
+        : initialMainLeft !== undefined || initialMainRight !== undefined
+          ? "legacy-main"
+          : "zero",
+      initialAccumulatorContract: AX_INITIAL_ACCUMULATOR_CONTRACT,
+      accumulatorPlanes: AX_REFERENCE_LIMITS.accumulatorPlanes,
       voicesProcessed: context.voicesProcessed,
       adpcmVoices: context.adpcmVoices,
       pcm16Voices: context.pcm16Voices,
+      voiceSubframesProcessed: context.voiceSubframesProcessed,
+      parameterBlockUpdateTables:
+        context.parameterBlockUpdateTables,
+      parameterBlockUpdateReadBytes:
+        context.parameterBlockUpdateReadBytes,
+      parameterBlockUpdateEntriesVisited:
+        context.parameterBlockUpdateEntriesVisited,
+      parameterBlockUpdateWordWrites:
+        context.parameterBlockUpdateWordWrites,
+      parameterBlockUpdateOffsetsIgnored:
+        context.parameterBlockUpdateOffsetsIgnored,
+      parameterBlockUpdateSlicesSkipped:
+        context.parameterBlockUpdateSlicesSkipped,
       sourceSampleReads: context.sourceSampleReads,
       aramSamplesDecoded: context.aramSamplesDecoded,
       aramWrappedReads: context.aramWrappedReads,
@@ -1034,10 +1512,11 @@ export function renderAxVoiceReference({
 
     return Object.freeze({
       ok: true,
+      accumulators,
       mainAccumulators: Object.freeze({
         frames: AX_REFERENCE_LIMITS.frames,
-        left,
-        right,
+        left: accumulators.main.left,
+        right: accumulators.main.right,
       }),
       output: Object.freeze({
         sampleRateHz: AX_REFERENCE_LIMITS.sampleRateHz,
