@@ -111,7 +111,8 @@ export const DI_DMA_AUTHORITY = deepFreeze({
       "DMA length writes clear the low five bits; control writes retain only TSTART, DMA, and RW.",
       "DI status interrupt bits are sticky W1C, their masks are writable, and the PI level is the OR of each status-and-mask pair.",
       "Read-sector offset is command word 1 multiplied by four; read-disc-ID requests 32 bytes at offset zero.",
-      "Disc data is copied only when the asynchronous read completes; TC then advances DIMAR, consumes DILENGTH, and clears TSTART.",
+      "Read-sector and read-disc-ID transfers copy the smaller of the requested length and normalized DILENGTH.",
+      "Disc data is copied only when the asynchronous read completes; successful TC then advances DIMAR by the full latched DILENGTH, consumes DILENGTH, and clears TSTART.",
       "Out-of-bounds reads report BlockOOB with DEINT and do not advance DMA registers.",
       "Inquiry writes its 12 compatibility bytes immediately, before delayed TC completion.",
       "Read scheduling has a 600 microsecond start cost and at most 32 MiB/s buffered transfer rate; seek, rotation, and buffer state can add latency.",
@@ -122,7 +123,7 @@ export const DI_DMA_AUTHORITY = deepFreeze({
   lazuliConservative: {
     classification: DI_DMA_AUTHORITY_CLASS.lazuliConservative,
     claims: [
-      "Only an equal, nonzero requested length and DMA length is admitted to the certified read path.",
+      "A zero requested length or zero normalized DMA length is rejected rather than treated as an unverified seek or empty transfer.",
       "A transaction must fit wholly in MEM1; a partial valid prefix is reported but no prefix is committed.",
       "A command start, register rewrite, or control rewrite while BUSY is rejected without replacing the accepted transaction.",
       "Successful disc reads invalidate only an overlapping MEM1 reservation and only when bytes commit at completion.",
@@ -167,14 +168,9 @@ export const DI_DMA_UNRESOLVED = deepFreeze([
     policy: "Reject and preserve the accepted transaction.",
   },
   {
-    id: "mismatched-request-and-dma-length",
-    policy:
-      "Reject; Dolphin clamps the disc read but finishes against DILENGTH, while current Lazuli requires equality.",
-  },
-  {
     id: "zero-length-read",
     policy:
-      "Reject; pinned Dolphin explicitly marks seek behavior for this case as untested.",
+      "Reject a zero requested length or zero normalized DILENGTH; pinned Dolphin explicitly marks zero-length seek behavior as untested.",
   },
   {
     id: "partial-or-invalid-mem1-target",
@@ -299,13 +295,18 @@ export const diDmaOracleVectors = deepFreeze([
       cycle: 4000,
       command0: 0xa8000040,
       dmaAddress: 0x00000400,
-      dmaLength: 0x20,
+      dmaLength: 0x40,
       discEndOffset: 0x00200000,
     },
     expected: {
       discOffset: 0,
       transferLength: 0x20,
       completionCycle: 296063,
+      dmaAddress: 0x00000440,
+      dmaLength: 0,
+      preservedSuffixBytes: 0x20,
+      status: DI_TRANSFER_COMPLETE_STATUS,
+      control: DI_DMA_MODE,
     },
   },
   {
@@ -421,36 +422,47 @@ export const diDmaOracleVectors = deepFreeze([
     },
   },
   {
-    id: "length-mismatch-fail-closed",
+    id: "length-mismatch-dolphin-clamp",
     authority: [
       DI_DMA_AUTHORITY_CLASS.dolphinCompatibility,
       DI_DMA_AUTHORITY_CLASS.lazuliConservative,
     ],
     outcomeAuthority: {
-      dolphinTransferLength:
+      clampedTransferAndRegisterCompletion:
         DI_DMA_AUTHORITY_CLASS.dolphinCompatibility,
-      oracleRejection:
+      reservationInvalidation:
         DI_DMA_AUTHORITY_CLASS.lazuliConservative,
     },
     input: {
+      cycle: 7000,
+      dmaAddress: 0x00000900,
       requestedLength: 0x40,
       dmaLength: 0x20,
+      discEndOffset: 0x00200000,
     },
     expected: {
       dolphinTransferLength: 0x20,
-      oracleAccepted: false,
-      reason: "uncertified-length-mismatch",
+      oracleAccepted: true,
+      reason: null,
+      completionCycle: 299063,
+      dmaAddress: 0x00000920,
+      dmaLength: 0,
+      preservedSuffixBytes: 0x20,
+      status: DI_TRANSFER_COMPLETE_STATUS,
+      control: DI_DMA_MODE,
     },
   },
   {
     id: "zero-length-and-missing-timing-fail-closed",
     authority: [DI_DMA_AUTHORITY_CLASS.lazuliConservative],
     input: {
-      zeroLength: 0,
+      zeroRequestedLength: 0,
+      zeroDmaLength: 0x1f,
       validLengthWithoutCompletionCycle: 0x20,
     },
     expected: {
-      zeroLengthReason: "uncertified-zero-length",
+      zeroRequestedLengthReason: "uncertified-zero-length",
+      zeroDmaLengthReason: "uncertified-zero-dma-length",
       missingTimingReason: "completion-cycle-required",
     },
   },
@@ -562,11 +574,11 @@ export function classifyDiDmaLength(requestedLength, dmaLength) {
     dolphinTransferLength: Math.min(requestedLength, normalizedDmaLength),
     oracleAccepted:
       requestedLength !== 0
-      && requestedLength === normalizedDmaLength,
+      && normalizedDmaLength !== 0,
     reason: requestedLength === 0
       ? "uncertified-zero-length"
-      : requestedLength !== normalizedDmaLength
-        ? "uncertified-length-mismatch"
+      : normalizedDmaLength === 0
+        ? "uncertified-zero-dma-length"
         : null,
   });
 }
@@ -745,6 +757,7 @@ function commandTransaction(state) {
   }
   if (opcode === 0xa8 && (subcommand === 0 || subcommand === 0x40)) {
     const discId = subcommand === 0x40;
+    const requestedLength = discId ? 0x20 : command2;
     return {
       kind: discId ? "read-disc-id" : "read-sector",
       opcode,
@@ -753,7 +766,8 @@ function commandTransaction(state) {
       command1,
       command2,
       discOffset: discId ? 0 : command1 * 4,
-      transferLength: discId ? 0x20 : command2,
+      requestedLength,
+      transferLength: Math.min(requestedLength, dmaLength),
       dmaAddress,
       dmaLength,
     };
@@ -834,16 +848,18 @@ export function writeDiDmaControl(
     });
   }
 
-  const lengthClassification = classifyDiDmaLength(
-    transactionDraft.transferLength,
-    transactionDraft.dmaLength,
-  );
-  if (!lengthClassification.oracleAccepted) {
-    return reject(state, lengthClassification.reason, {
-      requestedLength: transactionDraft.transferLength,
-      dmaLength: transactionDraft.dmaLength,
-      dolphinTransferLength: lengthClassification.dolphinTransferLength,
-    });
+  if (transactionDraft.kind !== "inquiry") {
+    const lengthClassification = classifyDiDmaLength(
+      transactionDraft.requestedLength,
+      transactionDraft.dmaLength,
+    );
+    if (!lengthClassification.oracleAccepted) {
+      return reject(state, lengthClassification.reason, {
+        requestedLength: transactionDraft.requestedLength,
+        dmaLength: transactionDraft.dmaLength,
+        dolphinTransferLength: lengthClassification.dolphinTransferLength,
+      });
+    }
   }
 
   const range = classifyDiMem1Range(

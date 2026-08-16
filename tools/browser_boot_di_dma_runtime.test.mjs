@@ -527,6 +527,11 @@ test("runtime vector 4 writes only Inquiry's 12 bytes immediately and delays TC"
 test("runtime vector 5 reads DiscID from offset zero independent of command word 2", async () => {
   const { input, expected } = vector("read-disc-id");
   const context = createContext();
+  context.bytes.fill(
+    0xcc,
+    input.dmaAddress,
+    input.dmaAddress + input.dmaLength,
+  );
   const transfer = program(context, {
     command0: input.command0,
     command1: 0x12345678,
@@ -537,10 +542,43 @@ test("runtime vector 5 reads DiscID from offset zero independent of command word
   });
   assert.equal(transfer.transaction.kind, "read-disc-id");
   assert.equal(transfer.transaction.discOffset, expected.discOffset);
+  assert.equal(transfer.transaction.requestedLength, 0x20);
   assert.equal(transfer.transaction.transferLength, expected.transferLength);
   assert.equal(transfer.completionCycle, expected.completionCycle);
   await settleHost(transfer);
   assert.deepEqual(context.reads, [{ offset: 0, length: 0x20 }]);
+  context.serviceDisk(expected.completionCycle);
+  assert.equal(context.diskTransfer, null);
+  assert.deepEqual(
+    Array.from(context.bytes.subarray(
+      input.dmaAddress,
+      input.dmaAddress + expected.transferLength,
+    )),
+    Array.from(pattern(expected.transferLength)),
+  );
+  assert.deepEqual(
+    Array.from(context.bytes.subarray(
+      input.dmaAddress + expected.transferLength,
+      input.dmaAddress + input.dmaLength,
+    )),
+    new Array(expected.preservedSuffixBytes).fill(0xcc),
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6014, false),
+    expected.dmaAddress,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6018, false),
+    expected.dmaLength,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x601c, false),
+    expected.control,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6000, false),
+    expected.status,
+  );
 });
 
 test("runtime vectors 6 and 7 turn range and host faults into delayed atomic DEINT", async () => {
@@ -650,7 +688,7 @@ test("runtime vector 8 preserves level-sensitive DI masks and W1C status", () =>
   );
 });
 
-test("runtime vectors 9 through 12 reject BUSY rewrites and uncertified preflight atomically", () => {
+test("runtime vectors 9, 10, and 12 reject BUSY rewrites and uncertified preflight atomically", () => {
   const busyVector = vector("busy-retrigger-rejected");
   const busy = createContext();
   const accepted = program(busy, {
@@ -697,30 +735,31 @@ test("runtime vectors 9 through 12 reject BUSY rewrites and uncertified prefligh
     prefixVector.expected.validPrefixBytes,
   );
 
-  const mismatchVector = vector("length-mismatch-fail-closed");
-  const mismatch = createContext();
-  mismatch.writeDiskDmaRegister(0x1c, 2, 0);
-  program(mismatch, {
-    command2: mismatchVector.input.requestedLength,
-    dmaLength: mismatchVector.input.dmaLength,
-  });
-  assert.equal(mismatch.diskTransfer, null);
-  assert.equal(
-    mismatch.diskDmaRejectionTrace.at(-1).reason,
-    mismatchVector.expected.reason,
-  );
-  assert.equal(mismatch.view.getUint32(mismatch.mmio + 0x601c, false), 2);
-
   const zeroVector = vector("zero-length-and-missing-timing-fail-closed");
   const zero = createContext();
   program(zero, {
-    command2: zeroVector.input.zeroLength,
-    dmaLength: zeroVector.input.zeroLength,
+    command2: zeroVector.input.zeroRequestedLength,
+    dmaLength: 0x20,
   });
   assert.equal(zero.diskTransfer, null);
   assert.equal(
     zero.diskDmaRejectionTrace.at(-1).reason,
-    zeroVector.expected.zeroLengthReason,
+    zeroVector.expected.zeroRequestedLengthReason,
+  );
+
+  const zeroDma = createContext();
+  program(zeroDma, {
+    command2: 0x20,
+    dmaLength: zeroVector.input.zeroDmaLength,
+  });
+  assert.equal(zeroDma.diskTransfer, null);
+  assert.equal(
+    zeroDma.diskDmaRejectionTrace.at(-1).reason,
+    zeroVector.expected.zeroDmaLengthReason,
+  );
+  assert.equal(
+    zeroDma.view.getUint32(zeroDma.mmio + 0x6018, false),
+    0,
   );
 
   const timed = createContext();
@@ -733,6 +772,75 @@ test("runtime vectors 9 through 12 reject BUSY rewrites and uncertified prefligh
   assert.equal(
     timed.diskDmaRejectionTrace.at(-1).reason,
     zeroVector.expected.missingTimingReason,
+  );
+});
+
+test("runtime vector 11 clamps a mismatched sector read and preserves its suffix", async () => {
+  const { input, expected } = vector("length-mismatch-dolphin-clamp");
+  const payload = pattern(expected.dolphinTransferLength, 0xa9);
+  const context = createContext({
+    discSize: input.discEndOffset,
+    read: async () => payload,
+    reservationPhysicalGranule: input.dmaAddress,
+  });
+  const sentinel = pattern(input.requestedLength, 0x7b);
+  context.bytes.set(sentinel, input.dmaAddress);
+
+  const transfer = program(context, {
+    command2: input.requestedLength,
+    dmaAddress: input.dmaAddress,
+    dmaLength: input.dmaLength,
+    cycle: input.cycle,
+  });
+  assert.notEqual(transfer, null);
+  assert.equal(transfer.transaction.requestedLength, input.requestedLength);
+  assert.equal(
+    transfer.transaction.transferLength,
+    expected.dolphinTransferLength,
+  );
+  assert.equal(transfer.transaction.dmaLength, input.dmaLength);
+
+  await settleHost(transfer);
+  assert.deepEqual(context.reads, [{
+    offset: 0,
+    length: expected.dolphinTransferLength,
+  }]);
+  context.serviceDisk(expected.completionCycle);
+  assert.equal(context.diskTransfer, null);
+  assert.deepEqual(
+    Array.from(context.bytes.subarray(
+      input.dmaAddress,
+      input.dmaAddress + expected.dolphinTransferLength,
+    )),
+    Array.from(payload),
+  );
+  assert.deepEqual(
+    Array.from(context.bytes.subarray(
+      input.dmaAddress + expected.dolphinTransferLength,
+      input.dmaAddress + input.requestedLength,
+    )),
+    Array.from(sentinel.subarray(expected.dolphinTransferLength)),
+  );
+  assert.deepEqual(context.reservationInvalidations, [{
+    address: input.dmaAddress,
+    length: expected.dolphinTransferLength,
+  }]);
+  assert.equal(context.reservationPhysicalGranule, null);
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6014, false),
+    expected.dmaAddress,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6018, false),
+    expected.dmaLength,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x601c, false),
+    expected.control,
+  );
+  assert.equal(
+    context.view.getUint32(context.mmio + 0x6000, false),
+    expected.status,
   );
 });
 
@@ -797,10 +905,10 @@ test("preflight rejection preserves the drive error for Request Error", () => {
       reason: "uncertified-control-mode",
     },
     {
-      name: "length",
+      name: "zero DMA length",
       context: createContext(),
-      command: { command2: 0x40, dmaLength: 0x20 },
-      reason: "uncertified-length-mismatch",
+      command: { command2: 0x40, dmaLength: 0x1f },
+      reason: "uncertified-zero-dma-length",
     },
     {
       name: "disc range",

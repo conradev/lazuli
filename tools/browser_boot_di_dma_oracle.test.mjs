@@ -71,6 +71,7 @@ function programSectorRead(
     command1 = 0x100,
     length = 0x20,
     dmaAddress = 0x200,
+    dmaLength = length,
   } = {},
 ) {
   const result = programDiDmaRegisters(state, {
@@ -78,7 +79,7 @@ function programSectorRead(
     command1,
     command2: length,
     dmaAddress,
-    dmaLength: length,
+    dmaLength,
   });
   assert.equal(result.accepted, true);
 }
@@ -113,6 +114,16 @@ test("DI DMA oracle separates hardware, Dolphin, and conservative authority", ()
   assert.match(
     DI_DMA_AUTHORITY.dolphinCompatibility.caveat,
     /not asserted as exact console timing/,
+  );
+  assert.ok(
+    DI_DMA_AUTHORITY.dolphinCompatibility.claims.some(
+      (claim) => claim.includes("smaller of the requested length"),
+    ),
+  );
+  assert.ok(
+    DI_DMA_AUTHORITY.dolphinCompatibility.claims.some(
+      (claim) => claim.includes("full latched DILENGTH"),
+    ),
   );
   assert.match(
     DI_DMA_AUTHORITY.lazuliConservative.caveat,
@@ -152,7 +163,6 @@ test("DI DMA oracle separates hardware, Dolphin, and conservative authority", ()
     [
       "exact-hardware-read-timing",
       "busy-retrigger-and-register-rewrite",
-      "mismatched-request-and-dma-length",
       "zero-length-read",
       "partial-or-invalid-mem1-target",
       "hardware-reservation-effect",
@@ -171,7 +181,7 @@ test("DI DMA oracle separates hardware, Dolphin, and conservative authority", ()
       "interrupt-mask-and-w1c",
       "busy-retrigger-rejected",
       "mem1-valid-prefix-atomic-rejection",
-      "length-mismatch-fail-closed",
+      "length-mismatch-dolphin-clamp",
       "zero-length-and-missing-timing-fail-closed",
       "uncertified-preflight-and-host-failure",
     ],
@@ -410,6 +420,11 @@ test("vector 5 reads the 32-byte disc ID from offset zero regardless of command 
   const state = createDiDmaOracleState({
     discEndOffset: input.discEndOffset,
   });
+  state.mem1.fill(
+    0xcc,
+    input.dmaAddress,
+    input.dmaAddress + input.dmaLength,
+  );
   programDiDmaRegisters(state, {
     command0: input.command0,
     command1: 0x12345678,
@@ -426,18 +441,30 @@ test("vector 5 reads the 32-byte disc ID from offset zero regardless of command 
   assert.equal(started.accepted, true);
   assert.equal(started.transaction.kind, "read-disc-id");
   assert.equal(started.transaction.discOffset, expected.discOffset);
+  assert.equal(started.transaction.requestedLength, 0x20);
   assert.equal(started.transaction.transferLength, expected.transferLength);
 
   const payload = pattern(expected.transferLength, 0x94);
   provideDiDmaReadData(state, payload);
-  assert.equal(
-    serviceDiDma(state, expected.completionCycle).successful,
-    true,
-  );
+  const completed = serviceDiDma(state, expected.completionCycle);
+  assert.equal(completed.successful, true);
+  assert.equal(completed.memoryWriteBytes, expected.transferLength);
   assert.deepEqual(
     bytesAt(state.mem1, input.dmaAddress, expected.transferLength),
     Array.from(payload),
   );
+  assert.deepEqual(
+    bytesAt(
+      state.mem1,
+      input.dmaAddress + expected.transferLength,
+      expected.preservedSuffixBytes,
+    ),
+    new Array(expected.preservedSuffixBytes).fill(0xcc),
+  );
+  assert.equal(state.registers.dmaAddress, expected.dmaAddress);
+  assert.equal(state.registers.dmaLength, expected.dmaLength);
+  assert.equal(state.registers.status, expected.status);
+  assert.equal(state.registers.control, expected.control);
 });
 
 test("vector 6 turns a disc-range failure into delayed DEINT without memory or DMA-register effects", () => {
@@ -659,8 +686,8 @@ test("vector 10 reports a valid MEM1 prefix but rejects the entire transfer atom
   assert.equal(whollyInvalid.fullRangeValid, false);
 });
 
-test("vector 11 exposes Dolphin's clamp but keeps the certified path fail-closed", () => {
-  const { input, expected } = vector("length-mismatch-fail-closed");
+test("vector 11 clamps a mismatched sector read and preserves the untouched suffix", () => {
+  const { input, expected } = vector("length-mismatch-dolphin-clamp");
   assert.deepEqual(
     classifyDiDmaLength(input.requestedLength, input.dmaLength),
     {
@@ -672,44 +699,98 @@ test("vector 11 exposes Dolphin's clamp but keeps the certified path fail-closed
     },
   );
 
-  const state = createDiDmaOracleState({ discEndOffset: 0x200000 });
+  const state = createDiDmaOracleState({
+    discEndOffset: input.discEndOffset,
+    reservationPhysicalGranule: input.dmaAddress,
+  });
+  const sentinel = pattern(input.requestedLength, 0x0a);
+  const payload = pattern(expected.dolphinTransferLength, 0x2c);
+  state.mem1.set(sentinel, input.dmaAddress);
   programDiDmaRegisters(state, {
     command0: 0xa8000000,
     command1: 0,
     command2: input.requestedLength,
-    dmaAddress: 0x900,
+    dmaAddress: input.dmaAddress,
     dmaLength: input.dmaLength,
   });
-  const rejected = writeDiDmaControl(
+  const started = writeDiDmaControl(
     state,
     DI_DMA_TRANSFER_START | DI_DMA_MODE,
-    1000,
-    {
-      completionCycle:
-        1000 + diBufferedReadLowerBoundCycles(input.requestedLength),
-    },
+    input.cycle,
+    { completionCycle: expected.completionCycle },
   );
-  assert.equal(rejected.accepted, expected.oracleAccepted);
-  assert.equal(rejected.reason, expected.reason);
-  assert.equal(rejected.dolphinTransferLength, expected.dolphinTransferLength);
-  assert.equal(state.pending, null);
+  assert.equal(started.accepted, expected.oracleAccepted);
+  assert.equal(started.transaction.requestedLength, input.requestedLength);
+  assert.equal(
+    started.transaction.transferLength,
+    expected.dolphinTransferLength,
+  );
+  assert.equal(started.transaction.dmaLength, input.dmaLength);
+  assert.equal(
+    provideDiDmaReadData(state, payload).payloadLength,
+    expected.dolphinTransferLength,
+  );
+
+  const completed = serviceDiDma(state, expected.completionCycle);
+  assert.equal(completed.successful, true);
+  assert.equal(completed.memoryWriteBytes, expected.dolphinTransferLength);
+  assert.deepEqual(
+    bytesAt(
+      state.mem1,
+      input.dmaAddress,
+      expected.dolphinTransferLength,
+    ),
+    Array.from(payload),
+  );
+  assert.deepEqual(
+    bytesAt(
+      state.mem1,
+      input.dmaAddress + expected.dolphinTransferLength,
+      expected.preservedSuffixBytes,
+    ),
+    Array.from(sentinel.subarray(expected.dolphinTransferLength)),
+  );
+  assert.equal(state.registers.dmaAddress, expected.dmaAddress);
+  assert.equal(state.registers.dmaLength, expected.dmaLength);
+  assert.equal(state.registers.status, expected.status);
+  assert.equal(state.registers.control, expected.control);
+  assert.equal(state.reservationPhysicalGranule, null);
 });
 
-test("vector 12 rejects zero-length reads, missing timing, and too-early timing without mutating BUSY", () => {
+test("vector 12 rejects zero requested or normalized DMA lengths and invalid timing without mutating BUSY", () => {
   const { input, expected } = vector(
     "zero-length-and-missing-timing-fail-closed",
   );
   const zero = createDiDmaOracleState({ discEndOffset: 0x200000 });
-  programSectorRead(zero, { length: input.zeroLength });
+  programSectorRead(zero, {
+    length: input.zeroRequestedLength,
+    dmaLength: 0x20,
+  });
   const zeroRejected = writeDiDmaControl(
     zero,
     DI_DMA_TRANSFER_START | DI_DMA_MODE,
     1000,
   );
   assert.equal(zeroRejected.accepted, false);
-  assert.equal(zeroRejected.reason, expected.zeroLengthReason);
+  assert.equal(zeroRejected.reason, expected.zeroRequestedLengthReason);
   assert.equal(zero.pending, null);
   assert.equal(zero.registers.control, 0);
+
+  const zeroDma = createDiDmaOracleState({ discEndOffset: 0x200000 });
+  programSectorRead(zeroDma, {
+    length: 0x20,
+    dmaLength: input.zeroDmaLength,
+  });
+  const zeroDmaRejected = writeDiDmaControl(
+    zeroDma,
+    DI_DMA_TRANSFER_START | DI_DMA_MODE,
+    1000,
+  );
+  assert.equal(zeroDmaRejected.accepted, false);
+  assert.equal(zeroDmaRejected.reason, expected.zeroDmaLengthReason);
+  assert.equal(zeroDmaRejected.dmaLength, 0);
+  assert.equal(zeroDma.pending, null);
+  assert.equal(zeroDma.registers.control, 0);
 
   const untimed = createDiDmaOracleState({ discEndOffset: 0x200000 });
   programSectorRead(untimed, {

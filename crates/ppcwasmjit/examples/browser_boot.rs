@@ -23501,18 +23501,19 @@ const TEMPLATE: &str = r##"<!doctype html>
           ? "read-disc-id"
           : "read-sector";
         const offset = kind === "read-disc-id" ? 0 : command1 * 4;
-        const length = kind === "read-disc-id" ? 0x20 : command2;
-        if (length === 0 || length !== dmaLength) {
+        const requestedLength = kind === "read-disc-id" ? 0x20 : command2;
+        const length = Math.min(requestedLength, dmaLength);
+        if (requestedLength === 0 || dmaLength === 0) {
           rejectDiskDmaStart(
             control,
             observedCycles,
-            length === 0
+            requestedLength === 0
               ? "uncertified-zero-length"
-              : "uncertified-length-mismatch",
+              : "uncertified-zero-dma-length",
             {
-              requestedLength: length,
+              requestedLength,
               dmaLength,
-              dolphinTransferLength: Math.min(length, dmaLength),
+              dolphinTransferLength: length,
             }
           );
           return false;
@@ -23608,6 +23609,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           discOffset: offset,
           dmaBase,
           dmaLength,
+          requestedLength,
           transferLength: length,
           control,
           triggerCycle: observedCycles,
@@ -23642,6 +23644,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           kind,
           offset,
           length,
+          requestedLength,
+          dmaLength,
           discEndOffset,
           timingModel: transaction.timingModel,
         };
