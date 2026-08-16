@@ -24471,6 +24471,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         && probeInstructionWord((candidatePc + 12) >>> 0) === 0x4182fff4;
     }
 
+    function isAramDmaBusyWaitCandidate(candidatePc) {
+      return decodeAramDmaBusyWait(candidatePc) !== null;
+    }
+
     function isRecognizedLoopPc(candidatePc) {
       return isSemanticIdlePattern(compiledBlock(candidatePc)?.pattern)
         || decodeStringHashLoop(candidatePc) !== null
@@ -24478,7 +24482,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         || decodeMemset32ByteLoop(candidatePc) !== null
         || isMusyxAramQueueFullWaitBackedge(candidatePc)
         || isAiSrcInitSampleCounterWaitCandidate(candidatePc)
-        || isDspReceiveMailboxWaitCandidate(candidatePc);
+        || isDspReceiveMailboxWaitCandidate(candidatePc)
+        || isAramDmaBusyWaitCandidate(candidatePc);
     }
 
     function decodeRelativeBranchTarget(address, instruction, link) {
@@ -24597,6 +24602,82 @@ const TEMPLATE: &str = r##"<!doctype html>
         queueBaseRegister,
         queueDisplacement,
       };
+    }
+
+    function decodeAramDmaBusyWait(currentPc) {
+      // The SDK wraps the DSPCSR read in OSDisableInterrupts /
+      // OSRestoreInterrupts, then callers poll the returned ARAM-DMA busy bit.
+      // Authenticate the complete call graph so unrelated call/cmp loops can
+      // never become timed-device waits.
+      const statusAddress = decodeRelativeBranchTarget(
+        currentPc,
+        probeInstructionWord(currentPc),
+        true
+      );
+      if (
+        statusAddress === null
+        || probeInstructionWord((currentPc + 4) >>> 0) !== 0x28030000
+        || probeInstructionWord((currentPc + 8) >>> 0) !== 0x4082fff8
+      ) return null;
+
+      if (!instructionWordsMatch(statusAddress, [
+        0x7c0802a6,
+        0x90010004,
+        0x9421fff0,
+        0x93e1000c,
+      ])) return null;
+      const disableCallAddress = (statusAddress + 0x10) >>> 0;
+      const disableAddress = decodeRelativeBranchTarget(
+        disableCallAddress,
+        probeInstructionWord(disableCallAddress),
+        true
+      );
+      if (
+        disableAddress === null
+        || !instructionWordsMatch((statusAddress + 0x14) >>> 0, [
+          0x3c80cc00,
+          0xa004500a,
+          0x541f05ac,
+        ])
+      ) return null;
+      const restoreCallAddress = (statusAddress + 0x20) >>> 0;
+      const restoreAddress = decodeRelativeBranchTarget(
+        restoreCallAddress,
+        probeInstructionWord(restoreCallAddress),
+        true
+      );
+      if (
+        restoreAddress === null
+        || !instructionWordsMatch((statusAddress + 0x24) >>> 0, [
+          0x80010014,
+          0x7fe3fb78,
+          0x83e1000c,
+          0x38210010,
+          0x7c0803a6,
+          0x4e800020,
+        ])
+      ) return null;
+
+      if (!instructionWordsMatch(disableAddress, [
+        0x7c6000a6,
+        0x5464045e,
+        0x7c800124,
+        0x54638ffe,
+        0x4e800020,
+      ])) return null;
+      if (!instructionWordsMatch(restoreAddress, [
+        0x2c030000,
+        0x7c8000a6,
+        0x4182000c,
+        0x60858000,
+        0x48000008,
+        0x5485045e,
+        0x7ca00124,
+        0x54848ffe,
+        0x4e800020,
+      ])) return null;
+
+      return { disableAddress, restoreAddress, statusAddress };
     }
 
     function runtimeEventCycleCandidates(
@@ -24845,6 +24926,48 @@ const TEMPLATE: &str = r##"<!doctype html>
       return wakeCycle > cycles ? { eventCycle, wakeCycle } : null;
     }
 
+    function aramDmaBusyWaitWakeCycle(currentPc) {
+      // LR/r3 prove that one complete SDK poll (including its stack stores and
+      // interrupt restore) already ran before any repetitions are skipped.
+      if (
+        aramTransfer === null
+        || aramTransfer.completionCycle <= cycles
+        || runtimeEventDueAtOrBefore(cycles)
+        || interruptDeliveryPendingAtCycle(cycles)
+      ) return null;
+      if (
+        cpFifoState.distance !== 0
+        && (cpFifoState.control & cpControlReadEnable) !== 0
+      ) return null;
+      if (
+        view.getUint32(cpu + pcOffset, true) !== currentPc
+        || (view.getUint32(cpu + msrOffset, true) & 0x00008000) === 0
+        || readLr() !== ((currentPc + 4) >>> 0)
+        || readGpr(3) !== 0x00000200
+      ) return null;
+      const dspControlRange = resolveDataRange(0xcc00500a, 2, false, false);
+      if (
+        dspControlRange.kind !== "mapped"
+        || dspControlRange.physical !== 0x0c00500a
+        || (view.getUint16(mmio + 0x500a, false) & 0x0200) === 0
+        || decodeAramDmaBusyWait(currentPc) === null
+      ) return null;
+      // A serviced event can let an external DMA or ISR touch the helper's
+      // retained stack slots. Execute one fresh real poll before coalescing
+      // again so its prologue/epilogue memory effects remain observable.
+      if (aramDmaBusyWaitNeedsPoll.delete(currentPc)) return null;
+
+      const eventCycle = nextRuntimeEventCycle(false);
+      if (
+        eventCycle === null
+        || eventCycle > aramTransfer.completionCycle
+      ) return null;
+      const wakeCycle = Number.isFinite(cycleLimit)
+        ? Math.min(eventCycle, cycleLimit)
+        : eventCycle;
+      return wakeCycle > cycles ? { eventCycle, wakeCycle } : null;
+    }
+
     async function accelerateMusyxAramQueueFullWait(currentPc) {
       const wait = musyxAramQueueFullWaitWakeCycle(currentPc);
       if (wait === null) return false;
@@ -24926,6 +25049,35 @@ const TEMPLATE: &str = r##"<!doctype html>
               ? dspReceiveMailboxWaitNoProgressServices + 1
               : 0;
         }
+      }
+      lastPc = null;
+      lastCpuSignature = null;
+      samePcCount = 0;
+      return true;
+    }
+
+    async function accelerateAramDmaBusyWait(currentPc) {
+      const wait = aramDmaBusyWaitWakeCycle(currentPc);
+      if (wait === null) return false;
+      const { eventCycle, wakeCycle } = wait;
+      const skipped = wakeCycle - cycles;
+      cycles = wakeCycle;
+      accelerations.set(
+        "aramDmaBusyWaitCycles",
+        (accelerations.get("aramDmaBusyWaitCycles") ?? 0) + skipped
+      );
+      accelerations.set(
+        "aramDmaBusyWaitJumps",
+        (accelerations.get("aramDmaBusyWaitJumps") ?? 0) + 1
+      );
+      if (wakeCycle >= eventCycle) {
+        const diskWait = dueDiskTransferPromise(cycles);
+        if (diskWait !== null) await diskWait;
+        // Device service owns DSPCSR busy-bit clearing, interrupt assertion,
+        // and any resulting exception delivery. Never synthesize completion.
+        serviceMmio(cycles);
+        aramDmaBusyWaitNeedsPoll.add(currentPc);
+        pc = view.getUint32(cpu + pcOffset, true);
       }
       lastPc = null;
       lastCpuSignature = null;
@@ -25892,6 +26044,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     let samePcCount = 0;
     let dspReceiveMailboxWaitTrackedPc = null;
     let dspReceiveMailboxWaitNoProgressServices = 0;
+    const aramDmaBusyWaitNeedsPoll = new Set();
     const blocks = new Map();
     try {
       bytes.fill(0, ram, ram + ramSize);
@@ -26014,6 +26167,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           continue;
         }
         if (await accelerateDspReceiveMailboxWait(pc)) {
+          await finishTerminalControllerScenario();
+          continue;
+        }
+        if (await accelerateAramDmaBusyWait(pc)) {
           await finishTerminalControllerScenario();
           continue;
         }

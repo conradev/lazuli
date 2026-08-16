@@ -35,6 +35,7 @@ function schedulerContext() {
     isMusyxAramQueueFullWaitBackedge: () => false,
     isAiSrcInitSampleCounterWaitCandidate: () => false,
     isDspReceiveMailboxWaitCandidate: () => false,
+    isAramDmaBusyWaitCandidate: () => false,
   };
   context.compiledBlock = pc => context.blocks.get(pc);
   vm.createContext(context);
@@ -99,6 +100,7 @@ test("structural loop recognition remains available before compilation", () => {
   context.isAiSrcInitSampleCounterWaitCandidate = pc => pc === 0x7000;
   context.decodeStringHashLoop = pc => pc === 0x8000 ? {} : null;
   context.isDspReceiveMailboxWaitCandidate = pc => pc === 0x9000;
+  context.isAramDmaBusyWaitCandidate = pc => pc === 0xa000;
 
   assert.equal(context.isRecognizedLoopPc(0x4000), true);
   assert.equal(context.isRecognizedLoopPc(0x5000), true);
@@ -106,7 +108,8 @@ test("structural loop recognition remains available before compilation", () => {
   assert.equal(context.isRecognizedLoopPc(0x7000), true);
   assert.equal(context.isRecognizedLoopPc(0x8000), true);
   assert.equal(context.isRecognizedLoopPc(0x9000), true);
-  assert.equal(context.isRecognizedLoopPc(0xa000), false);
+  assert.equal(context.isRecognizedLoopPc(0xa000), true);
+  assert.equal(context.isRecognizedLoopPc(0xb000), false);
 });
 
 test("lazy CPU stability witnesses do not hash across changing PCs", () => {
