@@ -74,6 +74,7 @@ const decoderFunctions = [
 const transportFunctions = [
   "withScopedCycles",
   "commandProcessorBreakpointLevel",
+  "readCommandProcessorRawStatus",
   "readCommandProcessorStatus",
   "commandProcessorInterruptInputs",
   "traceCommandProcessorInterrupt",

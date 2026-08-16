@@ -171,6 +171,17 @@ test("runtime wiring routes PI W1C and services CP before other devices", () => 
   assert.ok(fifoService !== -1 && fifoService < cpInterrupt);
   assert.ok(cpInterrupt < videoSchedule);
 
+  const serviceEnd = source.indexOf(
+    "function processSerialCommand(",
+    serviceStart,
+  );
+  const mmioService = source.slice(serviceStart, serviceEnd);
+  assert.match(
+    mmioService,
+    /cpFifoState\.distance !== 0[\s\S]*?cpControlReadEnable\) !== 0[\s\S]*?!commandProcessorBreakpointLevel\(\)[\s\S]*?serviceCommandProcessorFifo\(\);[\s\S]*?serviceCommandProcessorInterrupt\(observedCycles\);/,
+    "an already-live breakpoint skips redundant FIFO service without skipping IRQ delivery",
+  );
+
   const consumerStart = source.indexOf("function serviceCommandProcessorFifo(");
   const consumerEnd = source.indexOf(
     "function validateProcessorInterfaceFifoWriteState(",

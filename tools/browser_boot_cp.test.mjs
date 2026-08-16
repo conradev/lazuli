@@ -129,6 +129,7 @@ function makeContext() {
   vm.runInContext(
     [
       "commandProcessorBreakpointLevel",
+      "readCommandProcessorRawStatus",
       "readCommandProcessorStatus",
       "commandProcessorInterruptInputs",
       "traceCommandProcessorInterrupt",
@@ -376,22 +377,30 @@ test("every CP FIFO pair accepts the low word first and masks addresses exactly"
   );
 });
 
-test("CP watermarks and idle levels use the authoritative distance with strict comparisons", () => {
+test("CP raw watermarks and idle levels use authoritative distance with strict comparisons", () => {
   const context = makeContext();
   write16(context, 0xcc000002, 0x0001);
   writePair(context, 0x28, 0x00000040);
   writePair(context, 0x2c, 0x00000020);
 
   writePair(context, 0x30, 0x00000040);
-  assert.equal(read16(context, 0xcc000000), 0, "distance equal to high is not high");
+  assert.equal(
+    context.readCommandProcessorRawStatus(),
+    0,
+    "distance equal to high is not high",
+  );
   writePair(context, 0x30, 0x00000060);
-  assert.equal(read16(context, 0xcc000000), 0x0001);
+  assert.equal(context.readCommandProcessorRawStatus(), 0x0001);
 
   writePair(context, 0x30, 0x00000020);
-  assert.equal(read16(context, 0xcc000000), 0, "distance equal to low is not low");
+  assert.equal(
+    context.readCommandProcessorRawStatus(),
+    0,
+    "distance equal to low is not low",
+  );
   writePair(context, 0x30, 0);
   assert.equal(
-    read16(context, 0xcc000000),
+    context.readCommandProcessorRawStatus(),
     0x000e,
     "empty asserts low, read-idle, and command-idle",
   );

@@ -85,7 +85,11 @@ test("a resolved high-water crossing remains sticky until CP_CLEAR", () => {
 
   context.cpFifoState.distance = 0x20;
   context.refreshCommandProcessorInterruptLevel("high-resolved");
-  assert.equal(context.readCommandProcessorStatus() & 1, 0);
+  assert.equal(
+    context.readCommandProcessorStatus() & 1,
+    1,
+    "a sticky high interrupt remains guest-visible after its raw level resolves",
+  );
   assert.equal(context.commandProcessorHighInterruptPending, true);
   assert.equal(readPiCause(context), 0x00010800);
 
@@ -94,6 +98,7 @@ test("a resolved high-water crossing remains sticky until CP_CLEAR", () => {
     true,
   );
   assert.equal(context.commandProcessorHighInterruptPending, false);
+  assert.equal(context.readCommandProcessorStatus() & 1, 0);
   assert.equal(readPiCause(context), 0x00010000);
   assert.equal(context.commandProcessorInterruptClears, 1);
   assert.equal(context.commandProcessorPiDeassertions, 1);
@@ -101,6 +106,77 @@ test("a resolved high-water crossing remains sticky until CP_CLEAR", () => {
 
   context.writeCommandProcessorRegister(0x0c000004, 0x0004, 2);
   assert.equal(context.commandProcessorPerformanceMetricClears, 1);
+});
+
+test("a resolved low-water crossing remains visible and acknowledgeable", () => {
+  const context = makeContext();
+  configureInterruptingCp(context, {
+    distance: 0x20,
+    control: 0x09,
+    highWatermark: 0x100,
+    lowWatermark: 0x40,
+  });
+
+  context.refreshCommandProcessorInterruptLevel("low-crossing");
+  assert.equal(context.commandProcessorLowInterruptPending, true);
+  assert.equal(context.readCommandProcessorStatus() & 0x02, 0x02);
+  assert.equal(readPiCause(context) & 0x800, 0x800);
+
+  context.cpFifoState.distance = 0x60;
+  context.refreshCommandProcessorInterruptLevel("low-resolved");
+  assert.equal(
+    context.readCommandProcessorStatus() & 0x02,
+    0x02,
+    "the ISR must still be able to identify the latched low source",
+  );
+  assert.equal(context.commandProcessorLowInterruptPending, true);
+  assert.equal(readPiCause(context) & 0x800, 0x800);
+
+  context.writeCommandProcessorRegister(0x0c000004, 0x0002, 2);
+  assert.equal(context.commandProcessorLowInterruptPending, false);
+  assert.equal(context.readCommandProcessorStatus() & 0x02, 0);
+  assert.equal(readPiCause(context) & 0x800, 0);
+  assert.equal(context.commandProcessorInterruptClears, 1);
+});
+
+test("Rogue-shaped breakpoint status exposes and clears a resolved low latch", () => {
+  const context = makeContext();
+  configureInterruptingCp(context, {
+    distance: 0x7fe0,
+    control: 0x001b,
+    highWatermark: 0xc000,
+    lowWatermark: 0x8000,
+    readPointer: 0x100,
+    breakpoint: 0x100,
+  });
+
+  context.refreshCommandProcessorInterruptLevel("rogue-low-crossing");
+  assert.equal(context.commandProcessorLowInterruptPending, true);
+  assert.equal(readPiCause(context) & 0x800, 0x800);
+
+  context.cpFifoState.distance = 0xc020;
+  context.refreshCommandProcessorInterruptLevel("rogue-breakpoint-stall");
+  assert.equal(
+    context.readCommandProcessorRawStatus(),
+    0x0019,
+    "the resolved low threshold is absent from the raw level",
+  );
+  assert.equal(
+    context.readCommandProcessorStatus(),
+    0x001b,
+    "high, command-idle, breakpoint, and the resolved sticky low source stay visible",
+  );
+  assert.equal(context.commandProcessorQualifiedInterruptSources, 0x0011);
+  assert.equal(readPiCause(context) & 0x800, 0x800);
+
+  context.writeCommandProcessorRegister(0x0c000004, 0x0002, 2);
+  assert.equal(context.commandProcessorLowInterruptPending, false);
+  assert.equal(context.readCommandProcessorStatus(), 0x0019);
+  assert.equal(
+    readPiCause(context) & 0x800,
+    0,
+    "control 0x001b does not enable either live high or breakpoint IRQ",
+  );
 });
 
 test("active CP_CLEAR and PI W1C writes immediately reassert a live source", () => {

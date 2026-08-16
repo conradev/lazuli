@@ -14471,7 +14471,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         && cpFifoState.readPointer === cpFifoState.breakpoint;
     }
 
-    function readCommandProcessorStatus() {
+    function readCommandProcessorRawStatus() {
       // The browser command processor is synchronous for now, unlike the
       // hardware's independently consuming GP. Guest-published distance is
       // therefore the canonical empty/read-idle source. Later gather and GP
@@ -14494,16 +14494,29 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function readCommandProcessorStatus() {
+      // Watermark interrupts are sticky at the CP source. Expose the retained
+      // source in CP_STATUS as well as in the PI request so a guest ISR can
+      // identify and acknowledge an interrupt whose raw FIFO level resolved
+      // before delivery. Raw levels remain separate so CP_CLEAR reasserts only
+      // when the threshold is still actively qualified.
+      return readCommandProcessorRawStatus()
+        | (commandProcessorHighInterruptPending ? cpStatusHighWatermark : 0)
+        | (commandProcessorLowInterruptPending ? cpStatusLowWatermark : 0);
+    }
+
     function commandProcessorInterruptInputs() {
+      const rawStatus = readCommandProcessorRawStatus();
       const status = readCommandProcessorStatus();
       const readEnabled = (cpFifoState.control & cpControlReadEnable) !== 0;
       const highQualified = readEnabled
-        && (status & cpStatusHighWatermark) !== 0;
+        && (rawStatus & cpStatusHighWatermark) !== 0;
       const lowQualified = readEnabled
-        && (status & cpStatusLowWatermark) !== 0;
+        && (rawStatus & cpStatusLowWatermark) !== 0;
       const breakpointQualified = readEnabled
-        && (status & cpStatusBreakpoint) !== 0;
+        && (rawStatus & cpStatusBreakpoint) !== 0;
       return {
+        rawStatus,
         status,
         highQualified,
         lowQualified,
@@ -22892,6 +22905,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (
         cpFifoState.distance !== 0
         && (cpFifoState.control & cpControlReadEnable) !== 0
+        && !commandProcessorBreakpointLevel()
       ) {
         serviceCommandProcessorFifo();
       }
