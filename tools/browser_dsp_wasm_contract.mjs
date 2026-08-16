@@ -246,6 +246,41 @@ export async function verifyBrowserDspWasm(path) {
   assert.ok(dsp.browser_dsp_pc() >= 0x8000 && dsp.browser_dsp_pc() < 0x9000);
   assert.deepEqual(completions, []);
 
+  // A real low-reset program must be able to outlive the runner's first two 64-instruction
+  // quanta and publish DSP->CPU FULL only when its mailbox-low store actually executes. This
+  // synthetic payload models the timing shape of a retail bootstrap without embedding game data.
+  view.setUint32(MMIO_OFFSET + 0x5004, 0, false);
+  writeUcode(memory, [
+    ...new Array(130).fill(0x0000), // nop beyond two complete execution quanta
+    0x16fc, 0x1234, // si @dmbh, payload high and clear stale FULL
+    0x16fd, 0x5678, // si @dmbl, payload low and set FULL
+    0x0021,         // halt after publishing the mailbox
+  ]);
+  for (let slice = 1; slice <= 2; slice += 1) {
+    assert.equal(dsp.browser_dsp_exec(64), 64, `long bootstrap slice ${slice} was truncated`);
+    assert.equal(
+      dsp.browser_dsp_stop_reason(),
+      0,
+      `long bootstrap slice ${slice} did not exhaust its instruction budget`,
+    );
+    assert.equal(
+      view.getUint16(MMIO_OFFSET + 0x5004, false) & 0x8000,
+      0,
+      `long bootstrap published FULL during slice ${slice}`,
+    );
+  }
+  assert.ok(
+    dsp.browser_dsp_exec(64) > 0,
+    "long bootstrap did not execute its mailbox-publishing tail",
+  );
+  assert.equal(dsp.browser_dsp_stop_reason(), 1, "long bootstrap did not halt after publishing");
+  assert.equal(
+    view.getUint32(MMIO_OFFSET + 0x5004, false),
+    0x9234_5678,
+    "real DSP mailbox-low execution did not publish FULL and its payload",
+  );
+  assert.deepEqual(completions, [], "mailbox-only bootstrap emitted a main-RAM receipt");
+
   // Reset low loads this program directly from MEM1. It writes through the accelerator into the
   // shared ARAM window, then DMEM-DMAs into MEM1 and emits the exact host coherency receipt.
   writeUcode(memory, [

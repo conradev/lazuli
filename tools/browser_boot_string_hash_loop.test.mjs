@@ -418,6 +418,7 @@ test("the hash load boundary cannot be linked or fused through", () => {
     decodeMemset32ByteLoop: () => null,
     isMusyxAramQueueFullWaitBackedge: () => false,
     isAiSrcInitSampleCounterWaitCandidate: () => false,
+    isDspReceiveMailboxWaitCandidate: () => false,
   };
   vm.createContext(context);
   vm.runInContext(

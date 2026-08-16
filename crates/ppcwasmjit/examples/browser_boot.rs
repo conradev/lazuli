@@ -6782,6 +6782,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const regionFusionHits = new Map();
     const regionFusionHitThreshold = 8;
     const maximumFusedRegionBlocks = 256;
+    const dspReceiveMailboxWaitNoProgressServiceLimit = 256;
     const blockPattern = Object.freeze({
       idleBasic: 2,
       idleVolatileRead: 3,
@@ -24459,13 +24460,25 @@ const TEMPLATE: &str = r##"<!doctype html>
         && probeInstructionWord((candidatePc + 8) >>> 0) === 0x4182fff8;
     }
 
+    function isDspReceiveMailboxWaitCandidate(candidatePc) {
+      // WarioWare's SDK bootstrap preserves the receive-mail payload in r5,
+      // tests the DSP->CPU FULL bit in r0, and polls until the real DSP writes
+      // the low half. Keep this exact: a broader volatile-read classifier can
+      // incorrectly accelerate RAM-backed loops with no scheduled producer.
+      return probeInstructionWord(candidatePc) === 0xa01e0000
+        && probeInstructionWord((candidatePc + 4) >>> 0) === 0x5405043e
+        && probeInstructionWord((candidatePc + 8) >>> 0) === 0x54000421
+        && probeInstructionWord((candidatePc + 12) >>> 0) === 0x4182fff4;
+    }
+
     function isRecognizedLoopPc(candidatePc) {
       return isSemanticIdlePattern(compiledBlock(candidatePc)?.pattern)
         || decodeStringHashLoop(candidatePc) !== null
         || isCacheLineLoop(candidatePc)
         || decodeMemset32ByteLoop(candidatePc) !== null
         || isMusyxAramQueueFullWaitBackedge(candidatePc)
-        || isAiSrcInitSampleCounterWaitCandidate(candidatePc);
+        || isAiSrcInitSampleCounterWaitCandidate(candidatePc)
+        || isDspReceiveMailboxWaitCandidate(candidatePc);
     }
 
     function decodeRelativeBranchTarget(address, instruction, link) {
@@ -24772,6 +24785,66 @@ const TEMPLATE: &str = r##"<!doctype html>
         : null;
     }
 
+    function dspReceiveMailboxWaitProducerBlocked() {
+      const receiveMailboxFull =
+        (view.getUint16(mmio + 0x5004, false) & 0x8000) !== 0;
+      if (receiveMailboxFull) return false;
+      const sendMailboxFull =
+        (view.getUint16(mmio + 0x5000, false) & 0x8000) !== 0;
+      const dspControl = view.getUint16(mmio + 0x500a, false);
+      return (
+        dspLastStopReason.code === 3
+        && !sendMailboxFull
+      ) || (
+        dspLastStopReason.code === 1
+        && (dspControl & 0x0004) !== 0
+      );
+    }
+
+    function dspReceiveMailboxWaitWakeCycle(currentPc) {
+      // Two unchanged boundaries authenticate a completed poll rather than a
+      // coincidental entry at the same address. The loop cannot enable EE, so
+      // already-latched PI/decrementer state remains architecturally latent.
+      if (dspReceiveMailboxWaitTrackedPc !== currentPc) {
+        dspReceiveMailboxWaitTrackedPc = currentPc;
+        dspReceiveMailboxWaitNoProgressServices = 0;
+      }
+      if (samePcCount < 2 || runtimeEventDueAtOrBefore(cycles)) return null;
+      if (
+        cpFifoState.distance !== 0
+        && (cpFifoState.control & cpControlReadEnable) !== 0
+      ) return null;
+      if (
+        view.getUint32(cpu + pcOffset, true) !== currentPc
+        || (view.getUint32(cpu + msrOffset, true) & 0x00008000) !== 0
+        || readGpr(30) !== 0xcc005004
+        || nextDspExecutionCycle === null
+        || nextDspExecutionCycle <= cycles
+      ) return null;
+      const mailboxRange = resolveDataRange(0xcc005004, 2, false, false);
+      if (
+        mailboxRange.kind !== "mapped"
+        || mailboxRange.physical !== 0x0c005004
+        || (view.getUint16(mmio + 0x5004, false) & 0x8000) !== 0
+      ) return null;
+      if (!isDspReceiveMailboxWaitCandidate(currentPc)) return null;
+      if (
+        dspReceiveMailboxWaitNoProgressServices !== 0
+        && !dspReceiveMailboxWaitProducerBlocked()
+      ) dspReceiveMailboxWaitNoProgressServices = 0;
+      if (
+        dspReceiveMailboxWaitNoProgressServices
+          >= dspReceiveMailboxWaitNoProgressServiceLimit
+      ) return null;
+
+      const eventCycle = nextRuntimeEventCycle(false);
+      if (eventCycle === null || eventCycle > nextDspExecutionCycle) return null;
+      const wakeCycle = Number.isFinite(cycleLimit)
+        ? Math.min(eventCycle, cycleLimit)
+        : eventCycle;
+      return wakeCycle > cycles ? { eventCycle, wakeCycle } : null;
+    }
+
     async function accelerateMusyxAramQueueFullWait(currentPc) {
       const wait = musyxAramQueueFullWaitWakeCycle(currentPc);
       if (wait === null) return false;
@@ -24819,6 +24892,40 @@ const TEMPLATE: &str = r##"<!doctype html>
         if (diskWait !== null) await diskWait;
         serviceMmio(cycles);
         pc = view.getUint32(cpu + pcOffset, true);
+      }
+      lastPc = null;
+      lastCpuSignature = null;
+      samePcCount = 0;
+      return true;
+    }
+
+    async function accelerateDspReceiveMailboxWait(currentPc) {
+      const wait = dspReceiveMailboxWaitWakeCycle(currentPc);
+      if (wait === null) return false;
+      const { eventCycle, wakeCycle } = wait;
+      const skipped = wakeCycle - cycles;
+      cycles = wakeCycle;
+      accelerations.set(
+        "dspReceiveMailboxWaitCycles",
+        (accelerations.get("dspReceiveMailboxWaitCycles") ?? 0) + skipped
+      );
+      accelerations.set(
+        "dspReceiveMailboxWaitJumps",
+        (accelerations.get("dspReceiveMailboxWaitJumps") ?? 0) + 1
+      );
+      if (wakeCycle >= eventCycle) {
+        const dspExecutionSlicesBefore = dspExecutionSlices;
+        const diskWait = dueDiskTransferPromise(cycles);
+        if (diskWait !== null) await diskWait;
+        // Only the timed DSP interpreter may publish the mailbox response.
+        serviceMmio(cycles);
+        pc = view.getUint32(cpu + pcOffset, true);
+        if (dspExecutionSlices !== dspExecutionSlicesBefore) {
+          dspReceiveMailboxWaitNoProgressServices =
+            dspReceiveMailboxWaitProducerBlocked()
+              ? dspReceiveMailboxWaitNoProgressServices + 1
+              : 0;
+        }
       }
       lastPc = null;
       lastCpuSignature = null;
@@ -25783,6 +25890,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     let lastPc = null;
     let lastCpuSignature = null;
     let samePcCount = 0;
+    let dspReceiveMailboxWaitTrackedPc = null;
+    let dspReceiveMailboxWaitNoProgressServices = 0;
     const blocks = new Map();
     try {
       bytes.fill(0, ram, ram + ramSize);
@@ -25902,6 +26011,10 @@ const TEMPLATE: &str = r##"<!doctype html>
             compiledBlocks: blocks.size,
           });
           await honorRunnerControl();
+          continue;
+        }
+        if (await accelerateDspReceiveMailboxWait(pc)) {
+          await finishTerminalControllerScenario();
           continue;
         }
         if (await accelerateMusyxAramQueueFullWait(pc)) {
