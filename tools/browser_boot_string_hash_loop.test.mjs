@@ -411,13 +411,19 @@ test("preflight rejects effective-address wrap before commit", () => {
 
 test("the hash load boundary cannot be linked or fused through", () => {
   const context = {
-    blockPattern: { none: 0, idleBasic: 2, idleVolatileRead: 3 },
+    blockPattern: {
+      none: 0,
+      idleBasic: 2,
+      idleVolatileRead: 3,
+      dspSendMailboxStatus: 4,
+    },
     compiledBlock: () => ({ pattern: 0 }),
     decodeStringHashLoop: pc => pc === TAIL_PC ? {} : null,
     isCacheLineLoop: () => false,
     decodeMemset32ByteLoop: () => null,
     isMusyxAramQueueFullWaitBackedge: () => false,
     isAiSrcInitSampleCounterWaitCandidate: () => false,
+    isDspSendMailboxWaitCandidate: () => false,
     isDspReceiveMailboxWaitCandidate: () => false,
     isAramDmaBusyWaitCandidate: () => false,
   };

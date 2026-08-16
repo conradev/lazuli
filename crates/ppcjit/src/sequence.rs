@@ -1,7 +1,7 @@
 use std::ops::Deref;
 
 use gekko::disasm::{Ins, Opcode, ParsedIns};
-use gekko::{Address, InsExt};
+use gekko::{Address, GPR, InsExt};
 
 use crate::block::Pattern;
 
@@ -31,59 +31,44 @@ impl Sequence {
         is_load && is_cmp_imm && is_branch_cond && load_dst_is_cmp_src && is_rel_jmp_to_start
     }
 
-    // fn is_call_check_loop(&self) -> bool {
-    //     if self.len() < 3 {
-    //         return false;
-    //     }
-    //
-    //     let i0_is_branch = matches!(self[0].op, Opcode::B);
-    //     let i0_lk = self[0].field_lk();
-    //
-    //     let i0_is_call = i0_is_branch && i0_lk;
-    //
-    //     let i1_is_cmpli = matches!(self[1].op, Opcode::Cmpli);
-    //     let i1_ra = self[1].gpr_a();
-    //     // let i1_crfd = self[1].field_crfd();
-    //     // let i1_imm = self[1].field_uimm();
-    //
-    //     let i1_is_cmp = i1_is_cmpli && i1_ra == GPR::R3;
-    //
-    //     let i2_is_bc = matches!(self[2].op, Opcode::Bc);
-    //     let i2_is_branch_to_start = !self[2].field_aa() && self[2].field_bd() == -8;
-    //
-    //     let i2_is_check = i2_is_bc && i2_is_branch_to_start;
-    //
-    //     i0_is_call && i1_is_cmp && i2_is_check
-    // }
-
-    fn is_get_mailbox_status_func(&self) -> bool {
+    fn is_dsp_send_mailbox_status(&self) -> bool {
         if self.len() != 4 {
             return false;
         }
 
         let i0_is_addis = matches!(self[0].op, Opcode::Addis);
         let i0_imm = self[0].field_uimm();
+        let i0_base = self[0].gpr_a();
         let i0_dst = self[0].gpr_d();
 
-        let i0_is_setting_to_cc00 = i0_is_addis && i0_imm == 0xCC00;
+        let i0_is_setting_to_cc00 = i0_is_addis && i0_imm == 0xCC00 && i0_base == GPR::R0;
 
         let i1_is_lhz = matches!(self[1].op, Opcode::Lhz);
         let i1_src = self[1].gpr_a();
+        let i1_dst = self[1].gpr_d();
         let i1_offset = self[1].field_uimm();
 
         let i1_is_loading_from_mailbox = i1_is_lhz && i1_src == i0_dst && i1_offset == 0x5000;
 
         let i2_is_rlwinm = matches!(self[2].op, Opcode::Rlwinm);
+        let i2_src = self[2].gpr_s();
+        let i2_dst = self[2].gpr_a();
         let i2_sh = self[2].field_sh();
         let i2_mb = self[2].field_mb();
         let i2_me = self[2].field_me();
 
-        let i2_is_getting_status = i2_is_rlwinm && i2_sh == 17 && i2_mb == 31 && i2_me == 31;
+        let i2_is_getting_status = i2_is_rlwinm
+            && i2_src == i1_dst
+            && i2_dst == GPR::R3
+            && i2_sh == 17
+            && i2_mb == 31
+            && i2_me == 31
+            && !self[2].field_rc();
 
         let i3_is_branch_lr = matches!(self[3].op, Opcode::Bclr);
         let i3_is_branch_always = self[3].field_bo() == 20;
 
-        let i3_is_return = i3_is_branch_lr && i3_is_branch_always;
+        let i3_is_return = i3_is_branch_lr && i3_is_branch_always && !self[3].field_lk();
 
         i0_is_setting_to_cc00 && i1_is_loading_from_mailbox && i2_is_getting_status && i3_is_return
     }
@@ -118,8 +103,8 @@ impl Sequence {
             return Pattern::Call;
         }
 
-        if self.is_get_mailbox_status_func() {
-            return Pattern::GetMailboxStatusFunc;
+        if self.is_dsp_send_mailbox_status() {
+            return Pattern::DspSendMailboxStatus;
         }
 
         if self.is_generic_volatile_read() {
@@ -150,33 +135,68 @@ impl std::fmt::Display for Sequence {
     }
 }
 
-// #[cfg(test)]
-// mod test {
-//     use crate::Sequence;
-//     use gekko::disasm::{Extensions, Ins};
-//     use powerpc_asm::{Argument, Arguments, assemble};
-//
-//     macro_rules! ppc_asm {
-//         ($($mnemonic:ident $($arg:expr),*);* $(;)?) => {
-//             #[allow(unused_assignments)]
-//             {
-//                 use Argument::*;
-//                 let mut vec = vec![];
-//                 $(
-//                     let mut i = 0;
-//                     let mut args: Arguments = [Argument::None; 5];
-//
-//                     $(
-//                         args[i] = $arg;
-//                         i += 1;
-//                     )*
-//
-//                     let code = assemble(stringify!($mnemonic), &args).expect("Invalid arguments");
-//                     vec.push(Ins::new(code, Extensions::gekko_broadway()));
-//                 )*
-//
-//                 vec
-//             }
-//         };
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use gekko::disasm::{Extensions, Ins};
+
+    use super::*;
+
+    const SDK_MAILBOX_STATUS: [u32; 4] = [0x3c60_cc00, 0xa003_5000, 0x5403_8ffe, 0x4e80_0020];
+
+    fn sequence(words: impl IntoIterator<Item = u32>) -> Sequence {
+        Sequence(
+            words
+                .into_iter()
+                .map(|word| Ins::new(word, Extensions::gekko_broadway()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn detects_exact_sdk_cpu_mailbox_status_helper() {
+        assert_eq!(Pattern::DspSendMailboxStatus as u32, 4);
+        assert_eq!(
+            sequence(SDK_MAILBOX_STATUS).detect_pattern(),
+            Pattern::DspSendMailboxStatus
+        );
+    }
+
+    #[test]
+    fn tracks_equivalent_base_and_load_registers() {
+        assert_eq!(
+            sequence([
+                0x3c80_cc00, // lis r4, 0xcc00
+                0xa0a4_5000, // lhz r5, 0x5000(r4)
+                0x54a3_8ffe, // rlwinm r3, r5, 17, 31, 31
+                0x4e80_0020, // blr
+            ])
+            .detect_pattern(),
+            Pattern::DspSendMailboxStatus
+        );
+    }
+
+    #[test]
+    fn rejects_helpers_without_exact_address_dataflow_and_return_semantics() {
+        for (index, replacement) in [
+            (0, 0x3c64_cc00), // addis uses r4 instead of the zero base
+            (0, 0x3c60_cd00), // wrong MMIO page
+            (1, 0xa004_5000), // load does not use the constructed base
+            (1, 0xa003_5002), // wrong mailbox half
+            (2, 0x5483_8ffe), // extract does not use the loaded value
+            (2, 0x5404_8ffe), // result is not returned in r3
+            (2, 0x5403_87fe), // wrong rotate amount
+            (2, 0x5403_8fbe), // wrong mask
+            (2, 0x5403_8fff), // unexpected CR0 side effect
+            (3, 0x4e00_0020), // conditional/CTR branch through LR
+            (3, 0x4e80_0021), // links instead of returning
+        ] {
+            let mut words = SDK_MAILBOX_STATUS;
+            words[index] = replacement;
+            assert_eq!(
+                sequence(words).detect_pattern(),
+                Pattern::None,
+                "replacement {replacement:#010x} at word {index} was accepted"
+            );
+        }
+    }
+}

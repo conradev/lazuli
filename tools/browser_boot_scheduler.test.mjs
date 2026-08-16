@@ -27,13 +27,19 @@ function extractFunction(name) {
 
 function schedulerContext() {
   const context = {
-    blockPattern: { none: 0, idleBasic: 2, idleVolatileRead: 3 },
+    blockPattern: {
+      none: 0,
+      idleBasic: 2,
+      idleVolatileRead: 3,
+      dspSendMailboxStatus: 4,
+    },
     blocks: new Map(),
     decodeStringHashLoop: () => null,
     isCacheLineLoop: () => false,
     decodeMemset32ByteLoop: () => null,
     isMusyxAramQueueFullWaitBackedge: () => false,
     isAiSrcInitSampleCounterWaitCandidate: () => false,
+    isDspSendMailboxWaitCandidate: () => false,
     isDspReceiveMailboxWaitCandidate: () => false,
     isAramDmaBusyWaitCandidate: () => false,
   };
@@ -101,6 +107,7 @@ test("structural loop recognition remains available before compilation", () => {
   context.decodeStringHashLoop = pc => pc === 0x8000 ? {} : null;
   context.isDspReceiveMailboxWaitCandidate = pc => pc === 0x9000;
   context.isAramDmaBusyWaitCandidate = pc => pc === 0xa000;
+  context.isDspSendMailboxWaitCandidate = pc => pc === 0xb000;
 
   assert.equal(context.isRecognizedLoopPc(0x4000), true);
   assert.equal(context.isRecognizedLoopPc(0x5000), true);
@@ -109,7 +116,8 @@ test("structural loop recognition remains available before compilation", () => {
   assert.equal(context.isRecognizedLoopPc(0x8000), true);
   assert.equal(context.isRecognizedLoopPc(0x9000), true);
   assert.equal(context.isRecognizedLoopPc(0xa000), true);
-  assert.equal(context.isRecognizedLoopPc(0xb000), false);
+  assert.equal(context.isRecognizedLoopPc(0xb000), true);
+  assert.equal(context.isRecognizedLoopPc(0xc000), false);
 });
 
 test("lazy CPU stability witnesses do not hash across changing PCs", () => {

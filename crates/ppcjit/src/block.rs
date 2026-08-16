@@ -83,15 +83,15 @@ pub struct Executed {
 #[repr(u8)]
 pub enum Pattern {
     /// No known pattern.
-    None = 0,
+    None                 = 0,
     /// A single instruction long block with a call.
     Call,
     /// Branching to self
     IdleBasic,
     /// Idling by reading from a fixed memory location on a loop
     IdleVolatileRead,
-    /// Function which the status of the CPU->DSP mailbox and returns it.
-    GetMailboxStatusFunc,
+    /// Function which returns the status of the CPU-to-DSP mailbox.
+    DspSendMailboxStatus = 4,
 }
 
 /// Meta information regarding a block.

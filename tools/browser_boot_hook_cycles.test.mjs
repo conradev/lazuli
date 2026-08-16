@@ -548,8 +548,8 @@ test("coherent runner boundaries quiesce while fault reports remain nonquiescent
   );
   assert.equal(
     [...source.matchAll(/await finishQuiescentAfterRendererDrain\(/g)].length,
-    7,
-    "two operator stops, scenario, limit, first DSI, terminal PC, and stable loop quiesce",
+    8,
+    "two operator stops, scenario, limit, first DSI, terminal PC, and both stable-loop diagnostics quiesce",
   );
   assert.equal(
     [...source.matchAll(/await finishAfterRendererDrain\("stopped", \{/g)].length,

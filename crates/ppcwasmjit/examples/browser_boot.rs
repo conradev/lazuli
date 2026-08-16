@@ -6783,9 +6783,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     const regionFusionHitThreshold = 8;
     const maximumFusedRegionBlocks = 256;
     const dspReceiveMailboxWaitNoProgressServiceLimit = 256;
+    const dspSendMailboxWaitFullServiceLimit = 256;
     const blockPattern = Object.freeze({
       idleBasic: 2,
       idleVolatileRead: 3,
+      dspSendMailboxStatus: 4,
     });
     const hookCalls = new Map();
     const deviceEvents = new Map();
@@ -24475,6 +24477,10 @@ const TEMPLATE: &str = r##"<!doctype html>
         && probeInstructionWord((candidatePc + 12) >>> 0) === 0x4182fff4;
     }
 
+    function isDspSendMailboxWaitCandidate(candidatePc) {
+      return decodeDspSendMailboxWait(candidatePc) !== null;
+    }
+
     function isAramDmaBusyWaitCandidate(candidatePc) {
       return decodeAramDmaBusyWait(candidatePc) !== null;
     }
@@ -24487,6 +24493,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         || isMusyxAramQueueFullWaitBackedge(candidatePc)
         || isAiSrcInitSampleCounterWaitCandidate(candidatePc)
         || isDspReceiveMailboxWaitCandidate(candidatePc)
+        || isDspSendMailboxWaitCandidate(candidatePc)
         || isAramDmaBusyWaitCandidate(candidatePc);
     }
 
@@ -24516,6 +24523,29 @@ const TEMPLATE: &str = r##"<!doctype html>
       return expectedWords.every((word, index) =>
         probeInstructionWord((address + index * 4) >>> 0) === word
       );
+    }
+
+    function decodeDspSendMailboxWait(currentPc) {
+      // Nintendo's DSP SDK exposes the CPU->DSP FULL bit through a leaf
+      // helper. Authenticate both the call loop and helper: the same helper
+      // has legitimate one-shot callers which must never become waits.
+      const helperAddress = decodeRelativeBranchTarget(
+        currentPc,
+        probeInstructionWord(currentPc),
+        true
+      );
+      if (
+        helperAddress === null
+        || probeInstructionWord((currentPc + 4) >>> 0) !== 0x28030000
+        || probeInstructionWord((currentPc + 8) >>> 0) !== 0x4082fff8
+        || !instructionWordsMatch(helperAddress, [
+          0x3c60cc00,
+          0xa0035000,
+          0x54038ffe,
+          0x4e800020,
+        ])
+      ) return null;
+      return { helperAddress };
     }
 
     function decodeAiSrcInitSampleCounterWait(currentPc) {
@@ -24930,6 +24960,144 @@ const TEMPLATE: &str = r##"<!doctype html>
       return wakeCycle > cycles ? { eventCycle, wakeCycle } : null;
     }
 
+    function resetDspSendMailboxWaitWitness() {
+      dspSendMailboxWaitWitnessPc = null;
+      dspSendMailboxWaitWitnessSignature = null;
+      dspSendMailboxWaitWitnessMatches = 0;
+      dspSendMailboxWaitTraversalPhase = 0;
+    }
+
+    function clearDspSendMailboxWaitTracking() {
+      dspSendMailboxWaitTrackedPc = null;
+      dspSendMailboxWaitFullServices = 0;
+      resetDspSendMailboxWaitWitness();
+    }
+
+    function observeDspSendMailboxWaitFixedPoint(currentPc) {
+      const signature = cpuSignature();
+      if (
+        dspSendMailboxWaitWitnessPc !== currentPc
+        || dspSendMailboxWaitWitnessSignature !== signature
+      ) {
+        dspSendMailboxWaitWitnessPc = currentPc;
+        dspSendMailboxWaitWitnessSignature = signature;
+        dspSendMailboxWaitWitnessMatches = 0;
+        return false;
+      }
+      dspSendMailboxWaitWitnessMatches += 1;
+      return dspSendMailboxWaitWitnessMatches >= 2;
+    }
+
+    function dspSendMailboxWaitWakeCycle(currentPc) {
+      const decoded = decodeDspSendMailboxWait(currentPc);
+      if (decoded === null) {
+        if (dspSendMailboxWaitTrackedPc === null) return null;
+        const tracked = decodeDspSendMailboxWait(
+          dspSendMailboxWaitTrackedPc
+        );
+        if (
+          tracked !== null
+          && dspSendMailboxWaitTraversalPhase === 1
+          && currentPc === tracked.helperAddress
+        ) {
+          dspSendMailboxWaitTraversalPhase = 2;
+          return null;
+        }
+        if (
+          tracked !== null
+          && dspSendMailboxWaitTraversalPhase === 2
+          && currentPc === ((dspSendMailboxWaitTrackedPc + 4) >>> 0)
+        ) {
+          dspSendMailboxWaitTraversalPhase = 3;
+          return null;
+        }
+        clearDspSendMailboxWaitTracking();
+        return null;
+      }
+      if (dspSendMailboxWaitTrackedPc !== currentPc) {
+        dspSendMailboxWaitTrackedPc = currentPc;
+        dspSendMailboxWaitFullServices = 0;
+        resetDspSendMailboxWaitWitness();
+      } else if (
+        dspSendMailboxWaitTraversalPhase !== 0
+        && dspSendMailboxWaitTraversalPhase !== 3
+      ) {
+        // Re-entering the caller without executing the exact helper/suffix
+        // path invalidates both the fixed-point and liveness evidence.
+        dspSendMailboxWaitFullServices = 0;
+        resetDspSendMailboxWaitWitness();
+      }
+      const reject = (mailboxCleared = false) => {
+        if (mailboxCleared) dspSendMailboxWaitFullServices = 0;
+        resetDspSendMailboxWaitWitness();
+        return null;
+      };
+
+      const sendMailboxFull =
+        (view.getUint16(mmio + 0x5000, false) & 0x8000) !== 0;
+      const receiveMailboxFull =
+        (view.getUint16(mmio + 0x5004, false) & 0x8000) !== 0;
+      const dspControl = view.getUint16(mmio + 0x500a, false);
+      if (!sendMailboxFull) return reject(true);
+      if (
+        receiveMailboxFull
+        || (dspControl & 0x0004) !== 0
+        || (dspLastStopReason.code !== 0 && dspLastStopReason.code !== 3)
+      ) return reject();
+      if (
+        runtimeEventDueAtOrBefore(cycles)
+        || (
+          cpFifoState.distance !== 0
+          && (cpFifoState.control & cpControlReadEnable) !== 0
+        )
+      ) return reject();
+      if (
+        view.getUint32(cpu + pcOffset, true) !== currentPc
+        // With EE clear, service events cannot expose the register image from
+        // a skipped point inside the leaf helper/cmp/branch sequence.
+        || (view.getUint32(cpu + msrOffset, true) & 0x00008000) !== 0
+        || readLr() !== ((currentPc + 4) >>> 0)
+        || (readGpr(0) & 0x00008000) === 0
+        || readGpr(3) !== 1
+        || nextDspExecutionCycle === null
+        || nextDspExecutionCycle <= cycles
+      ) return reject();
+      const helperBlock = compiledBlock(decoded.helperAddress);
+      if (
+        helperBlock?.pattern !== blockPattern.dspSendMailboxStatus
+        || !compiledBlockInstructionWordsAreCurrent(helperBlock)
+      ) return reject();
+      const mailboxRange = resolveDataRange(0xcc005000, 2, false, false);
+      if (
+        mailboxRange.kind !== "mapped"
+        || mailboxRange.physical !== 0x0c005000
+      ) return reject();
+
+      if (!observeDspSendMailboxWaitFixedPoint(currentPc)) {
+        dspSendMailboxWaitTraversalPhase = 1;
+        return null;
+      }
+      if (
+        dspSendMailboxWaitFullServices >= dspSendMailboxWaitFullServiceLimit
+      ) return { stalled: true };
+      const eventCycle = nextRuntimeEventCycle(false);
+      if (
+        eventCycle === null
+        || eventCycle > nextDspExecutionCycle
+      ) {
+        dspSendMailboxWaitTraversalPhase = 1;
+        return null;
+      }
+      const wakeCycle = Number.isFinite(cycleLimit)
+        ? Math.min(eventCycle, cycleLimit)
+        : eventCycle;
+      if (wakeCycle <= cycles) {
+        dspSendMailboxWaitTraversalPhase = 1;
+        return null;
+      }
+      return { eventCycle, wakeCycle };
+    }
+
     function aramDmaBusyWaitWakeCycle(currentPc) {
       // LR/r3 prove that one complete SDK poll (including its stack stores and
       // interrupt restore) already ran before any repetitions are skipped.
@@ -25052,6 +25220,57 @@ const TEMPLATE: &str = r##"<!doctype html>
             dspReceiveMailboxWaitProducerBlocked()
               ? dspReceiveMailboxWaitNoProgressServices + 1
               : 0;
+        }
+      }
+      lastPc = null;
+      lastCpuSignature = null;
+      samePcCount = 0;
+      return true;
+    }
+
+    async function accelerateDspSendMailboxWait(currentPc) {
+      const wait = dspSendMailboxWaitWakeCycle(currentPc);
+      if (wait === null) return false;
+      if (wait.stalled === true) {
+        await finishQuiescentAfterRendererDrain("progress", {
+          stage: "stable-loop",
+          reason: "dsp-send-mailbox-full",
+          pc: hex32(currentPc),
+          instructions,
+          cycles,
+          dispatches,
+          compiledBlocks: blocks.size,
+          dspSendMailboxWaitFullServices,
+        });
+        throw Symbol.for("reported");
+      }
+      const { eventCycle, wakeCycle } = wait;
+      const skipped = wakeCycle - cycles;
+      cycles = wakeCycle;
+      accelerations.set(
+        "dspSendMailboxWaitCycles",
+        (accelerations.get("dspSendMailboxWaitCycles") ?? 0) + skipped
+      );
+      accelerations.set(
+        "dspSendMailboxWaitJumps",
+        (accelerations.get("dspSendMailboxWaitJumps") ?? 0) + 1
+      );
+      if (wakeCycle >= eventCycle) {
+        const dspExecutionSlicesBefore = dspExecutionSlices;
+        const diskWait = dueDiskTransferPromise(cycles);
+        if (diskWait !== null) await diskWait;
+        // Only the timed DSP interpreter may consume the CPU mailbox. A
+        // completed event must be followed by two fresh real polls before
+        // another jump can prove the loop's complete register fixed point.
+        serviceMmio(cycles);
+        resetDspSendMailboxWaitWitness();
+        pc = view.getUint32(cpu + pcOffset, true);
+        const sendMailboxFull =
+          (view.getUint16(mmio + 0x5000, false) & 0x8000) !== 0;
+        if (!sendMailboxFull) {
+          dspSendMailboxWaitFullServices = 0;
+        } else if (dspExecutionSlices !== dspExecutionSlicesBefore) {
+          dspSendMailboxWaitFullServices += 1;
         }
       }
       lastPc = null;
@@ -26048,6 +26267,12 @@ const TEMPLATE: &str = r##"<!doctype html>
     let samePcCount = 0;
     let dspReceiveMailboxWaitTrackedPc = null;
     let dspReceiveMailboxWaitNoProgressServices = 0;
+    let dspSendMailboxWaitWitnessPc = null;
+    let dspSendMailboxWaitWitnessSignature = null;
+    let dspSendMailboxWaitWitnessMatches = 0;
+    let dspSendMailboxWaitTraversalPhase = 0;
+    let dspSendMailboxWaitTrackedPc = null;
+    let dspSendMailboxWaitFullServices = 0;
     const aramDmaBusyWaitNeedsPoll = new Set();
     const blocks = new Map();
     try {
@@ -26171,6 +26396,10 @@ const TEMPLATE: &str = r##"<!doctype html>
           continue;
         }
         if (await accelerateDspReceiveMailboxWait(pc)) {
+          await finishTerminalControllerScenario();
+          continue;
+        }
+        if (await accelerateDspSendMailboxWait(pc)) {
           await finishTerminalControllerScenario();
           continue;
         }
