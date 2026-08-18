@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -49,6 +50,19 @@ class FidelityWatchdogCompletionTests(unittest.TestCase):
         self.completion.chmod(0o600)
         with self.assertRaisesRegex(ValueError, "not valid JSON"):
             watchdog.read_completion(self.completion, self.url)
+
+    def test_process_identity_probe_has_a_fixed_timeout(self) -> None:
+        with mock.patch.object(
+            watchdog.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["ps"], 2),
+        ) as run:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                watchdog.process_identity(101)
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            watchdog.PROCESS_IDENTITY_TIMEOUT_SECONDS,
+        )
 
     def test_symlink_completion_is_rejected(self) -> None:
         target = self.root / "target.json"
@@ -180,6 +194,62 @@ class FidelityWatchdogCompletionTests(unittest.TestCase):
         with (
             mock.patch.object(sys, "argv", arguments),
             mock.patch.object(watchdog.time, "time", side_effect=clock),
+            mock.patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=[100.0, 100.0 + (watchdog.FIXED_WALL_MS - 1_000) / 1_000],
+            ),
+            mock.patch.object(
+                watchdog,
+                "process_identity",
+                side_effect=[browser_identity, server_identity],
+            ),
+            mock.patch.object(watchdog, "read_completion") as read_completion,
+            mock.patch.object(
+                watchdog,
+                "kill_exact_browser",
+                return_value="sigkill-confirmed-exited",
+            ) as kill_browser,
+        ):
+            watchdog.main()
+
+        final = json.loads(state.read_text())
+        self.assertEqual(final["status"], "deadline-enforced")
+        read_completion.assert_not_called()
+        kill_browser.assert_called_once_with(101, browser_identity)
+
+    def test_backward_wall_clock_cannot_extend_the_monotonic_deadline(self) -> None:
+        state = self.root / "rollback-state.json"
+        start = 1_800_000_000_000
+        initial_now = start + 1_000
+        monotonic_start = 50.0
+        remaining_seconds = (watchdog.FIXED_WALL_MS - 1_000) / 1_000
+        browser_identity = f"Chrome --user-data-dir={self.root / 'profile'}"
+        server_identity = "python resident_machine_fidelity_server.py"
+        arguments = [
+            "resident_machine_fidelity_watchdog.py",
+            "--state", str(state),
+            "--start-unix-ms", str(start),
+            "--deadline-unix-ms", str(start + watchdog.FIXED_WALL_MS),
+            "--browser-pid", "101",
+            "--server-pid", "202",
+            "--expected-url", self.url,
+            "--browser-identity-fragment", str(self.root / "profile"),
+            "--server-identity-fragment", "resident_machine_fidelity_server.py",
+            "--completion", str(self.completion),
+        ]
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.object(
+                watchdog.time,
+                "time",
+                side_effect=[initial_now / 1_000, (start - 60_000) / 1_000, initial_now / 1_000],
+            ),
+            mock.patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=[monotonic_start, monotonic_start + remaining_seconds],
+            ),
             mock.patch.object(
                 watchdog,
                 "process_identity",

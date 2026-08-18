@@ -18,6 +18,7 @@ from pathlib import Path
 SCHEMA = "lazuli-resident-renderer-fidelity-watchdog-v1"
 COMPLETION_SCHEMA = "lazuli-resident-renderer-fidelity-watchdog-completion-v1"
 FIXED_WALL_MS = 600_000
+PROCESS_IDENTITY_TIMEOUT_SECONDS = 2.0
 
 
 def process_identity(pid: int) -> str:
@@ -26,6 +27,7 @@ def process_identity(pid: int) -> str:
         check=True,
         capture_output=True,
         text=True,
+        timeout=PROCESS_IDENTITY_TIMEOUT_SECONDS,
     )
     identity = result.stdout.strip()
     if not identity:
@@ -59,6 +61,8 @@ def durable_state(path: Path, value: dict[str, object]) -> None:
 def kill_exact_browser(pid: int, identity: str) -> str:
     try:
         current = process_identity(pid)
+    except subprocess.TimeoutExpired:
+        return "identity-probe-timeout-not-killed"
     except (OSError, subprocess.CalledProcessError, ValueError):
         return "already-exited"
     if current != identity:
@@ -68,6 +72,8 @@ def kill_exact_browser(pid: int, identity: str) -> str:
     while time.monotonic() < confirmation_deadline:
         try:
             process_identity(pid)
+        except subprocess.TimeoutExpired:
+            return "sigkill-sent-exit-not-confirmed"
         except (OSError, subprocess.CalledProcessError, ValueError):
             return "sigkill-confirmed-exited"
         time.sleep(0.05)
@@ -163,9 +169,12 @@ def main() -> None:
             )
     if arguments.deadline_unix_ms - arguments.start_unix_ms != FIXED_WALL_MS:
         raise ValueError("watchdog deadline must be exactly start + 600000 ms")
-    now = int(time.time() * 1_000)
-    if arguments.start_unix_ms > now or arguments.deadline_unix_ms <= now:
+    now_unix_ms = int(time.time() * 1_000)
+    if arguments.start_unix_ms > now_unix_ms or arguments.deadline_unix_ms <= now_unix_ms:
         raise ValueError("watchdog must be armed after start and before the fixed deadline")
+    monotonic_deadline = time.monotonic() + (
+        arguments.deadline_unix_ms - now_unix_ms
+    ) / 1_000
     if not arguments.expected_url.startswith("http://127.0.0.1:"):
         raise ValueError("watchdog URL must be loopback HTTP")
     browser_identity = process_identity(arguments.browser_pid)
@@ -205,8 +214,10 @@ def main() -> None:
                     "serverCleanup": "left-running-for-controller-cleanup",
                 })
                 return
-            current_unix_ms = int(time.time() * 1_000)
-            if current_unix_ms >= arguments.deadline_unix_ms:
+            if (
+                time.monotonic() >= monotonic_deadline
+                or int(time.time() * 1_000) >= arguments.deadline_unix_ms
+            ):
                 break
             try:
                 completion = read_completion(arguments.completion, arguments.expected_url)
@@ -217,7 +228,7 @@ def main() -> None:
                         raise RuntimeError(
                             "capture process identity changed before watchdog completion"
                         )
-            except (OSError, subprocess.CalledProcessError, ValueError, RuntimeError) as error:
+            except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
                 rejected = rejected_completion_state(
                     arguments,
                     armed,
@@ -230,7 +241,10 @@ def main() -> None:
                 ) from error
             if completion is not None:
                 completion_unix_ms = int(time.time() * 1_000)
-                if completion_unix_ms >= arguments.deadline_unix_ms:
+                if (
+                    time.monotonic() >= monotonic_deadline
+                    or completion_unix_ms >= arguments.deadline_unix_ms
+                ):
                     break
                 _, completion_sha256 = completion
                 durable_state(arguments.state, {
@@ -244,6 +258,17 @@ def main() -> None:
                 return
             try:
                 current_browser = process_identity(arguments.browser_pid)
+            except subprocess.TimeoutExpired as error:
+                rejected = rejected_completion_state(
+                    arguments,
+                    armed,
+                    browser_identity,
+                    error,
+                )
+                durable_state(arguments.state, rejected)
+                raise RuntimeError(
+                    "dedicated browser identity probe timed out before completion"
+                ) from error
             except (OSError, subprocess.CalledProcessError, ValueError) as error:
                 durable_state(arguments.state, {
                     **armed,
@@ -264,9 +289,7 @@ def main() -> None:
                 )
                 durable_state(arguments.state, rejected)
                 raise error
-            remaining_seconds = (
-                arguments.deadline_unix_ms - int(time.time() * 1_000)
-            ) / 1_000
+            remaining_seconds = monotonic_deadline - time.monotonic()
             if remaining_seconds <= 0:
                 break
             time.sleep(min(0.25, remaining_seconds))
