@@ -116,7 +116,7 @@ function closeNumber(actual, expected, location) {
 }
 
 function exactJson(value, expected, location) {
-  if (JSON.stringify(value) !== JSON.stringify(expected)) {
+  if (canonicalFidelityLockJson(value) !== canonicalFidelityLockJson(expected)) {
     fail(location, "did not match the trusted lock");
   }
 }

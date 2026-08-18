@@ -796,7 +796,7 @@ async function buildAttestationFixture(t, {
       workerUrl: authority.executionAssets.worker.url,
     },
   };
-  const performanceLockBytes = Buffer.from(`${JSON.stringify(performanceLock, null, 2)}\n`);
+  const performanceLockBytes = Buffer.from(canonicalFidelityJson(performanceLock), "utf8");
   performanceReport.evidenceLock = {
     schema: performanceLock.schema,
     sha256: sha256(performanceLockBytes),
@@ -1370,6 +1370,56 @@ test("exact seven-title evidence passes the fail-closed production gate", async 
   assert.deepEqual(summary.games.map(game => game.key), GAME_FIDELITY_V1_PROJECTORS.map(game => game.key));
   assert.ok(summary.games.every(game => game.sustained.viFields === "120"));
   assert.ok(summary.games.every(game => game.sustained.presentedFrames === "64"));
+});
+
+test("canonical production v2 performance authority ignores object order but binds arrays and values", async t => {
+  const canonical = await buildAttestationFixture(t);
+  const lockBytes = await readFile(
+    join(canonical.directory, canonical.attestation.controlledPerformance.lock.path),
+  );
+  const lock = JSON.parse(lockBytes);
+  assert.equal(lockBytes.toString(), canonicalFidelityJson(lock));
+  assert.deepEqual(Object.keys(lock.release), [...Object.keys(lock.release)].sort());
+  assert.notDeepEqual(Object.keys(lock.release), [
+    "schema",
+    "releaseId",
+    "manifestBytes",
+    "manifestSha256",
+    "sourceCommit",
+    "executionAssetsSha256",
+    "executionAssets",
+  ]);
+  assert.equal((await validateFixture(canonical)).ok, true);
+
+  const reordered = await buildAttestationFixture(t);
+  await mutateReferencedJson(
+    reordered,
+    reordered.attestation.controlledPerformance.lock,
+    value => { value.run.selectedGameKeys.reverse(); },
+  );
+  await mutateReferencedJson(
+    reordered,
+    reordered.attestation.controlledPerformance.report,
+    value => {
+      value.evidenceLock.sha256 = reordered.attestation.controlledPerformance.lock.sha256;
+    },
+  );
+  await assert.rejects(validateFixture(reordered), /trustedLock\.run\.selectedGameKeys/);
+
+  const changed = await buildAttestationFixture(t);
+  await mutateReferencedJson(
+    changed,
+    changed.attestation.controlledPerformance.lock,
+    value => { value.release.releaseId = "f".repeat(64); },
+  );
+  await mutateReferencedJson(
+    changed,
+    changed.attestation.controlledPerformance.report,
+    value => {
+      value.evidenceLock.sha256 = changed.attestation.controlledPerformance.lock.sha256;
+    },
+  );
+  await assert.rejects(validateFixture(changed), /trustedLock\.release/);
 });
 
 test("production gate rejects the retired v3 instruction authority", async t => {
