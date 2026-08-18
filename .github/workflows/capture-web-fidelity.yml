@@ -17,10 +17,6 @@ on:
         description: Exact lowercase source commit embedded in candidate A
         required: true
         type: string
-      capture_plan:
-        description: Relative canonical plan path beneath the configured LAZULI_CAPTURE_ROOT
-        required: true
-        type: string
 
 permissions:
   actions: read
@@ -31,11 +27,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  LAZULI_CAPTURE_ROOT: ${{ vars.LAZULI_CAPTURE_ROOT }}
+  LAZULI_GAMES_ROOT: ${{ vars.LAZULI_GAMES_ROOT }}
+  LAZULI_CHROME_BINARY: ${{ vars.LAZULI_CHROME_BINARY }}
   WEB_FIDELITY_CANARY_RUN_ID: ${{ inputs.canary_run_id }}
   WEB_FIDELITY_EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
   WEB_FIDELITY_EXPECTED_SOURCE_COMMIT: ${{ inputs.expected_source_commit }}
-  WEB_FIDELITY_CAPTURE_PLAN: ${{ inputs.capture_plan }}
 
 jobs:
   capture:
@@ -95,20 +91,26 @@ jobs:
           --worker-name gekko-free
           --expect-source-commit "$WEB_FIDELITY_EXPECTED_SOURCE_COMMIT"
           --expect-release-id "$WEB_FIDELITY_EXPECTED_RELEASE_ID"
-      - name: Create fresh outside-repository capture parent
+      - name: Configure fresh private outside-repository capture root
+        shell: bash
+        run: |
+          set -euo pipefail
+          capture_root="$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if [[ -e "$capture_root" || -L "$capture_root" ]]; then
+            echo "::error::Fresh production fidelity capture root already exists."
+            exit 1
+          fi
+          echo "LAZULI_CAPTURE_ROOT=$capture_root" >> "$GITHUB_ENV"
+      - name: Run all-seven cold-start capture and assemble private evidence
         run: >-
-          mkdir
-          "$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-      - name: Run all-seven continuous capture and assemble private evidence
-        run: >-
-          node tools/resident_machine_production_fidelity_bundle.mjs
-          --capture-root "$LAZULI_CAPTURE_ROOT"
-          --plan "$WEB_FIDELITY_CAPTURE_PLAN"
+          node tools/resident_machine_production_fidelity_local.mjs
           --candidate-dist "$RUNNER_TEMP/lazuli-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/web/dist"
-          --capture-directory "$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/capture"
-          --output-directory "$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/evidence"
           --repository "$GITHUB_WORKSPACE"
           --corpus "$GITHUB_WORKSPACE/tools/compatibility/games/corpus.json"
+          --games "$LAZULI_GAMES_ROOT"
+          --capture-root "$LAZULI_CAPTURE_ROOT"
+          --output-directory "$LAZULI_CAPTURE_ROOT/evidence"
+          --chrome "$LAZULI_CHROME_BINARY"
       - name: Independently re-run fail-closed production fidelity gate
         run: >-
           node tools/resident_machine_production_fidelity_gate.mjs

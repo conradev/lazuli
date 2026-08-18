@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from resident_machine_corpus_server import (
+    CORPUS_PRODUCTION_EVIDENCE_LOCK_SCHEMA,
     FIDELITY_PRODUCTION_EVIDENCE_LOCK_SCHEMA,
     PRODUCTION_SOURCE_PATHS as PYTHON_PRODUCTION_SOURCE_PATHS,
     ResidentCorpusHandler,
@@ -593,12 +594,9 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
 
     def test_production_corpus_freezes_sources_and_exact_packaged_execution(self) -> None:
         workspace = Path(self.temporary.name) / "workspace"
-        source_names = (
-            "tools/resident_machine_corpus.html",
-            "tools/resident_machine_corpus.mjs",
-            "tools/resident_machine_corpus_report.mjs",
-            "tools/resident_machine_corpus_server.py",
-        )
+        source_names = tuple(sorted(
+            PYTHON_PRODUCTION_SOURCE_PATHS[CORPUS_PRODUCTION_EVIDENCE_LOCK_SCHEMA]
+        ))
         source_records: dict[str, dict[str, object]] = {}
         source_bodies: dict[str, bytes] = {}
         for index, relative in enumerate(source_names):
@@ -711,7 +709,7 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                 )
             package_paths[role].write_bytes(original)
 
-    def test_v3_production_source_membership_matches_javascript_golden(self) -> None:
+    def test_v2_and_v3_production_source_membership_matches_javascript_golden(self) -> None:
         project_root = Path(__file__).resolve().parent.parent
         javascript = subprocess.run(
             [
@@ -732,10 +730,14 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
         javascript_paths = json.loads(javascript.stdout)
         self.assertIsInstance(javascript_paths, list)
         self.assertEqual(len(javascript_paths), len(set(javascript_paths)))
-        self.assertEqual(
-            set(javascript_paths),
-            PYTHON_PRODUCTION_SOURCE_PATHS[FIDELITY_PRODUCTION_EVIDENCE_LOCK_SCHEMA],
-        )
+        for schema in (
+            CORPUS_PRODUCTION_EVIDENCE_LOCK_SCHEMA,
+            FIDELITY_PRODUCTION_EVIDENCE_LOCK_SCHEMA,
+        ):
+            self.assertEqual(
+                set(javascript_paths),
+                PYTHON_PRODUCTION_SOURCE_PATHS[schema],
+            )
 
         workspace = Path(self.temporary.name) / "v3-workspace"
         source_records: dict[str, dict[str, object]] = {}

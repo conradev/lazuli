@@ -5,6 +5,11 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
+import {
+  PRODUCTION_SOURCE_PATHS,
+  canonicalFidelityLockJson,
+} from "./resident_machine_fidelity_lock.mjs";
+
 export const RESIDENT_CORPUS_EVIDENCE_SCHEMA =
   "lazuli-rust-resident-corpus-evidence-v1";
 const RESIDENT_CORPUS_EVIDENCE_LOCK_SCHEMA =
@@ -40,12 +45,7 @@ const EXECUTION_ROLES = [
   "rendererJavascript",
   "rendererWasm",
 ];
-const PRODUCTION_SOURCE_PATHS = [
-  "tools/resident_machine_corpus.html",
-  "tools/resident_machine_corpus.mjs",
-  "tools/resident_machine_corpus_report.mjs",
-  "tools/resident_machine_corpus_server.py",
-];
+export const RESIDENT_CORPUS_PRODUCTION_SOURCE_PATHS = PRODUCTION_SOURCE_PATHS;
 
 function fail(location, message) {
   throw new Error(`invalid resident corpus evidence at ${location}: ${message}`);
@@ -459,11 +459,21 @@ function verifyTrustedLock(value, expectedAuthority = null) {
     const authority = object(expectedAuthority, "options.expectedAuthority");
     exactKeys(
       authority,
-      ["release", "run", "sourceCorpusSha256", "games", "artifacts"],
+      ["release", "run", "sourceCorpusSha256", "games", "artifacts", "sources"],
       "options.expectedAuthority",
     );
-    for (const field of ["release", "run", "sourceCorpusSha256", "games", "artifacts"]) {
+    for (const field of [
+      "release",
+      "run",
+      "sourceCorpusSha256",
+      "games",
+      "artifacts",
+    ]) {
       exactJson(lock[field], authority[field], `${location}.${field}`);
+    }
+    if (canonicalFidelityLockJson(lock.sources)
+      !== canonicalFidelityLockJson(authority.sources)) {
+      fail(`${location}.sources`, "did not match the trusted lock");
     }
   }
   return { ...lock, byKey, production };

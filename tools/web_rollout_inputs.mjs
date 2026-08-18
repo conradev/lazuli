@@ -9,7 +9,6 @@ const RELEASE_ID = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RUN_ID = /^[1-9][0-9]{0,19}$/;
-const RELATIVE_PATH = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 function check(condition, message) {
   if (!condition) throw new Error(message);
@@ -73,16 +72,15 @@ export function validateFidelityCaptureDispatchInputs(options) {
   check(RELEASE_ID.test(options.expectedReleaseId ?? ""), "capture release ID is invalid");
   check(COMMIT.test(options.expectedSourceCommit ?? ""), "capture source commit is invalid");
   check(
-    typeof options.captureRoot === "string"
-      && options.captureRoot.startsWith("/")
-      && options.captureRoot !== "/",
-    "capture root must be an absolute configured path");
+    typeof options.gamesRoot === "string"
+      && options.gamesRoot.startsWith("/")
+      && options.gamesRoot !== "/",
+    "capture games root must be an absolute configured path");
   check(
-    typeof options.capturePlan === "string"
-      && RELATIVE_PATH.test(options.capturePlan)
-      && !options.capturePlan.includes("\\")
-      && !options.capturePlan.split("/").some(part => part === "." || part === ".." || part === ""),
-    "capture plan must be a portable relative path without dot segments",
+    typeof options.chromeBinary === "string"
+      && options.chromeBinary.startsWith("/")
+      && options.chromeBinary !== "/",
+    "capture Chrome binary must be an absolute configured path",
   );
   return Object.freeze({ ...options });
 }
@@ -110,8 +108,8 @@ function parseCaptureArguments(arguments_) {
     canaryRunId: process.env.WEB_FIDELITY_CANARY_RUN_ID ?? "",
     expectedReleaseId: process.env.WEB_FIDELITY_EXPECTED_RELEASE_ID ?? "",
     expectedSourceCommit: process.env.WEB_FIDELITY_EXPECTED_SOURCE_COMMIT ?? "",
-    captureRoot: process.env.LAZULI_CAPTURE_ROOT ?? "",
-    capturePlan: process.env.WEB_FIDELITY_CAPTURE_PLAN ?? "",
+    gamesRoot: process.env.LAZULI_GAMES_ROOT ?? "",
+    chromeBinary: process.env.LAZULI_CHROME_BINARY ?? "",
   };
 }
 

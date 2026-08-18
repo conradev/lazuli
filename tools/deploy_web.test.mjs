@@ -290,11 +290,12 @@ test("rollout input validator pins commit, release, rollback, version, and origi
   }), /exact HTTPS origin/);
 });
 
-test("self-hosted capture uses a contained plan and gates immutable evidence before upload", async () => {
+test("self-hosted capture cold-starts locally and gates immutable evidence before upload", async () => {
   const workflow = await readCaptureWorkflow();
   assert.match(workflow, /^on:\n  workflow_dispatch:/m);
   assert.match(workflow, /^\s+runs-on: \[self-hosted, macOS, lazuli-production-fidelity\]$/m);
-  assert.match(workflow, /^\s+LAZULI_CAPTURE_ROOT: \$\{\{ vars\.LAZULI_CAPTURE_ROOT \}\}$/m);
+  assert.match(workflow, /^\s+LAZULI_GAMES_ROOT: \$\{\{ vars\.LAZULI_GAMES_ROOT \}\}$/m);
+  assert.match(workflow, /^\s+LAZULI_CHROME_BINARY: \$\{\{ vars\.LAZULI_CHROME_BINARY \}\}$/m);
   assert.match(workflow, /^\s+ref: \$\{\{ inputs\.expected_source_commit \}\}$/m);
   assert.match(workflow, /^\s+fetch-depth: 0$/m);
   assert.match(workflow, /name: schema4-canary-candidate/);
@@ -302,10 +303,13 @@ test("self-hosted capture uses a contained plan and gates immutable evidence bef
   assert.match(workflow, /run\.conclusion !== "success"/);
   assert.match(workflow, /run\.head_sha !== process\.env\.AUTHENTICATED_SOURCE_COMMIT/);
   assert.match(workflow, /--capture-root "\$LAZULI_CAPTURE_ROOT"/);
-  assert.match(workflow, /--plan "\$WEB_FIDELITY_CAPTURE_PLAN"/);
+  assert.match(workflow, /node tools\/resident_machine_production_fidelity_local\.mjs/);
+  assert.match(workflow, /--games "\$LAZULI_GAMES_ROOT"/);
+  assert.match(workflow, /--chrome "\$LAZULI_CHROME_BINARY"/);
+  assert.doesNotMatch(workflow, /capture_plan|WEB_FIDELITY_CAPTURE_PLAN|--plan/);
   assert.doesNotMatch(workflow, /tools\/resident_machine_production_fidelity_attestation\.json/);
   assert.doesNotMatch(workflow, /cloudflare\/wrangler-action|versions deploy|command: rollback/);
-  const capture = after(workflow, "Run all-seven continuous capture");
+  const capture = after(workflow, "Run all-seven cold-start capture");
   const gate = after(workflow, "Independently re-run fail-closed production fidelity gate", capture);
   const upload = after(workflow, "Upload immutable all-seven fidelity evidence", gate);
   assert.ok(capture < gate && gate < upload);
@@ -313,26 +317,22 @@ test("self-hosted capture uses a contained plan and gates immutable evidence bef
   assert.match(workflow.slice(upload), /name: schema4-production-fidelity-evidence/);
 });
 
-test("capture dispatch validator rejects unpinned identities and path escape", () => {
+test("capture dispatch validator rejects unpinned identities and runner paths", () => {
   const valid = {
     canaryRunId: "123456789",
     expectedReleaseId: RELEASE_ID,
     expectedSourceCommit: COMMIT,
-    captureRoot: "/srv/lazuli-capture",
-    capturePlan: "candidate-a/plan.json",
+    gamesRoot: "/srv/lazuli-games",
+    chromeBinary: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   };
   assert.ok(Object.isFrozen(validateFidelityCaptureDispatchInputs(valid)));
   assert.throws(() => validateFidelityCaptureDispatchInputs({
     ...valid,
-    capturePlan: "../plan.json",
-  }), /portable relative path/);
-  assert.throws(() => validateFidelityCaptureDispatchInputs({
-    ...valid,
-    captureRoot: "relative/capture",
+    gamesRoot: "relative/games",
   }), /absolute configured path/);
   assert.throws(() => validateFidelityCaptureDispatchInputs({
     ...valid,
-    captureRoot: "/",
+    chromeBinary: "Google Chrome",
   }), /absolute configured path/);
   assert.throws(() => validateFidelityCaptureDispatchInputs({
     ...valid,

@@ -24,6 +24,15 @@ const CAPTURE_TRANSITIVE_SOURCE_PATHS = Object.freeze([
   "tools/browser_boot_devtools_socket.mjs",
   "tools/browser_boot_disc_identity.mjs",
 ]);
+const LOCAL_CAPTURE_STATIC_SOURCE_PATHS = Object.freeze([
+  "tools/browser_boot_headless_cdp.mjs",
+  "tools/browser_game_compatibility_corpus.mjs",
+  "tools/resident_machine_corpus_report.mjs",
+  "tools/resident_machine_fidelity_lock.mjs",
+  "tools/resident_machine_production_fidelity_bundle.mjs",
+  "tools/resident_machine_production_fidelity_capture.mjs",
+  "tools/resident_machine_production_fidelity_gate.mjs",
+]);
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -191,6 +200,17 @@ test("v3 source records require exact path order and release-commit byte records
     await writeFile(join(fixture.repository, source), fixture.sourceBytes.get(source));
     await commitAll(fixture.repository, `restore transitive dependency ${source}`);
   }
+});
+
+test("cold-start controller and every local static import are production-authorized", async () => {
+  const controller = "tools/resident_machine_production_fidelity_local.mjs";
+  assert.ok(PRODUCTION_SOURCE_PATHS.includes(controller));
+  const source = await readFile(new URL(`../${controller}`, import.meta.url), "utf8");
+  const imports = [...source.matchAll(/from "\.\/([^"\n]+)"/g)]
+    .map(match => `tools/${match[1]}`)
+    .sort();
+  assert.deepEqual(imports, [...LOCAL_CAPTURE_STATIC_SOURCE_PATHS].sort());
+  for (const imported of imports) assert.ok(PRODUCTION_SOURCE_PATHS.includes(imported));
 });
 
 test("v2 lock validation retains its existing source-record behavior", async () => {

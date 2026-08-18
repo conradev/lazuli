@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,7 +13,9 @@ import {
   operatorPublicationDue,
   orderCaptureInputs,
   parseCaptureArguments,
+  preparePrivateCaptureDirectory,
   productionFidelityRunFragment,
+  runGameCaptureLifecycle,
   selectRetainedPreWitnessMachineEvidence,
   selectCreatedCaptureTarget,
   sustainedWindowReached,
@@ -192,6 +194,55 @@ test("loader binding rejects URL, frame, and loader drift", () => {
   ]) assert.throws(() => validateNavigationFrame(binding, changed), /drifted/);
 });
 
+test("per-game lifecycle arms before capture and disarms only after terminal work", async () => {
+  const events = [];
+  const context = Object.freeze({
+    gameKey: "game-1",
+    priority: 1,
+    runId: "10000000-0000-4000-8000-000000000001",
+    captureUrl:
+      "http://127.0.0.1:8101/tools/resident_machine_first_frame.html?capture=fidelity&game=game-1",
+  });
+  const result = await runGameCaptureLifecycle(context, async () => {
+    events.push("capture-terminal-validated");
+    return "fragment";
+  }, {
+    beforeGameNavigation: async value => {
+      events.push(`armed:${value.gameKey}`);
+      return Object.freeze({ watchdog: "one" });
+    },
+    afterGameCapture: async value => {
+      events.push(`disarmed:${value.outcome}:${value.lifecycleToken.watchdog}`);
+      assert.equal(value.error, null);
+    },
+  });
+  assert.equal(result, "fragment");
+  assert.deepEqual(events, [
+    "armed:game-1",
+    "capture-terminal-validated",
+    "disarmed:complete:one",
+  ]);
+});
+
+test("per-game lifecycle reports capture failure and preserves cleanup failure", async () => {
+  const captureFailure = new Error("capture failed");
+  const cleanupFailure = new Error("watchdog failed");
+  await assert.rejects(
+    runGameCaptureLifecycle({ gameKey: "game-1" }, async () => {
+      throw captureFailure;
+    }, {
+      afterGameCapture: async value => {
+        assert.equal(value.outcome, "failed");
+        assert.match(value.error, /capture failed/);
+        throw cleanupFailure;
+      },
+    }),
+    error => error instanceof AggregateError
+      && error.errors[0] === captureFailure
+      && error.errors[1] === cleanupFailure,
+  );
+});
+
 test("offline sustained-window decision requires both +120 VI fields and +64 presentations", () => {
   const first = { vi: { viFields: "1000" }, gx: { presentedFrames: "400" } };
   assert.equal(sustainedWindowReached(first, {
@@ -267,6 +318,30 @@ test("private atomic leaves are contained, exact, and mode 0600", async () => {
     await assert.rejects(
       writePrivateLeafAtomic(root, "../escape.bin", bytes),
       /escaped the output directory/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("bundle-owned empty capture directory needs explicit lifecycle authority", async () => {
+  const root = path.join(
+    await realpath(tmpdir()),
+    `lazuli-capture-directory-${process.pid}-${Date.now()}`,
+  );
+  await mkdirForTest(root);
+  try {
+    const output = path.join(root, "capture");
+    await mkdir(output, { mode: 0o700 });
+    await assert.rejects(preparePrivateCaptureDirectory(output), /EEXIST/);
+    assert.equal(
+      await preparePrivateCaptureDirectory(output, { allowExistingEmpty: true }),
+      output,
+    );
+    await writePrivateLeafAtomic(output, "substituted", Buffer.from("not empty"));
+    await assert.rejects(
+      preparePrivateCaptureDirectory(output, { allowExistingEmpty: true }),
+      /must be empty/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

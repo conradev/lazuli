@@ -4,10 +4,13 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  lstat,
   mkdir,
   link,
   open,
+  readdir,
   readFile,
+  realpath,
   stat,
   unlink,
 } from "node:fs/promises";
@@ -469,7 +472,12 @@ export function selectCreatedCaptureTarget(targets, targetId) {
   });
 }
 
-async function createDedicatedCaptureTarget(endpoint, createSession, fetchImpl, requestTimeoutMs) {
+export async function createDedicatedCaptureTarget(
+  endpoint,
+  createSession,
+  fetchImpl,
+  requestTimeoutMs,
+) {
   const version = await fetchCdpJson(endpoint, "json/version", fetchImpl);
   const browserSocket = validateLoopbackSocket(version.webSocketDebuggerUrl);
   const browserSession = createSession(browserSocket, { requestTimeoutMs });
@@ -883,6 +891,76 @@ export function productionFidelityRunFragment(runValue) {
   });
 }
 
+export async function runGameCaptureLifecycle(
+  context,
+  capture,
+  {
+    beforeGameNavigation = async () => null,
+    afterGameCapture = async () => {},
+  } = {},
+) {
+  if (
+    typeof capture !== "function"
+    || typeof beforeGameNavigation !== "function"
+    || typeof afterGameCapture !== "function"
+  ) fail("capture lifecycle hooks must be functions");
+  const lifecycleToken = await beforeGameNavigation(context);
+  let result = null;
+  let failure = null;
+  try {
+    result = await capture();
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    await afterGameCapture(Object.freeze({
+      ...context,
+      lifecycleToken,
+      outcome: failure === null ? "complete" : "failed",
+      error: failure === null ? null : String(failure?.stack ?? failure),
+    }));
+  } catch (lifecycleError) {
+    if (failure !== null) {
+      throw new AggregateError(
+        [failure, lifecycleError],
+        `production fidelity capture and lifecycle cleanup failed for ${context.gameKey}`,
+      );
+    }
+    throw lifecycleError;
+  }
+  if (failure !== null) throw failure;
+  return result;
+}
+
+export async function preparePrivateCaptureDirectory(
+  directory,
+  { allowExistingEmpty = false } = {},
+) {
+  const requested = path.resolve(directory);
+  const requestedParent = path.dirname(requested);
+  const canonicalParent = await realpath(requestedParent);
+  if (canonicalParent !== requestedParent) {
+    fail("capture output parent must not traverse a symlink component");
+  }
+  const destination = path.join(canonicalParent, path.basename(requested));
+  if (destination !== requested) fail("capture output path changed during resolution");
+  try {
+    await mkdir(destination, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST" || !allowExistingEmpty) throw error;
+  }
+  const metadata = await lstat(destination);
+  if (
+    metadata.isSymbolicLink()
+    || !metadata.isDirectory()
+    || (metadata.mode & 0o777) !== 0o700
+  ) fail("capture output must be a mode-0700 non-symlink directory");
+  if ((await readdir(destination)).length !== 0) {
+    fail("capture output must be empty before capture");
+  }
+  return destination;
+}
+
 async function writeGameLeaves(
   root,
   input,
@@ -1124,9 +1202,14 @@ export async function runProductionFidelityCapture(options, {
   createSession = (url, sessionOptions) => new DevToolsSession(url, sessionOptions),
   fetchImpl = fetch,
   now = () => new Date(),
+  beforeGameNavigation = async () => null,
+  afterGameCapture = async () => {},
+  allowExistingEmptyOutputDirectory = false,
 } = {}) {
   const inputs = await loadInputs(options);
-  await mkdir(options.outputDirectory, { mode: 0o700 });
+  await preparePrivateCaptureDirectory(options.outputDirectory, {
+    allowExistingEmpty: allowExistingEmptyOutputDirectory,
+  });
   const dedicated = await createDedicatedCaptureTarget(
     options.cdpEndpoint,
     createSession,
@@ -1144,29 +1227,38 @@ export async function runProductionFidelityCapture(options, {
     await pageSession.send("Page.enable", {}, options.requestTimeoutMs);
     await pageSession.send("Page.bringToFront", {}, options.requestTimeoutMs);
     for (const input of inputs.ordered) {
-      let navigated = false;
-      let captured;
-      try {
-        const binding = await navigateDedicatedPage(
-          pageSession,
-          input.captureUrl,
-          options.requestTimeoutMs,
+      const lifecycleContext = Object.freeze({
+        gameKey: input.game.key,
+        priority: input.game.priority,
+        runId: input.lock.run.runId,
+        captureUrl: input.captureUrl,
+      });
+      const fragment = await runGameCaptureLifecycle(lifecycleContext, async () => {
+        let navigated = false;
+        let captured;
+        try {
+          const binding = await navigateDedicatedPage(
+            pageSession,
+            input.captureUrl,
+            options.requestTimeoutMs,
+          );
+          navigated = true;
+          captured = await captureOne(pageSession, input, options, binding);
+        } finally {
+          if (navigated) await unloadDedicatedPage(pageSession, options.requestTimeoutMs);
+        }
+        const journalBytes = await readFile(input.journalPath);
+        validateCaptureJournal(journalBytes, input);
+        return writeGameLeaves(
+          options.outputDirectory,
+          input,
+          captured.artifacts,
+          journalBytes,
+          now().toISOString(),
+          captured.operatorPublications,
         );
-        navigated = true;
-        captured = await captureOne(pageSession, input, options, binding);
-      } finally {
-        if (navigated) await unloadDedicatedPage(pageSession, options.requestTimeoutMs);
-      }
-      const journalBytes = await readFile(input.journalPath);
-      validateCaptureJournal(journalBytes, input);
-      fragments.push(await writeGameLeaves(
-        options.outputDirectory,
-        input,
-        captured.artifacts,
-        journalBytes,
-        now().toISOString(),
-        captured.operatorPublications,
-      ));
+      }, { beforeGameNavigation, afterGameCapture });
+      fragments.push(fragment);
     }
   } finally {
     pageSession?.close();

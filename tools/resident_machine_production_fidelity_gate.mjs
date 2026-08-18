@@ -994,6 +994,7 @@ async function validatePerformance(
   corpusGames,
   assetsSha256,
   authority,
+  sourceAuthority,
 ) {
   const location = "$.controlledPerformance";
   const performance = object(value, location);
@@ -1035,6 +1036,7 @@ async function validatePerformance(
       schema: "lazuli-resident-corpus-artifacts-v1",
       artifacts: expectedArtifacts,
     },
+    sources: sourceAuthority,
   };
   validateResidentCorpusEvidence(report, {
     requireComplete: true,
@@ -1805,6 +1807,7 @@ export async function validateProductionFidelityAttestationFiles({
     corpusGames,
     assetsSha256,
     authority,
+    sourceAuthority,
   );
 
   const games = array(attestation.games, "$.games");

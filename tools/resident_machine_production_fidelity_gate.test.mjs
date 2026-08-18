@@ -35,7 +35,6 @@ import { releaseIdentityPayload, sha256Hex } from "../web/release.mjs";
 
 const CORPUS_PATH = new URL("./compatibility/games/corpus.json", import.meta.url);
 const CORPUS_SHA = "43597e441ab8c38adb18beed8ac34895a8496cac8ac2112ef4cb27c7504f4fc6";
-const SOURCE_SHA = "d".repeat(64);
 const execFileAsync = promisify(execFile);
 
 function sha256(bytes) {
@@ -465,10 +464,6 @@ function releaseAuthority(release, releaseBytes) {
   };
 }
 
-function fileRecords(paths) {
-  return Object.fromEntries(paths.map(path => [path, { bytes: 1, sha256: SOURCE_SHA }]));
-}
-
 function firstFrameRunPolicy(workerUrl) {
   return {
     instructionUpperCap: "100000000",
@@ -792,12 +787,7 @@ async function buildAttestationFixture(t, {
       schema: "lazuli-resident-corpus-artifacts-v1",
       artifacts: structuredClone(reportArtifacts(release)),
     },
-    sources: fileRecords([
-      "tools/resident_machine_corpus.html",
-      "tools/resident_machine_corpus.mjs",
-      "tools/resident_machine_corpus_report.mjs",
-      "tools/resident_machine_corpus_server.py",
-    ]),
+    sources: structuredClone(sourceRepository.records),
     runPolicy: {
       ...structuredClone(performanceReport.policy),
       workerUrl: authority.executionAssets.worker.url,
@@ -1540,7 +1530,7 @@ test("v3 prelaunch verifier freezes raw authority, harness, and all packaged byt
   };
   assert.equal(
     await verifyResidentProductionFidelityEvidenceLockFiles(lockBytes, options),
-    36,
+    PRODUCTION_SOURCE_PATHS.length + 16,
   );
   await assert.rejects(
     verifyResidentProductionFidelityEvidenceLockFiles(lockBytes, {
@@ -1710,6 +1700,20 @@ test("controlled-performance packaged adapter and Worker substitutions fail clos
       new RegExp(`runtimeAssets\\.${role}`),
     );
   }
+});
+
+test("controlled-performance sources remain bound to the release commit", async t => {
+  const fixture = await buildAttestationFixture(t);
+  const performance = fixture.attestation.controlledPerformance;
+  await mutateReferencedJson(fixture, performance.lock, lock => {
+    const [firstSource] = PRODUCTION_SOURCE_PATHS;
+    lock.sources[firstSource].sha256 = "f".repeat(64);
+  });
+  const changedLockSha256 = performance.lock.sha256;
+  await mutateReferencedJson(fixture, performance.report, report => {
+    report.evidenceLock.sha256 = changedLockSha256;
+  });
+  await assert.rejects(validateFixture(fixture), /trustedLock\.sources/);
 });
 
 async function mutateReferencedJson(fixture, reference, mutate) {
