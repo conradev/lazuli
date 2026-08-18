@@ -2922,10 +2922,9 @@ impl WebGpuRenderer {
     }
 
     fn exact_required_rejection_snapshot(&self) -> ExactRequiredRejectionSnapshot {
-        ExactRequiredRejectionSnapshot::capture(
-            self.metrics.get(),
-            self.exact_required_preparation_rejection_counts.get(),
-        )
+        let metrics = self.metrics.get();
+        let preparation_rejections = self.exact_required_preparation_rejection_counts.get();
+        ExactRequiredRejectionSnapshot::capture(&metrics, &preparation_rejections)
     }
 
     fn host_phase_timer(&self, phase: RendererHostPhase) -> RendererPhaseTimer {
