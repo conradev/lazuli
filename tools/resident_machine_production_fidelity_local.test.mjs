@@ -10,6 +10,7 @@ import test from "node:test";
 import { canonicalCaptureJson } from "./resident_machine_production_fidelity_capture.mjs";
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_FIDELITY_EXECUTION_ROLES,
   PRODUCTION_SOURCE_PATHS,
@@ -191,6 +192,7 @@ test("local controller emits canonical production v2 and schema-ordered v3 locks
   assert.equal(performanceLock.runPolicy.bootTimeoutMs, 120_000);
   assert.equal(performanceLock.runPolicy.sliceTimeoutMs, 120_000);
   assert.equal(performanceLock.runPolicy.windowTimeoutMs, 120_000);
+  assert.equal(performanceLock.runPolicy.cycleUpperCap, "1000000");
   assert.equal(performanceLock.runPolicy.maxColdInstalls, 65_535);
   const performanceBytes = Buffer.from(canonicalCaptureJson(performanceLock));
   assert.equal(performanceBytes.toString(), canonicalCaptureJson(JSON.parse(performanceBytes)));
@@ -198,10 +200,20 @@ test("local controller emits canonical production v2 and schema-ordered v3 locks
   const fidelityLock = productionRendererFidelityEvidenceLock(base);
   assert.equal(fidelityLock.schema, PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA);
   assert.equal(
+    fidelityLock.runPolicy.executedCycleUpperCap,
+    PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  );
+  assert.equal(
     fidelityLock.runPolicy.totalColdInstallCap,
     PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   );
   assert.equal(validateResidentProductionFidelityEvidenceLock(fidelityLock, base), fidelityLock);
+  const staleCycleAuthority = structuredClone(fidelityLock);
+  staleCycleAuthority.runPolicy.executedCycleUpperCap = "250000000";
+  assert.throws(
+    () => validateResidentProductionFidelityEvidenceLock(staleCycleAuthority, base),
+    /executedCycleUpperCap/,
+  );
   const fidelityBytes = schemaOrderedLockBytes(fidelityLock);
   assert.deepEqual(Object.keys(JSON.parse(fidelityBytes).sources), [...PRODUCTION_SOURCE_PATHS]);
   assert.equal(fidelityBytes.at(-1), "}".charCodeAt(0));

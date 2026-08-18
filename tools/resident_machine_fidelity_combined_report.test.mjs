@@ -13,6 +13,7 @@ import { canonicalFidelityJson } from "./resident_machine_fidelity_checkpoint_re
 import { PRODUCTION_FIRST_FRAME_CAPTURE_ORDER } from "./resident_machine_first_frame_report.mjs";
 import {
   expectedFidelityHostIdentitySha256,
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   productionFidelityCapturePolicy,
@@ -150,6 +151,7 @@ function productionLock(base) {
     hostPolicy: structuredClone(base.hostPolicy),
     runPolicy: {
       ...structuredClone(base.runPolicy),
+      executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
       totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
       workerUrl: worker.url,
     },
@@ -241,7 +243,9 @@ async function productionFixture({
     expectedLockAuthority,
   );
   const report = residentFirstFrameReportFixture();
+  report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+  report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.artifacts.artifacts = structuredClone(lock.artifacts);
   report.evidenceLock = { schema: lock.schema, sha256: evidenceLockSha256 };
   report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
@@ -617,6 +621,23 @@ test("production combined authenticates a same-receipt Baseline before report bi
   assert.equal(summary.probeEvents, 0);
   assert.equal(evidence.report.capabilityBoundary.rendererOwnedRgbaReadbacks, 1);
   assert.equal(evidence.records[evidence.prefixCount].payload.kind, "first-frame-report-bound");
+});
+
+test("production combined rejects the retired 250M cap in either report or lock", async () => {
+  const staleReport = await productionFixture({ baselineMode: "same-pre" });
+  staleReport.report.policy.executedCycleUpperCap = "250000000";
+  staleReport.report.game.run.executedCycleUpperCap = "250000000";
+  assert.throws(
+    () => validateProduction(staleReport),
+    /report\.policy/,
+  );
+
+  const staleLock = await productionFixture({ baselineMode: "same-pre" });
+  staleLock.lock.runPolicy.executedCycleUpperCap = "250000000";
+  assert.throws(
+    () => validateProduction(staleLock),
+    /runPolicy\.executedCycleUpperCap/,
+  );
 });
 
 test("production combined requires capture mode and exact receipt-derived readback counts", async () => {

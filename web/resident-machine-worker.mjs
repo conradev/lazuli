@@ -366,6 +366,33 @@ function nonnegativeResultBigInt(value, label) {
   return result;
 }
 
+function exactResultU32(value, label) {
+  if (
+    typeof value !== "number"
+    || !Number.isInteger(value)
+    || value < 0
+    || value > 0xffff_ffff
+  ) {
+    throw new Error(`${label} was not an exact u32`);
+  }
+  return value;
+}
+
+function exactRustOutcomeIdentity(outcome) {
+  if (outcome === null || typeof outcome !== "object" || Array.isArray(outcome)) {
+    throw new Error("reported Rust outcome was not an object");
+  }
+  const reason = exactResultU32(outcome.reason, "reported Rust outcome reason");
+  const detail = exactResultU32(outcome.detail, "reported Rust outcome detail");
+  if (reason > 6) {
+    throw new Error("reported Rust outcome reason was outside the RunReason ABI");
+  }
+  if (reason === 0 && detail > 8) {
+    throw new Error("reported BudgetExhausted detail was outside the RunOutcomeDetail ABI");
+  }
+  return Object.freeze({ reason, detail });
+}
+
 /**
  * Worker-owned, one-machine cumulative execution authority for production fidelity capture.
  * Browser callers may lower a single request, but cannot raise or reset any frozen cap.
@@ -513,6 +540,13 @@ export class ResidentCaptureRunLedger {
   accept(result) {
     const issued = this.pending;
     if (issued === null) throw new Error("capture ledger received an unissued run result");
+    const remainingIssuedCycleAuthority = (
+      this.policy.executedCycleUpperCap - this.reportedExecutedCycles
+    );
+    const issuedFullTruncatedCycleTail = (
+      remainingIssuedCycleAuthority < this.policy.sliceCycleUpperCap
+      && issued.cycleUpperCap === remainingIssuedCycleAuthority
+    );
     this.pending = null;
     if (result === null || typeof result !== "object") {
       throw new Error("capture ledger received an invalid run result");
@@ -526,6 +560,12 @@ export class ResidentCaptureRunLedger {
     this.reportedColdInstalls += coldInstalls;
 
     if (result.boundary === "rust") {
+      const { reason, detail } = exactRustOutcomeIdentity(result.outcome);
+      if (reason !== 0) {
+        throw new Error(
+          `capture Rust resident run stopped with reason ${reason}, detail ${detail}`,
+        );
+      }
       const cycles = nonnegativeResultBigInt(
         result.outcome?.executedCycles,
         "reported executed cycles",
@@ -539,7 +579,18 @@ export class ResidentCaptureRunLedger {
       }
       this.reportedExecutedCycles += cycles;
       this.reportedExecutedInstructions += instructions;
-      if (cycles === 0n && instructions === 0n) {
+      if (issuedFullTruncatedCycleTail && detail === 1) {
+        this.assertProgressAvailable();
+        throw new Error(
+          "capture cumulative executed-cycle cap cannot retire the next block",
+        );
+      }
+      if (
+        cycles === 0n
+        && instructions === 0n
+        && hostCalls === 0
+        && coldInstalls === 0
+      ) {
         this.zeroProgressSlices += 1;
         this.consecutiveZeroProgressSlices += 1;
         this.maximumConsecutiveZeroProgressSlices = Math.max(

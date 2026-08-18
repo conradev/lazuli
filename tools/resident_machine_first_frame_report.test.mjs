@@ -12,6 +12,7 @@ import {
   validateResidentFirstFrameReport,
 } from "./resident_machine_first_frame_report.mjs";
 import {
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -441,7 +442,9 @@ test("production validation requires an exact v3 lock reference and zero client 
     sha256: "e".repeat(64),
   };
   report.evidenceLock = structuredClone(expectedEvidenceLock);
+  report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+  report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
   report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
   report.capabilityBoundary.rendererProbeEventsExpected = 0;
@@ -533,7 +536,9 @@ test("production capture order inserts only durable first-frame ownership", () =
   };
   const production = residentFirstFrameReportFixture();
   production.evidenceLock = structuredClone(expectedEvidenceLock);
+  production.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   production.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+  production.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   production.capabilityBoundary.rendererProbeEventsExpected = 0;
   production.game.fidelityCheckpoints.probeEventCount = 0;
   production.game.fidelityCheckpoints.maximumProbeEventsPerSubmission = 0;
@@ -622,7 +627,7 @@ test("complete evidence rejects cap, timeout, fault, and impossible progress mut
   }
 });
 
-test("semantic idle cycle progress does not consume the zero-progress slice budget", async () => {
+async function observeRustRunHarness() {
   const source = await readFile(
     new URL("./resident_machine_first_frame.mjs", import.meta.url),
     "utf8",
@@ -653,6 +658,11 @@ test("semantic idle cycle progress does not consume the zero-progress slice budg
     maximumConsecutiveZeroProgressSlices: 0,
     zeroProgressCapBoundaries: 0,
   };
+  return { observeRustRun, run };
+}
+
+test("semantic idle cycle progress does not consume the zero-progress slice budget", async () => {
+  const { observeRustRun, run } = await observeRustRunHarness();
   observeRustRun(run, {
     boundary: "rust",
     hostCalls: 0,
@@ -664,6 +674,36 @@ test("semantic idle cycle progress does not consume the zero-progress slice budg
   assert.equal(run.zeroProgressSlices, 0);
   assert.equal(run.consecutiveZeroProgressSlices, 0);
   assert.equal(run.maximumConsecutiveZeroProgressSlices, 0);
+});
+
+test("authenticated host and cold work reset consecutive zero progress", async () => {
+  const { observeRustRun, run } = await observeRustRunHarness();
+  const result = (hostCalls, coldInstalls) => ({
+    boundary: "rust",
+    hostCalls,
+    coldInstalls,
+    outcome: { reason: 0, detail: 0, executedCycles: "0", executedInstructions: "0" },
+  });
+
+  observeRustRun(run, result(0, 0));
+  assert.equal(run.zeroProgressSlices, 1);
+  assert.equal(run.consecutiveZeroProgressSlices, 1);
+  assert.equal(run.maximumConsecutiveZeroProgressSlices, 1);
+
+  observeRustRun(run, result(1, 0));
+  assert.equal(run.servicedHostCalls, 1);
+  assert.equal(run.zeroProgressSlices, 1);
+  assert.equal(run.consecutiveZeroProgressSlices, 0);
+
+  observeRustRun(run, result(0, 0));
+  assert.equal(run.zeroProgressSlices, 2);
+  assert.equal(run.consecutiveZeroProgressSlices, 1);
+
+  observeRustRun(run, result(0, 1));
+  assert.equal(run.coldInstalls, 1);
+  assert.equal(run.zeroProgressSlices, 2);
+  assert.equal(run.consecutiveZeroProgressSlices, 0);
+  assert.equal(run.maximumConsecutiveZeroProgressSlices, 1);
 });
 
 test("complete evidence rejects coordinated corpus, artifact, renderer, and transport rewrites", () => {
@@ -858,6 +898,10 @@ test("production page keeps query, ownership ACK, reuse, and controller APIs fai
   assert.match(
     source,
     /productionCaptureRequested\s*\? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP\s*:\s*65_535/,
+  );
+  assert.match(
+    source,
+    /productionCaptureRequested\s*\? PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP\s*:\s*"250000000"/,
   );
 
   const observationStart = source.indexOf("async captureFidelityObservation(message)");

@@ -20,6 +20,7 @@ import { residentFirstFrameReportFixture } from "./resident_machine_first_frame_
 import { PRODUCTION_FIRST_FRAME_CAPTURE_ORDER } from "./resident_machine_first_frame_report.mjs";
 import { canonicalFidelityJson } from "./resident_machine_fidelity_checkpoint_report.mjs";
 import {
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   expectedFidelityHostIdentitySha256,
@@ -468,7 +469,7 @@ function releaseAuthority(release, releaseBytes) {
 function firstFrameRunPolicy(workerUrl) {
   return {
     instructionUpperCap: "100000000",
-    executedCycleUpperCap: "250000000",
+    executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     sliceCycleUpperCap: "1000000",
     blockUpperCap: 16_384,
     totalHostCallCap: 65_535,
@@ -832,7 +833,9 @@ async function buildAttestationFixture(t, {
       throw new Error(`unsupported Baseline mode ${baselineMode}`);
     }
     const report = residentFirstFrameReportFixture();
+    report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
     report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+    report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
     report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
     report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
     report.game.inputSamples = reportInputSampleCounts[index] ?? 0;
@@ -2034,6 +2037,20 @@ test("authenticated terminal chronology and sustained bounds reject internally r
       pattern,
     );
   }
+});
+
+test("authenticated terminal execution rejects a cycle beyond the production cap", async t => {
+  const overCap = BigInt(PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP) + 1n;
+  const fixture = await buildAttestationFixture(t, {
+    terminalMachineMutators: [bytes => {
+      bytes.writeBigUInt64LE(overCap, 19 * 4);
+      bytes.writeBigUInt64LE(overCap, 21 * 4);
+    }],
+  });
+  await assert.rejects(
+    validateFixture(fixture),
+    /terminalExecutedCycles.*immutable lock cap/,
+  );
 });
 
 test("terminal SI may advance beyond receipt while scheduledCycle remains non-monotonic", async t => {

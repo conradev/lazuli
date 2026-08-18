@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   FIDELITY_CHECKPOINT_ACK_SCHEMA,
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   ResidentFidelityCheckpointClient,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -14,6 +15,12 @@ const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
 const LOCK_SHA = "c".repeat(64);
 const MACHINE_SESSION_ID = "87654321-4321-4321-8321-cba987654321";
+
+test("production v3 cycle authority is an exact decimal string", () => {
+  assert.equal(PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP, "2500000000");
+  assert.equal(typeof PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP, "string");
+});
+
 const CAPTURE_RUN_POLICY = Object.freeze({
   instructionUpperCap: "100",
   executedCycleUpperCap: "200",

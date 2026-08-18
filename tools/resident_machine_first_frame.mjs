@@ -5,6 +5,7 @@ import initRenderer, {
 } from "/resident-artifacts/browser_renderer.js";
 import {
   FIDELITY_CHECKPOINT_SCHEMA,
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   ResidentFidelityCheckpointClient,
 } from "/tools/resident_machine_fidelity_checkpoints.mjs";
@@ -91,6 +92,9 @@ function boundedBigInt(name, fallback, maximum = 1_000_000_000_000n) {
 }
 
 const productionCaptureRequested = captureFidelityRequested();
+const executedCycleUpperCapDefault = productionCaptureRequested
+  ? PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP
+  : "250000000";
 const totalColdInstallMaximum = productionCaptureRequested
   ? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
   : 65_535;
@@ -98,7 +102,7 @@ const policy = Object.freeze({
   transport: "frozen-resident-machine-worker",
   evidenceMode: "first-renderer-owned-presented-xfb",
   instructionUpperCap: boundedBigInt("instructionCap", "100000000"),
-  executedCycleUpperCap: boundedBigInt("executedCycleCap", "250000000"),
+  executedCycleUpperCap: boundedBigInt("executedCycleCap", executedCycleUpperCapDefault),
   sliceCycleUpperCap: BigInt(boundedInteger("sliceCycleCap", 1_000_000, 1, 1_000_000)),
   blockUpperCap: boundedInteger("blockCap", 16_384, 1, 16_384),
   totalHostCallCap: boundedInteger("hostCallCap", 65_535, 1, 65_535),
@@ -1342,9 +1346,11 @@ function capFailure(run, boundary, message) {
 }
 
 function observeRustRun(run, result) {
+  const hostCallDelta = Number(result.hostCalls ?? 0);
+  const coldInstallDelta = Number(result.coldInstalls ?? 0);
   run.slices += 1;
-  run.servicedHostCalls += Number(result.hostCalls ?? 0);
-  run.coldInstalls += Number(result.coldInstalls ?? 0);
+  run.servicedHostCalls += hostCallDelta;
+  run.coldInstalls += coldInstallDelta;
   if (result.boundary !== "rust") {
     if (result.boundary === "host-call-cap") {
       run.hostCallCapBoundaries += 1;
@@ -1361,8 +1367,8 @@ function observeRustRun(run, result) {
       {
         boundary: result.boundary,
         unobservablePartialRustCounters: true,
-        hostCalls: Number(result.hostCalls ?? 0),
-        coldInstalls: Number(result.coldInstalls ?? 0),
+        hostCalls: hostCallDelta,
+        coldInstalls: coldInstallDelta,
       },
     );
   }
@@ -1383,7 +1389,12 @@ function observeRustRun(run, result) {
   run.executedInstructions += instructionDelta;
   const key = String(detail);
   run.outcomeDetails[key] = (run.outcomeDetails[key] ?? 0) + 1;
-  if (instructionDelta === 0n && cycleDelta === 0n) {
+  if (
+    instructionDelta === 0n
+    && cycleDelta === 0n
+    && hostCallDelta === 0
+    && coldInstallDelta === 0
+  ) {
     run.zeroProgressSlices += 1;
     run.consecutiveZeroProgressSlices += 1;
     run.maximumConsecutiveZeroProgressSlices = Math.max(

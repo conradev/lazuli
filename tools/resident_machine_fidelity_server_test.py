@@ -23,6 +23,7 @@ from resident_machine_fidelity_server import (
     DURABLE_RECORD_SCHEMA,
     FidelityCheckpointError,
     FidelityCheckpointJournal,
+    PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
     canonical_json,
     locked_source_for_request,
@@ -868,7 +869,7 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_evidence_lock(changed)
 
-    def test_production_cold_install_authority_matches_javascript_and_summary_bounds(self) -> None:
+    def test_production_run_authority_matches_javascript_and_summary_bounds(self) -> None:
         project_root = Path(__file__).resolve().parent.parent
         javascript = subprocess.run(
             [
@@ -876,9 +877,10 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                 "--input-type=module",
                 "--eval",
                 (
-                    "import { PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP as cap } from "
+                    "import { PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP as cycle, "
+                    "PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP as cold } from "
                     "'./tools/resident_machine_fidelity_checkpoints.mjs';"
-                    "process.stdout.write(String(cap));"
+                    "process.stdout.write(JSON.stringify({cycle, cold}));"
                 ),
             ],
             cwd=project_root,
@@ -886,12 +888,18 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        javascript_authority = json.loads(javascript.stdout)
         self.assertEqual(
-            int(javascript.stdout),
+            int(javascript_authority["cycle"]),
+            PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+        )
+        self.assertEqual(
+            javascript_authority["cold"],
             PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
         )
         policy = {
             **CAPTURE_RUN_POLICY,
+            "executedCycleUpperCap": str(PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP),
             "totalColdInstallCap": PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
         }
         self.assertIs(validate_capture_run_policy(policy, "$.runPolicy"), policy)
@@ -919,6 +927,9 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             "sources": {},
             "hostPolicy": {},
             "runPolicy": {
+                "executedCycleUpperCap": str(
+                    PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP
+                ),
                 "totalColdInstallCap": PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
             },
             "checkpointPolicy": {},
@@ -934,6 +945,10 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             },
         }
         self.assertIs(validate_evidence_lock(lock), lock)
+        changed_cycle_cap = json.loads(json.dumps(lock))
+        changed_cycle_cap["runPolicy"]["executedCycleUpperCap"] = "250000000"
+        with self.assertRaisesRegex(ValueError, "production executed-cycle cap"):
+            validate_evidence_lock(changed_cycle_cap)
         changed_cap = json.loads(json.dumps(lock))
         changed_cap["runPolicy"]["totalColdInstallCap"] = 65_535
         with self.assertRaisesRegex(ValueError, "production cold-install cap"):

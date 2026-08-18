@@ -10,6 +10,7 @@ import {
   ResidentCaptureRunLedger,
 } from "../web/resident-machine-worker.mjs";
 import {
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -128,7 +129,12 @@ function workerHarness({
       return {
         boundary: "rust",
         cycleUpperCap: 1n,
-        outcome: { executedCycles: 1n, executedInstructions: 1n },
+        outcome: {
+          reason: 0,
+          detail: 0,
+          executedCycles: 1n,
+          executedInstructions: 1n,
+        },
       };
     },
     publishController(sequenceLo, sequenceHi, buttons, stickXyCxy, triggerLrab) {
@@ -240,7 +246,7 @@ test("capture run ledger is cumulative, stable, and fail-closed at frozen caps",
     boundary: "rust",
     hostCalls: 2,
     coldInstalls: 1,
-    outcome: { executedCycles: 9n, executedInstructions: 40n },
+    outcome: { reason: 0, detail: 0, executedCycles: 9n, executedInstructions: 40n },
   });
   assert.throws(
     () => ledger.issue({ cycleUpperCap: "11" }),
@@ -264,7 +270,7 @@ test("capture run ledger supports the v3 cumulative cold authority above the u16
   const productionPolicy = {
     ...CAPTURE_RUN_POLICY,
     instructionUpperCap: "100000000",
-    executedCycleUpperCap: "250000000",
+    executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   };
   const ledger = new ResidentCaptureRunLedger(productionPolicy, () => 0);
@@ -275,7 +281,7 @@ test("capture run ledger supports the v3 cumulative cold authority above the u16
     ledger.accept({
       boundary: "rust",
       coldInstalls: 65_535,
-      outcome: { executedCycles: 1n, executedInstructions: 1n },
+      outcome: { reason: 0, detail: 0, executedCycles: 1n, executedInstructions: 1n },
     });
   }
   const terminal = ledger.issue({});
@@ -293,12 +299,238 @@ test("capture run ledger supports the v3 cumulative cold authority above the u16
   assert.throws(() => exhausted.accept({
     boundary: "rust",
     coldInstalls: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
-    outcome: { executedCycles: 1n, executedInstructions: 1n },
+    outcome: { reason: 0, detail: 0, executedCycles: 1n, executedInstructions: 1n },
   }), /cumulative cold-install cap exhausted/);
   assert.equal(
     exhausted.summary().reportedColdInstalls,
     PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   );
+});
+
+test("capture run ledger classifies only a full truncated CycleBudget tail as terminal", () => {
+  const ordinarySlicePolicy = {
+    ...CAPTURE_RUN_POLICY,
+    executedCycleUpperCap: "2500000",
+    sliceCycleUpperCap: "1000000",
+  };
+  let ledger = new ResidentCaptureRunLedger(ordinarySlicePolicy, () => 0);
+  ledger.startAtReady();
+  assert.equal(ledger.issue({}).cycleUpperCap, 1_000_000n);
+  ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 1_000_000n,
+      executedInstructions: 1n,
+    },
+  });
+  assert.equal(ledger.summary().reportedExecutedCycles, "1000000");
+
+  const tailPolicy = {
+    ...CAPTURE_RUN_POLICY,
+    executedCycleUpperCap: "15",
+    sliceCycleUpperCap: "10",
+  };
+  const ledgerAtTail = (overrides = {}) => {
+    const ledger = new ResidentCaptureRunLedger({ ...tailPolicy, ...overrides }, () => 0);
+    ledger.startAtReady();
+    ledger.issue({});
+    ledger.accept({
+      boundary: "rust",
+      outcome: {
+        reason: 0,
+        detail: 1,
+        executedCycles: 10n,
+        executedInstructions: 1n,
+      },
+    });
+    return ledger;
+  };
+
+  ledger = ledgerAtTail({ instructionUpperCap: "4" });
+  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
+  assert.throws(() => ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 0n,
+      executedInstructions: 0n,
+    },
+  }), /capture cumulative executed-cycle cap cannot retire the next block/);
+  assert.equal(ledger.summary().zeroProgressSlices, 0);
+
+  ledger = ledgerAtTail();
+  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
+  assert.throws(() => ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 3n,
+      executedInstructions: 2n,
+    },
+  }), /capture cumulative executed-cycle cap cannot retire the next block/);
+  assert.equal(ledger.summary().reportedExecutedCycles, "13");
+  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
+  assert.equal(ledger.summary().zeroProgressSlices, 0);
+
+  ledger = ledgerAtTail();
+  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
+  assert.throws(() => ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 5n,
+      executedInstructions: 2n,
+    },
+  }), /capture cumulative executed-cycle cap exhausted/);
+  assert.equal(ledger.summary().reportedExecutedCycles, "15");
+  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
+
+  ledger = ledgerAtTail({ instructionUpperCap: "3" });
+  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
+  assert.throws(() => ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 3n,
+      executedInstructions: 2n,
+    },
+  }), /capture cumulative instruction cap exhausted/);
+  assert.equal(ledger.summary().reportedExecutedCycles, "13");
+  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
+
+  ledger = ledgerAtTail({ instructionUpperCap: "2" });
+  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
+  assert.throws(() => ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 3n,
+      executedInstructions: 2n,
+    },
+  }), /capture cumulative instruction cap exhausted/);
+  assert.equal(ledger.summary().reportedExecutedCycles, "13");
+  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
+
+  ledger = ledgerAtTail();
+  assert.equal(ledger.issue({ cycleUpperCap: "4" }).cycleUpperCap, 4n);
+  ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 0n,
+      executedInstructions: 0n,
+    },
+  });
+  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
+
+  ledger = ledgerAtTail();
+  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
+  ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 0,
+      executedCycles: 0n,
+      executedInstructions: 0n,
+    },
+  });
+  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
+  assert.equal(ledger.issue({}).cycleUpperCap, 5n, "BlockBudget tail was not resumable");
+
+  ledger = ledgerAtTail();
+  ledger.issue({});
+  assert.throws(() => ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 5,
+      detail: 0xffff_ffff,
+      executedCycles: 0n,
+      executedInstructions: 0n,
+    },
+  }), /Rust resident run stopped with reason 5, detail 4294967295/);
+  assert.equal(ledger.summary().zeroProgressSlices, 0);
+
+  const exactSlicePolicy = {
+    ...CAPTURE_RUN_POLICY,
+    executedCycleUpperCap: "10",
+    sliceCycleUpperCap: "10",
+  };
+  ledger = new ResidentCaptureRunLedger(exactSlicePolicy, () => 0);
+  ledger.startAtReady();
+  assert.equal(ledger.issue({}).cycleUpperCap, 10n);
+  assert.throws(() => ledger.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 1,
+      executedCycles: 10n,
+      executedInstructions: 1n,
+    },
+  }), /capture cumulative executed-cycle cap exhausted/);
+});
+
+test("capture run ledger validates Rust reason/detail before terminal classification", () => {
+  const rejectOutcome = (outcome, pattern) => {
+    const ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => 0);
+    ledger.startAtReady();
+    ledger.issue({});
+    assert.throws(() => ledger.accept({
+      boundary: "rust",
+      outcome: {
+        executedCycles: 0n,
+        executedInstructions: 0n,
+        ...outcome,
+      },
+    }), pattern);
+  };
+
+  rejectOutcome({ reason: "0", detail: 0 }, /reason was not an exact u32/);
+  rejectOutcome({ reason: 7, detail: 0 }, /reason was outside the RunReason ABI/);
+  rejectOutcome({ reason: 0, detail: "1" }, /detail was not an exact u32/);
+  rejectOutcome({ reason: 0, detail: 9 }, /outside the RunOutcomeDetail ABI/);
+  rejectOutcome({ reason: 5, detail: 0x1_0000_0000 }, /detail was not an exact u32/);
+});
+
+test("authenticated host and cold work reset cumulative zero-progress accounting", () => {
+  const ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => 0);
+  const zeroRustResult = (work = {}) => ({
+    boundary: "rust",
+    ...work,
+    outcome: {
+      reason: 0,
+      detail: 2,
+      executedCycles: 0n,
+      executedInstructions: 0n,
+    },
+  });
+  ledger.startAtReady();
+
+  ledger.issue({});
+  ledger.accept(zeroRustResult());
+  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
+
+  ledger.issue({});
+  ledger.accept(zeroRustResult({ hostCalls: 1 }));
+  assert.equal(ledger.summary().zeroProgressSlices, 1);
+  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 0);
+
+  ledger.issue({});
+  ledger.accept(zeroRustResult());
+  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
+
+  ledger.issue({});
+  ledger.accept(zeroRustResult({ coldInstalls: 1 }));
+  assert.equal(ledger.summary().zeroProgressSlices, 2);
+  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 0);
+  assert.equal(ledger.summary().maximumConsecutiveZeroProgressSlices, 1);
 });
 
 test("capture run ledger rejects overshoot, zero progress, and deadline exhaustion", () => {
@@ -308,7 +540,7 @@ test("capture run ledger rejects overshoot, zero progress, and deadline exhausti
   ledger.issue({ cycleUpperCap: "5" });
   assert.throws(() => ledger.accept({
     boundary: "rust",
-    outcome: { executedCycles: 6n, executedInstructions: 1n },
+    outcome: { reason: 0, detail: 0, executedCycles: 6n, executedInstructions: 1n },
   }), /issued cycle budget/);
 
   ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => now);
@@ -316,12 +548,12 @@ test("capture run ledger rejects overshoot, zero progress, and deadline exhausti
   ledger.issue({});
   ledger.accept({
     boundary: "rust",
-    outcome: { executedCycles: 0n, executedInstructions: 0n },
+    outcome: { reason: 0, detail: 1, executedCycles: 0n, executedInstructions: 0n },
   });
   ledger.issue({});
   assert.throws(() => ledger.accept({
     boundary: "rust",
-    outcome: { executedCycles: 0n, executedInstructions: 0n },
+    outcome: { reason: 0, detail: 1, executedCycles: 0n, executedInstructions: 0n },
   }), /zero-progress cap exhausted/);
 
   now = 0;

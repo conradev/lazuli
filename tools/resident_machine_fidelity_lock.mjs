@@ -10,10 +10,14 @@ import { fileURLToPath } from "node:url";
 
 import { validateRelease } from "../web/release.mjs";
 import {
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
-export { PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP };
+export {
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+};
 
 export const FIDELITY_EVIDENCE_LOCK_SCHEMA =
   "lazuli-resident-renderer-fidelity-evidence-lock-v2";
@@ -523,7 +527,7 @@ export function validateResidentProductionFidelityEvidenceLock(value, expectedAu
 
   const exactRunPolicy = {
     instructionUpperCap: "100000000",
-    executedCycleUpperCap: "250000000",
+    executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     sliceCycleUpperCap: "1000000",
     blockUpperCap: 16_384,
     totalHostCallCap: 65_535,

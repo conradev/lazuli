@@ -4,6 +4,7 @@ export const FIDELITY_CHECKPOINT_SCHEMA =
   "lazuli-resident-renderer-fidelity-checkpoint-v1";
 export const FIDELITY_CHECKPOINT_ACK_SCHEMA =
   "lazuli-resident-renderer-fidelity-checkpoint-ack-v1";
+export const PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = "2500000000";
 export const PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP = 0x000f_ffff;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;

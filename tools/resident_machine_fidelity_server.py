@@ -26,6 +26,7 @@ ACK_SCHEMA = "lazuli-resident-renderer-fidelity-checkpoint-ack-v1"
 CHECKPOINT_PATH = "/resident-fidelity/checkpoints"
 EVIDENCE_LOCK_SCHEMA = "lazuli-resident-renderer-fidelity-evidence-lock-v2"
 PRODUCTION_EVIDENCE_LOCK_SCHEMA = "lazuli-resident-renderer-fidelity-evidence-lock-v3"
+PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = 2_500_000_000
 PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP = 0x000F_FFFF
 EVIDENCE_LOCK_PATH = "/resident-fidelity/evidence-lock.json"
 DEFAULT_BODY_CAP = 4_096
@@ -264,9 +265,15 @@ def validate_evidence_lock(value: object) -> dict[str, Any]:
         if renderer_probe.get("checkpointProbeEvents") != 0:
             raise ValueError("--evidence-lock production checkpoint probes must be forbidden")
         run_policy = value.get("runPolicy")
-        if not isinstance(run_policy, dict) or run_policy.get(
-            "totalColdInstallCap"
-        ) != PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP:
+        if not isinstance(run_policy, dict) or (
+            run_policy.get("executedCycleUpperCap")
+            != str(PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP)
+        ):
+            raise ValueError("--evidence-lock has an invalid production executed-cycle cap")
+        if (
+            run_policy.get("totalColdInstallCap")
+            != PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
+        ):
             raise ValueError("--evidence-lock has an invalid production cold-install cap")
         capture_policy = value.get("capturePolicy")
         expected_capture_policy = production_capture_policy(run["gameKey"])
