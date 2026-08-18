@@ -263,7 +263,7 @@ function verifyGameFidelityTransport() {
     triggerLrab,
   });
   assert.equal(baseline.phase, 1);
-  assert.deepEqual(Buffer.from(baseline.record.payload, "base64"), record);
+  assert.deepEqual(new Uint8Array(Buffer.from(baseline.record.payload, "base64")), record);
 
   phase = 6;
   buttons = 0;
