@@ -39,12 +39,48 @@ async function fetchOk(fetchImpl, url, label) {
   return response;
 }
 
+function requireImmutable(response, label) {
+  check(/(?:^|,)\s*(?:public\s*,\s*)?max-age=31536000\s*,\s*immutable(?:,|$)/i.test(
+    response.headers.get("Cache-Control") ?? "",
+  ), `${label} is not immutable`);
+}
+
+async function fetchSchema3Frontend(fetchImpl, origin, asset) {
+  const url = `${origin}${asset.url}`;
+  const response = await fetchImpl(url, { cache: "no-store", redirect: "manual" });
+  if (response.status === 200) return response;
+  check(response.status === 307, `${asset.url} fetch failed: HTTP ${response.status}`);
+  requireImmutable(response, asset.url);
+  const location = response.headers.get("Location");
+  check(location !== null, `${asset.url} legacy redirect omits Location`);
+  check(asset.url.endsWith(".html"), `${asset.url} is not a terminal HTML asset`);
+  const expectedPath = asset.url.slice(0, -".html".length);
+  check(location === expectedPath,
+    `${asset.url} legacy redirect Location is not exact terminal .html removal`);
+  let target;
+  try {
+    target = new URL(location, url);
+  } catch {
+    throw new Error(`${asset.url} legacy redirect Location is not a URL`);
+  }
+  check(target.username === "" && target.password === "",
+    `${asset.url} legacy redirect contains credentials`);
+  check(target.origin === origin, `${asset.url} legacy redirect changed origin`);
+  check(target.pathname === expectedPath,
+    `${asset.url} legacy redirect is not exact terminal .html removal`);
+  check(target.search === "" && target.hash === "",
+    `${asset.url} legacy redirect contains a query or fragment`);
+  const expectedUrl = `${origin}${expectedPath}`;
+  check(target.href === expectedUrl, `${asset.url} legacy redirect target is not exact`);
+  return fetchOk(fetchImpl, expectedUrl, asset.url);
+}
+
 function requireNoStore(response, label) {
   check(/(?:^|,)\s*no-store\s*(?:,|$)/i.test(response.headers.get("Cache-Control") ?? ""),
     `${label} is not no-store`);
 }
 
-async function fetchVerifiedAssets(fetchImpl, origin, assets) {
+async function fetchVerifiedAssets(fetchImpl, origin, assets, schema3FrontendUrl) {
   const fetched = new Map();
   const descriptors = new Map();
   for (const asset of assets) {
@@ -55,11 +91,11 @@ async function fetchVerifiedAssets(fetchImpl, origin, assets) {
       continue;
     }
     descriptors.set(asset.url, asset);
-    const response = await fetchOk(fetchImpl, `${origin}${asset.url}`, asset.url);
+    const response = asset.url === schema3FrontendUrl
+      ? await fetchSchema3Frontend(fetchImpl, origin, asset)
+      : await fetchOk(fetchImpl, `${origin}${asset.url}`, asset.url);
     if (asset.url.startsWith("/assets/")) {
-      check(/(?:^|,)\s*(?:public\s*,\s*)?max-age=31536000\s*,\s*immutable(?:,|$)/i.test(
-        response.headers.get("Cache-Control") ?? "",
-      ), `${asset.url} is not immutable`);
+      requireImmutable(response, asset.url);
     } else {
       requireNoStore(response, asset.url);
     }
@@ -152,7 +188,12 @@ export async function smokeWebRelease(options) {
   const assets = expectedSchema === RELEASE_SCHEMA
     ? [...releaseAssets(release), ...rollbackReleaseAssets(release)]
     : releaseAssets(release);
-  const fetched = await fetchVerifiedAssets(fetchImpl, origin, assets);
+  const fetched = await fetchVerifiedAssets(
+    fetchImpl,
+    origin,
+    assets,
+    expectedSchema === ROLLBACK_RELEASE_SCHEMA ? release.frontend.url : undefined,
+  );
   if (expectedSchema === RELEASE_SCHEMA) {
     check(
       RELEASE_ID_PATTERN.test(options.expectedRollbackReleaseId ?? ""),

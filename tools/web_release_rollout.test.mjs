@@ -36,11 +36,26 @@ const CANDIDATE_VERSION_ID = "12345678-1234-4123-8123-123456789abc";
 const PREVIEW_ALIAS_ORIGIN =
   "https://resident-canary-gekko-free.example.workers.dev";
 const PREVIEW_ORIGIN = "https://12345678-gekko-free.example.workers.dev";
+const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const temporaryDirectories = [];
 after(async () => Promise.all(temporaryDirectories.map(path => rm(path, { recursive: true, force: true }))));
 
 function previewSettingsEnvelope(result) {
   return { success: true, errors: [], messages: [], result };
+}
+
+function redirectResponse(status, location, cacheControl = IMMUTABLE_CACHE_CONTROL) {
+  return {
+    ok: status >= 200 && status <= 299,
+    status,
+    headers: {
+      get(name) {
+        if (name.toLowerCase() === "location") return location ?? null;
+        if (name.toLowerCase() === "cache-control") return cacheControl;
+        return null;
+      },
+    },
+  };
 }
 
 function wranglerSession(overrides = {}) {
@@ -97,7 +112,7 @@ async function putAsset(responses, label, prefix, extension) {
   const bytes = new TextEncoder().encode(label);
   const sha256 = await sha256Hex(bytes);
   const asset = { url: `/assets/${prefix}-${sha256}.${extension}`, sha256, bytes: bytes.byteLength };
-  responses.set(asset.url, { bytes, cacheControl: "public, max-age=31536000, immutable" });
+  responses.set(asset.url, { bytes, cacheControl: IMMUTABLE_CACHE_CONTROL });
   return asset;
 }
 
@@ -215,20 +230,58 @@ async function fixture() {
   return { release, rollback, responses };
 }
 
+function responseFrom(value) {
+  const headers = { "Cache-Control": value.cacheControl };
+  if (value.json !== undefined) {
+    return new Response(JSON.stringify(value.json), {
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+  }
+  return new Response(value.bytes ?? value.text, { headers });
+}
+
 function fetchFrom(responses, requests = []) {
   return async input => {
     const url = new URL(typeof input === "string" ? input : input.url);
     requests.push(url.pathname);
     const value = responses.get(url.pathname);
     if (value === undefined) return new Response("missing", { status: 404 });
-    const headers = { "Cache-Control": value.cacheControl };
-    if (value.json !== undefined) {
-      return new Response(JSON.stringify(value.json), {
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
-    }
-    return new Response(value.bytes ?? value.text, { headers });
+    return responseFrom(value);
   };
+}
+
+function schema3Responses(value) {
+  const responses = new Map(value.responses);
+  responses.set("/release.json", { json: value.rollback, cacheControl: "no-store" });
+  responses.set("/", {
+    text: "const EXPECTED_RELEASE_SCHEMA = 3;",
+    cacheControl: "no-store",
+  });
+  responses.set("/release.mjs", {
+    text: "export const RELEASE_SCHEMA = 3;",
+    cacheControl: "no-store",
+  });
+  responses.set("/sw.js", { text: "validateRelease", cacheControl: "no-store" });
+  return responses;
+}
+
+function fetchWithOverrides(responses, override, requests = []) {
+  const fallback = fetchFrom(responses);
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    requests.push({ url: url.href, cache: init.cache, redirect: init.redirect });
+    const overridden = override === undefined ? undefined : await override(url, init);
+    return overridden === undefined ? fallback(input, init) : overridden;
+  };
+}
+
+function smokeSchema3(value, fetchImpl) {
+  return smokeWebRelease({
+    origin: ORIGIN,
+    expectedSchema: ROLLBACK_RELEASE_SCHEMA,
+    expectedReleaseId: value.rollback.releaseId,
+    fetchImpl,
+  });
 }
 
 test("fetches only an exact pinned schema-3 rollback and verifies every byte", async () => {
@@ -509,6 +562,226 @@ test("production version proof requires one exact UUID at 100 percent", () => {
       { version_id: "abcdef01-2345-4678-9abc-def012345678", percentage: 50 },
     ],
   }), versionId), /exactly one/);
+});
+
+test("schema-3 smoke accepts a direct authenticated frontend 200 without following redirects", async () => {
+  const value = await fixture();
+  const responses = schema3Responses(value);
+  const requests = [];
+  const report = await smokeSchema3(
+    value,
+    fetchWithOverrides(responses, undefined, requests),
+  );
+  assert.equal(report.ok, true);
+  assert.equal(report.schema, ROLLBACK_RELEASE_SCHEMA);
+  assert.equal(report.releaseId, value.rollback.releaseId);
+  assert.deepEqual(
+    requests.filter(request => new URL(request.url).pathname === value.rollback.frontend.url),
+    [{
+      url: `${ORIGIN}${value.rollback.frontend.url}`,
+      cache: "no-store",
+      redirect: "manual",
+    }],
+  );
+  assert.ok(requests
+    .filter(request => new URL(request.url).pathname !== value.rollback.frontend.url)
+    .every(request => request.redirect === "error"));
+});
+
+test("schema-3 smoke accepts only the historical same-origin terminal-html 307", async () => {
+  const value = await fixture();
+  const responses = schema3Responses(value);
+  const frontend = value.rollback.frontend.url;
+  const extensionless = frontend.slice(0, -".html".length);
+  const requests = [];
+  const report = await smokeSchema3(value, fetchWithOverrides(
+    responses,
+    url => {
+      if (url.pathname === frontend) {
+        return redirectResponse(307, extensionless);
+      }
+      if (url.pathname === extensionless) return responseFrom(responses.get(frontend));
+      return undefined;
+    },
+    requests,
+  ));
+  assert.equal(report.ok, true);
+  assert.deepEqual(
+    requests.filter(request => [frontend, extensionless].includes(new URL(request.url).pathname)),
+    [
+      { url: `${ORIGIN}${frontend}`, cache: "no-store", redirect: "manual" },
+      { url: `${ORIGIN}${extensionless}`, cache: "no-store", redirect: "error" },
+    ],
+  );
+});
+
+test("schema-3 historical frontend 307 is itself immutable", async t => {
+  const value = await fixture();
+  const responses = schema3Responses(value);
+  const frontend = value.rollback.frontend.url;
+  const extensionless = frontend.slice(0, -".html".length);
+  for (const [name, cacheControl] of [
+    ["missing cache control", null],
+    ["wrong cache control", "no-store"],
+  ]) {
+    await t.test(name, async () => {
+      const fetchImpl = fetchWithOverrides(responses, url => {
+        if (url.pathname !== frontend) return undefined;
+        return redirectResponse(307, extensionless, cacheControl);
+      });
+      await assert.rejects(smokeSchema3(value, fetchImpl), /is not immutable/);
+    });
+  }
+});
+
+test("schema-3 frontend redirect rejects every broader redirect shape", async t => {
+  const value = await fixture();
+  const responses = schema3Responses(value);
+  const frontend = value.rollback.frontend.url;
+  const extensionless = frontend.slice(0, -".html".length);
+  const vectors = [
+    ["301", 301, extensionless, /HTTP 301/],
+    ["302", 302, extensionless, /HTTP 302/],
+    ["303", 303, extensionless, /HTTP 303/],
+    ["308", 308, extensionless, /HTTP 308/],
+    ["direct non-200", 204, undefined, /HTTP 204/],
+    ["missing Location", 307, undefined, /omits Location/],
+    ["invalid Location", 307, "https://[", /Location is not exact terminal \.html removal/],
+    ["credentials", 307, `https://user:pass@canary.example${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["empty userinfo", 307, `https://@canary.example${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["cross-origin host", 307, `https://other.example${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["host case variant", 307, `https://CANARY.EXAMPLE${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["scheme change", 307, `http://canary.example${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["port change", 307, `https://canary.example:444${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["explicit default port", 307, `https://canary.example:443${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["absolute expected URL", 307, `${ORIGIN}${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["query", 307, `${extensionless}?unexpected=1`,
+      /Location is not exact terminal \.html removal/],
+    ["fragment", 307, `${extensionless}#unexpected`,
+      /Location is not exact terminal \.html removal/],
+    ["empty query delimiter", 307, `${extensionless}?`,
+      /Location is not exact terminal \.html removal/],
+    ["empty fragment delimiter", 307, `${extensionless}#`,
+      /Location is not exact terminal \.html removal/],
+    ["literal dot segment", 307, extensionless.replace("/assets/", "/assets/./"),
+      /Location is not exact terminal \.html removal/],
+    ["literal dot-dot segment", 307, extensionless.replace("/assets/", "/assets/ignored/../"),
+      /Location is not exact terminal \.html removal/],
+    ["encoded dot-dot segment", 307, extensionless.replace("/assets/", "/assets/ignored/%2e%2e/"),
+      /Location is not exact terminal \.html removal/],
+    ["encoded dot-dot case variant", 307,
+      extensionless.replace("/assets/", "/assets/ignored/%2E%2E/"),
+      /Location is not exact terminal \.html removal/],
+    ["backslash spelling", 307, extensionless.replaceAll("/", "\\"),
+      /Location is not exact terminal \.html removal/],
+    ["leading whitespace", 307, ` ${extensionless}`,
+      /Location is not exact terminal \.html removal/],
+    ["trailing whitespace", 307, `${extensionless} `,
+      /Location is not exact terminal \.html removal/],
+    ["percent-encoded path spelling", 307, extensionless.replace("/assets/r", "/assets/%72"),
+      /Location is not exact terminal \.html removal/],
+    ["path case variant", 307, extensionless.replace("/assets/", "/ASSETS/"),
+      /Location is not exact terminal \.html removal/],
+    ["extra path", 307, `${extensionless}/extra`,
+      /Location is not exact terminal \.html removal/],
+    ["different extension", 307, frontend.slice(0, -1),
+      /Location is not exact terminal \.html removal/],
+  ];
+  for (const [name, status, location, expected] of vectors) {
+    await t.test(name, async () => {
+      const fetchImpl = fetchWithOverrides(responses, url => {
+        if (url.pathname !== frontend) return undefined;
+        return redirectResponse(status, location);
+      });
+      await assert.rejects(smokeSchema3(value, fetchImpl), expected);
+    });
+  }
+});
+
+test("schema-3 redirected frontend keeps strict final response validation", async t => {
+  const value = await fixture();
+  const responses = schema3Responses(value);
+  const frontend = value.rollback.frontend.url;
+  const extensionless = frontend.slice(0, -".html".length);
+  const vectors = [
+    [
+      "second redirect",
+      () => redirectResponse(307, `${extensionless}-again`),
+      /HTTP 307/,
+    ],
+    [
+      "non-immutable final response",
+      () => new Response(responses.get(frontend).bytes, { headers: { "Cache-Control": "no-store" } }),
+      /is not immutable/,
+    ],
+    [
+      "wrong final bytes",
+      () => new Response("corrupt", {
+        headers: { "Cache-Control": IMMUTABLE_CACHE_CONTROL },
+      }),
+      /size does not match|hash does not match/,
+    ],
+  ];
+  for (const [name, finalResponse, expected] of vectors) {
+    await t.test(name, async () => {
+      const requests = [];
+      const fetchImpl = fetchWithOverrides(responses, url => {
+        if (url.pathname === frontend) {
+          return redirectResponse(307, extensionless);
+        }
+        if (url.pathname === extensionless) return finalResponse();
+        return undefined;
+      }, requests);
+      await assert.rejects(smokeSchema3(value, fetchImpl), expected);
+      assert.equal(
+        requests.find(request => new URL(request.url).pathname === extensionless)?.redirect,
+        "error",
+      );
+    });
+  }
+});
+
+test("non-frontend and schema-4 redirects remain forbidden", async t => {
+  const value = await fixture();
+  await t.test("schema-3 non-frontend", async () => {
+    const responses = schema3Responses(value);
+    const asset = value.rollback.renderer.javascript;
+    const requests = [];
+    await assert.rejects(smokeSchema3(value, fetchWithOverrides(responses, url => {
+      if (url.pathname !== asset.url) return undefined;
+      return redirectResponse(307, `${asset.url}-moved`);
+    }, requests)), /HTTP 307/);
+    assert.equal(
+      requests.find(request => new URL(request.url).pathname === asset.url)?.redirect,
+      "error",
+    );
+  });
+  await t.test("schema-4 frontend", async () => {
+    const frontend = value.release.frontend.url;
+    const requests = [];
+    await assert.rejects(smokeWebRelease({
+      origin: ORIGIN,
+      expectedSchema: RELEASE_SCHEMA,
+      expectedReleaseId: value.release.releaseId,
+      expectedRollbackReleaseId: value.rollback.releaseId,
+      fetchImpl: fetchWithOverrides(value.responses, url => {
+        if (url.pathname !== frontend) return undefined;
+        return redirectResponse(307, frontend.slice(0, -".html".length));
+      }, requests),
+    }), /HTTP 307/);
+    assert.equal(
+      requests.find(request => new URL(request.url).pathname === frontend)?.redirect,
+      "error",
+    );
+  });
 });
 
 test("schema-4 smoke authenticates resident and nested rollback artifacts", async () => {
