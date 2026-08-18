@@ -11,5 +11,5 @@ custom_domain = true
 
 [assets]
 directory = "./dist"
-html_handling = "auto-trailing-slash"
+html_handling = "none"
 not_found_handling = "none"

@@ -36,7 +36,7 @@ test("deployment serves static assets with version preview URLs and no request h
   assert.doesNotMatch(wrangler, /^main\s*=/m);
   assert.match(wrangler, /^preview_urls\s*=\s*true$/m);
   assert.match(wrangler, /^\[assets\]$/m);
-  assert.match(wrangler, /^html_handling\s*=\s*"auto-trailing-slash"$/m);
+  assert.match(wrangler, /^html_handling\s*=\s*"none"$/m);
   assert.match(wrangler, /^not_found_handling\s*=\s*"none"$/m);
 });
 
