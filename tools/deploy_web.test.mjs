@@ -188,8 +188,18 @@ test("canary authenticates a pinned production predecessor and every rollback by
 
 test("Cloudflare cutover captures immutable UUID evidence and never promotes a mutable alias or tag", async () => {
   const workflow = await readWorkflow();
+  const ensurePreview = after(workflow, "Ensure version previews without changing production version");
+  const upload = after(workflow, "Upload inactive Cloudflare version", ensurePreview);
+  assert.ok(ensurePreview < upload);
   assert.equal([...workflow.matchAll(/uses: cloudflare\/wrangler-action@v3/g)].length, 9);
   assert.equal([...workflow.matchAll(/^\s+wranglerVersion: "4\.112\.0"$/gm)].length, 9);
+  assert.equal([...workflow.matchAll(/cloudflare_release_metadata\.mjs ensure-preview/g)].length, 1);
+  const previewStep = workflow.slice(ensurePreview, upload);
+  assert.match(previewStep, /CLOUDFLARE_ACCOUNT_ID: \$\{\{ secrets\.CLOUDFLARE_ACCOUNT_ID \}\}/);
+  assert.match(previewStep, /CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}/);
+  assert.match(previewStep, /--account-id-env CLOUDFLARE_ACCOUNT_ID/);
+  assert.match(previewStep, /--token-env CLOUDFLARE_API_TOKEN/);
+  assert.match(previewStep, /--worker-name gekko-free/);
   assert.match(workflow, /WRANGLER_OUTPUT_FILE_PATH: \$\{\{ github\.workspace \}\}\/target\/wrangler-version-upload\.ndjson/);
   assert.match(workflow, /command: versions upload --preview-alias resident-canary/);
   assert.match(workflow, /cloudflare_release_metadata\.mjs capture/);
@@ -200,6 +210,7 @@ test("Cloudflare cutover captures immutable UUID evidence and never promotes a m
   assert.match(workflow, /name: schema4-canary-candidate/);
   assert.match(workflow, /retention-days: 90/);
   assert.doesNotMatch(workflow, /version_tag|version-tag/);
+  assert.doesNotMatch(workflow, /command: triggers deploy/);
   assert.doesNotMatch(workflow, /^\s+command: deploy(?:\s|$)/m);
 });
 

@@ -448,6 +448,12 @@ ${THIRD_PARTY_NOTICES_URL}
 `;
 }
 
+function cloudflareRedirects() {
+  return `# SPDX-License-Identifier: GPL-3.0-only
+/ /index.html 200
+`;
+}
+
 async function loadRollback(options) {
   const release = options.rollbackRelease ?? JSON.parse(
     await readFile(resolve(options.rollbackReleasePath), "utf8"),
@@ -679,6 +685,7 @@ export async function buildWeb(options) {
     writeFile(join(output, "release.json"), `${JSON.stringify(release, null, 2)}\n`),
     writeFile(join(legalDirectory, "index.html"), sourcePage(source)),
     writeFile(join(output, "_headers"), cloudflareHeaders()),
+    writeFile(join(output, "_redirects"), cloudflareRedirects()),
   ]);
   return release;
 }

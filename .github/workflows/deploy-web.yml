@@ -263,6 +263,15 @@ jobs:
           tools/resident_machine_production_fidelity_gate.test.mjs
           tools/web_release_rollout.test.mjs
           tools/web_dist.test.mjs
+      - name: Ensure version previews without changing production version
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs ensure-preview
+          --account-id-env CLOUDFLARE_ACCOUNT_ID
+          --token-env CLOUDFLARE_API_TOKEN
+          --worker-name gekko-free
       - name: Upload inactive Cloudflare version
         id: cloudflare_upload
         uses: cloudflare/wrangler-action@v3

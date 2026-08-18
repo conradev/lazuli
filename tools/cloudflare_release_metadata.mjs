@@ -14,12 +14,17 @@ import {
 
 export const CLOUDFLARE_RELEASE_METADATA_SCHEMA = 1;
 
+const CLOUDFLARE_ACCOUNT_ID = /^[0-9a-f]{32}$/;
 const RELEASE_ID = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const WORKER_NAME = /^[a-z][a-z0-9-]{0,62}$/;
 const PREVIEW_PREFIX = /^[a-z0-9][a-z0-9-]*$/;
 const RELEASE_SCHEMAS = new Set([ROLLBACK_RELEASE_SCHEMA, RELEASE_SCHEMA]);
+const PINNED_WRANGLER_VERSION = "4.112.0";
+const WORKERS_SCRIPT_API_DATE = "2025-08-01";
+const PREVIEW_SETTINGS = Object.freeze({ enabled: false, previews_enabled: true });
+const ENVIRONMENT_VARIABLE = /^[A-Z][A-Z0-9_]*$/;
 
 function check(condition, message) {
   if (!condition) throw new Error(message);
@@ -47,6 +52,64 @@ function exactOrigin(value, label) {
   return url;
 }
 
+async function readPreviewSettingsResponse(response, label) {
+  check(response !== null && typeof response === "object" &&
+    typeof response.ok === "boolean" && typeof response.status === "number" &&
+    typeof response.json === "function", `${label} response is invalid`);
+  check(response.ok, `${label} failed: HTTP ${response.status}`);
+  let envelope;
+  try {
+    envelope = await response.json();
+  } catch (error) {
+    throw new Error(`${label} response is not JSON: ${error.message}`);
+  }
+  exactKeys(envelope, ["errors", "messages", "result", "success"], `${label} response`);
+  check(envelope.success === true, `${label} response was not successful`);
+  check(Array.isArray(envelope.errors) && envelope.errors.length === 0,
+    `${label} response errors are not empty`);
+  check(Array.isArray(envelope.messages) && envelope.messages.length === 0,
+    `${label} response messages are not empty`);
+  exactKeys(envelope.result, ["enabled", "previews_enabled"], `${label} result`);
+  check(typeof envelope.result.enabled === "boolean" &&
+    typeof envelope.result.previews_enabled === "boolean", `${label} result is invalid`);
+  return Object.freeze({ ...envelope.result });
+}
+
+export async function ensureWorkerPreviewSettings(options) {
+  check(CLOUDFLARE_ACCOUNT_ID.test(options.accountId ?? ""),
+    "Cloudflare account ID is invalid");
+  check(WORKER_NAME.test(options.workerName ?? ""), "Worker name is invalid");
+  check(typeof options.token === "string" && options.token.length > 0 &&
+    options.token.trim() === options.token, "Cloudflare API token is invalid");
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  check(typeof fetchImpl === "function", "fetch is unavailable");
+  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${options.accountId}` +
+    `/workers/scripts/${options.workerName}/subdomain`;
+  const headers = {
+    Authorization: `Bearer ${options.token}`,
+    "Content-Type": "application/json",
+    "Cloudflare-Workers-Script-Api-Date": WORKERS_SCRIPT_API_DATE,
+  };
+  const current = await readPreviewSettingsResponse(await fetchImpl(endpoint, {
+    method: "GET",
+    headers,
+    redirect: "error",
+  }), "Cloudflare Worker preview settings GET");
+  if (current.enabled === PREVIEW_SETTINGS.enabled &&
+      current.previews_enabled === PREVIEW_SETTINGS.previews_enabled) return current;
+
+  const final = await readPreviewSettingsResponse(await fetchImpl(endpoint, {
+    method: "POST",
+    headers,
+    redirect: "error",
+    body: JSON.stringify(PREVIEW_SETTINGS),
+  }), "Cloudflare Worker preview settings POST");
+  check(final.enabled === PREVIEW_SETTINGS.enabled &&
+    final.previews_enabled === PREVIEW_SETTINGS.previews_enabled,
+  "Cloudflare Worker preview settings POST returned the wrong final state");
+  return final;
+}
+
 export function requireProductionVersion(statusText, expectedVersionId) {
   check(VERSION_ID.test(expectedVersionId ?? ""), "expected production version ID is invalid");
   let status;
@@ -69,15 +132,10 @@ export function requireProductionVersion(statusText, expectedVersionId) {
 
 export function parseVersionUploadOutput(outputText, options) {
   const lines = outputText.split(/\r?\n/).filter(line => line.trim() !== "");
-  check(lines.length === 1, "Wrangler output must contain exactly one record");
+  let session;
   let record;
-  try {
-    record = JSON.parse(lines[0]);
-  } catch (error) {
-    throw new Error(`Wrangler output is not NDJSON: ${error.message}`);
-  }
-  const optional = new Set(["worker_tag", "wrangler_environment"]);
-  const required = [
+  const versionOptional = new Set(["timestamp", "worker_tag", "wrangler_environment"]);
+  const versionRequired = [
     "type",
     "version",
     "worker_name",
@@ -86,12 +144,63 @@ export function parseVersionUploadOutput(outputText, options) {
     "preview_alias_url",
     "worker_name_overridden",
   ];
-  check(record !== null && typeof record === "object" && !Array.isArray(record),
-    "Wrangler version upload record must be an object");
-  for (const name of required) check(Object.hasOwn(record, name), `Wrangler output omits ${name}`);
-  for (const name of Object.keys(record)) {
-    check(required.includes(name) || optional.has(name), `Wrangler output has unknown ${name}`);
+  const sessionRequired = [
+    "type",
+    "version",
+    "wrangler_version",
+    "command_line_args",
+    "log_file_path",
+  ];
+  for (const [index, line] of lines.entries()) {
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch (error) {
+      throw new Error(`Wrangler output record ${index + 1} is not NDJSON: ${error.message}`);
+    }
+    check(parsed !== null && typeof parsed === "object" && !Array.isArray(parsed),
+      `Wrangler output record ${index + 1} must be an object`);
+    if (parsed.type === "wrangler-session") {
+      check(session === undefined, "Wrangler output contains duplicate wrangler-session records");
+      for (const name of sessionRequired) {
+        check(Object.hasOwn(parsed, name), `Wrangler session omits ${name}`);
+      }
+      for (const name of Object.keys(parsed)) {
+        check(sessionRequired.includes(name) || name === "timestamp",
+          `Wrangler session has unknown ${name}`);
+      }
+      check(parsed.version === 1, "Wrangler output is not wrangler-session schema 1");
+      check(parsed.wrangler_version === PINNED_WRANGLER_VERSION,
+        `Wrangler session version is not pinned ${PINNED_WRANGLER_VERSION}`);
+      check(Array.isArray(parsed.command_line_args) &&
+        parsed.command_line_args.every(value => typeof value === "string"),
+        "Wrangler session command line arguments are invalid");
+      check(typeof parsed.log_file_path === "string" && parsed.log_file_path.length > 0,
+        "Wrangler session log file path is invalid");
+      if (Object.hasOwn(parsed, "timestamp")) {
+        check(typeof parsed.timestamp === "string" && parsed.timestamp.length > 0,
+          "Wrangler session timestamp is invalid");
+      }
+      session = parsed;
+      continue;
+    }
+    check(parsed.type === "version-upload",
+      `Wrangler output has unknown record type ${String(parsed.type)}`);
+    check(record === undefined, "Wrangler output contains duplicate version-upload records");
+    for (const name of versionRequired) {
+      check(Object.hasOwn(parsed, name), `Wrangler output omits ${name}`);
+    }
+    for (const name of Object.keys(parsed)) {
+      check(versionRequired.includes(name) || versionOptional.has(name),
+        `Wrangler output has unknown ${name}`);
+    }
+    if (Object.hasOwn(parsed, "timestamp")) {
+      check(typeof parsed.timestamp === "string" && parsed.timestamp.length > 0,
+        "Wrangler output timestamp is invalid");
+    }
+    record = parsed;
   }
+  check(record !== undefined, "Wrangler output must contain exactly one version-upload record");
   check(record.type === "version-upload" && record.version === 1,
     "Wrangler output is not version-upload schema 1");
   check(WORKER_NAME.test(options.workerName ?? ""), "expected Worker name is invalid");
@@ -111,6 +220,8 @@ export function parseVersionUploadOutput(outputText, options) {
   check(preview.hostname.endsWith(versionSuffix), "versioned preview does not identify the expected Worker");
   const versionPrefix = preview.hostname.slice(0, -versionSuffix.length);
   check(PREVIEW_PREFIX.test(versionPrefix), "versioned preview prefix is invalid");
+  check(versionPrefix === record.version_id.slice(0, 8),
+    "versioned preview does not identify the uploaded version ID");
 
   return Object.freeze({
     versionId: record.version_id,
@@ -214,8 +325,9 @@ async function appendOutputs(path, metadata) {
 
 function parseArguments(arguments_) {
   const command = arguments_[0];
-  check(["assert-production", "capture", "verify"].includes(command),
-    "usage: cloudflare_release_metadata.mjs <assert-production|capture|verify> [options]");
+  check(["assert-production", "capture", "ensure-preview", "verify"].includes(command),
+    "usage: cloudflare_release_metadata.mjs " +
+      "<assert-production|capture|ensure-preview|verify> [options]");
   const options = {};
   for (let index = 1; index < arguments_.length; index += 2) {
     const name = arguments_[index];
@@ -223,6 +335,8 @@ function parseArguments(arguments_) {
     check(name?.startsWith("--") && value !== undefined, `invalid argument ${name ?? ""}`);
     const key = {
       "--status-env": "statusEnv",
+      "--account-id-env": "accountIdEnv",
+      "--token-env": "tokenEnv",
       "--expect-version-id": "expectedVersionId",
       "--wrangler-output": "wranglerOutputPath",
       "--release-manifest": "releaseManifestPath",
@@ -247,6 +361,26 @@ function parseArguments(arguments_) {
 
 async function main(arguments_) {
   const { command, options } = parseArguments(arguments_);
+  if (command === "ensure-preview") {
+    for (const key of ["accountIdEnv", "tokenEnv", "workerName"]) {
+      check(typeof options[key] === "string", `ensure-preview is missing ${key}`);
+    }
+    check(ENVIRONMENT_VARIABLE.test(options.accountIdEnv),
+      "ensure-preview account ID environment name is invalid");
+    check(ENVIRONMENT_VARIABLE.test(options.tokenEnv),
+      "ensure-preview token environment name is invalid");
+    check(Object.hasOwn(process.env, options.accountIdEnv),
+      "missing Cloudflare account ID environment");
+    check(Object.hasOwn(process.env, options.tokenEnv),
+      "missing Cloudflare API token environment");
+    const settings = await ensureWorkerPreviewSettings({
+      accountId: process.env[options.accountIdEnv],
+      token: process.env[options.tokenEnv],
+      workerName: options.workerName,
+    });
+    process.stdout.write(`${JSON.stringify(settings)}\n`);
+    return;
+  }
   if (command === "assert-production") {
     check(typeof options.statusEnv === "string" && typeof options.expectedVersionId === "string",
       "assert-production requires --status-env and --expect-version-id");

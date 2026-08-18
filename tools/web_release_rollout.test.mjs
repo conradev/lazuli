@@ -11,6 +11,8 @@ import { smokeWebRelease } from "./web_release_smoke.mjs";
 import {
   CLOUDFLARE_RELEASE_METADATA_SCHEMA,
   createCloudflareReleaseMetadata,
+  ensureWorkerPreviewSettings,
+  parseVersionUploadOutput,
   requireProductionVersion,
   validateCloudflareReleaseMetadata,
 } from "./cloudflare_release_metadata.mjs";
@@ -27,8 +29,54 @@ import {
 } from "../web/release.mjs";
 
 const ORIGIN = "https://canary.example";
+const CLOUDFLARE_ACCOUNT_ID = "d".repeat(32);
+const CLOUDFLARE_API_TOKEN = "test-cloudflare-api-token";
+const WORKER_NAME = "gekko-free";
+const CANDIDATE_VERSION_ID = "12345678-1234-4123-8123-123456789abc";
+const PREVIEW_ALIAS_ORIGIN =
+  "https://resident-canary-gekko-free.example.workers.dev";
+const PREVIEW_ORIGIN = "https://12345678-gekko-free.example.workers.dev";
 const temporaryDirectories = [];
 after(async () => Promise.all(temporaryDirectories.map(path => rm(path, { recursive: true, force: true }))));
+
+function previewSettingsEnvelope(result) {
+  return { success: true, errors: [], messages: [], result };
+}
+
+function wranglerSession(overrides = {}) {
+  return {
+    type: "wrangler-session",
+    version: 1,
+    wrangler_version: "4.112.0",
+    command_line_args: ["versions", "upload", "--preview-alias", "resident-canary"],
+    log_file_path: "/home/runner/.config/.wrangler/logs/wrangler.log",
+    timestamp: "2026-08-18T17:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function versionUpload(overrides = {}) {
+  return {
+    type: "version-upload",
+    version: 1,
+    worker_name: WORKER_NAME,
+    worker_tag: "worker-service-tag",
+    version_id: CANDIDATE_VERSION_ID,
+    preview_url: PREVIEW_ORIGIN,
+    preview_alias_url: PREVIEW_ALIAS_ORIGIN,
+    worker_name_overridden: false,
+    timestamp: "2026-08-18T17:00:01.000Z",
+    ...overrides,
+  };
+}
+
+function wranglerOutput(records) {
+  return `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+}
+
+function withoutKey(record, key) {
+  return Object.fromEntries(Object.entries(record).filter(([name]) => name !== key));
+}
 
 function source(commit) {
   const repository = "https://github.com/conradev/lazuli";
@@ -238,33 +286,140 @@ test("rollback fetch extracts the exact authenticated schema-3 fallback from liv
   assert.deepEqual(JSON.parse(await readFile(join(directory, "release.json"), "utf8")), value.rollback);
 });
 
+test("Cloudflare preview settings no-op only on the exact safe final state", async () => {
+  const requests = [];
+  const settings = await ensureWorkerPreviewSettings({
+    accountId: CLOUDFLARE_ACCOUNT_ID,
+    token: CLOUDFLARE_API_TOKEN,
+    workerName: WORKER_NAME,
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      return new Response(JSON.stringify(previewSettingsEnvelope({
+        enabled: false,
+        previews_enabled: true,
+      })));
+    },
+  });
+  assert.deepEqual(settings, { enabled: false, previews_enabled: true });
+  assert.ok(Object.isFrozen(settings));
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url,
+    `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}` +
+      `/workers/scripts/${WORKER_NAME}/subdomain`);
+  assert.deepEqual(requests[0].init, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+      "Content-Type": "application/json",
+      "Cloudflare-Workers-Script-Api-Date": "2025-08-01",
+    },
+    redirect: "error",
+  });
+});
+
+test("Cloudflare preview settings update with the exact request and final state", async () => {
+  const requests = [];
+  const responses = [
+    previewSettingsEnvelope({ enabled: false, previews_enabled: false }),
+    previewSettingsEnvelope({ enabled: false, previews_enabled: true }),
+  ];
+  const settings = await ensureWorkerPreviewSettings({
+    accountId: CLOUDFLARE_ACCOUNT_ID,
+    token: CLOUDFLARE_API_TOKEN,
+    workerName: WORKER_NAME,
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      return new Response(JSON.stringify(responses.shift()));
+    },
+  });
+  assert.deepEqual(settings, { enabled: false, previews_enabled: true });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].url, requests[1].url);
+  assert.equal(requests[0].init.method, "GET");
+  assert.equal(requests[1].init.method, "POST");
+  assert.deepEqual(requests[1].init.headers, requests[0].init.headers);
+  assert.deepEqual(JSON.parse(requests[1].init.body), {
+    enabled: false,
+    previews_enabled: true,
+  });
+});
+
+test("Cloudflare preview settings reject non-2xx GET and POST responses", async () => {
+  for (const failedMethod of ["GET", "POST"]) {
+    const responses = failedMethod === "GET"
+      ? [new Response("denied", { status: 403 })]
+      : [
+          new Response(JSON.stringify(previewSettingsEnvelope({
+            enabled: false,
+            previews_enabled: false,
+          }))),
+          new Response("failed", { status: 500 }),
+        ];
+    await assert.rejects(ensureWorkerPreviewSettings({
+      accountId: CLOUDFLARE_ACCOUNT_ID,
+      token: CLOUDFLARE_API_TOKEN,
+      workerName: WORKER_NAME,
+      fetchImpl: async () => responses.shift(),
+    }), new RegExp(`${failedMethod} failed: HTTP ${failedMethod === "GET" ? 403 : 500}`));
+  }
+});
+
+test("Cloudflare preview settings reject malformed API envelopes and results", async () => {
+  const vectors = [
+    [new Response("not json"), /response is not JSON/],
+    [new Response(JSON.stringify({
+      ...previewSettingsEnvelope({ enabled: false, previews_enabled: true }),
+      unexpected: true,
+    })), /response keys are not exact/],
+    [new Response(JSON.stringify(previewSettingsEnvelope({
+      enabled: false,
+      previews_enabled: true,
+      unexpected: true,
+    }))), /result keys are not exact/],
+    [new Response(JSON.stringify({
+      ...previewSettingsEnvelope({ enabled: false, previews_enabled: true }),
+      errors: [{ code: 1000 }],
+    })), /response errors are not empty/],
+  ];
+  for (const [response, expected] of vectors) {
+    await assert.rejects(ensureWorkerPreviewSettings({
+      accountId: CLOUDFLARE_ACCOUNT_ID,
+      token: CLOUDFLARE_API_TOKEN,
+      workerName: WORKER_NAME,
+      fetchImpl: async () => response,
+    }), expected);
+  }
+});
+
+test("Cloudflare preview settings reject the wrong POST final state", async () => {
+  const responses = [
+    previewSettingsEnvelope({ enabled: true, previews_enabled: false }),
+    previewSettingsEnvelope({ enabled: false, previews_enabled: false }),
+  ];
+  await assert.rejects(ensureWorkerPreviewSettings({
+    accountId: CLOUDFLARE_ACCOUNT_ID,
+    token: CLOUDFLARE_API_TOKEN,
+    workerName: WORKER_NAME,
+    fetchImpl: async () => new Response(JSON.stringify(responses.shift())),
+  }), /wrong final state/);
+});
+
 test("Cloudflare metadata binds exact immutable candidate and rollback version IDs", async () => {
   const value = await fixture();
-  const candidateVersionId = "12345678-1234-4123-8123-123456789abc";
   const rollbackVersionId = "abcdef01-2345-4678-9abc-def012345678";
-  const previewAliasOrigin = "https://resident-canary-gekko-free.example.workers.dev";
   const metadata = await createCloudflareReleaseMetadata({
     release: value.release,
     rollbackVersionId,
     predecessorSchema: ROLLBACK_RELEASE_SCHEMA,
     predecessorReleaseId: value.rollback.releaseId,
     predecessorVersionId: rollbackVersionId,
-    workerName: "gekko-free",
-    expectedPreviewAliasOrigin: previewAliasOrigin,
-    wranglerOutput: `${JSON.stringify({
-      type: "version-upload",
-      version: 1,
-      worker_name: "gekko-free",
-      worker_tag: "worker-service-tag",
-      version_id: candidateVersionId,
-      preview_url: "https://a1b2c3d4-gekko-free.example.workers.dev",
-      preview_alias_url: previewAliasOrigin,
-      worker_name_overridden: false,
-    })}\n`,
+    workerName: WORKER_NAME,
+    expectedPreviewAliasOrigin: PREVIEW_ALIAS_ORIGIN,
+    wranglerOutput: wranglerOutput([wranglerSession(), versionUpload()]),
   });
   assert.equal(metadata.schema, CLOUDFLARE_RELEASE_METADATA_SCHEMA);
   assert.equal(metadata.candidate.releaseId, value.release.releaseId);
-  assert.equal(metadata.candidate.versionId, candidateVersionId);
+  assert.equal(metadata.candidate.versionId, CANDIDATE_VERSION_ID);
   assert.deepEqual(metadata.predecessor, {
     schema: ROLLBACK_RELEASE_SCHEMA,
     releaseId: value.rollback.releaseId,
@@ -273,7 +428,7 @@ test("Cloudflare metadata binds exact immutable candidate and rollback version I
   assert.equal(metadata.rollback.releaseId, value.rollback.releaseId);
   assert.equal(metadata.rollback.versionId, rollbackVersionId);
   assert.equal(validateCloudflareReleaseMetadata(metadata, {
-    workerName: "gekko-free",
+    workerName: WORKER_NAME,
     sourceCommit: value.release.source.commit,
     releaseId: value.release.releaseId,
     rollbackReleaseId: value.rollback.releaseId,
@@ -284,11 +439,55 @@ test("Cloudflare metadata binds exact immutable candidate and rollback version I
   }), /keys are not exact/);
   assert.throws(() => validateCloudflareReleaseMetadata({
     ...metadata,
-    rollback: { ...metadata.rollback, versionId: candidateVersionId },
+    rollback: { ...metadata.rollback, versionId: CANDIDATE_VERSION_ID },
   }), /predecessor version does not match rollback/);
   assert.throws(() => validateCloudflareReleaseMetadata(metadata, {
     rollbackReleaseId: "f".repeat(64),
   }), /rollback release ID does not match/);
+});
+
+test("Wrangler upload parsing rejects incomplete, unknown, duplicate, or unpinned records", () => {
+  const options = {
+    workerName: WORKER_NAME,
+    expectedPreviewAliasOrigin: PREVIEW_ALIAS_ORIGIN,
+  };
+  for (const missing of ["preview_url", "preview_alias_url"]) {
+    assert.throws(() => parseVersionUploadOutput(wranglerOutput([
+      wranglerSession(),
+      withoutKey(versionUpload(), missing),
+    ]), options), new RegExp(`omits ${missing}`));
+  }
+  assert.throws(() => parseVersionUploadOutput(wranglerOutput([
+    wranglerSession(),
+    { type: "future-wrangler-record", version: 1 },
+    versionUpload(),
+  ]), options), /unknown record type future-wrangler-record/);
+  assert.throws(() => parseVersionUploadOutput(wranglerOutput([
+    wranglerSession(),
+    versionUpload({ unexpected: true }),
+  ]), options), /unknown unexpected/);
+  assert.throws(() => parseVersionUploadOutput(wranglerOutput([
+    wranglerSession(),
+    wranglerSession(),
+    versionUpload(),
+  ]), options), /duplicate wrangler-session/);
+  assert.throws(() => parseVersionUploadOutput(wranglerOutput([
+    wranglerSession(),
+    versionUpload(),
+    versionUpload(),
+  ]), options), /duplicate version-upload/);
+  assert.throws(() => parseVersionUploadOutput(wranglerOutput([
+    wranglerSession({ wrangler_version: "4.111.0" }),
+    versionUpload(),
+  ]), options), /session version is not pinned 4\.112\.0/);
+  assert.throws(() => parseVersionUploadOutput(wranglerOutput([
+    wranglerSession(),
+    versionUpload({ preview_url: "https://a1b2c3d4-gekko-free.example.workers.dev" }),
+  ]), options), /preview does not identify the uploaded version ID/);
+
+  const legacy = parseVersionUploadOutput(wranglerOutput([versionUpload()]), options);
+  assert.equal(legacy.versionId, CANDIDATE_VERSION_ID);
+  assert.equal(legacy.previewOrigin, PREVIEW_ORIGIN);
 });
 
 test("production version proof requires one exact UUID at 100 percent", () => {

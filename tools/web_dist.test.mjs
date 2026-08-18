@@ -116,7 +116,12 @@ test("generated public artifact contains only the release surface", async () => 
     JSON.stringify(release),
     /font_(?:japanese|western)\.bin/,
   );
+  assert.equal(
+    await readFile(new URL("_redirects", directory), "utf8"),
+    "# SPDX-License-Identifier: GPL-3.0-only\n/ /index.html 200\n",
+  );
   const rootFiles = await readdir(directory);
+  assert.ok(rootFiles.includes("_redirects"));
   assert.ok(rootFiles.includes("THIRD-PARTY-NOTICES.txt"));
   assert.ok(rootFiles.includes("source"));
   assert.ok(!rootFiles.includes("source.html"));

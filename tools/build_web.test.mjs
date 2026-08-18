@@ -349,7 +349,12 @@ ${genericDiscSourceConfig}
     /\/THIRD-PARTY-NOTICES\.txt\n  Cache-Control: no-store/,
   );
   assert.doesNotMatch(headers, /^\/app(?:\.html)?$/m);
+  assert.equal(
+    await readFile(join(outputPath, "_redirects"), "utf8"),
+    "# SPDX-License-Identifier: GPL-3.0-only\n/ /index.html 200\n",
+  );
   const rootFiles = await readdir(outputPath);
+  assert.ok(rootFiles.includes("_redirects"));
   assert.ok(rootFiles.includes("THIRD-PARTY-NOTICES.txt"));
   assert.ok(rootFiles.includes("source"));
   assert.ok(!rootFiles.includes("source.html"));
