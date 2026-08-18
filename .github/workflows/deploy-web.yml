@@ -175,12 +175,9 @@ jobs:
           --status-env CLOUDFLARE_DEPLOYMENT_STATUS
           --expect-version-id "${{ steps.predecessor.outputs.version_id }}"
       - name: Install Rust toolchain
-        run: >-
-          rustup toolchain install 1.95.0
-          --profile minimal
-          --component rustfmt
-          --component clippy
-          --target wasm32-unknown-unknown
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustup toolchain install nightly-2026-02-24 --profile minimal --component rustfmt
       - name: Test resident machine and renderer
         run: >-
           cargo +1.95.0 test --locked
@@ -192,7 +189,7 @@ jobs:
           --features browser-machine/game-fidelity-probes
       - name: Check production Rust formatting and lints
         run: |
-          cargo +1.95.0 fmt --all -- --check
+          cargo +nightly-2026-02-24 fmt --all -- --check
           cargo +1.95.0 clippy --locked -p disks -p lazuli -p lazuli-abi -p ppcwasmjit -p browser-machine -p browser-renderer --features browser-machine/game-fidelity-probes --lib -- -D warnings
       - name: Build default-off resident core rejection vector
         run: >-

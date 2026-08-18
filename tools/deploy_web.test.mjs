@@ -136,14 +136,19 @@ test("canary packages the exact feature-on resident runtime and rejects default-
   const release = after(workflow, "Build immutable schema-4 release");
   assert.ok(defaultOff < featureOn && featureOn < contracts && contracts < frontend && frontend < release);
   assert.match(workflow, /cargo \+1\.95\.0 test --locked[\s\S]*-p lazuli[\s\S]*--features browser-machine\/game-fidelity-probes/);
-  assert.match(workflow, /cargo \+1\.95\.0 fmt --all -- --check/);
+  assert.match(workflow, /cargo \+nightly-2026-02-24 fmt --all -- --check/);
   assert.match(workflow, /cargo \+1\.95\.0 clippy --locked[\s\S]*-p browser-renderer[\s\S]*-D warnings/);
   assert.match(workflow, /RUSTC_BOOTSTRAP: "1"/);
   assert.match(workflow, /rustup toolchain install 1\.95\.0/);
-  assert.doesNotMatch(workflow, /Swatinem\/rust-cache|nightly-2026/);
+  assert.match(workflow, /rustup toolchain install nightly-2026-02-24 --profile minimal --component rustfmt/);
+  assert.doesNotMatch(workflow, /Swatinem\/rust-cache/);
   for (const invocation of workflow.match(/^\s*cargo .*$/gm) ?? []) {
-    assert.match(invocation, /cargo \+1\.95\.0/);
-    if (!invocation.includes(" fmt ")) assert.match(invocation, /--locked/);
+    if (invocation.includes(" fmt ")) {
+      assert.match(invocation, /cargo \+nightly-2026-02-24 fmt --all -- --check/);
+    } else {
+      assert.match(invocation, /cargo \+1\.95\.0/);
+      assert.match(invocation, /--locked/);
+    }
   }
   assert.match(workflow, /--target-dir target\/schema4-default-off/);
   assert.match(workflow, /--target-dir target\/schema4-feature-on/);
