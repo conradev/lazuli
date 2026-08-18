@@ -9,6 +9,9 @@ import {
   validateMachineEvidenceV1PublicationEnvelope,
   validateMachineEvidenceV1Transition,
 } from "./resident_machine_evidence_v1.mjs";
+import {
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+} from "./resident_machine_fidelity_checkpoints.mjs";
 
 export const FIRST_FRAME_REPORT_SCHEMA =
   "lazuli-rust-resident-first-visible-xfb-evidence-v1";
@@ -294,7 +297,7 @@ function validateArtifacts(value, expectedArtifacts = EXPECTED_ARTIFACTS) {
   }
 }
 
-function validatePolicy(value) {
+function validatePolicy(value, maximumColdInstallCap) {
   const policy = object(value, "$.policy");
   exactKeys(policy, [
     "transport",
@@ -324,7 +327,7 @@ function validatePolicy(value) {
   const bounded = [
     ["blockUpperCap", 1, 16_384],
     ["totalHostCallCap", 1, 65_535],
-    ["totalColdInstallCap", 1, 65_535],
+    ["totalColdInstallCap", 1, maximumColdInstallCap],
     ["maxBootReads", 1, 65_535],
     ["bootTimeoutMs", 1_000, 600_000],
     ["sliceTimeoutMs", 1_000, 600_000],
@@ -541,7 +544,22 @@ function validateTerminalEnvelope(
   nonEmptyString(environment.userAgent, "$.environment.userAgent");
   exact(environment.crossOriginIsolated, true, "$.environment.crossOriginIsolated");
   positiveInteger(environment.hardwareConcurrency, "$.environment.hardwareConcurrency");
-  const { policy, instructionCap, cycleCap } = validatePolicy(report.policy);
+  const evidenceLock = object(report.evidenceLock, "$.evidenceLock");
+  exactKeys(evidenceLock, ["schema", "sha256"], "$.evidenceLock");
+  exact(
+    evidenceLock.schema,
+    expectedEvidenceLock?.schema ?? FIDELITY_EVIDENCE_LOCK_SCHEMA,
+    "$.evidenceLock.schema",
+  );
+  sha256(evidenceLock.sha256, "$.evidenceLock.sha256");
+  if (expectedEvidenceLock !== null) {
+    exact(evidenceLock.sha256, expectedEvidenceLock.sha256, "$.evidenceLock.sha256");
+  }
+  const productionLock = evidenceLock.schema === PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA;
+  const { policy, instructionCap, cycleCap } = validatePolicy(
+    report.policy,
+    productionLock ? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP : 65_535,
+  );
   validateArtifacts(report.artifacts, expectedArtifacts);
 
   const corpus = object(report.corpus, "$.corpus");
@@ -579,18 +597,6 @@ function validateTerminalEnvelope(
     "$.fidelityCheckpointPolicy.probeEventPerSubmissionCap",
   );
 
-  const evidenceLock = object(report.evidenceLock, "$.evidenceLock");
-  exactKeys(evidenceLock, ["schema", "sha256"], "$.evidenceLock");
-  exact(
-    evidenceLock.schema,
-    expectedEvidenceLock?.schema ?? FIDELITY_EVIDENCE_LOCK_SCHEMA,
-    "$.evidenceLock.schema",
-  );
-  sha256(evidenceLock.sha256, "$.evidenceLock.sha256");
-  if (expectedEvidenceLock !== null) {
-    exact(evidenceLock.sha256, expectedEvidenceLock.sha256, "$.evidenceLock.sha256");
-  }
-  const productionLock = evidenceLock.schema === PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA;
   const captureOrder = productionLock
     ? PRODUCTION_FIRST_FRAME_CAPTURE_ORDER
     : FIRST_FRAME_CAPTURE_ORDER;

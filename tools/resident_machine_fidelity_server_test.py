@@ -23,11 +23,14 @@ from resident_machine_fidelity_server import (
     DURABLE_RECORD_SCHEMA,
     FidelityCheckpointError,
     FidelityCheckpointJournal,
+    PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
     canonical_json,
     locked_source_for_request,
     locked_source_snapshots,
     production_capture_policy,
     sha256_hex,
+    validate_capture_run_policy,
+    validate_capture_run_summary,
     validate_evidence_lock,
 )
 
@@ -865,6 +868,43 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_evidence_lock(changed)
 
+    def test_production_cold_install_authority_matches_javascript_and_summary_bounds(self) -> None:
+        project_root = Path(__file__).resolve().parent.parent
+        javascript = subprocess.run(
+            [
+                "node",
+                "--input-type=module",
+                "--eval",
+                (
+                    "import { PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP as cap } from "
+                    "'./tools/resident_machine_fidelity_checkpoints.mjs';"
+                    "process.stdout.write(String(cap));"
+                ),
+            ],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            int(javascript.stdout),
+            PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+        )
+        policy = {
+            **CAPTURE_RUN_POLICY,
+            "totalColdInstallCap": PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+        }
+        self.assertIs(validate_capture_run_policy(policy, "$.runPolicy"), policy)
+        summary = capture_run_summary(True)
+        summary["reportedColdInstalls"] = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
+        self.assertIs(
+            validate_capture_run_summary(summary, policy, "$.runSummary", True),
+            summary,
+        )
+        summary["reportedColdInstalls"] += 1
+        with self.assertRaisesRegex(FidelityCheckpointError, "cumulative authority"):
+            validate_capture_run_summary(summary, policy, "$.runSummary", True)
+
     def test_production_evidence_lock_requires_exact_continuous_capture_policy(self) -> None:
         lock = {
             "schema": "lazuli-resident-renderer-fidelity-evidence-lock-v3",
@@ -878,7 +918,9 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             "artifacts": {},
             "sources": {},
             "hostPolicy": {},
-            "runPolicy": {},
+            "runPolicy": {
+                "totalColdInstallCap": PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+            },
             "checkpointPolicy": {},
             "capturePolicy": production_capture_policy(GAME_KEY),
             "rendererProbe": {"defaultHookImports": 0, "checkpointProbeEvents": 0},
@@ -892,6 +934,10 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             },
         }
         self.assertIs(validate_evidence_lock(lock), lock)
+        changed_cap = json.loads(json.dumps(lock))
+        changed_cap["runPolicy"]["totalColdInstallCap"] = 65_535
+        with self.assertRaisesRegex(ValueError, "production cold-install cap"):
+            validate_evidence_lock(changed_cap)
         for mutate in (
             lambda value: value["capturePolicy"].pop("genericOperatorPolicy"),
             lambda value: value["capturePolicy"]["genericOperatorPolicy"]["a"].update(

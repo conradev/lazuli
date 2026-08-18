@@ -11,6 +11,9 @@ import {
   PRODUCTION_FIRST_FRAME_CAPTURE_ORDER,
   validateResidentFirstFrameReport,
 } from "./resident_machine_first_frame_report.mjs";
+import {
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+} from "./resident_machine_fidelity_checkpoints.mjs";
 
 const SHA = "a".repeat(64);
 
@@ -422,6 +425,15 @@ test("an explicit exact artifact set can qualify a different immutable package",
   );
 });
 
+test("standalone v2 validation retains the u16 cold-install ceiling", () => {
+  const report = residentFirstFrameReportFixture();
+  report.policy.totalColdInstallCap = 65_536;
+  assert.throws(
+    () => validateResidentFirstFrameReport(report, { requireComplete: true }),
+    /totalColdInstallCap/,
+  );
+});
+
 test("production validation requires an exact v3 lock reference and zero client probes", () => {
   const report = residentFirstFrameReportFixture();
   const expectedEvidenceLock = {
@@ -429,6 +441,7 @@ test("production validation requires an exact v3 lock reference and zero client 
     sha256: "e".repeat(64),
   };
   report.evidenceLock = structuredClone(expectedEvidenceLock);
+  report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
   report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
   report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
   report.capabilityBoundary.rendererProbeEventsExpected = 0;
@@ -438,6 +451,12 @@ test("production validation requires an exact v3 lock reference and zero client 
     requireComplete: true,
     expectedEvidenceLock,
   }));
+  report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP + 1;
+  assert.throws(() => validateResidentFirstFrameReport(report, {
+    requireComplete: true,
+    expectedEvidenceLock,
+  }), /totalColdInstallCap/);
+  report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
 
   report.capabilityBoundary.rendererOwnedRgbaReadbacks = 2;
   assert.doesNotThrow(() => validateResidentFirstFrameReport(report, {
@@ -514,6 +533,7 @@ test("production capture order inserts only durable first-frame ownership", () =
   };
   const production = residentFirstFrameReportFixture();
   production.evidenceLock = structuredClone(expectedEvidenceLock);
+  production.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
   production.capabilityBoundary.rendererProbeEventsExpected = 0;
   production.game.fidelityCheckpoints.probeEventCount = 0;
   production.game.fidelityCheckpoints.maximumProbeEventsPerSubmission = 0;
@@ -831,6 +851,14 @@ test("production page keeps query, ownership ACK, reuse, and controller APIs fai
     'parameters.getAll("game").length !== 1',
     'parameters.get("game") !== gameKey',
   ]) assert.match(query, new RegExp(fragment.replace(/[()]/g, "\\$&")));
+  assert.match(
+    source,
+    /const productionCaptureRequested = captureFidelityRequested\(\);/,
+  );
+  assert.match(
+    source,
+    /productionCaptureRequested\s*\? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP\s*:\s*65_535/,
+  );
 
   const observationStart = source.indexOf("async captureFidelityObservation(message)");
   const observationEnd = source.indexOf("\n  async render(message)", observationStart);

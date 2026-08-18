@@ -20,6 +20,7 @@ import { residentFirstFrameReportFixture } from "./resident_machine_first_frame_
 import { PRODUCTION_FIRST_FRAME_CAPTURE_ORDER } from "./resident_machine_first_frame_report.mjs";
 import { canonicalFidelityJson } from "./resident_machine_fidelity_checkpoint_report.mjs";
 import {
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   expectedFidelityHostIdentitySha256,
   productionFidelityCapturePolicy,
@@ -471,7 +472,7 @@ function firstFrameRunPolicy(workerUrl) {
     sliceCycleUpperCap: "1000000",
     blockUpperCap: 16_384,
     totalHostCallCap: 65_535,
-    totalColdInstallCap: 65_535,
+    totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
     maxBootReads: 8_192,
     bootTimeoutMs: 180_000,
     sliceTimeoutMs: 180_000,
@@ -831,6 +832,7 @@ async function buildAttestationFixture(t, {
       throw new Error(`unsupported Baseline mode ${baselineMode}`);
     }
     const report = residentFirstFrameReportFixture();
+    report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
     report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
     report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
     report.game.inputSamples = reportInputSampleCounts[index] ?? 0;
@@ -1987,7 +1989,9 @@ test("operator provenance and the cumulative run ledger are exact and cap-bound"
     summary => { summary.reportedExecutedCycles = "3001"; },
     summary => { summary.reportedExecutedInstructions = "2001"; },
     summary => { summary.reportedHostCalls = 65_536; },
-    summary => { summary.reportedColdInstalls = 65_536; },
+    summary => {
+      summary.reportedColdInstalls = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP + 1;
+    },
     summary => { summary.consecutiveZeroProgressSlices = 2; summary.maximumConsecutiveZeroProgressSlices = 1; },
     summary => { summary.zeroProgressSlices = 0; summary.maximumConsecutiveZeroProgressSlices = 1; },
     summary => { summary.zeroProgressSlices = 4_096; summary.maximumConsecutiveZeroProgressSlices = 4_096; },

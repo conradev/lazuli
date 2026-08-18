@@ -10,6 +10,7 @@ import test from "node:test";
 import { canonicalCaptureJson } from "./resident_machine_production_fidelity_capture.mjs";
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_FIDELITY_EXECUTION_ROLES,
   PRODUCTION_SOURCE_PATHS,
   validateResidentProductionFidelityEvidenceLock,
@@ -190,11 +191,16 @@ test("local controller emits canonical production v2 and schema-ordered v3 locks
   assert.equal(performanceLock.runPolicy.bootTimeoutMs, 120_000);
   assert.equal(performanceLock.runPolicy.sliceTimeoutMs, 120_000);
   assert.equal(performanceLock.runPolicy.windowTimeoutMs, 120_000);
+  assert.equal(performanceLock.runPolicy.maxColdInstalls, 65_535);
   const performanceBytes = Buffer.from(canonicalCaptureJson(performanceLock));
   assert.equal(performanceBytes.toString(), canonicalCaptureJson(JSON.parse(performanceBytes)));
 
   const fidelityLock = productionRendererFidelityEvidenceLock(base);
   assert.equal(fidelityLock.schema, PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA);
+  assert.equal(
+    fidelityLock.runPolicy.totalColdInstallCap,
+    PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+  );
   assert.equal(validateResidentProductionFidelityEvidenceLock(fidelityLock, base), fidelityLock);
   const fidelityBytes = schemaOrderedLockBytes(fidelityLock);
   assert.deepEqual(Object.keys(JSON.parse(fidelityBytes).sources), [...PRODUCTION_SOURCE_PATHS]);

@@ -5,6 +5,7 @@ import initRenderer, {
 } from "/resident-artifacts/browser_renderer.js";
 import {
   FIDELITY_CHECKPOINT_SCHEMA,
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   ResidentFidelityCheckpointClient,
 } from "/tools/resident_machine_fidelity_checkpoints.mjs";
 
@@ -89,6 +90,10 @@ function boundedBigInt(name, fallback, maximum = 1_000_000_000_000n) {
   return value;
 }
 
+const productionCaptureRequested = captureFidelityRequested();
+const totalColdInstallMaximum = productionCaptureRequested
+  ? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
+  : 65_535;
 const policy = Object.freeze({
   transport: "frozen-resident-machine-worker",
   evidenceMode: "first-renderer-owned-presented-xfb",
@@ -97,7 +102,12 @@ const policy = Object.freeze({
   sliceCycleUpperCap: BigInt(boundedInteger("sliceCycleCap", 1_000_000, 1, 1_000_000)),
   blockUpperCap: boundedInteger("blockCap", 16_384, 1, 16_384),
   totalHostCallCap: boundedInteger("hostCallCap", 65_535, 1, 65_535),
-  totalColdInstallCap: boundedInteger("coldInstallCap", 65_535, 1, 65_535),
+  totalColdInstallCap: boundedInteger(
+    "coldInstallCap",
+    totalColdInstallMaximum,
+    1,
+    totalColdInstallMaximum,
+  ),
   maxBootReads: boundedInteger("bootReadCap", 8_192, 1, 65_535),
   bootTimeoutMs: boundedInteger("bootTimeoutMs", 180_000, 1_000, 600_000),
   sliceTimeoutMs: boundedInteger("sliceTimeoutMs", 180_000, 1_000, 600_000),
@@ -1998,7 +2008,7 @@ async function main() {
     artifactManifest,
     game,
   );
-  const captureRequested = captureFidelityRequested();
+  const captureRequested = productionCaptureRequested;
   if (evidenceLock.production) {
     requireExactProductionQuery(game.key);
     pageProductionContext = Object.freeze({ lock: evidenceLock.lock });

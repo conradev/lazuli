@@ -24,6 +24,7 @@ import {
 } from "./resident_machine_corpus_report.mjs";
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   productionFidelityCapturePolicy,
   productionFidelityLockAuthorityFromFiles,
@@ -207,7 +208,7 @@ export function productionRendererFidelityEvidenceLock(authority) {
       sliceCycleUpperCap: "1000000",
       blockUpperCap: 16_384,
       totalHostCallCap: 65_535,
-      totalColdInstallCap: 65_535,
+      totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
       maxBootReads: 8_192,
       bootTimeoutMs: 180_000,
       sliceTimeoutMs: 180_000,

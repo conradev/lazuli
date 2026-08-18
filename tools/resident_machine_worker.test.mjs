@@ -9,6 +9,9 @@ import {
   MainThreadRendererRelay,
   ResidentCaptureRunLedger,
 } from "../web/resident-machine-worker.mjs";
+import {
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+} from "./resident_machine_fidelity_checkpoints.mjs";
 
 const CAPTURE_RUN_POLICY = Object.freeze({
   instructionUpperCap: "100",
@@ -255,6 +258,47 @@ test("capture run ledger is cumulative, stable, and fail-closed at frozen caps",
   assert.equal(ledger.summary().accepted, true);
   assert.equal(ledger.summary().reportedHostCalls, 8);
   assert.throws(() => ledger.issue({}), /Accepted boundary/);
+});
+
+test("capture run ledger supports the v3 cumulative cold authority above the u16 range", () => {
+  const productionPolicy = {
+    ...CAPTURE_RUN_POLICY,
+    instructionUpperCap: "100000000",
+    executedCycleUpperCap: "250000000",
+    totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+  };
+  const ledger = new ResidentCaptureRunLedger(productionPolicy, () => 0);
+  ledger.startAtReady();
+  for (let index = 0; index < 16; index += 1) {
+    const issued = ledger.issue({ maxColdInstalls: 65_535 });
+    assert.equal(issued.maxColdInstalls, 65_535);
+    ledger.accept({
+      boundary: "rust",
+      coldInstalls: 65_535,
+      outcome: { executedCycles: 1n, executedInstructions: 1n },
+    });
+  }
+  const terminal = ledger.issue({});
+  assert.equal(terminal.maxColdInstalls, 15);
+  ledger.accept({ boundary: "fidelity", phase: 5, coldInstalls: 15 });
+  assert.equal(
+    ledger.summary().reportedColdInstalls,
+    PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+  );
+  assert.equal(ledger.summary().accepted, true);
+
+  const exhausted = new ResidentCaptureRunLedger(productionPolicy, () => 0);
+  exhausted.startAtReady();
+  exhausted.issue({});
+  assert.throws(() => exhausted.accept({
+    boundary: "rust",
+    coldInstalls: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+    outcome: { executedCycles: 1n, executedInstructions: 1n },
+  }), /cumulative cold-install cap exhausted/);
+  assert.equal(
+    exhausted.summary().reportedColdInstalls,
+    PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+  );
 });
 
 test("capture run ledger rejects overshoot, zero progress, and deadline exhaustion", () => {

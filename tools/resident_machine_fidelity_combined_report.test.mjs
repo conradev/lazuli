@@ -13,6 +13,7 @@ import { canonicalFidelityJson } from "./resident_machine_fidelity_checkpoint_re
 import { PRODUCTION_FIRST_FRAME_CAPTURE_ORDER } from "./resident_machine_first_frame_report.mjs";
 import {
   expectedFidelityHostIdentitySha256,
+  PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   productionFidelityCapturePolicy,
   verifyResidentProductionDefaultOffRenderer,
@@ -147,7 +148,11 @@ function productionLock(base) {
       { bytes: 1, sha256: "5".repeat(64) },
     ])),
     hostPolicy: structuredClone(base.hostPolicy),
-    runPolicy: { ...structuredClone(base.runPolicy), workerUrl: worker.url },
+    runPolicy: {
+      ...structuredClone(base.runPolicy),
+      totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+      workerUrl: worker.url,
+    },
     checkpointPolicy: structuredClone(base.checkpointPolicy),
     capturePolicy: productionFidelityCapturePolicy("warioware-usa"),
     rendererProbe: {
@@ -236,6 +241,7 @@ async function productionFixture({
     expectedLockAuthority,
   );
   const report = residentFirstFrameReportFixture();
+  report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
   report.artifacts.artifacts = structuredClone(lock.artifacts);
   report.evidenceLock = { schema: lock.schema, sha256: evidenceLockSha256 };
   report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
