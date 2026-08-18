@@ -421,7 +421,7 @@ function appendBounded(current, chunk) {
     : combined.slice(combined.length - MAX_PROCESS_OUTPUT_BYTES);
 }
 
-function startManagedProcess(command, arguments_, label, {
+export function startManagedProcess(command, arguments_, label, {
   spawnImpl = spawnChild,
   firstLine = false,
 } = {}) {
@@ -438,8 +438,8 @@ function startManagedProcess(command, arguments_, label, {
     exitPromise: null,
   };
   let firstLineBuffer = "";
-  let resolveLine;
-  let rejectLine;
+  let resolveLine = null;
+  let rejectLine = null;
   if (firstLine) {
     managed.firstLinePromise = new Promise((resolve, reject) => {
       resolveLine = resolve;
@@ -485,6 +485,7 @@ function startManagedProcess(command, arguments_, label, {
       resolve(Object.freeze({ code, signal }));
     });
   });
+  void managed.exitPromise.catch(() => {});
   return managed;
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -24,6 +25,7 @@ import {
   productionRendererFidelityEvidenceLock,
   requireExactPlainDirectory,
   schemaOrderedLockBytes,
+  startManagedProcess,
   validateCleanReleaseCheckout,
   waitForCompletedWatchdogState,
 } from "./resident_machine_production_fidelity_local.mjs";
@@ -84,6 +86,90 @@ function authority() {
     ])),
   };
 }
+
+function fakeChildProcess() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  return child;
+}
+
+test("managed processes without readiness preserve clean and nonzero exits", async () => {
+  for (const code of [0, 7]) {
+    const child = fakeChildProcess();
+    const managed = startManagedProcess("fake", [String(code)], `fake ${code}`, {
+      spawnImpl: () => child,
+      firstLine: false,
+    });
+    assert.equal(managed.firstLinePromise, null);
+    assert.doesNotThrow(() => child.emit("exit", code, null));
+    assert.deepEqual(await managed.exitPromise, { code, signal: null });
+  }
+});
+
+test("managed process errors remain handled before delayed observation", async t => {
+  const child = fakeChildProcess();
+  const managed = startManagedProcess("fake", [], "error fake", {
+    spawnImpl: () => child,
+    firstLine: false,
+  });
+  const failure = new Error("spawn failed without readiness");
+  const exitPromise = managed.exitPromise;
+  const unhandled = [];
+  const observeUnhandled = (reason, promise) => unhandled.push({ reason, promise });
+  process.on("unhandledRejection", observeUnhandled);
+  t.after(() => process.off("unhandledRejection", observeUnhandled));
+  assert.equal(managed.firstLinePromise, null);
+  assert.doesNotThrow(() => child.emit("error", failure));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(unhandled, []);
+  assert.equal(managed.exitPromise, exitPromise);
+  await assert.rejects(exitPromise, error => error === failure);
+});
+
+test("managed readiness resolves its first complete line", async () => {
+  const child = fakeChildProcess();
+  const managed = startManagedProcess("fake", [], "ready fake", {
+    spawnImpl: () => child,
+    firstLine: true,
+  });
+  child.stdout.emit("data", "http://127.0.0.1:");
+  child.stdout.emit("data", "8123/\nignored\n");
+  assert.equal(await managed.firstLinePromise, "http://127.0.0.1:8123/");
+  child.emit("exit", 0, null);
+  assert.deepEqual(await managed.exitPromise, { code: 0, signal: null });
+});
+
+test("managed readiness and exit reject the same pre-readiness process error", async () => {
+  const child = fakeChildProcess();
+  const managed = startManagedProcess("fake", [], "failing fake", {
+    spawnImpl: () => child,
+    firstLine: true,
+  });
+  const failure = new Error("spawn failed");
+  const readinessFailure = assert.rejects(managed.firstLinePromise, error => error === failure);
+  const exitFailure = assert.rejects(managed.exitPromise, error => error === failure);
+  assert.doesNotThrow(() => child.emit("error", failure));
+  await Promise.all([readinessFailure, exitFailure]);
+});
+
+test("managed readiness preserves the exact exit-before-readiness failure", async () => {
+  const child = fakeChildProcess();
+  const managed = startManagedProcess("fake", [], "early fake", {
+    spawnImpl: () => child,
+    firstLine: true,
+  });
+  child.stderr.emit("data", "startup failed");
+  const readinessFailure = assert.rejects(
+    managed.firstLinePromise,
+    /early fake exited before readiness \(code=7, signal=null\): startup failed/,
+  );
+  assert.doesNotThrow(() => child.emit("exit", 7, null));
+  assert.deepEqual(await managed.exitPromise, { code: 7, signal: null });
+  await readinessFailure;
+});
 
 test("local controller emits canonical production v2 and schema-ordered v3 locks", () => {
   const base = authority();
