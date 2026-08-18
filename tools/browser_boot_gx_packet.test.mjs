@@ -16,6 +16,10 @@ const packetParserSource = readFileSync(
   new URL("../crates/browser-renderer/src/packet.rs", import.meta.url),
   "utf8",
 );
+const canonicalPacketSource = readFileSync(
+  new URL("../crates/lzgx-packet/src/lib.rs", import.meta.url),
+  "utf8",
+);
 
 function extractFunction(name) {
   const match = new RegExp(`function\\s+${name}\\s*\\(`).exec(source);
@@ -1895,20 +1899,28 @@ test("captures every indirect TEV producer register without stale unsupported te
 
 test("pins the cross-language indirect TEV tail feature ABI", () => {
   assert.match(
-    packetParserSource,
-    /PACKET_FLAG_INDIRECT_TEV_STATE_V1: u32 = 1 << 1/,
+    canonicalPacketSource,
+    /pub const PACKET_FLAG_INDIRECT_TEV_STATE_V1: u32 = 1 << 1/,
+  );
+  assert.match(
+    canonicalPacketSource,
+    /pub const INDIRECT_TEV_TAIL_BYTES_PER_DRAW: u32 = 128/,
+  );
+  assert.match(
+    canonicalPacketSource,
+    /pub const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1: u32 = 1/,
+  );
+  assert.match(
+    canonicalPacketSource,
+    /pub const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2: u32 = 2/,
   );
   assert.match(
     packetParserSource,
-    /GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW: u32 = 128/,
+    /use lzgx_packet::\{[\s\S]*?INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1, INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2,[\s\S]*?INDIRECT_TEV_TAIL_BYTES_PER_DRAW as GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW,[\s\S]*?\n\};/,
   );
   assert.match(
     packetParserSource,
-    /INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1: u32 = 1/,
-  );
-  assert.match(
-    packetParserSource,
-    /INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2: u32 = 2/,
+    /pub\(crate\) use lzgx_packet::\{[\s\S]*?PACKET_FLAG_INDIRECT_TEV_STATE_V1,[\s\S]*?\n\};/,
   );
   assert.match(
     packetParserSource,

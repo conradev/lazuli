@@ -10,6 +10,9 @@ import {
   SMB_SUSTAINED_PLAY_SCHEMA_V5,
   verifySmbSustainedPlay,
 } from "./browser_boot_smb_sustained_play.mjs";
+import {
+  validateCompactPublicActiveRelease,
+} from "./browser_public_release_identity.mjs";
 
 const REPORT_SCHEMA = "lazuli-public-smb-screencast-v6";
 const FRAME_COUNT = 64;
@@ -146,44 +149,18 @@ function parsePublicUrl(value, path) {
   return url;
 }
 
-function asset(value, path, extension = null) {
-  exactKeys(value, ["bytes", "sha256", "url"], path);
-  positiveInteger(value.bytes, `${path}.bytes`);
-  const digest = hash(value.sha256, `${path}.sha256`);
-  boundedString(value.url, `${path}.url`);
-  if (
-    !value.url.startsWith("/assets/")
-    || !value.url.includes(`-${digest}.`)
-    || (extension !== null && !value.url.endsWith(extension))
-  ) {
-    fail(`${path}.url`, "expected a content-addressed release asset URL");
-  }
-  return value;
-}
-
 function releaseIdentity(value, path) {
-  exactKeys(value, [
-    "backend",
-    "commit",
-    "dsp",
-    "frontend",
-    "releaseId",
-    "renderer",
-    "schema",
-  ], path);
-  exact(value.schema, 3, `${path}.schema`);
-  hash(value.commit, `${path}.commit`, 40);
-  hash(value.releaseId, `${path}.releaseId`);
-  asset(value.frontend, `${path}.frontend`, ".html");
-  exactKeys(value.renderer, ["javascript", "wasm"], `${path}.renderer`);
-  asset(value.renderer.javascript, `${path}.renderer.javascript`, ".js");
-  asset(value.renderer.wasm, `${path}.renderer.wasm`, ".wasm");
-  asset(value.dsp, `${path}.dsp`, ".wasm");
-  exactKeys(value.backend, ["bytes", "sha256", "url"], `${path}.backend`);
-  positiveInteger(value.backend.bytes, `${path}.backend.bytes`);
-  hash(value.backend.sha256, `${path}.backend.sha256`);
-  exact(value.backend.url, "/ppcwasmjit.wasm", `${path}.backend.url`);
-  return value;
+  try {
+    return validateCompactPublicActiveRelease(value, { path });
+  } catch (error) {
+    if (
+      typeof error?.path === "string"
+      && typeof error?.detail === "string"
+    ) {
+      fail(error.path, error.detail);
+    }
+    throw error;
+  }
 }
 
 function fullViewportRect(value, path) {
@@ -884,11 +861,12 @@ export function verifyPublicSmbScreencastReport(report) {
   exact(report.rendererControl.renderEveryOverride, null, "$.rendererControl.renderEveryOverride");
   const publicUrl = parsePublicUrl(report.publicUrl, "$.publicUrl");
   releaseIdentity(report.release, "$.release");
-  releaseIdentity(report.terminalRelease, "$.terminalRelease");
+  object(report.terminalRelease, "$.terminalRelease");
   navigationProof(report.navigation, "$.navigation", publicUrl, report.release);
   if (JSON.stringify(report.release) !== JSON.stringify(report.terminalRelease)) {
     fail("$.terminalRelease", "active release changed during the screencast");
   }
+  releaseIdentity(report.terminalRelease, "$.terminalRelease");
   exactKeys(report.discImage, ["algorithm", "format", "sha256"], "$.discImage");
   const expectedImage = SUPER_MONKEY_BALL_READY_CHECKPOINT.game.image;
   exact(report.discImage.algorithm, expectedImage.algorithm, "$.discImage.algorithm");

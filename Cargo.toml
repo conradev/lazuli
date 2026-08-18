@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/lazuli-abi",
+    "crates/lzgx-packet",
+    "crates/browser-machine",
     "crates/util",
     "crates/disks",
     "crates/gekko",
@@ -27,6 +30,9 @@ members = [
 ]
 default-members = [
     # libraries
+    "crates/lazuli-abi",
+    "crates/lzgx-packet",
+    "crates/browser-machine",
     "crates/util",
     "crates/disks",
     "crates/gekko",
@@ -129,7 +135,10 @@ opt-level = 2
 
 [workspace.dependencies]
 # workspace crates
+browser-machine = { path = "./crates/browser-machine" }
 browser-dsp = { path = "./crates/browser-dsp" }
+lazuli-abi = { path = "./crates/lazuli-abi" }
+lzgx-packet = { path = "./crates/lzgx-packet" }
 util = { path = "./crates/util" }
 disks = { path = "./crates/disks" }
 gekko = { path = "./crates/gekko" }
@@ -176,6 +185,7 @@ ring-arena = { git = "https://github.com/vxpm/ring-arena.git" }
 rustc-hash = "2"
 seq-macro = "0.3"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 static_assertions = "1.1"
 strum = { version = "0.28", features = ["derive"] }
 tracing = { version = "0.1", default-features = false, features = [

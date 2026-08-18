@@ -1,5 +1,4 @@
 //! Memory of the system.
-use std::alloc::Layout;
 use std::ptr::NonNull;
 
 use bitos::BitUtils;
@@ -7,9 +6,9 @@ use gekko::{Address, Bat, MemoryManagement};
 
 use crate::system::ipl::Ipl;
 
-pub const RAM_LEN: usize = 24 * bytesize::MIB as usize;
-pub const L2C_LEN: usize = 16 * bytesize::KIB as usize;
-pub const IPL_LEN: usize = 2 * bytesize::MIB as usize;
+pub const RAM_LEN: usize = lazuli_abi::memory::MAIN_RAM_BYTES;
+pub const L2C_LEN: usize = lazuli_abi::memory::L2C_BYTES;
+pub const IPL_LEN: usize = lazuli_abi::memory::IPL_BYTES;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -40,6 +39,7 @@ impl PageTranslation {
 }
 
 const PAGES_COUNT: usize = 1 << 15;
+pub const FASTMEM_PAGE_BYTES: u32 = 1 << 17;
 type TranslationLut = [PageTranslation; PAGES_COUNT];
 type FastmemLut = [Option<NonNull<u8>>; PAGES_COUNT];
 
@@ -66,6 +66,17 @@ impl Region {
             _ => return None,
         })
     }
+
+    fn of_range(addr: Address, len: u32) -> Option<(Self, u32)> {
+        let (region, offset) = Self::of(addr)?;
+        let end = offset.checked_add(len)?;
+        let region_len = match region {
+            Self::Ram => RAM_LEN as u32,
+            Self::L2c => L2C_LEN as u32,
+            Self::Ipl => IPL_LEN as u32 / 2,
+        };
+        (end <= region_len).then_some((region, offset))
+    }
 }
 
 pub struct Regions<'mem> {
@@ -74,13 +85,105 @@ pub struct Regions<'mem> {
     pub ipl: &'mem [u8],
 }
 
-pub struct Memory {
-    ram: NonNull<u8>,
-    l2c: NonNull<u8>,
-    ipl: NonNull<u8>,
+/// Fixed, externally owned RAM and locked-cache backing for a browser machine.
+///
+/// Requiring `&'static mut` arrays makes construction safe: the mapped bytes have the exact
+/// architected sizes, cannot overlap when obtained through safe Rust, and outlive the [`Memory`]
+/// that borrows them. The browser Wasm entrypoint may construct these arrays from sealed linear
+/// memory in one small, audited unsafe boundary.
+pub struct MappedMemoryBacking {
+    ram: &'static mut [u8; RAM_LEN],
+    l2c: &'static mut [u8; L2C_LEN],
+    ipl: &'static mut [u8; IPL_LEN],
+}
 
-    data_fastmem_lut_physical: Box<FastmemLut>,
-    data_fastmem_lut_logical: Box<FastmemLut>,
+impl MappedMemoryBacking {
+    #[must_use]
+    pub fn new(
+        ram: &'static mut [u8; RAM_LEN],
+        l2c: &'static mut [u8; L2C_LEN],
+        ipl: &'static mut [u8; IPL_LEN],
+    ) -> Self {
+        Self { ram, l2c, ipl }
+    }
+
+    /// Mutable IPL window used only while constructing the machine.
+    pub fn ipl_mut(&mut self) -> &mut [u8; IPL_LEN] {
+        self.ipl
+    }
+}
+
+enum Backing {
+    Owned(Box<[u8]>),
+    Mapped(&'static mut [u8]),
+}
+
+impl Backing {
+    fn zeroed(len: usize) -> Self {
+        Self::Owned(vec![0; len].into_boxed_slice())
+    }
+
+    #[inline(always)]
+    fn as_ptr(&self) -> *mut u8 {
+        match self {
+            Self::Owned(bytes) => bytes.as_ptr().cast_mut(),
+            Self::Mapped(bytes) => bytes.as_ptr().cast_mut(),
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(bytes) => bytes,
+        }
+    }
+
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(bytes) => bytes,
+        }
+    }
+}
+
+enum ReadOnlyBacking {
+    Owned(Box<[u8]>),
+    Mapped(&'static mut [u8]),
+}
+
+impl ReadOnlyBacking {
+    fn copied(bytes: &[u8]) -> Self {
+        Self::Owned(bytes.to_vec().into_boxed_slice())
+    }
+
+    #[inline(always)]
+    fn as_ptr(&self) -> *mut u8 {
+        match self {
+            Self::Owned(bytes) => bytes.as_ptr().cast_mut(),
+            Self::Mapped(bytes) => bytes.as_ptr().cast_mut(),
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(bytes) => bytes,
+        }
+    }
+}
+
+pub struct Memory {
+    ram: Backing,
+    l2c: Backing,
+    ipl: ReadOnlyBacking,
+
+    data_fastmem_lut_physical_read: Box<FastmemLut>,
+    data_fastmem_lut_physical_write: Box<FastmemLut>,
+    data_fastmem_lut_logical_read: Box<FastmemLut>,
+    data_fastmem_lut_logical_write: Box<FastmemLut>,
     data_translation_lut: Box<TranslationLut>,
     inst_translation_lut: Box<TranslationLut>,
 }
@@ -90,20 +193,28 @@ fn update_fastmem_lut(
     l2c: *mut u8,
     ipl: *mut u8,
     lut: &mut FastmemLut,
+    allow_ipl: bool,
     iter: impl IntoIterator<Item = (u32, u32)>,
 ) {
     for (logical_base, physical_base) in iter {
         let physical = Address(physical_base << 17);
-        let region = Region::of(physical);
+        // A fastmem entry authorizes the complete 128 KiB guest page. Partial regions (notably
+        // the 16 KiB locked cache) must stay on the bounds-checked slow path.
+        let region = Region::of_range(physical, FASTMEM_PAGE_BYTES);
 
         let ptr = if let Some((region, offset)) = region {
             let base = match region {
                 Region::Ram => ram,
                 Region::L2c => l2c,
-                Region::Ipl => ipl,
+                Region::Ipl if allow_ipl => ipl,
+                Region::Ipl => std::ptr::null_mut(),
             };
 
-            unsafe { base.add(offset as usize) }
+            if base.is_null() {
+                base
+            } else {
+                unsafe { base.add(offset as usize) }
+            }
         } else {
             std::ptr::null_mut()
         };
@@ -112,33 +223,20 @@ fn update_fastmem_lut(
     }
 }
 
-fn update_fastmem_lut_with_bat(
+fn update_fastmem_lut_physical(
     ram: *mut u8,
     l2c: *mut u8,
     ipl: *mut u8,
     lut: &mut FastmemLut,
-    bat: &Bat,
+    allow_ipl: bool,
 ) {
-    let physical_start_base = bat.physical_start().value() >> 17;
-    let physical_end_base = bat.physical_end().value() >> 17;
-    let logical_start_base = bat.logical_start().value() >> 17;
-    let logical_end_base = bat.logical_end().value() >> 17;
-
-    let logical_range = logical_start_base..=logical_end_base;
-    let physical_range = physical_start_base..=physical_end_base;
-    let iter = logical_range.zip(physical_range);
-
-    update_fastmem_lut(ram, l2c, ipl, lut, iter);
-}
-
-fn update_fastmem_lut_physical(ram: *mut u8, l2c: *mut u8, ipl: *mut u8, lut: &mut FastmemLut) {
     let iter = |a, b| ((a >> 17)..=(b >> 17)).map(|x| (x, x));
     let ram_iter = iter(RAM_START, RAM_END);
     let l2c_iter = iter(L2C_START, L2C_END);
     let ipl_iter = iter(IPL_START, IPL_END);
-    update_fastmem_lut(ram, l2c, ipl, lut, ram_iter);
-    update_fastmem_lut(ram, l2c, ipl, lut, l2c_iter);
-    update_fastmem_lut(ram, l2c, ipl, lut, ipl_iter);
+    update_fastmem_lut(ram, l2c, ipl, lut, allow_ipl, ram_iter);
+    update_fastmem_lut(ram, l2c, ipl, lut, allow_ipl, l2c_iter);
+    update_fastmem_lut(ram, l2c, ipl, lut, allow_ipl, ipl_iter);
 }
 
 fn update_translation_lut_with(translation: &mut TranslationLut, bat: &Bat) {
@@ -158,24 +256,45 @@ fn update_translation_lut_with(translation: &mut TranslationLut, bat: &Bat) {
 
 impl Memory {
     pub fn new(ipl_data: &Ipl) -> Self {
-        let alloc = |len| {
-            NonNull::new(unsafe { std::alloc::alloc(Layout::array::<u8>(len).unwrap()) }).unwrap()
-        };
+        Self::from_backings(
+            Backing::zeroed(RAM_LEN),
+            Backing::zeroed(L2C_LEN),
+            ReadOnlyBacking::copied(ipl_data),
+        )
+    }
 
-        let ram = alloc(RAM_LEN);
-        let l2c = alloc(L2C_LEN);
-        let ipl = alloc(IPL_LEN);
+    /// Constructs memory over the browser's fixed shared RAM and locked-cache windows.
+    ///
+    /// RAM, L2C, and IPL remain externally owned and are never copied or freed by [`Memory`].
+    pub fn new_mapped(backing: MappedMemoryBacking) -> Self {
+        let MappedMemoryBacking { ram, l2c, ipl } = backing;
+        Self::from_backings(
+            Backing::Mapped(ram),
+            Backing::Mapped(l2c),
+            ReadOnlyBacking::Mapped(ipl),
+        )
+    }
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(ipl_data.as_ptr(), ipl.as_ptr(), IPL_LEN);
-        }
+    fn from_backings(ram: Backing, l2c: Backing, ipl: ReadOnlyBacking) -> Self {
+        debug_assert_eq!(ram.as_slice().len(), RAM_LEN);
+        debug_assert_eq!(l2c.as_slice().len(), L2C_LEN);
+        debug_assert_eq!(ipl.as_slice().len(), IPL_LEN);
 
-        let mut data_fastmem_lut_physical = util::boxed_array(None);
+        let mut data_fastmem_lut_physical_read = util::boxed_array(None);
         update_fastmem_lut_physical(
             ram.as_ptr(),
             l2c.as_ptr(),
             ipl.as_ptr(),
-            &mut data_fastmem_lut_physical,
+            &mut data_fastmem_lut_physical_read,
+            true,
+        );
+        let mut data_fastmem_lut_physical_write = util::boxed_array(None);
+        update_fastmem_lut_physical(
+            ram.as_ptr(),
+            l2c.as_ptr(),
+            ipl.as_ptr(),
+            &mut data_fastmem_lut_physical_write,
+            false,
         );
 
         Self {
@@ -183,8 +302,10 @@ impl Memory {
             l2c,
             ipl,
 
-            data_fastmem_lut_physical,
-            data_fastmem_lut_logical: util::boxed_array(None),
+            data_fastmem_lut_physical_read,
+            data_fastmem_lut_physical_write,
+            data_fastmem_lut_logical_read: util::boxed_array(None),
+            data_fastmem_lut_logical_write: util::boxed_array(None),
             data_translation_lut: util::boxed_array(PageTranslation::NO_MAPPING),
             inst_translation_lut: util::boxed_array(PageTranslation::NO_MAPPING),
         }
@@ -192,34 +313,34 @@ impl Memory {
 
     #[inline(always)]
     pub fn ram(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ram.as_ptr(), RAM_LEN) }
+        self.ram.as_slice()
     }
 
     #[inline(always)]
     pub fn ram_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ram.as_ptr(), RAM_LEN) }
+        self.ram.as_mut_slice()
     }
 
     #[inline(always)]
     pub fn l2c(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.l2c.as_ptr(), L2C_LEN) }
+        self.l2c.as_slice()
     }
 
     #[inline(always)]
     pub fn l2c_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.l2c.as_ptr(), L2C_LEN) }
+        self.l2c.as_mut_slice()
     }
 
     #[inline(always)]
     pub fn ipl(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ipl.as_ptr(), IPL_LEN) }
+        self.ipl.as_slice()
     }
 
     #[inline(always)]
-    pub fn regions(&self) -> Regions<'_> {
-        let ram = unsafe { std::slice::from_raw_parts_mut(self.ram.as_ptr(), RAM_LEN) };
-        let l2c = unsafe { std::slice::from_raw_parts_mut(self.l2c.as_ptr(), L2C_LEN) };
-        let ipl = unsafe { std::slice::from_raw_parts(self.ipl.as_ptr(), IPL_LEN) };
+    pub fn regions(&mut self) -> Regions<'_> {
+        let ram = self.ram.as_mut_slice();
+        let l2c = self.l2c.as_mut_slice();
+        let ipl = self.ipl.as_slice();
 
         Regions { ram, l2c, ipl }
     }
@@ -227,7 +348,8 @@ impl Memory {
     pub fn build_data_bat_lut(&mut self, dbats: &[Bat; 4]) {
         let _span = tracing::info_span!("building dbat lut").entered();
 
-        self.data_fastmem_lut_logical.fill(None);
+        self.data_fastmem_lut_logical_read.fill(None);
+        self.data_fastmem_lut_logical_write.fill(None);
         self.data_translation_lut.fill(PageTranslation::NO_MAPPING);
         for (i, bat) in dbats.iter().enumerate() {
             if !bat.supervisor_mode() {
@@ -243,13 +365,10 @@ impl Memory {
                 bat.physical_end()
             );
             update_translation_lut_with(&mut self.data_translation_lut, bat);
-            update_fastmem_lut_with_bat(
-                self.ram.as_ptr(),
-                self.l2c.as_ptr(),
-                self.ipl.as_ptr(),
-                &mut self.data_fastmem_lut_logical,
-                bat,
-            );
+            // Translated accesses deliberately remain off the legacy 128 KiB pointer LUT. Its
+            // shape cannot encode PR/PP, first-matching BAT priority, hashed 4 KiB pages, or a
+            // cross-page permission boundary. The machine-owned MMU and its permission-aware
+            // sidecar are the only translated fast path.
         }
     }
 
@@ -307,27 +426,123 @@ impl Memory {
 
     /// Returns the fastmem LUT.
     #[inline(always)]
-    pub fn data_fastmem_lut_logical(&self) -> &FastmemLut {
-        &self.data_fastmem_lut_logical
+    pub fn data_fastmem_lut_logical_read(&self) -> &FastmemLut {
+        &self.data_fastmem_lut_logical_read
     }
 
-    /// Returns the fastmem LUT.
+    /// Returns the logical fastmem LUT safe for writes. Read-only IPL pages are absent.
     #[inline(always)]
-    pub fn data_fastmem_lut_physical(&self) -> &FastmemLut {
-        &self.data_fastmem_lut_physical
+    pub fn data_fastmem_lut_logical_write(&self) -> &FastmemLut {
+        &self.data_fastmem_lut_logical_write
+    }
+
+    /// Returns the physical fastmem LUT for reads.
+    #[inline(always)]
+    pub fn data_fastmem_lut_physical_read(&self) -> &FastmemLut {
+        &self.data_fastmem_lut_physical_read
+    }
+
+    /// Returns the physical fastmem LUT safe for writes. Read-only IPL pages are absent.
+    #[inline(always)]
+    pub fn data_fastmem_lut_physical_write(&self) -> &FastmemLut {
+        &self.data_fastmem_lut_physical_write
+    }
+
+    /// Returns the raw wasm32 LUT address used by resident translated blocks.
+    ///
+    /// The portable JIT uses one conservative table for both loads and stores.  Selecting the
+    /// write-safe table keeps read-only IPL pages on the checked Rust hook path instead of
+    /// allowing a generated store to reuse a read-only pointer.  Translated accesses currently
+    /// use the empty logical table and therefore also fall through to the machine-owned MMU.
+    #[inline(always)]
+    pub fn resident_fastmem_write_lut_ptr(&self, translated: bool) -> *const Option<NonNull<u8>> {
+        let lut = if translated {
+            &self.data_fastmem_lut_logical_write
+        } else {
+            &self.data_fastmem_lut_physical_write
+        };
+        lut.as_ptr()
     }
 }
 
 unsafe impl Send for Memory {}
 
-impl Drop for Memory {
-    fn drop(&mut self) {
-        let dealloc = |ptr: NonNull<u8>, len| unsafe {
-            std::alloc::dealloc(ptr.as_ptr(), Layout::array::<u8>(len).unwrap())
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        dealloc(self.ram, RAM_LEN);
-        dealloc(self.l2c, L2C_LEN);
-        dealloc(self.ipl, IPL_LEN);
+    fn boxed_array<const N: usize>(value: u8) -> Box<[u8; N]> {
+        match vec![value; N].into_boxed_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => unreachable!("vector was created at the requested array length"),
+        }
+    }
+
+    fn test_ipl() -> Ipl {
+        Ipl::new(vec![0; IPL_LEN])
+    }
+
+    #[test]
+    fn owned_constructor_retains_independent_backing() {
+        let ipl = test_ipl();
+        let mut memory = Memory::new(&ipl);
+        assert_eq!(memory.ram().len(), RAM_LEN);
+        assert_eq!(memory.l2c().len(), L2C_LEN);
+        assert_eq!(memory.ipl(), &*ipl);
+
+        memory.ram_mut()[0x1234] = 0x5a;
+        memory.l2c_mut()[0x234] = 0xa5;
+        assert_eq!(memory.ram()[0x1234], 0x5a);
+        assert_eq!(memory.l2c()[0x234], 0xa5);
+    }
+
+    #[test]
+    fn mapped_backing_is_exactly_visible_and_not_freed_on_drop() {
+        let ram = Box::into_raw(boxed_array::<RAM_LEN>(0));
+        let l2c = Box::into_raw(boxed_array::<L2C_LEN>(0));
+        let ipl = Box::into_raw(boxed_array::<IPL_LEN>(0));
+        unsafe {
+            (*ram)[0x40] = 0x12;
+            (*l2c)[0x80] = 0x34;
+            (*ipl)[0x100] = 0x56;
+        }
+
+        let backing = MappedMemoryBacking::new(
+            // SAFETY: These boxes remain allocated until after `memory` is dropped below. Their
+            // ranges are disjoint, and no other references are used while `memory` owns them.
+            unsafe { &mut *ram },
+            unsafe { &mut *l2c },
+            unsafe { &mut *ipl },
+        );
+        let mut memory = Memory::new_mapped(backing);
+
+        assert_eq!(memory.ram().as_ptr(), ram.cast::<u8>());
+        assert_eq!(memory.l2c().as_ptr(), l2c.cast::<u8>());
+        assert_eq!(memory.ipl().as_ptr(), ipl.cast::<u8>());
+        assert_eq!(memory.ram()[0x40], 0x12);
+        assert_eq!(memory.l2c()[0x80], 0x34);
+        assert_eq!(memory.ipl()[0x100], 0x56);
+        assert_eq!(
+            memory.data_fastmem_lut_physical_read()[0]
+                .expect("physical RAM fastmem entry")
+                .as_ptr(),
+            ram.cast::<u8>()
+        );
+        let ipl_page = (IPL_START >> 17) as usize;
+        assert!(memory.data_fastmem_lut_physical_read()[ipl_page].is_some());
+        assert!(memory.data_fastmem_lut_physical_write()[ipl_page].is_none());
+
+        memory.ram_mut()[0x41] = 0xab;
+        memory.l2c_mut()[0x81] = 0xcd;
+        drop(memory);
+
+        // Reclaiming both boxes proves `Memory` did not free mapped storage. Values written via
+        // the emulator are still present in the exact host backing.
+        let ram = unsafe { Box::from_raw(ram) };
+        let l2c = unsafe { Box::from_raw(l2c) };
+        let ipl = unsafe { Box::from_raw(ipl) };
+        assert_eq!(ram[0x41], 0xab);
+        assert_eq!(l2c[0x81], 0xcd);
+        assert_eq!(ipl[0x100], 0x56);
     }
 }

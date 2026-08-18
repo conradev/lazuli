@@ -16,12 +16,19 @@ const LOCAL_DISC_SOURCE_KINDS = new Set([
   "local-file",
   "logical-range-endpoint",
 ]);
-const CRITICAL_EXCEPTION_VECTORS = [
+const UNRECOVERABLE_EXCEPTION_VECTORS = [
   "0x0200",
-  "0x0300",
-  "0x0400",
   "0x0600",
   "0x0700",
+];
+const CRITICAL_STORAGE_FAULT_SCHEMA =
+  "lazuli-critical-storage-fault-health-v1";
+const CRITICAL_STORAGE_FAULT_CLASSIFICATIONS = [
+  "data-page-fault",
+  "data-protection-fault",
+  "instruction-page-fault",
+  "instruction-protection-fault",
+  "unsupported",
 ];
 const DEVICE_FAILURE_EVENTS = [
   "diskDeviceError",
@@ -97,8 +104,10 @@ const DECODER_FAILURE_COUNTERS = [
 ];
 const PROGRESS_COUNTERS = [
   "cycles",
+  "dataStorageFaults",
   "dispatches",
   "instructions",
+  "instructionStorageFaults",
   "viFields",
   "hostPresentations",
   "presentationSerial",
@@ -359,6 +368,168 @@ function verifyRendererSync(report) {
   return armed;
 }
 
+function verifyCriticalStorageFaultRecord(value, path, raised) {
+  const record = requiredObject(value, path);
+  requirePattern(
+    record.address,
+    HEX_U32_PATTERN,
+    `${path}.address`,
+    "a lowercase 32-bit hexadecimal address",
+  );
+  requireExact(record.attempts, 1, `${path}.attempts`);
+  requirePattern(
+    record.cause,
+    HEX_U32_PATTERN,
+    `${path}.cause`,
+    "a lowercase 32-bit hexadecimal syndrome",
+  );
+  const classification = requiredString(
+    record.classification,
+    `${path}.classification`,
+  );
+  if (
+    classification === "unsupported"
+    || !CRITICAL_STORAGE_FAULT_CLASSIFICATIONS.includes(classification)
+  ) {
+    oracleFailure(
+      `${path}.classification`,
+      "expected a recoverable page or protection fault",
+    );
+  }
+  const expectedCauses = {
+    "data-page-fault": new Set(["0x40000000", "0x42000000"]),
+    "data-protection-fault": new Set(["0x08000000", "0x0a000000"]),
+    "instruction-page-fault": new Set(["0x40000000"]),
+    "instruction-protection-fault": new Set(["0x08000000"]),
+  };
+  if (!expectedCauses[classification].has(record.cause)) {
+    oracleFailure(`${path}.cause`, `unexpected ${classification} syndrome`);
+  }
+  const handlerCycles = requireNonNegativeInteger(
+    record.handlerCycles,
+    `${path}.handlerCycles`,
+  );
+  const handlerDispatches = requireNonNegativeInteger(
+    record.handlerDispatches,
+    `${path}.handlerDispatches`,
+  );
+  requirePattern(
+    record.pc,
+    HEX_U32_PATTERN,
+    `${path}.pc`,
+    "a lowercase 32-bit hexadecimal PC",
+  );
+  requireExact(
+    record.reason,
+    "retry-dispatch-complete",
+    `${path}.reason`,
+  );
+  requireExact(record.sequence, raised, `${path}.sequence`);
+  const expectedVector = classification.startsWith("data-")
+    ? "0x0300"
+    : "0x0400";
+  requireExact(record.vector, expectedVector, `${path}.vector`);
+  return { handlerCycles, handlerDispatches };
+}
+
+function verifyCriticalStorageFaultHealth(exceptions, counts) {
+  for (const vector of UNRECOVERABLE_EXCEPTION_VECTORS) {
+    requireZero(counts[vector], `$.report.exceptions.counts.${vector}`);
+  }
+  const dataStorageFaults = requireNonNegativeInteger(
+    counts["0x0300"] ?? 0,
+    '$.report.exceptions.counts["0x0300"]',
+  );
+  const instructionStorageFaults = requireNonNegativeInteger(
+    counts["0x0400"] ?? 0,
+    '$.report.exceptions.counts["0x0400"]',
+  );
+  const raised = dataStorageFaults + instructionStorageFaults;
+  if (!Number.isSafeInteger(raised)) {
+    oracleFailure("$.report.exceptions.counts", "storage-fault sum is not safe");
+  }
+  if (raised === 0 && exceptions.criticalStorageFaults === undefined) {
+    return { dataStorageFaults, instructionStorageFaults };
+  }
+
+  const path = "$.report.exceptions.criticalStorageFaults";
+  const health = requiredObject(exceptions.criticalStorageFaults, path);
+  requireExact(health.schema, CRITICAL_STORAGE_FAULT_SCHEMA, `${path}.schema`);
+  requireExact(
+    requireNonNegativeInteger(health.raised, `${path}.raised`),
+    raised,
+    `${path}.raised`,
+  );
+  requireExact(
+    requireNonNegativeInteger(health.handlerReturns, `${path}.handlerReturns`),
+    raised,
+    `${path}.handlerReturns`,
+  );
+  requireExact(
+    requireNonNegativeInteger(health.resolved, `${path}.resolved`),
+    raised,
+    `${path}.resolved`,
+  );
+  requireExact(
+    requireNonNegativeInteger(health.recurrences, `${path}.recurrences`),
+    0,
+    `${path}.recurrences`,
+  );
+  requireExact(
+    requireNonNegativeInteger(health.nested, `${path}.nested`),
+    0,
+    `${path}.nested`,
+  );
+  requireExact(health.pending, null, `${path}.pending`);
+
+  const { counts: classifications } = requireExactNonNegativeCountMap(
+    health.classifications,
+    CRITICAL_STORAGE_FAULT_CLASSIFICATIONS,
+    `${path}.classifications`,
+  );
+  requireExact(
+    classifications["data-page-fault"]
+      + classifications["data-protection-fault"],
+    dataStorageFaults,
+    `${path}.classifications.[data-sum]`,
+  );
+  requireExact(
+    classifications["instruction-page-fault"]
+      + classifications["instruction-protection-fault"],
+    instructionStorageFaults,
+    `${path}.classifications.[instruction-sum]`,
+  );
+  requireZero(classifications.unsupported, `${path}.classifications.unsupported`);
+
+  const maxHandlerDispatches = requireNonNegativeInteger(
+    health.maxHandlerDispatches,
+    `${path}.maxHandlerDispatches`,
+  );
+  const maxHandlerCycles = requireNonNegativeInteger(
+    health.maxHandlerCycles,
+    `${path}.maxHandlerCycles`,
+  );
+  if (raised === 0) {
+    requireExact(health.lastResolved, null, `${path}.lastResolved`);
+  } else {
+    const last = verifyCriticalStorageFaultRecord(
+      health.lastResolved,
+      `${path}.lastResolved`,
+      raised,
+    );
+    if (
+      last.handlerDispatches > maxHandlerDispatches
+      || last.handlerCycles > maxHandlerCycles
+    ) {
+      oracleFailure(
+        `${path}.lastResolved`,
+        "last handler latency exceeds the authenticated maximum",
+      );
+    }
+  }
+  return { dataStorageFaults, instructionStorageFaults };
+}
+
 function verifyDeviceHealth(report) {
   const events = requiredObject(report.deviceEvents, "$.report.deviceEvents");
   requirePositiveInteger(events.diskRead, "$.report.deviceEvents.diskRead");
@@ -370,9 +541,7 @@ function verifyDeviceHealth(report) {
 
   const exceptions = requiredObject(report.exceptions, "$.report.exceptions");
   const counts = requiredObject(exceptions.counts, "$.report.exceptions.counts");
-  for (const vector of CRITICAL_EXCEPTION_VECTORS) {
-    requireZero(counts[vector], `$.report.exceptions.counts.${vector}`);
-  }
+  verifyCriticalStorageFaultHealth(exceptions, counts);
 
   const diskCommands = requiredObject(report.diskCommands, "$.report.diskCommands");
   requireExact(
@@ -792,6 +961,7 @@ function progressProjection(
   return Object.freeze({
     controllerAppliedSequence: report.controller.appliedSequence,
     cycles: report.cycles,
+    dataStorageFaults: report.exceptions.counts["0x0300"] ?? 0,
     diskReads: report.deviceEvents.diskRead,
     dispatches: report.dispatches,
     dspBudgetedInstructions:
@@ -801,6 +971,7 @@ function progressProjection(
     gxCommands: report.gxFifo.decoder.commands,
     hostPresentations: presentationCount,
     instructions: report.instructions,
+    instructionStorageFaults: report.exceptions.counts["0x0400"] ?? 0,
     presentationSerial,
     primitives: report.gxFifo.decoder.primitives,
     rendererPresents: report.rendering.metrics.webgpu.presentXfbCalls,

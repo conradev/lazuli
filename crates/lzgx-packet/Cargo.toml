@@ -1,0 +1,9 @@
+[package]
+name = "lzgx-packet"
+description = "Canonical checked LZGX frame-packet format and encoder"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[lints]
+workspace = true

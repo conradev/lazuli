@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Capture web production fidelity
+
+on:
+  workflow_dispatch:
+    inputs:
+      canary_run_id:
+        description: Exact successful Release web run carrying immutable candidate A
+        required: true
+        type: string
+      expected_release_id:
+        description: Exact schema-4 release SHA-256 for candidate A
+        required: true
+        type: string
+      expected_source_commit:
+        description: Exact lowercase source commit embedded in candidate A
+        required: true
+        type: string
+      capture_plan:
+        description: Relative canonical plan path beneath the configured LAZULI_CAPTURE_ROOT
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: capture-web-production-fidelity
+  cancel-in-progress: false
+
+env:
+  LAZULI_CAPTURE_ROOT: ${{ vars.LAZULI_CAPTURE_ROOT }}
+  WEB_FIDELITY_CANARY_RUN_ID: ${{ inputs.canary_run_id }}
+  WEB_FIDELITY_EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+  WEB_FIDELITY_EXPECTED_SOURCE_COMMIT: ${{ inputs.expected_source_commit }}
+  WEB_FIDELITY_CAPTURE_PLAN: ${{ inputs.capture_plan }}
+
+jobs:
+  capture:
+    name: Capture and gate exact candidate A
+    runs-on: [self-hosted, macOS, lazuli-production-fidelity]
+    timeout-minutes: 240
+    steps:
+      - name: Checkout exact candidate source with full history
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.expected_source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable capture dispatch inputs and checkout
+        run: |
+          node tools/web_rollout_inputs.mjs capture
+          checked_out_commit="$(git rev-parse HEAD)"
+          if [[ "$checked_out_commit" != "$WEB_FIDELITY_EXPECTED_SOURCE_COMMIT" ]]; then
+            echo "::error::Checked-out commit does not equal the exact capture source commit."
+            exit 1
+          fi
+          if [[ "$(git rev-parse --is-shallow-repository)" != "false" ]]; then
+            echo "::error::Production fidelity capture requires full repository history."
+            exit 1
+          fi
+      - name: Authenticate exact successful candidate workflow run
+        uses: actions/github-script@v8
+        env:
+          AUTHENTICATED_RUN_ID: ${{ inputs.canary_run_id }}
+          AUTHENTICATED_SOURCE_COMMIT: ${{ inputs.expected_source_commit }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: process.env.AUTHENTICATED_RUN_ID,
+            });
+            if (run.conclusion !== "success" || run.event !== "workflow_dispatch" ||
+                run.path !== ".github/workflows/deploy-web.yml" ||
+                run.head_sha !== process.env.AUTHENTICATED_SOURCE_COMMIT ||
+                run.repository.full_name !== process.env.GITHUB_REPOSITORY) {
+              core.setFailed("Candidate did not come from the exact successful Release web source run.");
+            }
+      - name: Download exact immutable candidate A
+        uses: actions/download-artifact@v4
+        with:
+          name: schema4-canary-candidate
+          path: ${{ runner.temp }}/lazuli-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.canary_run_id }}
+      - name: Verify candidate metadata, manifest, release, and source identity
+        run: >-
+          node tools/cloudflare_release_metadata.mjs verify
+          --metadata "$RUNNER_TEMP/lazuli-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/target/cloudflare-version.json"
+          --release-manifest "$RUNNER_TEMP/lazuli-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/web/dist/release.json"
+          --worker-name gekko-free
+          --expect-source-commit "$WEB_FIDELITY_EXPECTED_SOURCE_COMMIT"
+          --expect-release-id "$WEB_FIDELITY_EXPECTED_RELEASE_ID"
+      - name: Create fresh outside-repository capture parent
+        run: >-
+          mkdir
+          "$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Run all-seven continuous capture and assemble private evidence
+        run: >-
+          node tools/resident_machine_production_fidelity_bundle.mjs
+          --capture-root "$LAZULI_CAPTURE_ROOT"
+          --plan "$WEB_FIDELITY_CAPTURE_PLAN"
+          --candidate-dist "$RUNNER_TEMP/lazuli-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/web/dist"
+          --capture-directory "$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/capture"
+          --output-directory "$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/evidence"
+          --repository "$GITHUB_WORKSPACE"
+          --corpus "$GITHUB_WORKSPACE/tools/compatibility/games/corpus.json"
+      - name: Independently re-run fail-closed production fidelity gate
+        run: >-
+          node tools/resident_machine_production_fidelity_gate.mjs
+          --attestation "$RUNNER_TEMP/lazuli-fidelity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/evidence/attestation.json"
+          --release-manifest "$RUNNER_TEMP/lazuli-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/web/dist/release.json"
+          --corpus "$GITHUB_WORKSPACE/tools/compatibility/games/corpus.json"
+          --repository "$GITHUB_WORKSPACE"
+      - name: Upload immutable all-seven fidelity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema4-production-fidelity-evidence
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+          path: ${{ runner.temp }}/lazuli-fidelity-${{ github.run_id }}-${{ github.run_attempt }}/evidence

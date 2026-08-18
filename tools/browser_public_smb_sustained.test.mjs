@@ -17,31 +17,23 @@ import {
   validatePublicSmbSustainedEnvelope,
   validatePublicSmbSustainedEvidence,
 } from "./browser_public_smb_sustained.mjs";
+import {
+  compactSchema4ReleaseIdentityFixture,
+} from "./browser_public_release_identity.test_fixture.mjs";
 
 const COMMIT = "1".repeat(40);
-const RELEASE_ID = "2".repeat(64);
 const FRONTEND_HASH = "3".repeat(64);
+const RELEASE_FIXTURE = compactSchema4ReleaseIdentityFixture({
+  assetHash: FRONTEND_HASH,
+  commit: COMMIT,
+});
+const RELEASE_ID = RELEASE_FIXTURE.releaseId;
 const TOP_LOADER = "top-loader";
 const FRAME_URL =
   `https://gekko.free/assets/frontend-${FRONTEND_HASH}.html`;
 
 function releaseIdentity() {
-  return {
-    schema: 3,
-    releaseId: RELEASE_ID,
-    commit: COMMIT,
-    frontend: {
-      url: `/assets/frontend-${FRONTEND_HASH}.html`,
-      sha256: FRONTEND_HASH,
-      bytes: 1_000,
-    },
-    renderer: {
-      javascript: { url: "/renderer.js", sha256: "4".repeat(64), bytes: 2_000 },
-      wasm: { url: "/renderer.wasm", sha256: "5".repeat(64), bytes: 3_000 },
-    },
-    dsp: { url: "/assets/browser-dsp-" + "7".repeat(64) + ".wasm", sha256: "7".repeat(64), bytes: 3_500 },
-    backend: { url: "/backend.wasm", sha256: "6".repeat(64), bytes: 4_000 },
-  };
+  return structuredClone(RELEASE_FIXTURE);
 }
 
 function navigationIdentity() {
@@ -153,9 +145,24 @@ test("public sustained envelope rejects release and navigation drift", () => {
       /\$\.release\.commit/,
     ],
     [
-      "DSP asset",
-      value => { delete value.release.dsp; },
-      /\$\.release\.dsp/,
+      "resident runtime",
+      value => { delete value.release.runtime.coordinator; },
+      /\$\.release\.runtime.*coordinator/,
+    ],
+    [
+      "runtime ABI",
+      value => { value.release.runtime.abi.machineEvidenceBytes += 1; },
+      /\$\.release\.runtime\.abi\.machineEvidenceBytes/,
+    ],
+    [
+      "bootstrap",
+      value => { value.release.bootstrap.serviceWorker.url = "/worker.js"; },
+      /\$\.release\.bootstrap\.serviceWorker\.url/,
+    ],
+    [
+      "nested rollback",
+      value => { delete value.release.rollback.release.releaseId; },
+      /\$\.release\.rollback\.release.*releaseId/,
     ],
     [
       "terminal release",

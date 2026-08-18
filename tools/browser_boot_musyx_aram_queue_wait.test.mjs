@@ -456,7 +456,7 @@ test("a cycle-limit cap advances without servicing a future device event", async
 
 test("runner recognizes the wait before compilation and preserves the guest ISR path", () => {
   const integration = source.indexOf(
-    "if (await accelerateMusyxAramQueueFullWait(pc))",
+    "const musyxAramAcceleration = pendingMusyxAramQueueFullWaitAcceleration(pc);",
   );
   assert.notEqual(integration, -1);
   const compilation = source.indexOf('stage = "compile"', integration);
@@ -464,7 +464,7 @@ test("runner recognizes the wait before compilation and preserves the guest ISR 
   assert.ok(integration < compilation, "the backedge must not be compiled or executed");
   assert.match(
     source.slice(integration, compilation),
-    /await finishTerminalControllerScenario\(\);\s*continue;/,
+    /if \(musyxAramAcceleration !== false && await musyxAramAcceleration\) \{\s*const terminalCompletion = pendingTerminalControllerScenarioCompletion\(\);\s*if \(terminalCompletion !== false\) await terminalCompletion;\s*continue;/,
   );
   assert.match(
     extractFunction("isRecognizedLoopPc"),

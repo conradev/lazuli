@@ -3,7 +3,7 @@
 name = "gekko-free"
 compatibility_date = "2026-07-17"
 workers_dev = false
-preview_urls = false
+preview_urls = true
 
 [[routes]]
 pattern = "gekko.free"

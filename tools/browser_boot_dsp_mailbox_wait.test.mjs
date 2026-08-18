@@ -488,7 +488,7 @@ test("runner excludes the wait from regions and accelerates before compilation",
     /isDspReceiveMailboxWaitCandidate\(candidatePc\)/,
   );
   const integration = source.indexOf(
-    "if (await accelerateDspReceiveMailboxWait(pc))",
+    "const dspReceiveAcceleration = pendingDspReceiveMailboxWaitAcceleration(pc);",
   );
   assert.notEqual(integration, -1);
   const compilation = source.indexOf('stage = "compile"', integration);
@@ -496,7 +496,7 @@ test("runner excludes the wait from regions and accelerates before compilation",
   assert.ok(integration < compilation);
   assert.match(
     source.slice(integration, compilation),
-    /await finishTerminalControllerScenario\(\);\s*continue;/,
+    /if \(dspReceiveAcceleration !== false && await dspReceiveAcceleration\) \{\s*const terminalCompletion = pendingTerminalControllerScenarioCompletion\(\);\s*if \(terminalCompletion !== false\) await terminalCompletion;\s*continue;/,
   );
 
   const accelerator = extractFunction("accelerateDspReceiveMailboxWait");

@@ -8,51 +8,38 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use lzgx_packet::{
+    BaseLayout as CanonicalBaseLayout, COPY_FLAG_CLEAR, DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE,
+    DRAW_FLAG_EXACT_CLIP_REQUIRED, DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE,
+    EXACT_CLIP_INPUT_ENCODING_F32_V1, EXACT_CLIP_STATE_BYTES, EXACT_CLIP_VERTEX_BYTES,
+    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1, INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2,
+    INDIRECT_TEV_TAIL_BYTES_PER_DRAW as GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW,
+    MAX_TEXTURE_DIMENSION as GX_MAX_TEXTURE_DIMENSION,
+    MODE1_TAIL_BYTES_PER_DRAW as GX_MODE1_TAIL_BYTES_PER_DRAW, PACKET_ALIGNMENT,
+    PacketError as CanonicalPacketError, PacketVersion as CanonicalPacketVersion,
+    SAMPLER_MODE0_MASK_V4 as SAMPLER_BITS_MASK_V4, SAMPLER_MODE0_MASK_V7, SAMPLER_MODE1_MASK_V7,
+    TEXTURE_FLAG_PAYLOAD, TailLayout as CanonicalTailLayout,
+};
+pub(crate) use lzgx_packet::{
+    DRAW_RECORD_BYTES as GX_DRAW_RECORD_BYTES, DRAW_RECORD_BYTES_V2 as GX_DRAW_RECORD_BYTES_V2,
+    HEADER_BYTES as GX_PACKET_HEADER_BYTES, MAGIC as GX_PACKET_MAGIC,
+    PACKET_FLAG_INDIRECT_TEV_STATE_V1, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1,
+    TEV_STATE_BYTES as GX_TEV_STATE_BYTES, TEXTURE_RECORD_BYTES as GX_TEXTURE_RECORD_BYTES,
+    TEXTURE_REFERENCE_ABSENT as GX_TEXTURE_REFERENCE_ABSENT, VERSION_V2 as GX_PACKET_VERSION_V2,
+    VERSION_V3 as GX_PACKET_VERSION_V3, VERSION_V4 as GX_PACKET_VERSION,
+    VERSION_V5 as GX_PACKET_VERSION_V5, VERSION_V6 as GX_PACKET_VERSION_V6,
+    VERSION_V7 as GX_PACKET_VERSION_V7, VERTEX_BYTES as GX_VERTEX_BYTES,
+};
+
 use crate::tev::{
-    INDIRECT_TEV_COMMAND_MASK, IndirectTevState, MAX_TEV_STAGES, MAX_TEV_TEXTURES,
-    direct_texture_requires_gen_mode, required_texture_maps,
-    required_texture_maps_with_indirect,
+    INDIRECT_TEV_COMMAND_MASK, MAX_TEV_STAGES, MAX_TEV_TEXTURES, direct_texture_requires_gen_mode,
 };
 use crate::{
     EFB_HEIGHT, EFB_WIDTH, GxEfbFormat, GxTextureCopyPlanError, clipped_copy_extent,
     gx_efb_depth_encoding, gx_efb_format, gx_texture_copy_plan,
 };
 
-pub(crate) const GX_PACKET_MAGIC: [u8; 4] = *b"LZGX";
-pub(crate) const GX_PACKET_VERSION: u16 = 4;
-pub(crate) const GX_PACKET_HEADER_BYTES: u16 = 160;
-pub(crate) const GX_DRAW_RECORD_BYTES: u16 = 176;
-pub(crate) const GX_TEXTURE_RECORD_BYTES: u16 = 64;
-pub(crate) const GX_TEV_STATE_BYTES: u32 = 464;
-pub(crate) const GX_VERTEX_BYTES: u32 = 144;
-pub(crate) const GX_TEXTURE_REFERENCE_ABSENT: u32 = u32::MAX;
-
-const GX_PACKET_VERSION_V2: u16 = 2;
-const GX_PACKET_VERSION_V3: u16 = 3;
-const GX_PACKET_VERSION_V5: u16 = 5;
-const GX_PACKET_VERSION_V6: u16 = 6;
-pub(crate) const GX_PACKET_VERSION_V7: u16 = 7;
-const GX_DRAW_RECORD_BYTES_V2: u16 = 128;
-const PACKET_ALIGNMENT: u32 = 16;
-const COPY_FLAG_CLEAR: u32 = 1;
-pub(crate) const PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1: u32 = 1;
-pub(crate) const PACKET_FLAG_INDIRECT_TEV_STATE_V1: u32 = 1 << 1;
-const DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE: u16 = 1;
-const DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE: u16 = 1 << 1;
-const DRAW_FLAG_EXACT_CLIP_REQUIRED: u16 = 1 << 2;
-const EXACT_CLIP_INPUT_ENCODING_F32_V1: u32 = 1;
-const EXACT_CLIP_STATE_BYTES: u32 = 48;
-const EXACT_CLIP_VERTEX_BYTES: u32 = 16;
-const TEXTURE_FLAG_PAYLOAD: u32 = 1;
 const SAMPLER_BITS_MASK_V3: u32 = 0xff;
-const SAMPLER_BITS_MASK_V4: u32 = SAMPLER_BITS_MASK_V3 | (3 << 19);
-const SAMPLER_MODE0_MASK_V7: u32 = 0x0039_ffff;
-const SAMPLER_MODE1_MASK_V7: u32 = 0xffff;
-const GX_MODE1_TAIL_BYTES_PER_DRAW: u32 = (MAX_TEV_TEXTURES as u32) * 4;
-const GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW: u32 = 128;
-const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1: u32 = 1;
-const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2: u32 = 2;
-const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
 const FOG_RANGE_ADJUSTMENT_ENABLE: u32 = 1 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,16 +240,17 @@ fn indirect_texture_dependencies(
         })
 }
 
-fn renderer_indirect_tev_state(state: &GxIndirectTevState) -> IndirectTevState {
-    let effective_gen_mode = (state.gen_mode & !0xf) | state.xf_num_tex_gens;
-    IndirectTevState::from_bp(
-        effective_gen_mode,
-        state.matrices,
-        state.imask,
-        state.commands,
-        state.tex_scales,
-        state.iref,
-    )
+fn canonical_indirect_tev_state(state: &GxIndirectTevState) -> lzgx_packet::IndirectTevState {
+    lzgx_packet::IndirectTevState {
+        encoding: INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2,
+        gen_mode: state.gen_mode,
+        matrices: state.matrices,
+        imask: state.imask,
+        commands: state.commands,
+        tex_scales: state.tex_scales,
+        iref: state.iref,
+        xf_num_tex_gens: state.xf_num_tex_gens,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -695,16 +683,102 @@ impl<'a> GxFramePacket<'a> {
             }
         };
 
-        let expected_draw_bytes =
-            checked_mul(draw_count, u32::from(draw_record_bytes), "draw table size")?;
-        let expected_texture_bytes = checked_mul(
-            texture_count,
-            u32::from(GX_TEXTURE_RECORD_BYTES),
-            "texture table size",
-        )?;
-        let expected_tev_bytes = checked_mul(draw_count, GX_TEV_STATE_BYTES, "TEV section size")?;
-        let expected_vertex_bytes =
-            checked_mul(total_vertex_count, GX_VERTEX_BYTES, "vertex section size")?;
+        let (
+            expected_draw_bytes,
+            expected_texture_bytes,
+            expected_tev_bytes,
+            expected_vertex_bytes,
+            expected_draw_offset,
+            expected_texture_offset,
+            expected_tev_offset,
+            expected_vertex_offset,
+            expected_key_offset,
+            key_end,
+            expected_pixel_offset,
+            packet_base_bytes,
+        ) = if matches!(
+            version,
+            GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7
+        ) && pixel_bytes.is_multiple_of(PACKET_ALIGNMENT)
+        {
+            let layout = CanonicalBaseLayout::new(
+                draw_count,
+                texture_count,
+                total_vertex_count,
+                key_bytes,
+                pixel_bytes,
+            )
+            .map_err(map_canonical_packet_error)?;
+            let key_end = checked_add(layout.key_offset, key_bytes, "key section end")?;
+            (
+                layout.draw_table_bytes,
+                layout.texture_table_bytes,
+                layout.tev_bytes,
+                layout.vertex_bytes,
+                layout.draw_table_offset,
+                layout.texture_table_offset,
+                layout.tev_offset,
+                layout.vertex_offset,
+                layout.key_offset,
+                key_end,
+                layout.pixel_offset,
+                layout.packet_base_bytes,
+            )
+        } else {
+            // V2/V3 use the historical 128-byte draw record. A malformed
+            // misaligned current packet also stays on the legacy arithmetic
+            // path so its established error ordering remains unchanged.
+            let expected_draw_bytes =
+                checked_mul(draw_count, u32::from(draw_record_bytes), "draw table size")?;
+            let expected_texture_bytes = checked_mul(
+                texture_count,
+                u32::from(GX_TEXTURE_RECORD_BYTES),
+                "texture table size",
+            )?;
+            let expected_tev_bytes =
+                checked_mul(draw_count, GX_TEV_STATE_BYTES, "TEV section size")?;
+            let expected_vertex_bytes =
+                checked_mul(total_vertex_count, GX_VERTEX_BYTES, "vertex section size")?;
+            let expected_draw_offset = u32::from(GX_PACKET_HEADER_BYTES);
+            let expected_texture_offset = checked_add(
+                expected_draw_offset,
+                expected_draw_bytes,
+                "texture table offset",
+            )?;
+            let expected_tev_offset = checked_add(
+                expected_texture_offset,
+                expected_texture_bytes,
+                "TEV section offset",
+            )?;
+            let expected_vertex_offset = checked_add(
+                expected_tev_offset,
+                expected_tev_bytes,
+                "vertex section offset",
+            )?;
+            let expected_key_offset = checked_add(
+                expected_vertex_offset,
+                expected_vertex_bytes,
+                "key section offset",
+            )?;
+            let key_end = checked_add(expected_key_offset, key_bytes, "key section end")?;
+            let expected_pixel_offset = align_packet(key_end, "pixel section offset")?;
+            let packet_base_bytes =
+                checked_add(expected_pixel_offset, pixel_bytes, "packet byte length")?;
+            (
+                expected_draw_bytes,
+                expected_texture_bytes,
+                expected_tev_bytes,
+                expected_vertex_bytes,
+                expected_draw_offset,
+                expected_texture_offset,
+                expected_tev_offset,
+                expected_vertex_offset,
+                expected_key_offset,
+                key_end,
+                expected_pixel_offset,
+                packet_base_bytes,
+            )
+        };
         expect_u32("draw table bytes", draw_table_bytes, expected_draw_bytes)?;
         expect_u32(
             "texture table bytes",
@@ -714,31 +788,6 @@ impl<'a> GxFramePacket<'a> {
         expect_u32("TEV bytes", tev_bytes, expected_tev_bytes)?;
         expect_u32("vertex bytes", vertex_bytes, expected_vertex_bytes)?;
 
-        let expected_draw_offset = u32::from(GX_PACKET_HEADER_BYTES);
-        let expected_texture_offset = checked_add(
-            expected_draw_offset,
-            expected_draw_bytes,
-            "texture table offset",
-        )?;
-        let expected_tev_offset = checked_add(
-            expected_texture_offset,
-            expected_texture_bytes,
-            "TEV section offset",
-        )?;
-        let expected_vertex_offset = checked_add(
-            expected_tev_offset,
-            expected_tev_bytes,
-            "vertex section offset",
-        )?;
-        let expected_key_offset = checked_add(
-            expected_vertex_offset,
-            expected_vertex_bytes,
-            "key section offset",
-        )?;
-        let key_end = checked_add(expected_key_offset, key_bytes, "key section end")?;
-        let expected_pixel_offset = align_packet(key_end, "pixel section offset")?;
-        let packet_base_bytes =
-            checked_add(expected_pixel_offset, pixel_bytes, "packet byte length")?;
         for (field, actual, expected) in [
             ("draw table offset", draw_table_offset, expected_draw_offset),
             (
@@ -1073,7 +1122,7 @@ impl<'a> GxFramePacket<'a> {
                 GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => SAMPLER_BITS_MASK_V3,
                 _ => unreachable!("validated LZGX packet version"),
             };
-            for map in 0..MAX_TEV_TEXTURES {
+            for (map, texture_slot) in texture_slots.iter_mut().enumerate() {
                 let slot_offset = 0x30 + map * 8;
                 let reference = read_u32(record, slot_offset);
                 let sampler_bits = read_u32(record, slot_offset + 4);
@@ -1104,7 +1153,7 @@ impl<'a> GxFramePacket<'a> {
                     }
                     Some(reference)
                 };
-                texture_slots[map] = GxTextureSlot {
+                *texture_slot = GxTextureSlot {
                     texture,
                     sampler_bits,
                     mode1: 0,
@@ -1143,66 +1192,45 @@ impl<'a> GxFramePacket<'a> {
             evidence_tail_bytes,
             "post-cull evidence end",
         )?;
-        let exact_clip_start = match version {
-            GX_PACKET_VERSION => align_packet(evidence_end, "post-cull evidence padding")?,
-            GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7 => {
-                align_packet(evidence_end, "exact clip input alignment")?
-            }
-            GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => evidence_end,
-            _ => unreachable!("validated LZGX packet version"),
-        };
-        let exact_clip_end = checked_add(
-            exact_clip_start,
-            exact_clip_tail_bytes,
-            "exact clip input end",
-        )?;
-        let mode1_tail_bytes = if version == GX_PACKET_VERSION_V7 {
-            checked_mul(
-                draw_count,
-                GX_MODE1_TAIL_BYTES_PER_DRAW,
-                "MODE1 tail byte length",
-            )?
-        } else {
-            0
-        };
-        let version_tail_end = match version {
-            GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => packet_base_bytes,
-            GX_PACKET_VERSION => exact_clip_start,
-            GX_PACKET_VERSION_V5 => {
-                if exact_clip_draw_count == 0 {
-                    return Err(GxPacketError::NonCanonical(
-                        "version 5 requires at least one exact clip input",
-                    ));
-                }
-                exact_clip_end
-            }
-            GX_PACKET_VERSION_V6 => {
-                if required_exact_clip_draw_count == 0 {
-                    return Err(GxPacketError::NonCanonical(
-                        "version 6 requires at least one required exact clip input",
-                    ));
-                }
-                exact_clip_end
-            }
-            GX_PACKET_VERSION_V7 => {
-                checked_add(exact_clip_end, mode1_tail_bytes, "MODE1 tail end")?
-            }
-            _ => unreachable!("validated LZGX packet version"),
-        };
-        let indirect_tev_tail_bytes = if indirect_tev_state_v1 {
-            checked_mul(
-                draw_count,
-                GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW,
-                "indirect TEV tail byte length",
-            )?
-        } else {
-            0
-        };
-        let expected_packet_bytes = checked_add(
-            version_tail_end,
-            indirect_tev_tail_bytes,
-            "indirect TEV tail end",
-        )?;
+        if version == GX_PACKET_VERSION_V5 && exact_clip_draw_count == 0 {
+            return Err(GxPacketError::NonCanonical(
+                "version 5 requires at least one exact clip input",
+            ));
+        }
+        if version == GX_PACKET_VERSION_V6 && required_exact_clip_draw_count == 0 {
+            return Err(GxPacketError::NonCanonical(
+                "version 6 requires at least one required exact clip input",
+            ));
+        }
+        let (exact_clip_start, exact_clip_end, version_tail_end, expected_packet_bytes) =
+            if let Some(canonical_version) = CanonicalPacketVersion::parse(version) {
+                let layout = CanonicalTailLayout::new(
+                    canonical_version,
+                    packet_base_bytes,
+                    evidence_tail_bytes,
+                    exact_clip_tail_bytes,
+                    draw_count,
+                    indirect_tev_state_v1,
+                )
+                .map_err(map_canonical_packet_error)?;
+                (
+                    layout.exact_clip_offset,
+                    layout.exact_clip_end,
+                    layout.version_tail_end,
+                    layout.packet_bytes,
+                )
+            } else {
+                debug_assert!(matches!(
+                    version,
+                    GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3
+                ));
+                (
+                    evidence_end,
+                    evidence_end,
+                    packet_base_bytes,
+                    packet_base_bytes,
+                )
+            };
         expect_u32("packet bytes", packet_bytes, expected_packet_bytes)?;
 
         let mut evidence_offset = to_usize(packet_base_bytes);
@@ -1249,7 +1277,7 @@ impl<'a> GxFramePacket<'a> {
             require_zero(bytes, evidence_offset, to_usize(exact_clip_start))?;
 
             let mut exact_clip_offset = exact_clip_start;
-            for (draw, has_exact_clip_input) in draws.iter_mut().zip(exact_clip_draws.into_iter()) {
+            for (draw, has_exact_clip_input) in draws.iter_mut().zip(exact_clip_draws) {
                 if !has_exact_clip_input {
                     continue;
                 }
@@ -1489,14 +1517,11 @@ impl<'a> GxFramePacket<'a> {
                 )?;
                 let direct_state = &bytes[to_usize(tev_start)..to_usize(tev_end)];
                 has_semantic_indirect_tev |= ((gen_mode >> 16) & 7) != 0
-                    || direct_texture_requires_gen_mode(
-                        direct_state,
-                        xf_num_tex_gens as usize,
-                    )
-                    .map_err(|_| GxPacketError::InvalidField {
-                        field: "TEV state",
-                        value: 0,
-                    })?
+                    || direct_texture_requires_gen_mode(direct_state, xf_num_tex_gens as usize)
+                        .map_err(|_| GxPacketError::InvalidField {
+                            field: "TEV state",
+                            value: 0,
+                        })?
                     || commands[..to_usize(direct_tev_stage_count)]
                         .iter()
                         .any(|command| *command & INDIRECT_TEV_COMMAND_MASK != 0);
@@ -1523,14 +1548,15 @@ impl<'a> GxFramePacket<'a> {
                 "draw TEV resource-validation end",
             )?;
             let direct_state = &bytes[to_usize(tev_start)..to_usize(tev_end)];
-            let required_maps = if let Some(indirect_tev) = &draw.indirect_tev {
-                required_texture_maps_with_indirect(
-                    direct_state,
-                    &renderer_indirect_tev_state(indirect_tev),
-                )
-            } else {
-                required_texture_maps(direct_state)
-            }
+            let canonical_direct_state: &[u8; GX_TEV_STATE_BYTES as usize] = direct_state
+                .try_into()
+                .map_err(|_| GxPacketError::SectionOutOfBounds("draw TEV state"))?;
+            let canonical_indirect_tev =
+                draw.indirect_tev.as_ref().map(canonical_indirect_tev_state);
+            let required_maps = lzgx_packet::required_texture_maps(
+                canonical_direct_state,
+                canonical_indirect_tev.as_ref(),
+            )
             .map_err(|_| GxPacketError::InvalidField {
                 field: "TEV state",
                 value: 0,
@@ -2081,6 +2107,14 @@ fn expect_u32(field: &'static str, actual: u32, expected: u32) -> Result<(), GxP
     Ok(())
 }
 
+fn map_canonical_packet_error(error: CanonicalPacketError) -> GxPacketError {
+    match error {
+        CanonicalPacketError::Overflow(field) => GxPacketError::IntegerOverflow(field),
+        CanonicalPacketError::NonCanonical(detail) => GxPacketError::NonCanonical(detail),
+        _ => GxPacketError::NonCanonical("shared Rust LZGX layout rejected the packet"),
+    }
+}
+
 fn checked_add(left: u32, right: u32, field: &'static str) -> Result<u32, GxPacketError> {
     left.checked_add(right)
         .ok_or(GxPacketError::IntegerOverflow(field))
@@ -2139,7 +2173,7 @@ fn source_triangle_count(topology: u8, vertex_count: u32) -> u32 {
 }
 
 fn triangle_action_bytes(triangle_count: u32) -> u32 {
-    triangle_count / 4 + u32::from(triangle_count % 4 != 0)
+    triangle_count.div_ceil(4)
 }
 
 fn to_usize(value: u32) -> usize {
@@ -2372,9 +2406,9 @@ mod tests {
         assert!(cull_mode <= 3);
         let word = |offset: u32| seed.wrapping_add(offset * 0x01_0101) & 0x00ff_ffff;
         let gen_mode = (word(29) & !((0xf << 10) | (3 << 14) | (7 << 16)))
-                | ((tev_stage_count - 1) << 10)
-                | (cull_mode << 14)
-                | (indirect_stage_count << 16);
+            | ((tev_stage_count - 1) << 10)
+            | (cull_mode << 14)
+            | (indirect_stage_count << 16);
         GxIndirectTevState {
             gen_mode,
             xf_num_tex_gens: 8,
@@ -3230,9 +3264,9 @@ mod tests {
             ..zero_iref
         };
         assert_eq!(no_texture_generators.gen_mode, zero_iref.gen_mode);
-        assert_eq!(renderer_indirect_tev_state(&zero_iref).num_tex_gens(), 1);
+        assert_eq!(canonical_indirect_tev_state(&zero_iref).xf_num_tex_gens, 1);
         assert_eq!(
-            renderer_indirect_tev_state(&no_texture_generators).num_tex_gens(),
+            canonical_indirect_tev_state(&no_texture_generators).xf_num_tex_gens,
             0
         );
         assert_eq!(
@@ -3245,7 +3279,10 @@ mod tests {
             ..zero_iref
         };
         assert_eq!(in_range_coord.gen_mode, zero_iref.gen_mode);
-        assert_eq!(renderer_indirect_tev_state(&in_range_coord).num_tex_gens(), 4);
+        assert_eq!(
+            canonical_indirect_tev_state(&in_range_coord).xf_num_tex_gens,
+            4
+        );
         assert_eq!(
             indirect_texture_dependencies(&in_range_coord).collect::<Vec<_>>(),
             [(0, Some(3))]

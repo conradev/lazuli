@@ -454,15 +454,25 @@ pub struct FramebufferCopy {
 pub struct Interface {
     pub control: Control,
     pub interrupt: InterruptStatus,
+    /// Raw PE alpha-read mode. Mode three reads back architecturally but EFB peeks canonicalize
+    /// it to Read00, matching the established browser renderer contract.
+    pub alpha_read: u16,
     pub constant_alpha: ConstantAlpha,
     pub depth_mode: DepthMode,
     pub blend_mode: BlendMode,
     pub scissor: Scissor,
     pub copy: FramebufferCopy,
     pub token: u32,
+    /// Rust-owned PE deadline and interrupt-delivery state used by the resident machine loop.
+    pub resident: super::resident_pe::ResidentPixelEngine,
 }
 
 impl Interface {
+    pub const fn canonical_alpha_read_mode(&self) -> u8 {
+        let mode = (self.alpha_read & 3) as u8;
+        if mode <= 2 { mode } else { 0 }
+    }
+
     pub fn write_interrupt(&mut self, status: u16) {
         self.interrupt.set_token_enabled(status.bit(0));
         self.interrupt.set_finish_enabled(status.bit(1));

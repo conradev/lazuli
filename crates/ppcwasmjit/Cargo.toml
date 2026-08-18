@@ -15,6 +15,7 @@ workspace = true
 clifwasm.workspace = true
 cranelift-codegen = { version = "0.130", default-features = false, features = ["std"] }
 gekko.workspace = true
+lazuli-abi.workspace = true
 ppcjit.workspace = true
 wasm-encoder.workspace = true
 

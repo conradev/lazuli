@@ -16,21 +16,44 @@
 
 #[cfg(target_arch = "wasm32")]
 mod browser_abi;
+mod dispatcher;
 mod gx_fifo;
 mod region;
+#[cfg(test)]
+mod self_install_tests;
 
 use std::fmt;
 
 pub use clifwasm::LowerError;
-use clifwasm::ModuleConfig;
+use clifwasm::{FunctionSelfInstall, ModuleConfig};
 use cranelift_codegen::ir;
 use cranelift_codegen::isa::CallConv;
+pub use dispatcher::{
+    DISPATCH_BASIC_BLOCK_KIND, DISPATCH_CACHE_WAYS, DISPATCH_DEPENDENCY_VALIDATOR_IMPORT,
+    DISPATCH_ENTRY_DEPENDENCY_0_EFFECTIVE_OFFSET, DISPATCH_ENTRY_DEPENDENCY_0_PHYSICAL_OFFSET,
+    DISPATCH_ENTRY_DEPENDENCY_1_EFFECTIVE_OFFSET, DISPATCH_ENTRY_DEPENDENCY_1_PHYSICAL_OFFSET,
+    DISPATCH_ENTRY_DEPENDENCY_COUNT_OFFSET, DISPATCH_ENTRY_GENERATION_HI_OFFSET,
+    DISPATCH_ENTRY_GENERATION_LO_OFFSET, DISPATCH_ENTRY_KIND_OFFSET,
+    DISPATCH_ENTRY_MAXIMUM_EXECUTED_OFFSET, DISPATCH_ENTRY_NONCE_HI_OFFSET,
+    DISPATCH_ENTRY_NONCE_LO_OFFSET, DISPATCH_ENTRY_PC_OFFSET, DISPATCH_ENTRY_READY,
+    DISPATCH_ENTRY_SIZE, DISPATCH_ENTRY_STATE_OFFSET, DISPATCH_ENTRY_TABLE_SLOT_OFFSET,
+    DISPATCH_MAX_DEPENDENCIES, DISPATCH_RUN_EXPORT, DISPATCH_SLOT_GENERATION_HI_OFFSET,
+    DISPATCH_SLOT_GENERATION_LO_OFFSET, DISPATCH_SLOT_IDENTITY_SIZE, DISPATCH_SLOT_NONCE_HI_OFFSET,
+    DISPATCH_SLOT_NONCE_LO_OFFSET, DISPATCH_SLOT_PC_OFFSET, DISPATCH_SLOT_READY,
+    DISPATCH_SLOT_STATE_OFFSET, DISPATCH_TABLE_EXPORT, DispatchReason, DispatcherConfig,
+    DispatcherDependency, DispatcherEntry, DispatcherError, DispatcherSlotIdentity,
+    build_resident_dispatcher, resident_dispatcher_set_index,
+};
 use gekko::disasm::Ins;
 pub use gx_fifo::hook_runtime as gx_fifo_hook_runtime;
+use lazuli_abi::memory::{
+    DISPATCH_SLOT_CAPACITY, RESIDENT_MEMORY_INITIAL_PAGES, RESIDENT_MEMORY_MAXIMUM_PAGES,
+};
+use lazuli_abi::{ResidentBlockInstallIdentity, ResidentControl, ResidentInstallStatus};
 pub use ppcjit::block::Pattern;
 use ppcjit::{
-    BuildError as PpcBuildError, CodegenSettings, ExitMode, TranslationConfig, TranslationExit,
-    Translator,
+    BuildError as PpcBuildError, CodegenSettings, ExitMode, SecondaryFastmemConfig,
+    TranslationConfig, TranslationExit, Translator,
 };
 pub use region::{BLOCK_IMPORT_MODULE, REGION_RUN_EXPORT, RegionBlock, RegionError, link_region};
 
@@ -39,17 +62,131 @@ pub const IMPORT_MODULE: &str = "lazuli";
 /// Imported linear memory used for CPU and, eventually, guest-memory access.
 pub const MEMORY_IMPORT: &str = "memory";
 /// Import module used by generated blocks for portable runtime hooks.
+///
+/// This is the temporary JavaScript-oracle namespace. New resident blocks use
+/// [`RESIDENT_HOOK_IMPORT_MODULE`] so every synchronous semantic call resolves directly to the
+/// Rust browser machine.
 pub const HOOK_IMPORT_MODULE: &str = "lazuli_hooks";
+/// Import module used by resident blocks for Rust/Wasm machine hooks.
+pub const RESIDENT_HOOK_IMPORT_MODULE: &str = IMPORT_MODULE;
+/// Offset at which resident blocks publish the current instruction's start cycle.
+pub const RESIDENT_HOOK_CYCLE_OFFSET: i32 =
+    core::mem::offset_of!(ResidentControl, instruction_cycle_offset) as i32;
+const _: () = assert!(RESIDENT_HOOK_CYCLE_OFFSET == 8);
 /// Exported block entry point.
 pub const RUN_EXPORT: &str = "run";
+/// Export invoked by the browser after compiling and instantiating an exact Rust-issued module.
+pub const RESIDENT_INSTALL_EXPORT: &str = "install";
+/// Rust/Wasm begin authorization imported by every self-installing resident block.
+pub const RESIDENT_INSTALL_BEGIN_IMPORT: &str = "begin_resident_block_install";
+/// Rust/Wasm commit authorization imported after the module stores its own `run` reference.
+pub const RESIDENT_INSTALL_COMMIT_IMPORT: &str = "commit_resident_block_install";
 
-/// Lowers portable CLIF with Lazuli's imported-memory module ABI.
+/// Tagged 4 KiB sidecar layout, relative to the primary fast-memory LUT pointer.
+pub const SECONDARY_FASTMEM_PAGE_SHIFT: u8 = 12;
+pub const SECONDARY_FASTMEM_SET_COUNT: u32 = 64;
+pub const SECONDARY_FASTMEM_ENTRY_COUNT: u32 = SECONDARY_FASTMEM_SET_COUNT * 2;
+pub const SECONDARY_FASTMEM_CONTROL_OFFSET: i32 = (ppcjit::FASTMEM_LUT_COUNT * 4) as i32;
+pub const SECONDARY_FASTMEM_READ_HITS_OFFSET: i32 = SECONDARY_FASTMEM_CONTROL_OFFSET + 4;
+pub const SECONDARY_FASTMEM_WRITE_HITS_OFFSET: i32 = SECONDARY_FASTMEM_CONTROL_OFFSET + 8;
+pub const SECONDARY_FASTMEM_MISSES_OFFSET: i32 = SECONDARY_FASTMEM_CONTROL_OFFSET + 12;
+pub const SECONDARY_FASTMEM_LRU_OFFSET: i32 = SECONDARY_FASTMEM_CONTROL_OFFSET + 16;
+pub const SECONDARY_FASTMEM_TAG_OFFSET: i32 =
+    SECONDARY_FASTMEM_LRU_OFFSET + SECONDARY_FASTMEM_SET_COUNT as i32 * 4;
+pub const SECONDARY_FASTMEM_READ_POINTER_OFFSET: i32 =
+    SECONDARY_FASTMEM_TAG_OFFSET + SECONDARY_FASTMEM_ENTRY_COUNT as i32 * 4;
+pub const SECONDARY_FASTMEM_WRITE_POINTER_OFFSET: i32 =
+    SECONDARY_FASTMEM_READ_POINTER_OFFSET + SECONDARY_FASTMEM_ENTRY_COUNT as i32 * 4;
+pub const SECONDARY_FASTMEM_END_OFFSET: i32 =
+    SECONDARY_FASTMEM_WRITE_POINTER_OFFSET + SECONDARY_FASTMEM_ENTRY_COUNT as i32 * 4;
+
+fn browser_secondary_fastmem_config() -> SecondaryFastmemConfig {
+    SecondaryFastmemConfig {
+        page_shift: SECONDARY_FASTMEM_PAGE_SHIFT,
+        set_count: SECONDARY_FASTMEM_SET_COUNT,
+        control_offset: SECONDARY_FASTMEM_CONTROL_OFFSET,
+        lru_offset: SECONDARY_FASTMEM_LRU_OFFSET,
+        tag_offset: SECONDARY_FASTMEM_TAG_OFFSET,
+        read_pointer_offset: SECONDARY_FASTMEM_READ_POINTER_OFFSET,
+        write_pointer_offset: SECONDARY_FASTMEM_WRITE_POINTER_OFFSET,
+        read_hit_count_offset: SECONDARY_FASTMEM_READ_HITS_OFFSET,
+        write_hit_count_offset: SECONDARY_FASTMEM_WRITE_HITS_OFFSET,
+        miss_count_offset: SECONDARY_FASTMEM_MISSES_OFFSET,
+    }
+}
+
+fn lower_clif_with_hook_module(
+    function: &ir::Function,
+    hook_import_module: &str,
+    install: Option<(ResidentBlockInstallIdentity, bool)>,
+) -> Result<Vec<u8>, LowerError> {
+    let config = ModuleConfig::new(IMPORT_MODULE, MEMORY_IMPORT, RUN_EXPORT)
+        .with_function_import_module(hook_import_module)
+        .with_stack_scratch(0, 0x800, 0x800);
+    let mut config = if hook_import_module == RESIDENT_HOOK_IMPORT_MODULE {
+        config.with_memory_limits(
+            RESIDENT_MEMORY_INITIAL_PAGES as u64,
+            Some(RESIDENT_MEMORY_MAXIMUM_PAGES as u64),
+        )
+    } else {
+        config
+    };
+    if let Some((identity, trap_after_table_set)) = install {
+        let identity_words = [
+            identity.request_id,
+            identity.table_slot,
+            identity.slot_nonce_lo,
+            identity.slot_nonce_hi,
+            identity.address_space_generation_lo,
+            identity.address_space_generation_hi,
+            identity.install_token_lo,
+            identity.install_token_hi,
+        ];
+        config = config.with_self_install(FunctionSelfInstall {
+            table_import_module: IMPORT_MODULE,
+            table_import_name: DISPATCH_TABLE_EXPORT,
+            begin_import_module: IMPORT_MODULE,
+            begin_import_name: RESIDENT_INSTALL_BEGIN_IMPORT,
+            commit_import_module: IMPORT_MODULE,
+            commit_import_name: RESIDENT_INSTALL_COMMIT_IMPORT,
+            install_export_name: RESIDENT_INSTALL_EXPORT,
+            identity_words,
+            authorized_value: ResidentInstallStatus::Authorized as u32,
+            table_unavailable_value: ResidentInstallStatus::TableUnavailable as u32,
+            table_minimum: 1,
+            table_maximum: Some(DISPATCH_SLOT_CAPACITY as u64),
+            trap_after_table_set,
+        });
+    }
+    clifwasm::function(function, &config)
+}
+
+/// Lowers portable CLIF with the temporary JavaScript hook-oracle ABI.
+///
+/// Production migration code should use [`lower_clif_resident`]. This entry point remains while
+/// the JavaScript machine is used as a differential correctness oracle.
 pub fn lower_clif(function: &ir::Function) -> Result<Vec<u8>, LowerError> {
-    clifwasm::function(
+    lower_clif_with_hook_module(function, HOOK_IMPORT_MODULE, None)
+}
+
+/// Lowers portable CLIF with memory and all synchronous hooks in the Rust `lazuli` Wasm module.
+///
+/// The imported field names and signatures are intentionally unchanged from the shared PPC
+/// frontend (`user_0_<HookKind>` and `user_1_0`). Only module ownership changes, which lets the
+/// same translated function be compared against the temporary oracle without a semantic fork.
+pub fn lower_clif_resident(function: &ir::Function) -> Result<Vec<u8>, LowerError> {
+    lower_clif_with_hook_module(function, RESIDENT_HOOK_IMPORT_MODULE, None)
+}
+
+/// Lowers an exact Rust-issued block with a typed-table self-installer.
+pub fn lower_clif_resident_installable(
+    function: &ir::Function,
+    identity: ResidentBlockInstallIdentity,
+) -> Result<Vec<u8>, LowerError> {
+    lower_clif_with_hook_module(
         function,
-        &ModuleConfig::new(IMPORT_MODULE, MEMORY_IMPORT, RUN_EXPORT)
-            .with_function_import_module(HOOK_IMPORT_MODULE)
-            .with_stack_scratch(0, 0x800, 0x800),
+        RESIDENT_HOOK_IMPORT_MODULE,
+        Some((identity, false)),
     )
 }
 
@@ -95,7 +232,7 @@ pub enum Exit {
     },
 }
 
-/// Metadata retained alongside a generated WebAssembly module.
+/// Metadata retained alongside a translated or generated block.
 #[derive(Debug, Clone)]
 pub struct Metadata {
     /// PowerPC instructions contained in the block.
@@ -129,6 +266,51 @@ impl Block {
     /// Consumes the block and returns its encoded WebAssembly module.
     pub fn into_wasm(self) -> Vec<u8> {
         self.wasm
+    }
+}
+
+/// A target-independent PowerPC block retained as Cranelift IR.
+///
+/// Preparing a block consumes the instruction iterator exactly once but does not emit a
+/// WebAssembly module. This lets the Rust browser machine perform architected lazy instruction
+/// fetch before it has a coordinator-issued install identity, then lower this exact CLIF once the
+/// typed-table identity is available.
+#[derive(Debug)]
+pub struct PreparedBlock {
+    function: ir::Function,
+    metadata: Metadata,
+}
+
+impl PreparedBlock {
+    /// Semantic metadata produced by the same frontend pass as the retained CLIF.
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// The retained target-independent Cranelift function.
+    pub fn clif(&self) -> &ir::Function {
+        &self.function
+    }
+
+    /// Emits this exact prepared block with a typed-table self-installer.
+    pub fn into_resident_installable(
+        self,
+        identity: ResidentBlockInstallIdentity,
+    ) -> Result<Block, BuildError> {
+        self.lower_with_hook_module(RESIDENT_HOOK_IMPORT_MODULE, Some((identity, false)))
+    }
+
+    fn lower_with_hook_module(
+        self,
+        hook_import_module: &str,
+        install: Option<(ResidentBlockInstallIdentity, bool)>,
+    ) -> Result<Block, BuildError> {
+        let wasm = lower_clif_with_hook_module(&self.function, hook_import_module, install)
+            .map_err(BuildError::Lower)?;
+        Ok(Block {
+            wasm,
+            metadata: self.metadata,
+        })
     }
 }
 
@@ -169,6 +351,7 @@ impl std::error::Error for BuildError {
 /// PowerPC to WebAssembly compiler.
 pub struct Jit {
     translator: Translator,
+    hook_import_module: &'static str,
 }
 
 impl Default for Jit {
@@ -183,9 +366,35 @@ impl Jit {
         Self::with_exit_mode(ExitMode::ReturnExecuted)
     }
 
+    /// Creates a compiler whose synchronous hooks bind to the Rust/Wasm browser machine.
+    pub fn new_resident() -> Self {
+        Self::with_exit_mode_and_hook_cycle_offset(
+            ExitMode::ReturnExecuted,
+            Some(RESIDENT_HOOK_CYCLE_OFFSET),
+            None,
+            RESIDENT_HOOK_IMPORT_MODULE,
+        )
+    }
+
     /// Creates a compiler whose generated blocks call runtime hooks for unmapped memory pages.
     pub fn with_slow_memory() -> Self {
         Self::with_exit_mode(ExitMode::ReturnExecutedWithSlowMemory)
+    }
+
+    /// Creates a resident compiler whose checked memory paths call Rust/Wasm machine hooks.
+    pub fn with_slow_memory_resident() -> Self {
+        Self::with_slow_memory_resident_hook_cycles()
+    }
+
+    /// Creates a resident compiler that publishes exact instruction-start cycles to its
+    /// machine-owned [`ResidentControl`] before every semantic hook.
+    pub fn with_slow_memory_resident_hook_cycles() -> Self {
+        Self::with_exit_mode_and_hook_cycle_offset(
+            ExitMode::ReturnExecutedWithSlowMemory,
+            Some(RESIDENT_HOOK_CYCLE_OFFSET),
+            Some(browser_secondary_fastmem_config()),
+            RESIDENT_HOOK_IMPORT_MODULE,
+        )
     }
 
     /// Creates the browser compiler with instruction-start hook-cycle publication enabled.
@@ -194,16 +403,30 @@ impl Jit {
         Self::with_exit_mode_and_hook_cycle_offset(
             ExitMode::ReturnExecutedWithSlowMemory,
             Some(hook_cycle_offset),
+            Some(browser_secondary_fastmem_config()),
+            HOOK_IMPORT_MODULE,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_browser_secondary_fastmem() -> Self {
+        Self::with_exit_mode_and_hook_cycle_offset(
+            ExitMode::ReturnExecutedWithSlowMemory,
+            None,
+            Some(browser_secondary_fastmem_config()),
+            HOOK_IMPORT_MODULE,
         )
     }
 
     fn with_exit_mode(exit_mode: ExitMode) -> Self {
-        Self::with_exit_mode_and_hook_cycle_offset(exit_mode, None)
+        Self::with_exit_mode_and_hook_cycle_offset(exit_mode, None, None, HOOK_IMPORT_MODULE)
     }
 
     fn with_exit_mode_and_hook_cycle_offset(
         exit_mode: ExitMode,
         hook_cycle_offset: Option<i32>,
+        secondary_fastmem: Option<SecondaryFastmemConfig>,
+        hook_import_module: &'static str,
     ) -> Self {
         let mut config = TranslationConfig::new(
             CodegenSettings::default(),
@@ -212,8 +435,10 @@ impl Jit {
             exit_mode,
         );
         config.hook_cycle_offset = hook_cycle_offset;
+        config.secondary_fastmem = secondary_fastmem;
         Self {
             translator: Translator::new(config),
+            hook_import_module,
         }
     }
 
@@ -224,6 +449,20 @@ impl Jit {
         &mut self,
         instructions: impl IntoIterator<Item = Ins>,
     ) -> Result<Block, BuildError> {
+        let hook_import_module = self.hook_import_module;
+        self.prepare(instructions)?
+            .lower_with_hook_module(hook_import_module, None)
+    }
+
+    /// Translates one PowerPC basic block into retained target-independent CLIF.
+    ///
+    /// This stage performs no WebAssembly emission. Compilation stops after an unconditional
+    /// branch, so lazy architectural instruction iterators observe the same exact prefix as
+    /// [`Self::build`].
+    pub fn prepare(
+        &mut self,
+        instructions: impl IntoIterator<Item = Ins>,
+    ) -> Result<PreparedBlock, BuildError> {
         let translated = match self.translator.translate(instructions.into_iter()) {
             Ok(translated) => translated,
             Err(PpcBuildError::EmptyBlock) => return Err(BuildError::EmptyBlock),
@@ -249,10 +488,9 @@ impl Jit {
                 call: meta.call(),
             },
         };
-        let wasm = lower_clif(&translated.function).map_err(BuildError::Lower)?;
 
-        Ok(Block {
-            wasm,
+        Ok(PreparedBlock {
+            function: translated.function,
             metadata: Metadata {
                 sequence: translated.sequence.0,
                 executed,
@@ -260,6 +498,26 @@ impl Jit {
                 pattern,
             },
         })
+    }
+
+    /// Compiles one resident block whose module installs its own typed `run` reference.
+    pub fn build_resident_installable(
+        &mut self,
+        instructions: impl IntoIterator<Item = Ins>,
+        identity: ResidentBlockInstallIdentity,
+    ) -> Result<Block, BuildError> {
+        self.prepare(instructions)?
+            .into_resident_installable(identity)
+    }
+
+    #[cfg(test)]
+    fn build_resident_installable_with_trap(
+        &mut self,
+        instructions: impl IntoIterator<Item = Ins>,
+        identity: ResidentBlockInstallIdentity,
+    ) -> Result<Block, BuildError> {
+        self.prepare(instructions)?
+            .lower_with_hook_module(RESIDENT_HOOK_IMPORT_MODULE, Some((identity, true)))
     }
 }
 
@@ -283,7 +541,13 @@ mod tests {
     use wasmparser::Validator;
 
     use super::{
-        BuildError, Executed, Exit, Jit, LowerError, Pattern, RegionBlock, link_region, lower_clif,
+        Block, BuildError, Executed, Exit, Jit, LowerError, Pattern, RegionBlock,
+        SECONDARY_FASTMEM_CONTROL_OFFSET, SECONDARY_FASTMEM_LRU_OFFSET,
+        SECONDARY_FASTMEM_MISSES_OFFSET, SECONDARY_FASTMEM_PAGE_SHIFT,
+        SECONDARY_FASTMEM_READ_HITS_OFFSET, SECONDARY_FASTMEM_READ_POINTER_OFFSET,
+        SECONDARY_FASTMEM_SET_COUNT, SECONDARY_FASTMEM_TAG_OFFSET,
+        SECONDARY_FASTMEM_WRITE_HITS_OFFSET, SECONDARY_FASTMEM_WRITE_POINTER_OFFSET, link_region,
+        lower_clif,
     };
 
     fn d_form(opcode: u32, rt_or_rs: u8, ra: u8, immediate: u16) -> Ins {
@@ -1551,6 +1815,255 @@ for (const [offset, expected] of [
             (12, [0, SUBNORMAL_PRODUCT]),
         ];
         assert_paired_float_execution(&sequence, &inputs, &expected);
+    }
+
+    #[test]
+    fn executes_tagged_secondary_fastmem_with_tlb_permissions() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+            return;
+        }
+
+        let load = Jit::with_browser_secondary_fastmem()
+            .build([lwz(4, 3, 0)])
+            .unwrap();
+        let store = Jit::with_browser_secondary_fastmem()
+            .build([stw(4, 3, 0)])
+            .unwrap();
+        Validator::new().validate_all(load.wasm()).unwrap();
+        Validator::new().validate_all(store.wasm()).unwrap();
+        let to_hex = |block: &Block| {
+            block
+                .wasm()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let load_wasm = to_hex(&load);
+        let store_wasm = to_hex(&store);
+        let script = r#"
+const [
+  loadHex,
+  storeHex,
+  pcOffset,
+  r3Offset,
+  r4Offset,
+  readI32Hook,
+  writeI32Hook,
+  loadExecuted,
+  storeExecuted,
+  pageShift,
+  setCount,
+  controlOffset,
+  readHitsOffset,
+  writeHitsOffset,
+  missesOffset,
+  lruOffset,
+  tagOffset,
+  readPointerOffset,
+  writePointerOffset,
+] = process.argv.slice(1).map((value, index) => index < 2 ? value : Number(value));
+
+const cpu = 64;
+const fmem = 0x10000;
+const dataPage = 0x60000;
+const effectivePage = 0x81234000;
+const readHookName = `user_0_${readI32Hook}`;
+const writeHookName = `user_0_${writeI32Hook}`;
+
+function makeState(address, way, { enabled = true, read = true, write = false, tag = null } = {}) {
+  const memory = new WebAssembly.Memory({ initial: 8 });
+  const view = new DataView(memory.buffer);
+  const page = address >>> pageShift;
+  const set = page & (setCount - 1);
+  const entry = set * 2 + way;
+  view.setUint32(cpu + pcOffset, 0x80001000, true);
+  view.setUint32(cpu + r3Offset, address, true);
+  view.setUint32(cpu + r4Offset, 0xaabbccdd, true);
+  view.setUint32(fmem + controlOffset, enabled ? 1 : 0, true);
+  view.setUint32(fmem + tagOffset + entry * 4, tag ?? ((page + 1) >>> 0), true);
+  if (read) view.setUint32(fmem + readPointerOffset + entry * 4, dataPage, true);
+  if (write) view.setUint32(fmem + writePointerOffset + entry * 4, dataPage, true);
+  return { memory, view, address, set };
+}
+
+function counters(state) {
+  return {
+    read: state.view.getUint32(fmem + readHitsOffset, true),
+    write: state.view.getUint32(fmem + writeHitsOffset, true),
+    miss: state.view.getUint32(fmem + missesOffset, true),
+    lru: state.view.getUint32(fmem + lruOffset + state.set * 4, true),
+  };
+}
+
+async function execute(hex, expectedExecuted, state, overrides = {}) {
+  const hooks = {
+    [readHookName]() { throw new Error("unexpected slow read"); },
+    [writeHookName]() { throw new Error("unexpected slow write"); },
+    user_1_0() { throw new Error("unexpected data-storage exception"); },
+    ...overrides,
+  };
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory: state.memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(0, cpu, fmem) >>> 0;
+  if (executed !== (expectedExecuted >>> 0)) {
+    throw new Error(`bad execution metadata: 0x${executed.toString(16)}`);
+  }
+}
+
+// Both hardware-shaped ways are addressable. A hit updates the shared next-replacement word to
+// the opposite way and performs the guest's big-endian access without a JS memory hook.
+for (const [way, value, expectedLru] of [[0, 0x11223344, 1], [1, 0x55667788, 0]]) {
+  const state = makeState(effectivePage + 0x10, way);
+  state.view.setUint32(dataPage + 0x10, value, false);
+  await execute(loadHex, loadExecuted, state);
+  const actual = state.view.getUint32(cpu + r4Offset, true);
+  if (actual !== value) throw new Error(`way ${way} loaded 0x${actual.toString(16)}`);
+  const actualCounters = counters(state);
+  const expectedCounters = { read: 1, write: 0, miss: 0, lru: expectedLru };
+  if (JSON.stringify(actualCounters) !== JSON.stringify(expectedCounters)) {
+    throw new Error(`bad way ${way} counters: ${JSON.stringify(actualCounters)}`);
+  }
+}
+
+// The established 128 KiB LUT remains first priority. Its hit must not touch sidecar state even
+// when an exact 4 KiB entry is also present.
+{
+  const state = makeState(effectivePage + 0x10, 0);
+  const primaryPage = 0x40000;
+  const primaryOffset = state.address & 0x1ffff;
+  state.view.setUint32(fmem + (state.address >>> 17) * 4, primaryPage, true);
+  state.view.setUint32(primaryPage + primaryOffset, 0x31415926, false);
+  state.view.setUint32(dataPage + 0x10, 0x27182818, false);
+  await execute(loadHex, loadExecuted, state);
+  const actual = state.view.getUint32(cpu + r4Offset, true);
+  if (actual !== 0x31415926) throw new Error(`primary LUT lost priority: 0x${actual.toString(16)}`);
+  const actualCounters = counters(state);
+  const expectedCounters = { read: 0, write: 0, miss: 0, lru: 0 };
+  if (JSON.stringify(actualCounters) !== JSON.stringify(expectedCounters)) {
+    throw new Error(`primary hit touched sidecar state: ${JSON.stringify(actualCounters)}`);
+  }
+}
+
+// A read-committed PTE does not authorize a direct write. The write remains on the checked hook
+// until the browser commits C and publishes the independent write pointer.
+{
+  const state = makeState(effectivePage + 0x10, 0);
+  state.view.setUint32(dataPage + 0x10, 0x01020304, false);
+  state.view.setUint32(fmem + lruOffset + state.set * 4, 1, true);
+  let writes = 0;
+  await execute(storeHex, storeExecuted, state, {
+    [writeHookName](context, address, value) {
+      if (context !== 0 || (address >>> 0) !== (state.address >>> 0) || (value >>> 0) !== 0xaabbccdd) {
+        throw new Error("bad slow-write hook arguments");
+      }
+      writes++;
+      return 1;
+    },
+  });
+  if (writes !== 1) throw new Error(`expected one checked write, got ${writes}`);
+  if (state.view.getUint32(dataPage + 0x10, false) !== 0x01020304) {
+    throw new Error("read-only sidecar entry performed a direct write");
+  }
+  const actualCounters = counters(state);
+  const expectedCounters = { read: 0, write: 0, miss: 1, lru: 1 };
+  if (JSON.stringify(actualCounters) !== JSON.stringify(expectedCounters)) {
+    throw new Error(`bad read-only counters: ${JSON.stringify(actualCounters)}`);
+  }
+}
+
+// Once write permission is published, the same store is direct and remains big-endian.
+{
+  const state = makeState(effectivePage + 0x10, 0, { write: true });
+  await execute(storeHex, storeExecuted, state);
+  const actual = state.view.getUint32(dataPage + 0x10, false);
+  if (actual !== 0xaabbccdd) throw new Error(`bad direct store: 0x${actual.toString(16)}`);
+  const actualCounters = counters(state);
+  const expectedCounters = { read: 0, write: 1, miss: 0, lru: 1 };
+  if (JSON.stringify(actualCounters) !== JSON.stringify(expectedCounters)) {
+    throw new Error(`bad writable counters: ${JSON.stringify(actualCounters)}`);
+  }
+}
+
+async function expectSlowRead(state, value, expectedCounters) {
+  let reads = 0;
+  await execute(loadHex, loadExecuted, state, {
+    [readHookName](context, address, output) {
+      if (context !== 0 || (address >>> 0) !== (state.address >>> 0)) {
+        throw new Error("bad slow-read hook arguments");
+      }
+      reads++;
+      state.view.setUint32(output, value, true);
+      return 1;
+    },
+  });
+  if (reads !== 1) throw new Error(`expected one checked read, got ${reads}`);
+  if (state.view.getUint32(cpu + r4Offset, true) !== (value >>> 0)) {
+    throw new Error("slow-read result was not committed");
+  }
+  const actualCounters = counters(state);
+  if (JSON.stringify(actualCounters) !== JSON.stringify(expectedCounters)) {
+    throw new Error(`bad slow-read counters: ${JSON.stringify(actualCounters)}`);
+  }
+}
+
+// Full-page tags reject same-set aliases. Disabling DR retains entries but bypasses them without
+// telemetry noise. A multi-byte access that crosses a 4 KiB page boundary is never direct.
+{
+  const state = makeState(effectivePage + 0x10, 0, { tag: 0x12345678 });
+  await expectSlowRead(state, 0xcafebabe, { read: 0, write: 0, miss: 1, lru: 0 });
+}
+{
+  const state = makeState(effectivePage + 0x10, 0, { enabled: false });
+  await expectSlowRead(state, 0xdecafbad, { read: 0, write: 0, miss: 0, lru: 0 });
+}
+{
+  const state = makeState(effectivePage + 0xfff, 0);
+  await expectSlowRead(state, 0x0badf00d, { read: 0, write: 0, miss: 1, lru: 0 });
+}
+{
+  const primaryBoundary = ((effectivePage & ~0x1ffff) + 0x1ffff) >>> 0;
+  const state = makeState(primaryBoundary, 0);
+  const primaryPage = 0x40000;
+  state.view.setUint32(fmem + (state.address >>> 17) * 4, primaryPage, true);
+  await expectSlowRead(state, 0x76543210, { read: 0, write: 0, miss: 0, lru: 0 });
+}
+"#;
+        let output = Command::new("node")
+            .args([
+                "--input-type=module",
+                "--eval",
+                script,
+                &load_wasm,
+                &store_wasm,
+                &Reg::PC.offset().to_string(),
+                &GPR::R3.offset().to_string(),
+                &GPR::R4.offset().to_string(),
+                &(ppcjit::hooks::HookKind::ReadI32 as u32).to_string(),
+                &(ppcjit::hooks::HookKind::WriteI32 as u32).to_string(),
+                &load.metadata().executed.pack().to_string(),
+                &store.metadata().executed.pack().to_string(),
+                &SECONDARY_FASTMEM_PAGE_SHIFT.to_string(),
+                &SECONDARY_FASTMEM_SET_COUNT.to_string(),
+                &SECONDARY_FASTMEM_CONTROL_OFFSET.to_string(),
+                &SECONDARY_FASTMEM_READ_HITS_OFFSET.to_string(),
+                &SECONDARY_FASTMEM_WRITE_HITS_OFFSET.to_string(),
+                &SECONDARY_FASTMEM_MISSES_OFFSET.to_string(),
+                &SECONDARY_FASTMEM_LRU_OFFSET.to_string(),
+                &SECONDARY_FASTMEM_TAG_OFFSET.to_string(),
+                &SECONDARY_FASTMEM_READ_POINTER_OFFSET.to_string(),
+                &SECONDARY_FASTMEM_WRITE_POINTER_OFFSET.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "node failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]

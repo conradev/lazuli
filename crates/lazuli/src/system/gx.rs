@@ -1,6 +1,10 @@
 //! Graphics subsystem (GX).
 pub mod cmd;
 pub mod pix;
+pub mod resident_fifo;
+pub mod resident_pe;
+pub mod resident_texture;
+pub mod resident_vertex;
 pub mod tev;
 pub mod tex;
 pub mod xform;
@@ -10,7 +14,6 @@ use std::sync::{LazyLock, Mutex};
 
 use bitos::integer::{UnsignedInt, u3, u4};
 use bitos::{BitUtils, TryBits, bitos};
-use bitvec::array::BitArray;
 use color::{Rgba, Rgba8};
 use gekko::{Address, LoadStoreReservation};
 use glam::{Mat4, Vec2, Vec3};
@@ -299,6 +302,7 @@ impl Reg {
     }
 
     #[inline]
+    #[allow(clippy::match_like_matches_macro)]
     pub fn is_tev_stage(&self) -> bool {
         seq! {
             N in 0..16 {
@@ -315,6 +319,7 @@ impl Reg {
     }
 
     #[inline]
+    #[allow(clippy::match_like_matches_macro)]
     pub fn is_tev_refs(&self) -> bool {
         seq! {
             N in 0..8 {
@@ -522,35 +527,42 @@ impl VertexStream {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[repr(transparent)]
-pub struct MatrixSet(BitArray<[u64; 2]>);
-
-impl Default for MatrixSet {
-    fn default() -> Self {
-        Self(BitArray::new([0; 2]))
-    }
-}
+pub struct MatrixSet([u32; 3]);
 
 impl MatrixSet {
     #[inline(always)]
     pub fn include(&mut self, id: MatrixId) {
-        self.0.set(id.get() as usize, true);
+        let index = usize::from(id.get());
+        self.0[index / 32] |= 1 << (index % 32);
     }
 
     #[inline(always)]
     pub fn clear(&mut self) {
-        self.0.fill(false);
+        self.0.fill(0);
     }
 
     #[inline(always)]
     pub fn iter(&self) -> impl Iterator<Item = MatrixId> {
-        self.0.iter_ones().map(|x| MatrixId::from_raw(x as u8))
+        self.0
+            .into_iter()
+            .enumerate()
+            .flat_map(|(word_index, mut word)| {
+                std::iter::from_fn(move || {
+                    if word == 0 {
+                        return None;
+                    }
+                    let bit = word.trailing_zeros();
+                    word &= word - 1;
+                    Some(MatrixId::from_raw((word_index as u32 * 32 + bit) as u8))
+                })
+            })
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.0.count_ones()
+        self.0.iter().map(|word| word.count_ones() as usize).sum()
     }
 }
 
@@ -1297,6 +1309,24 @@ mod tests {
                 uart_escape: false,
             },
         )
+    }
+
+    #[test]
+    fn matrix_set_is_portable_across_wasm_word_sizes() {
+        let mut matrices = MatrixSet::default();
+        for raw in [95, 64, 63, 32, 31, 0, 64] {
+            matrices.include(MatrixId::from_raw(raw));
+        }
+
+        assert_eq!(matrices.len(), 6);
+        assert_eq!(
+            matrices.iter().map(MatrixId::get).collect::<Vec<_>>(),
+            [0, 31, 32, 63, 64, 95]
+        );
+
+        matrices.clear();
+        assert_eq!(matrices.len(), 0);
+        assert_eq!(matrices.iter().next(), None);
     }
 
     #[test]

@@ -9,16 +9,20 @@ import process from "node:process";
 
 const ABI_VERSION = 1;
 const WASM_PAGE_BYTES = 64 * 1024;
-const MEMORY_INITIAL_PAGES = 688;
-const MEMORY_MAXIMUM_PAGES = 720;
+const LEGACY_MEMORY_INITIAL_PAGES = 720;
+const LEGACY_MEMORY_MAXIMUM_PAGES = 768;
 const MAIN_RAM_OFFSET = 0x0010_0000;
 const MAIN_RAM_BYTES = 0x0180_0000;
 const MMIO_OFFSET = 0x0190_0000;
 const MMIO_BYTES = 0x0002_0000;
-const ARAM_OFFSET = 0x01a0_0000;
+const L2C_OFFSET = 0x0192_0000;
+const L2C_BYTES = 0x0000_4000;
+const IPL_OFFSET = 0x01a0_0000;
+const IPL_BYTES = 0x0020_0000;
+const ARAM_OFFSET = 0x01c0_0000;
 const ARAM_BYTES = 0x0100_0000;
-const RUNTIME_BASE = 0x02a0_0000;
-const RUNTIME_END = MEMORY_MAXIMUM_PAGES * WASM_PAGE_BYTES;
+const RUNTIME_BASE = 0x02c0_0000;
+const LEGACY_RUNTIME_END = LEGACY_MEMORY_MAXIMUM_PAGES * WASM_PAGE_BYTES;
 
 const expectedImports = [
   { module: "lazuli", name: "memory", kind: "memory" },
@@ -37,6 +41,10 @@ const expectedFunctionExports = [
   "browser_dsp_fault_length",
   "browser_dsp_fault_memory_length",
   "browser_dsp_fault_operation",
+  "browser_dsp_ipl_bytes",
+  "browser_dsp_ipl_offset",
+  "browser_dsp_l2c_bytes",
+  "browser_dsp_l2c_offset",
   "browser_dsp_init",
   "browser_dsp_main_ram_bytes",
   "browser_dsp_main_ram_offset",
@@ -146,8 +154,8 @@ export async function verifyBrowserDspWasm(path) {
     () => new WebAssembly.Instance(
       module,
       importsFor(new WebAssembly.Memory({
-        initial: MEMORY_INITIAL_PAGES - 1,
-        maximum: MEMORY_MAXIMUM_PAGES,
+        initial: LEGACY_MEMORY_INITIAL_PAGES - 1,
+        maximum: LEGACY_MEMORY_MAXIMUM_PAGES,
       })),
     ),
     WebAssembly.LinkError,
@@ -157,17 +165,17 @@ export async function verifyBrowserDspWasm(path) {
     () => new WebAssembly.Instance(
       module,
       importsFor(new WebAssembly.Memory({
-        initial: MEMORY_INITIAL_PAGES,
-        maximum: MEMORY_MAXIMUM_PAGES + 1,
+        initial: LEGACY_MEMORY_INITIAL_PAGES,
+        maximum: LEGACY_MEMORY_MAXIMUM_PAGES + 1,
       })),
     ),
     WebAssembly.LinkError,
     "DSP wasm accepted a memory whose maximum exceeds its ABI",
   );
-  for (const initial of [MEMORY_INITIAL_PAGES + 1, MEMORY_MAXIMUM_PAGES]) {
+  for (const initial of [LEGACY_MEMORY_INITIAL_PAGES + 1, LEGACY_MEMORY_MAXIMUM_PAGES]) {
     const wrongBootstrapMemory = new WebAssembly.Memory({
       initial,
-      maximum: MEMORY_MAXIMUM_PAGES,
+      maximum: LEGACY_MEMORY_MAXIMUM_PAGES,
     });
     const wrongBootstrap = new WebAssembly.Instance(
       module,
@@ -182,8 +190,8 @@ export async function verifyBrowserDspWasm(path) {
   }
 
   const memory = new WebAssembly.Memory({
-    initial: MEMORY_INITIAL_PAGES,
-    maximum: MEMORY_MAXIMUM_PAGES,
+    initial: LEGACY_MEMORY_INITIAL_PAGES,
+    maximum: LEGACY_MEMORY_MAXIMUM_PAGES,
   });
   fillReservedMemory(memory);
   const cleanReservedDigest = reservedDigest(memory);
@@ -198,23 +206,27 @@ export async function verifyBrowserDspWasm(path) {
   const dataEnd = dsp.__data_end.value;
   const heapBase = dsp.__heap_base.value;
   assert.ok(RUNTIME_BASE <= dataEnd && dataEnd < heapBase);
-  assert.ok(heapBase <= MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES);
+  assert.ok(heapBase <= LEGACY_MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES);
 
   assert.equal(dsp.browser_dsp_abi_version(), ABI_VERSION);
-  assert.equal(dsp.browser_dsp_memory_initial_pages(), MEMORY_INITIAL_PAGES);
-  assert.equal(dsp.browser_dsp_memory_maximum_pages(), MEMORY_MAXIMUM_PAGES);
-  assert.equal(dsp.browser_dsp_memory_bytes(), RUNTIME_END);
+  assert.equal(dsp.browser_dsp_memory_initial_pages(), LEGACY_MEMORY_INITIAL_PAGES);
+  assert.equal(dsp.browser_dsp_memory_maximum_pages(), LEGACY_MEMORY_MAXIMUM_PAGES);
+  assert.equal(dsp.browser_dsp_memory_bytes(), LEGACY_RUNTIME_END);
   assert.equal(dsp.browser_dsp_main_ram_offset(), MAIN_RAM_OFFSET);
   assert.equal(dsp.browser_dsp_main_ram_bytes(), MAIN_RAM_BYTES);
   assert.equal(dsp.browser_dsp_mmio_offset(), MMIO_OFFSET);
   assert.equal(dsp.browser_dsp_mmio_bytes(), MMIO_BYTES);
+  assert.equal(dsp.browser_dsp_l2c_offset(), L2C_OFFSET);
+  assert.equal(dsp.browser_dsp_l2c_bytes(), L2C_BYTES);
+  assert.equal(dsp.browser_dsp_ipl_offset(), IPL_OFFSET);
+  assert.equal(dsp.browser_dsp_ipl_bytes(), IPL_BYTES);
   assert.equal(dsp.browser_dsp_aram_offset(), ARAM_OFFSET);
   assert.equal(dsp.browser_dsp_aram_bytes(), ARAM_BYTES);
   assert.equal(dsp.browser_dsp_runtime_base(), RUNTIME_BASE);
-  assert.equal(dsp.browser_dsp_runtime_end(), RUNTIME_END);
+  assert.equal(dsp.browser_dsp_runtime_end(), LEGACY_RUNTIME_END);
   assert.equal(dsp.browser_dsp_stop_reason(), 5, "uninitialized stop reason is not explicit");
 
-  assert.equal(memory.buffer.byteLength, MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES);
+  assert.equal(memory.buffer.byteLength, LEGACY_MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES);
   assert.equal(dsp.browser_dsp_init(), 1);
   assert.equal(
     reservedDigest(memory),
@@ -223,13 +235,18 @@ export async function verifyBrowserDspWasm(path) {
   );
   const allocatedPages = memory.buffer.byteLength / WASM_PAGE_BYTES;
   assert.ok(
-    MEMORY_INITIAL_PAGES <= allocatedPages && allocatedPages <= MEMORY_MAXIMUM_PAGES,
+    LEGACY_MEMORY_INITIAL_PAGES <= allocatedPages
+      && allocatedPages <= LEGACY_MEMORY_MAXIMUM_PAGES,
     "DSP initialization escaped its memory contract",
   );
   assert.equal(dsp.browser_dsp_exec(1), 0, "DSP executed before host memory sealing");
   assert.equal(dsp.browser_dsp_stop_reason(), 6, "pre-seal execution was not diagnosed");
-  memory.grow(MEMORY_MAXIMUM_PAGES - allocatedPages);
-  assert.equal(memory.buffer.byteLength, RUNTIME_END, "machine memory was not sealed at maximum");
+  memory.grow(LEGACY_MEMORY_MAXIMUM_PAGES - allocatedPages);
+  assert.equal(
+    memory.buffer.byteLength,
+    LEGACY_RUNTIME_END,
+    "machine memory was not sealed at maximum",
+  );
   assert.equal(dsp.browser_dsp_init(), 0, "DSP bridge allowed a second allocating initialization");
 
   // Real IROM, rather than a JavaScript synthetic reply, must publish the reset greeting and then
@@ -348,7 +365,7 @@ export async function verifyBrowserDspWasm(path) {
     dataEnd,
     heapBase,
     initializedPages: allocatedPages,
-    sealedPages: MEMORY_MAXIMUM_PAGES,
+    sealedPages: LEGACY_MEMORY_MAXIMUM_PAGES,
   };
 }
 

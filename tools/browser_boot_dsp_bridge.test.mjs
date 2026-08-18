@@ -29,7 +29,7 @@ test("DSP initialization seals the one memory before creating machine views", ()
   const memory = source.indexOf("const memory = new WebAssembly.Memory({");
   const instantiate = source.indexOf("const { instance: browserDspInstance }", memory);
   const initialize = source.indexOf("browserDsp.browser_dsp_init() === 1", instantiate);
-  const grow = source.indexOf("memory.grow(__MEMORY_MAXIMUM_PAGES__", initialize);
+  const grow = source.indexOf("memory.grow(__LEGACY_MEMORY_MAXIMUM_PAGES__", initialize);
   const bytes = source.indexOf("const bytes = new Uint8Array(memory.buffer);", grow);
   const view = source.indexOf("const view = new DataView(memory.buffer);", bytes);
   const aram = source.indexOf(
@@ -55,7 +55,7 @@ test("DSP initialization seals the one memory before creating machine views", ()
   const bootstrap = source.slice(memory, view + 48);
   assert.match(
     bootstrap,
-    /initial: __MEMORY_INITIAL_PAGES__,\s*maximum: __MEMORY_MAXIMUM_PAGES__,/,
+    /initial: __LEGACY_MEMORY_INITIAL_PAGES__,\s*maximum: __LEGACY_MEMORY_MAXIMUM_PAGES__,/,
   );
   assert.match(bootstrap, /lazuli: \{ memory \}/);
   assert.match(

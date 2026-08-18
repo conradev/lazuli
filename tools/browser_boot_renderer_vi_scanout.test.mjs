@@ -81,33 +81,44 @@ test("only Ready frames acquire the canvas while staged fields preserve complete
   const end = source.indexOf("\n}\n\nimpl WebGpuRenderer {", start);
   assert.notEqual(start, -1);
   assert.notEqual(end, -1);
-  const method = source.slice(start, end);
+  const wrapper = source.slice(start, end);
+  const typedStart = source.indexOf("    fn present_xfb_typed(", end);
+  const typedEnd = source.indexOf("\n    fn present_host_xfb_frame(", typedStart);
+  assert.notEqual(typedStart, -1);
+  assert.notEqual(typedEnd, -1);
+  const method = source.slice(typedStart, typedEnd);
   const validate = method.indexOf("xfb_scanout_plan(");
   const stage = method.indexOf("ViFieldPairOutcome::Awaiting");
   const ready = method.indexOf("ViFieldPairOutcome::Ready");
   const present = method.indexOf("self.present_host_xfb_frame");
-  const rejectZeroEpoch = method.indexOf("if pair_epoch == 0");
-  const parseMode = method.indexOf("vi_presentation_mode(");
-  const parseParity = method.indexOf("vi_field_parity(");
+  const rejectZeroEpoch = wrapper.indexOf("if pair_epoch == 0");
+  const typedRejectZeroEpoch = method.indexOf("if pair_epoch == 0");
+  const parseMode = wrapper.indexOf("vi_presentation_mode(");
+  const parseParity = wrapper.indexOf("vi_field_parity(");
   const lookupXfb = method.indexOf(".xfb_cache");
   const unavailableRetirements = [
     ...method.matchAll(/reject_unavailable_member\(mode, pair_epoch, parity\)/g),
   ];
 
   assert.match(
-    method,
+    wrapper,
     /capture_surface: bool,\s*capture_sustained_surface_history: bool,/,
+  );
+  assert.match(
+    wrapper,
+    /xfb_presentation_result_from_outcome\(self\.present_xfb_typed\([\s\S]*?capture_surface,\s*capture_sustained_surface_history,/,
   );
   assert.match(
     method,
     /self\.present_host_xfb_frame\(\s*frame,\s*capture_surface,\s*capture_sustained_surface_history,/,
   );
   assert.ok(rejectZeroEpoch >= 0 && rejectZeroEpoch < parseMode);
-  assert.ok(rejectZeroEpoch < parseParity && rejectZeroEpoch < lookupXfb);
+  assert.ok(rejectZeroEpoch < parseParity);
   assert.match(
-    method.slice(rejectZeroEpoch, parseMode),
+    wrapper.slice(rejectZeroEpoch, parseMode),
     /xfb_presentation_result\(\s*false,\s*false,\s*"vi-field-invalid-epoch",\s*pair_epoch,\s*None,/,
   );
+  assert.ok(typedRejectZeroEpoch >= 0 && typedRejectZeroEpoch < lookupXfb);
   assert.ok(validate >= 0 && validate < stage);
   assert.ok(stage >= 0 && stage < ready && ready < present);
   assert.equal(

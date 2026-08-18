@@ -1,0 +1,73 @@
+{
+  "schema": "lazuli-resident-corpus-evidence-lock-v1",
+  "sourceCorpusSha256": "43597e441ab8c38adb18beed8ac34895a8496cac8ac2112ef4cb27c7504f4fc6",
+  "games": [
+    {
+      "key": "warioware-usa",
+      "priority": 1,
+      "bytes": 889225792,
+      "sha256": "b8c33924afed0fec165afc3fe0d6e8dddfcdef53842fcae180560b3b904b4a81"
+    },
+    {
+      "key": "luigis-mansion-usa",
+      "priority": 2,
+      "bytes": 199262784,
+      "sha256": "a868fd4bcf4d304aae74fb32ddb067e605d64db35e035c248a630d05a7d8ac4f"
+    },
+    {
+      "key": "wind-waker-usa",
+      "priority": 3,
+      "bytes": 1088455232,
+      "sha256": "677726191ba8cc0829e9baa731c14eeff95ba399e1fe40a4f2473e7b8e0c80ac"
+    },
+    {
+      "key": "melee-usa-rev-2",
+      "priority": 4,
+      "bytes": 1449165376,
+      "sha256": "b7de482eb955c8a96b6746dfa043b69ae7bf6c7c2a09ac382b9da126faa7055c"
+    },
+    {
+      "key": "f-zero-gx-usa",
+      "priority": 5,
+      "bytes": 1438679616,
+      "sha256": "3d45ca0cdd5ed408c4dd417bc0a1691ef48b7d59fab123963bd9e934be6ee91e"
+    },
+    {
+      "key": "metroid-prime-usa-rev-2",
+      "priority": 6,
+      "bytes": 1344307776,
+      "sha256": "f168d1da2ab7055c1b7fa4976c69d93c17a59057dfca936871a6539958825ffd"
+    },
+    {
+      "key": "rogue-leader-usa",
+      "priority": 7,
+      "bytes": 1400930880,
+      "sha256": "f045960fc62aa885b05cb7eb725436cfbbb17221e38b0f7e8fadb8408e710686"
+    }
+  ],
+  "artifacts": {
+    "schema": "lazuli-resident-corpus-artifacts-v1",
+    "artifacts": {
+      "browser_machine.wasm": {
+        "bytes": 14321206,
+        "sha256": "84f320cf1c7f1816e512f395d25803ba59c70549f7fabb32b927ba3183efa0cb"
+      },
+      "resident_dispatcher.wasm": {
+        "bytes": 361408,
+        "sha256": "a6c963bab8b9591315dbb94ea6ba6085bd57870fdde933894fba6fb4af43abbe"
+      },
+      "core_run_coordinator.wasm": {
+        "bytes": 362,
+        "sha256": "e0e22adfecbeb4e07b9fdd7c55c35edb3d9512b9e78a87dec52304cf6463a183"
+      },
+      "browser_renderer.js": {
+        "bytes": 81244,
+        "sha256": "9ff0f03f283eea2d1d1751e91208513673548b5f10d223a8f03a8b896971d922"
+      },
+      "browser_renderer_bg.wasm": {
+        "bytes": 855777,
+        "sha256": "ed29a0569fc9bd400e2fe6101c6f437a626bf7918e88637fefc0ce1e12c05f57"
+      }
+    }
+  }
+}

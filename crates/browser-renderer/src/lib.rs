@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 mod clip;
 pub(crate) mod packet;
 mod raster;
+mod receipt_bridge;
+#[cfg(any(feature = "resident-render-probe", test))]
+mod render_probe;
 pub(crate) mod tev;
 
 #[allow(unused_imports)]
@@ -306,14 +309,14 @@ const _: () = assert!(
 
 impl ExactRequiredRejectionSnapshot {
     pub(crate) fn capture(
-        metrics: RendererMetrics,
-        preparation_reasons: ExactRequiredPreparationRejectionCounts,
+        metrics: &RendererMetrics,
+        preparation_reasons: &ExactRequiredPreparationRejectionCounts,
     ) -> Self {
         Self {
             aggregate: metrics.exact_required_rejected_draws,
             reasons: ExactRequiredRejectionReason::ALL
                 .map(|reason| metrics.exact_required_rejection_reason_draws(reason)),
-            preparation_reasons,
+            preparation_reasons: *preparation_reasons,
         }
     }
 
@@ -2908,7 +2911,7 @@ pub(crate) fn xfb_scanout_plan(
 ) -> Option<XfbScanoutPlan> {
     if copy.stride == 0
         || field_stride_bytes == 0
-        || field_stride_bytes % copy.stride != 0
+        || !field_stride_bytes.is_multiple_of(copy.stride)
         || field_height == 0
         || !matches!(row_repeat, 1 | 2)
         || display_height != field_height.checked_mul(row_repeat)?
@@ -3512,16 +3515,12 @@ impl fmt::Display for SustainedSurfaceHistoryError {
     }
 }
 
+#[derive(Default)]
 pub(crate) enum SustainedPresentedSurfaceHistory<T> {
+    #[default]
     Idle,
     Recording(Vec<T>),
     Failed,
-}
-
-impl<T> Default for SustainedPresentedSurfaceHistory<T> {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl<T> SustainedPresentedSurfaceHistory<T> {
@@ -4848,7 +4847,7 @@ mod tests {
                 )),
             );
         }
-        let previous = ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts);
+        let previous = ExactRequiredRejectionSnapshot::capture(&metrics, &preparation_counts);
 
         for reason in ExactRequiredPreparationRejectionReason::ALL {
             metrics.record_exact_required_rejection(
@@ -4861,7 +4860,7 @@ mod tests {
                 metrics.record_exact_required_rejection(reason, None);
             }
         }
-        let current = ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts);
+        let current = ExactRequiredRejectionSnapshot::capture(&metrics, &preparation_counts);
         let interval = current.checked_delta_since(previous).unwrap();
 
         assert_eq!(
@@ -4905,7 +4904,7 @@ mod tests {
             for &(reason, count) in preparation_reasons {
                 preparation_counts.set(reason, count);
             }
-            ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts)
+            ExactRequiredRejectionSnapshot::capture(&metrics, &preparation_counts)
         }
 
         let zero = ExactRequiredRejectionSnapshot::default();
@@ -4947,11 +4946,11 @@ mod tests {
         );
 
         let aggregate_mismatch = ExactRequiredRejectionSnapshot::capture(
-            RendererMetrics {
+            &RendererMetrics {
                 exact_required_rejected_draws: 2,
                 ..RendererMetrics::default()
             },
-            ExactRequiredPreparationRejectionCounts::default(),
+            &ExactRequiredPreparationRejectionCounts::default(),
         );
         assert!(!aggregate_mismatch.is_coherent());
         assert!(
@@ -4967,8 +4966,8 @@ mod tests {
         preparation_parent_without_detail.exact_required_rejection_reasons
             [ExactRequiredRejectionReason::ExactPreparation.index()] = 1;
         let preparation_mismatch = ExactRequiredRejectionSnapshot::capture(
-            preparation_parent_without_detail,
-            ExactRequiredPreparationRejectionCounts::default(),
+            &preparation_parent_without_detail,
+            &ExactRequiredPreparationRejectionCounts::default(),
         );
         assert!(!preparation_mismatch.is_coherent());
         assert!(
@@ -4996,7 +4995,7 @@ mod tests {
             ExactRequiredPreparationRejectionReason::UnsupportedTopology6,
             1,
         );
-        let saturated = ExactRequiredRejectionSnapshot::capture(metrics, preparation_counts);
+        let saturated = ExactRequiredRejectionSnapshot::capture(&metrics, &preparation_counts);
 
         assert!(saturated.is_coherent());
         assert!(

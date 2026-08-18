@@ -84,6 +84,15 @@ const mmuFunctions = [
   "resolveDataEffectiveRange",
   "translateDataEffectiveRange",
   "readSegmentRegisters",
+  "secondaryDataFastmemEntryIndex",
+  "secondaryDataFastmemReplacementWay",
+  "setSecondaryDataFastmemReplacementWay",
+  "clearSecondaryDataFastmemWay",
+  "invalidateSecondaryDataFastmemSet",
+  "invalidateSecondaryDataFastmem",
+  "setSecondaryDataFastmemEnabled",
+  "populateSecondaryDataFastmem",
+  "snapshotSecondaryDataFastmem",
   "readDataBats",
   "translateDataAddress",
   "translateDataRange",
@@ -104,6 +113,10 @@ const mmuFunctions = [
   "dataRamOrLockedCachePointer",
   "initializeBatRegisters",
   "initializeMemoryManagement",
+  "dataFastmemTemplateKey",
+  "secondaryDataFastmemSignaturesCompatible",
+  "buildDataFastmemTemplate",
+  "restoreDataFastmemTemplate",
   "rebuildDataFastmem",
   "msrChanged",
   "dataBatChanged",
@@ -143,8 +156,24 @@ function makeContext() {
     ),
     defaultDataBats,
     defaultInstructionBats,
+    accelerations: new Map(),
+    dataFastmemMsrSignature: null,
     dataFastmemTranslationSignature: null,
+    dataFastmemTemplateLimit: 16,
+    dataFastmemTemplates: new Map(),
     fastmem: 0x1000,
+    secondaryFastmemPageShift: 12,
+    secondaryFastmemSetCount: 64,
+    secondaryFastmemEntryCount: 128,
+    secondaryFastmemControl: 0x22000,
+    secondaryFastmemReadHits: 0x22004,
+    secondaryFastmemWriteHits: 0x22008,
+    secondaryFastmemMisses: 0x2200c,
+    secondaryFastmemLru: 0x22010,
+    secondaryFastmemTags: 0x22110,
+    secondaryFastmemReadPointers: 0x22310,
+    secondaryFastmemWritePointers: 0x22510,
+    secondaryDataFastmemLastInvalidationReason: null,
     instructionBatOffsets: [
       [0x80, 0x84],
       [0x88, 0x8c],
@@ -159,6 +188,8 @@ function makeContext() {
     physicalMmioBase: 0x0c000000,
     ram: 0x40000,
     ramSize: 0x40000,
+    observeCriticalStorageFaultHandlerReturn() {},
+    instructionTranslationMsrSignature: null,
     sdr1Offset: 0x180,
     segmentRegisterOffsets: Array.from(
       { length: 16 },
@@ -181,6 +212,11 @@ function makeContext() {
 function fastmemEntry(context, address) {
   const index = (address >>> context.__FASTMEM_PAGE_SHIFT__) >>> 0;
   return context.view.getUint32(context.fastmem + index * 4, true);
+}
+
+function fastmemBytes(context) {
+  const byteLength = context.__FASTMEM_LUT_COUNT__ * 4;
+  return context.bytes.slice(context.fastmem, context.fastmem + byteLength);
 }
 
 test("power-on BATs map the GameCube cached, uncached, and MMIO aliases", () => {
@@ -217,6 +253,257 @@ test("power-on BATs map the GameCube cached, uncached, and MMIO aliases", () => 
     context.physicalMmioPointer(0x0c008000, 4),
     context.mmio + 0x8000,
   );
+});
+
+test("exception-shaped DR toggles restore exact immutable fastmem templates", () => {
+  const context = makeContext();
+  const translatedTemplate = fastmemBytes(context);
+  const retainedTagAddress = context.secondaryFastmemTags;
+  context.view.setUint32(retainedTagAddress, 0x80001, true);
+  assert.equal(context.accelerations.get("dataFastmemTemplateBuilds"), 1);
+  assert.equal(context.dataFastmemTemplates.size, 1);
+  assert.equal(context.view.getUint32(context.secondaryFastmemControl, true), 1);
+
+  context.view.setUint32(context.msrOffset, 0x20, true);
+  assert.equal(context.rebuildDataFastmem(), true);
+  assert.equal(context.view.getUint32(context.secondaryFastmemControl, true), 0);
+  assert.equal(context.view.getUint32(retainedTagAddress, true), 0x80001);
+  const realModeTemplate = fastmemBytes(context);
+  assert.notDeepEqual(realModeTemplate, translatedTemplate);
+  assert.equal(context.accelerations.get("dataFastmemTemplateBuilds"), 2);
+  assert.equal(context.accelerations.get("dataFastmemTemplateRestores"), undefined);
+
+  // Tainting the live table must not alter the private translated template.
+  context.view.setUint32(context.fastmem, 0xdeadbeef, true);
+  context.view.setUint32(context.msrOffset, 0x30, true);
+  assert.equal(context.rebuildDataFastmem(), true);
+  assert.equal(context.view.getUint32(context.secondaryFastmemControl, true), 1);
+  assert.equal(context.view.getUint32(retainedTagAddress, true), 0x80001);
+  assert.deepEqual(fastmemBytes(context), translatedTemplate);
+  assert.equal(context.accelerations.get("dataFastmemTemplateBuilds"), 2);
+  assert.equal(context.accelerations.get("dataFastmemTemplateRestores"), 1);
+
+  // Repeated exception entry/rfi alternation reuses only the two exact
+  // signatures and copies each complete table byte-for-byte.
+  for (let toggle = 0; toggle < 256; toggle += 1) {
+    const translated = (toggle & 1) !== 0;
+    context.view.setUint32(context.msrOffset, translated ? 0x30 : 0x20, true);
+    assert.equal(context.rebuildDataFastmem(), true);
+    assert.deepEqual(
+      fastmemBytes(context),
+      translated ? translatedTemplate : realModeTemplate,
+    );
+  }
+  assert.equal(context.accelerations.get("dataFastmemTemplateBuilds"), 2);
+  assert.equal(context.accelerations.get("dataFastmemTemplateRestores"), 257);
+  assert.equal(context.dataFastmemTemplates.size, 2);
+  assert.equal(context.rebuildDataFastmem(), false);
+  assert.equal(context.accelerations.get("dataFastmemTemplateRestores"), 257);
+});
+
+test("fastmem template signatures cover every BAT word and the MEM1 layout", () => {
+  const context = makeContext();
+  const originalTemplate = fastmemBytes(context);
+  const originalBuilds = context.accelerations.get("dataFastmemTemplateBuilds");
+  const [lowerOffset] = context.dataBatOffsets[0];
+  const originalLower = context.view.getUint32(lowerOffset, true);
+  context.view.setUint32(context.secondaryFastmemTags, 0x80001, true);
+
+  context.view.setUint32(lowerOffset, originalLower ^ 0x8, true);
+  assert.equal(context.rebuildDataFastmem(), true);
+  assert.equal(context.view.getUint32(context.secondaryFastmemTags, true), 0);
+  assert.equal(
+    context.accelerations.get("dataFastmemTemplateBuilds"),
+    originalBuilds + 1,
+  );
+
+  context.view.setUint32(lowerOffset, originalLower, true);
+  assert.equal(context.rebuildDataFastmem(), true);
+  assert.deepEqual(fastmemBytes(context), originalTemplate);
+  assert.equal(
+    context.accelerations.get("dataFastmemTemplateRestores"),
+    1,
+  );
+
+  // Production layout inputs are const. A relocated fixture still changes
+  // the full signature before the unchanged-state early return.
+  context.ram += 0x10000;
+  assert.equal(context.rebuildDataFastmem(), true);
+  assert.equal(
+    context.accelerations.get("dataFastmemTemplateBuilds"),
+    originalBuilds + 2,
+  );
+  assert.equal(fastmemEntry(context, 0x80000000), context.ram);
+});
+
+test("secondary fastmem publishes only committed resident page translations", () => {
+  const context = makeContext();
+  const effective = 0x7f001234;
+  const physical = 0x00001234;
+  const setIndex = context.dataTlbSetIndex(effective);
+  const way = 0;
+  const vsid = 0x12345;
+  context.dataTlbSets[setIndex].entries[way] = {
+    vsid,
+    pageIndex: (effective >>> 12) & 0xffff,
+  };
+  const resolved = {
+    kind: "mapped",
+    translations: [{ source: "page", setIndex, way, vsid }],
+  };
+  const entryIndex = setIndex * 2 + way;
+  const tagAddress = context.secondaryFastmemTags + entryIndex * 4;
+  const readAddress = context.secondaryFastmemReadPointers + entryIndex * 4;
+  const writeAddress = context.secondaryFastmemWritePointers + entryIndex * 4;
+
+  assert.equal(
+    context.populateSecondaryDataFastmem(
+      resolved,
+      effective,
+      physical,
+      4,
+      false,
+    ),
+    true,
+  );
+  assert.equal(
+    context.view.getUint32(tagAddress, true),
+    (effective >>> 12) + 1,
+  );
+  assert.equal(context.view.getUint32(readAddress, true), context.ram + 0x1000);
+  assert.equal(context.view.getUint32(writeAddress, true), 0);
+
+  assert.equal(
+    context.populateSecondaryDataFastmem(
+      resolved,
+      effective,
+      physical,
+      4,
+      true,
+    ),
+    true,
+  );
+  assert.equal(context.view.getUint32(writeAddress, true), context.ram + 0x1000);
+  assert.deepEqual(
+    { ...context.snapshotSecondaryDataFastmem() },
+    {
+      enabled: true,
+      sets: 64,
+      ways: 2,
+      pageBytes: 4096,
+      residentEntries: 1,
+      writableEntries: 1,
+      readHits: 0,
+      writeHits: 0,
+      misses: 0,
+      lastInvalidationReason: "data-translation-change",
+    },
+  );
+
+  const stale = {
+    kind: "mapped",
+    translations: [{ source: "page", setIndex, way: 1, vsid }],
+  };
+  assert.equal(
+    context.populateSecondaryDataFastmem(stale, effective, physical, 4, false),
+    false,
+  );
+  assert.equal(
+    context.populateSecondaryDataFastmem(
+      resolved,
+      (effective & 0xfffff000) | 0xfff,
+      (physical & 0xfffff000) | 0xfff,
+      2,
+      false,
+    ),
+    false,
+    "cross-page access must stay on the checked hook",
+  );
+  assert.equal(
+    context.populateSecondaryDataFastmem(
+      resolved,
+      effective,
+      0x0c001234,
+      4,
+      false,
+    ),
+    false,
+    "MMIO must never enter the MEM1 sidecar",
+  );
+
+  assert.match(
+    extractFunction("readInteger"),
+    /resolveDataRange\(logical, size, false, true\)[\s\S]*populateSecondaryDataFastmem/,
+  );
+  assert.match(
+    extractFunction("writeInteger"),
+    /resolveDataRange\(logical, size, true, true\)[\s\S]*populateSecondaryDataFastmem/,
+  );
+});
+
+test("secondary fastmem shares exact two-way replacement state with the data TLB", () => {
+  const context = makeContext();
+  const first = 0x70001000;
+  const second = first + 0x40000;
+  const third = second + 0x40000;
+  const vsid = 7;
+  const entry = physical => ({
+    pte0: 0x80000000,
+    pte1: physical | 2,
+    ptePhysical: 0x1000,
+    ptePointer: context.ram + 0x1000,
+  });
+  const setIndex = context.dataTlbSetIndex(first);
+  assert.equal(context.dataTlbSetIndex(second), setIndex);
+  assert.equal(context.dataTlbSetIndex(third), setIndex);
+
+  context.fillDataTlb(first, vsid, entry(0x8000));
+  context.fillDataTlb(second, vsid, entry(0x9000));
+  assert.equal(context.secondaryDataFastmemReplacementWay(setIndex), 0);
+  assert.equal(context.lookupDataTlb(first, vsid, true).way, 0);
+  assert.equal(context.secondaryDataFastmemReplacementWay(setIndex), 1);
+
+  const secondEntryIndex = setIndex * 2 + 1;
+  context.view.setUint32(
+    context.secondaryFastmemTags + secondEntryIndex * 4,
+    (second >>> 12) + 1,
+    true,
+  );
+  context.fillDataTlb(third, vsid, entry(0xa000));
+  assert.notEqual(context.lookupDataTlb(first, vsid), null);
+  assert.equal(context.lookupDataTlb(second, vsid), null);
+  assert.notEqual(context.lookupDataTlb(third, vsid), null);
+  assert.equal(
+    context.view.getUint32(
+      context.secondaryFastmemTags + secondEntryIndex * 4,
+      true,
+    ),
+    0,
+    "evicting a hardware-shaped TLB way must clear its sidecar mapping",
+  );
+});
+
+test("fastmem template cache evicts least-recently-used mappings at its bound", () => {
+  const context = makeContext();
+  context.dataFastmemTemplateLimit = 3;
+  const [lowerOffset] = context.dataBatOffsets[0];
+  const originalLower = context.view.getUint32(lowerOffset, true);
+
+  for (let variant = 1; variant <= 3; variant += 1) {
+    // WIMG participates in the BAT translation signature even though it does
+    // not alter the host pointer chosen for ordinary RAM.
+    context.view.setUint32(lowerOffset, originalLower ^ (variant << 3), true);
+    assert.equal(context.rebuildDataFastmem(), true);
+  }
+  assert.equal(context.dataFastmemTemplates.size, 3);
+  assert.equal(context.accelerations.get("dataFastmemTemplateBuilds"), 4);
+  assert.equal(context.accelerations.get("dataFastmemTemplateEvictions"), 1);
+
+  context.view.setUint32(lowerOffset, originalLower, true);
+  assert.equal(context.rebuildDataFastmem(), true);
+  assert.equal(context.dataFastmemTemplates.size, 3);
+  assert.equal(context.accelerations.get("dataFastmemTemplateBuilds"), 5);
+  assert.equal(context.accelerations.get("dataFastmemTemplateEvictions"), 2);
 });
 
 test("physical normalization rejects aliases and boundaries independently of BATs", () => {

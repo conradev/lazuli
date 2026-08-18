@@ -13,3 +13,7 @@ workspace = true
 
 [dependencies]
 dspint.workspace = true
+lazuli-abi.workspace = true
+
+[build-dependencies]
+lazuli-abi.workspace = true

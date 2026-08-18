@@ -1,0 +1,34 @@
+[package]
+name = "browser-machine"
+description = "Unified Rust-owned browser machine core for Lazuli"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Contract-only semantic entry points. Production browser-machine artifacts never enable this;
+# the host may complete Rust-issued requests but cannot synthesize guest DI commands.
+di-contract-probes = []
+# Rust-authenticated, title-specific compatibility evidence. The production artifact keeps this
+# disabled; release qualification builds opt in and expose only the reduced canonical record.
+game-fidelity-probes = []
+
+[lints]
+workspace = true
+
+[dependencies]
+lazuli.workspace = true
+lazuli-abi.workspace = true
+lzgx-packet.workspace = true
+ppcwasmjit.workspace = true
+sha2.workspace = true
+wasm-encoder.workspace = true
+
+[build-dependencies]
+lazuli-abi.workspace = true
+
+[dev-dependencies]
+wasmparser.workspace = true

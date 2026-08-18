@@ -2859,6 +2859,7 @@ async function executeFailure() {
         view.getUint32(context + cycleOffset, true),
         registers,
         exception,
+        view.getUint32(registers + pcOffset, true),
         view.getUint32(registers + dsisrOffset, true),
       ]);
     },
@@ -2875,7 +2876,7 @@ async function executeFailure() {
   }
   const expected = [
     ["read", 5, 0x1000],
-    ["exception", 5, cpu, dsiException, 0x4a01beef],
+    ["exception", 5, cpu, dsiException, 0x8000100c, 0x4a01beef],
   ];
   if (JSON.stringify(events) !== JSON.stringify(expected)) {
     throw new Error(`bad DSI hook events: ${JSON.stringify(events)}`);

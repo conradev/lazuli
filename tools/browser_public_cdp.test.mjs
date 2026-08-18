@@ -4,63 +4,105 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  RELEASE_SCHEMA,
-  WASM_CHUNK_SIZE,
-  releaseIdentityPayload,
-  sha256Hex,
-} from "../web/release.mjs";
-import {
+  PUBLIC_RESIDENT_POLICY,
   PUBLIC_VIEWPORT,
+  assertNoPublicResidentExceptions,
   assignPublicDisc,
+  assignPublicResidentDisc,
+  capturePublicResidentDiagnostics,
   clearPublicViewport,
+  compactPublicActiveRelease,
   configurePublicCompatibilityDebug,
   configurePublicViewport,
   expectedPublicFrameUrl,
+  observePublicResidentNavigation,
   requestPublicSnapshot,
+  validateCompactPublicActiveRelease,
   validateObservedPublicActiveRelease,
+  validatePublicResidentDiagnosticCapture,
+  waitForPublicResidentFirstXfb,
+  waitForPublicResidentRelease,
   waitForPublicRelease,
   waitForPublicRunner,
   waitForPublicSnapshot,
 } from "./browser_public_cdp.mjs";
+import { schema4ReleaseFixture } from "./browser_public_release_identity.test_fixture.mjs";
 
 async function activeRelease() {
-  const commit = "1".repeat(40);
-  const hash = "2".repeat(64);
-  const asset = (prefix, extension, bytes) => ({
-    url: `/assets/${prefix}-${hash}.${extension}`,
-    sha256: hash,
-    bytes,
-  });
-  const release = {
-    schema: RELEASE_SCHEMA,
-    releaseId: "0".repeat(64),
-    source: {
-      repository: "https://github.com/conradev/lazuli",
-      commit,
-      tree: `https://github.com/conradev/lazuli/tree/${commit}`,
-      archive: `https://github.com/conradev/lazuli/archive/${commit}.tar.gz`,
-      license: {
-        expression: "GPL-3.0-only",
-        text: "/LICENSE.txt",
-        source: `https://github.com/conradev/lazuli/blob/${commit}/licenses/GPL-3.0-only.txt`,
+  return schema4ReleaseFixture();
+}
+
+function residentBinding(publicUrl, frameUrl, offset = 0) {
+  return {
+    frameDocumentTimeOrigin: 2_000 + offset,
+    frameSource: frameUrl,
+    frameUrl,
+    topDocumentTimeOrigin: 1_000 + offset,
+    topUrl: publicUrl,
+  };
+}
+
+function residentCapture(release, binding) {
+  return {
+    binding: structuredClone(binding),
+    resultMatched: true,
+    report: {
+      schema: "lazuli-resident-frontend-diagnostics-v1",
+      status: "running",
+      policy: structuredClone(PUBLIC_RESIDENT_POLICY),
+      runtime: structuredClone(release.runtime),
+      session: {
+        state: "running",
+        label: "local: disc.ciso",
+        boot: { status: 3, reads: 7 },
+        totals: {
+          rustSlices: 2,
+          hostCallCapBoundaries: 1,
+          coldInstallCapBoundaries: 1,
+          hostCalls: 64,
+          coldInstalls: 64,
+          executedCycles: "1000000",
+          executedInstructions: "42",
+          zeroProgressSlices: 0,
+          maximumConsecutiveZeroProgressSlices: 0,
+          consecutiveZeroProgressSlices: 0,
+          outcomeDetails: { 0: 2 },
+        },
+        diagnostics: {
+          booted: true,
+          memoryPages: release.runtime.abi.memoryInitialPages,
+          totalBootReads: 7,
+          totalDiReads: 8,
+          totalRenderCalls: 1,
+          totalColdInstalls: 64,
+          pendingControllerSample: false,
+          totalControllerRetries: 0,
+          tableSlots: 65_536,
+          machineEvidence: {
+            available: true,
+            bytes: release.runtime.abi.machineEvidenceBytes,
+            encoding: "base64",
+            payload: "A".repeat(
+              Math.ceil(release.runtime.abi.machineEvidenceBytes / 3) * 4,
+            ),
+          },
+        },
+        failure: null,
+      },
+      renderer: {
+        diagnostics: { presentXfbCalls: 1 },
+        hasPresentedXfb: true,
+        hostDiagnostics: {},
+      },
+      capabilityBoundary: {
+        rawDiscBytesOnly: true,
+        opaqueRendererRequestsAndReceipts: true,
+        opaqueMachineEvidence: true,
+        javascriptDispatchTableSets: 0,
+        javascriptGuestMemoryReads: 0,
       },
     },
-    frontend: asset("frontend", "html", 1234),
-    renderer: {
-      javascript: asset("renderer", "js", 2345),
-      wasm: asset("renderer-wasm", "wasm", 3456),
-    },
-    dsp: asset("browser-dsp", "wasm", 4567),
-    backend: {
-      url: "/ppcwasmjit.wasm",
-      sha256: hash,
-      bytes: WASM_CHUNK_SIZE,
-      chunkSize: WASM_CHUNK_SIZE,
-      chunks: [asset("ppcwasmjit-0000", "wasm", WASM_CHUNK_SIZE)],
-    },
   };
-  release.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(release)));
-  return release;
 }
 
 function readyState(frameUrl, publicUrl) {
@@ -112,7 +154,10 @@ test("public release pins the outer path and immutable iframe identity", async (
     status: 200,
   }, options);
   assert.equal(identity.frontend.url, release.frontend.url);
-  assert.deepEqual(identity.dsp, release.dsp);
+  assert.equal(identity.runtime.choice, release.runtime.choice);
+  assert.deepEqual(identity.runtime.abi, release.runtime.abi);
+  assert.deepEqual(identity.bootstrap.document, release.bootstrap.document);
+  assert.equal(identity.rollback.release.releaseId, release.rollback.release.releaseId);
   assert.equal(identity.commit, release.source.commit);
   assert.equal(identity.releaseId, release.releaseId);
 
@@ -136,6 +181,306 @@ test("public release pins the outer path and immutable iframe identity", async (
     }, options, { ...identity, releaseId: "3".repeat(64) }),
     /changed during observation/,
   );
+});
+
+test("compact public identity fails closed on resident, bootstrap, and rollback drift", async () => {
+  const release = await activeRelease();
+  const identity = await validateObservedPublicActiveRelease({
+    body: JSON.stringify(release),
+    controlled: true,
+    error: null,
+    pathname: "/",
+    status: 200,
+  }, {
+    expectCommit: release.source.commit,
+    expectReleaseId: release.releaseId,
+    publicUrl: "https://gekko.free/",
+  });
+  const cases = [
+    ["runtime", value => { delete value.runtime.coordinator; }, /runtime.*coordinator/],
+    ["runtime ABI", value => { value.runtime.abi.machineEvidenceBytes += 1; }, /machineEvidenceBytes/],
+    [
+      "runtime artifact substitution",
+      value => {
+        value.runtime.core.sha256 = "6".repeat(64);
+        value.runtime.core.url = `/assets/browser-machine-${"6".repeat(64)}.wasm`;
+      },
+      /releaseId.*authenticate the compact schema-4 identity/,
+    ],
+    ["bootstrap", value => { value.bootstrap.document.url = "/"; }, /bootstrap\.document\.url/],
+    [
+      "bootstrap digest substitution",
+      value => { value.bootstrap.document.sha256 = "7".repeat(64); },
+      /releaseId.*authenticate the compact schema-4 identity/,
+    ],
+    ["rollback", value => { delete value.rollback.release.releaseId; }, /rollback\.release.*releaseId/],
+    [
+      "nested rollback bytes",
+      value => { value.rollback.release.frontend.bytes += 1; },
+      /rollback\.release\.releaseId.*authenticate the nested rollback manifest/,
+    ],
+    ["rollback schema", value => { value.rollback.release.schema = 4; }, /rollback\.release\.schema/],
+  ];
+  for (const [label, mutate, pattern] of cases) {
+    const changed = structuredClone(identity);
+    mutate(changed);
+    assert.throws(
+      () => validateCompactPublicActiveRelease(changed),
+      pattern,
+      label,
+    );
+  }
+});
+
+test("resident readiness binds the same-origin document without legacy controls", async () => {
+  const manifest = await activeRelease();
+  const release = compactPublicActiveRelease(manifest);
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = expectedPublicFrameUrl(publicUrl, release);
+  const binding = residentBinding(publicUrl, frameUrl);
+  const state = {
+    binding,
+    dataset: { renderer: "wgpu-webgpu", status: "waiting" },
+    discStatus: "open a disc",
+    frameHidden: false,
+    frameReadyState: "complete",
+    hasDiscInput: true,
+    hasResult: true,
+    result: JSON.stringify({ status: "waiting" }),
+    runnerAvailable: true,
+    statusHidden: true,
+    surface: "release",
+    topReadyState: "complete",
+  };
+  const expressions = [];
+  const session = {
+    exceptions: [],
+    async evaluate(expression) {
+      expressions.push(expression);
+      return state;
+    },
+  };
+  assert.strictEqual(await waitForPublicResidentRelease(session, {
+    deadline: Date.now() + 1_000,
+    expectedFrameUrl: frameUrl,
+    pollMs: 0,
+    publicUrl,
+  }), state);
+  assert.equal(expressions.length, 1);
+  assert.match(expressions[0], /lazuliCycleRunner\?\.snapshot/);
+  assert.match(expressions[0], /body\?\.dataset/);
+  assert.match(expressions[0], /#disc-file/);
+  assert.match(expressions[0], /#result/);
+  assert.doesNotMatch(
+    expressions[0],
+    /lazuliCompatibilityDebug|selectScenario|capture-diagnostics|requestId|read_presented_xfb|\bpc\b/i,
+  );
+
+  await assert.rejects(
+    waitForPublicResidentRelease({ ...session, async evaluate() {
+      return { ...state, binding: residentBinding(publicUrl, frameUrl, 1) };
+    } }, {
+      deadline: Date.now() + 1_000,
+      expectedBinding: binding,
+      expectedFrameUrl: frameUrl,
+      pollMs: 0,
+      publicUrl,
+    }),
+    /resident document identity changed/,
+  );
+});
+
+test("resident disc assignment remains bound to the ready document", async () => {
+  const release = compactPublicActiveRelease(await activeRelease());
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = expectedPublicFrameUrl(publicUrl, release);
+  const binding = residentBinding(publicUrl, frameUrl);
+  const calls = [];
+  const session = {
+    exceptions: [],
+    async evaluate(expression) {
+      calls.push({ expression, method: "evaluate" });
+      return { activated: true, binding, dispatched: true, fileCount: 1 };
+    },
+    async send(method, params) {
+      calls.push({ method, params });
+      if (method === "Runtime.evaluate") return { result: { objectId: "resident-disc-input" } };
+      return {};
+    },
+  };
+  assert.deepEqual(await assignPublicResidentDisc(session, "/tmp/disc.ciso", {
+    deadline: Date.now() + 1_000,
+    expectedBinding: binding,
+    expectedFrameUrl: frameUrl,
+    pollMs: 0,
+    publicUrl,
+  }), { activated: true, binding, dispatched: true, fileCount: 1 });
+  assert.ok(calls.some(call => call.method === "DOM.setFileInputFiles"));
+  assert.ok(calls.some(call => call.method === "Runtime.releaseObject"));
+  const residentExpressions = calls
+    .filter(call => typeof call.params?.expression === "string" || typeof call.expression === "string")
+    .map(call => call.params?.expression ?? call.expression);
+  assert.equal(residentExpressions.length, 2);
+  for (const expression of residentExpressions) {
+    assert.match(expression, /expectedBinding/);
+    assert.match(expression, /#disc-file/);
+    assert.doesNotMatch(expression, /lazuliCompatibilityDebug|selectScenario|capture-diagnostics/);
+  }
+});
+
+test("resident diagnostics bind runner return to the same frame and result JSON", async () => {
+  const release = compactPublicActiveRelease(await activeRelease());
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = expectedPublicFrameUrl(publicUrl, release);
+  const binding = residentBinding(publicUrl, frameUrl);
+  const capture = residentCapture(release, binding);
+  const expressions = [];
+  const session = {
+    exceptions: [],
+    async evaluate(expression) {
+      expressions.push(expression);
+      return capture;
+    },
+  };
+  assert.strictEqual(await capturePublicResidentDiagnostics(session, {
+    expectedBinding: binding,
+    expectedFrameUrl: frameUrl,
+    publicUrl,
+    release,
+  }), capture);
+  assert.equal(expressions.length, 1);
+  assert.match(expressions[0], /await runner\.snapshot\(\)/);
+  assert.match(expressions[0], /frame\.contentDocument !== frameDocument/);
+  assert.match(expressions[0], /frameDocument\.querySelector\("#result"\) !== result/);
+  assert.match(expressions[0], /JSON\.stringify\(published\) !== JSON\.stringify\(report\)/);
+  assert.doesNotMatch(
+    expressions[0],
+    /lazuliCompatibilityDebug|selectScenario|capture-diagnostics|read_presented_xfb|read_presented_surface|\bpc\b/i,
+  );
+});
+
+test("resident milestone rejects malformed boot, progress, evidence, presentation, and drift", async () => {
+  const release = compactPublicActiveRelease(await activeRelease());
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = expectedPublicFrameUrl(publicUrl, release);
+  const binding = residentBinding(publicUrl, frameUrl);
+  const options = { expectedBinding: binding, expectedFrameUrl: frameUrl, publicUrl, release };
+  const cases = [
+    ["boot", value => { value.report.session.boot.status = 2; }, /boot\.status.*did not commit/],
+    ["no Rust slice", value => {
+      value.report.session.totals.rustSlices = 0;
+      value.report.session.totals.executedCycles = "0";
+      value.report.session.totals.executedInstructions = "0";
+      value.report.session.totals.outcomeDetails = {};
+    }, /no Rust slice/],
+    ["noncanonical cycles", value => {
+      value.report.session.totals.executedCycles = "01";
+    }, /canonical unsigned decimal/],
+    ["zero progress", value => {
+      value.report.session.totals.executedCycles = "0";
+      value.report.session.totals.executedInstructions = "0";
+    }, /positive progress/],
+    ["impossible progress", value => {
+      value.report.session.totals.executedCycles = "0";
+    }, /positive instructions cannot accompany zero executed cycles/],
+    ["unaccounted Rust slice", value => {
+      value.report.session.totals.outcomeDetails[0] = 1;
+    }, /account for every Rust slice/],
+    ["evidence bytes", value => {
+      value.report.session.diagnostics.machineEvidence.bytes -= 1;
+    }, /authenticated ABI length/],
+    ["evidence alphabet", value => {
+      value.report.session.diagnostics.machineEvidence.payload = "!".repeat(1_088);
+    }, /length or alphabet changed/],
+    ["evidence unavailable", value => {
+      value.report.session.diagnostics.machineEvidence.available = false;
+      value.report.session.diagnostics.machineEvidence.payload = null;
+    }, /opaque evidence is unavailable/],
+    ["no first presentation", value => {
+      value.report.renderer.hasPresentedXfb = false;
+    }, /no XFB has been presented/],
+    ["no presentation call", value => {
+      value.report.renderer.diagnostics.presentXfbCalls = 0;
+    }, /no presentation call/],
+    ["no machine render", value => {
+      value.report.session.diagnostics.totalRenderCalls = 0;
+    }, /no machine render call/],
+    ["runtime drift", value => { value.report.runtime.worker.bytes += 1; }, /frozen resident contract/],
+    ["result mismatch", value => { value.resultMatched = false; }, /same result element JSON/],
+    ["document drift", value => { value.binding.frameDocumentTimeOrigin += 1; }, /identity changed/],
+    ["capability drift", value => {
+      value.report.capabilityBoundary.javascriptGuestMemoryReads = 1;
+    }, /frozen resident contract/],
+    ["failure", value => { value.report.session.failure = "worker stopped"; }, /session failed/],
+  ];
+  for (const [label, mutate, pattern] of cases) {
+    const value = structuredClone(residentCapture(release, binding));
+    mutate(value);
+    assert.throws(
+      () => validatePublicResidentDiagnosticCapture(value, options),
+      pattern,
+      label,
+    );
+  }
+  assert.doesNotThrow(() => assertNoPublicResidentExceptions([]));
+  assert.throws(() => assertNoPublicResidentExceptions([{ text: "boom" }]), /expected no exceptions/);
+  await assert.rejects(
+    capturePublicResidentDiagnostics({
+      exceptions: [{ text: "boom" }],
+      async evaluate() { assert.fail("capture ran after a DevTools exception"); },
+    }, options),
+    /expected no exceptions/,
+  );
+});
+
+test("resident first-XFB wait retries only a well-formed pending milestone", async () => {
+  const release = compactPublicActiveRelease(await activeRelease());
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = expectedPublicFrameUrl(publicUrl, release);
+  const binding = residentBinding(publicUrl, frameUrl);
+  const pending = residentCapture(release, binding);
+  pending.report.renderer.hasPresentedXfb = false;
+  const ready = residentCapture(release, binding);
+  const captures = [pending, ready];
+  const session = {
+    exceptions: [],
+    async evaluate() { return captures.shift() ?? ready; },
+  };
+  assert.strictEqual(await waitForPublicResidentFirstXfb(session, {
+    deadline: Date.now() + 1_000,
+    expectedBinding: binding,
+    expectedFrameUrl: frameUrl,
+    pollMs: 0,
+    publicUrl,
+    release,
+  }), ready);
+});
+
+test("resident navigation pins one immutable iframe loader", async () => {
+  const publicUrl = "https://gekko.free/";
+  const frameUrl = "https://gekko.free/assets/frontend-immutable.html";
+  const session = {
+    exceptions: [],
+    async send(method) {
+      assert.equal(method, "Page.getFrameTree");
+      return {
+        frameTree: {
+          frame: { id: "top", loaderId: "top-loader", url: publicUrl },
+          childFrames: [{
+            frame: { id: "resident", loaderId: "resident-loader", url: frameUrl },
+          }],
+        },
+      };
+    },
+  };
+  assert.deepEqual(await observePublicResidentNavigation(session, {
+    expectedFrameUrl: frameUrl,
+    expectedTopLoaderId: "top-loader",
+    publicUrl,
+  }), {
+    top: { frameId: "top", loaderId: "top-loader", url: publicUrl },
+    frame: { frameId: "resident", loaderId: "resident-loader", url: frameUrl },
+  });
 });
 
 test("public readiness requires the exact top-level and immutable frame URLs", async () => {

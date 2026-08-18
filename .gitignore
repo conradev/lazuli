@@ -9,3 +9,11 @@ log.log
 /[Rr][Oo][Mm]/
 /web/dist
 /.wrangler/
+
+# Local resident-runtime evidence is generated from authenticated private game images.
+# Production attestations are transferred as immutable workflow artifacts, never committed.
+/tools/resident_machine_production_fidelity_attestation.json
+/tools/resident_machine_perf_*_report.json
+/tools/resident_machine_first_frame_*_report.json
+/tools/*.rgba
+/tools/*.jsonl

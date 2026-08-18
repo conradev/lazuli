@@ -8,9 +8,16 @@ import process from "node:process";
 
 import {
   RELEASE_SCHEMA,
-  WASM_CHUNK_SIZE,
+  RELEASE_BOOTSTRAP_URLS,
+  RESIDENT_RUNTIME_ABI,
+  RESIDENT_RUNTIME_CHOICE,
   releaseIdentityPayload,
+  releaseAssets,
+  rollbackReleaseAssets,
   sha256Hex,
+  validateRelease,
+  validateRollbackRelease,
+  verifyAssetBytes,
 } from "../web/release.mjs";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -19,7 +26,9 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const RENDERER_JAVASCRIPT_NAME = "browser_renderer.js";
 const RENDERER_WASM_NAME = "browser_renderer_bg.wasm";
 const RENDERER_IMPORT_URL = `/${RENDERER_JAVASCRIPT_NAME}`;
-const DSP_IMPORT_URL = "/browser_dsp.wasm";
+const RESIDENT_RUNTIME_MARKER = "__LAZULI_RESIDENT_RELEASE_RUNTIME__";
+const RESIDENT_ADAPTER_NAME = "resident-machine.mjs";
+const RESIDENT_WORKER_NAME = "resident-machine-worker.mjs";
 const DSP_ATTRIBUTION_URL =
   "https://github.com/dolphin-emu/dolphin/blob/a5e2a0d97307ef146879a6f46a86d728a3ac2e97/docs/DSP/free_dsp_rom/dsp_rom_readme.txt";
 const THIRD_PARTY_NOTICES_NAME = "THIRD-PARTY-NOTICES.txt";
@@ -37,11 +46,8 @@ const GENERIC_DISC_SOURCE_CONFIG = `const defaultDiscSourceConfig = false
         ? { kind: "boot-assets" }
         : null;`;
 const STATIC_FILES = [
-  "index.html",
   "app.webmanifest",
   "icon.svg",
-  "release.mjs",
-  "sw.js",
 ];
 const DEBUG_UI_START = "<!-- LAZULI DEBUG UI START -->";
 const DEBUG_UI_END = "<!-- LAZULI DEBUG UI END -->";
@@ -90,6 +96,222 @@ async function contentAsset(directory, prefix, extension, bytes) {
   return { url: `/assets/${name}`, sha256, bytes: bytes.byteLength };
 }
 
+async function stableAsset(url, bytes) {
+  return {
+    url,
+    sha256: await sha256Hex(bytes),
+    bytes: bytes.byteLength,
+  };
+}
+
+function exactWasmBoundary(bytes, expectedImports, expectedExports, label) {
+  let module;
+  try {
+    module = new WebAssembly.Module(bytes);
+  } catch (error) {
+    throw new Error(`${label} is not valid Wasm: ${error.message}`);
+  }
+  check(
+    JSON.stringify(WebAssembly.Module.imports(module)) === JSON.stringify(expectedImports),
+    `${label} imports crossed the resident boundary`,
+  );
+  check(
+    JSON.stringify(WebAssembly.Module.exports(module)) === JSON.stringify(expectedExports),
+    `${label} exports crossed the resident boundary`,
+  );
+  return module;
+}
+
+function requiredWasmFunction(exports, name, label) {
+  const value = exports[name];
+  check(typeof value === "function", `${label} is missing ${name}`);
+  return value;
+}
+
+function exactAdapterConstant(source, name, expected) {
+  const match = source.match(new RegExp(`const\\s+${name}\\s*=\\s*([0-9_]+)(?:n)?\\s*;`));
+  check(match !== null, `resident adapter does not declare ${name}`);
+  check(Number(match[1].replaceAll("_", "")) === expected, `resident adapter ${name} ABI changed`);
+}
+
+function adapterRequiredCoreFunctions(source) {
+  const match = source.match(/const\s+REQUIRED_CORE_FUNCTIONS\s*=\s*\[([\s\S]*?)\];/);
+  check(match !== null, "resident adapter does not declare REQUIRED_CORE_FUNCTIONS");
+  const names = [...match[1].matchAll(/"([a-zA-Z0-9_]+)"/g)].map(item => item[1]);
+  check(names.length > 0 && new Set(names).size === names.length,
+    "resident adapter required-core list is empty or duplicated");
+  return names;
+}
+
+export function requireUnselectedGameFidelitySnapshot(core, stage) {
+  const pointer = requiredWasmFunction(
+    core,
+    "core_game_fidelity_snapshot",
+    "resident core",
+  )() >>> 0;
+  check(
+    pointer === 0,
+    `resident core exposed a game-fidelity snapshot ${stage} authenticated title selection`,
+  );
+}
+
+export function deriveResidentRuntimeAbi(coreBytes, dispatcherBytes, coordinatorBytes, adapterSource) {
+  const coreModule = new WebAssembly.Module(coreBytes);
+  check(
+    JSON.stringify(WebAssembly.Module.imports(coreModule)) ===
+      JSON.stringify([{ module: "lazuli", name: "memory", kind: "memory" }]),
+    "resident core imports crossed the resident boundary",
+  );
+  const memory = new WebAssembly.Memory({
+    initial: RESIDENT_RUNTIME_ABI.memoryInitialPages,
+    maximum: RESIDENT_RUNTIME_ABI.memoryMaximumPages,
+  });
+  let core;
+  try {
+    core = new WebAssembly.Instance(coreModule, { lazuli: { memory } }).exports;
+  } catch (error) {
+    throw new Error(`resident core rejected the canonical memory ABI: ${error.message}`);
+  }
+  for (const name of adapterRequiredCoreFunctions(adapterSource)) {
+    requiredWasmFunction(core, name, "resident core required by adapter");
+  }
+  for (const name of [
+    "core_abi_version",
+    "core_compile_request_bytes",
+    "core_host_request_bytes",
+    "core_machine_evidence_bytes",
+    "core_machine_evidence_snapshot",
+    "core_game_fidelity_bytes",
+    "core_game_fidelity_requested_buttons",
+    "core_game_fidelity_requested_stick_xy_cxy",
+    "core_game_fidelity_requested_trigger_lrab",
+    "core_game_fidelity_phase",
+    "core_game_fidelity_snapshot",
+    "core_memory_initial_pages",
+    "core_memory_maximum_pages",
+    "core_dispatch_slot_capacity",
+    "core_init",
+    "core_begin_slice",
+    "core_current_run_outcome",
+    "core_finish_slice",
+    "validate_instruction_page_dependency",
+  ]) {
+    requiredWasmFunction(core, name, "resident core");
+  }
+  for (const name of [
+    "core_game_fidelity_bytes",
+    "core_game_fidelity_requested_buttons",
+    "core_game_fidelity_requested_stick_xy_cxy",
+    "core_game_fidelity_requested_trigger_lrab",
+    "core_game_fidelity_phase",
+    "core_game_fidelity_snapshot",
+  ]) {
+    check(core[name].length === 0, `resident core ${name} signature is not zero-argument`);
+  }
+  requireUnselectedGameFidelitySnapshot(core, "before");
+  const abi = {
+    coreVersion: core.core_abi_version() >>> 0,
+    compileRequestBytes: core.core_compile_request_bytes() >>> 0,
+    hostRequestBytes: core.core_host_request_bytes() >>> 0,
+    runOutcomeBytes: 0,
+    machineEvidenceBytes: core.core_machine_evidence_bytes() >>> 0,
+    gameFidelityBytes: core.core_game_fidelity_bytes() >>> 0,
+    memoryInitialPages: core.core_memory_initial_pages() >>> 0,
+    memoryMaximumPages: core.core_memory_maximum_pages() >>> 0,
+  };
+  check(core.core_init() === 1, "resident core did not initialize for ABI derivation");
+  const machineEvidencePointer = core.core_machine_evidence_snapshot() >>> 0;
+  check(
+    machineEvidencePointer !== 0 && machineEvidencePointer % 8 === 0 &&
+      machineEvidencePointer + abi.machineEvidenceBytes <= memory.buffer.byteLength,
+    "resident core machine-evidence snapshot ABI is invalid",
+  );
+  requireUnselectedGameFidelitySnapshot(core, "after");
+  check(core.core_begin_slice(0n, 0) === 0, "resident core accepted a zero-cap ABI probe");
+  const outcomePointer = core.core_current_run_outcome() >>> 0;
+  check(outcomePointer !== 0 && outcomePointer + 8 <= memory.buffer.byteLength,
+    "resident core did not publish its zero-cap outcome ABI");
+  const outcome = new DataView(memory.buffer, outcomePointer, 8);
+  check(outcome.getUint32(0, true) === abi.coreVersion, "resident outcome ABI version changed");
+  abi.runOutcomeBytes = outcome.getUint32(4, true);
+
+  for (const [name, expected] of Object.entries(RESIDENT_RUNTIME_ABI)) {
+    check(abi[name] === expected, `resident ABI ${name} is ${abi[name]}, expected ${expected}`);
+  }
+  exactAdapterConstant(adapterSource, "COMPILE_REQUEST_BYTES", abi.compileRequestBytes);
+  exactAdapterConstant(adapterSource, "HOST_REQUEST_BYTES", abi.hostRequestBytes);
+  exactAdapterConstant(adapterSource, "RUN_OUTCOME_BYTES", abi.runOutcomeBytes);
+  exactAdapterConstant(
+    adapterSource,
+    "RESIDENT_MEMORY_INITIAL_PAGES",
+    abi.memoryInitialPages,
+  );
+  exactAdapterConstant(
+    adapterSource,
+    "RESIDENT_MEMORY_MAXIMUM_PAGES",
+    abi.memoryMaximumPages,
+  );
+
+  const dispatcherModule = exactWasmBoundary(
+    dispatcherBytes,
+    [
+      { module: "lazuli", name: "memory", kind: "memory" },
+      {
+        module: "lazuli",
+        name: "validate_instruction_page_dependency",
+        kind: "function",
+      },
+    ],
+    [
+      { name: "run", kind: "function" },
+      { name: "blocks", kind: "table" },
+    ],
+    "resident dispatcher",
+  );
+  const dispatcher = new WebAssembly.Instance(dispatcherModule, {
+    lazuli: {
+      memory,
+      validate_instruction_page_dependency: core.validate_instruction_page_dependency,
+    },
+  }).exports;
+  const slotCapacity = core.core_dispatch_slot_capacity() >>> 0;
+  check(slotCapacity > 0 && dispatcher.blocks instanceof WebAssembly.Table,
+    "resident dispatcher table ABI is invalid");
+  check(dispatcher.blocks.length <= slotCapacity, "resident dispatcher exceeds the core slot ABI");
+  if (dispatcher.blocks.length < slotCapacity) {
+    dispatcher.blocks.grow(slotCapacity - dispatcher.blocks.length);
+  }
+
+  const coordinatorModule = exactWasmBoundary(
+    coordinatorBytes,
+    [
+      { module: "lazuli", name: "memory", kind: "memory" },
+      { module: "lazuli_core", name: "core_begin_slice", kind: "function" },
+      { module: "lazuli_core", name: "core_finish_slice", kind: "function" },
+      { module: "lazuli_core", name: "core_current_run_outcome", kind: "function" },
+      { module: "lazuli_dispatch", name: "run", kind: "function" },
+    ],
+    [{ name: "core_run", kind: "function" }],
+    "resident coordinator",
+  );
+  let coordinator;
+  try {
+    coordinator = new WebAssembly.Instance(coordinatorModule, {
+      lazuli: { memory },
+      lazuli_core: {
+        core_begin_slice: core.core_begin_slice,
+        core_finish_slice: core.core_finish_slice,
+        core_current_run_outcome: core.core_current_run_outcome,
+      },
+      lazuli_dispatch: { run: dispatcher.run },
+    }).exports;
+  } catch (error) {
+    throw new Error(`resident coordinator rejected the linked core/dispatcher ABI: ${error.message}`);
+  }
+  requiredWasmFunction(coordinator, "core_run", "resident coordinator");
+  return Object.freeze({ ...abi });
+}
+
 function sourceMetadata(repository, commit) {
   return {
     repository,
@@ -136,18 +358,28 @@ export function assertGenericFrontend(html) {
   );
 }
 
-function licensedFrontend(html, source, rendererJavascriptUrl, dspUrl) {
+function licensedFrontend(html, source, rendererJavascriptUrl, runtime) {
   assertGenericFrontend(html);
   html = withoutDebugUi(html);
   const sourceAnchor = '<a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a>';
   check(html.includes(sourceAnchor), "generated frontend does not contain the expected source link");
-  check(html.includes('new URL("/ppcwasmjit.wasm", location.href)'), "generated frontend has no browser compiler URL");
-  check(html.includes(`new URL("${DSP_IMPORT_URL}", location.href)`), "generated frontend has no browser DSP URL");
+  check(!html.includes("/ppcwasmjit.wasm"), "generated frontend still contains the legacy compiler URL");
+  check(!html.includes("/browser_dsp.wasm"), "generated frontend still contains the legacy DSP URL");
   check(html.includes(RENDERER_IMPORT_URL), "generated frontend has no browser renderer import");
+  check(
+    html.split(RESIDENT_RUNTIME_MARKER).length === 2,
+    "generated frontend must contain exactly one resident runtime marker",
+  );
+  for (const field of ["worker", "core", "dispatcher", "coordinator"]) {
+    check(
+      html.includes(`residentReleaseRuntime.${field}.url`),
+      `generated frontend does not consume residentReleaseRuntime.${field}.url`,
+    );
+  }
+  html = html.replace(RESIDENT_RUNTIME_MARKER, JSON.stringify(runtime));
+  check(!html.includes(RESIDENT_RUNTIME_MARKER), "generated frontend retained its runtime marker");
   html = html.replaceAll(RENDERER_IMPORT_URL, rendererJavascriptUrl);
   check(!html.includes(RENDERER_IMPORT_URL), "generated frontend still imports the stable browser renderer URL");
-  html = html.replaceAll(DSP_IMPORT_URL, dspUrl);
-  check(!html.includes(DSP_IMPORT_URL), "generated frontend still imports the stable browser DSP URL");
   const links = [
     CAPTURE_DIAGNOSTICS_CONTROL,
     `<a href="${source.tree}" target="_blank" rel="source noopener">Source</a>`,
@@ -216,31 +448,103 @@ ${THIRD_PARTY_NOTICES_URL}
 `;
 }
 
+async function loadRollback(options) {
+  const release = options.rollbackRelease ?? JSON.parse(
+    await readFile(resolve(options.rollbackReleasePath), "utf8"),
+  );
+  await validateRollbackRelease(release);
+  const directory = resolve(
+    options.rollbackDirectory ?? dirname(resolve(options.rollbackReleasePath)),
+  );
+  return { release, directory };
+}
+
+async function copyVerifiedRollbackAssets(rollback, output) {
+  for (const asset of releaseAssets(rollback.release)) {
+    const relativePath = asset.url.slice(1);
+    const sourcePath = resolve(rollback.directory, relativePath);
+    const sourceRemainder = relative(rollback.directory, sourcePath);
+    check(
+      sourceRemainder !== "" && !sourceRemainder.startsWith("..") && !sourceRemainder.startsWith("/"),
+      `rollback asset escapes its directory: ${asset.url}`,
+    );
+    const bytes = await readFile(sourcePath);
+    await verifyAssetBytes(asset, bytes);
+    const destination = resolve(output, relativePath);
+    const destinationRemainder = relative(output, destination);
+    check(
+      destinationRemainder !== "" && !destinationRemainder.startsWith("..") &&
+        !destinationRemainder.startsWith("/"),
+      `rollback asset escapes output: ${asset.url}`,
+    );
+    await mkdir(dirname(destination), { recursive: true });
+    try {
+      const existing = await readFile(destination);
+      await verifyAssetBytes(asset, existing);
+      check(existing.equals(bytes), `rollback asset collides with primary asset ${asset.url}`);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await writeFile(destination, bytes);
+    }
+  }
+}
+
 export async function buildWeb(options) {
   const appPath = resolve(options.appPath);
-  const wasmPath = resolve(options.wasmPath);
-  const dspPath = resolve(options.dspPath);
+  const corePath = resolve(options.corePath);
+  const dispatcherPath = resolve(options.dispatcherPath);
+  const coordinatorPath = resolve(options.coordinatorPath);
   const generatedDirectory = dirname(appPath);
   const rendererJavascriptPath = join(generatedDirectory, RENDERER_JAVASCRIPT_NAME);
   const rendererWasmPath = join(generatedDirectory, RENDERER_WASM_NAME);
   const output = outputDirectory(options.outputPath);
+  const webDirectory = resolve(options.webDirectory ?? join(PROJECT_ROOT, "web"));
   const repository = (options.repository ?? DEFAULT_REPOSITORY).replace(/\/$/, "");
   const commit = options.commit;
   check(COMMIT_PATTERN.test(commit), "--commit must be a lowercase 40-character Git commit");
   check(repository === DEFAULT_REPOSITORY, `unsupported source repository ${repository}`);
 
   const source = sourceMetadata(repository, commit);
-  const [generatedHtml, wasm, dspWasm, rendererJavascriptSource, rendererWasm] = await Promise.all([
+  const rollback = await loadRollback(options);
+  const [
+    generatedHtml,
+    rendererJavascriptSource,
+    rendererWasm,
+    coreWasm,
+    dispatcherWasm,
+    coordinatorWasm,
+    adapterSource,
+    workerSource,
+    bootstrapDocumentBytes,
+    bootstrapReleaseModuleBytes,
+    bootstrapServiceWorkerBytes,
+  ] = await Promise.all([
     readFile(appPath, "utf8"),
-    readFile(wasmPath),
-    readFile(dspPath),
     readFile(rendererJavascriptPath, "utf8"),
     readFile(rendererWasmPath),
+    readFile(corePath),
+    readFile(dispatcherPath),
+    readFile(coordinatorPath),
+    readFile(join(webDirectory, RESIDENT_ADAPTER_NAME), "utf8"),
+    readFile(join(webDirectory, RESIDENT_WORKER_NAME), "utf8"),
+    readFile(join(webDirectory, RELEASE_BOOTSTRAP_URLS.document.slice(1))),
+    readFile(join(webDirectory, RELEASE_BOOTSTRAP_URLS.releaseModule.slice(1))),
+    readFile(join(webDirectory, RELEASE_BOOTSTRAP_URLS.serviceWorker.slice(1))),
   ]);
-  check(wasm.byteLength > 0, "browser compiler is empty");
-  check(dspWasm.byteLength > 0, "browser DSP is empty");
   check(rendererJavascriptSource.length > 0, "browser renderer JavaScript is empty");
   check(rendererWasm.byteLength > 0, "browser renderer wasm is empty");
+  check(coreWasm.byteLength > 0, "resident core is empty");
+  check(dispatcherWasm.byteLength > 0, "resident dispatcher is empty");
+  check(coordinatorWasm.byteLength > 0, "resident coordinator is empty");
+  check(adapterSource.length > 0, "resident adapter is empty");
+  check(workerSource.length > 0, "resident worker is empty");
+  const verifyRuntimeAbi = options.runtimeAbiVerifier ?? deriveResidentRuntimeAbi;
+  const runtimeAbi = verifyRuntimeAbi(
+    coreWasm,
+    dispatcherWasm,
+    coordinatorWasm,
+    adapterSource,
+  );
 
   await rm(output, { recursive: true, force: true });
   const assetsDirectory = join(output, "assets");
@@ -280,30 +584,90 @@ export async function buildWeb(options) {
     wasm: rendererWasmAsset,
   };
 
-  const dsp = await contentAsset(assetsDirectory, "browser-dsp", "wasm", dspWasm);
+  const core = await contentAsset(assetsDirectory, "browser-machine", "wasm", coreWasm);
+  const dispatcher = await contentAsset(
+    assetsDirectory,
+    "resident-dispatcher",
+    "wasm",
+    dispatcherWasm,
+  );
+  const coordinator = await contentAsset(
+    assetsDirectory,
+    "core-run-coordinator",
+    "wasm",
+    coordinatorWasm,
+  );
+  const adapter = await contentAsset(
+    assetsDirectory,
+    "resident-machine-adapter",
+    "mjs",
+    new TextEncoder().encode(adapterSource),
+  );
+  const adapterImport = `from "./${RESIDENT_ADAPTER_NAME}"`;
+  check(
+    workerSource.split(adapterImport).length === 2,
+    "resident worker must contain exactly one canonical adapter import",
+  );
+  const packagedWorker = workerSource.replace(adapterImport, `from "${adapter.url}"`);
+  check(!packagedWorker.includes(adapterImport), "resident worker retained its mutable adapter import");
+  const worker = await contentAsset(
+    assetsDirectory,
+    "resident-machine-worker",
+    "mjs",
+    new TextEncoder().encode(packagedWorker),
+  );
+  const runtime = {
+    choice: RESIDENT_RUNTIME_CHOICE,
+    abi: { ...runtimeAbi },
+    core,
+    dispatcher,
+    coordinator,
+    adapter,
+    worker,
+  };
 
   const frontendBytes = new TextEncoder().encode(
-    licensedFrontend(generatedHtml, source, renderer.javascript.url, dsp.url),
+    licensedFrontend(generatedHtml, source, renderer.javascript.url, runtime),
   );
   const frontend = await contentAsset(assetsDirectory, "frontend", "html", frontendBytes);
-  const chunks = [];
-  for (let offset = 0; offset < wasm.byteLength; offset += WASM_CHUNK_SIZE) {
-    const bytes = wasm.subarray(offset, Math.min(offset + WASM_CHUNK_SIZE, wasm.byteLength));
-    chunks.push(await contentAsset(assetsDirectory, "backend", "wasm.chunk", bytes));
+  const bootstrap = {
+    document: await stableAsset(RELEASE_BOOTSTRAP_URLS.document, bootstrapDocumentBytes),
+    releaseModule: await stableAsset(
+      RELEASE_BOOTSTRAP_URLS.releaseModule,
+      bootstrapReleaseModuleBytes,
+    ),
+    serviceWorker: await stableAsset(
+      RELEASE_BOOTSTRAP_URLS.serviceWorker,
+      bootstrapServiceWorkerBytes,
+    ),
+  };
+  const release = {
+    schema: RELEASE_SCHEMA,
+    source,
+    bootstrap,
+    runtime,
+    frontend,
+    renderer,
+    rollback: { release: rollback.release },
+  };
+  release.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(release)));
+  await validateRelease(release);
+  await copyVerifiedRollbackAssets(rollback, output);
+  for (const asset of rollbackReleaseAssets(release)) {
+    await verifyAssetBytes(asset, await readFile(join(output, asset.url.slice(1))));
   }
 
-  const backend = {
-    url: "/ppcwasmjit.wasm",
-    sha256: await sha256Hex(wasm),
-    bytes: wasm.byteLength,
-    chunkSize: WASM_CHUNK_SIZE,
-    chunks,
-  };
-  const release = { schema: RELEASE_SCHEMA, source, frontend, renderer, dsp, backend };
-  release.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(release)));
-
-  const webDirectory = resolve(options.webDirectory ?? join(PROJECT_ROOT, "web"));
-  await Promise.all(STATIC_FILES.map(file => copyFile(join(webDirectory, file), join(output, file))));
+  await Promise.all([
+    ...STATIC_FILES.map(file => copyFile(join(webDirectory, file), join(output, file))),
+    ...Object.entries(bootstrap).map(([name, descriptor]) => {
+      const bytes = {
+        document: bootstrapDocumentBytes,
+        releaseModule: bootstrapReleaseModuleBytes,
+        serviceWorker: bootstrapServiceWorkerBytes,
+      }[name];
+      return writeFile(join(output, descriptor.url.slice(1)), bytes);
+    }),
+  ]);
   await Promise.all([
     copyFile(join(PROJECT_ROOT, "licenses/GPL-3.0-only.txt"), join(output, "LICENSE.txt")),
     copyFile(
@@ -327,8 +691,11 @@ function parseArguments(arguments_) {
     check(name?.startsWith("--") && value !== undefined, `invalid argument ${name ?? ""}`);
     const key = {
       "--app": "appPath",
-      "--wasm": "wasmPath",
-      "--dsp": "dspPath",
+      "--core": "corePath",
+      "--dispatcher": "dispatcherPath",
+      "--coordinator": "coordinatorPath",
+      "--rollback-release": "rollbackReleasePath",
+      "--rollback-directory": "rollbackDirectory",
       "--output": "outputPath",
       "--commit": "commit",
       "--repository": "repository",
@@ -336,7 +703,15 @@ function parseArguments(arguments_) {
     check(key !== undefined, `unknown argument ${name}`);
     options[key] = value;
   }
-  for (const key of ["appPath", "wasmPath", "dspPath", "outputPath", "commit"]) {
+  for (const key of [
+    "appPath",
+    "corePath",
+    "dispatcherPath",
+    "coordinatorPath",
+    "rollbackReleasePath",
+    "outputPath",
+    "commit",
+  ]) {
     check(typeof options[key] === "string", `missing required --${key.replace("Path", "")}`);
   }
   return options;

@@ -6,7 +6,13 @@ import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
 import { assertGenericFrontend } from "./build_web.mjs";
-import { sha256Hex, validateRelease } from "../web/release.mjs";
+import {
+  releaseAssets,
+  rollbackReleaseAssets,
+  sha256Hex,
+  validateRelease,
+  verifyAssetBytes,
+} from "../web/release.mjs";
 
 test("generated public artifact contains only the release surface", async () => {
   const directory = new URL("../web/dist/", import.meta.url);
@@ -15,7 +21,7 @@ test("generated public artifact contains only the release surface", async () => 
   const [
     frontend,
     rendererJavascript,
-    dspWasm,
+    residentWorker,
     sourcePage,
     thirdPartyNotices,
     vendoredFontLicense,
@@ -25,7 +31,7 @@ test("generated public artifact contains only the release surface", async () => 
       new URL(`.${release.renderer.javascript.url}`, directory),
       "utf8",
     ),
-    readFile(new URL(`.${release.dsp.url}`, directory)),
+    readFile(new URL(`.${release.runtime.worker.url}`, directory), "utf8"),
     readFile(new URL("source/index.html", directory), "utf8"),
     readFile(new URL("THIRD-PARTY-NOTICES.txt", directory)),
     readFile(
@@ -69,18 +75,23 @@ test("generated public artifact contains only the release surface", async () => 
     frontend,
     /<pre id="result" data-testid="browser-boot-result" hidden aria-hidden="true"><\/pre>\s*<\/main>/,
   );
-  assert.match(frontend, /globalThis, "lazuliCompatibilityDebug"/);
-  assert.match(frontend, /selectScenario: selectCompatibilityScenario/);
-  assert.match(
+  assert.doesNotMatch(
     frontend,
-    /runnerSearchForSurface\(\s*debugSurface,\s*location\.search,\s*selectedCompatibilityRunnerSearch\s*\)/,
+    /lazuliCompatibilityDebug|selectCompatibilityScenario|runnerSearchForSurface|selectedCompatibilityRunnerSearch/,
+  );
+  assert.doesNotMatch(
+    frontend,
+    /__LAZULI_RESIDENT_RELEASE_RUNTIME__|\/ppcwasmjit\.wasm|\/browser_dsp\.wasm/,
   );
   assert.ok(frontend.includes(release.renderer.javascript.url));
   assert.ok(!frontend.includes("/browser_renderer.js"));
-  assert.ok(frontend.includes(release.dsp.url));
+  assert.ok(frontend.includes(release.runtime.worker.url));
+  assert.ok(frontend.includes(release.runtime.core.url));
+  assert.ok(frontend.includes(release.runtime.dispatcher.url));
+  assert.ok(frontend.includes(release.runtime.coordinator.url));
   assert.ok(!frontend.includes("/browser_dsp.wasm"));
-  assert.equal(dspWasm.byteLength, release.dsp.bytes);
-  assert.equal(await sha256Hex(dspWasm), release.dsp.sha256);
+  assert.ok(residentWorker.includes(`from "${release.runtime.adapter.url}"`));
+  assert.ok(!residentWorker.includes('from "./resident-machine.mjs"'));
   assert.ok(rendererJavascript.includes(release.renderer.wasm.url));
   assert.ok(!rendererJavascript.includes("browser_renderer_bg.wasm"));
   assert.deepEqual(thirdPartyNotices, vendoredFontLicense);
@@ -98,6 +109,9 @@ test("generated public artifact contains only the release surface", async () => 
   );
   assert.match(sourcePage, /DSP ROM attribution[\s\S]*upstream source and contributor history/);
   assert.equal(release.source.license.expression, "GPL-3.0-only");
+  for (const asset of [...releaseAssets(release), ...rollbackReleaseAssets(release)]) {
+    await verifyAssetBytes(asset, await readFile(new URL(`.${asset.url}`, directory)));
+  }
   assert.doesNotMatch(
     JSON.stringify(release),
     /font_(?:japanese|western)\.bin/,

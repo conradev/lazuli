@@ -6,14 +6,20 @@ use std::{env, fs};
 
 use browser_dsp::{
     ABI_VERSION as DSP_ABI_VERSION, ARAM_BYTES as ARAM_SIZE, ARAM_OFFSET as ARAM_PTR,
-    MAIN_RAM_BYTES as RAM_SIZE, MAIN_RAM_OFFSET as RAM_PTR, MEMORY_INITIAL_PAGES,
-    MEMORY_MAXIMUM_PAGES, MMIO_BYTES as MMIO_SIZE, MMIO_OFFSET as MMIO_PTR,
+    LEGACY_MEMORY_INITIAL_PAGES, LEGACY_MEMORY_MAXIMUM_PAGES, MAIN_RAM_BYTES as RAM_SIZE,
+    MAIN_RAM_OFFSET as RAM_PTR, MMIO_BYTES as MMIO_SIZE, MMIO_OFFSET as MMIO_PTR,
 };
 use disks::binrw::BinRead;
 use disks::cso::{Cso, CsoReader};
 use disks::iso;
 use gekko::{GPR, Reg, SPR};
-use ppcwasmjit::gx_fifo_hook_runtime;
+use ppcwasmjit::{
+    SECONDARY_FASTMEM_CONTROL_OFFSET, SECONDARY_FASTMEM_END_OFFSET, SECONDARY_FASTMEM_ENTRY_COUNT,
+    SECONDARY_FASTMEM_LRU_OFFSET, SECONDARY_FASTMEM_MISSES_OFFSET, SECONDARY_FASTMEM_PAGE_SHIFT,
+    SECONDARY_FASTMEM_READ_HITS_OFFSET, SECONDARY_FASTMEM_READ_POINTER_OFFSET,
+    SECONDARY_FASTMEM_SET_COUNT, SECONDARY_FASTMEM_TAG_OFFSET, SECONDARY_FASTMEM_WRITE_HITS_OFFSET,
+    SECONDARY_FASTMEM_WRITE_POINTER_OFFSET, gx_fifo_hook_runtime,
+};
 
 const CPU_PTR: usize = 0x1000;
 const FASTMEM_LUT_PTR: usize = 0x1_0000;
@@ -24,11 +30,27 @@ const GX_FIFO_STAGING_DATA_PTR: usize = GX_FIFO_STAGING_META_PTR + 16;
 const GX_FIFO_STAGING_CAPACITY: usize = 64 * 1024;
 const FASTMEM_PAGE_SHIFT: u32 = 17;
 const FASTMEM_LUT_COUNT: usize = 1 << 15;
+const SECONDARY_FASTMEM_CONTROL_PTR: usize =
+    FASTMEM_LUT_PTR + SECONDARY_FASTMEM_CONTROL_OFFSET as usize;
+const SECONDARY_FASTMEM_LRU_PTR: usize = FASTMEM_LUT_PTR + SECONDARY_FASTMEM_LRU_OFFSET as usize;
+const SECONDARY_FASTMEM_TAG_PTR: usize = FASTMEM_LUT_PTR + SECONDARY_FASTMEM_TAG_OFFSET as usize;
+const SECONDARY_FASTMEM_READ_POINTER_PTR: usize =
+    FASTMEM_LUT_PTR + SECONDARY_FASTMEM_READ_POINTER_OFFSET as usize;
+const SECONDARY_FASTMEM_WRITE_POINTER_PTR: usize =
+    FASTMEM_LUT_PTR + SECONDARY_FASTMEM_WRITE_POINTER_OFFSET as usize;
+const SECONDARY_FASTMEM_READ_HITS_PTR: usize =
+    FASTMEM_LUT_PTR + SECONDARY_FASTMEM_READ_HITS_OFFSET as usize;
+const SECONDARY_FASTMEM_WRITE_HITS_PTR: usize =
+    FASTMEM_LUT_PTR + SECONDARY_FASTMEM_WRITE_HITS_OFFSET as usize;
+const SECONDARY_FASTMEM_MISSES_PTR: usize =
+    FASTMEM_LUT_PTR + SECONDARY_FASTMEM_MISSES_OFFSET as usize;
+const SECONDARY_FASTMEM_END_PTR: usize = FASTMEM_LUT_PTR + SECONDARY_FASTMEM_END_OFFSET as usize;
 const DISC_BI2_OFFSET: u64 = 0x440;
 const DISC_BI2_SIZE: usize = 0x2000;
 const CISO_HEADER_SIZE: usize = 0x8000;
 const GAMECUBE_DISC_BYTES: u64 = 0x57058000;
 const DISC_SOURCE_RUNTIME: &str = include_str!("browser_disc_source.mjs");
+const RESIDENT_FRONTEND_RUNTIME: &str = include_str!("browser_resident_frontend.mjs");
 const IPL_IMAGE_SIZE: usize = 2 * 1024 * 1024;
 const IPL_FONT_JAPANESE_OFFSET: usize = 0x1a_ff00;
 const IPL_FONT_JAPANESE: &[u8] = include_bytes!("../../../resources/ipl/font_japanese.bin");
@@ -216,14 +238,83 @@ fn copy_browser_asset(source: &PathBuf, destination: &PathBuf, label: &str) {
     });
 }
 
+fn write_resident_frontend(output: &PathBuf) {
+    const LEGACY_RUNNER_START: &str = "  <script id=\"runner-source\" type=\"text/plain\">";
+    const BODY_END: &str = "</body>";
+    const RELEASE_MARKER: &str = "__LAZULI_RESIDENT_RELEASE_RUNTIME__";
+
+    assert_eq!(
+        TEMPLATE.match_indices(LEGACY_RUNNER_START).count(),
+        1,
+        "legacy browser shell runner boundary changed"
+    );
+    assert_eq!(
+        TEMPLATE.match_indices(BODY_END).count(),
+        1,
+        "legacy browser shell body boundary changed"
+    );
+    assert_eq!(
+        RESIDENT_FRONTEND_RUNTIME
+            .match_indices(RELEASE_MARKER)
+            .count(),
+        1,
+        "resident frontend must contain exactly one release marker"
+    );
+    let runner_start = TEMPLATE
+        .find(LEGACY_RUNNER_START)
+        .expect("checked resident runner boundary");
+    let body_end = TEMPLATE
+        .find(BODY_END)
+        .expect("checked resident body boundary");
+    assert!(
+        runner_start < body_end,
+        "resident shell boundaries are reversed"
+    );
+
+    let html = format!(
+        "{}  <script type=\"module\">\n{}\n  </script>\n{}",
+        &TEMPLATE[..runner_start],
+        RESIDENT_FRONTEND_RUNTIME,
+        &TEMPLATE[body_end..],
+    );
+    assert!(
+        !html.contains("/ppcwasmjit.wasm"),
+        "resident frontend retained the legacy compiler"
+    );
+    assert!(
+        !html.contains("/browser_dsp.wasm"),
+        "resident frontend retained the legacy browser DSP"
+    );
+    assert!(
+        !html.contains("id=\"runner-source\""),
+        "resident frontend retained the legacy machine source"
+    );
+
+    let output_directory = output
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&output_directory).expect("failed to create resident frontend directory");
+    fs::write(output, html).expect("failed to write resident frontend");
+}
+
 fn main() {
     let mut arguments = env::args_os().skip(1);
     let output = arguments
         .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/ppcwasmjit-browser-boot/index.html"));
-    let compiler_path = arguments
-        .next()
+    let compiler_argument = arguments.next();
+    if compiler_argument.as_deref() == Some(std::ffi::OsStr::new("--resident-release")) {
+        assert!(
+            arguments.next().is_none(),
+            "resident frontend mode accepts only an output path"
+        );
+        write_resident_frontend(&output);
+        println!("{}", output.display());
+        return;
+    }
+    let compiler_path = compiler_argument
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/wasm32-unknown-unknown/release/ppcwasmjit.wasm"));
     let dsp_path = compiler_path.with_file_name("browser_dsp.wasm");
@@ -272,6 +363,10 @@ fn main() {
     assert!(
         IPL_FONT_WESTERN_OFFSET + IPL_FONT_WESTERN.len() <= IPL_IMAGE_SIZE,
         "bundled western IPL font exceeds the virtual IPL image"
+    );
+    assert!(
+        SECONDARY_FASTMEM_END_PTR <= RAM_PTR,
+        "secondary fastmem cache overlaps browser MEM1"
     );
 
     let output_directory = output
@@ -332,12 +427,12 @@ fn main() {
         )
         .replace("__TV_MODE__", &disc.tv_mode.to_string())
         .replace(
-            "__MEMORY_INITIAL_PAGES__",
-            &MEMORY_INITIAL_PAGES.to_string(),
+            "__LEGACY_MEMORY_INITIAL_PAGES__",
+            &LEGACY_MEMORY_INITIAL_PAGES.to_string(),
         )
         .replace(
-            "__MEMORY_MAXIMUM_PAGES__",
-            &MEMORY_MAXIMUM_PAGES.to_string(),
+            "__LEGACY_MEMORY_MAXIMUM_PAGES__",
+            &LEGACY_MEMORY_MAXIMUM_PAGES.to_string(),
         )
         .replace("__DSP_ABI_VERSION__", &DSP_ABI_VERSION.to_string())
         .replace("__CPU_PTR__", &CPU_PTR.to_string())
@@ -365,7 +460,52 @@ fn main() {
         )
         .replace("__FASTMEM_PAGE_SHIFT__", &FASTMEM_PAGE_SHIFT.to_string())
         .replace("__FASTMEM_LUT_COUNT__", &FASTMEM_LUT_COUNT.to_string())
+        .replace(
+            "__SECONDARY_FASTMEM_PAGE_SHIFT__",
+            &SECONDARY_FASTMEM_PAGE_SHIFT.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_ENTRY_COUNT__",
+            &SECONDARY_FASTMEM_ENTRY_COUNT.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_SET_COUNT__",
+            &SECONDARY_FASTMEM_SET_COUNT.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_CONTROL_PTR__",
+            &SECONDARY_FASTMEM_CONTROL_PTR.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_TAG_PTR__",
+            &SECONDARY_FASTMEM_TAG_PTR.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_LRU_PTR__",
+            &SECONDARY_FASTMEM_LRU_PTR.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_READ_POINTER_PTR__",
+            &SECONDARY_FASTMEM_READ_POINTER_PTR.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_WRITE_POINTER_PTR__",
+            &SECONDARY_FASTMEM_WRITE_POINTER_PTR.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_READ_HITS_PTR__",
+            &SECONDARY_FASTMEM_READ_HITS_PTR.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_WRITE_HITS_PTR__",
+            &SECONDARY_FASTMEM_WRITE_HITS_PTR.to_string(),
+        )
+        .replace(
+            "__SECONDARY_FASTMEM_MISSES_PTR__",
+            &SECONDARY_FASTMEM_MISSES_PTR.to_string(),
+        )
         .replace("__PC_OFFSET__", &Reg::PC.offset().to_string())
+        .replace("__CR_OFFSET__", &Reg::CR.offset().to_string())
         .replace("__CTR_OFFSET__", &SPR::CTR.offset().to_string())
         .replace("__MSR_OFFSET__", &Reg::MSR.offset().to_string())
         .replace("__SDR1_OFFSET__", &SPR::SDR1.offset().to_string())
@@ -6194,8 +6334,8 @@ const TEMPLATE: &str = r##"<!doctype html>
     // The DSP allocator must bootstrap from the exact imported-memory minimum. It may grow only
     // while constructing the interpreter; seal the memory at its maximum before creating a view.
     const memory = new WebAssembly.Memory({
-      initial: __MEMORY_INITIAL_PAGES__,
-      maximum: __MEMORY_MAXIMUM_PAGES__,
+      initial: __LEGACY_MEMORY_INITIAL_PAGES__,
+      maximum: __LEGACY_MEMORY_MAXIMUM_PAGES__,
     });
     const { instance: browserDspInstance } = await WebAssembly.instantiate(
       browserDspWasm,
@@ -6210,11 +6350,11 @@ const TEMPLATE: &str = r##"<!doctype html>
     const browserDsp = browserDspInstance.exports;
     check(browserDsp.browser_dsp_abi_version() === __DSP_ABI_VERSION__, "browser DSP ABI mismatch");
     check(
-      browserDsp.browser_dsp_memory_initial_pages() === __MEMORY_INITIAL_PAGES__,
+      browserDsp.browser_dsp_memory_initial_pages() === __LEGACY_MEMORY_INITIAL_PAGES__,
       "browser DSP initial-memory layout mismatch"
     );
     check(
-      browserDsp.browser_dsp_memory_maximum_pages() === __MEMORY_MAXIMUM_PAGES__,
+      browserDsp.browser_dsp_memory_maximum_pages() === __LEGACY_MEMORY_MAXIMUM_PAGES__,
       "browser DSP maximum-memory layout mismatch"
     );
     check(browserDsp.browser_dsp_main_ram_offset() === __RAM_PTR__, "browser DSP MEM1 offset mismatch");
@@ -6227,13 +6367,13 @@ const TEMPLATE: &str = r##"<!doctype html>
     const initializedMemoryPages = memory.buffer.byteLength / 65536;
     check(
       Number.isSafeInteger(initializedMemoryPages)
-        && initializedMemoryPages >= __MEMORY_INITIAL_PAGES__
-        && initializedMemoryPages <= __MEMORY_MAXIMUM_PAGES__,
+        && initializedMemoryPages >= __LEGACY_MEMORY_INITIAL_PAGES__
+        && initializedMemoryPages <= __LEGACY_MEMORY_MAXIMUM_PAGES__,
       "browser DSP initialization escaped the machine memory contract"
     );
-    memory.grow(__MEMORY_MAXIMUM_PAGES__ - initializedMemoryPages);
+    memory.grow(__LEGACY_MEMORY_MAXIMUM_PAGES__ - initializedMemoryPages);
     check(
-      memory.buffer.byteLength === __MEMORY_MAXIMUM_PAGES__ * 65536,
+      memory.buffer.byteLength === __LEGACY_MEMORY_MAXIMUM_PAGES__ * 65536,
       "browser machine memory was not sealed"
     );
     const bytes = new Uint8Array(memory.buffer);
@@ -6244,6 +6384,17 @@ const TEMPLATE: &str = r##"<!doctype html>
     const regionExitRequestOffset = 4;
     const hookCycleOffset = 8;
     const fastmem = __FASTMEM_PTR__;
+    const secondaryFastmemPageShift = __SECONDARY_FASTMEM_PAGE_SHIFT__;
+    const secondaryFastmemSetCount = __SECONDARY_FASTMEM_SET_COUNT__;
+    const secondaryFastmemEntryCount = __SECONDARY_FASTMEM_ENTRY_COUNT__;
+    const secondaryFastmemControl = __SECONDARY_FASTMEM_CONTROL_PTR__;
+    const secondaryFastmemLru = __SECONDARY_FASTMEM_LRU_PTR__;
+    const secondaryFastmemTags = __SECONDARY_FASTMEM_TAG_PTR__;
+    const secondaryFastmemReadPointers = __SECONDARY_FASTMEM_READ_POINTER_PTR__;
+    const secondaryFastmemWritePointers = __SECONDARY_FASTMEM_WRITE_POINTER_PTR__;
+    const secondaryFastmemReadHits = __SECONDARY_FASTMEM_READ_HITS_PTR__;
+    const secondaryFastmemWriteHits = __SECONDARY_FASTMEM_WRITE_HITS_PTR__;
+    const secondaryFastmemMisses = __SECONDARY_FASTMEM_MISSES_PTR__;
     const ram = __RAM_PTR__;
     const ramSize = __RAM_SIZE__;
     const mmio = __MMIO_PTR__;
@@ -6256,6 +6407,7 @@ const TEMPLATE: &str = r##"<!doctype html>
     const gxFifoStagingData = __GX_FIFO_STAGING_DATA_PTR__;
     const gxFifoStagingCapacity = __GX_FIFO_STAGING_CAPACITY__;
     const pcOffset = __PC_OFFSET__;
+    const crOffset = __CR_OFFSET__;
     const ctrOffset = __CTR_OFFSET__;
     const msrOffset = __MSR_OFFSET__;
     const sdr1Offset = __SDR1_OFFSET__;
@@ -6836,11 +6988,38 @@ const TEMPLATE: &str = r##"<!doctype html>
     const exceptionFirstTrace = [];
     const exceptionTrace = [];
     const exceptionFirstByVector = {};
+    const criticalStorageFaultSchema = "lazuli-critical-storage-fault-health-v1";
+    const criticalStorageFaultClassifications = {
+      "data-page-fault": 0,
+      "data-protection-fault": 0,
+      "instruction-page-fault": 0,
+      "instruction-protection-fault": 0,
+      unsupported: 0,
+    };
+    let criticalStorageFaultRaised = 0;
+    let criticalStorageFaultHandlerReturns = 0;
+    let criticalStorageFaultResolved = 0;
+    let criticalStorageFaultRecurrences = 0;
+    let criticalStorageFaultNested = 0;
+    let criticalStorageFaultSequence = 0;
+    let criticalStorageFaultPending = null;
+    let criticalStorageFaultLastResolved = null;
+    let criticalStorageFaultMaxHandlerDispatches = 0;
+    let criticalStorageFaultMaxHandlerCycles = 0;
     let firstDsi = null;
     let lastDataStorageFault = null;
     let lastUnmappedAccess = null;
     let dataFastmemTranslationSignature = null;
+    let dataFastmemMsrSignature = null;
+    // Exception entry and rfi repeatedly alternate between the same DR-on and
+    // DR-off mappings. Retain a small LRU of exact translation templates so a
+    // known mapping can be restored with one native byte copy instead of
+    // rescanning every 128 KiB effective page in JavaScript.
+    const dataFastmemTemplateLimit = 16;
+    const dataFastmemTemplates = new Map();
+    let secondaryDataFastmemLastInvalidationReason = null;
     let instructionTranslationSignature = null;
+    let instructionTranslationMsrSignature = null;
     let instructionAddressSpaceKey = null;
     let instructionAddressSpaceGeneration = 0;
     const instructionTlbSets = Array.from(
@@ -7532,6 +7711,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         ) {
           resident = candidate;
           set.lru = resolved.way ^ 1;
+          if (typeof setSecondaryDataFastmemReplacementWay === "function") {
+            setSecondaryDataFastmemReplacementWay(resolved.setIndex, set.lru);
+          }
         }
       }
       if (
@@ -7873,6 +8055,187 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
     }
 
+    function secondaryDataFastmemEntryIndex(setIndex, way) {
+      if (
+        !Number.isInteger(setIndex)
+        || setIndex < 0
+        || setIndex >= secondaryFastmemSetCount
+        || (way !== 0 && way !== 1)
+      ) return null;
+      return setIndex * 2 + way;
+    }
+
+    function secondaryDataFastmemReplacementWay(setIndex) {
+      if (
+        !Number.isInteger(setIndex)
+        || setIndex < 0
+        || setIndex >= secondaryFastmemSetCount
+      ) return 0;
+      const way = view.getUint32(secondaryFastmemLru + setIndex * 4, true);
+      return way === 1 ? 1 : 0;
+    }
+
+    function setSecondaryDataFastmemReplacementWay(setIndex, way) {
+      if (
+        !Number.isInteger(setIndex)
+        || setIndex < 0
+        || setIndex >= secondaryFastmemSetCount
+        || (way !== 0 && way !== 1)
+      ) return false;
+      view.setUint32(secondaryFastmemLru + setIndex * 4, way, true);
+      return true;
+    }
+
+    function clearSecondaryDataFastmemWay(setIndex, way) {
+      const entryIndex = secondaryDataFastmemEntryIndex(setIndex, way);
+      if (entryIndex === null) return false;
+      view.setUint32(secondaryFastmemTags + entryIndex * 4, 0, true);
+      view.setUint32(secondaryFastmemReadPointers + entryIndex * 4, 0, true);
+      view.setUint32(secondaryFastmemWritePointers + entryIndex * 4, 0, true);
+      return true;
+    }
+
+    function invalidateSecondaryDataFastmemSet(setIndex, reason) {
+      if (
+        !Number.isInteger(setIndex)
+        || setIndex < 0
+        || setIndex >= secondaryFastmemSetCount
+      ) return false;
+      clearSecondaryDataFastmemWay(setIndex, 0);
+      clearSecondaryDataFastmemWay(setIndex, 1);
+      setSecondaryDataFastmemReplacementWay(setIndex, 0);
+      secondaryDataFastmemLastInvalidationReason = reason;
+      accelerations.set(
+        "secondaryDataFastmemSetInvalidations",
+        (accelerations.get("secondaryDataFastmemSetInvalidations") ?? 0) + 1
+      );
+      return true;
+    }
+
+    function invalidateSecondaryDataFastmem(reason) {
+      bytes.fill(
+        0,
+        secondaryFastmemLru,
+        secondaryFastmemWritePointers + secondaryFastmemEntryCount * 4
+      );
+      secondaryDataFastmemLastInvalidationReason = reason;
+      accelerations.set(
+        "secondaryDataFastmemInvalidations",
+        (accelerations.get("secondaryDataFastmemInvalidations") ?? 0) + 1
+      );
+    }
+
+    function setSecondaryDataFastmemEnabled(enabled) {
+      view.setUint32(secondaryFastmemControl, enabled ? 1 : 0, true);
+    }
+
+    function populateSecondaryDataFastmem(
+      resolved,
+      effectiveAddress,
+      physicalAddress,
+      size,
+      write
+    ) {
+      if (view.getUint32(secondaryFastmemControl, true) !== 1) return false;
+      if (
+        resolved?.kind !== "mapped"
+        || !Array.isArray(resolved.translations)
+        || resolved.translations.length !== 1
+        || !Number.isSafeInteger(size)
+        || size <= 0
+      ) return false;
+      const translation = resolved.translations[0];
+      if (
+        translation?.source !== "page"
+        || !Number.isInteger(translation.setIndex)
+        || (translation.way !== 0 && translation.way !== 1)
+      ) return false;
+
+      const effective = effectiveAddress >>> 0;
+      const physical = physicalAddress >>> 0;
+      const pageBytes = 1 << secondaryFastmemPageShift;
+      const pageMask = pageBytes - 1;
+      if (
+        (effective & pageMask) + size > pageBytes
+        || (physical & pageMask) !== (effective & pageMask)
+      ) return false;
+      const physicalPage = (physical & ~pageMask) >>> 0;
+      if (physicalPage >= ramSize || pageBytes > ramSize - physicalPage) {
+        return false;
+      }
+
+      const setIndex = translation.setIndex;
+      const way = translation.way;
+      const resident = dataTlbSets[setIndex]?.entries[way] ?? null;
+      const effectivePage = effective >>> secondaryFastmemPageShift;
+      if (
+        resident === null
+        || resident.vsid !== (translation.vsid & 0x00ffffff)
+        || resident.pageIndex !== (effectivePage & 0xffff)
+      ) return false;
+
+      const entryIndex = secondaryDataFastmemEntryIndex(setIndex, way);
+      if (entryIndex === null) return false;
+      const tag = (effectivePage + 1) >>> 0;
+      const tagAddress = secondaryFastmemTags + entryIndex * 4;
+      const previousTag = view.getUint32(tagAddress, true);
+      if (previousTag !== 0 && previousTag !== tag) {
+        accelerations.set(
+          "secondaryDataFastmemCollisions",
+          (accelerations.get("secondaryDataFastmemCollisions") ?? 0) + 1
+        );
+      }
+      if (previousTag !== tag) clearSecondaryDataFastmemWay(setIndex, way);
+
+      const pointer = ram + physicalPage;
+      const readAddress = secondaryFastmemReadPointers + entryIndex * 4;
+      const writeAddress = secondaryFastmemWritePointers + entryIndex * 4;
+      const readChanged = view.getUint32(readAddress, true) !== pointer;
+      const writeChanged = write
+        && view.getUint32(writeAddress, true) !== pointer;
+      view.setUint32(readAddress, pointer, true);
+      if (write) view.setUint32(writeAddress, pointer, true);
+      // Publish the exact effective-page tag after both pointer permissions.
+      view.setUint32(tagAddress, tag, true);
+      if (readChanged || writeChanged) {
+        accelerations.set(
+          "secondaryDataFastmemPopulations",
+          (accelerations.get("secondaryDataFastmemPopulations") ?? 0) + 1
+        );
+        if (writeChanged) {
+          accelerations.set(
+            "secondaryDataFastmemWritePopulations",
+            (accelerations.get("secondaryDataFastmemWritePopulations") ?? 0) + 1
+          );
+        }
+      }
+      return true;
+    }
+
+    function snapshotSecondaryDataFastmem() {
+      let residentEntries = 0;
+      let writableEntries = 0;
+      for (let index = 0; index < secondaryFastmemEntryCount; index += 1) {
+        if (view.getUint32(secondaryFastmemTags + index * 4, true) === 0) continue;
+        residentEntries += 1;
+        if (
+          view.getUint32(secondaryFastmemWritePointers + index * 4, true) !== 0
+        ) writableEntries += 1;
+      }
+      return {
+        enabled: view.getUint32(secondaryFastmemControl, true) === 1,
+        sets: secondaryFastmemSetCount,
+        ways: 2,
+        pageBytes: 1 << secondaryFastmemPageShift,
+        residentEntries,
+        writableEntries,
+        readHits: view.getUint32(secondaryFastmemReadHits, true),
+        writeHits: view.getUint32(secondaryFastmemWriteHits, true),
+        misses: view.getUint32(secondaryFastmemMisses, true),
+        lastInvalidationReason: secondaryDataFastmemLastInvalidationReason,
+      };
+    }
+
     function resetTranslationLookasideBuffer(sets) {
       for (const set of sets) {
         set.entries[0] = null;
@@ -7884,6 +8247,9 @@ const TEMPLATE: &str = r##"<!doctype html>
     function initializeTranslationLookasideBuffers() {
       resetTranslationLookasideBuffer(instructionTlbSets);
       resetTranslationLookasideBuffer(dataTlbSets);
+      if (typeof invalidateSecondaryDataFastmem === "function") {
+        invalidateSecondaryDataFastmem("initialize-tlb");
+      }
     }
 
     function instructionTlbSetIndex(effectiveAddress) {
@@ -7906,7 +8272,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           || entry.vsid !== (vsid & 0x00ffffff)
           || entry.pageIndex !== pageIndex
         ) continue;
-        if (touch) set.lru = way ^ 1;
+        if (touch) {
+          set.lru = way ^ 1;
+          if (typeof setSecondaryDataFastmemReplacementWay === "function") {
+            setSecondaryDataFastmemReplacementWay(setIndex, set.lru);
+          }
+        }
         return { ...entry, setIndex, way };
       }
       return null;
@@ -7917,7 +8288,14 @@ const TEMPLATE: &str = r##"<!doctype html>
       const setIndex = dataTlbSetIndex(effective);
       const set = dataTlbSets[setIndex];
       let way = set.entries.findIndex(candidate => candidate === null);
-      if (way < 0) way = set.lru;
+      if (way < 0) {
+        way = typeof secondaryDataFastmemReplacementWay === "function"
+          ? secondaryDataFastmemReplacementWay(setIndex)
+          : set.lru;
+      }
+      if (typeof clearSecondaryDataFastmemWay === "function") {
+        clearSecondaryDataFastmemWay(setIndex, way);
+      }
       const stored = {
         ...entry,
         vsid: vsid & 0x00ffffff,
@@ -7925,6 +8303,9 @@ const TEMPLATE: &str = r##"<!doctype html>
       };
       set.entries[way] = stored;
       set.lru = way ^ 1;
+      if (typeof setSecondaryDataFastmemReplacementWay === "function") {
+        setSecondaryDataFastmemReplacementWay(setIndex, set.lru);
+      }
       return { ...stored, setIndex, way };
     }
 
@@ -15160,7 +15541,8 @@ const TEMPLATE: &str = r##"<!doctype html>
         return reject("device", "dsp-receive-mailbox-register-rejected");
       }
       const lockedSource = physicalLockedCachePointer(physical, size);
-      const source = physicalRamPointer(physical, size)
+      const ramSource = physicalRamPointer(physical, size);
+      const source = ramSource
         ?? physicalMmioPointer(physical, size)
         ?? lockedSource;
       if (source === null) {
@@ -15211,6 +15593,18 @@ const TEMPLATE: &str = r##"<!doctype html>
         check(
           finishDspReceiveMailboxRead(physical, size),
           "validated DSP receive-mailbox read was rejected"
+        );
+      }
+      if (
+        ramSource !== null
+        && typeof populateSecondaryDataFastmem === "function"
+      ) {
+        populateSecondaryDataFastmem(
+          resolved,
+          logical,
+          physical,
+          size,
+          false
         );
       }
       if (size === 4 && physical >= 0x0c006404 && physical <= 0x0c00642c) {
@@ -16087,7 +16481,8 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
 
       const lockedTarget = physicalLockedCachePointer(physical, size);
-      const target = physicalRamPointer(physical, size)
+      const ramTarget = physicalRamPointer(physical, size);
+      const target = ramTarget
         ?? physicalMmioPointer(physical, size)
         ?? lockedTarget;
       if (target === null) {
@@ -16115,6 +16510,18 @@ const TEMPLATE: &str = r##"<!doctype html>
       if (lockedTarget !== null) {
         lockedCacheWrites += 1;
         lockedCacheWriteBytes += size;
+      }
+      if (
+        ramTarget !== null
+        && typeof populateSecondaryDataFastmem === "function"
+      ) {
+        populateSecondaryDataFastmem(
+          resolved,
+          logical,
+          physical,
+          size,
+          true
+        );
       }
       return 1;
     }
@@ -16320,25 +16727,32 @@ const TEMPLATE: &str = r##"<!doctype html>
       view.setUint32(cpu + msrOffset, 0x30, true);
     }
 
-    function rebuildDataFastmem() {
-      const currentMsr = view.getUint32(cpu + msrOffset, true);
-      const currentDataBats = readDataBats();
-      const translationSignature = [currentMsr & 0x4010];
-      for (const [upper, lower] of currentDataBats) {
-        translationSignature.push(upper >>> 0, lower >>> 0);
-      }
+    function dataFastmemTemplateKey(translationSignature) {
+      return translationSignature
+        .map(value => (value >>> 0).toString(16))
+        .join(":");
+    }
+
+    function secondaryDataFastmemSignaturesCompatible(previous, next) {
       if (
-        dataFastmemTranslationSignature !== null
-        && translationSignature.every((value, index) =>
-          dataFastmemTranslationSignature[index] === value
-        )
-      ) {
-        return false;
-      }
-      dataFastmemTranslationSignature = translationSignature;
-      for (let index = 0; index < __FASTMEM_LUT_COUNT__; index += 1) {
-        view.setUint32(fastmem + index * 4, 0, true);
-      }
+        !Array.isArray(previous)
+        || !Array.isArray(next)
+        || previous.length !== next.length
+      ) return false;
+      return next.every((value, index) => {
+        // Index four is MSR[PR,DR]. DR merely selects whether the retained
+        // page TLB is active; exception entry/rfi do not flush that TLB.
+        if (index === 4) return (previous[index] & ~0x10) === (value & ~0x10);
+        return previous[index] === value;
+      });
+    }
+
+    function buildDataFastmemTemplate(currentMsr, currentDataBats) {
+      // ArrayBuffer bytes are zero initialized, preserving unmapped entries
+      // without a separate clearing pass. DataView pins little-endian layout
+      // independently of the host's typed-array byte order.
+      const buffer = new ArrayBuffer(__FASTMEM_LUT_COUNT__ * 4);
+      const templateView = new DataView(buffer);
       for (let index = 0; index < __FASTMEM_LUT_COUNT__; index += 1) {
         const effective = (index << __FASTMEM_PAGE_SHIFT__) >>> 0;
         const pointer = dataFastmemPointer(
@@ -16348,8 +16762,89 @@ const TEMPLATE: &str = r##"<!doctype html>
           ramSize,
           ram
         );
-        if (pointer !== null) view.setUint32(fastmem + index * 4, pointer, true);
+        if (pointer !== null) templateView.setUint32(index * 4, pointer, true);
       }
+      // This private byte view is never handed to generated code; rebuilds
+      // only copy from it, so mutations to the live LUT cannot taint a cached
+      // mapping.
+      return new Uint8Array(buffer);
+    }
+
+    function restoreDataFastmemTemplate(template) {
+      const expectedBytes = __FASTMEM_LUT_COUNT__ * 4;
+      if (!(template instanceof Uint8Array) || template.byteLength !== expectedBytes) {
+        throw new Error("invalid data fastmem template");
+      }
+      bytes.set(template, fastmem);
+    }
+
+    function rebuildDataFastmem() {
+      const currentMsr = view.getUint32(cpu + msrOffset, true);
+      const currentMsrSignature = currentMsr & 0x4010;
+      const currentDataBats = readDataBats();
+      // These are every input used by dataFastmemPointer. The first four are
+      // fixed in production, but retaining them in the signature also makes
+      // a relocated isolated fixture incapable of aliasing an old template.
+      const translationSignature = [
+        __FASTMEM_PAGE_SHIFT__,
+        __FASTMEM_LUT_COUNT__,
+        ram >>> 0,
+        ramSize >>> 0,
+        currentMsrSignature,
+      ];
+      for (const [upper, lower] of currentDataBats) {
+        translationSignature.push(upper >>> 0, lower >>> 0);
+      }
+      if (
+        dataFastmemTranslationSignature !== null
+        && dataFastmemTranslationSignature.length === translationSignature.length
+        && translationSignature.every((value, index) =>
+          dataFastmemTranslationSignature[index] === value
+        )
+      ) {
+        dataFastmemMsrSignature = currentMsrSignature;
+        return false;
+      }
+
+      if (!secondaryDataFastmemSignaturesCompatible(
+        dataFastmemTranslationSignature,
+        translationSignature
+      )) {
+        invalidateSecondaryDataFastmem("data-translation-change");
+      }
+
+      const key = dataFastmemTemplateKey(translationSignature);
+      let template = dataFastmemTemplates.get(key);
+      if (template === undefined) {
+        template = buildDataFastmemTemplate(currentMsr, currentDataBats);
+        if (dataFastmemTemplates.size >= dataFastmemTemplateLimit) {
+          const oldestKey = dataFastmemTemplates.keys().next().value;
+          dataFastmemTemplates.delete(oldestKey);
+          accelerations.set(
+            "dataFastmemTemplateEvictions",
+            (accelerations.get("dataFastmemTemplateEvictions") ?? 0) + 1
+          );
+        }
+        dataFastmemTemplates.set(key, template);
+        accelerations.set(
+          "dataFastmemTemplateBuilds",
+          (accelerations.get("dataFastmemTemplateBuilds") ?? 0) + 1
+        );
+      } else {
+        // Map iteration order is the LRU order. Refresh an exact hit without
+        // exposing or modifying the retained template bytes.
+        dataFastmemTemplates.delete(key);
+        dataFastmemTemplates.set(key, template);
+        accelerations.set(
+          "dataFastmemTemplateRestores",
+          (accelerations.get("dataFastmemTemplateRestores") ?? 0) + 1
+        );
+      }
+
+      restoreDataFastmemTemplate(template);
+      dataFastmemTranslationSignature = translationSignature;
+      dataFastmemMsrSignature = currentMsrSignature;
+      setSecondaryDataFastmemEnabled((currentMsr & 0x10) !== 0);
       return true;
     }
 
@@ -16757,6 +17252,9 @@ const TEMPLATE: &str = r##"<!doctype html>
         instructionSetIndex
       );
       const dataEntries = invalidateSet(dataTlbSets, dataSetIndex);
+      if (typeof invalidateSecondaryDataFastmemSet === "function") {
+        invalidateSecondaryDataFastmemSet(dataSetIndex, "tlbie");
+      }
       const blocks = invalidateInstructionTranslationSet(effectiveAddress);
       accelerations.set(
         "translationTlbInvalidations",
@@ -16819,9 +17317,11 @@ const TEMPLATE: &str = r##"<!doctype html>
           instructionTranslationSignature[index] === value
         )
       ) {
+        instructionTranslationMsrSignature = signature[0];
         return false;
       }
       instructionTranslationSignature = signature;
+      instructionTranslationMsrSignature = signature[0];
       instructionAddressSpaceKey = instructionTranslationKey(signature);
       instructionAddressSpaceGeneration += 1;
       if (invalidate) {
@@ -16845,16 +17345,19 @@ const TEMPLATE: &str = r##"<!doctype html>
     function msrChanged() {
       // The compiler terminates this block after publishing its automatic PC.
       // Device interrupt delivery remains in the normal post-block service pass.
-      const dataTranslationChanged = rebuildDataFastmem();
-      const instructionTranslationChanged = synchronizeInstructionAddressSpace("msr");
-      if (
-        dataTranslationChanged !== false
-        || instructionTranslationChanged !== false
-      ) return 0;
+      const currentMsr = view.getUint32(cpu + msrOffset, true);
+      const dataTranslationChanged =
+        dataFastmemMsrSignature !== (currentMsr & 0x4010);
+      if (dataTranslationChanged) rebuildDataFastmem();
+      const instructionTranslationChanged =
+        instructionTranslationMsrSignature !== (currentMsr & 0x4020);
+      if (instructionTranslationChanged) {
+        synchronizeInstructionAddressSpace("msr");
+      }
+      observeCriticalStorageFaultHandlerReturn();
+      if (dataTranslationChanged || instructionTranslationChanged) return 0;
 
-      const interruptsEnabled = (
-        view.getUint32(cpu + msrOffset, true) & 0x00008000
-      ) !== 0;
+      const interruptsEnabled = (currentMsr & 0x00008000) !== 0;
       // An interrupt-disable with unchanged translations cannot make a device
       // exception newly deliverable. An interrupt-enable may also remain linked
       // when the exact published hook cycle has no asserted interrupt or due
@@ -16871,10 +17374,16 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function segmentRegisterChanged() {
+      if (typeof invalidateSecondaryDataFastmem === "function") {
+        invalidateSecondaryDataFastmem("segment-register-change");
+      }
       synchronizeInstructionAddressSpace("sr");
     }
 
     function sdr1Changed() {
+      if (typeof invalidateSecondaryDataFastmem === "function") {
+        invalidateSecondaryDataFastmem("sdr1-change");
+      }
       synchronizeInstructionAddressSpace("sdr1");
     }
 
@@ -16948,9 +17457,53 @@ const TEMPLATE: &str = r##"<!doctype html>
       return signature >>> 0;
     }
 
+    function volatileReadStabilityGpr(pattern, instructionWords) {
+      if (
+        pattern !== blockPattern.idleVolatileRead
+        || !Array.isArray(instructionWords)
+        || instructionWords.length !== 3
+      ) return null;
+      const load = instructionWords[0] >>> 0;
+      const compare = instructionWords[1] >>> 0;
+      const branch = instructionWords[2] >>> 0;
+      const loadOpcode = load >>> 26;
+      const compareOpcode = compare >>> 26;
+      const loadedGpr = (load >>> 21) & 31;
+      const comparedGpr = (compare >>> 16) & 31;
+      if (
+        ![32, 34, 40, 42].includes(loadOpcode)
+        || ![10, 11].includes(compareOpcode)
+        || loadedGpr !== comparedGpr
+        || branch >>> 26 !== 16
+        || (branch & 2) !== 0
+        || (branch & 0xfffc) !== 0xfff8
+      ) return null;
+      return loadedGpr;
+    }
+
+    function stableCpuSignature(block, readFullSignature = cpuSignature) {
+      const loadedGpr = block?.volatileReadStabilityGpr;
+      if (!Number.isInteger(loadedGpr) || loadedGpr < 0 || loadedGpr >= 32) {
+        return readFullSignature();
+      }
+      // The compiler-authenticated loop contains exactly one non-updating
+      // integer load, one immediate compare, and its conditional backedge.
+      // These are the only architectural registers it can change while the
+      // PC remains at the same block: the loaded GPR, CR, CTR, and (for a
+      // linked conditional branch) LR. Keep all four values collision-free
+      // in one 128-bit witness instead of hashing the entire 1 KiB Cpu.
+      return (
+        (BigInt(view.getUint32(cpu + gprOffsets[loadedGpr], true)) << 96n)
+        | (BigInt(view.getUint32(cpu + crOffset, true)) << 64n)
+        | (BigInt(view.getUint32(cpu + ctrOffset, true)) << 32n)
+        | BigInt(view.getUint32(cpu + lrOffset, true))
+      );
+    }
+
     function updateStablePcWitness(
       nextPc,
-      readCpuSignature = cpuSignature
+      readCpuSignature = cpuSignature,
+      signatureContext = undefined
     ) {
       if (nextPc !== lastPc) {
         lastPc = nextPc;
@@ -16959,7 +17512,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         return samePcCount;
       }
 
-      const nextCpuSignature = readCpuSignature();
+      const nextCpuSignature = readCpuSignature(signatureContext);
       samePcCount = lastCpuSignature !== null
         && nextCpuSignature === lastCpuSignature
           ? samePcCount + 1
@@ -23987,6 +24540,171 @@ const TEMPLATE: &str = r##"<!doctype html>
       }
     }
 
+    function classifyCriticalStorageFault(exception) {
+      if (exception === 0x0300) {
+        if (
+          lastDataStorageFault?.stage === "translation"
+          && lastDataStorageFault.resolverKind === "page-fault"
+        ) return "data-page-fault";
+        if (
+          lastDataStorageFault?.stage === "translation"
+          && lastDataStorageFault.resolverKind === "protection"
+        ) return "data-protection-fault";
+        return "unsupported";
+      }
+      if (exception === 0x0400) {
+        if (lastUnmappedAccess?.reason === "page-fault") {
+          return "instruction-page-fault";
+        }
+        if (lastUnmappedAccess?.reason === "protection") {
+          return "instruction-protection-fault";
+        }
+        return "unsupported";
+      }
+      return null;
+    }
+
+    function criticalStorageFaultMatches(pending, candidate) {
+      return pending.vector === candidate.vector
+        && pending.pc === candidate.pc
+        && pending.address === candidate.address
+        && pending.cause === candidate.cause
+        && pending.classification === candidate.classification;
+    }
+
+    function resolveCriticalStorageFaultPending(reason) {
+      const pending = criticalStorageFaultPending;
+      if (pending === null || pending.phase !== "retry") return false;
+      criticalStorageFaultResolved += pending.attempts;
+      criticalStorageFaultLastResolved = {
+        address: pending.address,
+        attempts: pending.attempts,
+        cause: pending.cause,
+        classification: pending.classification,
+        handlerCycles: pending.handlerCycles,
+        handlerDispatches: pending.handlerDispatches,
+        pc: pending.pc,
+        reason,
+        sequence: pending.sequence,
+        vector: pending.vector,
+      };
+      criticalStorageFaultPending = null;
+      return true;
+    }
+
+    function beginCriticalStorageFault(exception, oldPc, specialSrr1 = 0) {
+      if (exception !== 0x0300 && exception !== 0x0400) return;
+      const vector = "0x" + exception.toString(16).padStart(4, "0");
+      const classification = classifyCriticalStorageFault(exception);
+      const candidate = {
+        address: exception === 0x0300
+          ? view.getUint32(cpu + darOffset, true)
+          : oldPc >>> 0,
+        cause: exception === 0x0300
+          ? view.getUint32(cpu + dsisrOffset, true)
+          : specialSrr1 >>> 0,
+        classification,
+        pc: oldPc >>> 0,
+        vector,
+      };
+      let attempts = 1;
+      if (criticalStorageFaultPending !== null) {
+        if (criticalStorageFaultPending.phase === "retry") {
+          if (criticalStorageFaultMatches(criticalStorageFaultPending, candidate)) {
+            criticalStorageFaultRecurrences += 1;
+            attempts = criticalStorageFaultPending.attempts + 1;
+          } else {
+            // Reaching a distinct precise storage fault proves the returned
+            // instruction made forward architectural progress first.
+            resolveCriticalStorageFaultPending("subsequent-distinct-fault");
+          }
+        } else {
+          // A storage fault taken inside an outstanding storage-fault handler
+          // is not part of the authenticated single-fault recovery contract.
+          criticalStorageFaultNested += 1;
+        }
+      }
+      criticalStorageFaultRaised += 1;
+      criticalStorageFaultClassifications[classification] += 1;
+      criticalStorageFaultSequence += 1;
+      criticalStorageFaultPending = {
+        ...candidate,
+        attempts,
+        handlerCycles: null,
+        handlerDispatches: null,
+        phase: "handler",
+        raisedCycle: cycles,
+        raisedDispatch: dispatches,
+        sequence: criticalStorageFaultSequence,
+      };
+    }
+
+    function observeCriticalStorageFaultHandlerReturn() {
+      const pending = criticalStorageFaultPending;
+      if (pending === null || pending.phase !== "handler") return false;
+      const returnedPc = view.getUint32(cpu + pcOffset, true);
+      if (returnedPc !== pending.pc) return false;
+      const handlerDispatches = dispatches - pending.raisedDispatch;
+      const handlerCycles = cycles - pending.raisedCycle;
+      if (handlerDispatches < 0 || handlerCycles < 0) return false;
+      pending.phase = "retry";
+      pending.handlerDispatches = handlerDispatches;
+      pending.handlerCycles = handlerCycles;
+      criticalStorageFaultHandlerReturns += 1;
+      criticalStorageFaultMaxHandlerDispatches = Math.max(
+        criticalStorageFaultMaxHandlerDispatches,
+        handlerDispatches
+      );
+      criticalStorageFaultMaxHandlerCycles = Math.max(
+        criticalStorageFaultMaxHandlerCycles,
+        handlerCycles
+      );
+      return true;
+    }
+
+    function observeCriticalStorageFaultRetryProgress(executedPc) {
+      const pending = criticalStorageFaultPending;
+      if (
+        pending === null
+        || pending.phase !== "retry"
+        || (executedPc >>> 0) !== pending.pc
+      ) return false;
+      return resolveCriticalStorageFaultPending("retry-dispatch-complete");
+    }
+
+    function snapshotCriticalStorageFaultHealth() {
+      const common = fault => ({
+        address: hex32(fault.address),
+        attempts: fault.attempts,
+        cause: hex32(fault.cause),
+        classification: fault.classification,
+        handlerCycles: fault.handlerCycles,
+        handlerDispatches: fault.handlerDispatches,
+        pc: hex32(fault.pc),
+        sequence: fault.sequence,
+        vector: fault.vector,
+      });
+      return {
+        schema: criticalStorageFaultSchema,
+        raised: criticalStorageFaultRaised,
+        handlerReturns: criticalStorageFaultHandlerReturns,
+        resolved: criticalStorageFaultResolved,
+        recurrences: criticalStorageFaultRecurrences,
+        nested: criticalStorageFaultNested,
+        classifications: { ...criticalStorageFaultClassifications },
+        maxHandlerDispatches: criticalStorageFaultMaxHandlerDispatches,
+        maxHandlerCycles: criticalStorageFaultMaxHandlerCycles,
+        pending: criticalStorageFaultPending === null ? null : {
+          ...common(criticalStorageFaultPending),
+          phase: criticalStorageFaultPending.phase,
+        },
+        lastResolved: criticalStorageFaultLastResolved === null ? null : {
+          ...common(criticalStorageFaultLastResolved),
+          reason: criticalStorageFaultLastResolved.reason,
+        },
+      };
+    }
+
     function instructionStorageCause(fault) {
       if (fault?.kind === "page-fault") return 0x40000000;
       if (fault?.kind === "guarded" || fault?.kind === "no-execute") {
@@ -24015,6 +24733,7 @@ const TEMPLATE: &str = r##"<!doctype html>
       const oldMsr = view.getUint32(registers + msrOffset, true);
       const exceptionName = "0x" + exception.toString(16).padStart(4, "0");
       exceptionCounts.set(exceptionName, (exceptionCounts.get(exceptionName) ?? 0) + 1);
+      beginCriticalStorageFault(exception, oldPc, specialSrr1);
       const sample = {
         exception: exceptionName,
         pc: "0x" + oldPc.toString(16).padStart(8, "0"),
@@ -24757,21 +25476,127 @@ const TEMPLATE: &str = r##"<!doctype html>
     }
 
     function runtimeEventDueAtOrBefore(observedCycles) {
-      return runtimeEventCycleCandidates(observedCycles, false)
-        .some(value => value !== null && value <= observedCycles);
+      ensureViSchedule(observedCycles);
+      const diskCompletionCycle = diskTransfer?.completionCycle ?? null;
+      const serialCompletionCycle = serialTransfer?.completionCycle ?? null;
+      const aramCompletionCycle = aramTransfer?.completionCycle ?? null;
+      const audioCycle = nextAudioSampleCycle();
+      const dspAudioCompletionCycle = nextDspAudioDmaCycle;
+      const viEnabled = Boolean(viTiming?.displayEnabled);
+      return (
+        (viEnabled && nextViCycle !== null
+          && nextViCycle <= observedCycles)
+        || (viEnabled && nextViPresentCycle !== null
+          && nextViPresentCycle <= observedCycles)
+        || (viEnabled && nextViBoundaryCycle !== null
+          && nextViBoundaryCycle <= observedCycles)
+        || (viEnabled && nextViTimingBoundaryCycle !== null
+          && nextViTimingBoundaryCycle <= observedCycles)
+        || (nextSerialPollCycle !== null && nextSerialPollCycle <= observedCycles)
+        || (nextDecrementerCycle !== null && nextDecrementerCycle <= observedCycles)
+        || (diskCompletionCycle !== null && diskCompletionCycle <= observedCycles)
+        || (nextDiskAudioCycle !== null && nextDiskAudioCycle <= observedCycles)
+        || (serialCompletionCycle !== null && serialCompletionCycle <= observedCycles)
+        || (peFinishCycle !== null && peFinishCycle <= observedCycles)
+        || (nextDspExecutionCycle !== null && nextDspExecutionCycle <= observedCycles)
+        || (nextDspAudioDmaInterruptCycle !== null
+          && nextDspAudioDmaInterruptCycle <= observedCycles)
+        || (dspAudioCompletionCycle !== null
+          && dspAudioCompletionCycle <= observedCycles)
+        || (aramCompletionCycle !== null && aramCompletionCycle <= observedCycles)
+        || (audioCycle !== null && audioCycle <= observedCycles)
+      );
     }
 
     function nextRuntimeEventCycle(
       includeCycleLimit = true,
       coalesceIdleAudio = false
     ) {
-      const candidates = runtimeEventCycleCandidates(
-        cycles,
-        includeCycleLimit,
-        coalesceIdleAudio
-      )
-        .filter(value => value !== null && value > cycles);
-      return candidates.length === 0 ? null : Math.min(...candidates);
+      ensureViSchedule(cycles);
+      const diskCompletionCycle = diskTransfer?.completionCycle ?? null;
+      const serialCompletionCycle = serialTransfer?.completionCycle ?? null;
+      const dspAudioCompletionCycle = coalesceIdleAudio
+        ? nextDspAudioDmaCompletionCycle()
+        : nextDspAudioDmaCycle;
+      const aramCompletionCycle = aramTransfer?.completionCycle ?? null;
+      const audioCycle = coalesceIdleAudio
+        ? nextAudioInterruptCycle()
+        : nextAudioSampleCycle();
+      let candidate = Number.POSITIVE_INFINITY;
+      let hasCandidate = false;
+      const viEnabled = Boolean(viTiming?.displayEnabled);
+      if (viEnabled && nextViCycle !== null && nextViCycle > cycles) {
+        candidate = Math.min(candidate, nextViCycle);
+        hasCandidate = true;
+      }
+      if (viEnabled && nextViPresentCycle !== null && nextViPresentCycle > cycles) {
+        candidate = Math.min(candidate, nextViPresentCycle);
+        hasCandidate = true;
+      }
+      if (viEnabled && nextViBoundaryCycle !== null && nextViBoundaryCycle > cycles) {
+        candidate = Math.min(candidate, nextViBoundaryCycle);
+        hasCandidate = true;
+      }
+      if (
+        viEnabled
+        && nextViTimingBoundaryCycle !== null
+        && nextViTimingBoundaryCycle > cycles
+      ) {
+        candidate = Math.min(candidate, nextViTimingBoundaryCycle);
+        hasCandidate = true;
+      }
+      if (nextSerialPollCycle !== null && nextSerialPollCycle > cycles) {
+        candidate = Math.min(candidate, nextSerialPollCycle);
+        hasCandidate = true;
+      }
+      if (nextDecrementerCycle !== null && nextDecrementerCycle > cycles) {
+        candidate = Math.min(candidate, nextDecrementerCycle);
+        hasCandidate = true;
+      }
+      if (diskCompletionCycle !== null && diskCompletionCycle > cycles) {
+        candidate = Math.min(candidate, diskCompletionCycle);
+        hasCandidate = true;
+      }
+      if (nextDiskAudioCycle !== null && nextDiskAudioCycle > cycles) {
+        candidate = Math.min(candidate, nextDiskAudioCycle);
+        hasCandidate = true;
+      }
+      if (serialCompletionCycle !== null && serialCompletionCycle > cycles) {
+        candidate = Math.min(candidate, serialCompletionCycle);
+        hasCandidate = true;
+      }
+      if (peFinishCycle !== null && peFinishCycle > cycles) {
+        candidate = Math.min(candidate, peFinishCycle);
+        hasCandidate = true;
+      }
+      if (nextDspExecutionCycle !== null && nextDspExecutionCycle > cycles) {
+        candidate = Math.min(candidate, nextDspExecutionCycle);
+        hasCandidate = true;
+      }
+      if (
+        nextDspAudioDmaInterruptCycle !== null
+        && nextDspAudioDmaInterruptCycle > cycles
+      ) {
+        candidate = Math.min(candidate, nextDspAudioDmaInterruptCycle);
+        hasCandidate = true;
+      }
+      if (dspAudioCompletionCycle !== null && dspAudioCompletionCycle > cycles) {
+        candidate = Math.min(candidate, dspAudioCompletionCycle);
+        hasCandidate = true;
+      }
+      if (aramCompletionCycle !== null && aramCompletionCycle > cycles) {
+        candidate = Math.min(candidate, aramCompletionCycle);
+        hasCandidate = true;
+      }
+      if (audioCycle !== null && audioCycle > cycles) {
+        candidate = Math.min(candidate, audioCycle);
+        hasCandidate = true;
+      }
+      if (includeCycleLimit && Number.isFinite(cycleLimit) && cycleLimit > cycles) {
+        candidate = Math.min(candidate, cycleLimit);
+        hasCandidate = true;
+      }
+      return hasCandidate ? candidate : null;
     }
 
     function nextStableWaitEventCycle(
@@ -25154,8 +25979,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       return wakeCycle > cycles ? { eventCycle, wakeCycle } : null;
     }
 
-    async function accelerateMusyxAramQueueFullWait(currentPc) {
+    function pendingMusyxAramQueueFullWaitAcceleration(currentPc) {
       const wait = musyxAramQueueFullWaitWakeCycle(currentPc);
+      return wait === null
+        ? false
+        : accelerateMusyxAramQueueFullWait(currentPc, wait);
+    }
+
+    async function accelerateMusyxAramQueueFullWait(
+      currentPc,
+      wait = musyxAramQueueFullWaitWakeCycle(currentPc)
+    ) {
       if (wait === null) return false;
       const { eventCycle, wakeCycle } = wait;
       const skipped = wakeCycle - cycles;
@@ -25182,8 +26016,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
-    async function accelerateAiSrcInitSampleCounterWait(currentPc) {
+    function pendingAiSrcInitSampleCounterWaitAcceleration(currentPc) {
       const wait = aiSrcInitSampleCounterWaitWakeCycle(currentPc);
+      return wait === null
+        ? false
+        : accelerateAiSrcInitSampleCounterWait(currentPc, wait);
+    }
+
+    async function accelerateAiSrcInitSampleCounterWait(
+      currentPc,
+      wait = aiSrcInitSampleCounterWaitWakeCycle(currentPc)
+    ) {
       if (wait === null) return false;
       const { eventCycle, wakeCycle } = wait;
       const skipped = wakeCycle - cycles;
@@ -25208,8 +26051,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
-    async function accelerateDspReceiveMailboxWait(currentPc) {
+    function pendingDspReceiveMailboxWaitAcceleration(currentPc) {
       const wait = dspReceiveMailboxWaitWakeCycle(currentPc);
+      return wait === null
+        ? false
+        : accelerateDspReceiveMailboxWait(currentPc, wait);
+    }
+
+    async function accelerateDspReceiveMailboxWait(
+      currentPc,
+      wait = dspReceiveMailboxWaitWakeCycle(currentPc)
+    ) {
       if (wait === null) return false;
       const { eventCycle, wakeCycle } = wait;
       const skipped = wakeCycle - cycles;
@@ -25242,8 +26094,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
-    async function accelerateDspSendMailboxWait(currentPc) {
+    function pendingDspSendMailboxWaitAcceleration(currentPc) {
       const wait = dspSendMailboxWaitWakeCycle(currentPc);
+      return wait === null
+        ? false
+        : accelerateDspSendMailboxWait(currentPc, wait);
+    }
+
+    async function accelerateDspSendMailboxWait(
+      currentPc,
+      wait = dspSendMailboxWaitWakeCycle(currentPc)
+    ) {
       if (wait === null) return false;
       if (wait.stalled === true) {
         await finishQuiescentAfterRendererDrain("progress", {
@@ -25293,8 +26154,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       return true;
     }
 
-    async function accelerateAramDmaBusyWait(currentPc) {
+    function pendingAramDmaBusyWaitAcceleration(currentPc) {
       const wait = aramDmaBusyWaitWakeCycle(currentPc);
+      return wait === null
+        ? false
+        : accelerateAramDmaBusyWait(currentPc, wait);
+    }
+
+    async function accelerateAramDmaBusyWait(
+      currentPc,
+      wait = aramDmaBusyWaitWakeCycle(currentPc)
+    ) {
       if (wait === null) return false;
       const { eventCycle, wakeCycle } = wait;
       const skipped = wakeCycle - cycles;
@@ -25385,14 +26255,17 @@ const TEMPLATE: &str = r##"<!doctype html>
       );
       const retained = captureInstructionPageDependencies(pc, effectiveBytes);
       if (retained.fault !== null) return { fault: retained.fault };
+      const pattern = compiler.ppcwasmjit_pattern() >>> 0;
+      const instructionWords = stagedWords.slice(0, effectiveBytes >>> 2);
       return {
         maximum,
-        pattern: compiler.ppcwasmjit_pattern() >>> 0,
+        pattern,
         wasm: new Uint8Array(compiler.memory.buffer, pointer, length).slice(),
         effectiveStart: pc >>> 0,
         effectiveBytes,
-        instructionWords: stagedWords.slice(0, effectiveBytes >>> 2),
+        instructionWords,
         instructionPageDependencies: retained.dependencies,
+        volatileReadStabilityGpr: volatileReadStabilityGpr(pattern, instructionWords),
       };
     }
 
@@ -25631,6 +26504,7 @@ const TEMPLATE: &str = r##"<!doctype html>
           ...Object.fromEntries(accelerations),
           wasmRegionContinuableHooks: regionContinuableHookCalls,
         },
+        secondaryDataFastmem: snapshotSecondaryDataFastmem(),
         gxFifo: {
           stores: gxFifoStores,
           quantizedStores: gxFifoQuantizedStores,
@@ -25962,6 +26836,7 @@ const TEMPLATE: &str = r##"<!doctype html>
         },
         exceptions: {
           counts: Object.fromEntries(exceptionCounts),
+          criticalStorageFaults: snapshotCriticalStorageFaultHealth(),
           firstByVector: exceptionFirstByVector,
           firstTrace: exceptionFirstTrace,
           lastTrace: exceptionTrace,
@@ -26359,8 +27234,16 @@ const TEMPLATE: &str = r##"<!doctype html>
       statusDataset.dispatchLimit = String(dispatchLimit);
       statusDataset.status = "running";
 
-      async function finishTerminalControllerScenario() {
+      function pendingTerminalControllerScenarioCompletion() {
         const scenarioStatus = serviceControllerScenario(controllerScenario, cycles);
+        if (scenarioStatus !== "complete" && scenarioStatus !== "failed") return false;
+        if (dspLastServiceCycle !== cycles) return false;
+        return finishTerminalControllerScenario(scenarioStatus);
+      }
+
+      async function finishTerminalControllerScenario(
+        scenarioStatus = serviceControllerScenario(controllerScenario, cycles)
+      ) {
         if (scenarioStatus !== "complete" && scenarioStatus !== "failed") return;
         if (dspLastServiceCycle !== cycles) return;
         const failed = scenarioStatus === "failed";
@@ -26381,7 +27264,11 @@ const TEMPLATE: &str = r##"<!doctype html>
         // unchanged load redispatches and normal MMIO service runs. Keep a
         // snapshot request queued until every timed device, including DSP,
         // has observed the published CPU cycle.
-        if (runnerSnapshotRequested && dspLastServiceCycle === cycles) {
+        if (
+          runnerSnapshotRequested
+          && dspLastServiceCycle === cycles
+          && criticalStorageFaultPending === null
+        ) {
           publishRunnerSnapshot();
         }
         while (rendererFramesInFlight.size !== 0 || rendererFailure !== null) {
@@ -26390,7 +27277,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           serviceVideoPresentation(cycles);
         }
         if (runnerPaused || runnerStopRequested) await honorRunnerControl();
-        await finishTerminalControllerScenario();
+        const initialTerminalCompletion = pendingTerminalControllerScenarioCompletion();
+        if (initialTerminalCompletion !== false) await initialTerminalCompletion;
         const reachedLimit = cycles >= cycleLimit
           ? "cycle-limit"
           : dispatches >= dispatchLimit
@@ -26409,24 +27297,34 @@ const TEMPLATE: &str = r##"<!doctype html>
           await honorRunnerControl();
           continue;
         }
-        if (await accelerateDspReceiveMailboxWait(pc)) {
-          await finishTerminalControllerScenario();
+        const dspReceiveAcceleration = pendingDspReceiveMailboxWaitAcceleration(pc);
+        if (dspReceiveAcceleration !== false && await dspReceiveAcceleration) {
+          const terminalCompletion = pendingTerminalControllerScenarioCompletion();
+          if (terminalCompletion !== false) await terminalCompletion;
           continue;
         }
-        if (await accelerateDspSendMailboxWait(pc)) {
-          await finishTerminalControllerScenario();
+        const dspSendAcceleration = pendingDspSendMailboxWaitAcceleration(pc);
+        if (dspSendAcceleration !== false && await dspSendAcceleration) {
+          const terminalCompletion = pendingTerminalControllerScenarioCompletion();
+          if (terminalCompletion !== false) await terminalCompletion;
           continue;
         }
-        if (await accelerateAramDmaBusyWait(pc)) {
-          await finishTerminalControllerScenario();
+        const aramDmaAcceleration = pendingAramDmaBusyWaitAcceleration(pc);
+        if (aramDmaAcceleration !== false && await aramDmaAcceleration) {
+          const terminalCompletion = pendingTerminalControllerScenarioCompletion();
+          if (terminalCompletion !== false) await terminalCompletion;
           continue;
         }
-        if (await accelerateMusyxAramQueueFullWait(pc)) {
-          await finishTerminalControllerScenario();
+        const musyxAramAcceleration = pendingMusyxAramQueueFullWaitAcceleration(pc);
+        if (musyxAramAcceleration !== false && await musyxAramAcceleration) {
+          const terminalCompletion = pendingTerminalControllerScenarioCompletion();
+          if (terminalCompletion !== false) await terminalCompletion;
           continue;
         }
-        if (await accelerateAiSrcInitSampleCounterWait(pc)) {
-          await finishTerminalControllerScenario();
+        const aiSrcInitAcceleration = pendingAiSrcInitSampleCounterWaitAcceleration(pc);
+        if (aiSrcInitAcceleration !== false && await aiSrcInitAcceleration) {
+          const terminalCompletion = pendingTerminalControllerScenarioCompletion();
+          if (terminalCompletion !== false) await terminalCompletion;
           continue;
         }
         // The pending-probe region fence below keeps this GX function entry
@@ -26685,10 +27583,12 @@ const TEMPLATE: &str = r##"<!doctype html>
           );
           if (pendingFusion !== null) await pendingFusion;
         }
-        updateStablePcWitness(nextPc);
+        observeCriticalStorageFaultRetryProgress(executedPc);
+        updateStablePcWitness(nextPc, stableCpuSignature, block);
         pc = nextPc;
 
-        await finishTerminalControllerScenario();
+        const executedTerminalCompletion = pendingTerminalControllerScenarioCompletion();
+        if (executedTerminalCompletion !== false) await executedTerminalCompletion;
 
         const semanticIdle = !executedRegion
           && executedBlocks === 1
@@ -26724,7 +27624,8 @@ const TEMPLATE: &str = r##"<!doctype html>
           lastPc = null;
           lastCpuSignature = null;
           samePcCount = 0;
-          await finishTerminalControllerScenario();
+          const idleTerminalCompletion = pendingTerminalControllerScenarioCompletion();
+          if (idleTerminalCompletion !== false) await idleTerminalCompletion;
         }
 
         if (pc === 0) {

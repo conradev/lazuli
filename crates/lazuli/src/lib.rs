@@ -1,6 +1,8 @@
 #![feature(deque_extend_front)]
 
 pub mod primitive;
+pub mod runtime;
+pub mod runtime_hooks;
 pub mod stream;
 
 pub mod cores;

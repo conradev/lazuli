@@ -41,10 +41,11 @@
   <noscript>JavaScript is required. <a href="/source/">Source and legal notices</a></noscript>
   <script type="module">
     // Keep this bootstrap self-contained: an incumbent stored worker can
-    // cache the new shell before the schema-3 worker finishes installing.
+    // cache the new shell before the schema-4 worker finishes installing.
     const documentId = crypto.randomUUID();
     document.body.dataset.documentId = documentId;
-    const EXPECTED_RELEASE_SCHEMA = 3;
+    const EXPECTED_RELEASE_SCHEMA = 4;
+    const EXPECTED_RUNTIME_CHOICE = "rust-resident-v1";
     const status = document.querySelector("#status");
     const detail = document.querySelector("#detail");
     const app = document.querySelector("#app");
@@ -52,8 +53,11 @@
     function requireCompatibleRelease(release) {
       if (release?.schema !== EXPECTED_RELEASE_SCHEMA) {
         throw new Error(
-          `release schema ${release?.schema ?? "unknown"} cannot provide mandatory WebGPU`,
+          `release schema ${release?.schema ?? "unknown"} cannot provide the resident runtime`,
         );
+      }
+      if (release?.runtime?.choice !== EXPECTED_RUNTIME_CHOICE) {
+        throw new Error(`release runtime ${release?.runtime?.choice ?? "unknown"} is incompatible`);
       }
       return release;
     }
@@ -65,14 +69,17 @@
           try {
             const response = await fetch("/.gekko/worker-status", { cache: "no-store" });
             const worker = response.ok ? await response.json() : null;
-            if (worker?.releaseSchema === EXPECTED_RELEASE_SCHEMA) {
+            if (
+              worker?.releaseSchema === EXPECTED_RELEASE_SCHEMA &&
+              worker?.runtimeChoice === EXPECTED_RUNTIME_CHOICE
+            ) {
               return navigator.serviceWorker.controller;
             }
           } catch {}
         }
         await new Promise(resolve => setTimeout(resolve, 50));
       }
-      throw new Error("mandatory WebGPU service worker did not take control");
+      throw new Error("mandatory resident service worker did not take control");
     }
 
     async function registerWorker() {

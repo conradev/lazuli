@@ -5,6 +5,12 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import {
+  compactPublicActiveRelease,
+  validateCompactPublicActiveRelease,
+} from "./browser_public_release_identity.mjs";
+import { schema4ReleaseFixture } from "./browser_public_release_identity.test_fixture.mjs";
+
 const source = readFileSync(
   new URL("./browser_boot_headless.mjs", import.meta.url),
   "utf8",
@@ -74,6 +80,8 @@ test("headless capture pins the validated active deployed release twice", async 
     source,
     /import \{ validateRelease \} from "\.\.\/web\/release\.mjs"/,
   );
+  assert.match(source, /compactPublicActiveRelease/);
+  assert.match(source, /validateCompactPublicActiveRelease/);
   assert.match(source, /case "--expect-commit":/);
   assert.match(source, /case "--expect-release-id":/);
   assert.doesNotMatch(source, /fetch\("\/release\.json"/);
@@ -145,34 +153,22 @@ test("headless capture pins the validated active deployed release twice", async 
     Array,
     Error,
     JSON,
+    compactPublicActiveRelease,
+    validateCompactPublicActiveRelease,
     async validateRelease(release) {
-      assert.equal(release.schema, 3);
+      assert.equal(release.schema, 4);
       assert.equal(Object.hasOwn(release, "cacheName"), false);
       return release;
     },
   });
   vm.runInContext([
-    extractFunction("compactReleaseAsset"),
     extractFunction("compactActiveRelease"),
     extractFunction("validateObservedActiveRelease"),
   ].join("\n\n"), context);
-  const release = {
-    schema: 3,
-    releaseId: "a".repeat(64),
-    source: { commit: "b".repeat(40) },
-    frontend: { url: `/assets/frontend-${"c".repeat(64)}.html`, sha256: "c".repeat(64), bytes: 10 },
-    renderer: {
-      javascript: { url: `/assets/renderer-${"d".repeat(64)}.js`, sha256: "d".repeat(64), bytes: 20 },
-      wasm: { url: `/assets/renderer-${"e".repeat(64)}.wasm`, sha256: "e".repeat(64), bytes: 30 },
-    },
-    dsp: { url: `/assets/browser-dsp-${"1".repeat(64)}.wasm`, sha256: "1".repeat(64), bytes: 35 },
-    backend: {
-      url: "/ppcwasmjit.wasm",
-      sha256: "f".repeat(64),
-      bytes: 40,
-      chunks: [{ ignored: "compact evidence omits chunks" }],
-    },
-  };
+  const release = await schema4ReleaseFixture({
+    assetHash: "c".repeat(64),
+    commit: "b".repeat(40),
+  });
   const options = {
     expectCommit: release.source.commit,
     expectReleaseId: release.releaseId,
@@ -189,12 +185,15 @@ test("headless capture pins the validated active deployed release twice", async 
     "schema",
     "releaseId",
     "commit",
+    "source",
+    "bootstrap",
+    "runtime",
     "frontend",
     "renderer",
-    "dsp",
-    "backend",
+    "rollback",
   ]);
-  assert.equal(Object.hasOwn(identity.backend, "chunks"), false);
+  assert.equal(identity.runtime.choice, "rust-resident-v1");
+  assert.equal(identity.rollback.release.schema, 3);
   await assert.doesNotReject(
     context.validateObservedActiveRelease(observation, options, identity),
   );

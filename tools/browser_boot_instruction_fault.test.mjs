@@ -74,6 +74,10 @@ const intendedFunctions = [
   "fetchInstructionWord",
   "probeInstructionWord",
   "stageInstructionBlock",
+  "classifyCriticalStorageFault",
+  "criticalStorageFaultMatches",
+  "resolveCriticalStorageFaultPending",
+  "beginCriticalStorageFault",
   "instructionStorageCause",
   "raiseInstructionFetchFault",
 ];
@@ -154,6 +158,22 @@ function makeExceptionContext() {
   const buffer = new ArrayBuffer(1024 * 1024);
   const context = {
     cpu: 0,
+    cycles: 31,
+    criticalStorageFaultClassifications: {
+      "data-page-fault": 0,
+      "data-protection-fault": 0,
+      "instruction-page-fault": 0,
+      "instruction-protection-fault": 0,
+      unsupported: 0,
+    },
+    criticalStorageFaultHandlerReturns: 0,
+    criticalStorageFaultLastResolved: null,
+    criticalStorageFaultNested: 0,
+    criticalStorageFaultPending: null,
+    criticalStorageFaultRaised: 0,
+    criticalStorageFaultRecurrences: 0,
+    criticalStorageFaultResolved: 0,
+    criticalStorageFaultSequence: 0,
     ctrOffset: 0x90,
     darOffset: 0x88,
     dispatches: 19,
@@ -165,6 +185,7 @@ function makeExceptionContext() {
     firstDsi: null,
     gprOffsets: Array.from({ length: 32 }, (_unused, index) => 0xa0 + index * 4),
     lastUnmappedAccess: null,
+    lastDataStorageFault: null,
     lrOffset: 0x8c,
     msrOffset: 0x20,
     namespaceTransitions: [],
@@ -192,6 +213,10 @@ function makeExceptionContext() {
   vm.runInContext(
     [
       "instructionStorageCause",
+      "classifyCriticalStorageFault",
+      "criticalStorageFaultMatches",
+      "resolveCriticalStorageFaultPending",
+      "beginCriticalStorageFault",
       "raiseException",
       "raiseInstructionFetchFault",
     ].map(extractFunction).join("\n\n"),
@@ -388,6 +413,12 @@ semanticTest("a first-word page-table fault enters a low-vector ISI without recu
   assert.equal(context.view.getUint32(context.cpu + context.pcOffset, true), 0x00000400);
   assert.equal(context.exceptionCounts.get("0x0400"), 1);
   assert.equal(context.exceptionFirstByVector["0x0400"].instruction, null);
+  assert.equal(context.criticalStorageFaultRaised, 1);
+  assert.equal(
+    context.criticalStorageFaultPending.classification,
+    "instruction-page-fault",
+  );
+  assert.equal(context.criticalStorageFaultPending.phase, "handler");
   assert.deepEqual(context.namespaceTransitions, [{
     reason: "exception",
     msr: 0,
@@ -421,6 +452,10 @@ semanticTest("ISI causes preserve IP for high vectors and keep unbacked faults s
   );
   assert.equal(context.view.getUint32(context.cpu + context.msrOffset, true), 0x40);
   assert.equal(context.view.getUint32(context.cpu + context.pcOffset, true), 0xfff00400);
+  assert.equal(
+    context.criticalStorageFaultPending.classification,
+    "instruction-protection-fault",
+  );
 
   const before = {
     pc: context.view.getUint32(context.cpu + context.pcOffset, true),

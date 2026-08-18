@@ -2,17 +2,22 @@
 
 import {
   RELEASE_SCHEMA,
+  RESIDENT_RUNTIME_CHOICE,
+  ROLLBACK_RELEASE_SCHEMA,
   releaseAssets,
   validateRelease,
   validateStoredRelease,
   verifyAssetBytes,
 } from "./release.mjs";
 
-export const BOOTSTRAP_CACHE = "gekko-bootstrap-v2";
+export const BOOTSTRAP_CACHE = "gekko-bootstrap-v3";
 export const META_CACHE = "gekko-meta-v1";
 export const RELEASE_CACHE_PREFIX = "gekko-release-";
 export const ACTIVE_RECORD_PATH = "/.gekko/active-release";
 export const STAGE_RELEASE_PATH = "/.gekko/stage-release";
+export const CANDIDATE_RECORD_PATH = "/.gekko/candidate-release";
+export const STAGE_CANARY_PATH = "/.gekko/stage-canary";
+export const PROMOTE_CANARY_PATH = "/.gekko/promote-canary";
 export const WORKER_STATUS_PATH = "/.gekko/worker-status";
 export const LEGAL_PAGE_PATH = "/source/";
 export const LEGACY_LEGAL_PAGE_PATH = "/source.html";
@@ -31,20 +36,43 @@ function absoluteUrl(path, origin) {
   return new URL(path, origin).href;
 }
 
-function activeRecordUrl(origin) {
-  return absoluteUrl(ACTIVE_RECORD_PATH, origin);
+function metadataRecordUrl(path, origin) {
+  return absoluteUrl(path, origin);
 }
 
-export async function readActiveRelease(cacheStorage, origin) {
+function exactKeys(value, expected) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+}
+
+function validCacheRecord(record) {
+  if (!exactKeys(record, ["release", "cacheName"])) return false;
+  const expectedPrefix = `${RELEASE_CACHE_PREFIX}${record.release.releaseId}-`;
+  return typeof record.cacheName === "string" && record.cacheName.startsWith(expectedPrefix);
+}
+
+async function readReleaseRecord(cacheStorage, origin, path) {
   const metadata = await cacheStorage.open(META_CACHE);
-  const response = await metadata.match(activeRecordUrl(origin));
+  const response = await metadata.match(metadataRecordUrl(path, origin));
   if (response === undefined) return null;
   try {
     const record = await response.json();
+    const expectedKeys = record?.release?.schema === RELEASE_SCHEMA
+      ? ["release", "cacheName", "rollback"]
+      : ["release", "cacheName"];
+    if (!exactKeys(record, expectedKeys)) return null;
     await validateStoredRelease(record.release);
-    const expectedPrefix = `${RELEASE_CACHE_PREFIX}${record.release.releaseId}-`;
-    if (typeof record.cacheName !== "string" || !record.cacheName.startsWith(expectedPrefix)) {
-      return null;
+    if (!validCacheRecord({ release: record.release, cacheName: record.cacheName })) return null;
+    if (record.release.schema === RELEASE_SCHEMA) {
+      if (!validCacheRecord(record.rollback)) return null;
+      await validateStoredRelease(record.rollback.release);
+      if (
+        record.rollback.release.schema !== ROLLBACK_RELEASE_SCHEMA ||
+        record.rollback.release.releaseId !== record.release.rollback.release.releaseId ||
+        JSON.stringify(record.rollback.release) !== JSON.stringify(record.release.rollback.release)
+      ) {
+        return null;
+      }
     }
     return record;
   } catch {
@@ -52,12 +80,64 @@ export async function readActiveRelease(cacheStorage, origin) {
   }
 }
 
+export function readActiveRelease(cacheStorage, origin) {
+  return readReleaseRecord(cacheStorage, origin, ACTIVE_RECORD_PATH);
+}
+
+export function readCandidateRelease(cacheStorage, origin) {
+  return readReleaseRecord(cacheStorage, origin, CANDIDATE_RECORD_PATH);
+}
+
+async function writeMetadataRecord(cacheStorage, origin, path, record) {
+  const metadata = await cacheStorage.open(META_CACHE);
+  await metadata.put(
+    metadataRecordUrl(path, origin),
+    new Response(JSON.stringify(record), {
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    }),
+  );
+}
+
+async function deleteMetadataRecord(cacheStorage, origin, path) {
+  const metadata = await cacheStorage.open(META_CACHE);
+  if (typeof metadata.delete === "function") {
+    await metadata.delete(metadataRecordUrl(path, origin));
+  }
+}
+
 async function releaseCacheIsComplete(record, cacheStorage, origin) {
   const cache = await cacheStorage.open(record.cacheName);
-  for (const asset of releaseAssets(record.release)) {
-    if ((await cache.match(absoluteUrl(asset.url, origin))) === undefined) return false;
+  const assets = releaseAssets(record.release);
+  if (typeof cache.keys !== "function") return false;
+  const expected = assets.map(asset => absoluteUrl(asset.url, origin)).sort();
+  const observed = (await cache.keys()).map(request => keyUrl(request)).sort();
+  if (JSON.stringify(observed) !== JSON.stringify(expected)) return false;
+  try {
+    for (const asset of assets) {
+      const response = await cache.match(absoluteUrl(asset.url, origin));
+      if (response === undefined || !response.ok) return false;
+      await verifyAssetBytes(asset, await response.arrayBuffer());
+    }
+  } catch {
+    return false;
   }
   return true;
+}
+
+function keyUrl(request) {
+  return typeof request === "string" ? request : request.url;
+}
+
+async function verifiedCachedResponse(asset, cache, url) {
+  const response = await cache.match(url);
+  if (response === undefined || !response.ok) return undefined;
+  try {
+    await verifyAssetBytes(asset, await response.clone().arrayBuffer());
+    return response;
+  } catch {
+    if (typeof cache.delete === "function") await cache.delete(url);
+    return undefined;
+  }
 }
 
 async function putVerifiedAsset(asset, response, cache, origin) {
@@ -73,85 +153,158 @@ async function putVerifiedAsset(asset, response, cache, origin) {
 async function fetchAndCacheAsset(
   asset,
   cache,
-  reusableCache,
+  reusableCaches,
   fetcher,
   origin,
 ) {
   const url = absoluteUrl(asset.url, origin);
-  const reusable = reusableCache === null ? undefined : await reusableCache.match(url);
-  if (reusable !== undefined) {
-    await putVerifiedAsset(asset, reusable, cache, origin);
-    return;
+  for (const reusableCache of reusableCaches) {
+    const reusable = await reusableCache.match(url);
+    if (reusable !== undefined) {
+      await putVerifiedAsset(asset, reusable, cache, origin);
+      return;
+    }
   }
   const response = await fetcher(new Request(url, { cache: "no-store" }));
   if (!response.ok) throw new Error(`${asset.url} fetch failed: HTTP ${response.status}`);
   await putVerifiedAsset(asset, response, cache, origin);
 }
 
-async function fillReleaseCache(release, cache, reusableCache, fetcher, origin) {
+async function fillReleaseCache(release, cache, reusableCaches, fetcher, origin) {
   const pending = [...releaseAssets(release)];
   const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
     while (pending.length > 0) {
       const asset = pending.shift();
-      await fetchAndCacheAsset(asset, cache, reusableCache, fetcher, origin);
+      await fetchAndCacheAsset(asset, cache, reusableCaches, fetcher, origin);
     }
   });
   await Promise.all(workers);
 }
 
-export async function stageRelease(release, options = {}) {
+async function stageReleaseCache(release, options) {
+  const cacheStorage = options.cacheStorage ?? caches;
+  const fetcher = options.fetcher ?? fetch;
+  const origin = options.origin ?? self.location.origin;
+  for (const reusableRecord of options.reusableRecords ?? []) {
+    if (
+      reusableRecord?.release.releaseId === release.releaseId &&
+      await releaseCacheIsComplete(reusableRecord, cacheStorage, origin)
+    ) {
+      return { record: reusableRecord, created: false };
+    }
+  }
+  const suffix = options.cacheSuffix;
+  const cacheName = `${RELEASE_CACHE_PREFIX}${release.releaseId}-${suffix}`;
+  const releaseCache = await cacheStorage.open(cacheName);
+  const reusableCaches = await Promise.all(
+    (options.reusableRecords ?? []).map(record => cacheStorage.open(record.cacheName)),
+  );
+  try {
+    await fillReleaseCache(release, releaseCache, reusableCaches, fetcher, origin);
+  } catch (error) {
+    await cacheStorage.delete(cacheName);
+    throw error;
+  }
+  return { record: { release, cacheName }, created: true };
+}
+
+async function cleanupReleaseCaches(cacheStorage, retained) {
+  try {
+    for (const existing of await cacheStorage.keys()) {
+      if (existing.startsWith(RELEASE_CACHE_PREFIX) && !retained.has(existing)) {
+        await cacheStorage.delete(existing);
+      }
+    }
+  } catch {}
+}
+
+export async function stageCanaryRelease(release, options = {}) {
   const cacheStorage = options.cacheStorage ?? caches;
   const fetcher = options.fetcher ?? fetch;
   const origin = options.origin ?? self.location.origin;
   await validateRelease(release);
 
-  const active = await readActiveRelease(cacheStorage, origin);
+  const [active, priorCandidate] = await Promise.all([
+    readActiveRelease(cacheStorage, origin),
+    readCandidateRelease(cacheStorage, origin),
+  ]);
   if (
-    active?.release.releaseId === release.releaseId &&
-    await releaseCacheIsComplete(active, cacheStorage, origin)
+    priorCandidate?.release.releaseId === release.releaseId &&
+    await releaseCacheIsComplete(priorCandidate, cacheStorage, origin) &&
+    await releaseCacheIsComplete(priorCandidate.rollback, cacheStorage, origin)
   ) {
-    return active;
+    return priorCandidate;
   }
 
   const suffix = options.cacheSuffix ?? crypto.randomUUID();
-  const cacheName = `${RELEASE_CACHE_PREFIX}${release.releaseId}-${suffix}`;
-  const releaseCache = await cacheStorage.open(cacheName);
-  const reusableCache = active === null ? null : await cacheStorage.open(active.cacheName);
+  const reusable = [active, active?.rollback, priorCandidate, priorCandidate?.rollback]
+    .filter(record => record !== null && record !== undefined);
+  const rollbackStage = await stageReleaseCache(release.rollback.release, {
+    cacheStorage,
+    fetcher,
+    origin,
+    cacheSuffix: `${suffix}-rollback`,
+    reusableRecords: reusable,
+  });
+  let primaryStage;
   try {
-    await fillReleaseCache(release, releaseCache, reusableCache, fetcher, origin);
+    primaryStage = await stageReleaseCache(release, {
+      cacheStorage,
+      fetcher,
+      origin,
+      cacheSuffix: `${suffix}-candidate`,
+      reusableRecords: [rollbackStage.record, ...reusable],
+    });
   } catch (error) {
-    await cacheStorage.delete(cacheName);
+    if (rollbackStage.created) await cacheStorage.delete(rollbackStage.record.cacheName);
     throw error;
   }
 
-  const record = { release, cacheName };
+  const record = {
+    ...primaryStage.record,
+    rollback: rollbackStage.record,
+  };
   try {
-    const metadata = await cacheStorage.open(META_CACHE);
-    await metadata.put(
-      activeRecordUrl(origin),
-      new Response(JSON.stringify(record), {
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-      }),
-    );
+    await writeMetadataRecord(cacheStorage, origin, CANDIDATE_RECORD_PATH, record);
   } catch (error) {
-    await cacheStorage.delete(cacheName);
+    if (primaryStage.created) await cacheStorage.delete(primaryStage.record.cacheName);
+    if (rollbackStage.created) await cacheStorage.delete(rollbackStage.record.cacheName);
     throw error;
   }
-
-  // Cleanup is deliberately best-effort and happens after the only commit point.
-  // A quota or eviction error here must not invalidate the newly active release.
-  try {
-    for (const existing of await cacheStorage.keys()) {
-      if (
-        existing.startsWith(RELEASE_CACHE_PREFIX) &&
-        existing !== cacheName &&
-        existing !== active?.cacheName
-      ) {
-        await cacheStorage.delete(existing);
-      }
-    }
-  } catch {}
   return record;
+}
+
+export async function promoteCanaryRelease(releaseId, options = {}) {
+  const cacheStorage = options.cacheStorage ?? caches;
+  const origin = options.origin ?? self.location.origin;
+  if (!/^[0-9a-f]{64}$/.test(releaseId ?? "")) throw new Error("invalid candidate release ID");
+  const [active, candidate] = await Promise.all([
+    readActiveRelease(cacheStorage, origin),
+    readCandidateRelease(cacheStorage, origin),
+  ]);
+  if (candidate === null || candidate.release.releaseId !== releaseId) {
+    throw new Error("exact candidate release is not staged");
+  }
+  if (
+    !await releaseCacheIsComplete(candidate, cacheStorage, origin) ||
+    !await releaseCacheIsComplete(candidate.rollback, cacheStorage, origin)
+  ) {
+    throw new Error("candidate or rollback cache is incomplete");
+  }
+  await writeMetadataRecord(cacheStorage, origin, ACTIVE_RECORD_PATH, candidate);
+  await deleteMetadataRecord(cacheStorage, origin, CANDIDATE_RECORD_PATH);
+  await cleanupReleaseCaches(cacheStorage, new Set([
+    candidate.cacheName,
+    candidate.rollback.cacheName,
+    active?.cacheName,
+    active?.rollback?.cacheName,
+  ].filter(Boolean)));
+  return candidate;
+}
+
+export async function stageRelease(release, options = {}) {
+  const record = await stageCanaryRelease(release, options);
+  return promoteCanaryRelease(record.release.releaseId, options);
 }
 
 export async function backendResponse(
@@ -160,16 +313,19 @@ export async function backendResponse(
   origin = self.location.origin,
   fetcher = fetch,
 ) {
-  if (record?.release?.schema !== RELEASE_SCHEMA) {
-    throw new Error(`release schema ${RELEASE_SCHEMA} is required to serve the browser compiler`);
+  if (record?.release?.schema !== ROLLBACK_RELEASE_SCHEMA) {
+    throw new Error(
+      `rollback release schema ${ROLLBACK_RELEASE_SCHEMA} is required to serve the browser compiler`,
+    );
   }
   const cache = await cacheStorage.open(record.cacheName);
   const responses = [];
   for (const chunk of record.release.backend.chunks) {
-    let response = await cache.match(absoluteUrl(chunk.url, origin));
+    const url = absoluteUrl(chunk.url, origin);
+    let response = await verifiedCachedResponse(chunk, cache, url);
     if (response === undefined) {
-      await fetchAndCacheAsset(chunk, cache, null, fetcher, origin);
-      response = await cache.match(absoluteUrl(chunk.url, origin));
+      await fetchAndCacheAsset(chunk, cache, [], fetcher, origin);
+      response = await verifiedCachedResponse(chunk, cache, url);
     }
     if (response === undefined) throw new Error(`cached backend chunk is missing: ${chunk.url}`);
     responses.push(response);
@@ -259,17 +415,20 @@ export async function cachedReleaseAsset(
     status: 503,
     headers: { "Cache-Control": "no-store" },
   });
-  if (active?.release?.schema !== RELEASE_SCHEMA) return unavailable();
+  if (
+    active?.release?.schema !== RELEASE_SCHEMA &&
+    active?.release?.schema !== ROLLBACK_RELEASE_SCHEMA
+  ) return unavailable();
   const asset = releaseAssets(active.release)
     .find(candidate => absoluteUrl(candidate.url, origin) === canonical);
   if (asset === undefined) return unavailable();
 
   const cache = await cacheStorage.open(active.cacheName);
-  let response = await cache.match(canonical);
+  let response = await verifiedCachedResponse(asset, cache, canonical);
   if (response !== undefined) return response;
   try {
-    await fetchAndCacheAsset(asset, cache, null, fetcher, origin);
-    response = await cache.match(canonical);
+    await fetchAndCacheAsset(asset, cache, [], fetcher, origin);
+    response = await verifiedCachedResponse(asset, cache, canonical);
   } catch {
     return unavailable();
   }
@@ -300,8 +459,60 @@ async function stageReleaseRequest(request) {
   }
 }
 
+async function stageCanaryRequest(request) {
+  try {
+    const record = await stageCanaryRelease(await request.json());
+    return new Response(JSON.stringify({ ok: true, active: false, release: record.release }), {
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ ok: false, error: String(error) }), {
+      status: 503,
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
+  }
+}
+
+async function exactReleaseIdBody(request, label) {
+  const body = await request.json();
+  if (!exactKeys(body, ["releaseId"]) || !/^[0-9a-f]{64}$/.test(body.releaseId ?? "")) {
+    throw new Error(`${label} requires exactly one lowercase releaseId`);
+  }
+  return body.releaseId;
+}
+
+async function promoteCanaryRequest(request) {
+  try {
+    const releaseId = await exactReleaseIdBody(request, "candidate promotion");
+    const record = await promoteCanaryRelease(releaseId);
+    return new Response(JSON.stringify({ ok: true, release: record.release }), {
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ ok: false, error: String(error) }), {
+      status: 409,
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
+  }
+}
+
 export function workerStatusResponse() {
-  return new Response(JSON.stringify({ releaseSchema: RELEASE_SCHEMA }), {
+  return new Response(JSON.stringify({
+    releaseSchema: RELEASE_SCHEMA,
+    runtimeChoice: RESIDENT_RUNTIME_CHOICE,
+  }), {
     headers: {
       "Cache-Control": "no-store",
       "Content-Type": "application/json; charset=utf-8",
@@ -336,6 +547,12 @@ export async function handleFetch(request) {
   }
   if (url.pathname === STAGE_RELEASE_PATH && request.method === "POST") {
     return stageReleaseRequest(request);
+  }
+  if (url.pathname === STAGE_CANARY_PATH && request.method === "POST") {
+    return stageCanaryRequest(request);
+  }
+  if (url.pathname === PROMOTE_CANARY_PATH && request.method === "POST") {
+    return promoteCanaryRequest(request);
   }
   if (url.pathname === ACTIVE_RECORD_PATH && request.method === "GET") {
     return activeReleaseResponse();

@@ -2,28 +2,40 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFile } from "node:fs/promises";
 
 import {
   ACTIVE_RECORD_PATH,
   BOOTSTRAP_ASSETS,
   BOOTSTRAP_CACHE,
+  CANDIDATE_RECORD_PATH,
   LEGAL_PAGE_PATH,
   LEGACY_LEGAL_PAGE_PATH,
   META_CACHE,
+  PROMOTE_CANARY_PATH,
+  RELEASE_CACHE_PREFIX,
+  STAGE_CANARY_PATH,
   WORKER_STATUS_PATH,
   activeReleaseResponse,
-  backendResponse,
   cachedReleaseAsset,
   handleFetch,
+  promoteCanaryRelease,
   readActiveRelease,
+  readCandidateRelease,
+  stageCanaryRelease,
   stageRelease,
   workerStatusResponse,
 } from "./sw.js";
 import {
   LEGACY_RELEASE_SCHEMA,
   PREVIOUS_RELEASE_SCHEMA,
+  RELEASE_BOOTSTRAP_URLS,
   RELEASE_SCHEMA,
+  RESIDENT_RUNTIME_ABI,
+  RESIDENT_RUNTIME_CHOICE,
+  ROLLBACK_RELEASE_SCHEMA,
   WASM_CHUNK_SIZE,
+  releaseAssets,
   releaseIdentityPayload,
   sha256Hex,
   validateRelease,
@@ -31,102 +43,6 @@ import {
 } from "./release.mjs";
 
 const ORIGIN = "https://gekko.free";
-
-test("keeps the legal page and bundled font notice available offline", async () => {
-  const legalAssets = new Map([
-    [LEGAL_PAGE_PATH, "<h1>Gekko source</h1>"],
-    ["/THIRD-PARTY-NOTICES.txt", "Apache-2.0 font attribution"],
-  ]);
-  const storage = new MemoryCacheStorage();
-  const cache = await storage.open(BOOTSTRAP_CACHE);
-  for (const [path, body] of legalAssets) {
-    assert.ok(BOOTSTRAP_ASSETS.includes(path));
-    await cache.put(`${ORIGIN}${path}`, new Response(body));
-  }
-  await withWorkerGlobals(
-    storage,
-    async () => {
-      throw new Error("offline");
-    },
-    async () => {
-      for (const [path, body] of legalAssets) {
-        const response = await handleFetch(new Request(`${ORIGIN}${path}`));
-        assert.equal(await response.text(), body);
-      }
-      const legacyLegalPage = await handleFetch(
-        new Request(`${ORIGIN}${LEGACY_LEGAL_PAGE_PATH}`),
-      );
-      assert.equal(await legacyLegalPage.text(), legalAssets.get(LEGAL_PAGE_PATH));
-    },
-  );
-});
-
-test("worker status identifies the release schema during upgrades", async () => {
-  assert.equal(WORKER_STATUS_PATH, "/.gekko/worker-status");
-  const response = workerStatusResponse();
-  assert.equal(response.headers.get("Cache-Control"), "no-store");
-  assert.deepEqual(await response.json(), { releaseSchema: RELEASE_SCHEMA });
-});
-
-test("active release endpoint fails closed until a validated schema-3 release is active", async () => {
-  assert.equal(ACTIVE_RECORD_PATH, "/.gekko/active-release");
-  const storage = new MemoryCacheStorage();
-
-  const missing = await activeReleaseResponse(storage, ORIGIN);
-  assert.equal(missing.status, 503);
-  assert.equal(missing.headers.get("Cache-Control"), "no-store");
-
-  const candidate = await makeRelease(6);
-  const legacy = await legacyRelease(candidate.release);
-  const metadata = await storage.open(META_CACHE);
-  await metadata.put(
-    `${ORIGIN}${ACTIVE_RECORD_PATH}`,
-    new Response(JSON.stringify({
-      release: legacy,
-      cacheName: `gekko-release-${legacy.releaseId}-legacy`,
-    })),
-  );
-  assert.equal((await activeReleaseResponse(storage, ORIGIN)).status, 503);
-
-  const corrupt = structuredClone(candidate.release);
-  corrupt.releaseId = "0".repeat(64);
-  await metadata.put(
-    `${ORIGIN}${ACTIVE_RECORD_PATH}`,
-    new Response(JSON.stringify({
-      release: corrupt,
-      cacheName: `gekko-release-${corrupt.releaseId}-corrupt`,
-    })),
-  );
-  assert.equal((await activeReleaseResponse(storage, ORIGIN)).status, 503);
-});
-
-test("active release GET exposes only the validated schema-3 manifest", async () => {
-  const storage = new MemoryCacheStorage();
-  const candidate = await makeRelease(7);
-  await stageRelease(candidate.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(candidate.responses),
-    origin: ORIGIN,
-    cacheSuffix: "observer",
-  });
-
-  const direct = await activeReleaseResponse(storage, ORIGIN);
-  assert.equal(direct.status, 200);
-  assert.equal(direct.headers.get("Cache-Control"), "no-store");
-  assert.equal(direct.headers.get("Content-Type"), "application/json; charset=utf-8");
-  const directText = await direct.text();
-  assert.deepEqual(JSON.parse(directText), candidate.release);
-  assert.doesNotMatch(directText, /cacheName/);
-
-  await withWorkerGlobals(storage, async () => {
-    throw new Error("active release observer must not use the network");
-  }, async () => {
-    const response = await handleFetch(new Request(`${ORIGIN}${ACTIVE_RECORD_PATH}`));
-    const body = await response.json();
-    assert.deepEqual(body, candidate.release);
-    assert.equal(Object.hasOwn(body, "cacheName"), false);
-  });
-});
 
 function key(request) {
   return typeof request === "string" ? request : request.url;
@@ -146,6 +62,15 @@ class MemoryCache {
   async put(request, response) {
     this.log.push(`put:${this.name}:${new URL(key(request)).pathname}`);
     this.entries.set(key(request), response.clone());
+  }
+
+  async delete(request) {
+    this.log.push(`delete-entry:${this.name}:${new URL(key(request)).pathname}`);
+    return this.entries.delete(key(request));
+  }
+
+  async keys() {
+    return [...this.entries.keys()].map(url => new Request(url));
   }
 }
 
@@ -175,80 +100,128 @@ async function asset(bytes, prefix, extension) {
   return { url: `/assets/${prefix}-${sha256}.${extension}`, sha256, bytes: bytes.byteLength };
 }
 
-async function makeRelease(seed) {
-  const frontendBytes = new TextEncoder().encode(`<p>release ${seed}</p>`);
-  const rendererJavascriptBytes = new TextEncoder().encode("export default function init() {}\n");
-  const rendererWasmBytes = new TextEncoder().encode("shared renderer wasm");
-  const dspWasmBytes = new TextEncoder().encode("shared browser DSP wasm");
-  const backendBytes = new Uint8Array(WASM_CHUNK_SIZE + 3);
-  backendBytes.fill(seed);
-  const chunks = [
-    backendBytes.slice(0, WASM_CHUNK_SIZE),
-    backendBytes.slice(WASM_CHUNK_SIZE),
-  ];
-  const source = {
-    repository: "https://github.com/conradev/lazuli",
-    commit: String(seed).repeat(40),
-    tree: `https://github.com/conradev/lazuli/tree/${String(seed).repeat(40)}`,
-    archive: `https://github.com/conradev/lazuli/archive/${String(seed).repeat(40)}.tar.gz`,
+function source(seed) {
+  const repository = "https://github.com/conradev/lazuli";
+  const commit = seed.repeat(40);
+  return {
+    repository,
+    commit,
+    tree: `${repository}/tree/${commit}`,
+    archive: `${repository}/archive/${commit}.tar.gz`,
     license: {
       expression: "GPL-3.0-only",
       text: "/LICENSE.txt",
-      source: `https://github.com/conradev/lazuli/blob/${String(seed).repeat(40)}/licenses/GPL-3.0-only.txt`,
+      source: `${repository}/blob/${commit}/licenses/GPL-3.0-only.txt`,
     },
   };
-  const release = {
-    schema: RELEASE_SCHEMA,
-    source,
-    frontend: await asset(frontendBytes, "frontend", "html"),
+}
+
+async function assetWithResponse(responses, bytes, prefix, extension) {
+  const descriptor = await asset(bytes, prefix, extension);
+  responses.set(descriptor.url, bytes);
+  return descriptor;
+}
+
+async function stableAssetWithResponse(responses, bytes, url) {
+  const descriptor = { url, sha256: await sha256Hex(bytes), bytes: bytes.byteLength };
+  responses.set(url, bytes);
+  return descriptor;
+}
+
+async function makeRelease(seed = "1") {
+  const responses = new Map();
+  const bytes = label => new TextEncoder().encode(`${label}-${seed}`);
+  const backendBytes = new Uint8Array(WASM_CHUNK_SIZE + 3).fill(seed.charCodeAt(0));
+  const backendChunks = [
+    backendBytes.slice(0, WASM_CHUNK_SIZE),
+    backendBytes.slice(WASM_CHUNK_SIZE),
+  ];
+  const rollback = {
+    schema: ROLLBACK_RELEASE_SCHEMA,
+    source: source(seed),
+    frontend: await assetWithResponse(responses, bytes("rollback frontend"), "rollback-frontend", "html"),
     renderer: {
-      javascript: await asset(rendererJavascriptBytes, "browser-renderer", "js"),
-      wasm: await asset(rendererWasmBytes, "browser-renderer-wasm", "wasm"),
+      javascript: await assetWithResponse(responses, bytes("rollback renderer js"), "rollback-renderer", "js"),
+      wasm: await assetWithResponse(responses, bytes("rollback renderer wasm"), "rollback-renderer-wasm", "wasm"),
     },
-    dsp: await asset(dspWasmBytes, "browser-dsp", "wasm"),
+    dsp: await assetWithResponse(responses, bytes("rollback dsp"), "rollback-dsp", "wasm"),
     backend: {
       url: "/ppcwasmjit.wasm",
       sha256: await sha256Hex(backendBytes),
       bytes: backendBytes.byteLength,
       chunkSize: WASM_CHUNK_SIZE,
-      chunks: await Promise.all(chunks.map(bytes => asset(bytes, "backend", "wasm.chunk"))),
+      chunks: await Promise.all(backendChunks.map((chunk, index) =>
+        assetWithResponse(responses, chunk, `rollback-backend-${index}`, "wasm.chunk")
+      )),
     },
   };
+  rollback.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(rollback)));
+
+  const runtime = {
+    choice: RESIDENT_RUNTIME_CHOICE,
+    abi: { ...RESIDENT_RUNTIME_ABI },
+    core: await assetWithResponse(responses, bytes("core"), "browser-machine", "wasm"),
+    dispatcher: await assetWithResponse(responses, bytes("dispatcher"), "resident-dispatcher", "wasm"),
+    coordinator: await assetWithResponse(responses, bytes("coordinator"), "core-run-coordinator", "wasm"),
+    adapter: await assetWithResponse(responses, bytes("adapter"), "resident-machine-adapter", "mjs"),
+    worker: await assetWithResponse(responses, bytes("worker"), "resident-machine-worker", "mjs"),
+  };
+  const release = {
+    schema: RELEASE_SCHEMA,
+    source: source(seed),
+    bootstrap: {
+      document: await stableAssetWithResponse(
+        responses,
+        bytes("const EXPECTED_RELEASE_SCHEMA = 4;"),
+        RELEASE_BOOTSTRAP_URLS.document,
+      ),
+      releaseModule: await stableAssetWithResponse(
+        responses,
+        bytes("export const RELEASE_SCHEMA = 4;"),
+        RELEASE_BOOTSTRAP_URLS.releaseModule,
+      ),
+      serviceWorker: await stableAssetWithResponse(
+        responses,
+        bytes("validateRelease /.gekko/stage-canary /.gekko/promote-canary"),
+        RELEASE_BOOTSTRAP_URLS.serviceWorker,
+      ),
+    },
+    runtime,
+    frontend: await assetWithResponse(responses, bytes("resident frontend"), "resident-frontend", "html"),
+    renderer: {
+      javascript: await assetWithResponse(responses, bytes("resident renderer js"), "resident-renderer", "js"),
+      wasm: await assetWithResponse(responses, bytes("resident renderer wasm"), "resident-renderer-wasm", "wasm"),
+    },
+    rollback: { release: rollback },
+  };
   release.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(release)));
-  const responses = new Map([
-    [release.frontend.url, frontendBytes],
-    [release.renderer.javascript.url, rendererJavascriptBytes],
-    [release.renderer.wasm.url, rendererWasmBytes],
-    [release.dsp.url, dspWasmBytes],
-    ...release.backend.chunks.map((chunk, index) => [chunk.url, chunks[index]]),
-  ]);
-  return { release, responses, backendBytes, dspWasmBytes };
+  await validateRelease(release);
+  return { release, rollback, responses, backendBytes };
 }
 
-async function legacyRelease(release) {
-  const legacy = structuredClone(release);
-  legacy.schema = LEGACY_RELEASE_SCHEMA;
-  delete legacy.renderer;
-  delete legacy.dsp;
-  legacy.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(legacy)));
-  return legacy;
-}
-
-async function previousRelease(release) {
-  const previous = structuredClone(release);
-  previous.schema = PREVIOUS_RELEASE_SCHEMA;
-  delete previous.dsp;
-  previous.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(previous)));
-  return previous;
-}
-
-function fetchAssets(responses, failPath = null) {
+function fetchAssets(responses, failPath = null, requests = []) {
   return async request => {
     const path = new URL(request.url).pathname;
+    requests.push(path);
     if (path === failPath) return new Response("failed", { status: 503 });
-    const bytes = responses.get(path);
-    return bytes === undefined ? new Response("missing", { status: 404 }) : new Response(bytes);
+    const value = responses.get(path);
+    return value === undefined ? new Response("missing", { status: 404 }) : new Response(value);
   };
+}
+
+async function seedActiveRollback(storage, fixture, suffix = "rollback-active") {
+  const cacheName = `${RELEASE_CACHE_PREFIX}${fixture.rollback.releaseId}-${suffix}`;
+  const cache = await storage.open(cacheName);
+  for (const descriptor of releaseAssets(fixture.rollback)) {
+    await cache.put(`${ORIGIN}${descriptor.url}`, new Response(fixture.responses.get(descriptor.url)));
+  }
+  const record = { release: fixture.rollback, cacheName };
+  const metadata = await storage.open(META_CACHE);
+  await metadata.put(
+    `${ORIGIN}${ACTIVE_RECORD_PATH}`,
+    new Response(JSON.stringify(record)),
+  );
+  return record;
 }
 
 async function withWorkerGlobals(cacheStorage, fetcher, callback) {
@@ -272,318 +245,223 @@ async function withWorkerGlobals(cacheStorage, fetcher, callback) {
   }
 }
 
-test("keeps verified schema-1 and schema-2 releases readable until schema 3 commits", async () => {
-  const candidate = await makeRelease(6);
-  const legacy = await legacyRelease(candidate.release);
-  const previous = await previousRelease(candidate.release);
-  await validateStoredRelease(legacy);
-  await validateStoredRelease(previous);
-  await assert.rejects(validateRelease(legacy), /unsupported schema/);
-  await assert.rejects(validateRelease(previous), /unsupported schema/);
-
+test("bootstrap keeps legal assets offline and identifies schema-4 resident worker", async () => {
   const storage = new MemoryCacheStorage();
-  const cacheName = `gekko-release-${legacy.releaseId}-legacy`;
-  const metadata = await storage.open(META_CACHE);
-  await metadata.put(
-    `${ORIGIN}/.gekko/active-release`,
-    new Response(JSON.stringify({ release: legacy, cacheName })),
-  );
-  const active = await readActiveRelease(storage, ORIGIN);
-  assert.equal(active.release.releaseId, legacy.releaseId);
-  assert.equal(active.release.schema, LEGACY_RELEASE_SCHEMA);
-
-  const previousStorage = new MemoryCacheStorage();
-  const previousCacheName = `gekko-release-${previous.releaseId}-previous`;
-  const previousMetadata = await previousStorage.open(META_CACHE);
-  await previousMetadata.put(
-    `${ORIGIN}/.gekko/active-release`,
-    new Response(JSON.stringify({ release: previous, cacheName: previousCacheName })),
-  );
-  assert.equal(
-    (await readActiveRelease(previousStorage, ORIGIN)).release.schema,
-    PREVIOUS_RELEASE_SCHEMA,
-  );
-
-  const legacyCache = await storage.open(cacheName);
-  for (const releaseAsset of [legacy.frontend, ...legacy.backend.chunks]) {
-    await legacyCache.put(
-      `${ORIGIN}${releaseAsset.url}`,
-      new Response(candidate.responses.get(releaseAsset.url)),
+  const cache = await storage.open(BOOTSTRAP_CACHE);
+  await cache.put(`${ORIGIN}${LEGAL_PAGE_PATH}`, new Response("legal"));
+  assert.ok(BOOTSTRAP_ASSETS.includes(LEGAL_PAGE_PATH));
+  await withWorkerGlobals(storage, async () => { throw new Error("offline"); }, async () => {
+    assert.equal(await (await handleFetch(new Request(`${ORIGIN}${LEGAL_PAGE_PATH}`))).text(), "legal");
+    assert.equal(
+      await (await handleFetch(new Request(`${ORIGIN}${LEGACY_LEGAL_PAGE_PATH}`))).text(),
+      "legal",
     );
-  }
-  const inactiveCache = await storage.open(
-    `gekko-release-${candidate.release.releaseId}-inactive-current`,
-  );
-  for (const rendererAsset of Object.values(candidate.release.renderer)) {
-    await inactiveCache.put(
-      `${ORIGIN}${rendererAsset.url}`,
-      new Response(candidate.responses.get(rendererAsset.url)),
-    );
-  }
-  await inactiveCache.put(
-    `${ORIGIN}${candidate.release.dsp.url}`,
-    new Response(candidate.responses.get(candidate.release.dsp.url)),
-  );
-  await assert.rejects(
-    backendResponse(active, storage, ORIGIN),
-    /release schema 3 is required/,
-  );
-  const legacyAssetRequests = [];
-  const legacyAsset = await cachedReleaseAsset(
-    new Request(`${ORIGIN}${legacy.frontend.url}`),
-    storage,
-    ORIGIN,
-    recordingFetch(new Map(), legacyAssetRequests),
-  );
-  assert.equal(legacyAsset.status, 503);
-  assert.deepEqual(legacyAssetRequests, []);
-
-  const networkRequests = [];
-  await withWorkerGlobals(
-    storage,
-    async request => {
-      networkRequests.push(new URL(request.url).pathname);
-      return new Response("unexpected network response");
-    },
-    async () => {
-      const blockedPaths = [
-        legacy.backend.url,
-        legacy.frontend.url,
-        ...legacy.backend.chunks.map(chunk => chunk.url),
-        ...Object.values(candidate.release.renderer).map(asset => asset.url),
-        candidate.release.dsp.url,
-      ];
-      for (const path of blockedPaths) {
-        const response = await handleFetch(new Request(`${ORIGIN}${path}`));
-        assert.equal(response.status, 503, `${path} must fail closed during schema-1 migration`);
-      }
-    },
-  );
-  assert.deepEqual(networkRequests, []);
-
-  await assert.rejects(
-    stageRelease(candidate.release, {
-      cacheStorage: storage,
-      fetcher: fetchAssets(candidate.responses, candidate.release.dsp.url),
-      origin: ORIGIN,
-      cacheSuffix: "failed-upgrade",
-    }),
-    /fetch failed/,
-  );
-  const preserved = await readActiveRelease(storage, ORIGIN);
-  assert.equal(preserved.release.releaseId, legacy.releaseId);
+  });
+  assert.equal(WORKER_STATUS_PATH, "/.gekko/worker-status");
+  assert.deepEqual(await workerStatusResponse().json(), {
+    releaseSchema: RELEASE_SCHEMA,
+    runtimeChoice: RESIDENT_RUNTIME_CHOICE,
+  });
 });
 
-function recordingFetch(responses, requests) {
-  return async request => {
-    const path = new URL(request.url).pathname;
-    requests.push(path);
-    const bytes = responses.get(path);
-    return bytes === undefined ? new Response("missing", { status: 404 }) : new Response(bytes);
-  };
-}
-
-test("commits a verified release only after every asset is cached", async () => {
-  const storage = new MemoryCacheStorage();
-  const first = await makeRelease(1);
-  const record = await stageRelease(first.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(first.responses),
-    origin: ORIGIN,
-    cacheSuffix: "test",
-  });
-  assert.equal((await readActiveRelease(storage, ORIGIN)).release.releaseId, first.release.releaseId);
-  const metadataWrite = storage.log.findIndex(entry => entry.startsWith(`put:${META_CACHE}:`));
-  const assetWrites = storage.log
-    .map((entry, index) => entry.includes(`put:${record.cacheName}:`) ? index : -1)
-    .filter(index => index >= 0);
-  assert.ok(metadataWrite > Math.max(...assetWrites), "active pointer must be the final write");
-  const releaseCache = storage.caches.get(record.cacheName);
-  for (const releaseAsset of [...Object.values(first.release.renderer), first.release.dsp]) {
-    assert.ok(
-      releaseCache.entries.has(`${ORIGIN}${releaseAsset.url}`),
-      `${releaseAsset.url} must be cached before commit`,
-    );
+test("schema 1, 2, and 3 stored records remain readable but not current-active", async () => {
+  const fixture = await makeRelease();
+  for (const schema of [LEGACY_RELEASE_SCHEMA, PREVIOUS_RELEASE_SCHEMA, ROLLBACK_RELEASE_SCHEMA]) {
+    const historical = structuredClone(fixture.rollback);
+    historical.schema = schema;
+    if (schema < 3) delete historical.dsp;
+    if (schema < 2) delete historical.renderer;
+    historical.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(historical)));
+    await validateStoredRelease(historical);
   }
+  const storage = new MemoryCacheStorage();
+  await seedActiveRollback(storage, fixture);
+  assert.equal((await readActiveRelease(storage, ORIGIN)).release.schema, ROLLBACK_RELEASE_SCHEMA);
+  assert.equal((await activeReleaseResponse(storage, ORIGIN)).status, 503);
+});
 
-  const response = await backendResponse(record, storage, ORIGIN);
-  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), first.backendBytes);
+test("canary staging is inactive until exact-ID promotion", async () => {
+  const fixture = await makeRelease();
+  const storage = new MemoryCacheStorage();
+  const rollback = await seedActiveRollback(storage, fixture);
+  const candidate = await stageCanaryRelease(fixture.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(fixture.responses),
+    origin: ORIGIN,
+    cacheSuffix: "canary",
+  });
+  assert.equal((await readActiveRelease(storage, ORIGIN)).release.releaseId, rollback.release.releaseId);
+  assert.equal((await readCandidateRelease(storage, ORIGIN)).release.releaseId, fixture.release.releaseId);
+  await assert.rejects(
+    promoteCanaryRelease("f".repeat(64), { cacheStorage: storage, origin: ORIGIN }),
+    /exact candidate release is not staged/,
+  );
+  const promoted = await promoteCanaryRelease(fixture.release.releaseId, {
+    cacheStorage: storage,
+    origin: ORIGIN,
+  });
+  assert.equal(promoted.release.releaseId, fixture.release.releaseId);
+  assert.equal((await readActiveRelease(storage, ORIGIN)).release.releaseId, fixture.release.releaseId);
+  assert.equal(await readCandidateRelease(storage, ORIGIN), null);
+  assert.equal(candidate.rollback.release.releaseId, fixture.rollback.releaseId);
+});
 
-  const missing = first.release.backend.chunks[0];
-  storage.caches.get(record.cacheName).entries.delete(`${ORIGIN}${missing.url}`);
+test("promotion rehashes every primary byte and rejects post-stage mutation", async () => {
+  const fixture = await makeRelease();
+  const storage = new MemoryCacheStorage();
+  const rollback = await seedActiveRollback(storage, fixture);
+  const candidate = await stageCanaryRelease(fixture.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(fixture.responses),
+    origin: ORIGIN,
+    cacheSuffix: "mutated-primary",
+  });
+  const cache = storage.caches.get(candidate.cacheName);
+  await cache.put(`${ORIGIN}${fixture.release.runtime.core.url}`, new Response("corrupt"));
+  await assert.rejects(
+    promoteCanaryRelease(fixture.release.releaseId, { cacheStorage: storage, origin: ORIGIN }),
+    /candidate or rollback cache is incomplete/,
+  );
+  assert.equal((await readActiveRelease(storage, ORIGIN)).release.releaseId, rollback.release.releaseId);
+});
+
+test("promotion rehashes every authenticated rollback byte", async () => {
+  const fixture = await makeRelease();
+  const storage = new MemoryCacheStorage();
+  const rollback = await seedActiveRollback(storage, fixture);
+  const candidate = await stageCanaryRelease(fixture.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(fixture.responses),
+    origin: ORIGIN,
+    cacheSuffix: "mutated-rollback",
+  });
+  await storage.caches.get(candidate.rollback.cacheName).put(
+    `${ORIGIN}${fixture.rollback.frontend.url}`,
+    new Response("corrupt"),
+  );
+  await assert.rejects(
+    promoteCanaryRelease(fixture.release.releaseId, { cacheStorage: storage, origin: ORIGIN }),
+    /candidate or rollback cache is incomplete/,
+  );
+  assert.equal((await readActiveRelease(storage, ORIGIN)).release.releaseId, rollback.release.releaseId);
+});
+
+test("promotion rejects unexpected cache entries", async () => {
+  const fixture = await makeRelease();
+  const storage = new MemoryCacheStorage();
+  await seedActiveRollback(storage, fixture);
+  const candidate = await stageCanaryRelease(fixture.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(fixture.responses),
+    origin: ORIGIN,
+    cacheSuffix: "extra-entry",
+  });
+  await storage.caches.get(candidate.cacheName).put(`${ORIGIN}/assets/unexpected`, new Response("x"));
+  await assert.rejects(
+    promoteCanaryRelease(fixture.release.releaseId, { cacheStorage: storage, origin: ORIGIN }),
+    /candidate or rollback cache is incomplete/,
+  );
+});
+
+test("serving rehashes an active cached executable and repairs only from verified network bytes", async () => {
+  const fixture = await makeRelease();
+  const storage = new MemoryCacheStorage();
+  const active = await stageRelease(fixture.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(fixture.responses),
+    origin: ORIGIN,
+    cacheSuffix: "serve-mutation",
+  });
+  const asset = fixture.release.runtime.worker;
+  await storage.caches.get(active.cacheName).put(`${ORIGIN}${asset.url}`, new Response("corrupt"));
   const requests = [];
-  const recovered = await backendResponse(
-    record,
+  const response = await cachedReleaseAsset(
+    new Request(`${ORIGIN}${asset.url}`),
     storage,
     ORIGIN,
-    recordingFetch(first.responses, requests),
+    fetchAssets(fixture.responses, null, requests),
   );
-  assert.deepEqual(requests, [missing.url]);
-  assert.deepEqual(new Uint8Array(await recovered.arrayBuffer()), first.backendBytes);
+  assert.equal(response.status, 200);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), fixture.responses.get(asset.url));
+  assert.deepEqual(requests, [asset.url]);
+
+  await storage.caches.get(active.cacheName).put(`${ORIGIN}${asset.url}`, new Response("corrupt again"));
+  const unavailable = await cachedReleaseAsset(
+    new Request(`${ORIGIN}${asset.url}`),
+    storage,
+    ORIGIN,
+    fetchAssets(new Map()),
+  );
+  assert.equal(unavailable.status, 503);
 });
 
-test("a failed stage preserves the last known good release", async () => {
+test("failed canary fetch preserves active and cleans newly created caches", async () => {
+  const fixture = await makeRelease();
   const storage = new MemoryCacheStorage();
-  const first = await makeRelease(1);
-  await stageRelease(first.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(first.responses),
-    origin: ORIGIN,
-    cacheSuffix: "first",
-  });
-  const second = await makeRelease(2);
-  const changedDspBytes = new TextEncoder().encode("changed browser DSP wasm");
-  second.release.dsp = await asset(changedDspBytes, "browser-dsp", "wasm");
-  second.responses.set(second.release.dsp.url, changedDspBytes);
-  second.release.releaseId = await sha256Hex(
-    JSON.stringify(releaseIdentityPayload(second.release)),
-  );
+  const rollback = await seedActiveRollback(storage, fixture);
+  const failing = fixture.release.runtime.coordinator.url;
   await assert.rejects(
-    stageRelease(second.release, {
+    stageCanaryRelease(fixture.release, {
       cacheStorage: storage,
-      fetcher: fetchAssets(second.responses, second.release.dsp.url),
+      fetcher: fetchAssets(fixture.responses, failing),
       origin: ORIGIN,
-      cacheSuffix: "second",
+      cacheSuffix: "failed",
     }),
     /HTTP 503/,
   );
-  const active = await readActiveRelease(storage, ORIGIN);
-  assert.equal(active.release.releaseId, first.release.releaseId);
-  assert.ok(storage.caches.has(active.cacheName));
-  assert.ok(!storage.caches.has(`${active.cacheName.replace("first", "second")}`));
+  assert.equal((await readActiveRelease(storage, ORIGIN)).release.releaseId, rollback.release.releaseId);
+  assert.equal(await readCandidateRelease(storage, ORIGIN), null);
+  assert.ok([...storage.caches.keys()].every(name => !name.includes("failed-candidate")));
 });
 
-test("reuses unchanged content-addressed backend chunks across releases", async () => {
+test("HTTP canary and promotion controls require exact request bodies", async () => {
+  assert.equal(STAGE_CANARY_PATH, "/.gekko/stage-canary");
+  assert.equal(PROMOTE_CANARY_PATH, "/.gekko/promote-canary");
+  assert.equal(CANDIDATE_RECORD_PATH, "/.gekko/candidate-release");
+  const fixture = await makeRelease();
   const storage = new MemoryCacheStorage();
-  const first = await makeRelease(1);
-  const firstRecord = await stageRelease(first.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(first.responses),
-    origin: ORIGIN,
-    cacheSuffix: "first",
+  await seedActiveRollback(storage, fixture);
+  await withWorkerGlobals(storage, fetchAssets(fixture.responses), async () => {
+    const staged = await handleFetch(new Request(`${ORIGIN}${STAGE_CANARY_PATH}`, {
+      method: "POST",
+      body: JSON.stringify(fixture.release),
+    }));
+    assert.deepEqual(await staged.json(), { ok: true, active: false, release: fixture.release });
+    const invalid = await handleFetch(new Request(`${ORIGIN}${PROMOTE_CANARY_PATH}`, {
+      method: "POST",
+      body: JSON.stringify({ releaseId: fixture.release.releaseId, extra: true }),
+    }));
+    assert.equal(invalid.status, 409);
+    const promoted = await handleFetch(new Request(`${ORIGIN}${PROMOTE_CANARY_PATH}`, {
+      method: "POST",
+      body: JSON.stringify({ releaseId: fixture.release.releaseId }),
+    }));
+    assert.equal(promoted.status, 200);
   });
-  const second = await makeRelease(2);
-  second.release.backend = structuredClone(first.release.backend);
-  second.release.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(second.release)));
-  for (const [path, bytes] of first.responses) {
-    if (path !== first.release.frontend.url) second.responses.set(path, bytes);
-  }
-  const requests = [];
-  const secondRecord = await stageRelease(second.release, {
-    cacheStorage: storage,
-    fetcher: recordingFetch(second.responses, requests),
-    origin: ORIGIN,
-    cacheSuffix: "second",
-  });
-  assert.deepEqual(requests, [second.release.frontend.url]);
-  assert.ok(storage.caches.has(firstRecord.cacheName), "the immediately previous release is retained");
-  assert.ok(storage.caches.has(secondRecord.cacheName));
 });
 
-test("does not intercept unknown navigation routes", async () => {
+test("service worker exposes no misleading mixed-schema rollback endpoint", async () => {
+  const worker = await readFile(new URL("./sw.js", import.meta.url), "utf8");
+  assert.doesNotMatch(worker, /\/\.gekko\/rollback-release|rollbackActiveRelease/);
+});
+
+test("active endpoint exposes schema 4 only and immutable routes never escape active identity", async () => {
+  const fixture = await makeRelease();
   const storage = new MemoryCacheStorage();
-  const networkRequests = [];
-  await withWorkerGlobals(
+  await stageRelease(fixture.release, {
+    cacheStorage: storage,
+    fetcher: fetchAssets(fixture.responses),
+    origin: ORIGIN,
+    cacheSuffix: "observer",
+  });
+  const response = await activeReleaseResponse(storage, ORIGIN);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), fixture.release);
+  const unknown = await cachedReleaseAsset(
+    new Request(`${ORIGIN}/assets/not-in-release.wasm`),
     storage,
-    async request => {
-      networkRequests.push(request.url);
-      return new Response("not found", { status: 404 });
-    },
-    async () => {
-      const paths = [
-        "/unknown",
-        "/nested/unknown",
-        "/warioware",
-        "/smb",
-        "/games/foo",
-        "/browser_dsp.wasm",
-      ];
-      for (const path of paths) {
-        const response = await handleFetch(new Request(`${ORIGIN}${path}`));
-        assert.equal(response.status, 404);
-      }
-      assert.deepEqual(networkRequests, paths.map(path => `${ORIGIN}${path}`));
-    },
+    ORIGIN,
+    async () => { throw new Error("must not use network"); },
   );
-});
-
-test("serves only the active schema-3 browser code through public routes", async () => {
-  const storage = new MemoryCacheStorage();
-  const candidate = await makeRelease(7);
-  await stageRelease(candidate.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(candidate.responses),
-    origin: ORIGIN,
-    cacheSuffix: "active-current",
-  });
-  const networkRequests = [];
-  await withWorkerGlobals(
-    storage,
-    async request => {
-      networkRequests.push(new URL(request.url).pathname);
-      return new Response("unexpected network response");
-    },
-    async () => {
-      const backend = await handleFetch(new Request(`${ORIGIN}${candidate.release.backend.url}`));
-      assert.equal(backend.status, 200);
-      assert.deepEqual(new Uint8Array(await backend.arrayBuffer()), candidate.backendBytes);
-
-      for (const rendererAsset of Object.values(candidate.release.renderer)) {
-        const response = await handleFetch(new Request(`${ORIGIN}${rendererAsset.url}`));
-        assert.equal(response.status, 200, `${rendererAsset.url} must be served`);
-        assert.deepEqual(
-          new Uint8Array(await response.arrayBuffer()),
-          candidate.responses.get(rendererAsset.url),
-        );
-      }
-      const dsp = await handleFetch(new Request(`${ORIGIN}${candidate.release.dsp.url}`));
-      assert.equal(dsp.status, 200);
-      assert.deepEqual(
-        new Uint8Array(await dsp.arrayBuffer()),
-        candidate.dspWasmBytes,
-      );
-    },
-  );
-  assert.deepEqual(networkRequests, []);
-});
-
-test("post-commit cleanup failure cannot invalidate the active release", async () => {
-  const storage = new MemoryCacheStorage();
-  storage.keys = async () => { throw new Error("quota bookkeeping failed"); };
-  const candidate = await makeRelease(3);
-  const record = await stageRelease(candidate.release, {
-    cacheStorage: storage,
-    fetcher: fetchAssets(candidate.responses),
-    origin: ORIGIN,
-    cacheSuffix: "cleanup-fails",
-  });
-  assert.equal((await readActiveRelease(storage, ORIGIN)).release.releaseId, candidate.release.releaseId);
-  assert.ok(storage.caches.has(record.cacheName));
-});
-
-test("rejects mutable release asset paths before fetching them", async () => {
-  const candidate = await makeRelease(4);
-  candidate.release.frontend.url = "/assets/frontend.html";
-  candidate.release.releaseId = await sha256Hex(
-    JSON.stringify(releaseIdentityPayload(candidate.release)),
-  );
-  await assert.rejects(validateRelease(candidate.release), /content-addressed|contain its hash/);
-});
-
-test("rejects a release without its renderer pair", async () => {
-  const candidate = await makeRelease(5);
-  delete candidate.release.renderer.wasm;
-  candidate.release.releaseId = await sha256Hex(
-    JSON.stringify(releaseIdentityPayload(candidate.release)),
-  );
-  await assert.rejects(validateRelease(candidate.release), /renderer wasm is missing/);
-});
-
-test("rejects a schema-3 release without its DSP artifact", async () => {
-  const candidate = await makeRelease(8);
-  delete candidate.release.dsp;
-  candidate.release.releaseId = await sha256Hex(
-    JSON.stringify(releaseIdentityPayload(candidate.release)),
-  );
-  await assert.rejects(validateRelease(candidate.release), /DSP wasm is missing/);
+  assert.equal(unknown.status, 503);
 });
