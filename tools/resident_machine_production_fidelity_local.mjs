@@ -25,6 +25,7 @@ import {
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   productionFidelityCapturePolicy,
@@ -204,7 +205,7 @@ export function productionRendererFidelityEvidenceLock(authority) {
       checkpointBodyCap: 4_096,
     },
     runPolicy: {
-      instructionUpperCap: "100000000",
+      instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
       executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
       sliceCycleUpperCap: "1000000",
       blockUpperCap: 16_384,

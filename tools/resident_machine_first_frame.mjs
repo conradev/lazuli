@@ -6,6 +6,7 @@ import initRenderer, {
 import {
   FIDELITY_CHECKPOINT_SCHEMA,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   ResidentFidelityCheckpointClient,
 } from "/tools/resident_machine_fidelity_checkpoints.mjs";
@@ -95,13 +96,16 @@ const productionCaptureRequested = captureFidelityRequested();
 const executedCycleUpperCapDefault = productionCaptureRequested
   ? PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP
   : "250000000";
+const instructionUpperCapDefault = productionCaptureRequested
+  ? PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP
+  : "100000000";
 const totalColdInstallMaximum = productionCaptureRequested
   ? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
   : 65_535;
 const policy = Object.freeze({
   transport: "frozen-resident-machine-worker",
   evidenceMode: "first-renderer-owned-presented-xfb",
-  instructionUpperCap: boundedBigInt("instructionCap", "100000000"),
+  instructionUpperCap: boundedBigInt("instructionCap", instructionUpperCapDefault),
   executedCycleUpperCap: boundedBigInt("executedCycleCap", executedCycleUpperCapDefault),
   sliceCycleUpperCap: BigInt(boundedInteger("sliceCycleCap", 1_000_000, 1, 1_000_000)),
   blockUpperCap: boundedInteger("blockCap", 16_384, 1, 16_384),

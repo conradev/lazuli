@@ -21,6 +21,7 @@ import { PRODUCTION_FIRST_FRAME_CAPTURE_ORDER } from "./resident_machine_first_f
 import { canonicalFidelityJson } from "./resident_machine_fidelity_checkpoint_report.mjs";
 import {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   expectedFidelityHostIdentitySha256,
@@ -468,7 +469,7 @@ function releaseAuthority(release, releaseBytes) {
 
 function firstFrameRunPolicy(workerUrl) {
   return {
-    instructionUpperCap: "100000000",
+    instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
     executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     sliceCycleUpperCap: "1000000",
     blockUpperCap: 16_384,
@@ -833,8 +834,10 @@ async function buildAttestationFixture(t, {
       throw new Error(`unsupported Baseline mode ${baselineMode}`);
     }
     const report = residentFirstFrameReportFixture();
+    report.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
     report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
     report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+    report.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
     report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
     report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
     report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
@@ -1367,6 +1370,19 @@ test("exact seven-title evidence passes the fail-closed production gate", async 
   assert.deepEqual(summary.games.map(game => game.key), GAME_FIDELITY_V1_PROJECTORS.map(game => game.key));
   assert.ok(summary.games.every(game => game.sustained.viFields === "120"));
   assert.ok(summary.games.every(game => game.sustained.presentedFrames === "64"));
+});
+
+test("production gate rejects the retired v3 instruction authority", async t => {
+  const fixture = await buildAttestationFixture(t);
+  await mutateReferencedJson(
+    fixture,
+    fixture.attestation.games[0].evidenceLock,
+    lock => { lock.runPolicy.instructionUpperCap = "100000000"; },
+  );
+  await assert.rejects(
+    validateFixture(fixture),
+    /runPolicy\.instructionUpperCap/,
+  );
 });
 
 test("same receipt and distinct pre/post-report Baselines preserve exact causal joins", async t => {
@@ -2050,6 +2066,19 @@ test("authenticated terminal execution rejects a cycle beyond the production cap
   await assert.rejects(
     validateFixture(fixture),
     /terminalExecutedCycles.*immutable lock cap/,
+  );
+});
+
+test("authenticated terminal execution rejects instructions beyond the production cap", async t => {
+  const overCap = BigInt(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP) + 1n;
+  const fixture = await buildAttestationFixture(t, {
+    terminalMachineMutators: [bytes => {
+      bytes.writeBigUInt64LE(overCap, 23 * 4);
+    }],
+  });
+  await assert.rejects(
+    validateFixture(fixture),
+    /terminalExecutedInstructions.*immutable lock cap/,
   );
 });
 

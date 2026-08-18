@@ -14,6 +14,7 @@ import { PRODUCTION_FIRST_FRAME_CAPTURE_ORDER } from "./resident_machine_first_f
 import {
   expectedFidelityHostIdentitySha256,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_SOURCE_PATHS,
   productionFidelityCapturePolicy,
@@ -151,6 +152,7 @@ function productionLock(base) {
     hostPolicy: structuredClone(base.hostPolicy),
     runPolicy: {
       ...structuredClone(base.runPolicy),
+      instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
       executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
       totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
       workerUrl: worker.url,
@@ -243,8 +245,10 @@ async function productionFixture({
     expectedLockAuthority,
   );
   const report = residentFirstFrameReportFixture();
+  report.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
   report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+  report.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
   report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.artifacts.artifacts = structuredClone(lock.artifacts);
   report.evidenceLock = { schema: lock.schema, sha256: evidenceLockSha256 };
@@ -623,7 +627,22 @@ test("production combined authenticates a same-receipt Baseline before report bi
   assert.equal(evidence.records[evidence.prefixCount].payload.kind, "first-frame-report-bound");
 });
 
-test("production combined rejects the retired 250M cap in either report or lock", async () => {
+test("production combined rejects retired cumulative caps in either report or lock", async () => {
+  const staleInstructionReport = await productionFixture({ baselineMode: "same-pre" });
+  staleInstructionReport.report.policy.instructionUpperCap = "100000000";
+  staleInstructionReport.report.game.run.instructionUpperCap = "100000000";
+  assert.throws(
+    () => validateProduction(staleInstructionReport),
+    /report\.policy|instructionUpperCap/,
+  );
+
+  const staleInstructionLock = await productionFixture({ baselineMode: "same-pre" });
+  staleInstructionLock.lock.runPolicy.instructionUpperCap = "100000000";
+  assert.throws(
+    () => validateProduction(staleInstructionLock),
+    /runPolicy\.instructionUpperCap/,
+  );
+
   const staleReport = await productionFixture({ baselineMode: "same-pre" });
   staleReport.report.policy.executedCycleUpperCap = "250000000";
   staleReport.report.game.run.executedCycleUpperCap = "250000000";

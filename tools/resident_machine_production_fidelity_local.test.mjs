@@ -11,6 +11,7 @@ import { canonicalCaptureJson } from "./resident_machine_production_fidelity_cap
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   PRODUCTION_FIDELITY_EXECUTION_ROLES,
   PRODUCTION_SOURCE_PATHS,
@@ -200,6 +201,10 @@ test("local controller emits canonical production v2 and schema-ordered v3 locks
   const fidelityLock = productionRendererFidelityEvidenceLock(base);
   assert.equal(fidelityLock.schema, PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA);
   assert.equal(
+    fidelityLock.runPolicy.instructionUpperCap,
+    PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+  );
+  assert.equal(
     fidelityLock.runPolicy.executedCycleUpperCap,
     PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   );
@@ -213,6 +218,12 @@ test("local controller emits canonical production v2 and schema-ordered v3 locks
   assert.throws(
     () => validateResidentProductionFidelityEvidenceLock(staleCycleAuthority, base),
     /executedCycleUpperCap/,
+  );
+  const staleInstructionAuthority = structuredClone(fidelityLock);
+  staleInstructionAuthority.runPolicy.instructionUpperCap = "100000000";
+  assert.throws(
+    () => validateResidentProductionFidelityEvidenceLock(staleInstructionAuthority, base),
+    /instructionUpperCap/,
   );
   const fidelityBytes = schemaOrderedLockBytes(fidelityLock);
   assert.deepEqual(Object.keys(JSON.parse(fidelityBytes).sources), [...PRODUCTION_SOURCE_PATHS]);

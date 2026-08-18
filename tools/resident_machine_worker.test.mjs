@@ -11,6 +11,7 @@ import {
 } from "../web/resident-machine-worker.mjs";
 import {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -266,10 +267,10 @@ test("capture run ledger is cumulative, stable, and fail-closed at frozen caps",
   assert.throws(() => ledger.issue({}), /Accepted boundary/);
 });
 
-test("capture run ledger supports the v3 cumulative cold authority above the u16 range", () => {
+test("capture run ledger supports the v3 cumulative instruction and cold authorities", () => {
   const productionPolicy = {
     ...CAPTURE_RUN_POLICY,
-    instructionUpperCap: "100000000",
+    instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
     executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   };
@@ -305,6 +306,36 @@ test("capture run ledger supports the v3 cumulative cold authority above the u16
     exhausted.summary().reportedColdInstalls,
     PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   );
+
+  const raisedInstructionAuthority = new ResidentCaptureRunLedger(productionPolicy, () => 0);
+  raisedInstructionAuthority.startAtReady();
+  raisedInstructionAuthority.issue({});
+  raisedInstructionAuthority.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 0,
+      executedCycles: 1n,
+      executedInstructions: 100_000_001n,
+    },
+  });
+  assert.equal(
+    raisedInstructionAuthority.summary().reportedExecutedInstructions,
+    "100000001",
+  );
+
+  const instructionOvershoot = new ResidentCaptureRunLedger(productionPolicy, () => 0);
+  instructionOvershoot.startAtReady();
+  instructionOvershoot.issue({});
+  assert.throws(() => instructionOvershoot.accept({
+    boundary: "rust",
+    outcome: {
+      reason: 0,
+      detail: 0,
+      executedCycles: 1n,
+      executedInstructions: BigInt(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP) + 1n,
+    },
+  }), /cumulative instruction cap overshot/);
 });
 
 test("capture run ledger classifies only a full truncated CycleBudget tail as terminal", () => {

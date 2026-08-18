@@ -13,6 +13,7 @@ import {
 } from "./resident_machine_first_frame_report.mjs";
 import {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -442,8 +443,10 @@ test("production validation requires an exact v3 lock reference and zero client 
     sha256: "e".repeat(64),
   };
   report.evidenceLock = structuredClone(expectedEvidenceLock);
+  report.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
   report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+  report.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
   report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
   report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
@@ -454,6 +457,15 @@ test("production validation requires an exact v3 lock reference and zero client 
     requireComplete: true,
     expectedEvidenceLock,
   }));
+  report.policy.instructionUpperCap = "100000000";
+  report.game.run.instructionUpperCap = "100000000";
+  assert.throws(() => validateResidentFirstFrameReport(report, {
+    requireComplete: true,
+    expectedEvidenceLock,
+  }), /instructionUpperCap/);
+  report.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
+  report.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
+
   report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP + 1;
   assert.throws(() => validateResidentFirstFrameReport(report, {
     requireComplete: true,
@@ -536,8 +548,10 @@ test("production capture order inserts only durable first-frame ownership", () =
   };
   const production = residentFirstFrameReportFixture();
   production.evidenceLock = structuredClone(expectedEvidenceLock);
+  production.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
   production.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   production.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+  production.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
   production.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
   production.capabilityBoundary.rendererProbeEventsExpected = 0;
   production.game.fidelityCheckpoints.probeEventCount = 0;
@@ -903,6 +917,11 @@ test("production page keeps query, ownership ACK, reuse, and controller APIs fai
     source,
     /productionCaptureRequested\s*\? PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP\s*:\s*"250000000"/,
   );
+  assert.match(
+    source,
+    /productionCaptureRequested\s*\? PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP\s*:\s*"100000000"/,
+  );
+  assert.equal(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP, "1250000000");
 
   const observationStart = source.indexOf("async captureFidelityObservation(message)");
   const observationEnd = source.indexOf("\n  async render(message)", observationStart);

@@ -11,11 +11,13 @@ import { fileURLToPath } from "node:url";
 import { validateRelease } from "../web/release.mjs";
 import {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
 export {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 };
 
@@ -526,7 +528,7 @@ export function validateResidentProductionFidelityEvidenceLock(value, expectedAu
   exact(lock.hostPolicy.checkpointBodyCap, 4_096, "$.hostPolicy.checkpointBodyCap");
 
   const exactRunPolicy = {
-    instructionUpperCap: "100000000",
+    instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
     executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     sliceCycleUpperCap: "1000000",
     blockUpperCap: 16_384,

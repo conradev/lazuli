@@ -10,6 +10,7 @@ import {
   validateMachineEvidenceV1Transition,
 } from "./resident_machine_evidence_v1.mjs";
 import {
+  PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -560,6 +561,13 @@ function validateTerminalEnvelope(
     report.policy,
     productionLock ? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP : 65_535,
   );
+  if (productionLock) {
+    exact(
+      policy.instructionUpperCap,
+      PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+      "$.policy.instructionUpperCap",
+    );
+  }
   validateArtifacts(report.artifacts, expectedArtifacts);
 
   const corpus = object(report.corpus, "$.corpus");
