@@ -125,6 +125,12 @@ function mutateWord(envelope, index, value) {
   return changed;
 }
 
+function mutateByte(envelope, index, value) {
+  const bytes = Buffer.from(envelope.payload, "base64");
+  bytes[index] = value;
+  return { ...envelope, payload: bytes.toString("base64") };
+}
+
 function zeroHash(envelope, index) {
   const changed = structuredClone(envelope);
   const bytes = Buffer.from(changed.payload, "base64");
@@ -167,6 +173,7 @@ test("projector identity, predicate bitmap, input witness, and hashes fail close
   const fixture = gameFidelityEnvelope();
   for (const [changed, pattern] of [
     [mutateWord(fixture, 6, 2), /identity/],
+    [mutateByte(fixture, 32, "G".charCodeAt(0) | 0x80), /identity/],
     [mutateWord(fixture, 10, 0x07ff), /requiredPredicates/],
     [mutateWord(fixture, 12, 0), /passedPredicates/],
     [mutateWord(fixture, 14, 1), /failedPredicates/],

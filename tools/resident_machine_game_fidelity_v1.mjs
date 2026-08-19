@@ -246,10 +246,13 @@ export function validateGameFidelityV1Envelope(
   const projector = PROJECTOR_BY_NUMBER.get(word(6));
   if (!projector) fail(`${path}.projector`, "unknown projector");
   if (word(7) !== 0) fail(`${path}.reserved`, "expected zero");
-  const identifier = bytes.subarray(32, 38).toString("ascii");
+  const identifierBytes = bytes.subarray(32, 38);
   const revision = bytes[38];
   if (bytes[39] !== 0) fail(`${path}.identity.reserved`, "expected zero");
-  if (identifier !== projector.identifier || revision !== projector.revision) {
+  if (
+    !identifierBytes.equals(Buffer.from(projector.identifier, "ascii"))
+    || revision !== projector.revision
+  ) {
     fail(`${path}.identity`, "does not match the selected projector");
   }
   if (expectedGameKey !== undefined) {
