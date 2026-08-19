@@ -25,6 +25,7 @@ from resident_machine_fidelity_server import (
     FidelityCheckpointJournal,
     PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
     PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+    PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
     PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
     canonical_json,
     locked_source_for_request,
@@ -880,9 +881,10 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                 (
                     "import { PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP as cycle, "
                     "PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP as instruction, "
+                    "PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP as operator, "
                     "PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP as cold } from "
                     "'./tools/resident_machine_fidelity_checkpoints.mjs';"
-                    "process.stdout.write(JSON.stringify({cycle, instruction, cold}));"
+                    "process.stdout.write(JSON.stringify({cycle, instruction, operator, cold}));"
                 ),
             ],
             cwd=project_root,
@@ -903,6 +905,10 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             javascript_authority["cold"],
             PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
         )
+        self.assertEqual(
+            javascript_authority["operator"],
+            PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+        )
         policy = {
             **CAPTURE_RUN_POLICY,
             "instructionUpperCap": str(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP),
@@ -916,6 +922,15 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             validate_capture_run_summary(summary, policy, "$.runSummary", True),
             summary,
         )
+        summary["operatorPublications"] = PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP
+        self.assertIs(
+            validate_capture_run_summary(summary, policy, "$.runSummary", True),
+            summary,
+        )
+        summary["operatorPublications"] += 1
+        with self.assertRaisesRegex(FidelityCheckpointError, "cumulative authority"):
+            validate_capture_run_summary(summary, policy, "$.runSummary", True)
+        summary["operatorPublications"] = 0
         summary["reportedColdInstalls"] += 1
         with self.assertRaisesRegex(FidelityCheckpointError, "cumulative authority"):
             validate_capture_run_summary(summary, policy, "$.runSummary", True)
@@ -969,6 +984,9 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             validate_evidence_lock(changed_cap)
         for mutate in (
             lambda value: value["capturePolicy"].pop("genericOperatorPolicy"),
+            lambda value: value["capturePolicy"]["genericOperatorPolicy"].update(
+                maximumPublications=64
+            ),
             lambda value: value["capturePolicy"]["genericOperatorPolicy"]["a"].update(
                 buttons=0
             ),

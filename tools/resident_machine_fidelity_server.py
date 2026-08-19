@@ -29,6 +29,7 @@ PRODUCTION_EVIDENCE_LOCK_SCHEMA = "lazuli-resident-renderer-fidelity-evidence-lo
 PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP = 1_250_000_000
 PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = 2_500_000_000
 PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP = 0x000F_FFFF
+PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP = 65
 EVIDENCE_LOCK_PATH = "/resident-fidelity/evidence-lock.json"
 DEFAULT_BODY_CAP = 4_096
 DEFAULT_RECORD_CAP = 65_535
@@ -176,7 +177,7 @@ def production_capture_policy(game_key: str) -> dict[str, Any]:
             "algorithm": "alternating-neutral-a-v1",
             "runBoundaryOrigin": "post-first-frame-report-local-zero",
             "runBoundaryInterval": 8,
-            "maximumPublications": 64,
+            "maximumPublications": PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
             "startsWith": "neutral",
             "neutral": {
                 "buttons": 0,
@@ -386,7 +387,7 @@ def validate_capture_run_summary(
         or value["reportedColdInstalls"] > policy["totalColdInstallCap"]
         or value["consecutiveZeroProgressSlices"] >= policy["zeroProgressSliceCap"]
         or value["maximumConsecutiveZeroProgressSlices"] >= policy["zeroProgressSliceCap"]
-        or value["operatorPublications"] > 64
+        or value["operatorPublications"] > PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP
         or value["witnessPublications"] > 1
     ):
         raise FidelityCheckpointError(f"{path} exceeded frozen cumulative authority")

@@ -18,7 +18,10 @@ import {
 import { validateResidentCorpusEvidence } from "./resident_machine_corpus_report.mjs";
 import { parseFidelityCheckpointJsonl } from "./resident_machine_fidelity_checkpoint_report.mjs";
 import { validateCombinedResidentFidelityEvidence } from "./resident_machine_fidelity_combined_report.mjs";
-import { productionSourceAuthorityFromGit } from "./resident_machine_fidelity_lock.mjs";
+import {
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+  productionSourceAuthorityFromGit,
+} from "./resident_machine_fidelity_lock.mjs";
 import {
   RELEASE_SCHEMA,
   RESIDENT_RUNTIME_ABI,
@@ -950,10 +953,15 @@ function validateCumulativeRunSummary(value, lock, terminalMachine, location) {
     `${location}.reportedColdInstalls`,
     lock.runPolicy.totalColdInstallCap,
   );
+  exact(
+    lock.capturePolicy.genericOperatorPolicy.maximumPublications,
+    PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+    `${location}.operatorPublicationCap`,
+  );
   nonNegativeInteger(
     summary.operatorPublications,
     `${location}.operatorPublications`,
-    lock.capturePolicy.genericOperatorPolicy.maximumPublications,
+    PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   );
   exact(summary.witnessPublications, 1, `${location}.witnessPublications`);
   for (const field of [
@@ -1691,7 +1699,7 @@ async function validateGameRun(
   nonNegativeInteger(
     run.operatorPublications.count,
     `${location}.operatorPublications.count`,
-    lock.capturePolicy.genericOperatorPolicy.maximumPublications,
+    PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   );
   const runSummary = validateCumulativeRunSummary(
     terminal.record.payload.runSummary,

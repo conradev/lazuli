@@ -9,6 +9,9 @@ import {
   parseFidelityCheckpointJsonl,
   validateFidelityCheckpointJournal,
 } from "./resident_machine_fidelity_checkpoint_report.mjs";
+import {
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+} from "./resident_machine_fidelity_lock.mjs";
 
 const RUN_ID = "12345678-1234-4234-9234-123456789abc";
 const SHA_A = "a".repeat(64);
@@ -34,7 +37,7 @@ const CAPTURE_RUN_POLICY = Object.freeze({
   workerUrl: "/worker.mjs",
 });
 
-function captureRunSummary(accepted = false) {
+function captureRunSummary(accepted = false, operatorPublications = 0) {
   return {
     schema: "lazuli-resident-cumulative-run-summary-v1",
     issuedRunCalls: accepted ? 2 : 0,
@@ -45,7 +48,7 @@ function captureRunSummary(accepted = false) {
     zeroProgressSlices: 0,
     consecutiveZeroProgressSlices: 0,
     maximumConsecutiveZeroProgressSlices: 0,
-    operatorPublications: 0,
+    operatorPublications,
     witnessPublications: accepted ? 1 : 0,
     elapsedWallMs: accepted ? 20 : 0,
     wallTimeoutMs: 10_000,
@@ -167,7 +170,10 @@ function appendResolvedReceipt(builder, submission, receiptSha256 = SHA_B) {
   };
 }
 
-function productionJournal({ distinctBaselineReceipt = false } = {}) {
+function productionJournal({
+  distinctBaselineReceipt = false,
+  operatorPublications = 0,
+} = {}) {
   const builder = new ProductionJournalBuilder();
   const initialized = builder.append("capture-machine-initialized", {
     machineSessionId: MACHINE_SESSION_ID,
@@ -252,7 +258,7 @@ function productionJournal({ distinctBaselineReceipt = false } = {}) {
     baselineRecordSha256: baseline.recordSha256,
     acceptedRecordSha256: accepted.recordSha256,
     ...fidelityArtifactFields(),
-    runSummary: captureRunSummary(true),
+    runSummary: captureRunSummary(true, operatorPublications),
   });
   return {
     records: builder.value,
@@ -481,6 +487,22 @@ test("production journal accepts one continuous same-receipt Baseline chain", ()
     initialRunSummary: captureRunSummary(false),
     terminalRunSummary: captureRunSummary(true),
   });
+});
+
+test("production journal accepts 65 operator publications and rejects 66", () => {
+  assert.equal(PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP, 65);
+  const accepted = productionJournal({
+    operatorPublications: PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+  });
+  assert.equal(
+    validateProduction(accepted.records).capture.terminalRunSummary.operatorPublications,
+    65,
+  );
+  const rejected = rebuiltWithMutation(accepted.records, payloads => {
+    payloads.find(entry => entry.kind === "fidelity-terminal")
+      .runSummary.operatorPublications = 66;
+  });
+  assert.throws(() => validateProduction(rejected), /exceeded frozen cumulative authority/);
 });
 
 test("production journal rejects incomplete or over-cap ready boot authority", () => {

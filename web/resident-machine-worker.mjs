@@ -288,7 +288,7 @@ const CAPTURE_RUN_POLICY_FIELDS = Object.freeze([
   "zeroProgressSliceCap",
   "workerUrl",
 ]);
-const CAPTURE_OPERATOR_PUBLICATION_CAP = 64;
+const CAPTURE_OPERATOR_PUBLICATION_CAP = 65;
 const CAPTURE_OPERATOR_NEUTRAL = Object.freeze({
   buttons: 0,
   stickXyCxy: 0x8080_8080,

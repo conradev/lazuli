@@ -12,6 +12,7 @@ import {
 import {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -947,14 +948,12 @@ test("atomic operator input is phase-zero-only and requires the mandatory state 
   assert.equal(harness.publishCalls.length, 1);
 });
 
-test("atomic operator derives the exact alternating neutral/A parity", async () => {
+test("atomic operator exhausts at 65 with a retained terminal neutral state", async () => {
   const harness = workerHarness();
   await initializeCapture(harness);
-  const expected = [
-    { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 },
-    { buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 },
-  ];
-  for (let index = 0; index < expected.length; index += 1) {
+  const neutral = { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 };
+  const a = { buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 };
+  for (let index = 0; index < PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP; index += 1) {
     const requestId = 2 + index * 2;
     harness.scope.receive({ type: "resident-controller-operator", requestId });
     const result = await waitForWorkerMessage(
@@ -965,7 +964,7 @@ test("atomic operator derives the exact alternating neutral/A parity", async () 
     );
     assert.deepEqual(
       { buttons: result.buttons, stickXyCxy: result.stickXyCxy, triggerLrab: result.triggerLrab },
-      expected[index],
+      index % 2 === 0 ? neutral : a,
     );
     assert.equal(result.runSummary.operatorPublications, index + 1);
     harness.scope.receive({ type: "resident-fidelity-state", requestId: requestId + 1 });
@@ -976,11 +975,31 @@ test("atomic operator derives the exact alternating neutral/A parity", async () 
       `derived operator ${index} state poll`,
     );
   }
-  assert.deepEqual(harness.publishCalls.map(call => ({
-    buttons: call.buttons,
-    stickXyCxy: call.stickXyCxy,
-    triggerLrab: call.triggerLrab,
-  })), expected);
+  assert.equal(harness.publishCalls.length, 65);
+  assert.deepEqual(harness.publishCalls[63], {
+    sequenceLo: 64,
+    sequenceHi: 0,
+    ...a,
+  });
+  assert.deepEqual(harness.publishCalls[64], {
+    sequenceLo: 65,
+    sequenceHi: 0,
+    ...neutral,
+  });
+
+  harness.scope.receive({ type: "resident-controller-operator", requestId: 132 });
+  const exhausted = await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-error" && message.requestId === 132,
+    "exhausted operator rejection",
+  );
+  assert.match(exhausted.error, /operator publication cap exhausted/);
+  assert.equal(harness.publishCalls.length, 65);
+  assert.deepEqual(harness.publishCalls.at(-1), {
+    sequenceLo: 65,
+    sequenceHi: 0,
+    ...neutral,
+  });
 });
 
 test("atomic operator rejects caller-supplied state and parity", async () => {

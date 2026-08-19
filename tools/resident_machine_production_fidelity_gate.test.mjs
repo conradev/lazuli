@@ -2029,7 +2029,7 @@ test("Baseline GFP is recomputed as the exact durable phase-one Rust record", as
 test("operator provenance and the cumulative run ledger are exact and cap-bound", async t => {
   for (const mutate of [
     run => { run.operatorPublications.algorithm = "caller-authored-v1"; },
-    run => { run.operatorPublications.count = 65; },
+    run => { run.operatorPublications.count = 66; },
     run => { run.operatorPublications.states = ["neutral", "a"]; },
   ]) {
     const fixture = await buildAttestationFixture(t);
@@ -2037,6 +2037,12 @@ test("operator provenance and the cumulative run ledger are exact and cap-bound"
     await persistAttestation(fixture);
     await assert.rejects(validateFixture(fixture), /operatorPublications/);
   }
+
+  const terminalNeutral = await buildAttestationFixture(t, {
+    baselineModes: ["distinct-post"],
+    operatorPublicationCounts: [65],
+  });
+  await validateFixture(terminalNeutral);
 
   const preBindingOperator = await buildAttestationFixture(t, {
     operatorPublicationCounts: [1],

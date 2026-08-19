@@ -6,6 +6,7 @@ import { readFile } from "node:fs/promises";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   expectedFidelityHostIdentitySha256,
   validateResidentFidelityEvidenceLock,
 } from "./resident_machine_fidelity_lock.mjs";
@@ -164,7 +165,7 @@ function validateCaptureRunSummary(value, policy, path, accepted) {
     || summary.reportedColdInstalls > policy.totalColdInstallCap
     || summary.consecutiveZeroProgressSlices >= policy.zeroProgressSliceCap
     || summary.maximumConsecutiveZeroProgressSlices >= policy.zeroProgressSliceCap
-    || summary.operatorPublications > 64
+    || summary.operatorPublications > PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP
     || summary.witnessPublications > 1
   ) fail(path, "exceeded frozen cumulative authority");
   return summary;

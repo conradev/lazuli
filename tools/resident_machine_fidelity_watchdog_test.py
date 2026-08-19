@@ -18,6 +18,12 @@ class FidelityWatchdogCompletionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        previous_sigterm_handler = watchdog.signal.getsignal(watchdog.signal.SIGTERM)
+        self.addCleanup(
+            watchdog.signal.signal,
+            watchdog.signal.SIGTERM,
+            previous_sigterm_handler,
+        )
         self.root = Path(self.temporary.name)
         self.url = (
             "http://127.0.0.1:8701/tools/resident_machine_first_frame.html"
@@ -269,6 +275,91 @@ class FidelityWatchdogCompletionTests(unittest.TestCase):
         read_completion.assert_not_called()
         kill_browser.assert_called_once_with(101, browser_identity)
 
+    def test_sigterm_after_durable_deadline_state_cannot_signal_watchdog_exit(self) -> None:
+        state = self.root / "deadline-sigterm-state.json"
+        start = 1_800_000_000_000
+        deadline = start + watchdog.FIXED_WALL_MS
+        initial_now = start + 1_000
+        browser_identity = f"Chrome --user-data-dir={self.root / 'profile'}"
+        server_identity = "python resident_machine_fidelity_server.py"
+        arguments = [
+            "resident_machine_fidelity_watchdog.py",
+            "--state", str(state),
+            "--start-unix-ms", str(start),
+            "--deadline-unix-ms", str(deadline),
+            "--browser-pid", "101",
+            "--server-pid", "202",
+            "--expected-url", self.url,
+            "--browser-identity-fragment", str(self.root / "profile"),
+            "--server-identity-fragment", "resident_machine_fidelity_server.py",
+            "--completion", str(self.completion),
+        ]
+        active_sigterm_handler: object = watchdog.signal.SIG_DFL
+        deadline_kill_completed = False
+        terminal_state_durable = False
+        post_write_sigterm_delivered = False
+        original_durable_state = watchdog.durable_state
+
+        def install(_signal: int, handler: object) -> object:
+            nonlocal active_sigterm_handler
+            previous = active_sigterm_handler
+            active_sigterm_handler = handler
+            return previous
+
+        def kill_browser(_pid: int, _identity: str) -> str:
+            nonlocal deadline_kill_completed
+            deadline_kill_completed = True
+            return "sigkill-confirmed-exited"
+
+        def write_state(path: Path, value: dict[str, object]) -> None:
+            nonlocal terminal_state_durable, post_write_sigterm_delivered
+            if value["status"] == "deadline-enforced":
+                self.assertTrue(deadline_kill_completed)
+                original_durable_state(path, value)
+                terminal_state_durable = True
+                handler = active_sigterm_handler
+                if not callable(handler):
+                    self.fail("deadline terminal state restored SIGTERM too early")
+                handler(watchdog.signal.SIGTERM, None)
+                post_write_sigterm_delivered = True
+                return
+            original_durable_state(path, value)
+
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.object(
+                watchdog.time,
+                "time",
+                side_effect=[initial_now / 1_000, deadline / 1_000, deadline / 1_000],
+            ),
+            mock.patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=[100.0, 100.0 + (watchdog.FIXED_WALL_MS - 1_000) / 1_000],
+            ),
+            mock.patch.object(
+                watchdog,
+                "process_identity",
+                side_effect=[browser_identity, server_identity],
+            ),
+            mock.patch.object(
+                watchdog.signal,
+                "signal",
+                side_effect=install,
+            ) as install_handler,
+            mock.patch.object(watchdog, "kill_exact_browser", side_effect=kill_browser),
+            mock.patch.object(watchdog, "durable_state", side_effect=write_state),
+        ):
+            watchdog.main()
+
+        final = json.loads(state.read_text())
+        self.assertTrue(terminal_state_durable)
+        self.assertTrue(post_write_sigterm_delivered)
+        self.assertEqual(final["status"], "deadline-enforced")
+        self.assertEqual(final["browserCleanup"], "sigkill-confirmed-exited")
+        self.assertTrue(callable(active_sigterm_handler))
+        self.assertEqual(install_handler.call_count, 1)
+
     def test_controller_termination_writes_durable_failed_state(self) -> None:
         state = self.root / "terminated-state.json"
         now = 1_800_000_001_000
@@ -305,14 +396,31 @@ class FidelityWatchdogCompletionTests(unittest.TestCase):
                 "process_identity",
                 side_effect=[browser_identity, server_identity],
             ),
-            mock.patch.object(watchdog.signal, "signal", side_effect=install),
+            mock.patch.object(
+                watchdog.signal,
+                "signal",
+                side_effect=install,
+            ) as install_handler,
             mock.patch.object(watchdog, "kill_exact_browser") as kill_browser,
         ):
             watchdog.main()
 
         final = json.loads(state.read_text())
         self.assertEqual(final["status"], "controller-terminated-before-completion")
+        self.assertEqual(
+            final["browserCleanup"],
+            "left-running-for-controller-cleanup",
+        )
+        self.assertEqual(
+            final["serverCleanup"],
+            "left-running-for-controller-cleanup",
+        )
         kill_browser.assert_not_called()
+        self.assertEqual(install_handler.call_count, 2)
+        self.assertEqual(
+            install_handler.call_args_list[1],
+            mock.call(watchdog.signal.SIGTERM, watchdog.signal.SIG_DFL),
+        )
 
 
 if __name__ == "__main__":

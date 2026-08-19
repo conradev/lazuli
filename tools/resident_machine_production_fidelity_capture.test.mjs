@@ -8,14 +8,23 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+  productionFidelityCapturePolicy,
+} from "./resident_machine_fidelity_lock.mjs";
+import {
   PRODUCTION_FIDELITY_RUN_FRAGMENT_SCHEMA,
   canonicalCaptureJson,
+  closeDedicatedCaptureTarget,
+  createDedicatedCaptureTarget,
+  formatProductionFidelityCaptureFailure,
   operatorPublicationDue,
   orderCaptureInputs,
   parseCaptureArguments,
   preparePrivateCaptureDirectory,
   productionFidelityRunFragment,
+  runDedicatedPageCapture,
   runGameCaptureLifecycle,
+  runWithPreservedCleanup,
   selectRetainedPreWitnessMachineEvidence,
   selectCreatedCaptureTarget,
   sustainedWindowReached,
@@ -142,20 +151,346 @@ test("CDP attachment creates one dedicated target and accepts only exact loopbac
   );
 });
 
-test("verified generic operator policy schedules only at deterministic run boundaries", () => {
-  const policy = Object.freeze({
-    algorithm: "alternating-neutral-a-v1",
-    runBoundaryOrigin: "post-first-frame-report-local-zero",
-    runBoundaryInterval: 8,
-    maximumPublications: 64,
-    startsWith: "neutral",
-    neutral: Object.freeze({ buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 }),
-    a: Object.freeze({ buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 }),
+test("dedicated page capture preserves capture failure before unload failure", async () => {
+  const session = Object.freeze({});
+  const input = Object.freeze({
+    game: Object.freeze({ key: "game-1" }),
+    captureUrl:
+      "http://127.0.0.1:8101/tools/resident_machine_first_frame.html?capture=fidelity&game=game-1",
   });
+  const options = Object.freeze({ requestTimeoutMs: 123 });
+  const unloadFailure = new Error("page unload failed");
+
+  const primaryFailure = new Error("capture failed");
+  await assert.rejects(
+    runDedicatedPageCapture(session, input, options, {
+      navigate: async () => Object.freeze({ frameId: "frame", loaderId: "loader" }),
+      capture: async () => { throw primaryFailure; },
+      unload: async (actualSession, timeout) => {
+        assert.strictEqual(actualSession, session);
+        assert.equal(timeout, 123);
+        throw unloadFailure;
+      },
+    }),
+    error => error instanceof AggregateError
+      && error.errors[0] === primaryFailure
+      && error.errors[1] === unloadFailure,
+  );
+});
+
+test("capture CLI failure formatting recursively preserves order, causes, and identity", () => {
+  const primaryFailure = new Error("capture Runtime.evaluate connection closed");
+  primaryFailure.stack = "PRIMARY_CAPTURE_FAILURE";
+  const pageCleanupFailure = new Error("page unload connection closed");
+  pageCleanupFailure.stack = "PAGE_CLEANUP_FAILURE";
+  const targetCleanupFailure = new Error("Target.closeTarget connection closed");
+  targetCleanupFailure.stack = "TARGET_CLEANUP_FAILURE";
+  const rootCause = new Error("browser transport disconnected");
+  rootCause.stack = "ROOT_CAUSE";
+  const nested = new AggregateError(
+    [primaryFailure, pageCleanupFailure],
+    "capture and page cleanup failed",
+    { cause: primaryFailure },
+  );
+  nested.stack = "NESTED_CAPTURE_AND_PAGE_CLEANUP";
+  const outer = new AggregateError(
+    [nested, targetCleanupFailure, pageCleanupFailure],
+    "capture and target cleanup failed",
+    { cause: rootCause },
+  );
+  outer.stack = "OUTER_CAPTURE_AND_TARGET_CLEANUP";
+
+  assert.equal(formatProductionFidelityCaptureFailure(outer), [
+    "failure:",
+    "OUTER_CAPTURE_AND_TARGET_CLEANUP",
+    "failure.errors[0]:",
+    "NESTED_CAPTURE_AND_PAGE_CLEANUP",
+    "failure.errors[0].errors[0]:",
+    "PRIMARY_CAPTURE_FAILURE",
+    "failure.errors[0].errors[1]:",
+    "PAGE_CLEANUP_FAILURE",
+    "failure.errors[0].cause: [same failure object as failure.errors[0].errors[0]]",
+    "failure.errors[1]:",
+    "TARGET_CLEANUP_FAILURE",
+    "failure.errors[2]: [same failure object as failure.errors[0].errors[1]]",
+    "failure.cause:",
+    "ROOT_CAUSE",
+  ].join("\n"));
+});
+
+test("capture CLI formatting exposes nested operation and cleanup failures", async () => {
+  const primaryFailure = new Error("capture failed");
+  primaryFailure.stack = "CAPTURE_FAILURE";
+  const pageCleanupFailure = new Error("page unload failed");
+  pageCleanupFailure.stack = "PAGE_UNLOAD_FAILURE";
+  const targetCleanupFailure = new Error("target close failed");
+  targetCleanupFailure.stack = "TARGET_CLOSE_FAILURE";
+
+  let pageFailure;
+  try {
+    await runWithPreservedCleanup(
+      async () => { throw primaryFailure; },
+      async () => { throw pageCleanupFailure; },
+      "capture and page unload failed",
+    );
+    assert.fail("capture and page cleanup must fail");
+  } catch (error) {
+    pageFailure = error;
+  }
+  pageFailure.stack = "CAPTURE_AND_PAGE_CLEANUP";
+
+  let terminalFailure;
+  try {
+    await runWithPreservedCleanup(
+      async () => { throw pageFailure; },
+      async () => { throw targetCleanupFailure; },
+      "capture and target cleanup failed",
+    );
+    assert.fail("capture and target cleanup must fail");
+  } catch (error) {
+    terminalFailure = error;
+  }
+  terminalFailure.stack = "CAPTURE_AND_TARGET_CLEANUP";
+
+  assert.equal(formatProductionFidelityCaptureFailure(terminalFailure), [
+    "failure:",
+    "CAPTURE_AND_TARGET_CLEANUP",
+    "failure.errors[0]:",
+    "CAPTURE_AND_PAGE_CLEANUP",
+    "failure.errors[0].errors[0]:",
+    "CAPTURE_FAILURE",
+    "failure.errors[0].errors[1]:",
+    "PAGE_UNLOAD_FAILURE",
+    "failure.errors[1]:",
+    "TARGET_CLOSE_FAILURE",
+  ].join("\n"));
+});
+
+test("dedicated page capture does not unload a navigation that never bound", async () => {
+  const primaryFailure = new Error("navigate failed");
+  let unloadCalls = 0;
+  await assert.rejects(
+    runDedicatedPageCapture(
+      Object.freeze({}),
+      Object.freeze({ game: Object.freeze({ key: "game-1" }), captureUrl: "capture" }),
+      Object.freeze({ requestTimeoutMs: 123 }),
+      {
+        navigate: async () => { throw primaryFailure; },
+        capture: async () => assert.fail("capture must not run after navigation failure"),
+        unload: async () => { unloadCalls += 1; },
+      },
+    ),
+    error => error === primaryFailure,
+  );
+  assert.equal(unloadCalls, 0);
+});
+
+test("dedicated page cleanup-only failure remains fatal", async () => {
+  const unloadFailure = new Error("page unload failed");
+  const result = Object.freeze({ captured: true });
+  await assert.rejects(
+    runDedicatedPageCapture(
+      Object.freeze({}),
+      Object.freeze({ game: Object.freeze({ key: "game-1" }), captureUrl: "capture" }),
+      Object.freeze({ requestTimeoutMs: 123 }),
+      {
+        navigate: async () => Object.freeze({ frameId: "frame", loaderId: "loader" }),
+        capture: async () => result,
+        unload: async () => { throw unloadFailure; },
+      },
+    ),
+    error => error === unloadFailure,
+  );
+});
+
+test("primary page setup failure precedes target close failure and all sessions close", async () => {
+  const primaryFailure = new Error("page setup failed");
+  const closeFailure = new Error("CDP connection closed");
+  const events = [];
+  const pageSession = {
+    close() {
+      events.push("page-session-close");
+    },
+  };
+  const dedicated = {
+    target: { id: "dedicated-target" },
+    browserSession: {
+      async send(method, parameters, timeout) {
+        events.push(`${method}:${parameters.targetId}:${timeout}`);
+        throw closeFailure;
+      },
+      close() {
+        events.push("browser-session-close");
+      },
+    },
+  };
+  await assert.rejects(
+    runWithPreservedCleanup(
+      async () => { throw primaryFailure; },
+      () => closeDedicatedCaptureTarget(dedicated, pageSession, 456),
+      "capture and cleanup failed",
+    ),
+    error => error instanceof AggregateError
+      && error.errors[0] === primaryFailure
+      && error.errors[1] === closeFailure,
+  );
+  assert.deepEqual(events, [
+    "page-session-close",
+    "Target.closeTarget:dedicated-target:456",
+    "browser-session-close",
+  ]);
+});
+
+test("dedicated target cleanup requires exact success true and always closes sessions", async () => {
+  for (const response of [{ success: false }, { success: "true" }, {}, undefined]) {
+    const events = [];
+    const dedicated = {
+      target: { id: "dedicated-target" },
+      browserSession: {
+        async send() {
+          events.push("target-close");
+          return response;
+        },
+        close() {
+          events.push("browser-session-close");
+        },
+      },
+    };
+    await assert.rejects(
+      closeDedicatedCaptureTarget(dedicated, {
+        close() {
+          events.push("page-session-close");
+        },
+      }, 456),
+      /dedicated CDP target did not close/,
+    );
+    assert.deepEqual(events, [
+      "page-session-close",
+      "target-close",
+      "browser-session-close",
+    ]);
+  }
+
+  const successEvents = [];
+  await closeDedicatedCaptureTarget({
+    target: { id: "dedicated-target" },
+    browserSession: {
+      async send() {
+        successEvents.push("target-close");
+        return { success: true };
+      },
+      close() {
+        successEvents.push("browser-session-close");
+      },
+    },
+  }, {
+    close() {
+      successEvents.push("page-session-close");
+    },
+  }, 456);
+  assert.deepEqual(successEvents, [
+    "page-session-close",
+    "target-close",
+    "browser-session-close",
+  ]);
+
+  const pageCloseFailure = new Error("page session close failed");
+  const targetCloseFailure = new Error("target close failed");
+  const browserCloseFailure = new Error("browser session close failed");
+  const failureEvents = [];
+  await assert.rejects(
+    closeDedicatedCaptureTarget({
+      target: { id: "dedicated-target" },
+      browserSession: {
+        async send() {
+          failureEvents.push("target-close");
+          throw targetCloseFailure;
+        },
+        close() {
+          failureEvents.push("browser-session-close");
+          throw browserCloseFailure;
+        },
+      },
+    }, {
+      close() {
+        failureEvents.push("page-session-close");
+        throw pageCloseFailure;
+      },
+    }, 456),
+    error => error instanceof AggregateError
+      && error.errors[0] === pageCloseFailure
+      && error.errors[1] === targetCloseFailure
+      && error.errors[2] === browserCloseFailure,
+  );
+  assert.deepEqual(failureEvents, [
+    "page-session-close",
+    "target-close",
+    "browser-session-close",
+  ]);
+});
+
+test("target creation failure preserves close failure and closes the browser session", async () => {
+  const setupFailure = new Error("target listing failed");
+  const closeFailure = new Error("target close failed");
+  const events = [];
+  let fetchCount = 0;
+  const browserSession = {
+    async connect() {
+      events.push("browser-session-connect");
+    },
+    async send(method) {
+      events.push(method);
+      if (method === "Target.createTarget") return { targetId: "dedicated-target" };
+      throw closeFailure;
+    },
+    close() {
+      events.push("browser-session-close");
+    },
+  };
+  const fetchImpl = async () => {
+    fetchCount += 1;
+    if (fetchCount === 1) {
+      return {
+        ok: true,
+        async json() {
+          return { webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/one" };
+        },
+      };
+    }
+    throw setupFailure;
+  };
+  await assert.rejects(
+    createDedicatedCaptureTarget(
+      new URL("http://127.0.0.1:9222/"),
+      () => browserSession,
+      fetchImpl,
+      456,
+    ),
+    error => error instanceof AggregateError
+      && error.errors[0] === setupFailure
+      && error.errors[1] === closeFailure,
+  );
+  assert.deepEqual(events, [
+    "browser-session-connect",
+    "Target.createTarget",
+    "Target.closeTarget",
+    "browser-session-close",
+  ]);
+});
+
+test("verified generic operator policy schedules only at deterministic run boundaries", () => {
+  const policy = productionFidelityCapturePolicy("warioware-usa").genericOperatorPolicy;
+  assert.equal(policy.maximumPublications, PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP);
   assert.equal(operatorPublicationDue(policy, 0, 0), true);
   assert.equal(operatorPublicationDue(policy, 1, 1), false);
   assert.equal(operatorPublicationDue(policy, 8, 1), true);
-  assert.equal(operatorPublicationDue(policy, 512, 64), false);
+  assert.equal(operatorPublicationDue(policy, 512, 64), true);
+  assert.equal(operatorPublicationDue(policy, 512, 65), false);
+  assert.equal(operatorPublicationDue(policy, 520, 65), false);
+  assert.throws(
+    () => operatorPublicationDue({ ...policy, maximumPublications: 64 }, 512, 64),
+    /publication cap changed/,
+  );
   assert.throws(
     () => operatorPublicationDue({ ...policy, runBoundaryOrigin: "boot" }, 0, 0),
     /origin changed/,

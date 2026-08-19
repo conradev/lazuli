@@ -12,12 +12,14 @@ import { validateRelease } from "../web/release.mjs";
 import {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
 export {
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 };
 
@@ -237,7 +239,7 @@ export function productionFidelityCapturePolicy(gameKey) {
       algorithm: "alternating-neutral-a-v1",
       runBoundaryOrigin: "post-first-frame-report-local-zero",
       runBoundaryInterval: 8,
-      maximumPublications: 64,
+      maximumPublications: PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
       startsWith: "neutral",
       neutral: { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 },
       a: { buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 },

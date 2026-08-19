@@ -4,9 +4,11 @@
 import { Buffer } from "node:buffer";
 import { spawn as spawnChild, execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   lstat,
   mkdir,
+  open,
   readFile,
   realpath,
   stat,
@@ -53,6 +55,10 @@ export const LOCAL_PRODUCTION_FIDELITY_RESULT_SCHEMA =
   "lazuli-resident-production-fidelity-local-result-v1";
 export const WATCHDOG_COMPLETION_SCHEMA =
   "lazuli-resident-renderer-fidelity-watchdog-completion-v1";
+export const WATCHDOG_STATE_SCHEMA =
+  "lazuli-resident-renderer-fidelity-watchdog-v1";
+export const PRODUCTION_FIDELITY_WALL_DEADLINE_ERROR_CODE =
+  "ERR_PRODUCTION_FIDELITY_WALL_DEADLINE";
 
 const EXEC_FILE = promisify(execFile);
 const SERVER_START_TIMEOUT_MS = 30 * 60_000;
@@ -63,10 +69,12 @@ const PROCESS_STOP_TIMEOUT_MS = 30_000;
 const WATCHDOG_ARM_TIMEOUT_MS = 30_000;
 const WATCHDOG_COMPLETE_TIMEOUT_MS = 30_000;
 const FIXED_FIDELITY_WALL_MS = 600_000;
+const WATCHDOG_STATE_MAX_BYTES = 64 * 1024;
 const MAX_PROCESS_OUTPUT_BYTES = 128 * 1024;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const TERMINAL_PERFORMANCE_STATUSES = new Set(["complete", "partial", "failed"]);
 const WATCHDOG_PATH = fileURLToPath(
   new URL("./resident_machine_fidelity_watchdog.py", import.meta.url),
@@ -77,9 +85,329 @@ const CORPUS_SERVER_PATH = fileURLToPath(
 const FIDELITY_SERVER_PATH = fileURLToPath(
   new URL("./resident_machine_fidelity_server.py", import.meta.url),
 );
+const WATCHDOG_ARMED_KEYS = Object.freeze([
+  "schema",
+  "status",
+  "startUnixMs",
+  "deadlineUnixMs",
+  "expectedUrl",
+  "browserPid",
+  "browserIdentity",
+  "serverPid",
+  "serverIdentity",
+  "cleanupIndependentOfPageMainThread",
+]);
+const WATCHDOG_IMMUTABLE_KEYS = Object.freeze(
+  WATCHDOG_ARMED_KEYS.filter(key => key !== "status"),
+);
+const WATCHDOG_CLEANUP_KEYS = Object.freeze([
+  ...WATCHDOG_ARMED_KEYS,
+  "cleanupUnixMs",
+  "browserCleanup",
+  "serverCleanup",
+]);
+const WATCHDOG_COMPLETED_KEYS = Object.freeze([
+  ...WATCHDOG_ARMED_KEYS,
+  "completionUnixMs",
+  "completionSha256",
+  "browserCleanup",
+  "serverCleanup",
+]);
 
 function fail(message) {
   throw new Error(`local production fidelity: ${message}`);
+}
+
+function exactWatchdogKeys(value, expected, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    fail(`${label} must be an object`);
+  }
+  const actualKeys = Object.keys(value).sort();
+  const expectedKeys = [...expected].sort();
+  if (JSON.stringify(actualKeys) !== JSON.stringify(expectedKeys)) {
+    fail(`${label} has an invalid exact field set`);
+  }
+}
+
+function watchdogInteger(value, label, { positive = false } = {}) {
+  if (
+    !Number.isSafeInteger(value)
+    || (positive ? value <= 0 : value < 0)
+  ) fail(`${label} must be a ${positive ? "positive" : "nonnegative"} safe integer`);
+  return value;
+}
+
+function validatedArmedWatchdogShape(value, label) {
+  exactWatchdogKeys(value, WATCHDOG_ARMED_KEYS, label);
+  if (value.schema !== WATCHDOG_STATE_SCHEMA) fail(`${label} schema changed`);
+  if (value.status !== "armed-before-navigation") fail(`${label} status changed`);
+  watchdogInteger(value.startUnixMs, `${label} startUnixMs`);
+  watchdogInteger(value.deadlineUnixMs, `${label} deadlineUnixMs`);
+  if (value.deadlineUnixMs - value.startUnixMs !== FIXED_FIDELITY_WALL_MS) {
+    fail(`${label} deadline is not exactly start + ${FIXED_FIDELITY_WALL_MS} ms`);
+  }
+  if (typeof value.expectedUrl !== "string" || value.expectedUrl.length === 0) {
+    fail(`${label} expectedUrl must be a nonempty string`);
+  }
+  watchdogInteger(value.browserPid, `${label} browserPid`, { positive: true });
+  watchdogInteger(value.serverPid, `${label} serverPid`, { positive: true });
+  if (typeof value.browserIdentity !== "string" || value.browserIdentity.length === 0) {
+    fail(`${label} browserIdentity must be a nonempty string`);
+  }
+  if (typeof value.serverIdentity !== "string" || value.serverIdentity.length === 0) {
+    fail(`${label} serverIdentity must be a nonempty string`);
+  }
+  if (value.cleanupIndependentOfPageMainThread !== true) {
+    fail(`${label} cleanup independence changed`);
+  }
+  return value;
+}
+
+export function validateArmedWatchdogState(value, expected) {
+  const label = "watchdog armed state";
+  validatedArmedWatchdogShape(value, label);
+  for (const key of [
+    "startUnixMs",
+    "deadlineUnixMs",
+    "expectedUrl",
+    "browserPid",
+    "serverPid",
+  ]) {
+    if (value[key] !== expected?.[key]) fail(`${label} ${key} changed from controller authority`);
+  }
+  for (const [key, fragmentKey] of [
+    ["browserIdentity", "browserIdentityFragment"],
+    ["serverIdentity", "serverIdentityFragment"],
+  ]) {
+    const fragment = expected?.[fragmentKey];
+    if (typeof fragment !== "string" || fragment.length === 0) {
+      fail(`${label} ${fragmentKey} authority is invalid`);
+    }
+    if (!value[key].includes(fragment)) fail(`${label} ${key} changed from controller authority`);
+  }
+  return Object.freeze(Object.fromEntries(WATCHDOG_ARMED_KEYS.map(key => [key, value[key]])));
+}
+
+async function readPrivateWatchdogState(statePath, label) {
+  let pathMetadata;
+  try {
+    pathMetadata = await lstat(statePath);
+  } catch (error) {
+    fail(`${label} is unreadable: ${error.message}`);
+  }
+  if (pathMetadata.isSymbolicLink() || !pathMetadata.isFile()) {
+    fail(`${label} must be a non-symlink regular file`);
+  }
+  if ((pathMetadata.mode & 0o077) !== 0) fail(`${label} must be owner-only`);
+  if (typeof process.getuid === "function" && pathMetadata.uid !== process.getuid()) {
+    fail(`${label} must be owned by the controller user`);
+  }
+  if (pathMetadata.size <= 0 || pathMetadata.size > WATCHDOG_STATE_MAX_BYTES) {
+    fail(`${label} has an invalid byte length`);
+  }
+
+  let handle;
+  try {
+    handle = await open(
+      statePath,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    );
+  } catch (error) {
+    fail(`${label} could not be opened without following links: ${error.message}`);
+  }
+  let bytes;
+  try {
+    const openedMetadata = await handle.stat();
+    if (
+      !openedMetadata.isFile()
+      || (openedMetadata.mode & 0o077) !== 0
+      || (
+        typeof process.getuid === "function"
+        && openedMetadata.uid !== process.getuid()
+      )
+      || openedMetadata.size <= 0
+      || openedMetadata.size > WATCHDOG_STATE_MAX_BYTES
+      || openedMetadata.dev !== pathMetadata.dev
+      || openedMetadata.ino !== pathMetadata.ino
+      || openedMetadata.size !== pathMetadata.size
+    ) fail(`${label} changed before it was opened`);
+    bytes = await handle.readFile();
+    const readMetadata = await handle.stat();
+    const currentMetadata = await lstat(statePath);
+    if (
+      readMetadata.dev !== openedMetadata.dev
+      || readMetadata.ino !== openedMetadata.ino
+      || readMetadata.size !== openedMetadata.size
+      || readMetadata.mtimeMs !== openedMetadata.mtimeMs
+      || currentMetadata.isSymbolicLink()
+      || !currentMetadata.isFile()
+      || (currentMetadata.mode & 0o077) !== 0
+      || (
+        typeof process.getuid === "function"
+        && currentMetadata.uid !== process.getuid()
+      )
+      || currentMetadata.dev !== openedMetadata.dev
+      || currentMetadata.ino !== openedMetadata.ino
+      || currentMetadata.size !== openedMetadata.size
+      || bytes.byteLength !== openedMetadata.size
+    ) fail(`${label} changed while it was read`);
+  } finally {
+    await handle.close();
+  }
+  try {
+    return JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    fail(`${label} is not valid JSON: ${error.message}`);
+  }
+}
+
+function validateCleanWatchdogExit(exit, label) {
+  if (
+    exit === null
+    || typeof exit !== "object"
+    || exit.code !== 0
+    || exit.signal !== null
+  ) {
+    fail(
+      `${label} did not exit cleanly `
+      + `(code=${String(exit?.code)}, signal=${String(exit?.signal)})`,
+    );
+  }
+}
+
+function validateTerminalWatchdogState(
+  value,
+  {
+    armed,
+    outcome,
+    expectedCompletionSha256 = null,
+    exit,
+    label,
+  },
+) {
+  validatedArmedWatchdogShape(armed, `${label} armed token`);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    fail(`${label} durable terminal state must be an object`);
+  }
+  for (const key of WATCHDOG_IMMUTABLE_KEYS) {
+    if (value[key] !== armed[key]) {
+      fail(`${label} durable terminal state ${key} changed from the armed state`);
+    }
+  }
+  if (outcome === "complete" && value.status !== "deadline-enforced") {
+    if (value.status !== "completed-before-deadline") {
+      fail(`${label} durable terminal state did not authenticate completion: ${String(value.status)}`);
+    }
+    exactWatchdogKeys(value, WATCHDOG_COMPLETED_KEYS, `${label} completed state`);
+    watchdogInteger(value.completionUnixMs, `${label} completionUnixMs`);
+    if (value.completionUnixMs >= armed.deadlineUnixMs) {
+      fail(`${label} completionUnixMs is not before the fixed deadline`);
+    }
+    if (
+      typeof expectedCompletionSha256 !== "string"
+      || !SHA256_PATTERN.test(expectedCompletionSha256)
+    ) fail(`${label} expected completion SHA-256 authority is invalid`);
+    if (value.completionSha256 !== expectedCompletionSha256) {
+      fail(`${label} completion SHA-256 changed`);
+    }
+    if (value.browserCleanup !== "left-running-for-next-capture") {
+      fail(`${label} completed browser cleanup changed`);
+    }
+    if (value.serverCleanup !== "left-running-for-graceful-capture") {
+      fail(`${label} completed server cleanup changed`);
+    }
+    validateCleanWatchdogExit(exit, label);
+    return Object.freeze({ ...value });
+  }
+  if (outcome !== "complete" && outcome !== "failed") fail(`${label} outcome is invalid`);
+  if (
+    value.status !== "deadline-enforced"
+    && (
+      outcome !== "failed"
+      || value.status !== "controller-terminated-before-completion"
+    )
+  ) {
+    fail(
+      `${label} durable terminal state did not authenticate `
+      + `${outcome === "complete" ? "completion" : "failure"}: ${String(value.status)}`,
+    );
+  }
+  exactWatchdogKeys(value, WATCHDOG_CLEANUP_KEYS, `${label} failed state`);
+  watchdogInteger(value.cleanupUnixMs, `${label} cleanupUnixMs`);
+  if (value.status === "deadline-enforced") {
+    if (
+      value.browserCleanup !== "already-exited"
+      && value.browserCleanup !== "sigkill-confirmed-exited"
+    ) fail(`${label} deadline browser cleanup was not confirmed`);
+    if (
+      value.serverCleanup
+      !== "left-running-for-journal-recovery-and-graceful-capture"
+    ) fail(`${label} deadline server cleanup changed`);
+  } else {
+    if (value.browserCleanup !== "left-running-for-controller-cleanup") {
+      fail(`${label} controller browser cleanup changed`);
+    }
+    if (value.serverCleanup !== "left-running-for-controller-cleanup") {
+      fail(`${label} controller server cleanup changed`);
+    }
+  }
+  validateCleanWatchdogExit(exit, label);
+  return Object.freeze({ ...value });
+}
+
+export class ProductionFidelityWallDeadlineError extends Error {
+  constructor(gameKey, terminal) {
+    super(
+      `production fidelity fixed ${FIXED_FIDELITY_WALL_MS} ms wall deadline enforced `
+      + `for ${gameKey}`,
+    );
+    this.name = "ProductionFidelityWallDeadlineError";
+    this.code = PRODUCTION_FIDELITY_WALL_DEADLINE_ERROR_CODE;
+    this.gameKey = gameKey;
+    this.startUnixMs = terminal.startUnixMs;
+    this.deadlineUnixMs = terminal.deadlineUnixMs;
+    this.cleanupUnixMs = terminal.cleanupUnixMs;
+    this.browserCleanup = terminal.browserCleanup;
+    this.serverCleanup = terminal.serverCleanup;
+    this.watchdogState = terminal;
+  }
+}
+
+export function formatProductionFidelityFailure(failure) {
+  const lines = [];
+  const seen = new Map();
+  const metadataKeys = [
+    "code",
+    "gameKey",
+    "startUnixMs",
+    "deadlineUnixMs",
+    "cleanupUnixMs",
+    "browserCleanup",
+    "serverCleanup",
+  ];
+  const visit = (value, pathLabel) => {
+    if ((typeof value === "object" && value !== null) || typeof value === "function") {
+      const firstPath = seen.get(value);
+      if (firstPath !== undefined) {
+        lines.push(`${pathLabel}: [same failure object as ${firstPath}]`);
+        return;
+      }
+      seen.set(value, pathLabel);
+    }
+    lines.push(`${pathLabel}:`);
+    lines.push(String(value?.stack ?? value));
+    for (const key of metadataKeys) {
+      if (value?.[key] !== undefined) lines.push(`${pathLabel}.${key}: ${String(value[key])}`);
+    }
+    if (Array.isArray(value?.errors)) {
+      for (let index = 0; index < value.errors.length; index += 1) {
+        visit(value.errors[index], `${pathLabel}.errors[${index}]`);
+      }
+    }
+    if (value?.cause !== undefined) visit(value.cause, `${pathLabel}.cause`);
+  };
+  visit(failure, "failure");
+  return lines.join("\n");
 }
 
 function hashBytes(bytes) {
@@ -765,29 +1093,46 @@ async function startWatchdog(context, state, deps) {
   const completionPath = path.join(state.captureRoot, `${prefix}-completion.json`);
   await mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
   const startUnixMs = Date.now();
+  const armedAuthority = Object.freeze({
+    startUnixMs,
+    deadlineUnixMs: startUnixMs + FIXED_FIDELITY_WALL_MS,
+    expectedUrl: context.captureUrl,
+    browserPid: state.chrome.managed.child.pid,
+    serverPid: server.managed.child.pid,
+    browserIdentityFragment: state.chrome.profile,
+    serverIdentityFragment: "resident_machine_fidelity_server.py",
+  });
   const managed = startManagedProcess(state.python, [
     WATCHDOG_PATH,
     "--state", statePath,
-    "--start-unix-ms", String(startUnixMs),
-    "--deadline-unix-ms", String(startUnixMs + FIXED_FIDELITY_WALL_MS),
-    "--browser-pid", String(state.chrome.managed.child.pid),
-    "--server-pid", String(server.managed.child.pid),
-    "--expected-url", context.captureUrl,
-    "--browser-identity-fragment", state.chrome.profile,
-    "--server-identity-fragment", "resident_machine_fidelity_server.py",
+    "--start-unix-ms", String(armedAuthority.startUnixMs),
+    "--deadline-unix-ms", String(armedAuthority.deadlineUnixMs),
+    "--browser-pid", String(armedAuthority.browserPid),
+    "--server-pid", String(armedAuthority.serverPid),
+    "--expected-url", armedAuthority.expectedUrl,
+    "--browser-identity-fragment", armedAuthority.browserIdentityFragment,
+    "--server-identity-fragment", armedAuthority.serverIdentityFragment,
     "--completion", completionPath,
   ], `watchdog ${context.gameKey}`, { spawnImpl: deps.spawnImpl });
   state.watchdogs.add(managed);
+  let armed;
   try {
     await waitForJsonFile(
       statePath,
       value => value?.status === "armed-before-navigation"
-        && value.expectedUrl === context.captureUrl
-        && value.browserPid === state.chrome.managed.child.pid
-        && value.serverPid === server.managed.child.pid,
+        && value.expectedUrl === armedAuthority.expectedUrl
+        && value.browserPid === armedAuthority.browserPid
+        && value.serverPid === armedAuthority.serverPid,
       WATCHDOG_ARM_TIMEOUT_MS,
       `watchdog ${context.gameKey}`,
       managed,
+    );
+    armed = validateArmedWatchdogState(
+      await readPrivateWatchdogState(
+        statePath,
+        `watchdog ${context.gameKey} armed state`,
+      ),
+      armedAuthority,
     );
   } catch (error) {
     let cleanupFailure = null;
@@ -805,13 +1150,15 @@ async function startWatchdog(context, state, deps) {
     }
     throw error;
   }
-  return Object.freeze({ managed, statePath, completionPath });
+  return Object.freeze({ managed, statePath, completionPath, armed });
 }
 
-export async function waitForCompletedWatchdogState({
+export async function waitForTerminalWatchdogState({
   managed,
   statePath,
-  expectedUrl,
+  armed,
+  outcome,
+  expectedCompletionSha256 = null,
   timeoutMs = WATCHDOG_COMPLETE_TIMEOUT_MS,
 }) {
   const exit = await withTimeout(
@@ -819,44 +1166,86 @@ export async function waitForCompletedWatchdogState({
     timeoutMs,
     `${managed.label} exit`,
   );
-  if (exit.code !== 0 || exit.signal !== null) {
-    fail(`${managed.label} did not disarm cleanly`);
-  }
-  let terminal;
-  try {
-    terminal = JSON.parse(await readFile(statePath, "utf8"));
-  } catch (error) {
-    fail(`${managed.label} durable terminal state is unreadable: ${error.message}`);
-  }
-  if (terminal?.status !== "completed-before-deadline" || terminal.expectedUrl !== expectedUrl) {
-    fail(`${managed.label} durable terminal state did not authenticate completion`);
-  }
-  return terminal;
+  const terminal = await readPrivateWatchdogState(
+    statePath,
+    `${managed.label} durable terminal state`,
+  );
+  return validateTerminalWatchdogState(terminal, {
+    armed,
+    outcome,
+    expectedCompletionSha256,
+    exit,
+    label: managed.label,
+  });
 }
 
-async function finishWatchdog(context, state) {
+export async function waitForCompletedWatchdogState({
+  managed,
+  statePath,
+  armed,
+  expectedUrl,
+  expectedCompletionSha256,
+  timeoutMs = WATCHDOG_COMPLETE_TIMEOUT_MS,
+}) {
+  if (armed?.expectedUrl !== expectedUrl) {
+    fail(`${managed.label} expected URL changed from the armed state`);
+  }
+  return waitForTerminalWatchdogState({
+    managed,
+    statePath,
+    armed,
+    outcome: "complete",
+    expectedCompletionSha256,
+    timeoutMs,
+  });
+}
+
+export async function finishWatchdog(context, state) {
   const token = context.lifecycleToken;
   if (token?.managed === undefined) fail(`watchdog token is unavailable for ${context.gameKey}`);
-  if (context.outcome === "complete") {
-    const completion = {
-      schema: WATCHDOG_COMPLETION_SCHEMA,
-      status: "terminal-journal-validated",
-      expectedUrl: context.captureUrl,
-    };
-    await writePrivateLeafAtomic(
-      path.dirname(token.completionPath),
-      path.basename(token.completionPath),
-      Buffer.from(canonicalCaptureJson(completion), "utf8"),
-    );
-    await waitForCompletedWatchdogState({
+  try {
+    if (token.armed === undefined) fail(`watchdog armed token is unavailable for ${context.gameKey}`);
+    if (token.armed.expectedUrl !== context.captureUrl) {
+      fail(`watchdog token URL changed for ${context.gameKey}`);
+    }
+    if (context.outcome === "complete") {
+      const completion = {
+        schema: WATCHDOG_COMPLETION_SCHEMA,
+        status: "terminal-journal-validated",
+        expectedUrl: context.captureUrl,
+      };
+      const completionBytes = Buffer.from(canonicalCaptureJson(completion), "utf8");
+      await writePrivateLeafAtomic(
+        path.dirname(token.completionPath),
+        path.basename(token.completionPath),
+        completionBytes,
+      );
+      const terminal = await waitForCompletedWatchdogState({
+        managed: token.managed,
+        statePath: token.statePath,
+        armed: token.armed,
+        expectedUrl: context.captureUrl,
+        expectedCompletionSha256: hashBytes(completionBytes),
+      });
+      if (terminal.status === "deadline-enforced") {
+        throw new ProductionFidelityWallDeadlineError(context.gameKey, terminal);
+      }
+      return;
+    }
+    if (context.outcome !== "failed") fail(`watchdog outcome is invalid for ${context.gameKey}`);
+    await stopManagedProcess(token.managed, "SIGTERM");
+    const terminal = await waitForTerminalWatchdogState({
       managed: token.managed,
       statePath: token.statePath,
-      expectedUrl: context.captureUrl,
+      armed: token.armed,
+      outcome: "failed",
     });
-  } else {
-    await stopManagedProcess(token.managed, "SIGTERM");
+    if (terminal.status === "deadline-enforced") {
+      throw new ProductionFidelityWallDeadlineError(context.gameKey, terminal);
+    }
+  } finally {
+    if (!processAlive(token.managed)) state.watchdogs.delete(token.managed);
   }
-  if (!processAlive(token.managed)) state.watchdogs.delete(token.managed);
 }
 
 export function parseLocalProductionFidelityArguments(values) {
@@ -1199,7 +1588,7 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch(error => {
-    process.stderr.write(`${String(error?.stack ?? error)}\n`);
+    process.stderr.write(`${formatProductionFidelityFailure(error)}\n`);
     process.exitCode = 1;
   });
 }

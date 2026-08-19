@@ -7,6 +7,7 @@ export const FIDELITY_CHECKPOINT_ACK_SCHEMA =
 export const PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP = "1250000000";
 export const PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = "2500000000";
 export const PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP = 0x000f_ffff;
+export const PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP = 65;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const UUID_PATTERN =
@@ -136,7 +137,7 @@ function captureRunSummary(value, policy, label, accepted) {
     || result.reportedColdInstalls > policy.totalColdInstallCap
     || result.consecutiveZeroProgressSlices >= policy.zeroProgressSliceCap
     || result.maximumConsecutiveZeroProgressSlices >= policy.zeroProgressSliceCap
-    || result.operatorPublications > 64
+    || result.operatorPublications > PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP
     || result.witnessPublications > 1
   ) {
     throw new Error(`${label} exceeded the frozen cumulative authority`);

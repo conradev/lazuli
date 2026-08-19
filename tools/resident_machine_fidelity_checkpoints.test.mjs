@@ -7,6 +7,7 @@ import {
   FIDELITY_CHECKPOINT_ACK_SCHEMA,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   ResidentFidelityCheckpointClient,
 } from "./resident_machine_fidelity_checkpoints.mjs";
 
@@ -43,7 +44,11 @@ const CAPTURE_RUN_POLICY = Object.freeze({
   workerUrl: "/worker.mjs",
 });
 
-function captureRunSummary({ accepted = false, witnessPublications = 0 } = {}) {
+function captureRunSummary({
+  accepted = false,
+  operatorPublications = 0,
+  witnessPublications = 0,
+} = {}) {
   return {
     schema: "lazuli-resident-cumulative-run-summary-v1",
     issuedRunCalls: accepted ? 2 : 0,
@@ -54,7 +59,7 @@ function captureRunSummary({ accepted = false, witnessPublications = 0 } = {}) {
     zeroProgressSlices: 0,
     consecutiveZeroProgressSlices: 0,
     maximumConsecutiveZeroProgressSlices: 0,
-    operatorPublications: 0,
+    operatorPublications,
     witnessPublications,
     elapsedWallMs: accepted ? 20 : 0,
     wallTimeoutMs: 10_000,
@@ -147,7 +152,10 @@ async function resolveSubmission(client, value, receiptSha256 = SHA_B) {
   };
 }
 
-async function completeCapture(client, { distinctBaselineReceipt = false } = {}) {
+async function completeCapture(client, {
+  distinctBaselineReceipt = false,
+  operatorPublications = 0,
+} = {}) {
   await client.captureMachineInitialized({
     machineSessionId: MACHINE_SESSION_ID,
     bootStatus: 3,
@@ -210,7 +218,11 @@ async function completeCapture(client, { distinctBaselineReceipt = false } = {})
   });
   await client.fidelityTerminal({
     ...fidelityArtifacts(),
-    runSummary: captureRunSummary({ accepted: true, witnessPublications: 1 }),
+    runSummary: captureRunSummary({
+      accepted: true,
+      operatorPublications,
+      witnessPublications: 1,
+    }),
   });
 }
 
@@ -363,6 +375,34 @@ test("checkpoint client emits the complete same-receipt Baseline capture chain",
     /terminal record/,
   );
   client.close();
+});
+
+test("checkpoint client accepts 65 operator publications and rejects 66", async () => {
+  assert.equal(PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP, 65);
+  const acceptedWorker = new FakeWorker();
+  const acceptedClient = new ResidentFidelityCheckpointClient(acceptedWorker, {
+    runId: RUN_ID,
+    gameKey: GAME_KEY,
+    evidenceLockSha256: LOCK_SHA,
+  });
+  await completeCapture(acceptedClient, {
+    operatorPublications: PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+  });
+  assert.equal(acceptedWorker.records.at(-1).runSummary.operatorPublications, 65);
+  acceptedClient.close();
+
+  const rejectedWorker = new FakeWorker();
+  const rejectedClient = new ResidentFidelityCheckpointClient(rejectedWorker, {
+    runId: RUN_ID,
+    gameKey: GAME_KEY,
+    evidenceLockSha256: LOCK_SHA,
+  });
+  await assert.rejects(
+    completeCapture(rejectedClient, { operatorPublications: 66 }),
+    /exceeded the frozen cumulative authority/,
+  );
+  assert.notEqual(rejectedWorker.records.at(-1).kind, "fidelity-terminal");
+  rejectedClient.close();
 });
 
 test("capture initialization requires complete boot within the locked read cap", async () => {

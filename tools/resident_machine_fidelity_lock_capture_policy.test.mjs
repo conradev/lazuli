@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   canonicalFidelityLockJson,
   productionFidelityCapturePolicy,
 } from "./resident_machine_fidelity_lock.mjs";
@@ -34,7 +35,7 @@ test("v3 capture policy freezes machine, ledger, operator, leaves, and checkpoin
     algorithm: "alternating-neutral-a-v1",
     runBoundaryOrigin: "post-first-frame-report-local-zero",
     runBoundaryInterval: 8,
-    maximumPublications: 64,
+    maximumPublications: PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
     startsWith: "neutral",
     neutral: { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 },
     a: { buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 },

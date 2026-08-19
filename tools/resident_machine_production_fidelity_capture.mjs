@@ -26,6 +26,7 @@ import {
 } from "./browser_game_compatibility_corpus.mjs";
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
+  PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   canonicalFidelityLockJson,
   expectedFidelityHostIdentitySha256,
   validateResidentProductionFidelityEvidenceLock,
@@ -54,6 +55,31 @@ const DEFAULT_CORPUS_PATH = GAME_COMPATIBILITY_CORPUS_PATH;
 
 function fail(message) {
   throw new Error(`production fidelity capture: ${message}`);
+}
+
+export function formatProductionFidelityCaptureFailure(failure) {
+  const lines = [];
+  const seen = new Map();
+  const visit = (value, pathLabel) => {
+    if ((typeof value === "object" && value !== null) || typeof value === "function") {
+      const firstPath = seen.get(value);
+      if (firstPath !== undefined) {
+        lines.push(`${pathLabel}: [same failure object as ${firstPath}]`);
+        return;
+      }
+      seen.set(value, pathLabel);
+    }
+    lines.push(`${pathLabel}:`);
+    lines.push(String(value?.stack ?? value));
+    if (Array.isArray(value?.errors)) {
+      for (let index = 0; index < value.errors.length; index += 1) {
+        visit(value.errors[index], `${pathLabel}.errors[${index}]`);
+      }
+    }
+    if (value?.cause !== undefined) visit(value.cause, `${pathLabel}.cause`);
+  };
+  visit(failure, "failure");
+  return lines.join("\n");
 }
 
 function object(value, label) {
@@ -398,6 +424,9 @@ export function operatorPublicationDue(policy, runBoundary, publicationCount) {
   if (policy.runBoundaryOrigin !== "post-first-frame-report-local-zero") {
     fail("operator run boundary origin changed");
   }
+  if (policy.maximumPublications !== PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP) {
+    fail("operator publication cap changed");
+  }
   return runBoundary % policy.runBoundaryInterval === 0
     && publicationCount < policy.maximumPublications;
 }
@@ -472,6 +501,60 @@ export function selectCreatedCaptureTarget(targets, targetId) {
   });
 }
 
+export async function runWithPreservedCleanup(operation, cleanup, message) {
+  let operationFailed = false;
+  let operationFailure;
+  let result;
+  try {
+    result = await operation();
+  } catch (error) {
+    operationFailed = true;
+    operationFailure = error;
+  }
+  try {
+    await cleanup();
+  } catch (cleanupFailure) {
+    if (operationFailed) {
+      throw new AggregateError([operationFailure, cleanupFailure], message);
+    }
+    throw cleanupFailure;
+  }
+  if (operationFailed) throw operationFailure;
+  return result;
+}
+
+export async function closeDedicatedCaptureTarget(
+  dedicated,
+  pageSession,
+  requestTimeoutMs,
+) {
+  const failures = [];
+  try {
+    await pageSession?.close();
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    const closed = await dedicated.browserSession.send(
+      "Target.closeTarget",
+      { targetId: dedicated.target.id },
+      requestTimeoutMs,
+    );
+    if (closed?.success !== true) fail("dedicated CDP target did not close");
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    await dedicated.browserSession.close();
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "dedicated CDP target cleanup failed");
+  }
+}
+
 export async function createDedicatedCaptureTarget(
   endpoint,
   createSession,
@@ -481,38 +564,50 @@ export async function createDedicatedCaptureTarget(
   const version = await fetchCdpJson(endpoint, "json/version", fetchImpl);
   const browserSocket = validateLoopbackSocket(version.webSocketDebuggerUrl);
   const browserSession = createSession(browserSocket, { requestTimeoutMs });
-  await browserSession.connect();
   let targetId = null;
-  try {
-    const created = await browserSession.send(
-      "Target.createTarget",
-      { url: "about:blank" },
-      requestTimeoutMs,
-    );
-    if (typeof created.targetId !== "string" || created.targetId.length === 0) {
-      fail("Target.createTarget omitted its target ID");
-    }
-    targetId = created.targetId;
-    const deadline = Date.now() + requestTimeoutMs;
-    let target = null;
-    while (target === null) {
-      const targets = await fetchCdpJson(endpoint, "json/list", fetchImpl);
-      const matching = targets.filter(candidate => candidate?.id === targetId);
-      if (matching.length === 1 && typeof matching[0].webSocketDebuggerUrl === "string") {
-        target = selectCreatedCaptureTarget(targets, targetId);
-        break;
+  let handedOff = false;
+  return runWithPreservedCleanup(
+    async () => {
+      await browserSession.connect();
+      const created = await browserSession.send(
+        "Target.createTarget",
+        { url: "about:blank" },
+        requestTimeoutMs,
+      );
+      if (typeof created.targetId !== "string" || created.targetId.length === 0) {
+        fail("Target.createTarget omitted its target ID");
       }
-      if (Date.now() >= deadline) fail("dedicated CDP target did not become debuggable");
-      await new Promise(resolve => setTimeout(resolve, 25));
-    }
-    return Object.freeze({ browserSession, target });
-  } catch (error) {
-    if (targetId !== null) {
-      await browserSession.send("Target.closeTarget", { targetId }, requestTimeoutMs).catch(() => {});
-    }
-    browserSession.close();
-    throw error;
-  }
+      targetId = created.targetId;
+      const deadline = Date.now() + requestTimeoutMs;
+      let target = null;
+      while (target === null) {
+        const targets = await fetchCdpJson(endpoint, "json/list", fetchImpl);
+        const matching = targets.filter(candidate => candidate?.id === targetId);
+        if (matching.length === 1 && typeof matching[0].webSocketDebuggerUrl === "string") {
+          target = selectCreatedCaptureTarget(targets, targetId);
+          break;
+        }
+        if (Date.now() >= deadline) fail("dedicated CDP target did not become debuggable");
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      const dedicated = Object.freeze({ browserSession, target });
+      handedOff = true;
+      return dedicated;
+    },
+    async () => {
+      if (handedOff) return;
+      if (targetId === null) {
+        await browserSession.close();
+        return;
+      }
+      await closeDedicatedCaptureTarget(
+        { browserSession, target: { id: targetId } },
+        null,
+        requestTimeoutMs,
+      );
+    },
+    "dedicated CDP target setup and cleanup both failed",
+  );
 }
 
 function rootFrame(frameTree) {
@@ -1198,6 +1293,32 @@ async function captureOne(session, input, options, navigationBinding) {
   }
 }
 
+export async function runDedicatedPageCapture(
+  session,
+  input,
+  options,
+  {
+    navigate = navigateDedicatedPage,
+    capture = captureOne,
+    unload = unloadDedicatedPage,
+  } = {},
+) {
+  let navigated = false;
+  return runWithPreservedCleanup(
+    async () => {
+      const binding = await navigate(
+        session,
+        input.captureUrl,
+        options.requestTimeoutMs,
+      );
+      navigated = true;
+      return capture(session, input, options, binding);
+    },
+    () => navigated ? unload(session, options.requestTimeoutMs) : undefined,
+    `production fidelity navigation or capture and page unload both failed for ${input.game.key}`,
+  );
+}
+
 export async function runProductionFidelityCapture(options, {
   createSession = (url, sessionOptions) => new DevToolsSession(url, sessionOptions),
   fetchImpl = fetch,
@@ -1218,63 +1339,46 @@ export async function runProductionFidelityCapture(options, {
   );
   const fragments = [];
   let pageSession = null;
-  try {
-    pageSession = createSession(dedicated.target.webSocketDebuggerUrl, {
-      requestTimeoutMs: options.requestTimeoutMs,
-    });
-    await pageSession.connect();
-    await pageSession.send("Runtime.enable", {}, options.requestTimeoutMs);
-    await pageSession.send("Page.enable", {}, options.requestTimeoutMs);
-    await pageSession.send("Page.bringToFront", {}, options.requestTimeoutMs);
-    for (const input of inputs.ordered) {
-      const lifecycleContext = Object.freeze({
-        gameKey: input.game.key,
-        priority: input.game.priority,
-        runId: input.lock.run.runId,
-        captureUrl: input.captureUrl,
+  return runWithPreservedCleanup(
+    async () => {
+      pageSession = createSession(dedicated.target.webSocketDebuggerUrl, {
+        requestTimeoutMs: options.requestTimeoutMs,
       });
-      const fragment = await runGameCaptureLifecycle(lifecycleContext, async () => {
-        let navigated = false;
-        let captured;
-        try {
-          const binding = await navigateDedicatedPage(
-            pageSession,
-            input.captureUrl,
-            options.requestTimeoutMs,
+      await pageSession.connect();
+      await pageSession.send("Runtime.enable", {}, options.requestTimeoutMs);
+      await pageSession.send("Page.enable", {}, options.requestTimeoutMs);
+      await pageSession.send("Page.bringToFront", {}, options.requestTimeoutMs);
+      for (const input of inputs.ordered) {
+        const lifecycleContext = Object.freeze({
+          gameKey: input.game.key,
+          priority: input.game.priority,
+          runId: input.lock.run.runId,
+          captureUrl: input.captureUrl,
+        });
+        const fragment = await runGameCaptureLifecycle(lifecycleContext, async () => {
+          const captured = await runDedicatedPageCapture(pageSession, input, options);
+          const journalBytes = await readFile(input.journalPath);
+          validateCaptureJournal(journalBytes, input);
+          return writeGameLeaves(
+            options.outputDirectory,
+            input,
+            captured.artifacts,
+            journalBytes,
+            now().toISOString(),
+            captured.operatorPublications,
           );
-          navigated = true;
-          captured = await captureOne(pageSession, input, options, binding);
-        } finally {
-          if (navigated) await unloadDedicatedPage(pageSession, options.requestTimeoutMs);
-        }
-        const journalBytes = await readFile(input.journalPath);
-        validateCaptureJournal(journalBytes, input);
-        return writeGameLeaves(
-          options.outputDirectory,
-          input,
-          captured.artifacts,
-          journalBytes,
-          now().toISOString(),
-          captured.operatorPublications,
-        );
-      }, { beforeGameNavigation, afterGameCapture });
-      fragments.push(fragment);
-    }
-  } finally {
-    pageSession?.close();
-    let closed;
-    try {
-      closed = await dedicated.browserSession.send(
-        "Target.closeTarget",
-        { targetId: dedicated.target.id },
-        options.requestTimeoutMs,
-      );
-    } finally {
-      dedicated.browserSession.close();
-    }
-    if (closed.success !== true) fail("dedicated CDP target did not close");
-  }
-  return Object.freeze(fragments);
+        }, { beforeGameNavigation, afterGameCapture });
+        fragments.push(fragment);
+      }
+      return Object.freeze(fragments);
+    },
+    () => closeDedicatedCaptureTarget(
+      dedicated,
+      pageSession,
+      options.requestTimeoutMs,
+    ),
+    "production fidelity capture and dedicated CDP target cleanup both failed",
+  );
 }
 
 async function main() {
@@ -1285,7 +1389,7 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch(error => {
-    process.stderr.write(`${error.stack ?? error}\n`);
+    process.stderr.write(`${formatProductionFidelityCaptureFailure(error)}\n`);
     process.exitCode = 1;
   });
 }

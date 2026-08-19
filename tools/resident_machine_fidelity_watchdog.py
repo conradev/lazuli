@@ -196,6 +196,7 @@ def main() -> None:
         "cleanupIndependentOfPageMainThread": True,
     }
     termination_requested = False
+    deadline_enforcement_started = False
 
     def request_termination(_signum: int, _frame: object) -> None:
         nonlocal termination_requested
@@ -293,19 +294,34 @@ def main() -> None:
             if remaining_seconds <= 0:
                 break
             time.sleep(min(0.25, remaining_seconds))
+        deadline_enforcement_started = True
+        browser_cleanup = kill_exact_browser(arguments.browser_pid, browser_identity)
+        cleanup_confirmed = browser_cleanup in {
+            "already-exited",
+            "sigkill-confirmed-exited",
+        }
+        durable_state(arguments.state, {
+            **armed,
+            "status": (
+                "deadline-enforced"
+                if cleanup_confirmed
+                else "deadline-enforcement-unconfirmed"
+            ),
+            "cleanupUnixMs": int(time.time() * 1_000),
+            "browserCleanup": browser_cleanup,
+            "serverCleanup": "left-running-for-journal-recovery-and-graceful-capture",
+        })
+        if not cleanup_confirmed:
+            raise RuntimeError(
+                f"dedicated browser termination was not confirmed: {browser_cleanup}"
+            )
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm_handler)
-    browser_cleanup = kill_exact_browser(arguments.browser_pid, browser_identity)
-    cleanup_confirmed = browser_cleanup in {"already-exited", "sigkill-confirmed-exited"}
-    durable_state(arguments.state, {
-        **armed,
-        "status": "deadline-enforced" if cleanup_confirmed else "deadline-enforcement-unconfirmed",
-        "cleanupUnixMs": int(time.time() * 1_000),
-        "browserCleanup": browser_cleanup,
-        "serverCleanup": "left-running-for-journal-recovery-and-graceful-capture",
-    })
-    if not cleanup_confirmed:
-        raise RuntimeError(f"dedicated browser termination was not confirmed: {browser_cleanup}")
+        # Once deadline enforcement starts, retain the handler through process exit.
+        # Restoring SIG_DFL after the durable terminal write would reopen a window
+        # where a controller SIGTERM could turn an authenticated clean exit into a
+        # signalled exit. Predeadline exits retain the ordinary restoration path.
+        if not deadline_enforcement_started:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 if __name__ == "__main__":
