@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies]
 lazuli.workspace = true
-ppcjit.workspace = true
+ppcjit = { workspace = true, features = ["native"] }
 dspint.workspace = true
 util.workspace = true
 tracing.workspace = true

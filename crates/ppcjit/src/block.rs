@@ -1,10 +1,14 @@
+#[cfg(feature = "native")]
 use std::ffi::c_void;
+#[cfg(feature = "native")]
 use std::ptr::NonNull;
 
 use bitos::bitos;
+#[cfg(feature = "native")]
 use jitalloc::{Allocation, ReadExec};
 
 use crate::Sequence;
+#[cfg(feature = "native")]
 use crate::hooks::Context;
 
 /// Metadata regarding a branch exit.
@@ -103,18 +107,22 @@ pub struct Meta {
 /// memory behind the block.
 ///
 /// In order to call the block, use [`Jit::call`](super::Jit::call).
+#[cfg(feature = "native")]
 pub struct Block {
     code: Allocation<ReadExec>,
     meta: Meta,
 }
 
 /// A opaque handle representing the function of a compiled [`Block`].
+#[cfg(feature = "native")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct BlockFn(NonNull<c_void>);
 
+#[cfg(feature = "native")]
 unsafe impl Send for BlockFn {}
 
+#[cfg(feature = "native")]
 impl Block {
     pub(crate) fn new(code: Allocation<ReadExec>, meta: Meta) -> Self {
         Self { code, meta }
@@ -133,10 +141,13 @@ impl Block {
 }
 
 /// A trampoline that allows calling blocks produced by a [`Jit`](super::Jit) compiler.
+#[cfg(feature = "native")]
 pub(super) struct Trampoline(pub(super) Allocation<ReadExec>);
 
+#[cfg(feature = "native")]
 type TrampolineFn = extern "C-unwind" fn(*mut Context, BlockFn);
 
+#[cfg(feature = "native")]
 impl Trampoline {
     /// Calls the given block using this trampoline.
     ///

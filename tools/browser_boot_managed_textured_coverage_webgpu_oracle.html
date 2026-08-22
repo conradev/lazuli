@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli managed textured GX coverage WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli managed textured GX coverage WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildManagedTexturedCoverageOraclePacket,
+      fnv1a64Hex,
+      managedTexturedCoverageExpectedMetrics,
+      managedTexturedCoverageMask,
+      managedTexturedCoverageOracleCases,
+      managedTexturedCoverageXfb,
+    } from "./browser_boot_managed_textured_coverage_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length &&
+        actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    function managedMetrics(diagnostics) {
+      return {
+        managedCoverageDraws: diagnostics.managedCoverageDraws,
+        managedCoverageTriangles: diagnostics.managedCoverageTriangles,
+      };
+    }
+
+    function subtractMetrics(after, before) {
+      return {
+        managedCoverageDraws:
+          after.managedCoverageDraws - before.managedCoverageDraws,
+        managedCoverageTriangles:
+          after.managedCoverageTriangles -
+          before.managedCoverageTriangles,
+      };
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      renderer.reset_diagnostics();
+      const runs = [];
+      const referenceBytes = new Map();
+      try {
+        for (let runIndex = 0; runIndex < RUN_COUNT; runIndex += 1) {
+          const cases = [];
+          for (
+            let caseIndex = 0;
+            caseIndex < managedTexturedCoverageOracleCases.length;
+            caseIndex += 1
+          ) {
+            const entry =
+              managedTexturedCoverageOracleCases[caseIndex];
+            const generation =
+              runIndex * managedTexturedCoverageOracleCases.length +
+              caseIndex +
+              1;
+            renderer.reset();
+            const beforeMetrics = managedMetrics(renderer.diagnostics());
+            renderer.submit_gx_frame(
+              buildManagedTexturedCoverageOraclePacket(
+                entry.id,
+                generation,
+              ),
+            );
+            const presentation = renderer.present_xfb(
+              managedTexturedCoverageXfb.destination,
+              generation,
+              0,
+              "progressive",
+              "top",
+              generation,
+              managedTexturedCoverageXfb.width,
+              managedTexturedCoverageXfb.height,
+              managedTexturedCoverageXfb.stride,
+              managedTexturedCoverageXfb.height,
+              1,
+              false,
+            );
+            await renderer.drain();
+            const readback = await renderer.read_presented_xfb_rgba();
+            const afterMetrics = managedMetrics(renderer.diagnostics());
+            const metricDelta = subtractMetrics(
+              afterMetrics,
+              beforeMetrics,
+            );
+            const expectedMetricDelta = {
+              managedCoverageDraws:
+                entry.expectedPath === "managed" ? 1 : 0,
+              managedCoverageTriangles:
+                entry.expectedManagedTriangles,
+            };
+            const metricsExact =
+              metricDelta.managedCoverageDraws ===
+                expectedMetricDelta.managedCoverageDraws &&
+              metricDelta.managedCoverageTriangles ===
+                expectedMetricDelta.managedCoverageTriangles;
+            const actualRgba = Array.from(readback.rgba);
+            const prior = referenceBytes.get(entry.id);
+            const byteExact = bytesEqual(
+              actualRgba,
+              entry.expectedRgba,
+            );
+            const dimensionsExact =
+              readback.width === managedTexturedCoverageXfb.width &&
+              readback.height === managedTexturedCoverageXfb.height;
+            const deterministic =
+              prior === undefined || bytesEqual(actualRgba, prior);
+            if (prior === undefined) {
+              referenceBytes.set(entry.id, actualRgba);
+            }
+            renderer.check_health();
+            cases.push({
+              id: entry.id,
+              name: entry.name,
+              expectedPath: entry.expectedPath,
+              expectedMetricDelta,
+              metricDelta,
+              metricsExact,
+              expectedMask: entry.expectedMask,
+              actualMask: managedTexturedCoverageMask(actualRgba),
+              expectedRgbaFnv1a64: entry.expectedRgbaFnv1a64,
+              actualRgbaFnv1a64: fnv1a64Hex(actualRgba),
+              expectedRgba: entry.expectedRgba,
+              actualRgba,
+              byteExact,
+              dimensionsExact,
+              deterministic,
+              pass:
+                byteExact &&
+                dimensionsExact &&
+                deterministic &&
+                metricsExact,
+              width: readback.width,
+              height: readback.height,
+              presentation,
+            });
+          }
+          runs.push({
+            index: runIndex + 1,
+            pass: cases.every(entry => entry.pass),
+            cases,
+          });
+        }
+        renderer.check_health();
+        const diagnostics = renderer.diagnostics();
+        const expectedMetrics =
+          managedTexturedCoverageExpectedMetrics.twoRuns;
+        const managedCoverageCountersExact =
+          diagnostics.managedCoverageDraws ===
+            expectedMetrics.managedCoverageDraws &&
+          diagnostics.managedCoverageTriangles ===
+            expectedMetrics.managedCoverageTriangles;
+        const result = {
+          pass:
+            runs.every(entry => entry.pass) &&
+            managedCoverageCountersExact,
+          runCount: RUN_COUNT,
+          strictWebGpu: true,
+          deterministic: runs
+            .flatMap(entry => entry.cases)
+            .every(entry => entry.deterministic),
+          expectedMetrics,
+          managedCoverageCountersExact,
+          runs,
+          diagnostics,
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliManagedTexturedCoverageOraclePromise =
+      run().catch(error => {
+        const result = {
+          pass: false,
+          error: error instanceof Error ? error.stack : String(error),
+        };
+        document.body.dataset.status = "error";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      });
+  </script>
+</body>
+</html>

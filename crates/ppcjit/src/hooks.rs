@@ -1,9 +1,10 @@
-use cranelift::codegen::ir;
-use cranelift::codegen::isa::CallConv;
+use cranelift_codegen::ir;
+use cranelift_codegen::isa::CallConv;
 use gekko::{Address, Cpu, QuantReg};
 use strum::FromRepr;
 
 use crate::FastmemLut;
+#[cfg(feature = "native")]
 use crate::block::{BlockFn, Executed, ExitReason};
 
 /// Caller context.
@@ -21,13 +22,21 @@ pub type GetFastmemHook = extern "C-unwind" fn(*mut Context) -> *mut FastmemLut;
 ///
 /// Should return a pointer to a block to jump to and keep the chain executing or `None` if you
 /// wish to exit the chain. In other words, this allows for _block linking_.
+#[cfg(feature = "native")]
 pub type ExitHook =
     extern "C-unwind" fn(*const Context, *mut ExitData, ExitReason, Executed) -> Option<BlockFn>;
 
 pub type ReadHook<T> = extern "C-unwind" fn(*mut Context, Address, *mut T) -> bool;
 pub type WriteHook<T> = extern "C-unwind" fn(*mut Context, Address, T) -> bool;
+pub type StoreConditionalHook = extern "C-unwind" fn(*mut Context, Address, i32) -> u8;
 pub type ReadQuantizedHook = extern "C-unwind" fn(*mut Context, Address, QuantReg, *mut f64) -> u8;
 pub type WriteQuantizedHook = extern "C-unwind" fn(*mut Context, Address, QuantReg, f64) -> u8;
+
+pub const LOAD_RESERVE_FAULT: u8 = 0;
+pub const LOAD_RESERVE_LOADED: u8 = 1;
+pub const STORE_CONDITIONAL_FAULT: u8 = 0;
+pub const STORE_CONDITIONAL_NOT_STORED: u8 = 1;
+pub const STORE_CONDITIONAL_STORED: u8 = 2;
 
 pub type InvalidateICache = extern "C-unwind" fn(*mut Context, Address);
 
@@ -59,9 +68,16 @@ pub enum HookKind {
     TbChanged,
     DecRead,
     DecChanged,
+    SrChanged,
+    Sdr1Changed,
+    Tlbie,
+    Tlbsync,
+    LoadReserve      = 27,
+    StoreConditional = 28,
 }
 
 /// External functions that JITed code calls.
+#[cfg(feature = "native")]
 pub struct Hooks {
     pub get_registers: GetRegistersHook,
     pub get_fastmem: GetFastmemHook,
@@ -77,16 +93,24 @@ pub struct Hooks {
     pub write_i32: WriteHook<i32>,
     pub read_i64: ReadHook<i64>,
     pub write_i64: WriteHook<i64>,
+    pub load_reserve: ReadHook<i32>,
+    pub store_conditional: StoreConditionalHook,
     pub read_quantized: ReadQuantizedHook,
     pub write_quantized: WriteQuantizedHook,
 
     // cache
     pub invalidate_icache: InvalidateICache,
+    pub tlbie: InvalidateICache,
+    pub tlbsync: GenericHook,
     pub clear_icache: GenericHook,
     pub dcache_dma: GenericHook,
 
     // msr
     pub msr_changed: GenericHook,
+
+    // page translation
+    pub sr_changed: GenericHook,
+    pub sdr1_changed: GenericHook,
 
     // bats
     pub ibat_changed: GenericHook,
@@ -101,6 +125,7 @@ pub struct Hooks {
     pub dec_changed: GenericHook,
 }
 
+#[cfg(feature = "native")]
 impl Hooks {
     #[allow(unused_assignments)]
     #[cfg(test)]
@@ -126,12 +151,18 @@ impl Hooks {
             write_i32: stub!(),
             read_i64: stub!(),
             write_i64: stub!(),
+            load_reserve: stub!(),
+            store_conditional: stub!(),
             read_quantized: stub!(),
             write_quantized: stub!(),
             invalidate_icache: stub!(),
+            tlbie: stub!(),
+            tlbsync: stub!(),
             clear_icache: stub!(),
             dcache_dma: stub!(),
             msr_changed: stub!(),
+            sr_changed: stub!(),
+            sdr1_changed: stub!(),
             ibat_changed: stub!(),
             dbat_changed: stub!(),
             tb_read: stub!(),
@@ -140,9 +171,15 @@ impl Hooks {
             dec_changed: stub!(),
         }
     }
+}
 
+/// CLIF signatures for runtime hooks used by every translation mode.
+pub(crate) struct HookSignatures;
+
+impl HookSignatures {
     /// Returns the function signature for the `get_registers` hook.
-    pub(crate) fn get_registers_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
+    #[cfg(feature = "native")]
+    pub(crate) fn get_registers(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
         ir::Signature {
             params: vec![
                 ir::AbiParam::new(ptr_type), // ctx
@@ -153,7 +190,8 @@ impl Hooks {
     }
 
     /// Returns the function signature for the `get_fastmem` hook.
-    pub(crate) fn get_fastmem_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
+    #[cfg(feature = "native")]
+    pub(crate) fn get_fastmem(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
         ir::Signature {
             params: vec![
                 ir::AbiParam::new(ptr_type), // ctx
@@ -164,7 +202,7 @@ impl Hooks {
     }
 
     /// Returns the function signature for the exit hook.
-    pub(crate) fn exit_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
+    pub(crate) fn exit(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
         ir::Signature {
             params: vec![
                 ir::AbiParam::new(ptr_type),       // ctx
@@ -178,7 +216,7 @@ impl Hooks {
     }
 
     /// Returns the function signature for a memory read hook.
-    pub(crate) fn read_sig(
+    pub(crate) fn read(
         ptr_type: ir::Type,
         _read_type: ir::Type,
         call_conv: CallConv,
@@ -195,7 +233,7 @@ impl Hooks {
     }
 
     /// Returns the function signature for a memory write hook.
-    pub(crate) fn write_sig(
+    pub(crate) fn write(
         ptr_type: ir::Type,
         write_type: ir::Type,
         call_conv: CallConv,
@@ -212,7 +250,7 @@ impl Hooks {
     }
 
     /// Returns the function signature for a quantized memory read hook.
-    pub(crate) fn read_quantized_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
+    pub(crate) fn read_quantized(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
         ir::Signature {
             params: vec![
                 ir::AbiParam::new(ptr_type),       // ctx
@@ -226,7 +264,7 @@ impl Hooks {
     }
 
     /// Returns the function signature for a quantized memory read hook.
-    pub(crate) fn write_quantized_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
+    pub(crate) fn write_quantized(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
         ir::Signature {
             params: vec![
                 ir::AbiParam::new(ptr_type),       // ctx
@@ -240,7 +278,7 @@ impl Hooks {
     }
 
     /// Returns the function signature for a invalidade icache hook.
-    pub(crate) fn invalidate_icache_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
+    pub(crate) fn invalidate_icache(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
         ir::Signature {
             params: vec![
                 ir::AbiParam::new(ptr_type),       // ctx
@@ -252,7 +290,7 @@ impl Hooks {
     }
 
     /// Returns the function signature for a generic hook.
-    pub(crate) fn generic_hook_sig(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
+    pub(crate) fn generic(ptr_type: ir::Type, call_conv: CallConv) -> ir::Signature {
         ir::Signature {
             params: vec![
                 ir::AbiParam::new(ptr_type), // ctx

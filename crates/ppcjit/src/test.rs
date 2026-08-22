@@ -1,6 +1,6 @@
 use std::alloc::Layout;
 
-use cranelift::codegen::isa;
+use cranelift_codegen::isa;
 
 use crate::block::Meta;
 use crate::hooks::Hooks;

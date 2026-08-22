@@ -227,6 +227,9 @@ pub fn write_control(sys: &mut System, value: Control) {
                 ]);
 
                 sys.mem.ram_mut()[target.value() as usize + 12..][..32 - 12].fill(0);
+                sys.cpu
+                    .reservation
+                    .invalidate_range(target, length as usize);
                 sys.scheduler.schedule(10000, complete_transfer);
             }
             Command::Read { offset, length } => {
@@ -266,6 +269,9 @@ pub fn write_control(sys: &mut System, value: Control) {
                     sys.modules.disk.read_exact(slice).unwrap();
                 }
 
+                sys.cpu
+                    .reservation
+                    .invalidate_range(Address(target), length as usize);
                 sys.scheduler.schedule(10000, complete_transfer);
             }
             Command::Seek { .. } => {

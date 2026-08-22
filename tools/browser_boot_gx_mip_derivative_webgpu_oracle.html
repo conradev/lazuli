@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli GX derivative mip WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 256px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli GX derivative mip WebGPU oracle</h1>
+  <canvas id="oracle" width="16" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildGxMipDerivativeOraclePacket,
+      buildGxMipDerivativeSequencePacket,
+      classifyGxMipDerivativeFingerprint,
+      gxMipDerivativeFingerprintCases,
+      gxMipDerivativeHardGateCases,
+      gxMipDerivativeOracle,
+      gxMipDerivativeSequenceCases,
+    } from "./browser_boot_gx_mip_derivative_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length &&
+        actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    function fnv1a64Hex(bytes) {
+      let hash = 0xcbf29ce484222325n;
+      for (const byte of bytes) {
+        hash ^= BigInt(byte);
+        hash = BigInt.asUintN(
+          64,
+          hash * 0x100000001b3n,
+        );
+      }
+      return `0x${hash.toString(16).padStart(16, "0")}`;
+    }
+
+    function probePixel(rgba, width, probe) {
+      const offset = (probe.y * width + probe.x) * 4;
+      return rgba.slice(offset, offset + 4);
+    }
+
+    function pixelsUniform(rgba) {
+      if (rgba.length === 0 || rgba.length % 4 !== 0) {
+        return false;
+      }
+      const first = rgba.slice(0, 4);
+      for (let offset = 4; offset < rgba.length; offset += 4) {
+        if (!bytesEqual(rgba.slice(offset, offset + 4), first)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function rendererMetrics(diagnostics) {
+      return {
+        gxFramePacketPayloadBytes:
+          diagnostics.gxFramePacketPayloadBytes,
+        texturePixelBytes: diagnostics.texturePixelBytes,
+        textureUploadBytes: diagnostics.textureUploadBytes,
+        textureWrites: diagnostics.textureWrites,
+        managedCoverageDraws: diagnostics.managedCoverageDraws,
+        managedCoverageTriangles:
+          diagnostics.managedCoverageTriangles,
+      };
+    }
+
+    function subtractMetrics(after, before) {
+      return Object.fromEntries(
+        Object.keys(after).map(key => [key, after[key] - before[key]]),
+      );
+    }
+
+    function exactMetrics(actual, expected) {
+      return (
+        actual.gxFramePacketPayloadBytes ===
+          expected.packetPayloadBytes &&
+        actual.texturePixelBytes === expected.packetPayloadBytes &&
+        actual.textureUploadBytes === expected.textureUploadBytes &&
+        actual.textureWrites === expected.textureWrites &&
+        actual.managedCoverageDraws ===
+          expected.managedCoverageDraws &&
+        actual.managedCoverageTriangles ===
+          expected.managedCoverageTriangles
+      );
+    }
+
+    function traceCanvasContextRequests(canvas) {
+      const requests = [];
+      const original = canvas.getContext;
+      canvas.getContext = function getContext(type, ...options) {
+        requests.push(String(type));
+        return Reflect.apply(original, this, [type, ...options]);
+      };
+      return Object.freeze({
+        requests,
+        restore() {
+          delete canvas.getContext;
+        },
+      });
+    }
+
+    function paletteObservation(rgba) {
+      const lods = [];
+      const unknownPixels = [];
+      for (let offset = 0; offset < rgba.length; offset += 4) {
+        const pixel = rgba.slice(offset, offset + 4);
+        const match = gxMipDerivativeOracle.allTrilinearColors.find(
+          entry => bytesEqual(pixel, entry.rgba),
+        );
+        if (match === undefined) {
+          unknownPixels.push({
+            pixel: offset / 4,
+            rgba: pixel,
+          });
+        } else {
+          lods.push(match.lodSixteenths);
+        }
+      }
+      return {
+        lods,
+        uniqueLods: [...new Set(lods)],
+        unknownPixels,
+        coverageExact:
+          rgba.length > 0 &&
+          unknownPixels.length === 0 &&
+          lods.length * 4 === rgba.length,
+      };
+    }
+
+    async function submitAndRead(
+      renderer,
+      packet,
+      generation,
+      width,
+      height,
+      stride,
+      expectedMetrics,
+    ) {
+      renderer.reset();
+      const diagnosticsBefore = rendererMetrics(
+        renderer.diagnostics(),
+      );
+      const acknowledgedKeys = Array.from(
+        renderer.submit_gx_frame(packet),
+      );
+      const presentation = renderer.present_xfb(
+        gxMipDerivativeOracle.xfb.destination,
+        generation,
+        0,
+        "progressive",
+        "top",
+        generation,
+        width,
+        height,
+        stride,
+        height,
+        1,
+        false,
+      );
+      await renderer.drain();
+      const readback = await renderer.read_presented_xfb_rgba();
+      renderer.check_health();
+      const diagnosticsAfter = rendererMetrics(
+        renderer.diagnostics(),
+      );
+      const metricDelta = subtractMetrics(
+        diagnosticsAfter,
+        diagnosticsBefore,
+      );
+      return {
+        rgba: Array.from(readback.rgba),
+        width: readback.width,
+        height: readback.height,
+        acknowledgedKeys,
+        acknowledgementExact:
+          acknowledgedKeys.length === 1 &&
+          acknowledgedKeys[0] === gxMipDerivativeOracle.key,
+        expectedMetrics,
+        metricDelta,
+        metricsExact: exactMetrics(metricDelta, expectedMetrics),
+        presentation,
+      };
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const contextTrace = traceCanvasContextRequests(canvas);
+      let renderer;
+      try {
+        renderer = await WebGpuRenderer.create(canvas);
+      } finally {
+        contextTrace.restore();
+      }
+      renderer.reset_diagnostics();
+      const firstReadbacks = new Map();
+      const runs = [];
+      let generation = 0;
+      try {
+        for (let runIndex = 0; runIndex < RUN_COUNT; runIndex += 1) {
+          const hardGates = [];
+          for (const entry of gxMipDerivativeHardGateCases) {
+            generation += 1;
+            const sample = await submitAndRead(
+              renderer,
+              buildGxMipDerivativeOraclePacket(
+                entry.id,
+                generation,
+              ),
+              generation,
+              gxMipDerivativeOracle.xfb.width,
+              gxMipDerivativeOracle.xfb.height,
+              gxMipDerivativeOracle.xfb.stride,
+              gxMipDerivativeOracle.expectedSingleDrawMetrics,
+            );
+            const actualRgbaFnv1a64 = fnv1a64Hex(sample.rgba);
+            const prior = firstReadbacks.get(entry.id);
+            const deterministic =
+              prior === undefined || bytesEqual(sample.rgba, prior);
+            if (prior === undefined) {
+              firstReadbacks.set(entry.id, sample.rgba);
+            }
+            const byteExact = bytesEqual(
+              sample.rgba,
+              entry.expectedSurface,
+            );
+            const hashExact =
+              actualRgbaFnv1a64 === entry.expectedSurfaceFnv1a64;
+            const dimensionsExact =
+              sample.width === gxMipDerivativeOracle.xfb.width &&
+              sample.height === gxMipDerivativeOracle.xfb.height;
+            const palette = paletteObservation(sample.rgba);
+            hardGates.push({
+              id: entry.id,
+              feature: entry.feature,
+              margin: entry.margin,
+              dx: entry.dx,
+              dy: entry.dy,
+              diagonal: entry.diagonal,
+              biasSixteenths: entry.biasSixteenths,
+              minLodSixteenths: entry.minLodSixteenths,
+              maxLodSixteenths: entry.maxLodSixteenths,
+              mode0: entry.mode0,
+              mode1: entry.mode1,
+              model: entry.model,
+              expectedRgba: entry.expectedRgba,
+              actualProbeRgba: probePixel(
+                sample.rgba,
+                sample.width,
+                gxMipDerivativeOracle.probe,
+              ),
+              expectedSurfaceFnv1a64:
+                entry.expectedSurfaceFnv1a64,
+              actualRgbaFnv1a64,
+              byteExact,
+              hashExact,
+              deterministic,
+              dimensionsExact,
+              palette,
+              ...sample,
+              pass:
+                byteExact &&
+                hashExact &&
+                deterministic &&
+                dimensionsExact &&
+                palette.coverageExact &&
+                sample.acknowledgementExact &&
+                sample.metricsExact,
+            });
+          }
+
+          const fingerprints = [];
+          for (const entry of gxMipDerivativeFingerprintCases) {
+            generation += 1;
+            const sample = await submitAndRead(
+              renderer,
+              buildGxMipDerivativeOraclePacket(
+                entry.id,
+                generation,
+              ),
+              generation,
+              gxMipDerivativeOracle.xfb.width,
+              gxMipDerivativeOracle.xfb.height,
+              gxMipDerivativeOracle.xfb.stride,
+              gxMipDerivativeOracle.expectedSingleDrawMetrics,
+            );
+            const actualRgbaFnv1a64 = fnv1a64Hex(sample.rgba);
+            const prior = firstReadbacks.get(entry.id);
+            const deterministic =
+              prior === undefined || bytesEqual(sample.rgba, prior);
+            if (prior === undefined) {
+              firstReadbacks.set(entry.id, sample.rgba);
+            }
+            const palette = paletteObservation(sample.rgba);
+            const dimensionsExact =
+              sample.width === gxMipDerivativeOracle.xfb.width &&
+              sample.height === gxMipDerivativeOracle.xfb.height;
+            const modelByteExact = bytesEqual(
+              sample.rgba,
+              entry.expectedSurface,
+            );
+            const bucket = classifyGxMipDerivativeFingerprint(
+              palette.lods,
+            );
+            const uniform =
+              pixelsUniform(sample.rgba) && bucket.uniformBucket;
+            fingerprints.push({
+              id: entry.id,
+              feature: entry.feature,
+              dx: entry.dx,
+              dy: entry.dy,
+              boundarySixteenths: entry.boundarySixteenths,
+              model: entry.model,
+              modelExpectedSurfaceFnv1a64:
+                entry.expectedSurfaceFnv1a64,
+              actualRgbaFnv1a64,
+              modelByteExact,
+              deterministic,
+              dimensionsExact,
+              palette,
+              uniform,
+              observedBucket: bucket.observedBucket,
+              plausibleBucket: bucket.plausibleBucket,
+              ...sample,
+              // The observed boundary bucket is adapter evidence. It is not
+              // required to equal the independent model cross-adapter.
+              pass:
+                deterministic &&
+                dimensionsExact &&
+                palette.coverageExact &&
+                uniform &&
+                bucket.plausibleBucket &&
+                sample.acknowledgementExact &&
+                sample.metricsExact,
+            });
+          }
+
+          const sequences = [];
+          for (const entry of gxMipDerivativeSequenceCases) {
+            generation += 1;
+            const sample = await submitAndRead(
+              renderer,
+              buildGxMipDerivativeSequencePacket(
+                entry.id,
+                generation,
+              ),
+              generation,
+              entry.width,
+              entry.height,
+              entry.stride,
+              gxMipDerivativeOracle.expectedSequenceMetrics,
+            );
+            const actualRgbaFnv1a64 = fnv1a64Hex(sample.rgba);
+            const prior = firstReadbacks.get(entry.id);
+            const deterministic =
+              prior === undefined || bytesEqual(sample.rgba, prior);
+            if (prior === undefined) {
+              firstReadbacks.set(entry.id, sample.rgba);
+            }
+            const byteExact = bytesEqual(
+              sample.rgba,
+              entry.expectedSurface,
+            );
+            const hashExact =
+              actualRgbaFnv1a64 === entry.expectedSurfaceFnv1a64;
+            const dimensionsExact =
+              sample.width === entry.width &&
+              sample.height === entry.height;
+            const palette = paletteObservation(sample.rgba);
+            sequences.push({
+              id: entry.id,
+              recordOrder: entry.order.map(({ slot, state }) => ({
+                slot,
+                state: state.id,
+                mode0: state.mode0,
+                mode1: state.mode1,
+              })),
+              expectedSurfaceFnv1a64:
+                entry.expectedSurfaceFnv1a64,
+              actualRgbaFnv1a64,
+              byteExact,
+              hashExact,
+              deterministic,
+              dimensionsExact,
+              palette,
+              ...sample,
+              pass:
+                byteExact &&
+                hashExact &&
+                deterministic &&
+                dimensionsExact &&
+                palette.coverageExact &&
+                sample.acknowledgementExact &&
+                sample.metricsExact,
+            });
+          }
+
+          const sequencePermutationIndependent =
+            sequences.length === 2 &&
+            bytesEqual(sequences[0].rgba, sequences[1].rgba) &&
+            sequences[0].actualRgbaFnv1a64 ===
+              sequences[1].actualRgbaFnv1a64;
+          const hardGatePass =
+            hardGates.length ===
+              gxMipDerivativeHardGateCases.length &&
+            hardGates.every(entry => entry.pass);
+          const fingerprintIntegrityPass =
+            fingerprints.length ===
+              gxMipDerivativeFingerprintCases.length &&
+            fingerprints.every(entry => entry.pass);
+          const sequencePass =
+            sequencePermutationIndependent &&
+            sequences.every(entry => entry.pass);
+          runs.push({
+            index: runIndex + 1,
+            hardGates,
+            fingerprints,
+            sequences,
+            hardGatePass,
+            fingerprintIntegrityPass,
+            sequencePermutationIndependent,
+            sequencePass,
+            pass:
+              hardGatePass &&
+              fingerprintIntegrityPass &&
+              sequencePass,
+          });
+        }
+
+        const unexpectedCanvasContexts =
+          contextTrace.requests.filter(type => type !== "webgpu");
+        const backendDiagnostics = {
+          renderer: "WebGpuRenderer",
+          navigatorGpuAvailable:
+            typeof navigator.gpu?.requestAdapter === "function",
+          canvasContextRequests: [...contextTrace.requests],
+          unexpectedCanvasContexts,
+          strictWebGpuOnly:
+            contextTrace.requests.length > 0 &&
+            unexpectedCanvasContexts.length === 0 &&
+            contextTrace.requests.every(type => type === "webgpu"),
+        };
+        const boundaryFingerprint = runs[0].fingerprints.map(
+          entry => ({
+            id: entry.id,
+            actualRgbaFnv1a64: entry.actualRgbaFnv1a64,
+            observedLodSixteenths: entry.observedBucket,
+            uniform: entry.uniform,
+            plausibleBucket: entry.plausibleBucket,
+            modelLodSixteenths:
+              entry.model.clampedLodSixteenths,
+            modelByteExact: entry.modelByteExact,
+          }),
+        );
+        const deterministic = runs
+          .flatMap(run => [
+            ...run.hardGates,
+            ...run.fingerprints,
+            ...run.sequences,
+          ])
+          .every(entry => entry.deterministic);
+        renderer.check_health();
+        const result = {
+          pass:
+            backendDiagnostics.navigatorGpuAvailable &&
+            backendDiagnostics.strictWebGpuOnly &&
+            deterministic &&
+            runs.every(entry => entry.pass),
+          runCount: RUN_COUNT,
+          deterministic,
+          hardGateFeatures:
+            gxMipDerivativeOracle.hardGateFeatures,
+          boundaryFingerprint,
+          derivativeBoundary:
+            gxMipDerivativeOracle.derivativeBoundary,
+          runs,
+          backendDiagnostics,
+          diagnostics: renderer.diagnostics(),
+          derivativeLodOracleGap:
+            gxMipDerivativeOracle.derivativeLodOracleGap,
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliGxMipDerivativeOraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>

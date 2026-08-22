@@ -74,7 +74,7 @@ block4:
   orl %ecx, %eax
   movl %eax, 0x28c(%rsi)
   movq %rsi, %rbx
-  load_ext_name userextname23+0, %rsi
+  load_ext_name userextname29+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x20001, %ecx
@@ -94,7 +94,7 @@ block1:
   load_ext_name userextname0+0, %rax
   movq %rbx, %rdi
   call    *%rax
-  load_ext_name userextname22+0, %rsi
+  load_ext_name userextname28+0, %rsi
   uninit  %rdx
   xorq %rdx, %rdx
   movl $0x20001, %ecx

@@ -1,5 +1,6 @@
-use cranelift::codegen::ir;
-use cranelift::prelude::{InstBuilder, IntCC};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::condcodes::IntCC;
 use gekko::disasm::Ins;
 use gekko::{InsExt, SPR};
 
@@ -596,6 +597,7 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let value = self.bd.ins().fadd(fpr_a, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -653,6 +655,7 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let value = self.bd.ins().fsub(fpr_a, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -939,6 +942,7 @@ impl BlockBuilder<'_> {
 
         let fpr_a = self.get(ins.fpr_a());
         let fpr_c = self.get(ins.fpr_c());
+        let fpr_c = self.force_paired_25_bit(fpr_c);
 
         let value = self.bd.ins().fmul(fpr_a, fpr_c);
         let value = self.round_to_single(value);
@@ -958,8 +962,10 @@ impl BlockBuilder<'_> {
         let fpr_a = self.get(ins.fpr_a());
         let fpr_b = self.get(ins.fpr_b());
         let fpr_c = self.get(ins.fpr_c());
+        let fpr_c = self.force_paired_25_bit(fpr_c);
 
         let value = self.bd.ins().fma(fpr_a, fpr_c, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -977,7 +983,9 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let fpr_c = self.get(ins.fpr_c());
-        let fpr_c_ps0 = self.copy_ps0_to_ps1(fpr_c);
+        let fpr_c_ps0 = self.bd.ins().extractlane(fpr_c, 0);
+        let fpr_c_ps0 = self.force_25_bit_lane(fpr_c_ps0);
+        let fpr_c_ps0 = self.bd.ins().splat(ir::types::F64X2, fpr_c_ps0);
 
         let value = self.bd.ins().fma(fpr_a, fpr_c_ps0, fpr_b);
         let value = self.round_to_single(value);
@@ -998,7 +1006,9 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let fpr_c = self.get(ins.fpr_c());
-        let fpr_c_ps1 = self.copy_ps1_to_ps0(fpr_c);
+        let fpr_c_ps1 = self.bd.ins().extractlane(fpr_c, 1);
+        let fpr_c_ps1 = self.force_25_bit_lane(fpr_c_ps1);
+        let fpr_c_ps1 = self.bd.ins().splat(ir::types::F64X2, fpr_c_ps1);
 
         let value = self.bd.ins().fma(fpr_a, fpr_c_ps1, fpr_b);
         let value = self.round_to_single(value);
@@ -1018,6 +1028,7 @@ impl BlockBuilder<'_> {
         let fpr_a = self.get(ins.fpr_a());
         let fpr_b = self.get(ins.fpr_b());
         let fpr_c = self.get(ins.fpr_c());
+        let fpr_c = self.force_paired_25_bit(fpr_c);
 
         let neg_fpr_b = self.bd.ins().fneg(fpr_b);
         let value = self.bd.ins().fma(fpr_a, fpr_c, neg_fpr_b);
@@ -1038,6 +1049,7 @@ impl BlockBuilder<'_> {
         let fpr_a = self.get(ins.fpr_a());
         let fpr_b = self.get(ins.fpr_b());
         let fpr_c = self.get(ins.fpr_c());
+        let fpr_c = self.force_paired_25_bit(fpr_c);
 
         let value = self.bd.ins().fma(fpr_a, fpr_c, fpr_b);
         let value = self.bd.ins().fneg(value);
@@ -1058,6 +1070,7 @@ impl BlockBuilder<'_> {
         let fpr_a = self.get(ins.fpr_a());
         let fpr_b = self.get(ins.fpr_b());
         let fpr_c = self.get(ins.fpr_c());
+        let fpr_c = self.force_paired_25_bit(fpr_c);
 
         let neg_fpr_b = self.bd.ins().fneg(fpr_b);
         let value = self.bd.ins().fma(fpr_a, fpr_c, neg_fpr_b);
@@ -1078,7 +1091,9 @@ impl BlockBuilder<'_> {
 
         let fpr_a = self.get(ins.fpr_a());
         let fpr_c = self.get(ins.fpr_c());
-        let fpr_c_ps0 = self.copy_ps0_to_ps1(fpr_c);
+        let fpr_c_ps0 = self.bd.ins().extractlane(fpr_c, 0);
+        let fpr_c_ps0 = self.force_25_bit_lane(fpr_c_ps0);
+        let fpr_c_ps0 = self.bd.ins().splat(ir::types::F64X2, fpr_c_ps0);
 
         let value = self.bd.ins().fmul(fpr_a, fpr_c_ps0);
         let value = self.round_to_single(value);
@@ -1097,7 +1112,9 @@ impl BlockBuilder<'_> {
 
         let fpr_a = self.get(ins.fpr_a());
         let fpr_c = self.get(ins.fpr_c());
-        let fpr_c_ps1 = self.copy_ps1_to_ps0(fpr_c);
+        let fpr_c_ps1 = self.bd.ins().extractlane(fpr_c, 1);
+        let fpr_c_ps1 = self.force_25_bit_lane(fpr_c_ps1);
+        let fpr_c_ps1 = self.bd.ins().splat(ir::types::F64X2, fpr_c_ps1);
 
         let value = self.bd.ins().fmul(fpr_a, fpr_c_ps1);
         let value = self.round_to_single(value);
@@ -1118,6 +1135,7 @@ impl BlockBuilder<'_> {
         let fpr_b = self.get(ins.fpr_b());
 
         let value = self.bd.ins().fdiv(fpr_a, fpr_b);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);

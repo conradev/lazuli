@@ -1,5 +1,6 @@
-use cranelift::codegen::ir;
-use cranelift::prelude::{FloatCC, InstBuilder};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::condcodes::FloatCC;
 use gekko::disasm::Ins;
 use gekko::{InsExt, Reg};
 
@@ -149,6 +150,25 @@ impl BlockBuilder<'_> {
         FLOAT_INFO
     }
 
+    pub fn fnabs(&mut self, ins: Ins) -> InstructionInfo {
+        self.check_floats();
+
+        let fpr_b = self.get(ins.fpr_b());
+
+        // fnabs is a move-style operation: it sets the sign bit without performing floating-point
+        // arithmetic, preserving NaN payloads and leaving FPSCR unchanged.
+        let value = self.bd.ins().fabs(fpr_b);
+        let value = self.bd.ins().fneg(value);
+        let value = self.copy_ps0_to_ps1(value);
+        self.set(ins.fpr_d(), value);
+
+        if ins.field_rc() {
+            self.update_cr1_float();
+        }
+
+        FLOAT_INFO
+    }
+
     pub fn ps_rsqrte(&mut self, ins: Ins) -> InstructionInfo {
         self.check_floats();
 
@@ -212,6 +232,7 @@ impl BlockBuilder<'_> {
         let b1 = self.bd.ins().scalar_to_vector(ir::types::F64X2, b1);
 
         let value = self.bd.ins().fadd(ac, b1);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);
@@ -237,6 +258,7 @@ impl BlockBuilder<'_> {
         let b1 = self.bd.ins().insertlane(fpr_b, zero, 0);
 
         let value = self.bd.ins().fadd(ca, b1);
+        let value = self.round_to_single(value);
         self.set(ins.fpr_d(), value);
 
         self.update_fprf_cmpz(value);

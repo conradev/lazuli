@@ -193,6 +193,9 @@ fn ipl_transfer(sys: &mut System) {
 
     let regions = sys.mem.regions();
     regions.ram[ram_base..][..length].copy_from_slice(&regions.ipl[ipl_base..][..length]);
+    sys.cpu
+        .reservation
+        .invalidate_range(Address(ram_base as u32), length);
 }
 
 fn update_sram_checksum(sys: &mut System) {
@@ -232,6 +235,9 @@ fn sram_transfer_read(sys: &mut System) {
 
     sys.mem.ram_mut()[ram_base..][..length]
         .copy_from_slice(&sys.external.sram[sram_base..][..length]);
+    sys.cpu
+        .reservation
+        .invalidate_range(Address(ram_base as u32), length);
 }
 
 fn sram_transfer_write(sys: &mut System, current: u8) {
@@ -284,6 +290,9 @@ fn uart_transfer_read(sys: &mut System) {
     );
 
     sys.mem.ram_mut()[ram_base..][..length].fill(0);
+    sys.cpu
+        .reservation
+        .invalidate_range(Address(ram_base as u32), length);
 }
 
 fn ipl_rtc_sram_transfer(sys: &mut System) {

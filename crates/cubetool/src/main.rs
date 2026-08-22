@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use disks::binrw::BinWrite;
 use disks::binrw::io::BufReader;
-use disks::{dol, iso};
+use disks::{cso, dol, iso};
 use eyre_pretty::{Context, ContextCompat, Result, bail, eyre};
 
 #[derive(Debug, Subcommand)]
@@ -79,6 +79,21 @@ fn extract_bootfile(input: PathBuf, output: PathBuf) -> Result<()> {
 
     let mut output = BufWriter::new(std::fs::File::create(&output).context("opening output file")?);
     let dol = iso.bootfile()?;
+    dol.write(&mut output)?;
+
+    Ok(())
+}
+
+fn extract_cso_bootfile(input: PathBuf, output: PathBuf) -> Result<()> {
+    let input = std::fs::File::open(&input).context("opening input file")?;
+    let cso = cso::Cso::new(BufReader::new(input)).context("opening CISO")?;
+    let mut cso = cso::CsoReader::new(cso);
+
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).context("creating output directory")?;
+    }
+    let mut output = BufWriter::new(std::fs::File::create(&output).context("opening output file")?);
+    let dol = cso.bootfile().context("reading boot DOL from CISO")?;
     dol.write(&mut output)?;
 
     Ok(())
@@ -167,6 +182,7 @@ fn main() -> Result<()> {
 
             match (extension, &*target) {
                 ("iso", "bootfile") => extract_bootfile(input, output),
+                ("ciso" | "cso", "bootfile") => extract_cso_bootfile(input, output),
                 ("iso", _) => extract_iso_file(input, output, target),
                 _ => bail!("unsupported extension/target combination"),
             }

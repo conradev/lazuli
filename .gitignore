@@ -3,3 +3,9 @@
 profile.json.gz
 log.log
 *.wav
+*.ciso
+*.iso
+*.cso
+/[Rr][Oo][Mm]/
+/web/dist
+/.wrangler/

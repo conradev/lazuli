@@ -1,0 +1,17 @@
+[package]
+name = "clifwasm"
+description = "Cranelift IR backend targeting WebAssembly"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[lints]
+workspace = true
+
+[dependencies]
+cranelift-codegen = { version = "0.130", default-features = false, features = ["std"] }
+wasm-encoder.workspace = true
+
+[dev-dependencies]
+cranelift-frontend = { version = "0.130", default-features = false, features = ["std"] }
+wasmparser.workspace = true

@@ -1,0 +1,154 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0c0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/app.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <title>Gekko</title>
+  <style>
+    :root { color-scheme: dark; font: 15px/1.4 system-ui, sans-serif; background: #0b0c0f; }
+    * { box-sizing: border-box; }
+    body { min-width: 20rem; min-height: 100vh; margin: 0; background: #0b0c0f; color: #f1f3f5; }
+    iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; background: #0b0c0f; }
+    #status {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      display: grid;
+      place-content: center;
+      gap: 0.75rem;
+      padding: 2rem;
+      text-align: center;
+      background: #0b0c0f;
+    }
+    #status[hidden] { display: none; }
+    #detail { max-width: 32rem; color: #aeb4bf; }
+    a { color: #c9d9ff; }
+  </style>
+</head>
+<body>
+  <main id="status" aria-live="polite">
+    <strong>Gekko</strong>
+    <span id="detail">Checking for the latest release…</span>
+    <span><a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a> · <a href="/source/" target="_blank" rel="license noopener">Legal</a></span>
+  </main>
+  <iframe id="app" title="Gekko" hidden></iframe>
+  <noscript>JavaScript is required. <a href="/source/">Source and legal notices</a></noscript>
+  <script type="module">
+    // Keep this bootstrap self-contained: an incumbent schema-1 worker can
+    // cache the new shell before the schema-2 worker finishes installing.
+    const EXPECTED_RELEASE_SCHEMA = 2;
+    const status = document.querySelector("#status");
+    const detail = document.querySelector("#detail");
+    const app = document.querySelector("#app");
+
+    function requireCompatibleRelease(release) {
+      if (release?.schema !== EXPECTED_RELEASE_SCHEMA) {
+        throw new Error(
+          `release schema ${release?.schema ?? "unknown"} cannot provide mandatory WebGPU`,
+        );
+      }
+      return release;
+    }
+
+    async function waitForCompatibleController() {
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        if (navigator.serviceWorker.controller !== null) {
+          try {
+            const response = await fetch("/.gekko/worker-status", { cache: "no-store" });
+            const worker = response.ok ? await response.json() : null;
+            if (worker?.releaseSchema === EXPECTED_RELEASE_SCHEMA) {
+              return navigator.serviceWorker.controller;
+            }
+          } catch {}
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      throw new Error("mandatory WebGPU service worker did not take control");
+    }
+
+    async function registerWorker() {
+      if (!("serviceWorker" in navigator)) return null;
+      const registration = await navigator.serviceWorker.register("/sw.js", {
+        scope: "/",
+        type: "module",
+        updateViaCache: "none",
+      });
+      await registration.update().catch(() => {});
+      await navigator.serviceWorker.ready;
+      return waitForCompatibleController();
+    }
+
+    async function fetchLatestRelease() {
+      const response = await fetch("/release.json", { cache: "no-store" });
+      if (!response.ok) throw new Error(`release check failed: HTTP ${response.status}`);
+      const release = requireCompatibleRelease(await response.json());
+      return { release, offline: response.headers.has("X-Gekko-Offline") };
+    }
+
+    async function stageLatestRelease(release) {
+      const response = await fetch("/.gekko/stage-release", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(release),
+      });
+      const result = await response.json();
+      if (!result.release) throw new Error(result.error ?? "release staging failed");
+      result.release = requireCompatibleRelease(result.release);
+      return result;
+    }
+
+    function selectStagedRelease(latest, staged) {
+      if (latest.offline !== true && staged.ok !== true) {
+        throw new Error(
+          `latest release could not be activated: ${staged.error ?? "staging failed"}`,
+        );
+      }
+      return {
+        release: staged.release,
+        saved: latest.offline === true,
+      };
+    }
+
+    function hasExactRootLocation(value) {
+      return value.pathname === "/" && value.search === "" && value.hash === "";
+    }
+
+    async function launch() {
+      const worker = await registerWorker();
+      if (worker === null) throw new Error("this browser does not support offline applications");
+      const latest = await fetchLatestRelease();
+      detail.textContent = latest.offline ? "Opening the saved release…" : "Preparing the latest release…";
+      const staged = await stageLatestRelease(latest.release);
+      const selected = selectStagedRelease(latest, staged);
+      const release = selected.release;
+      const saved = selected.saved;
+
+      const url = new URL(release.frontend.url, location.href);
+      url.search = "";
+      url.hash = "";
+      app.addEventListener("load", () => {
+        status.hidden = true;
+        app.hidden = false;
+      }, { once: true });
+      if (saved) detail.textContent = "Using the last saved release.";
+      app.src = url.href;
+    }
+
+    if (!hasExactRootLocation(location)) {
+      location.replace(new URL("/", location.origin).href);
+    } else {
+      launch().catch(error => {
+        detail.textContent = `Unable to open Gekko: ${error.message}`;
+      });
+    }
+  </script>
+</body>
+</html>

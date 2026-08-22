@@ -4,17 +4,17 @@ expression: clir
 ---
 function u0:0(i64, i64, i64) tail {
     ss0 = explicit_slot 8, align = 8
-    gv0 = symbol userextname22
-    gv1 = symbol userextname23
-    gv2 = symbol userextname24
-    gv3 = symbol userextname25
-    gv4 = symbol userextname26
-    gv5 = symbol userextname27
-    gv6 = symbol userextname28
-    gv7 = symbol userextname29
-    gv8 = symbol userextname30
-    gv9 = symbol userextname31
-    gv10 = symbol userextname32
+    gv0 = symbol userextname28
+    gv1 = symbol userextname29
+    gv2 = symbol userextname30
+    gv3 = symbol userextname31
+    gv4 = symbol userextname32
+    gv5 = symbol userextname33
+    gv6 = symbol userextname34
+    gv7 = symbol userextname35
+    gv8 = symbol userextname36
+    gv9 = symbol userextname37
+    gv10 = symbol userextname38
     sig0 = (i64, i64, i64) tail
     sig1 = (i64, i64, i64, i32) -> i64 system_v
     sig2 = (i64, i32, i64) -> i8 system_v
@@ -52,6 +52,12 @@ function u0:0(i64, i64, i64) tail {
     fn19 = u0:20 sig13
     fn20 = u0:21 sig13
     fn21 = u0:22 sig13
+    fn22 = u0:23 sig13
+    fn23 = u0:24 sig13
+    fn24 = u0:25 sig12
+    fn25 = u0:26 sig13
+    fn26 = u0:27 sig4
+    fn27 = u0:28 sig8
 
                                 block0(v0: i64, v1: i64, v2: i64):
 @0000                               v3 = load.i32 notrap aligned v1+680

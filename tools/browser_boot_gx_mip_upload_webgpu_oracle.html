@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli GX mip upload WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli GX mip upload WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildGxMipUploadOraclePacket,
+      gxMipUploadOracle,
+    } from "./browser_boot_gx_mip_upload_oracle.mjs";
+
+    function resourceMetrics(diagnostics) {
+      return {
+        gxFramePacketPayloadBytes:
+          diagnostics.gxFramePacketPayloadBytes,
+        texturePixelBytes: diagnostics.texturePixelBytes,
+        textureUploadBytes: diagnostics.textureUploadBytes,
+        textureWrites: diagnostics.textureWrites,
+      };
+    }
+
+    function subtractMetrics(after, before) {
+      return {
+        gxFramePacketPayloadBytes:
+          after.gxFramePacketPayloadBytes -
+          before.gxFramePacketPayloadBytes,
+        texturePixelBytes:
+          after.texturePixelBytes - before.texturePixelBytes,
+        textureUploadBytes:
+          after.textureUploadBytes - before.textureUploadBytes,
+        textureWrites:
+          after.textureWrites - before.textureWrites,
+      };
+    }
+
+    function exactAcknowledgement(keys, expected) {
+      return (
+        keys.length === expected.resourceIdentities &&
+        keys[0] === gxMipUploadOracle.key
+      );
+    }
+
+    function exactUploadMetrics(actual, expected) {
+      return (
+        actual.gxFramePacketPayloadBytes ===
+          expected.packetPayloadBytes &&
+        actual.texturePixelBytes === expected.packetPayloadBytes &&
+        actual.textureUploadBytes === expected.textureUploadBytes &&
+        actual.textureWrites === expected.textureWrites
+      );
+    }
+
+    function traceCanvasContextRequests(canvas) {
+      const requests = [];
+      const original = canvas.getContext;
+      canvas.getContext = function getContext(type, ...options) {
+        requests.push(String(type));
+        return Reflect.apply(original, this, [type, ...options]);
+      };
+      return Object.freeze({
+        requests,
+        restore() {
+          delete canvas.getContext;
+        },
+      });
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const contextTrace = traceCanvasContextRequests(canvas);
+      let renderer;
+      try {
+        renderer = await WebGpuRenderer.create(canvas);
+      } finally {
+        contextTrace.restore();
+      }
+      renderer.reset_diagnostics();
+      try {
+        const beforeFirst = resourceMetrics(renderer.diagnostics());
+        const firstAcknowledgedKeys = Array.from(
+          renderer.submit_gx_frame(
+            buildGxMipUploadOraclePacket({
+              generation: 1,
+              resident: false,
+            }),
+          ),
+        );
+        await renderer.drain();
+        renderer.check_health();
+        const afterFirst = resourceMetrics(renderer.diagnostics());
+        const firstMetricDelta = subtractMetrics(
+          afterFirst,
+          beforeFirst,
+        );
+        const firstAcknowledgementExact =
+          exactAcknowledgement(
+            firstAcknowledgedKeys,
+            gxMipUploadOracle.expectedFirstUpload,
+          );
+        const firstMetricsExact = exactUploadMetrics(
+          firstMetricDelta,
+          gxMipUploadOracle.expectedFirstUpload,
+        );
+
+        const beforeResident = resourceMetrics(
+          renderer.diagnostics(),
+        );
+        const residentAcknowledgedKeys = Array.from(
+          renderer.submit_gx_frame(
+            buildGxMipUploadOraclePacket({
+              generation: 2,
+              resident: true,
+            }),
+          ),
+        );
+        await renderer.drain();
+        renderer.check_health();
+        const afterResident = resourceMetrics(
+          renderer.diagnostics(),
+        );
+        const residentMetricDelta = subtractMetrics(
+          afterResident,
+          beforeResident,
+        );
+        const residentAcknowledgementExact =
+          exactAcknowledgement(
+            residentAcknowledgedKeys,
+            gxMipUploadOracle.expectedResidentUpload,
+          );
+        const residentMetricsExact = exactUploadMetrics(
+          residentMetricDelta,
+          gxMipUploadOracle.expectedResidentUpload,
+        );
+
+        const unexpectedCanvasContexts =
+          contextTrace.requests.filter(type => type !== "webgpu");
+        const backendDiagnostics = {
+          renderer: "WebGpuRenderer",
+          navigatorGpuAvailable:
+            typeof navigator.gpu?.requestAdapter === "function",
+          canvasContextRequests: [...contextTrace.requests],
+          unexpectedCanvasContexts,
+          strictWebGpuOnly:
+            contextTrace.requests.length > 0 &&
+            unexpectedCanvasContexts.length === 0 &&
+            contextTrace.requests.every(type => type === "webgpu"),
+        };
+        const diagnostics = renderer.diagnostics();
+        const synchronizationExact =
+          diagnostics.drainCalls === 2 &&
+          diagnostics.checkHealthCalls === 2;
+        const identity = {
+          key: gxMipUploadOracle.key,
+          width: gxMipUploadOracle.width,
+          height: gxMipUploadOracle.height,
+          mipLevelCount: gxMipUploadOracle.mipLevelCount,
+        };
+        const result = {
+          pass:
+            backendDiagnostics.navigatorGpuAvailable &&
+            backendDiagnostics.strictWebGpuOnly &&
+            firstAcknowledgementExact &&
+            firstMetricsExact &&
+            residentAcknowledgementExact &&
+            residentMetricsExact &&
+            synchronizationExact,
+          identity,
+          first: {
+            acknowledgedKeys: firstAcknowledgedKeys,
+            acknowledgementExact: firstAcknowledgementExact,
+            expectedMetrics:
+              gxMipUploadOracle.expectedFirstUpload,
+            metricDelta: firstMetricDelta,
+            metricsExact: firstMetricsExact,
+          },
+          resident: {
+            acknowledgedKeys: residentAcknowledgedKeys,
+            acknowledgementExact: residentAcknowledgementExact,
+            expectedMetrics:
+              gxMipUploadOracle.expectedResidentUpload,
+            metricDelta: residentMetricDelta,
+            metricsExact: residentMetricsExact,
+          },
+          backendDiagnostics,
+          synchronizationExact,
+          diagnostics,
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliGxMipUploadOraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>

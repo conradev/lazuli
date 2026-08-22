@@ -1,6 +1,7 @@
 use bitos::BitUtils;
-use cranelift::codegen::ir;
-use cranelift::prelude::{InstBuilder, IntCC};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::condcodes::IntCC;
 use gekko::InsExt;
 use gekko::disasm::Ins;
 

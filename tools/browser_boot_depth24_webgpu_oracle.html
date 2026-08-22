@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli canonical GX depth WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli canonical GX depth WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildDepth24OraclePacket,
+      depth24OracleCases,
+      depth24OracleXfb,
+      uniformDepth24OracleRgba,
+    } from "./browser_boot_depth24_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length &&
+        actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      renderer.reset_diagnostics();
+      const runs = [];
+      const referenceBytes = new Map();
+      try {
+        for (let runIndex = 0; runIndex < RUN_COUNT; runIndex += 1) {
+          const cases = [];
+          for (
+            let caseIndex = 0;
+            caseIndex < depth24OracleCases.length;
+            caseIndex += 1
+          ) {
+            const entry = depth24OracleCases[caseIndex];
+            const generation =
+              runIndex * depth24OracleCases.length + caseIndex + 1;
+            renderer.reset();
+            renderer.submit_gx_frame(
+              buildDepth24OraclePacket(entry.draws, generation),
+            );
+            const presentation = renderer.present_xfb(
+              depth24OracleXfb.destination,
+              generation,
+              0,
+              "progressive",
+              "top",
+              generation,
+              depth24OracleXfb.width,
+              depth24OracleXfb.height,
+              depth24OracleXfb.stride,
+              depth24OracleXfb.height,
+              1,
+              false,
+            );
+            await renderer.drain();
+            const readback = await renderer.read_presented_xfb_rgba();
+            const actualRgba = Array.from(readback.rgba);
+            const expectedRgba = uniformDepth24OracleRgba(entry.expected);
+            const prior = referenceBytes.get(entry.name);
+            const byteExact = bytesEqual(actualRgba, expectedRgba);
+            const deterministic =
+              prior === undefined || bytesEqual(actualRgba, prior);
+            if (prior === undefined) {
+              referenceBytes.set(entry.name, actualRgba);
+            }
+            renderer.check_health();
+            cases.push({
+              name: entry.name,
+              expectedPixel: entry.expected,
+              expectedRgba,
+              actualRgba,
+              byteExact,
+              deterministic,
+              pass: byteExact && deterministic,
+              width: readback.width,
+              height: readback.height,
+              presentation,
+            });
+          }
+          runs.push({
+            index: runIndex + 1,
+            pass: cases.every(entry => entry.pass),
+            cases,
+          });
+        }
+        renderer.check_health();
+        const result = {
+          pass: runs.every(entry => entry.pass),
+          runCount: RUN_COUNT,
+          deterministic: runs
+            .flatMap(entry => entry.cases)
+            .every(entry => entry.deterministic),
+          runs,
+          diagnostics: renderer.diagnostics(),
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliDepth24OraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>

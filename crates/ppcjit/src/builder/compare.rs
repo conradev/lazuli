@@ -1,5 +1,6 @@
-use cranelift::codegen::ir;
-use cranelift::prelude::{FloatCC, InstBuilder, IntCC};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use gekko::disasm::Ins;
 use gekko::{InsExt, SPR};
 

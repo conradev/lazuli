@@ -115,7 +115,7 @@ block4:
   orr w1, w1, w2, LSL 12
   orr w0, w0, w1
   str w0, [x3, #652]
-  load_ext_name_far x1, User(userextname23)+0
+  load_ext_name_far x1, User(userextname29)+0
   movz x2, #0
   movz w3, #4
   movk w3, w3, #8, LSL #16
@@ -135,7 +135,7 @@ block1:
   load_ext_name_far x2, User(userextname0)+0
   mov x0, x28
   blr x2
-  load_ext_name_far x1, User(userextname22)+0
+  load_ext_name_far x1, User(userextname28)+0
   movz x2, #0
   movz w3, #1
   movk w3, w3, #2, LSL #16

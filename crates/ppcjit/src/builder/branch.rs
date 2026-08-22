@@ -1,7 +1,7 @@
 use bitos::bitos;
 use bitos::integer::u5;
-use cranelift::codegen::ir;
-use cranelift::prelude::InstBuilder;
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
 use gekko::disasm::Ins;
 use gekko::{Reg, SPR};
 
@@ -160,8 +160,7 @@ impl BlockBuilder<'_> {
         self.branch(meta, target);
 
         self.flush();
-        let exit_reason = self.branch_exit_reason(meta, current_pc);
-        self.exit(exit_reason);
+        self.branch_exit_with(meta, current_pc, CONDITIONAL_BRANCH_INFO);
 
         // => continue (do not take branch)
         self.switch_to_bb(continue_block);

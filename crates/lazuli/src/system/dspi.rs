@@ -230,6 +230,9 @@ pub fn aram_dma(sys: &mut System) {
 
             sys.mem.ram_mut()[ram_base as usize..][..effective_length]
                 .copy_from_slice(&sys.dsp.aram[aram_base..][..effective_length]);
+            sys.cpu
+                .reservation
+                .invalidate_range(Address(ram_base), effective_length);
         }
     }
 

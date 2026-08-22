@@ -1,10 +1,10 @@
 use bitos::BitUtils;
-use cranelift::codegen::ir;
-use cranelift::prelude::InstBuilder;
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
 use gekko::disasm::Ins;
 use gekko::{InsExt, Reg, SPR};
 
-use super::BlockBuilder;
+use super::{BlockBuilder, MEMFLAGS};
 use crate::builder::{Action, InstructionInfo};
 
 const SPR_INFO: InstructionInfo = InstructionInfo {
@@ -17,6 +17,12 @@ const MSR_INFO: InstructionInfo = InstructionInfo {
     cycles: 1,
     auto_pc: true,
     action: Action::Continue,
+};
+
+const ADDRESS_SPACE_BARRIER_INFO: InstructionInfo = InstructionInfo {
+    cycles: 1,
+    auto_pc: true,
+    action: Action::Exit,
 };
 
 const CR_INFO: InstructionInfo = InstructionInfo {
@@ -50,6 +56,21 @@ const INV_ICACHE_INFO: InstructionInfo = InstructionInfo {
 };
 
 const SYNC_ICACHE_INFO: InstructionInfo = InstructionInfo {
+    cycles: 2,
+    auto_pc: true,
+    action: Action::Exit,
+};
+
+const TLB_INVALIDATE_INFO: InstructionInfo = InstructionInfo {
+    cycles: 3,
+    auto_pc: true,
+    action: Action::Exit,
+};
+
+// The MPC750 marks tlbsync finished at dispatch and assigns it no execution-unit latency. Keep
+// Lazuli's existing no-op-class estimate while still ending the translated region at the exact
+// architectural synchronization point.
+const TLB_SYNC_INFO: InstructionInfo = InstructionInfo {
     cycles: 2,
     auto_pc: true,
     action: Action::Exit,
@@ -92,8 +113,19 @@ impl BlockBuilder<'_> {
             SPR::TBL | SPR::TBU => self.call_generic_hook(self.hooks.tb_changed),
             SPR::DMAL | SPR::DMAU => self.call_generic_hook(self.hooks.dcache_dma),
             SPR::WPAR => tracing::warn!("write to WPAR"),
-            spr if spr.is_data_bat() => self.dbat_changed = true,
-            spr if spr.is_instr_bat() => self.ibat_changed = true,
+            SPR::SDR1 => {
+                self.flush();
+                self.call_generic_hook(self.hooks.sdr1_changed);
+                return ADDRESS_SPACE_BARRIER_INFO;
+            }
+            spr if spr.is_data_bat() => {
+                self.call_generic_hook(self.hooks.dbat_changed);
+                return ADDRESS_SPACE_BARRIER_INFO;
+            }
+            spr if spr.is_instr_bat() => {
+                self.call_generic_hook(self.hooks.ibat_changed);
+                return ADDRESS_SPACE_BARRIER_INFO;
+            }
             _ => (),
         }
 
@@ -105,12 +137,55 @@ impl BlockBuilder<'_> {
         let sr = Reg::SR[ins.field_sr() as usize];
         self.set(sr, value);
 
-        SR_INFO
+        self.flush();
+        self.call_generic_hook(self.hooks.sr_changed);
+
+        InstructionInfo {
+            action: Action::Exit,
+            ..SR_INFO
+        }
     }
 
     pub fn mfsr(&mut self, ins: Ins) -> InstructionInfo {
         let sr = Reg::SR[ins.field_sr() as usize];
         let value = self.get(sr);
+        self.set(ins.gpr_d(), value);
+
+        SR_INFO
+    }
+
+    fn indexed_sr_address(&mut self, ins: Ins) -> ir::Value {
+        let address = self.get(ins.gpr_b());
+        let index = self.bd.ins().ushr_imm(address, 28);
+        let byte_offset = self.bd.ins().ishl_imm(index, 2);
+        let byte_offset = if self.consts.ptr_type == ir::types::I32 {
+            byte_offset
+        } else {
+            self.bd.ins().uextend(self.consts.ptr_type, byte_offset)
+        };
+        let sr_base = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.regs_ptr, Reg::SR[0].offset() as i64);
+        self.bd.ins().iadd(sr_base, byte_offset)
+    }
+
+    pub fn mtsrin(&mut self, ins: Ins) -> InstructionInfo {
+        let value = self.get(ins.gpr_s());
+        let sr_address = self.indexed_sr_address(ins);
+        self.bd.ins().store(MEMFLAGS, value, sr_address, 0);
+
+        self.call_generic_hook(self.hooks.sr_changed);
+
+        InstructionInfo {
+            action: Action::Exit,
+            ..SR_INFO
+        }
+    }
+
+    pub fn mfsrin(&mut self, ins: Ins) -> InstructionInfo {
+        let sr_address = self.indexed_sr_address(ins);
+        let value = self.bd.ins().load(ir::types::I32, MEMFLAGS, sr_address, 0);
         self.set(ins.gpr_d(), value);
 
         SR_INFO
@@ -131,7 +206,7 @@ impl BlockBuilder<'_> {
 
         self.call_generic_hook(self.hooks.msr_changed);
 
-        MSR_INFO
+        ADDRESS_SPACE_BARRIER_INFO
     }
 
     pub fn mfcr(&mut self, ins: Ins) -> InstructionInfo {
@@ -344,6 +419,36 @@ impl BlockBuilder<'_> {
         CR_INFO
     }
 
+    pub fn mcrfs(&mut self, ins: Ins) -> InstructionInfo {
+        const FPSCR_EXCEPTION_MASK: u32 = 0x9ff8_0700;
+
+        let src_field = 7 - ins.field_crfs();
+        let dst_field = 7 - ins.field_crfd();
+        let src_shift = 4 * src_field;
+        let dst_shift = 4 * dst_field;
+
+        // CR receives the field as it existed before mcrfs clears the exception bits it read.
+        let fpscr = self.get(Reg::FPSCR);
+        let src = self.bd.ins().ushr_imm(fpscr, i64::from(src_shift));
+        let src = self.bd.ins().band_imm(src, 0b1111);
+
+        let cr = self.get(Reg::CR);
+        let new = self.bd.ins().ishl_imm(src, i64::from(dst_shift));
+        let dst_mask = self.ir_value(0b1111u32 << dst_shift);
+        let value = self.bd.ins().bitselect(dst_mask, new, cr);
+        self.set(Reg::CR, value);
+
+        // Only sticky exception bits (and FX) in the selected FPSCR field are cleared. FEX and
+        // VX are derived summaries, while control and result bits in the same field are retained.
+        let field_mask = 0b1111u32 << src_shift;
+        let clear_mask = field_mask & FPSCR_EXCEPTION_MASK;
+        let value = self.bd.ins().band_imm(fpscr, i64::from(!clear_mask));
+        self.set(Reg::FPSCR, value);
+        self.update_fpscr();
+
+        CR_INFO
+    }
+
     pub fn mcrx(&mut self, ins: Ins) -> InstructionInfo {
         let dst_field = 7 - ins.field_crfd();
 
@@ -425,6 +530,7 @@ impl BlockBuilder<'_> {
         };
 
         self.flush();
+        self.publish_hook_cycle_offset();
         self.bd
             .ins()
             .call(self.hooks.inv_icache, &[self.consts.ctx_ptr, addr]);
@@ -434,10 +540,33 @@ impl BlockBuilder<'_> {
 
     pub fn isync(&mut self, _: Ins) -> InstructionInfo {
         self.flush();
+        self.publish_hook_cycle_offset();
         self.bd
             .ins()
             .call(self.hooks.clear_icache, &[self.consts.ctx_ptr]);
 
         SYNC_ICACHE_INFO
+    }
+
+    pub fn tlbie(&mut self, ins: Ins) -> InstructionInfo {
+        let address = self.get(ins.gpr_b());
+
+        self.flush();
+        self.publish_hook_cycle_offset();
+        self.bd
+            .ins()
+            .call(self.hooks.tlbie, &[self.consts.ctx_ptr, address]);
+
+        TLB_INVALIDATE_INFO
+    }
+
+    pub fn tlbsync(&mut self, _: Ins) -> InstructionInfo {
+        self.flush();
+        self.publish_hook_cycle_offset();
+        self.bd
+            .ins()
+            .call(self.hooks.tlbsync, &[self.consts.ctx_ptr]);
+
+        TLB_SYNC_INFO
     }
 }

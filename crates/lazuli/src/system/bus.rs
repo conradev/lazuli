@@ -7,7 +7,7 @@ use gekko::Address;
 use zerocopy::IntoBytes;
 
 use crate::Primitive;
-use crate::system::mem::{IPL_LEN, L2C_LEN, RAM_LEN};
+use crate::system::mem::{IPL_LEN, L2C_LEN, L2C_START, RAM_LEN};
 use crate::system::{System, ai, di, dspi, exi, gx, pi, si, vi};
 
 #[rustfmt::skip]
@@ -15,6 +15,49 @@ pub use mmio::Mmio;
 
 fn range_overlap(a: Range<usize>, b: Range<usize>) -> bool {
     (a.start < b.end) && (b.start < a.end)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataReservationFault {
+    Translation,
+    Protection,
+    Backing,
+}
+
+impl DataReservationFault {
+    pub const fn dsisr(self, write: bool) -> u32 {
+        let store = if write { 0x0200_0000 } else { 0 };
+        store
+            | match self {
+                Self::Translation => 0x4000_0000,
+                Self::Protection => 0x0800_0000,
+                Self::Backing => 0,
+            }
+    }
+}
+
+enum DataReservationBacking {
+    Ram(usize),
+    LockedCache(usize),
+}
+
+fn data_reservation_backing(address: Address) -> Option<DataReservationBacking> {
+    const WORD_SIZE: usize = size_of::<i32>();
+
+    let physical = address.value();
+    let ram_offset = physical as usize;
+    if ram_offset
+        .checked_add(WORD_SIZE)
+        .is_some_and(|end| end <= RAM_LEN)
+    {
+        return Some(DataReservationBacking::Ram(ram_offset));
+    }
+
+    let cache_offset = physical.checked_sub(L2C_START)? as usize;
+    cache_offset
+        .checked_add(WORD_SIZE)
+        .is_some_and(|end| end <= L2C_LEN)
+        .then_some(DataReservationBacking::LockedCache(cache_offset))
 }
 
 /// Allows the usage of const values in patterns. It's a neat trick!
@@ -44,6 +87,66 @@ macro_rules! map {
 // called from within the JIT.
 
 impl System {
+    /// Resolves an architected load/store-reservation access through the currently active DBATs.
+    ///
+    /// Hashed page translation is intentionally not modeled by the native runtime yet, so a DBAT
+    /// miss while data translation is enabled is reported as a translation fault.
+    pub fn translate_data_reservation_addr(
+        &self,
+        addr: Address,
+        write: bool,
+    ) -> Result<Address, DataReservationFault> {
+        let msr = &self.cpu.supervisor.config.msr;
+        if !msr.data_addr_translation() {
+            return Ok(addr);
+        }
+
+        let user_mode = msr.user_mode();
+        for bat in &self.cpu.supervisor.memory.dbat {
+            let valid = if user_mode {
+                bat.user_mode()
+            } else {
+                bat.supervisor_mode()
+            };
+            if !valid || !bat.contains(addr) {
+                continue;
+            }
+
+            let protection = bat.protection().value();
+            let permitted = if write {
+                protection == 2
+            } else {
+                protection != 0
+            };
+            if !permitted {
+                return Err(DataReservationFault::Protection);
+            }
+            return Ok(bat.translate(addr));
+        }
+
+        Err(DataReservationFault::Translation)
+    }
+
+    /// Reads a reservation word only from architected RAM or locked-cache backing.
+    pub fn read_data_reservation_phys(&self, addr: Address) -> Option<i32> {
+        let bytes = match data_reservation_backing(addr)? {
+            DataReservationBacking::Ram(offset) => &self.mem.ram()[offset..],
+            DataReservationBacking::LockedCache(offset) => &self.mem.l2c()[offset..],
+        };
+        Some(i32::read_be_bytes(bytes))
+    }
+
+    /// Writes a reservation word only to architected RAM or locked-cache backing.
+    pub fn write_data_reservation_phys(&mut self, addr: Address, value: i32) -> bool {
+        let bytes = match data_reservation_backing(addr) {
+            Some(DataReservationBacking::Ram(offset)) => &mut self.mem.ram_mut()[offset..],
+            Some(DataReservationBacking::LockedCache(offset)) => &mut self.mem.l2c_mut()[offset..],
+            None => return false,
+        };
+        value.write_be_bytes(bytes);
+        true
+    }
+
     /// Translates a data logical address into a physical address.
     #[inline(always)]
     pub fn translate_data_addr(&self, addr: Address) -> Option<Address> {
@@ -745,5 +848,130 @@ impl System {
     #[inline(always)]
     pub fn write<P: Primitive>(&mut self, addr: Address, value: P) -> bool {
         self.write_fast(addr, value) || self.write_slow(addr, value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gekko::Bat;
+
+    use super::*;
+    use crate::modules::audio::NopAudioModule;
+    use crate::modules::debug::NopDebugModule;
+    use crate::modules::disk::NopDiskModule;
+    use crate::modules::input::NopInputModule;
+    use crate::modules::render::NopRenderModule;
+    use crate::modules::vertex::NopVertexModule;
+    use crate::system::{Config, Modules};
+
+    fn test_system() -> System {
+        System::new(
+            Modules {
+                audio: Box::new(NopAudioModule),
+                debug: Box::new(NopDebugModule),
+                disk: Box::new(NopDiskModule),
+                input: Box::new(NopInputModule),
+                render: Box::new(NopRenderModule),
+                vertex: Box::new(NopVertexModule),
+            },
+            Config {
+                ipl_lle: false,
+                ipl: None,
+                sideload: None,
+                perform_efb_copies: false,
+                uart_escape: false,
+            },
+        )
+    }
+
+    fn bat(upper: u32, lower: u32) -> Bat {
+        Bat::from_bits(u64::from(upper) << 32 | u64::from(lower))
+    }
+
+    #[test]
+    fn reservation_translation_uses_current_pr_validity_and_bat_protection() {
+        let mut sys = test_system();
+        let effective = Address(0x9000_0020);
+        let physical = Address(0x0000_0020);
+        sys.cpu
+            .supervisor
+            .config
+            .msr
+            .set_data_addr_translation(true);
+        sys.cpu.supervisor.config.msr.set_user_mode(true);
+
+        // User-valid, read-only. A matching protected BAT has precedence over later entries.
+        sys.cpu.supervisor.memory.dbat[0] = bat(0x9000_0001, 0x0000_0001);
+        sys.cpu.supervisor.memory.dbat[1] = bat(0x9000_0001, 0x0000_0002);
+        assert_eq!(
+            sys.translate_data_reservation_addr(effective, false),
+            Ok(physical)
+        );
+        assert_eq!(
+            sys.translate_data_reservation_addr(effective, true),
+            Err(DataReservationFault::Protection)
+        );
+
+        // The same BAT is invalid when PR selects supervisor validity.
+        sys.cpu.supervisor.config.msr.set_user_mode(false);
+        assert_eq!(
+            sys.translate_data_reservation_addr(effective, false),
+            Err(DataReservationFault::Translation)
+        );
+
+        // A supervisor-valid PP=2 mapping permits both read and write.
+        sys.cpu.supervisor.memory.dbat[0] = bat(0x9000_0002, 0x0000_0002);
+        assert_eq!(
+            sys.translate_data_reservation_addr(effective, false),
+            Ok(physical)
+        );
+        assert_eq!(
+            sys.translate_data_reservation_addr(effective, true),
+            Ok(physical)
+        );
+
+        sys.cpu.supervisor.memory.dbat[0] = bat(0x9000_0002, 0x0000_0000);
+        assert_eq!(
+            sys.translate_data_reservation_addr(effective, false),
+            Err(DataReservationFault::Protection)
+        );
+    }
+
+    #[test]
+    fn reservation_faults_encode_precise_data_storage_causes() {
+        assert_eq!(DataReservationFault::Translation.dsisr(false), 0x4000_0000);
+        assert_eq!(DataReservationFault::Translation.dsisr(true), 0x4200_0000);
+        assert_eq!(DataReservationFault::Protection.dsisr(false), 0x0800_0000);
+        assert_eq!(DataReservationFault::Protection.dsisr(true), 0x0a00_0000);
+        assert_eq!(DataReservationFault::Backing.dsisr(false), 0);
+        assert_eq!(DataReservationFault::Backing.dsisr(true), 0x0200_0000);
+    }
+
+    #[test]
+    fn reservation_backing_accepts_only_complete_ram_and_locked_cache_words() {
+        let mut sys = test_system();
+
+        assert!(sys.write_data_reservation_phys(Address(0x20), 0x1122_3344));
+        assert_eq!(
+            sys.read_data_reservation_phys(Address(0x20)),
+            Some(0x1122_3344)
+        );
+
+        let locked_cache = Address(L2C_START + 0x20);
+        assert!(sys.write_data_reservation_phys(locked_cache, 0x5566_7788));
+        assert_eq!(
+            sys.read_data_reservation_phys(locked_cache),
+            Some(0x5566_7788)
+        );
+
+        for unbacked in [
+            Address(RAM_LEN as u32 - 2),
+            Address(0x0c00_0100),
+            Address(0x1000_0000),
+            Address(0xfff0_0100),
+        ] {
+            assert_eq!(sys.read_data_reservation_phys(unbacked), None);
+            assert!(!sys.write_data_reservation_phys(unbacked, 0x7f00_00ff));
+        }
     }
 }

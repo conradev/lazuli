@@ -477,6 +477,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-renderer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "js-sys",
+ "naga",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -691,6 +704,16 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "clifwasm"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "wasm-encoder",
+ "wasmparser",
+]
 
 [[package]]
 name = "clipboard-win"
@@ -2230,6 +2253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "foldhash 0.1.5",
+ "serde",
 ]
 
 [[package]]
@@ -3973,8 +3997,10 @@ name = "ppcjit"
 version = "0.1.0"
 dependencies = [
  "bitos",
- "cranelift",
+ "clifwasm",
  "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-native",
  "easyerr",
  "fjall",
  "gekko",
@@ -3991,6 +4017,19 @@ dependencies = [
  "twox-hash",
  "zerocopy",
  "zstd",
+]
+
+[[package]]
+name = "ppcwasmjit"
+version = "0.1.0"
+dependencies = [
+ "clifwasm",
+ "cranelift-codegen",
+ "disks",
+ "gekko",
+ "ppcjit",
+ "wasm-encoder",
+ "wasmparser",
 ]
 
 [[package]]
@@ -5459,6 +5498,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+ "serde",
 ]
 
 [[package]]

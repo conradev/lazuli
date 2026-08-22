@@ -1,0 +1,1737 @@
+{
+  "schema": "lazuli-browser-boot-checkpoint-v3",
+  "algorithm": "sha256",
+  "fields": [
+    "/status",
+    "/stage",
+    "/title",
+    "/disc/identifier",
+    "/disc/revision",
+    "/gameplayTranscript",
+    "/rendering/backend",
+    "/rendering/temporalSelectedXfb"
+  ],
+  "id": "smb-usa/smb-ready-play/render-every-1/temporal-xfb-8",
+  "game": {
+    "title": "Super Monkey Ball (GMBE8P Rev.00)",
+    "identifier": "GMBE8P",
+    "revision": 0,
+    "image": {
+      "algorithm": "sha256",
+      "format": "ciso",
+      "sha256": "441a0eadc85afb501e2a3db5af2ee81d4783b96a58f6a2df2605f5c33dcb6202"
+    }
+  },
+  "checkpoint": {
+    "status": "paused",
+    "stage": "scenario-complete"
+  },
+  "run": {
+    "cleanRunsRequired": 3,
+    "renderEvery": 1,
+    "renderer": "wgpu-webgpu",
+    "scenario": "smb-ready-play",
+    "temporalXfbCapacity": 8
+  },
+  "sha256": "cfed69a03d57a9cdbbe04446d88c911a0b35ad1296bb90651c6554d1dc8a8aed",
+  "state": {
+    "status": "paused",
+    "stage": "scenario-complete",
+    "title": "Super Monkey Ball (GMBE8P Rev.00)",
+    "disc": {
+      "identifier": "GMBE8P",
+      "revision": 0
+    },
+    "gameplayTranscript": {
+      "controller": {
+        "appliedSequence": 18,
+        "lastPolledButtons": 0,
+        "lastPolledSequence": 18,
+        "pendingButtons": 0,
+        "pollIndex": 2093,
+        "queueOverflows": 0,
+        "queuedStates": 0
+      },
+      "game": {
+        "identifier": "GMBE8P",
+        "revision": 0
+      },
+      "scenario": {
+        "completedCycle": 17263782944,
+        "hardCycleLimit": 30000000000,
+        "id": "smb-ready-play",
+        "startCycle": 0,
+        "status": "complete"
+      },
+      "schema": "lazuli-browser-gameplay-transcript-v1",
+      "steps": [
+        {
+          "button": 512,
+          "completed": {
+            "cycle": 925079753,
+            "pollIndex": 91
+          },
+          "guest": {
+            "neutralCycle": 925079753,
+            "pressedCycle": 892647353,
+            "releasedCycle": 916972112
+          },
+          "id": "memory-card-back",
+          "press": {
+            "publications": [
+              {
+                "buttons": 512,
+                "observedCycle": 884772296,
+                "pollIndex": 86,
+                "scheduledCycle": 884772286,
+                "sequence": 1,
+                "source": "periodic"
+              },
+              {
+                "buttons": 512,
+                "observedCycle": 892880419,
+                "pollIndex": 87,
+                "scheduledCycle": 892880386,
+                "sequence": 1,
+                "source": "periodic"
+              },
+              {
+                "buttons": 512,
+                "observedCycle": 900988495,
+                "pollIndex": 88,
+                "scheduledCycle": 900988486,
+                "sequence": 1,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 1
+          },
+          "ready": {
+            "cycle": 884545618,
+            "pollIndex": 85,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 0,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 0,
+              "floor": 0,
+              "gameMode": 0,
+              "gameModeRequest": -1,
+              "gameSubmode": 6,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 0,
+              "selectorChoice": 0,
+              "selectorCurrent": 0,
+              "selectorRequest": 0,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 8800,
+              "warningDialogPhase": 255,
+              "warningState": 2
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 909096634,
+                "pollIndex": 89,
+                "scheduledCycle": 909096586,
+                "sequence": 2,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 917204693,
+                "pollIndex": 90,
+                "scheduledCycle": 917204686,
+                "sequence": 2,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 924834022,
+                "pollIndex": 91,
+                "scheduledCycle": 924834022,
+                "sequence": 2,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 2
+          },
+          "type": "input"
+        },
+        {
+          "button": 4096,
+          "completed": {
+            "cycle": 7890170687,
+            "pollIndex": 948
+          },
+          "guest": {
+            "neutralCycle": 7889937676,
+            "pressedCycle": 7857505276,
+            "releasedCycle": 7881829575
+          },
+          "id": "skip-opening-demo",
+          "press": {
+            "publications": [
+              {
+                "buttons": 4096,
+                "observedCycle": 7849630187,
+                "pollIndex": 943,
+                "scheduledCycle": 7849630186,
+                "sequence": 3,
+                "source": "periodic"
+              },
+              {
+                "buttons": 4096,
+                "observedCycle": 7857738288,
+                "pollIndex": 944,
+                "scheduledCycle": 7857738286,
+                "sequence": 3,
+                "source": "periodic"
+              },
+              {
+                "buttons": 4096,
+                "observedCycle": 7865846428,
+                "pollIndex": 945,
+                "scheduledCycle": 7865846386,
+                "sequence": 3,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 3
+          },
+          "ready": {
+            "cycle": 7842170753,
+            "pollIndex": 942,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 0,
+              "floor": 0,
+              "gameMode": 0,
+              "gameModeRequest": -1,
+              "gameSubmode": 2,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 0,
+              "selectorRequest": 0,
+              "submodeTimer": 2899,
+              "textBoxState": 1,
+              "textBoxTimer": 8,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 7873954496,
+                "pollIndex": 946,
+                "scheduledCycle": 7873954486,
+                "sequence": 4,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 7882062619,
+                "pollIndex": 947,
+                "scheduledCycle": 7882062586,
+                "sequence": 4,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 7890170687,
+                "pollIndex": 948,
+                "scheduledCycle": 7890170686,
+                "sequence": 4,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 4
+          },
+          "type": "input"
+        },
+        {
+          "id": "opening-demo-skipped",
+          "observed": {
+            "cycle": 7890170687,
+            "pollIndex": 948,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 26,
+              "difficulty": 0,
+              "flags": 8192,
+              "floor": 0,
+              "gameMode": 0,
+              "gameModeRequest": -1,
+              "gameSubmode": 2,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 0,
+              "selectorRequest": 0,
+              "submodeTimer": 2893,
+              "textBoxState": 20,
+              "textBoxTimer": 5,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "type": "observe"
+        },
+        {
+          "button": 4096,
+          "completed": {
+            "cycle": 8928007536,
+            "pollIndex": 1072
+          },
+          "guest": {
+            "neutralCycle": 8927774476,
+            "pressedCycle": 8895342076,
+            "releasedCycle": 8919666375
+          },
+          "id": "title-start",
+          "press": {
+            "publications": [
+              {
+                "buttons": 4096,
+                "observedCycle": 8887467011,
+                "pollIndex": 1067,
+                "scheduledCycle": 8887466986,
+                "sequence": 5,
+                "source": "periodic"
+              },
+              {
+                "buttons": 4096,
+                "observedCycle": 8895575137,
+                "pollIndex": 1068,
+                "scheduledCycle": 8895575086,
+                "sequence": 5,
+                "source": "periodic"
+              },
+              {
+                "buttons": 4096,
+                "observedCycle": 8903683229,
+                "pollIndex": 1069,
+                "scheduledCycle": 8903683186,
+                "sequence": 5,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 5
+          },
+          "ready": {
+            "cycle": 8880007534,
+            "pollIndex": 1066,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 8192,
+              "floor": 0,
+              "gameMode": 0,
+              "gameModeRequest": -1,
+              "gameSubmode": 20,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 0,
+              "selectorRequest": 0,
+              "submodeTimer": 1109,
+              "textBoxState": 10,
+              "textBoxTimer": 61,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 8911791330,
+                "pollIndex": 1070,
+                "scheduledCycle": 8911791286,
+                "sequence": 6,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 8919899417,
+                "pollIndex": 1071,
+                "scheduledCycle": 8919899386,
+                "sequence": 6,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 8928007536,
+                "pollIndex": 1072,
+                "scheduledCycle": 8928007486,
+                "sequence": 6,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 6
+          },
+          "type": "input"
+        },
+        {
+          "button": 256,
+          "completed": {
+            "cycle": 9673952696,
+            "pollIndex": 1164
+          },
+          "guest": {
+            "neutralCycle": 9673719676,
+            "pressedCycle": 9641287276,
+            "releasedCycle": 9665611575
+          },
+          "id": "title-game-start",
+          "press": {
+            "publications": [
+              {
+                "buttons": 256,
+                "observedCycle": 9633412226,
+                "pollIndex": 1159,
+                "scheduledCycle": 9633412186,
+                "sequence": 7,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 9641520313,
+                "pollIndex": 1160,
+                "scheduledCycle": 9641520286,
+                "sequence": 7,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 9649628402,
+                "pollIndex": 1161,
+                "scheduledCycle": 9649628386,
+                "sequence": 7,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 7
+          },
+          "ready": {
+            "cycle": 9625952734,
+            "pollIndex": 1158,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 8196,
+              "floor": 0,
+              "gameMode": 0,
+              "gameModeRequest": -1,
+              "gameSubmode": 20,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 0,
+              "selectorRequest": 0,
+              "submodeTimer": 1017,
+              "textBoxState": 10,
+              "textBoxTimer": 61,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 9657736490,
+                "pollIndex": 1162,
+                "scheduledCycle": 9657736486,
+                "sequence": 8,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 9665844629,
+                "pollIndex": 1163,
+                "scheduledCycle": 9665844586,
+                "sequence": 8,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 9673952696,
+                "pollIndex": 1164,
+                "scheduledCycle": 9673952686,
+                "sequence": 8,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 8
+          },
+          "type": "input"
+        },
+        {
+          "button": 256,
+          "completed": {
+            "cycle": 10233411589,
+            "pollIndex": 1229
+          },
+          "guest": {
+            "neutralCycle": 10233178576,
+            "pressedCycle": 10200746264,
+            "releasedCycle": 10225070475
+          },
+          "id": "select-current-8",
+          "press": {
+            "publications": [
+              {
+                "buttons": 256,
+                "observedCycle": 10192871098,
+                "pollIndex": 1224,
+                "scheduledCycle": 10192871086,
+                "sequence": 9,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 10200979205,
+                "pollIndex": 1225,
+                "scheduledCycle": 10200979186,
+                "sequence": 9,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 10209087296,
+                "pollIndex": 1226,
+                "scheduledCycle": 10209087286,
+                "sequence": 9,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 9
+          },
+          "ready": {
+            "cycle": 10185411637,
+            "pollIndex": 1223,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 0,
+              "floor": 0,
+              "gameMode": 1,
+              "gameModeRequest": -1,
+              "gameSubmode": 32,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 8,
+              "selectorRequest": -1,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 10217195420,
+                "pollIndex": 1227,
+                "scheduledCycle": 10217195386,
+                "sequence": 10,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 10225303505,
+                "pollIndex": 1228,
+                "scheduledCycle": 10225303486,
+                "sequence": 10,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 10233411589,
+                "pollIndex": 1229,
+                "scheduledCycle": 10233411586,
+                "sequence": 10,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 10
+          },
+          "type": "input"
+        },
+        {
+          "button": 256,
+          "completed": {
+            "cycle": 10987464899,
+            "pollIndex": 1322
+          },
+          "guest": {
+            "neutralCycle": 10987231875,
+            "pressedCycle": 10954799475,
+            "releasedCycle": 10979123776
+          },
+          "id": "select-current-10",
+          "press": {
+            "publications": [
+              {
+                "buttons": 256,
+                "observedCycle": 10946924434,
+                "pollIndex": 1317,
+                "scheduledCycle": 10946924386,
+                "sequence": 11,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 10955032499,
+                "pollIndex": 1318,
+                "scheduledCycle": 10955032486,
+                "sequence": 11,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 10963140603,
+                "pollIndex": 1319,
+                "scheduledCycle": 10963140586,
+                "sequence": 11,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 11
+          },
+          "ready": {
+            "cycle": 10939464972,
+            "pollIndex": 1316,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 0,
+              "floor": 0,
+              "gameMode": 1,
+              "gameModeRequest": -1,
+              "gameSubmode": 32,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 10,
+              "selectorRequest": -1,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 10971248695,
+                "pollIndex": 1320,
+                "scheduledCycle": 10971248686,
+                "sequence": 12,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 10979356795,
+                "pollIndex": 1321,
+                "scheduledCycle": 10979356786,
+                "sequence": 12,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 10987464899,
+                "pollIndex": 1322,
+                "scheduledCycle": 10987464886,
+                "sequence": 12,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 12
+          },
+          "type": "input"
+        },
+        {
+          "button": 256,
+          "completed": {
+            "cycle": 11741518234,
+            "pollIndex": 1415
+          },
+          "guest": {
+            "neutralCycle": 11741285176,
+            "pressedCycle": 11708852776,
+            "releasedCycle": 11733177075
+          },
+          "id": "select-current-16",
+          "press": {
+            "publications": [
+              {
+                "buttons": 256,
+                "observedCycle": 11700977699,
+                "pollIndex": 1410,
+                "scheduledCycle": 11700977686,
+                "sequence": 13,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 11709085788,
+                "pollIndex": 1411,
+                "scheduledCycle": 11709085786,
+                "sequence": 13,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 11717193898,
+                "pollIndex": 1412,
+                "scheduledCycle": 11717193886,
+                "sequence": 13,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 13
+          },
+          "ready": {
+            "cycle": 11693518274,
+            "pollIndex": 1409,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 0,
+              "floor": 0,
+              "gameMode": 1,
+              "gameModeRequest": -1,
+              "gameSubmode": 32,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 16,
+              "selectorRequest": -1,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 11725302004,
+                "pollIndex": 1413,
+                "scheduledCycle": 11725301986,
+                "sequence": 14,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 11733410086,
+                "pollIndex": 1414,
+                "scheduledCycle": 11733410086,
+                "sequence": 14,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 11741518234,
+                "pollIndex": 1415,
+                "scheduledCycle": 11741518186,
+                "sequence": 14,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 14
+          },
+          "type": "input"
+        },
+        {
+          "button": 256,
+          "completed": {
+            "cycle": 12495571501,
+            "pollIndex": 1508
+          },
+          "guest": {
+            "neutralCycle": 12495338475,
+            "pressedCycle": 12462906075,
+            "releasedCycle": 12487230376
+          },
+          "id": "select-current-18",
+          "press": {
+            "publications": [
+              {
+                "buttons": 256,
+                "observedCycle": 12455030987,
+                "pollIndex": 1503,
+                "scheduledCycle": 12455030986,
+                "sequence": 15,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 12463139148,
+                "pollIndex": 1504,
+                "scheduledCycle": 12463139086,
+                "sequence": 15,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 12471247189,
+                "pollIndex": 1505,
+                "scheduledCycle": 12471247186,
+                "sequence": 15,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 15
+          },
+          "ready": {
+            "cycle": 12447571571,
+            "pollIndex": 1502,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 0,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 0,
+              "floor": 0,
+              "gameMode": 1,
+              "gameModeRequest": -1,
+              "gameSubmode": 32,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 18,
+              "selectorRequest": -1,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 12479355286,
+                "pollIndex": 1506,
+                "scheduledCycle": 12479355286,
+                "sequence": 16,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 12487463392,
+                "pollIndex": 1507,
+                "scheduledCycle": 12487463386,
+                "sequence": 16,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 12495571501,
+                "pollIndex": 1508,
+                "scheduledCycle": 12495571486,
+                "sequence": 16,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 16
+          },
+          "type": "input"
+        },
+        {
+          "button": 256,
+          "completed": {
+            "cycle": 13249624805,
+            "pollIndex": 1601
+          },
+          "guest": {
+            "neutralCycle": 13249391776,
+            "pressedCycle": 13216959376,
+            "releasedCycle": 13241283675
+          },
+          "id": "select-current-22",
+          "press": {
+            "publications": [
+              {
+                "buttons": 256,
+                "observedCycle": 13209084299,
+                "pollIndex": 1596,
+                "scheduledCycle": 13209084286,
+                "sequence": 17,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 13217192401,
+                "pollIndex": 1597,
+                "scheduledCycle": 13217192386,
+                "sequence": 17,
+                "source": "periodic"
+              },
+              {
+                "buttons": 256,
+                "observedCycle": 13225300492,
+                "pollIndex": 1598,
+                "scheduledCycle": 13225300486,
+                "sequence": 17,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 17
+          },
+          "ready": {
+            "cycle": 13201624855,
+            "pollIndex": 1595,
+            "witness": {
+              "attempts": 0,
+              "characterLocked0": 1,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 0,
+              "floor": 0,
+              "gameMode": 1,
+              "gameModeRequest": -1,
+              "gameSubmode": 32,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 0,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 22,
+              "selectorRequest": -1,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "release": {
+            "publications": [
+              {
+                "buttons": 0,
+                "observedCycle": 13233408587,
+                "pollIndex": 1599,
+                "scheduledCycle": 13233408586,
+                "sequence": 18,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 13241516703,
+                "pollIndex": 1600,
+                "scheduledCycle": 13241516686,
+                "sequence": 18,
+                "source": "periodic"
+              },
+              {
+                "buttons": 0,
+                "observedCycle": 13249624805,
+                "pollIndex": 1601,
+                "scheduledCycle": 13249624786,
+                "sequence": 18,
+                "source": "periodic"
+              }
+            ],
+            "sequence": 18
+          },
+          "type": "input"
+        },
+        {
+          "id": "ready-main",
+          "observed": {
+            "cycle": 14279134319,
+            "pollIndex": 1724,
+            "witness": {
+              "attempts": 1,
+              "characterLocked0": 1,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 257,
+              "floor": 1,
+              "gameMode": 2,
+              "gameModeRequest": -1,
+              "gameSubmode": 49,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 264,
+              "infoTimer": 3600,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 54,
+              "selectorRequest": -1,
+              "submodeTimer": 360,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "type": "observe"
+        },
+        {
+          "id": "play-main",
+          "observed": {
+            "cycle": 17206166800,
+            "pollIndex": 2085,
+            "witness": {
+              "attempts": 1,
+              "characterLocked0": 1,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 257,
+              "floor": 1,
+              "gameMode": 2,
+              "gameModeRequest": -1,
+              "gameSubmode": 51,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 3599,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 54,
+              "selectorRequest": -1,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "type": "observe"
+        },
+        {
+          "id": "post-play-presented",
+          "observed": {
+            "cycle": 17263782944,
+            "pollIndex": 2093,
+            "witness": {
+              "attempts": 1,
+              "characterLocked0": 1,
+              "characterSelection0": 0,
+              "currentPlayer": 0,
+              "demoResourcesReady": 1,
+              "demoSkipTimer": 0,
+              "difficulty": 0,
+              "flags": 257,
+              "floor": 1,
+              "gameMode": 2,
+              "gameModeRequest": -1,
+              "gameSubmode": 51,
+              "gameSubmodeRequest": -1,
+              "gameType": 0,
+              "gameVersion": 0,
+              "infoFlags": 0,
+              "infoTimer": 3591,
+              "inputLockStatus": 0,
+              "menuSelection": 0,
+              "pad": {
+                "held": 0,
+                "pressed": 0,
+                "released": 0
+              },
+              "pauseStatus": 0,
+              "playerCount": 1,
+              "selectorChoice": 0,
+              "selectorCurrent": 54,
+              "selectorRequest": -1,
+              "submodeTimer": 0,
+              "textBoxState": 0,
+              "textBoxTimer": 0,
+              "titleChoice": 0,
+              "warningDialogFlags": 0,
+              "warningDialogPhase": 0,
+              "warningState": 0
+            }
+          },
+          "type": "observe"
+        }
+      ]
+    },
+    "rendering": {
+      "backend": "wgpu-webgpu",
+      "temporalSelectedXfb": {
+        "capacity": 8,
+        "frames": [
+          {
+            "ordinal": 1,
+            "presentation": {
+              "address": "0x00392c80",
+              "copyIndex": 2060,
+              "copyRow": 0,
+              "field": "top",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4184,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00392c80",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2060,
+              "height": 448,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 931,
+                "other": 281931,
+                "unique": 126537,
+                "white": 3858
+              },
+              "rgbSha256": "6677866ac953be31d9031ab79c2e770330e69c1b806a48c7606b12bd1f8c2fa1",
+              "rgbaByteLength": 1146880,
+              "rgbaSha256": "cf665282852be5b4d4deba6b05e62c7501ab0cc50003da9398adce0ceabe25eb",
+              "row": 0,
+              "sourceRow": 0,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          },
+          {
+            "ordinal": 2,
+            "presentation": {
+              "address": "0x00307180",
+              "copyIndex": 2061,
+              "copyRow": 1,
+              "field": "bottom",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4186,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00307180",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2061,
+              "height": 447,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 944,
+                "other": 281878,
+                "unique": 132547,
+                "white": 3258
+              },
+              "rgbSha256": "a4e6d0c57422be4453890054c47c103c24934fb924c2af2a0dea940db7f8faee",
+              "rgbaByteLength": 1144320,
+              "rgbaSha256": "83e67ffd71c3fac29360ae39406279daa528ec26c636902466ab28979c874dfc",
+              "row": 1,
+              "sourceRow": 1,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          },
+          {
+            "ordinal": 3,
+            "presentation": {
+              "address": "0x00392c80",
+              "copyIndex": 2062,
+              "copyRow": 0,
+              "field": "top",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4188,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00392c80",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2062,
+              "height": 448,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 959,
+                "other": 281549,
+                "unique": 137276,
+                "white": 4212
+              },
+              "rgbSha256": "25a8ff014a0a7e69d68cdbd67e5f32b43224481cffe4a331a2477e0f5b38ce1b",
+              "rgbaByteLength": 1146880,
+              "rgbaSha256": "e47c35e291fc4475022cebb1e98a2587763183678e05971d7dfe9950a0a57b61",
+              "row": 0,
+              "sourceRow": 0,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          },
+          {
+            "ordinal": 4,
+            "presentation": {
+              "address": "0x00307180",
+              "copyIndex": 2063,
+              "copyRow": 1,
+              "field": "bottom",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4190,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00307180",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2063,
+              "height": 447,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 841,
+                "other": 281490,
+                "unique": 139934,
+                "white": 3749
+              },
+              "rgbSha256": "e09e134a673ddc2f1f3b7a0653f8918973f18bdd31e0700c1dc31935e235d481",
+              "rgbaByteLength": 1144320,
+              "rgbaSha256": "089029392b823ad8caac99b361a3ee7b07b0bd84145b95ef7b42b7308388db19",
+              "row": 1,
+              "sourceRow": 1,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          },
+          {
+            "ordinal": 5,
+            "presentation": {
+              "address": "0x00392c80",
+              "copyIndex": 2064,
+              "copyRow": 0,
+              "field": "top",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4192,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00392c80",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2064,
+              "height": 448,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 755,
+                "other": 282134,
+                "unique": 124089,
+                "white": 3831
+              },
+              "rgbSha256": "26094dd5afdf280cbd0628cb0b9b8710bfd706e23f144e29893567f4c80d73e3",
+              "rgbaByteLength": 1146880,
+              "rgbaSha256": "343d61a0ca507233a8a08d936001c3ea2d7d8aab3cdc6623f09583126fe27801",
+              "row": 0,
+              "sourceRow": 0,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          },
+          {
+            "ordinal": 6,
+            "presentation": {
+              "address": "0x00307180",
+              "copyIndex": 2065,
+              "copyRow": 1,
+              "field": "bottom",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4194,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00307180",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2065,
+              "height": 447,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 731,
+                "other": 282133,
+                "unique": 125889,
+                "white": 3216
+              },
+              "rgbSha256": "8c3ab11dc7fff3902a26e24f82098fce55fe130b8b93f1963947129fd5e348a0",
+              "rgbaByteLength": 1144320,
+              "rgbaSha256": "ec12f808e57311871fae5e6982aac08631a3b9810e7d223c5c2cc9d515431142",
+              "row": 1,
+              "sourceRow": 1,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          },
+          {
+            "ordinal": 7,
+            "presentation": {
+              "address": "0x00392c80",
+              "copyIndex": 2066,
+              "copyRow": 0,
+              "field": "top",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4196,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00392c80",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2066,
+              "height": 448,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 728,
+                "other": 282133,
+                "unique": 127110,
+                "white": 3859
+              },
+              "rgbSha256": "84baadcea05aa8f264ab6cda79fd138a86bb58b94f9c40faf7436fcf25c5ea67",
+              "rgbaByteLength": 1146880,
+              "rgbaSha256": "ee776fa1198b7be75c866ce07a33caa02457eeab0e1e295185def3802d11f1a5",
+              "row": 0,
+              "sourceRow": 0,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          },
+          {
+            "ordinal": 8,
+            "presentation": {
+              "address": "0x00307180",
+              "copyIndex": 2067,
+              "copyRow": 1,
+              "field": "bottom",
+              "height": 448,
+              "selected": true,
+              "width": 640
+            },
+            "rendererSequence": 4198,
+            "scenario": "smb-ready-play",
+            "selectedXfb": {
+              "address": "0x00307180",
+              "displayHeight": 448,
+              "displayWidth": 640,
+              "format": "rgba8unorm",
+              "generation": 2067,
+              "height": 447,
+              "layout": "top-left-row-major-tight",
+              "logicalHeight": 448,
+              "logicalWidth": 640,
+              "rgb": {
+                "black": 703,
+                "other": 282177,
+                "unique": 128143,
+                "white": 3200
+              },
+              "rgbSha256": "f626d8c2caab304ab9467d5d4664c177e445349e1089a44f70da655243afd2b2",
+              "rgbaByteLength": 1144320,
+              "rgbaSha256": "efbce6c31b4edf0d4379ad4a342742ae7cee0388756a5e56d1dff28e9c0bc8e1",
+              "row": 1,
+              "sourceRow": 1,
+              "textureHeight": 448,
+              "textureWidth": 640,
+              "width": 640
+            },
+            "step": "post-play-presented"
+          }
+        ],
+        "oracle": {
+          "allFramesMonochrome": false,
+          "alternatingMonochromePair": false,
+          "blackOrdinals": [],
+          "blackWhiteAlternating": false,
+          "capacity": 8,
+          "captured": 8,
+          "complete": true,
+          "copyIndexRegressions": [],
+          "distinctCopyIndices": 8,
+          "distinctGenerations": 8,
+          "distinctRgbHashes": 8,
+          "distinctRgbaHashes": 8,
+          "frames": [
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2060,
+              "generation": 2060,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 1,
+              "rendererSequence": 4184,
+              "rgbSha256": "6677866ac953be31d9031ab79c2e770330e69c1b806a48c7606b12bd1f8c2fa1",
+              "rgbaSha256": "cf665282852be5b4d4deba6b05e62c7501ab0cc50003da9398adce0ceabe25eb",
+              "selected": true
+            },
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2061,
+              "generation": 2061,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 2,
+              "rendererSequence": 4186,
+              "rgbSha256": "a4e6d0c57422be4453890054c47c103c24934fb924c2af2a0dea940db7f8faee",
+              "rgbaSha256": "83e67ffd71c3fac29360ae39406279daa528ec26c636902466ab28979c874dfc",
+              "selected": true
+            },
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2062,
+              "generation": 2062,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 3,
+              "rendererSequence": 4188,
+              "rgbSha256": "25a8ff014a0a7e69d68cdbd67e5f32b43224481cffe4a331a2477e0f5b38ce1b",
+              "rgbaSha256": "e47c35e291fc4475022cebb1e98a2587763183678e05971d7dfe9950a0a57b61",
+              "selected": true
+            },
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2063,
+              "generation": 2063,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 4,
+              "rendererSequence": 4190,
+              "rgbSha256": "e09e134a673ddc2f1f3b7a0653f8918973f18bdd31e0700c1dc31935e235d481",
+              "rgbaSha256": "089029392b823ad8caac99b361a3ee7b07b0bd84145b95ef7b42b7308388db19",
+              "selected": true
+            },
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2064,
+              "generation": 2064,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 5,
+              "rendererSequence": 4192,
+              "rgbSha256": "26094dd5afdf280cbd0628cb0b9b8710bfd706e23f144e29893567f4c80d73e3",
+              "rgbaSha256": "343d61a0ca507233a8a08d936001c3ea2d7d8aab3cdc6623f09583126fe27801",
+              "selected": true
+            },
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2065,
+              "generation": 2065,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 6,
+              "rendererSequence": 4194,
+              "rgbSha256": "8c3ab11dc7fff3902a26e24f82098fce55fe130b8b93f1963947129fd5e348a0",
+              "rgbaSha256": "ec12f808e57311871fae5e6982aac08631a3b9810e7d223c5c2cc9d515431142",
+              "selected": true
+            },
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2066,
+              "generation": 2066,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 7,
+              "rendererSequence": 4196,
+              "rgbSha256": "84baadcea05aa8f264ab6cda79fd138a86bb58b94f9c40faf7436fcf25c5ea67",
+              "rgbaSha256": "ee776fa1198b7be75c866ce07a33caa02457eeab0e1e295185def3802d11f1a5",
+              "selected": true
+            },
+            {
+              "allBlack": false,
+              "allWhite": false,
+              "copyIndex": 2067,
+              "generation": 2067,
+              "matchesPresentation": true,
+              "monochrome": false,
+              "ordinal": 8,
+              "rendererSequence": 4198,
+              "rgbSha256": "f626d8c2caab304ab9467d5d4664c177e445349e1089a44f70da655243afd2b2",
+              "rgbaSha256": "efbce6c31b4edf0d4379ad4a342742ae7cee0388756a5e56d1dff28e9c0bc8e1",
+              "selected": true
+            }
+          ],
+          "generationRegressions": [],
+          "mismatchedPresentationOrdinals": [],
+          "missingOrUnselectedOrdinals": [],
+          "monochromeOrdinals": [],
+          "whiteOrdinals": []
+        }
+      }
+    }
+  },
+  "consensus": {
+    "cleanRuns": 3
+  }
+}

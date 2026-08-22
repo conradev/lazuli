@@ -9,9 +9,9 @@ mod others;
 mod util;
 
 use bitos::BitUtils;
-use cranelift::codegen::ir;
-use cranelift::frontend;
-use cranelift::prelude::InstBuilder;
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_frontend as frontend;
 use easyerr::Error;
 use gekko::disasm::{Ins, Opcode};
 use gekko::{Reg, SPR};
@@ -19,10 +19,10 @@ use rustc_hash::FxHashMap;
 
 use crate::block::{BranchMeta, ExitReason};
 use crate::builder::util::IntoIrValue;
-use crate::hooks::{HookKind, Hooks};
+use crate::hooks::{HookKind, HookSignatures};
 use crate::{
-    Codegen, INTERNAL_RAISE_EXCEPTION, NAMESPACE_EXIT_DATA, NAMESPACE_INTERNALS,
-    NAMESPACE_USER_HOOKS, Sequence,
+    ExitMode, INTERNAL_RAISE_EXCEPTION, NAMESPACE_EXIT_DATA, NAMESPACE_INTERNALS,
+    NAMESPACE_USER_HOOKS, Sequence, TranslationConfig, TranslationExit,
 };
 
 const MEMFLAGS: ir::MemFlags = ir::MemFlags::trusted();
@@ -47,13 +47,31 @@ fn is_cacheable(reg: Reg) -> bool {
             | SPR::WPAR
             | SPR::DMAL
             | SPR::DMAU
+            | SPR::SDR1
             | SPR::SRR0
             | SPR::SRR1
+            | SPR::DSISR
             | SPR::DAR => false,
             spr if spr.is_bat() => false,
             spr if spr.is_gqr() => false,
             _ => true,
         },
+        Reg::SR0
+        | Reg::SR1
+        | Reg::SR2
+        | Reg::SR3
+        | Reg::SR4
+        | Reg::SR5
+        | Reg::SR6
+        | Reg::SR7
+        | Reg::SR8
+        | Reg::SR9
+        | Reg::SR10
+        | Reg::SR11
+        | Reg::SR12
+        | Reg::SR13
+        | Reg::SR14
+        | Reg::SR15 => false,
         _ => true,
     }
 }
@@ -64,6 +82,8 @@ pub enum BuilderError {
     Illegal(Ins),
     #[error("unimplemented instruction {f0:?}")]
     Unimplemented(Ins),
+    #[error("hook cycle publication requires a portable exit mode")]
+    HookCycleOffsetRequiresPortableExit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,9 +111,9 @@ pub(crate) struct InstructionInfo {
 }
 
 struct Signatures {
-    block: ir::SigRef,
+    block: Option<ir::SigRef>,
 
-    exit: ir::SigRef,
+    exit: Option<ir::SigRef>,
     read_i8_hook: ir::SigRef,
     read_i16_hook: ir::SigRef,
     read_i32_hook: ir::SigRef,
@@ -111,7 +131,7 @@ struct Signatures {
 }
 
 struct HookFuncs {
-    exit: ir::FuncRef,
+    exit: Option<ir::FuncRef>,
 
     read_i8: ir::FuncRef,
     read_i16: ir::FuncRef,
@@ -121,6 +141,8 @@ struct HookFuncs {
     write_i16: ir::FuncRef,
     write_i32: ir::FuncRef,
     write_i64: ir::FuncRef,
+    load_reserve: ir::FuncRef,
+    store_conditional: ir::FuncRef,
     read_quant: ir::FuncRef,
     write_quant: ir::FuncRef,
     inv_icache: ir::FuncRef,
@@ -129,6 +151,8 @@ struct HookFuncs {
     clear_icache: ir::FuncRef,
     dcache_dma: ir::FuncRef,
     msr_changed: ir::FuncRef,
+    sr_changed: ir::FuncRef,
+    sdr1_changed: ir::FuncRef,
     ibat_changed: ir::FuncRef,
     dbat_changed: ir::FuncRef,
     tb_read: ir::FuncRef,
@@ -137,6 +161,8 @@ struct HookFuncs {
     dec_changed: ir::FuncRef,
 
     // special
+    tlbie: ir::FuncRef,
+    tlbsync: ir::FuncRef,
     raise_exception: ir::FuncRef,
 }
 
@@ -160,7 +186,7 @@ struct CachedValue {
 
 /// Structure to build JIT blocks.
 pub struct BlockBuilder<'ctx> {
-    codegen: &'ctx mut Codegen,
+    frontend: &'ctx TranslationConfig,
     bd: frontend::FunctionBuilder<'ctx>,
     cache: FxHashMap<Reg, CachedValue>,
     consts: Consts,
@@ -171,13 +197,14 @@ pub struct BlockBuilder<'ctx> {
     executed_cycles: u16,
     executed_instructions: u16,
 
-    ibat_changed: bool,
-    dbat_changed: bool,
     floats_checked: bool,
 }
 
 impl<'ctx> BlockBuilder<'ctx> {
-    pub fn new(codegen: &'ctx mut Codegen, mut builder: frontend::FunctionBuilder<'ctx>) -> Self {
+    pub fn new(
+        frontend: &'ctx TranslationConfig,
+        mut builder: frontend::FunctionBuilder<'ctx>,
+    ) -> Self {
         let entry_bb = builder.create_block();
         builder.append_block_params_for_function_params(entry_bb);
         builder.switch_to_block(entry_bb);
@@ -189,63 +216,66 @@ impl<'ctx> BlockBuilder<'ctx> {
             align_of::<u64>().ilog2() as u8,
         ));
 
-        let ptr_type = codegen.isa.pointer_type();
-        let default = codegen.isa.default_call_conv();
+        let ptr_type = frontend.pointer_type;
+        let default = frontend.call_conv;
         let params = builder.block_params(entry_bb);
         let ctx_ptr = params[0];
         let regs_ptr = params[1];
         let fmem_ptr = params[2];
 
         let sigs = Signatures {
-            block: builder.import_signature(builder.func.signature.clone()),
+            block: (frontend.exit_mode == ExitMode::Native)
+                .then(|| builder.import_signature(builder.func.signature.clone())),
 
-            exit: builder.import_signature(Hooks::exit_sig(ptr_type, default)),
-            read_i8_hook: builder.import_signature(Hooks::read_sig(
+            exit: (frontend.exit_mode == ExitMode::Native)
+                .then(|| builder.import_signature(HookSignatures::exit(ptr_type, default))),
+            read_i8_hook: builder.import_signature(HookSignatures::read(
                 ptr_type,
                 ir::types::I8,
                 default,
             )),
-            read_i16_hook: builder.import_signature(Hooks::read_sig(
+            read_i16_hook: builder.import_signature(HookSignatures::read(
                 ptr_type,
                 ir::types::I16,
                 default,
             )),
-            read_i32_hook: builder.import_signature(Hooks::read_sig(
+            read_i32_hook: builder.import_signature(HookSignatures::read(
                 ptr_type,
                 ir::types::I32,
                 default,
             )),
-            read_i64_hook: builder.import_signature(Hooks::read_sig(
+            read_i64_hook: builder.import_signature(HookSignatures::read(
                 ptr_type,
                 ir::types::I64,
                 default,
             )),
-            write_i8_hook: builder.import_signature(Hooks::write_sig(
+            write_i8_hook: builder.import_signature(HookSignatures::write(
                 ptr_type,
                 ir::types::I8,
                 default,
             )),
-            write_i16_hook: builder.import_signature(Hooks::write_sig(
+            write_i16_hook: builder.import_signature(HookSignatures::write(
                 ptr_type,
                 ir::types::I16,
                 default,
             )),
-            write_i32_hook: builder.import_signature(Hooks::write_sig(
+            write_i32_hook: builder.import_signature(HookSignatures::write(
                 ptr_type,
                 ir::types::I32,
                 default,
             )),
-            write_i64_hook: builder.import_signature(Hooks::write_sig(
+            write_i64_hook: builder.import_signature(HookSignatures::write(
                 ptr_type,
                 ir::types::I64,
                 default,
             )),
-            read_quant_hook: builder.import_signature(Hooks::read_quantized_sig(ptr_type, default)),
+            read_quant_hook: builder
+                .import_signature(HookSignatures::read_quantized(ptr_type, default)),
             write_quant_hook: builder
-                .import_signature(Hooks::write_quantized_sig(ptr_type, default)),
+                .import_signature(HookSignatures::write_quantized(ptr_type, default)),
             invalidate_icache_hook: builder
-                .import_signature(Hooks::invalidate_icache_sig(ptr_type, default)),
-            generic_hook: builder.import_signature(Hooks::generic_hook_sig(ptr_type, default)),
+                .import_signature(HookSignatures::invalidate_icache(ptr_type, default)),
+            generic_hook: builder.import_signature(HookSignatures::generic(ptr_type, default)),
 
             raise_exception: builder
                 .import_signature(exception::raise_exception_sig(ptr_type, default)),
@@ -284,7 +314,7 @@ impl<'ctx> BlockBuilder<'ctx> {
         };
 
         let hooks = HookFuncs {
-            exit: hook(sigs.exit, HookKind::Exit),
+            exit: sigs.exit.map(|sig| hook(sig, HookKind::Exit)),
             read_i8: hook(sigs.read_i8_hook, HookKind::ReadI8),
             read_i16: hook(sigs.read_i16_hook, HookKind::ReadI16),
             read_i32: hook(sigs.read_i32_hook, HookKind::ReadI32),
@@ -305,6 +335,12 @@ impl<'ctx> BlockBuilder<'ctx> {
             tb_changed: hook(sigs.generic_hook, HookKind::TbChanged),
             dec_read: hook(sigs.generic_hook, HookKind::DecRead),
             dec_changed: hook(sigs.generic_hook, HookKind::DecChanged),
+            sr_changed: hook(sigs.generic_hook, HookKind::SrChanged),
+            sdr1_changed: hook(sigs.generic_hook, HookKind::Sdr1Changed),
+            tlbie: hook(sigs.invalidate_icache_hook, HookKind::Tlbie),
+            tlbsync: hook(sigs.generic_hook, HookKind::Tlbsync),
+            load_reserve: hook(sigs.read_i32_hook, HookKind::LoadReserve),
+            store_conditional: hook(sigs.write_i32_hook, HookKind::StoreConditional),
             raise_exception,
         };
 
@@ -321,7 +357,7 @@ impl<'ctx> BlockBuilder<'ctx> {
         };
 
         Self {
-            codegen,
+            frontend,
             bd: builder,
             cache: FxHashMap::default(),
             consts,
@@ -332,8 +368,6 @@ impl<'ctx> BlockBuilder<'ctx> {
             executed_cycles: 0,
             executed_instructions: 0,
 
-            ibat_changed: false,
-            dbat_changed: false,
             floats_checked: false,
         }
     }
@@ -429,7 +463,33 @@ impl<'ctx> BlockBuilder<'ctx> {
 
     /// Calls a generic context hook.
     fn call_generic_hook(&mut self, hook: ir::FuncRef) {
+        self.call_generic_hook_at(hook, self.executed_cycles);
+    }
+
+    /// Calls a generic context hook on behalf of an instruction that started at `cycles`.
+    fn call_generic_hook_at(&mut self, hook: ir::FuncRef, cycles: u16) {
+        self.publish_hook_cycle_offset_at(cycles);
         self.bd.ins().call(hook, &[self.consts.ctx_ptr]);
+    }
+
+    /// Publishes the current instruction's start-cycle offset for portable semantic hooks.
+    fn publish_hook_cycle_offset(&mut self) {
+        self.publish_hook_cycle_offset_at(self.executed_cycles);
+    }
+
+    /// Publishes a semantic hook's instruction-start cycle offset.
+    fn publish_hook_cycle_offset_at(&mut self, cycles: u16) {
+        let Some(offset) = self.frontend.hook_cycle_offset else {
+            return;
+        };
+
+        let cycles = self.ir_value(cycles as u32);
+        let flags = ir::MemFlags::new()
+            .with_notrap()
+            .with_endianness(ir::Endianness::Little);
+        self.bd
+            .ins()
+            .store(flags, cycles, self.consts.ctx_ptr, offset);
     }
 
     fn create_exit_data(&mut self) -> ir::Value {
@@ -458,14 +518,35 @@ impl<'ctx> BlockBuilder<'ctx> {
         self.bd.ins().bor_imm(address, reason.to_bits() as i64)
     }
 
+    fn branch_exit(&mut self, meta: BranchMeta, address: ir::Value) {
+        if self.frontend.exit_mode == ExitMode::Native {
+            let reason = self.branch_exit_reason(meta, address);
+            self.exit(reason);
+        } else {
+            self.exit(ExitReason::SYNC);
+        }
+    }
+
+    /// Exits a taken conditional branch after accounting for the branch itself.
+    fn branch_exit_with(&mut self, meta: BranchMeta, address: ir::Value, info: InstructionInfo) {
+        self.executed_instructions += 1;
+        self.executed_cycles += info.cycles as u16;
+
+        self.branch_exit(meta, address);
+
+        self.executed_instructions -= 1;
+        self.executed_cycles -= info.cycles as u16;
+    }
+
     /// Exits the block.
     fn exit(&mut self, reason: impl IntoIrValue) {
-        if self.dbat_changed {
-            self.call_generic_hook(self.hooks.dbat_changed);
-        }
-
-        if self.ibat_changed {
-            self.call_generic_hook(self.hooks.ibat_changed);
+        if self.frontend.exit_mode != ExitMode::Native {
+            let executed = 0
+                .with_bits(0, 16, self.executed_instructions as u32)
+                .with_bits(16, 32, self.executed_cycles as u32);
+            let executed = self.ir_value(executed);
+            self.bd.ins().return_(&[executed]);
+            return;
         }
 
         let exit_data_ptr = self.create_exit_data();
@@ -476,7 +557,7 @@ impl<'ctx> BlockBuilder<'ctx> {
         let executed = self.ir_value(executed);
 
         let inst = self.bd.ins().call(
-            self.hooks.exit,
+            self.hooks.exit.unwrap(),
             &[self.consts.ctx_ptr, exit_data_ptr, reason, executed],
         );
 
@@ -500,7 +581,7 @@ impl<'ctx> BlockBuilder<'ctx> {
         // continue
         self.switch_to_bb(continue_block);
         self.bd.ins().return_call_indirect(
-            self.consts.signatures.block,
+            self.consts.signatures.block.unwrap(),
             next,
             &[
                 self.consts.ctx_ptr,
@@ -591,6 +672,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Fmsubs => self.fmsubs(ins),
             Opcode::Fmul => self.fmul(ins),
             Opcode::Fmuls => self.fmuls(ins),
+            Opcode::Fnabs => self.fnabs(ins),
             Opcode::Fneg => self.fneg(ins),
             Opcode::Fnmadd => self.fnmadd(ins),
             Opcode::Fnmadds => self.fnmadds(ins),
@@ -627,19 +709,21 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Lhzx => self.lhzx(ins),
             Opcode::Lmw => self.lmw(ins),
             Opcode::Lswi => self.lswi(ins),
-            Opcode::Lwarx => self.lwzx(ins), // NOTE: same behaviour
+            Opcode::Lwarx => self.lwarx(ins),
             Opcode::Lwbrx => self.lwbrx(ins),
             Opcode::Lwz => self.lwz(ins),
             Opcode::Lwzu => self.lwzu(ins),
             Opcode::Lwzux => self.lwzux(ins),
             Opcode::Lwzx => self.lwzx(ins),
             Opcode::Mcrf => self.mcrf(ins),
+            Opcode::Mcrfs => self.mcrfs(ins),
             Opcode::Mcrxr => self.mcrx(ins),
             Opcode::Mfcr => self.mfcr(ins),
             Opcode::Mffs => self.mffs(ins),
             Opcode::Mfmsr => self.mfmsr(ins),
             Opcode::Mfspr => self.mfspr(ins),
             Opcode::Mfsr => self.mfsr(ins),
+            Opcode::Mfsrin => self.mfsrin(ins),
             Opcode::Mftb => self.mftb(ins),
             Opcode::Mtcrf => self.mtcrf(ins),
             Opcode::Mtfsb0 => self.mtfsb0(ins),
@@ -648,6 +732,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Mtmsr => self.mtmsr(ins),
             Opcode::Mtspr => self.mtspr(ins),
             Opcode::Mtsr => self.mtsr(ins),
+            Opcode::Mtsrin => self.mtsrin(ins),
             Opcode::Mulhw => self.mulhw(ins),
             Opcode::Mulhwu => self.mulhwu(ins),
             Opcode::Mulli => self.mulli(ins),
@@ -688,9 +773,11 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::PsSum1 => self.ps_sum1(ins),
             Opcode::PsqL => self.psq_l(ins),
             Opcode::PsqLu => self.psq_lu(ins),
+            Opcode::PsqLux => self.psq_lux(ins),
             Opcode::PsqLx => self.psq_lx(ins),
             Opcode::PsqSt => self.psq_st(ins),
             Opcode::PsqStu => self.psq_stu(ins),
+            Opcode::PsqStux => self.psq_stux(ins),
             Opcode::PsqStx => self.psq_stx(ins),
             Opcode::Rfi => self.rfi(ins),
             Opcode::Rlwimi => self.rlwimi(ins),
@@ -734,23 +821,23 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Subfme => self.subfme(ins),
             Opcode::Subfze => self.subfze(ins),
             Opcode::Sync => self.nop(Action::Exit),
-            Opcode::Tlbie => self.nop(Action::Continue),
-            Opcode::Tlbsync => self.nop(Action::Continue),
+            Opcode::Tlbie => self.tlbie(ins),
+            Opcode::Tlbsync => self.tlbsync(ins),
             Opcode::Xor => self.xor(ins),
             Opcode::Xori => self.xori(ins),
             Opcode::Xoris => self.xoris(ins),
             Opcode::Illegal => {
-                if self.codegen.settings.ignore_unimplemented {
+                if self.frontend.settings.ignore_unimplemented {
                     self.stub(ins)
                 } else {
                     return Err(BuilderError::Illegal(ins));
                 }
             }
             _ => {
-                if self.codegen.settings.ignore_unimplemented {
+                if self.frontend.settings.ignore_unimplemented {
                     self.stub(ins)
                 } else {
-                    todo!("unimplemented instruction {ins:?}")
+                    return Err(BuilderError::Unimplemented(ins));
                 }
             }
         };
@@ -770,15 +857,15 @@ impl<'ctx> BlockBuilder<'ctx> {
     pub fn build(
         mut self,
         mut instructions: impl Iterator<Item = Ins>,
-    ) -> Result<(Sequence, u16), BuilderError> {
+    ) -> Result<(Sequence, u16, TranslationExit), BuilderError> {
         let mut sequence = Sequence::default();
-        loop {
+        let exit = loop {
             let Some(ins) = instructions.next() else {
                 self.bd.set_srcloc(ir::SourceLoc::new(u32::MAX));
                 self.flush();
                 self.exit(ExitReason::SYNC);
                 self.bd.finalize();
-                break;
+                break TranslationExit::Fallthrough;
             };
 
             sequence.0.push(ins);
@@ -788,27 +875,26 @@ impl<'ctx> BlockBuilder<'ctx> {
                 Action::Branch { meta, address } => {
                     self.bd.set_srcloc(ir::SourceLoc::new(u32::MAX));
                     self.flush();
-                    let reason = self.branch_exit_reason(meta, address);
-                    self.exit(reason);
+                    self.branch_exit(meta, address);
                     self.bd.finalize();
-                    break;
+                    break TranslationExit::Branch(meta);
                 }
                 Action::Exit => {
                     self.bd.set_srcloc(ir::SourceLoc::new(u32::MAX));
                     self.flush();
                     self.exit(ExitReason::SYNC);
                     self.bd.finalize();
-                    break;
+                    break TranslationExit::Synchronous;
                 }
                 Action::ExitNoFlush => {
                     self.bd.set_srcloc(ir::SourceLoc::new(u32::MAX));
                     self.exit(ExitReason::SYNC);
                     self.bd.finalize();
-                    break;
+                    break TranslationExit::Synchronous;
                 }
             }
-        }
+        };
 
-        Ok((sequence, self.executed_cycles))
+        Ok((sequence, self.executed_cycles, exit))
     }
 }
