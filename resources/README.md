@@ -2,8 +2,14 @@
 
 This folder contains resources used by the emulator.
 
-- `dsp_coef.bin` and `dsp_coef.bin`: Copies of Dolphin's
-  [free DSP roms](https://github.com/dolphin-emu/dolphin/tree/master/docs/DSP/free_dsp_rom).
+- `dsp_rom.bin` and `dsp_coef.bin`: Dolphin's free replacement DSP IROM and
+  coefficient ROM images. Their source and contributor history are in
+  Dolphin's
+  [`free_dsp_rom`](https://github.com/dolphin-emu/dolphin/tree/master/docs/DSP/free_dsp_rom)
+  directory. Their SHA-256 digests are
+  `4ea1fea6c649bcf9f627007bc9403d5437896c681d3e089b083263a7646cd3ae`
+  and `d7741279c2e8ec5c5fb318f8fbdd6de6bf583520d288e836a5383233a4238179`,
+  respectively.
 - `ipl/font_japanese.bin`: Dolphin's Apache-2.0 Shift JIS IPL font alternative,
   copied from
   [`Data/Sys/GC/font_japanese.bin`](https://github.com/dolphin-emu/dolphin/blob/707d3c7a732634ad8d522bd27e52b075f54ac4f3/Data/Sys/GC/font_japanese.bin).

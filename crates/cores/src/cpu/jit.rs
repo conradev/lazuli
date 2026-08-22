@@ -334,6 +334,14 @@ const CTX_HOOKS: Hooks = {
         ctx.executed_instructions += block_executed.instructions as u32;
         ctx.sys.scheduler.advance(block_executed.cycles as u64);
 
+        // A yielded slow load preserves its current PC for a later retry. A normal synchronous
+        // exit is linkable, which would otherwise tail-call that same load indefinitely while the
+        // asynchronous producer is still pending.
+        if reason == ExitReason::YIELD {
+            ctx.last_followed_link = None;
+            return None;
+        }
+
         // should we exit?
         let has_pending = ctx.sys.scheduler.has_pending();
         let limits_reached = ctx.executed_cycles >= ctx.target_cycles
@@ -432,14 +440,14 @@ const CTX_HOOKS: Hooks = {
         ctx: &mut Context,
         addr: Address,
         value: &mut P,
-    ) -> bool {
+    ) -> u8 {
         if let Some(read) = ctx.sys.read_slow(addr) {
             *value = read;
-            true
+            READ_COMPLETE
         } else {
             std::hint::cold_path();
             tracing::error!(pc = ?ctx.sys.cpu.pc, "failed to translate address {addr}");
-            false
+            READ_FAULT
         }
     }
 
@@ -453,13 +461,17 @@ const CTX_HOOKS: Hooks = {
         }
     }
 
-    extern "C-unwind" fn load_reserve(ctx: &mut Context, addr: Address, value: &mut i32) -> bool {
+    extern "C-unwind" fn load_reserve(
+        ctx: &mut Context,
+        addr: Address,
+        value: &mut i32,
+    ) -> u8 {
         if load_reserve_system(ctx.sys, addr, value) {
-            true
+            LOAD_RESERVE_LOADED
         } else {
             std::hint::cold_path();
             tracing::error!(pc = ?ctx.sys.cpu.pc, "failed load-reserve access at {addr}");
-            false
+            LOAD_RESERVE_FAULT
         }
     }
 

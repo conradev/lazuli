@@ -204,9 +204,25 @@ test("strict V7 preflight fails closed on unknown sampler and mip states", () =>
   rejected(3 << 5, "reserved-min-filter");
   rejected(7 << 5, "reserved-min-filter");
   rejected((1 << 5) | (1 << 21), "unsupported-lod-bias-clamp");
-  rejected((1 << 5) | (1 << 19), "unsupported-anisotropy");
-  rejected((1 << 5) | (2 << 19), "unsupported-anisotropy");
+  rejected(
+    (1 << 5) | (1 << 19),
+    "unsupported-anisotropy-filter-combination",
+  );
+  rejected(
+    (1 << 5) | (2 << 19),
+    "unsupported-anisotropy-filter-combination",
+  );
   rejected((1 << 5) | (3 << 19), "reserved-anisotropy");
+  assert.deepEqual(
+    plain(context.gxStrictV7TexturePreflight(
+      (1 << 4) | (6 << 5) | (1 << 19),
+      0,
+      6,
+      8,
+      8,
+    )),
+    { accepted: false, reason: "anisotropy-requires-mip-chain" },
+  );
 
   assert.deepEqual(
     plain(context.gxStrictV7TexturePreflight(-1, mode1, 6, 8, 8)),
@@ -228,6 +244,58 @@ test("strict V7 preflight fails closed on unknown sampler and mip states", () =>
       { accepted: false, reason: "invalid-texture-dimensions" },
     );
   }
+});
+
+test("strict V7 preflight certifies F-Zero's native WebGPU anisotropy", () => {
+  const context = pureContext();
+  const fzeroMode0 = 0x0011c0d8;
+  for (const [raw, expected] of [[1, 2], [2, 4]]) {
+    const mode0 = (fzeroMode0 & ~(3 << 19)) | (raw << 19);
+    const preflight = context.gxStrictV7TexturePreflight(
+      mode0,
+      0x5000,
+      6,
+      64,
+      64,
+    );
+    assert.equal(preflight.accepted, true);
+    assert.equal(preflight.classification, "genuine-mip");
+    assert.equal(preflight.mode0, mode0);
+    assert.equal(preflight.levelCount, 6);
+    assert.equal(preflight.magLinear, true);
+    assert.equal(preflight.minFilter, 6);
+    assert.equal(preflight.maxAnisotropy, expected);
+    assert.equal(preflight.diagonalLod, false);
+    assert.equal(preflight.lodBiasRaw, 0xe0);
+    assert.equal(preflight.lodBiasSixteenths, -16);
+    assert.equal(preflight.wrapS, 0);
+    assert.equal(preflight.wrapT, 2);
+  }
+});
+
+test("strict V7 preflight accepts Rogue Leader's inert diagonal anisotropy", () => {
+  const context = pureContext();
+  const mode0 = 0x0011c1d0;
+  const preflight = context.gxStrictV7TexturePreflight(
+    mode0,
+    0x5000,
+    6,
+    64,
+    64,
+  );
+  assert.equal(preflight.accepted, true);
+  assert.equal(preflight.classification, "genuine-mip");
+  assert.equal(preflight.mode0, mode0);
+  assert.equal(preflight.levelCount, 6);
+  assert.equal(preflight.magLinear, true);
+  assert.equal(preflight.minLinear, true);
+  assert.equal(preflight.minFilter, 6);
+  assert.equal(preflight.maxAnisotropy, 4);
+  assert.equal(preflight.diagonalLod, true);
+  assert.equal(preflight.lodBiasRaw, 0xe0);
+  assert.equal(preflight.lodBiasSixteenths, -16);
+  assert.equal(preflight.wrapS, 0);
+  assert.equal(preflight.wrapT, 0);
 });
 
 test("strict V7 preflight normalizes effective LOD state like the renderer", () => {
@@ -392,6 +460,7 @@ test("strict V7 preflight classifies transport-safe SMB-relevant raw state", () 
     levelCount: 11,
     minFilter: 6,
     mipMode: 2,
+    maxAnisotropy: 1,
     magLinear: true,
     minLinear: true,
     diagonalLod: true,

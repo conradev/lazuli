@@ -26,14 +26,23 @@ pub type GetFastmemHook = extern "C-unwind" fn(*mut Context) -> *mut FastmemLut;
 pub type ExitHook =
     extern "C-unwind" fn(*const Context, *mut ExitData, ExitReason, Executed) -> Option<BlockFn>;
 
-pub type ReadHook<T> = extern "C-unwind" fn(*mut Context, Address, *mut T) -> bool;
+/// Hook used for a slow memory read.
+///
+/// The hook returns [`READ_FAULT`], [`READ_COMPLETE`], or [`READ_YIELD`]. The output of a yielded
+/// read is ignored; the generated block exits at the current instruction and retries it when the
+/// caller dispatches that PC again. A hook may yield only when repeating any earlier sub-accesses
+/// from the same guest instruction is safe.
+pub type ReadHook<T> = extern "C-unwind" fn(*mut Context, Address, *mut T) -> u8;
 pub type WriteHook<T> = extern "C-unwind" fn(*mut Context, Address, T) -> bool;
 pub type StoreConditionalHook = extern "C-unwind" fn(*mut Context, Address, i32) -> u8;
 pub type ReadQuantizedHook = extern "C-unwind" fn(*mut Context, Address, QuantReg, *mut f64) -> u8;
 pub type WriteQuantizedHook = extern "C-unwind" fn(*mut Context, Address, QuantReg, f64) -> u8;
 
-pub const LOAD_RESERVE_FAULT: u8 = 0;
-pub const LOAD_RESERVE_LOADED: u8 = 1;
+pub const READ_FAULT: u8 = 0;
+pub const READ_COMPLETE: u8 = 1;
+pub const READ_YIELD: u8 = 2;
+pub const LOAD_RESERVE_FAULT: u8 = READ_FAULT;
+pub const LOAD_RESERVE_LOADED: u8 = READ_COMPLETE;
 pub const STORE_CONDITIONAL_FAULT: u8 = 0;
 pub const STORE_CONDITIONAL_NOT_STORED: u8 = 1;
 pub const STORE_CONDITIONAL_STORED: u8 = 2;

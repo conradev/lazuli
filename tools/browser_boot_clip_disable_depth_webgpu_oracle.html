@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli XF clip-disable depth WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli XF clip-disable depth WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      CLIP_DISABLE_DEPTH_MODES,
+      buildClipDisableDepthOraclePacket,
+      buildClipDisableDepthProbePacket,
+      clipDisableDepthCases,
+      clipDisableDepthExpectation,
+      clipDisableDepthProbeCases,
+      clipDisableDepthProbeExpectation,
+      evaluateClipDisableDepth,
+      evaluateClipDisableDepthProbe,
+    } from "./browser_boot_clip_disable_depth_oracle.mjs";
+    import {
+      varyingRasterOracleXfb,
+    } from "./browser_boot_varying_raster_oracle.mjs";
+
+    const RUN_COUNT = 2;
+
+    async function present(renderer, generation) {
+      const presentation = renderer.present_xfb(
+        varyingRasterOracleXfb.destination,
+        generation,
+        0,
+        "progressive",
+        "top",
+        generation,
+        varyingRasterOracleXfb.width,
+        varyingRasterOracleXfb.height,
+        varyingRasterOracleXfb.stride,
+        varyingRasterOracleXfb.height,
+        1,
+        false,
+        false,
+      );
+      await renderer.drain();
+      const readback = await renderer.read_presented_xfb_rgba();
+      renderer.check_health();
+      return { presentation, readback };
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      renderer.reset_diagnostics();
+      const runs = [];
+      let generation = 0;
+      try {
+        for (let runIndex = 0; runIndex < RUN_COUNT; runIndex += 1) {
+          const cases = [];
+          for (const definition of clipDisableDepthCases) {
+            for (const mode of CLIP_DISABLE_DEPTH_MODES) {
+              generation += 1;
+              renderer.reset();
+              const before = renderer.diagnostics();
+              renderer.submit_gx_frame(
+                buildClipDisableDepthOraclePacket(
+                  definition.id,
+                  mode,
+                  generation,
+                ),
+              );
+              const surface = await present(renderer, generation);
+              const after = renderer.diagnostics();
+              cases.push({
+                ...evaluateClipDisableDepth(
+                  definition.id,
+                  mode,
+                  before,
+                  after,
+                  surface.readback,
+                ),
+                presentation: surface.presentation,
+              });
+            }
+          }
+          const depthProbes = [];
+          for (const definition of clipDisableDepthProbeCases) {
+            generation += 1;
+            renderer.reset();
+            const before = renderer.diagnostics();
+            renderer.submit_gx_frame(
+              buildClipDisableDepthProbePacket(
+                definition.id,
+                generation,
+              ),
+            );
+            const surface = await present(renderer, generation);
+            const after = renderer.diagnostics();
+            depthProbes.push({
+              ...evaluateClipDisableDepthProbe(
+                definition.id,
+                before,
+                after,
+                surface.readback,
+              ),
+              presentation: surface.presentation,
+            });
+          }
+          runs.push({
+            index: runIndex + 1,
+            pass:
+              cases.every((entry) => entry.pass) &&
+              depthProbes.every((entry) => entry.pass),
+            cases,
+            depthProbes,
+          });
+        }
+
+        renderer.check_health();
+        const diagnostics = renderer.diagnostics();
+        const expectations = clipDisableDepthCases.flatMap(
+          (definition) =>
+            CLIP_DISABLE_DEPTH_MODES.map((mode) =>
+              clipDisableDepthExpectation(definition.id, mode)
+            ),
+        );
+        const probeExpectations = clipDisableDepthProbeCases.map(
+          (definition) =>
+            clipDisableDepthProbeExpectation(definition.id),
+        );
+        const allExpectations = [
+          ...expectations,
+          ...probeExpectations,
+        ];
+        const expectedManagedCoverage = RUN_COUNT *
+          allExpectations.reduce(
+            (total, entry) =>
+              total + entry.expectedManagedCoverage.draws,
+            0,
+          );
+        const expectedManagedTriangles = RUN_COUNT *
+          allExpectations.reduce(
+            (total, entry) =>
+              total + entry.expectedManagedCoverage.triangles,
+            0,
+          );
+        const expectedExactRasterEmptyDraws = RUN_COUNT *
+          allExpectations.reduce(
+            (total, entry) =>
+              total + entry.expectedExactRasterEmptyDraws,
+            0,
+          );
+        const expectedPushTevDrawCalls = RUN_COUNT *
+          (
+            expectations.length +
+            probeExpectations.reduce(
+              (total, entry) =>
+                total + entry.expectedPushTevDrawCalls,
+              0,
+            )
+          );
+        const expectedSubmitGxFrameCalls = RUN_COUNT *
+          allExpectations.reduce(
+            (total, entry) =>
+              total + entry.expectedSubmitGxFrameCalls,
+            0,
+          );
+        const aggregateCountersExact =
+          diagnostics.exactRequiredRejectedDraws === 0 &&
+          diagnostics.managedCoverageDraws ===
+            expectedManagedCoverage &&
+          diagnostics.managedCoverageTriangles ===
+            expectedManagedTriangles &&
+          diagnostics.exactRasterEmptyDraws ===
+            expectedExactRasterEmptyDraws &&
+          diagnostics.pushTevDrawCalls ===
+            expectedPushTevDrawCalls &&
+          diagnostics.submitGxFrameCalls ===
+            expectedSubmitGxFrameCalls;
+        const result = {
+          pass:
+            runs.every((entry) => entry.pass) &&
+            aggregateCountersExact,
+          strictWebGpu: true,
+          runCount: RUN_COUNT,
+          modes: CLIP_DISABLE_DEPTH_MODES,
+          caseIds: clipDisableDepthCases.map((entry) => entry.id),
+          depthProbeIds: clipDisableDepthProbeCases.map(
+            (entry) => entry.id,
+          ),
+          expectedManagedCoverage,
+          expectedManagedTriangles,
+          expectedExactRasterEmptyDraws,
+          expectedPushTevDrawCalls,
+          expectedSubmitGxFrameCalls,
+          aggregateCountersExact,
+          runs,
+          diagnostics,
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliClipDisableDepthOraclePromise =
+      run().catch((error) => {
+        const result = {
+          pass: false,
+          error: error instanceof Error ? error.stack : String(error),
+        };
+        document.body.dataset.status = "error";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      });
+  </script>
+</body>
+</html>

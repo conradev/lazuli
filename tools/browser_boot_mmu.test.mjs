@@ -91,6 +91,14 @@ const mmuFunctions = [
   "physicalRamPointer",
   "physicalMmioPointer",
   "dataRamPointer",
+  "guestEffectivePointer",
+  "guestEffectiveU32",
+  "guestEffectiveS32",
+  "guestEffectiveF32",
+  "guestEffectiveU16",
+  "guestEffectiveS16",
+  "guestEffectiveU8",
+  "guestEffectiveS8",
   "dataFastmemPointer",
   "physicalLockedCachePointer",
   "dataRamOrLockedCachePointer",
@@ -429,6 +437,48 @@ test("locked cache is reachable only through a translated physical mapping", () 
     context.dataRamOrLockedCachePointer(0xe0000010, 4, true),
     context.lockedCache + 0x10,
   );
+});
+
+test("effective guest probes read translated RAM and reject unbacked ranges", () => {
+  const context = makeContext();
+  for (const [lowerOffset, upperOffset] of context.dataBatOffsets) {
+    context.view.setUint32(lowerOffset, 0, true);
+    context.view.setUint32(upperOffset, 0, true);
+  }
+  const [lowerOffset, upperOffset] = context.dataBatOffsets[0];
+  context.view.setUint32(upperOffset, 0x90000002, true);
+  context.view.setUint32(lowerOffset, 0x00000002, true);
+
+  const pointer = context.ram + 0x120;
+  context.view.setUint32(pointer, 0x89abcdef, false);
+  context.view.setInt32(pointer + 4, -1234567, false);
+  context.view.setFloat32(pointer + 8, -12.5, false);
+  context.view.setUint16(pointer + 12, 0xbeef, false);
+  context.view.setInt16(pointer + 14, -1234, false);
+  context.view.setUint8(pointer + 16, 0xa5);
+  context.view.setInt8(pointer + 17, -42);
+
+  assert.equal(context.guestEffectivePointer(0x90000120, 18), pointer);
+  assert.equal(context.guestEffectiveU32(0x90000120), 0x89abcdef);
+  assert.equal(context.guestEffectiveS32(0x90000124), -1234567);
+  assert.equal(context.guestEffectiveF32(0x90000128), -12.5);
+  assert.equal(context.guestEffectiveU16(0x9000012c), 0xbeef);
+  assert.equal(context.guestEffectiveS16(0x9000012e), -1234);
+  assert.equal(context.guestEffectiveU8(0x90000130), 0xa5);
+  assert.equal(context.guestEffectiveS8(0x90000131), -42);
+
+  context.view.setUint32(upperOffset, 0, true);
+  assert.equal(context.guestEffectivePointer(0x90000120, 4), null);
+  assert.equal(context.guestEffectiveU32(0x90000120), null);
+  for (const [address, size] of [
+    [-1, 4],
+    [0x1_0000_0000, 4],
+    [0, 0],
+    [0xffff_ffff, 2],
+    [NaN, 4],
+  ]) {
+    assert.equal(context.guestEffectivePointer(address, size), null);
+  }
 });
 
 test("translated ranges require contiguous physical BATs and permissions", () => {

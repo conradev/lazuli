@@ -276,8 +276,8 @@ mod tests {
     use gekko::{Address, CondReg, Cpu, FPR, FloatControlReg, FloatPair, GPR, QuantReg, Reg, SPR};
     use ppcjit::block::{BlockFn, Executed as NativeExecuted, ExitReason as NativeExitReason};
     use ppcjit::hooks::{
-        Context as NativeContext, ExitData, Hooks, STORE_CONDITIONAL_FAULT,
-        STORE_CONDITIONAL_NOT_STORED, STORE_CONDITIONAL_STORED,
+        Context as NativeContext, ExitData, Hooks, LOAD_RESERVE_FAULT, LOAD_RESERVE_LOADED,
+        STORE_CONDITIONAL_FAULT, STORE_CONDITIONAL_NOT_STORED, STORE_CONDITIONAL_STORED,
     };
     use ppcjit::{CodegenSettings, ExitMode, FastmemLut, TranslationConfig, Translator};
     use wasmparser::Validator;
@@ -559,7 +559,7 @@ mod tests {
         _ctx: *mut NativeContext,
         _addr: Address,
         _value: *mut T,
-    ) -> bool {
+    ) -> u8 {
         panic!("unexpected native JIT read hook")
     }
 
@@ -575,17 +575,17 @@ mod tests {
         ctx: *mut NativeContext,
         address: Address,
         value: *mut i32,
-    ) -> bool {
+    ) -> u8 {
         let state = unsafe { &mut *ctx.cast::<NativeState>() };
         let Some(offset) = NativeState::guest_offset(address, size_of::<i32>()) else {
-            return false;
+            return LOAD_RESERVE_FAULT;
         };
         let bytes = state.guest_page[offset..offset + size_of::<i32>()]
             .try_into()
             .unwrap();
         unsafe { value.write(i32::from_be_bytes(bytes)) };
         state.cpu.reservation.reserve(Address(offset as u32));
-        true
+        LOAD_RESERVE_LOADED
     }
 
     extern "C-unwind" fn store_conditional(
@@ -918,6 +918,19 @@ for (const [register, bits0, bits1] of records(expectedRecords)) {
         let block = Jit::new().build([branch(0, false, false)]).unwrap();
 
         assert_eq!(block.metadata().pattern, Pattern::IdleBasic);
+    }
+
+    #[test]
+    fn validates_256_block_linked_region() {
+        let blocks = (0..256)
+            .map(|index| RegionBlock {
+                pc: 0x8000_1000 + index * 4,
+                maximum_cycles: 4,
+            })
+            .collect::<Vec<_>>();
+        let region = link_region(&blocks).unwrap();
+
+        Validator::new().validate_all(&region).unwrap();
     }
 
     #[test]

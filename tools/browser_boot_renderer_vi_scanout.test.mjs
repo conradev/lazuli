@@ -94,6 +94,14 @@ test("only Ready frames acquire the canvas while staged fields preserve complete
     ...method.matchAll(/reject_unavailable_member\(mode, pair_epoch, parity\)/g),
   ];
 
+  assert.match(
+    method,
+    /capture_surface: bool,\s*capture_sustained_surface_history: bool,/,
+  );
+  assert.match(
+    method,
+    /self\.present_host_xfb_frame\(\s*frame,\s*capture_surface,\s*capture_sustained_surface_history,/,
+  );
   assert.ok(rejectZeroEpoch >= 0 && rejectZeroEpoch < parseMode);
   assert.ok(rejectZeroEpoch < parseParity && rejectZeroEpoch < lookupXfb);
   assert.match(
@@ -116,16 +124,31 @@ test("only Ready frames acquire the canvas while staged fields preserve complete
   const helper = source.slice(helperStart, helperEnd);
   assert.notEqual(helperStart, -1);
   assert.notEqual(helperEnd, -1);
+  assert.match(
+    helper,
+    /capture_surface: bool,\s*capture_sustained_surface_history: bool,/,
+  );
+  assert.ok(
+    helper.indexOf(
+      ".capture_requested(capture_sustained_surface_history)",
+    ) < helper.indexOf("self.surface.get_current_texture()"),
+    "history gaps and overflow must fail before acquiring a canvas texture",
+  );
   assert.match(helper, /self\.surface\.get_current_texture\(\)/);
   assert.equal([...helper.matchAll(/begin_render_pass/g)].length, 1);
   assert.ok(
-    helper.indexOf("encoder.copy_texture_to_buffer")
+    helper.indexOf('"browser sustained presented surface readback"')
       < helper.indexOf("self.queue.submit"),
-    "optional COPY_SRC capture must stay in the presentation encoder",
+    "optional sustained capture must be encoded before the presentation submit",
   );
+  assert.doesNotMatch(helper, /BufferMap::new|QueueDrain::new|future_to_promise|\.await/);
 
   const resetStart = source.indexOf("    pub fn reset(&mut self)");
   const resetEnd = source.indexOf("    pub fn reset_diagnostics", resetStart);
   const reset = source.slice(resetStart, resetEnd);
   assert.ok(reset.indexOf("self.vi_field_pairs.reset()") < reset.indexOf("self.ensure_healthy()?"));
+  assert.ok(
+    reset.indexOf("self.sustained_presented_surface_history.reset()")
+      < reset.indexOf("self.ensure_healthy()?"),
+  );
 });

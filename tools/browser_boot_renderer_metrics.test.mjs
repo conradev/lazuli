@@ -18,6 +18,10 @@ const rendererCoreSource = readFileSync(
   new URL("../crates/browser-renderer/src/lib.rs", import.meta.url),
   "utf8",
 );
+const rendererGeometrySource = readFileSync(
+  new URL("../crates/browser-renderer/src/clip/geometry.rs", import.meta.url),
+  "utf8",
+);
 const headlessSource = readFileSync(
   new URL("./browser_boot_headless.mjs", import.meta.url),
   "utf8",
@@ -47,18 +51,24 @@ test("GX frames cross the renderer bridge as one exact packet view", () => {
     Number,
     String,
     Uint8Array,
+    Uint32Array,
     document: { body: { dataset: {} } },
     rendererHostMetrics: {
       workerMessages: { gxFrames: 0, drawCalls: 0, receivedArrayBufferBytes: 0 },
     },
     webGpuRenderer: {
-      submit_gx_frame(packet) {
-        submissions.push(packet);
+      submit_gx_frame(packet, preClearWords) {
+        submissions.push({ packet, preClearWords });
       },
     },
   };
   vm.createContext(context);
-  vm.runInContext(extractFunction("submitGxFrame"), context);
+  vm.runInContext(
+    ["gxValidatePreClearWords", "submitGxFrame"]
+      .map(extractFunction)
+      .join("\n\n"),
+    context,
+  );
 
   const xfbPacket = new ArrayBuffer(1920);
   context.submitGxFrame({
@@ -66,10 +76,11 @@ test("GX frames cross the renderer bridge as one exact packet view", () => {
     diagnostics: { copyKind: 2, index: 0x11223344, drawCalls: 2, vertices: 3 },
   });
   assert.equal(submissions.length, 1);
-  assert.ok(submissions[0] instanceof Uint8Array);
-  assert.strictEqual(submissions[0].buffer, xfbPacket);
-  assert.equal(submissions[0].byteOffset, 0);
-  assert.equal(submissions[0].byteLength, 1920);
+  assert.ok(submissions[0].packet instanceof Uint8Array);
+  assert.strictEqual(submissions[0].packet.buffer, xfbPacket);
+  assert.equal(submissions[0].packet.byteOffset, 0);
+  assert.equal(submissions[0].packet.byteLength, 1920);
+  assert.deepEqual([...submissions[0].preClearWords], []);
   assert.deepEqual(context.rendererHostMetrics.workerMessages, {
     gxFrames: 1,
     drawCalls: 2,
@@ -82,24 +93,29 @@ test("GX frames cross the renderer bridge as one exact packet view", () => {
   });
 
   const texturePacket = new ArrayBuffer(128);
+  const preClearWords = new Uint32Array([
+    7, 9, 11, 13, 0x17, 0x5a9, 3, 4, 5, 6, 0xff, 0x123456,
+  ]);
   context.submitGxFrame({
     packet: texturePacket,
     diagnostics: { copyKind: 1, index: 7, drawCalls: 0, vertices: 0 },
+    preClearWords,
   });
   assert.equal(submissions.length, 2);
-  assert.strictEqual(submissions[1].buffer, texturePacket);
-  assert.equal(submissions[1].byteLength, 128);
+  assert.strictEqual(submissions[1].packet.buffer, texturePacket);
+  assert.equal(submissions[1].packet.byteLength, 128);
+  assert.strictEqual(submissions[1].preClearWords, preClearWords);
   assert.deepEqual(context.rendererHostMetrics.workerMessages, {
     gxFrames: 2,
     drawCalls: 2,
-    receivedArrayBufferBytes: 2048,
+    receivedArrayBufferBytes: 2096,
   });
   assert.equal(context.document.body.dataset.gxTextureCopies, "7");
 
   assert.throws(
     () => context.submitGxFrame({
       packet: new ArrayBuffer(16),
-      diagnostics: { copyKind: 3, index: 0, drawCalls: 0, vertices: 0 },
+      diagnostics: { copyKind: 4, index: 0, drawCalls: 0, vertices: 0 },
     }),
     /diagnostics are invalid/,
   );
@@ -147,6 +163,14 @@ test("renderer performance derives exact bridge and resource totals", async () =
     Promise,
     rendererHostMetrics: {
       operations: { enqueued: 5, pending: 0, highWater: 1 },
+      xfbDrainBatch: {
+        limit: 8,
+        pending: 3,
+        highWater: 8,
+        acknowledgementsWithoutDrain: 19,
+        forcedDrains: 2,
+        mandatoryDrains: 4,
+      },
       wall: {
         workerStartToLastReportMs: 1234.5,
         phases: {
@@ -188,6 +212,14 @@ test("renderer performance derives exact bridge and resource totals", async () =
   assert.equal(performance.scope, "current-worker");
   assert.deepEqual(performance.wasmBridge, { calls: 17, typedArrayBytes: 1920 });
   assert.deepEqual(performance.queue, { drains: 5, submits: 6 });
+  assert.deepEqual(performance.xfbDrainBatch, {
+    limit: 8,
+    pending: 3,
+    highWater: 8,
+    acknowledgementsWithoutDrain: 19,
+    forcedDrains: 2,
+    mandatoryDrains: 4,
+  });
   assert.deepEqual(performance.resources, {
     bindGroups: 8,
     buffers: 9,
@@ -241,9 +273,11 @@ test("renderer performance derives exact bridge and resource totals", async () =
     },
   });
   context.rendererHostMetrics.wall.phases.operationQueueWait.totalMs = 999;
+  context.rendererHostMetrics.xfbDrainBatch.pending = 7;
   webgpuPhases.packetParse.totalMs = 999;
   assert.equal(performance.wall.phases.operationQueueWait.totalMs, 3);
   assert.equal(performance.wall.phases.packetParse.totalMs, 1.5);
+  assert.equal(performance.xfbDrainBatch.pending, 3);
   assert.deepEqual(context.rendererHostMetrics.operations, {
     enqueued: 5,
     pending: 0,
@@ -293,7 +327,7 @@ test("sampled renderer queue and drain phases account exact captured-epoch wall 
     rendererHostMetrics: { operations: {} },
     rendererOperationTail: new Promise(resolve => { release = resolve; }),
     webGpuRenderer: {
-      drain: () => Promise.resolve(),
+      drain: () => Promise.resolve([]),
       check_health: () => { healthChecks += 1; },
     },
   };
@@ -306,6 +340,7 @@ test("sampled renderer queue and drain phases account exact captured-epoch wall 
       "newRendererWallPhases",
       "appendRendererOperation",
       "enqueueRendererOperation",
+      "requireTextureCopyReceiptArray",
       "drainWebGpuRenderer",
     ].map(extractFunction).join("\n\n"),
     context,
@@ -355,7 +390,7 @@ test("sampled renderer queue and drain phases account exact captured-epoch wall 
   assert.deepEqual(clock, []);
 });
 
-test("terminal capture snapshots metrics before its serialized XFB readback", async () => {
+test("terminal capture drains before snapshotting metrics and reading XFB", async () => {
   const calls = [];
   const originalHostMetrics = { id: "original" };
   const replacementHostMetrics = { id: "replacement" };
@@ -371,6 +406,13 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
     Promise,
     rendererOperationTail: new Promise(resolve => { release = resolve; }),
     rendererHostMetrics: originalHostMetrics,
+    drainWebGpuRenderer(_phases, hostMetrics) {
+      calls.push(`drain:${hostMetrics.id}`);
+      return Promise.resolve([]);
+    },
+    requireNoTextureCopyReceipts(receipts) {
+      assert.deepEqual(receipts, []);
+    },
     snapshotRendererPerformance(hostMetrics) {
       calls.push(`metrics:${hostMetrics.id}`);
       return { calls: 17 };
@@ -415,7 +457,13 @@ test("terminal capture snapshots metrics before its serialized XFB readback", as
       surfaceOracle: { captured: 0, capacity: 8 },
     },
   });
-  assert.deepEqual(calls, ["metrics:original", "read", "temporal", "surface"]);
+  assert.deepEqual(calls, [
+    "drain:original",
+    "metrics:original",
+    "read",
+    "temporal",
+    "surface",
+  ]);
 });
 
 test("headless capture consumes page-owned rendering without renderer calls", () => {
@@ -432,6 +480,41 @@ test("WebGPU diagnostic readback is excluded from workload counters", () => {
   assert.notEqual(start, -1);
   assert.notEqual(end, -1);
   assert.doesNotMatch(rendererSource.slice(start, end), /update_renderer_metrics/);
+});
+
+test("native GX anisotropy is explicit in WebGPU sampler diagnostics", () => {
+  for (const [publicField, rustField] of [
+    ["anisotropicSamplersCreated", "anisotropic_samplers_created"],
+    [
+      "maximumRequestedSamplerAnisotropy",
+      "maximum_requested_sampler_anisotropy",
+    ],
+  ]) {
+    assert.match(
+      rendererCoreSource,
+      new RegExp(`pub\\(crate\\) ${rustField}: u64`),
+    );
+    assert.match(
+      rendererSource,
+      new RegExp(`"${publicField}"[\\s\\S]{0,100}metrics\\.${rustField}`),
+    );
+  }
+  const samplerCreation = rendererSource.slice(
+    rendererSource.indexOf("for identity in sampler_identities"),
+    rendererSource.indexOf(
+      "drop(bind_group_timer)",
+      rendererSource.indexOf("for identity in sampler_identities"),
+    ),
+  );
+  assert.match(samplerCreation, /identity\.max_anisotropy > 1/);
+  assert.match(
+    samplerCreation,
+    /anisotropic_samplers_created[\s\S]*saturating_add\(1\)/,
+  );
+  assert.match(
+    samplerCreation,
+    /maximum_requested_sampler_anisotropy[\s\S]*\.max\(u64::from\(identity\.max_anisotropy\)\)/,
+  );
 });
 
 test("exact authoritative no-ops have distinct renderer compatibility counters", () => {
@@ -452,11 +535,15 @@ test("exact authoritative no-ops have distinct renderer compatibility counters",
       rendererSource,
       new RegExp(`"${publicField}"[\\s\\S]{0,80}metrics\\.${rustField}`),
     );
-    assert.match(
-      rendererSource,
-      new RegExp(`${rustField}\\s*=\\s*metrics\\.${rustField}\\.saturating_add\\(1\\)`),
-    );
   }
+  assert.match(
+    rendererSource,
+    /exact_raster_empty_draws\s*=\s*metrics\.exact_raster_empty_draws\.saturating_add\(1\)/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /self\.exact_required_rejected_draws\s*=\s*self\.exact_required_rejected_draws\.saturating_add\(1\)/,
+  );
   const classifierStart = rendererSource.indexOf(
     "fn authoritative_noop(&self) -> Option<ExactAuthoritativeNoop>",
   );
@@ -513,8 +600,169 @@ test("required exact no-ops expose one bounded compatibility-reason map", () => 
     /for reason in ExactRequiredRejectionReason::ALL[\s\S]*"exactRequiredRejectionReasons"/,
   );
   assert.match(
-    rendererSource,
+    rendererCoreSource,
     /fn record_exact_required_rejection[\s\S]*exact_required_rejected_draws[\s\S]*record_exact_required_rejection_reason\(reason\)/,
+  );
+  assert.match(
+    rendererSource,
+    /fn record_exact_required_rejection[\s\S]*current\.record_exact_required_rejection\(\s*reason,\s*Some\(\(&mut current_preparation_counts, preparation_reason\)\),\s*\)[\s\S]*current\.record_exact_required_rejection\(reason, None\)/,
+  );
+});
+
+test("required exact preparation failures expose one bounded subtype map", () => {
+  const reasonCodes = [
+    "invalidVertexLayout",
+    "missingExactClipInput",
+    "positionCountMismatch",
+    "nonFiniteSourceVertex",
+    "cullModeStateMismatch",
+    "unsupportedMultisampling",
+    "unsupportedZFreeze",
+    "nonCanonicalSourceRaster",
+    "unsupportedPostClipW",
+    "unsupportedPostClipPosition",
+    "unsupportedPostClipDepth",
+    "clipInvalidComponentCount",
+    "unsupportedTopology5",
+    "unsupportedTopology6",
+    "unsupportedTopology7",
+    "unsupportedTopologyOther",
+    "clipNoSourceTriangles",
+    "clipInvalidCullMode",
+    "clipInvalidViewportHeight",
+    "clipNonFiniteVertex",
+    "clipArithmeticOverflow",
+    "projectionInvalidComponentCount",
+    "projectionInvalidBpState",
+    "projectionInvalidClipDisable",
+    "unsupportedClipDisable1",
+    "unsupportedClipDisable2",
+    "unsupportedClipDisable3",
+    "unsupportedClipDisable4",
+    "unsupportedClipDisable5",
+    "unsupportedClipDisable6",
+    "unsupportedClipDisable7",
+    "unsupportedClipDisableOther",
+    "projectionInvalidViewport",
+    "projectionInvalidScissor",
+    "projectionNoVisibleScissor",
+    "projectionWrappedScissor",
+    "projectionNonFiniteVertex",
+    "projectionZeroClipW",
+    "projectionArithmeticOverflow",
+    "invalidPreparedScissor",
+    "uncertifiedFaceCull",
+  ];
+  assert.match(
+    rendererCoreSource,
+    /EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT: usize = 41/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /struct ExactRequiredPreparationRejectionCounts[\s\S]{0,160}counts:\s*\[u64; EXACT_REQUIRED_PREPARATION_REJECTION_REASON_COUNT\]/,
+  );
+  assert.doesNotMatch(
+    rendererCoreSource,
+    /exact_required_preparation_rejection_reasons:\s*ExactRequiredPreparationRejectionCounts/,
+  );
+  assert.match(
+    rendererSource,
+    /exact_required_preparation_rejection_counts:\s*Cell<ExactRequiredPreparationRejectionCounts>/,
+  );
+  assert.match(
+    rendererSource,
+    /reset_diagnostics\(&mut self\)[\s\S]{0,240}exact_required_preparation_rejection_counts[\s\S]{0,120}ExactRequiredPreparationRejectionCounts::default\(\)/,
+  );
+  assert.match(
+    rendererSource,
+    /exact_required_preparation_rejection_counts:\s*Cell::new\(\s*ExactRequiredPreparationRejectionCounts::default\(\),\s*\)/,
+  );
+  for (const code of reasonCodes) {
+    assert.match(
+      rendererCoreSource,
+      new RegExp(`=> "${code}"`),
+      `missing stable exact preparation rejection code ${code}`,
+    );
+  }
+  for (const topology of [5, 6, 7]) {
+    assert.match(
+      rendererGeometrySource,
+      new RegExp(
+        `GxClipError::UnsupportedTopology\\(${topology}\\)[\\s\\S]{0,100}`
+          + `Reason::UnsupportedTopology${topology}`,
+      ),
+    );
+  }
+  for (const mode of [1, 2, 3, 4, 5, 6, 7]) {
+    assert.match(
+      rendererGeometrySource,
+      new RegExp(
+        `GxExactProjectionError::UnsupportedClipDisable\\(${mode}\\)`
+          + `[\\s\\S]{0,100}Reason::UnsupportedClipDisable${mode}`,
+      ),
+    );
+  }
+  assert.match(
+    rendererSource,
+    /preparation_failure:\s*Option<GxExactPreparationFailure>/,
+  );
+  assert.match(
+    rendererSource,
+    /Err\(error\)[\s\S]{0,300}preparation_failure:\s*Some\(error\.into\(\)\)/,
+  );
+  assert.match(
+    rendererSource,
+    /preparation_failure:\s*Some\(GxExactPreparationFailure::InvalidPreparedScissor\)/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /debug_assert_eq!\([\s\S]{0,180}reason == ExactRequiredRejectionReason::ExactPreparation[\s\S]{0,120}preparation_rejection\.is_some\(\)/,
+  );
+  assert.match(
+    rendererSource,
+    /for reason in ExactRequiredPreparationRejectionReason::ALL[\s\S]*"exactRequiredPreparationRejectionReasons"/,
+  );
+  assert.match(
+    rendererSource,
+    /renderer_metrics_object\(\s*self\.metrics\.get\(\),\s*self\.exact_required_preparation_rejection_counts\.get\(\),\s*\)/,
+  );
+
+  const snapshotStart = rendererCoreSource.indexOf(
+    "pub(crate) struct ExactRequiredRejectionSnapshot",
+  );
+  const snapshotEnd = rendererCoreSource.indexOf(
+    "\n/// Side-effect-free facts",
+    snapshotStart,
+  );
+  assert.notEqual(snapshotStart, -1);
+  assert.notEqual(snapshotEnd, -1);
+  const snapshot = rendererCoreSource.slice(snapshotStart, snapshotEnd);
+  assert.match(snapshot, /aggregate:\s*u64/);
+  assert.match(
+    snapshot,
+    /reasons:\s*\[u64; EXACT_REQUIRED_REJECTION_REASON_COUNT\]/,
+  );
+  assert.match(
+    snapshot,
+    /preparation_reasons:\s*ExactRequiredPreparationRejectionCounts/,
+  );
+  assert.match(snapshot, /checked_delta_since/);
+  assert.equal(snapshot.match(/checked_sub\(/g)?.length, 2);
+  assert.match(
+    snapshot,
+    /delta\.is_coherent\(\)\.then_some\(delta\)/,
+  );
+  assert.match(
+    snapshot,
+    /fold\(0, u64::saturating_add\)\s*== self\.aggregate/,
+  );
+  assert.match(
+    snapshot,
+    /saturated_total\(\)\s*== self\.reason\(ExactRequiredRejectionReason::ExactPreparation\)/,
+  );
+  assert.match(
+    rendererCoreSource,
+    /size_of::<ExactRequiredRejectionSnapshot>\(\),\s*56 \* 8/,
   );
 });
 

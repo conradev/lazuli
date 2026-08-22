@@ -477,6 +477,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-dsp"
+version = "0.1.0"
+dependencies = [
+ "dspint",
+]
+
+[[package]]
 name = "browser-renderer"
 version = "0.1.0"
 dependencies = [
@@ -1408,10 +1415,8 @@ version = "0.1.0"
 dependencies = [
  "binrw",
  "bitos",
- "lazuli",
  "libtest-mimic",
  "strum",
- "tinyvec",
  "tracing",
  "util",
  "zerocopy",
@@ -4023,6 +4028,7 @@ dependencies = [
 name = "ppcwasmjit"
 version = "0.1.0"
 dependencies = [
+ "browser-dsp",
  "clifwasm",
  "cranelift-codegen",
  "disks",
@@ -5028,21 +5034,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "tinyvec"
-version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
-dependencies = [
- "tinyvec_macros",
-]
-
-[[package]]
-name = "tinyvec_macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_stream_flatten"

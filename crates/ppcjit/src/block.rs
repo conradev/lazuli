@@ -55,6 +55,12 @@ pub struct ExitReason {
 
 impl ExitReason {
     pub const SYNC: Self = Self(0);
+    /// A cooperative exit which leaves the current instruction at its retry boundary.
+    ///
+    /// Synchronous exits are normally eligible for native block linking. This distinct payload
+    /// uses address bits which have no meaning for a synchronous exit so runtimes can account the
+    /// completed prefix and return without linking the unchanged PC back to itself.
+    pub const YIELD: Self = Self(u32::MAX as u64);
 
     pub fn from_branch(branch: BranchMeta) -> Self {
         Self::from_bits(0)
@@ -77,15 +83,15 @@ pub struct Executed {
 #[repr(u8)]
 pub enum Pattern {
     /// No known pattern.
-    None = 0,
+    None                 = 0,
     /// A single instruction long block with a call.
     Call,
     /// Branching to self
     IdleBasic,
     /// Idling by reading from a fixed memory location on a loop
     IdleVolatileRead,
-    /// Function which the status of the CPU->DSP mailbox and returns it.
-    GetMailboxStatusFunc,
+    /// Function which returns the status of the CPU-to-DSP mailbox.
+    DspSendMailboxStatus = 4,
 }
 
 /// Meta information regarding a block.

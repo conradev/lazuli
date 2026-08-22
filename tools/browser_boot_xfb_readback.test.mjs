@@ -14,6 +14,10 @@ const rendererSource = readFileSync(
   new URL("../crates/browser-renderer/src/web.rs", import.meta.url),
   "utf8",
 );
+const rendererLibSource = readFileSync(
+  new URL("../crates/browser-renderer/src/lib.rs", import.meta.url),
+  "utf8",
+);
 
 function extractFunction(name) {
   const functionStart = source.indexOf(`function ${name}(`);
@@ -160,6 +164,9 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
   const context = evaluate(
     [
       "appendRendererOperation",
+      "requireTextureCopyReceiptArray",
+      "requireNoTextureCopyReceipts",
+      "drainWebGpuRenderer",
       "sha256Hex",
       "presentedXfbRgbBytes",
       "summarizePresentedXfbRgba",
@@ -176,6 +183,8 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
     {
       rendererOperationTail,
       webGpuRenderer: {
+        drain() { calls.push("drain"); return Promise.resolve([]); },
+        check_health() { calls.push("health"); },
         has_presented_xfb() { calls.push("has"); return true; },
         read_presented_xfb_rgba() {
           calls.push("read");
@@ -197,7 +206,7 @@ test("selected XFB capture waits behind renderer work and returns compact diagno
   assert.deepEqual(calls, []);
   releaseRenderer();
   const capture = await pending;
-  assert.deepEqual(calls, ["has", "read"]);
+  assert.deepEqual(calls, ["drain", "health", "has", "read"]);
   assert.deepEqual(context.rendererHostMetrics.operations, {
     enqueued: 0,
     pending: 0,
@@ -236,6 +245,9 @@ test("selected XFB capture reports no image after a renderer reset", async () =>
   const context = evaluate(
     [
       "appendRendererOperation",
+      "requireTextureCopyReceiptArray",
+      "requireNoTextureCopyReceipts",
+      "drainWebGpuRenderer",
       "sha256Hex",
       "presentedXfbRgbBytes",
       "summarizePresentedXfbRgba",
@@ -245,6 +257,8 @@ test("selected XFB capture reports no image after a renderer reset", async () =>
     {
       rendererOperationTail: Promise.resolve(),
       webGpuRenderer: {
+        drain() { return Promise.resolve([]); },
+        check_health() {},
         has_presented_xfb() { return false; },
         read_presented_xfb_rgba() { reads += 1; },
       },
@@ -271,6 +285,7 @@ test("presented surface capture returns canonical tight RGBA evidence", async ()
       "summarizePresentedFieldRows",
       "attachPresentedFieldEvidence",
       "legacyPresentedXfbProjection",
+      "summarizePresentedSurfaceCapture",
       "readPresentedSurface",
     ],
     {
@@ -681,15 +696,27 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
   const end = rendererSource.indexOf("\n    fn xfb_present_bind_group", start);
   const present = rendererSource.slice(start, end);
   assert.match(bridge, /capture_surface: bool/);
+  assert.match(bridge, /capture_sustained_surface_history: bool/);
   assert.match(present, /capture_surface: bool/);
-  assert.match(present, /requested_surface_readback_layout\(\s*capture_surface,/);
-  assert.match(present, /let surface_capture = capture_plan\.map/);
+  assert.match(present, /capture_sustained_surface_history: bool/);
+  assert.match(
+    present,
+    /requested_surface_readback_layout\(\s*capture_surface \|\| capture_sustained_surface_history,/,
+  );
+  assert.match(present, /let surface_capture = capture_surface\.then/);
+  const helperStart = rendererSource.indexOf("fn encode_presented_surface_readback");
+  const helperEnd = rendererSource.indexOf(
+    "\nasync fn finish_presented_surface_readback",
+    helperStart,
+  );
+  const helper = rendererSource.slice(helperStart, helperEnd);
+  assert.match(helper, /wgpu::BufferUsages::COPY_DST \| wgpu::BufferUsages::MAP_READ/);
+  assert.match(helper, /encoder\.copy_texture_to_buffer/);
   const allocation = present.indexOf("browser presented surface readback");
-  const copy = present.indexOf("encoder.copy_texture_to_buffer", allocation);
-  const submit = present.indexOf("self.queue.submit", copy);
+  const submit = present.indexOf("self.queue.submit", allocation);
   const browserPresent = present.indexOf("output.present()", submit);
-  assert.ok(allocation > present.indexOf("capture_plan.map"));
-  assert.ok(allocation < copy && copy < submit && submit < browserPresent);
+  assert.ok(allocation > present.indexOf("capture_surface.then"));
+  assert.ok(allocation < submit && submit < browserPresent);
   for (const field of ["last_presented_xfb", "last_presented_surface"]) {
     assert.doesNotMatch(
       bridge,
@@ -700,9 +727,16 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
   const resetStart = rendererSource.indexOf("pub fn reset(&mut self)");
   const resetEnd = rendererSource.indexOf("pub fn reset_diagnostics", resetStart);
   const reset = rendererSource.slice(resetStart, resetEnd);
-  for (const field of ["last_presented_xfb", "last_presented_surface"]) {
+  for (const field of [
+    "last_presented_xfb",
+    "last_presented_surface",
+    "sustained_presented_surface_history",
+  ]) {
+    const resetStatement = field === "sustained_presented_surface_history"
+      ? `self.${field}.reset()`
+      : `self.${field} = None`;
     assert.ok(
-      reset.indexOf(`self.${field} = None`) < reset.indexOf("self.ensure_healthy()?"),
+      reset.indexOf(resetStatement) < reset.indexOf("self.ensure_healthy()?"),
       `reset must clear stale ${field} evidence before its fallible health check`,
     );
   }
@@ -724,6 +758,225 @@ test("swapchain capture is opt-in and copied in the presentation encoder", () =>
   assert.match(
     source.slice(viPresentStart, viPresentEnd),
     /frame\.temporalXfbCapture !== undefined/,
+  );
+  assert.match(
+    source.slice(viPresentStart, viPresentEnd),
+    /frame\.sustainedPlayReceipt !== undefined/,
+  );
+});
+
+test("sustained presented-surface history is exact, ordered, and terminal-only", () => {
+  assert.match(
+    rendererLibSource,
+    /const SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY: usize = 60;/,
+  );
+  const surfaceStart = rendererSource.indexOf("struct PresentedSurface {");
+  const sustainedSurfaceStart = rendererSource.indexOf(
+    "struct SustainedPresentedSurface {",
+    surfaceStart,
+  );
+  const sustainedSurfaceEnd = rendererSource.indexOf(
+    "\nstruct Pipelines",
+    sustainedSurfaceStart,
+  );
+  assert.notEqual(surfaceStart, -1);
+  assert.notEqual(sustainedSurfaceStart, -1);
+  assert.notEqual(sustainedSurfaceEnd, -1);
+  const ordinarySurface = rendererSource.slice(
+    surfaceStart,
+    sustainedSurfaceStart,
+  );
+  const sustainedSurface = rendererSource.slice(
+    sustainedSurfaceStart,
+    sustainedSurfaceEnd,
+  );
+  assert.doesNotMatch(
+    ordinarySurface,
+    /ExactRequiredRejectionSnapshot|exact_required_rejection/,
+    "ordinary and temporal captures must not retain sustained diagnostics",
+  );
+  assert.match(sustainedSurface, /surface:\s*PresentedSurface/);
+  assert.match(
+    sustainedSurface,
+    /exact_required_rejection_interval:\s*ExactRequiredRejectionSnapshot/,
+  );
+  assert.match(
+    rendererSource,
+    /SustainedPresentedSurfaceHistory<SustainedPresentedSurface>/,
+  );
+  const terminalStart = source.indexOf("function captureRendererTerminal(");
+  const terminalEnd = source.indexOf(
+    "\n    const localIplImageBytes",
+    terminalStart,
+  );
+  const terminal = source.slice(terminalStart, terminalEnd);
+  assert.match(
+    terminal,
+    /terminalReport\?\.status === "paused"[\s\S]*terminalReport\?\.stage === "scenario-complete"[\s\S]*terminalReport\?\.scenario\?\.status === "complete"/,
+    "live prefix snapshots must not drain an incomplete sustained history",
+  );
+  assert.ok(
+    terminal.indexOf("const sustainedPlayTerminal")
+      < terminal.indexOf("readSmbSustainedPresentedSurfaceHistory()"),
+  );
+  const publishStart = source.indexOf("async function publishWorkerTerminalReport(");
+  const publishEnd = source.indexOf("\n    function handleWorkerMessage", publishStart);
+  assert.match(
+    source.slice(publishStart, publishEnd),
+    /captureRendererTerminal\(\s*hostMetrics,\s*temporalFrames,\s*report\s*\)/,
+  );
+  const stateStart = rendererLibSource.indexOf(
+    "pub(crate) enum SustainedPresentedSurfaceHistory",
+  );
+  const stateEnd = rendererLibSource.indexOf("\n#[cfg(test)]", stateStart);
+  const state = rendererLibSource.slice(stateStart, stateEnd);
+  assert.match(
+    state,
+    /Self::Recording\(Vec::with_capacity\(\s*SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY,/,
+  );
+  assert.match(
+    state,
+    /captures\.len\(\) < SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY/,
+  );
+  assert.match(
+    state,
+    /captures\.len\(\) == SUSTAINED_PRESENTED_SURFACE_HISTORY_CAPACITY/,
+  );
+  assert.match(state, /\*self = Self::Failed;/);
+
+  const presentStart = rendererSource.indexOf("fn present_host_xfb_frame");
+  const presentEnd = rendererSource.indexOf("\n    fn xfb_present_bind_group", presentStart);
+  const present = rendererSource.slice(presentStart, presentEnd);
+  const request = present.indexOf(
+    ".capture_requested(capture_sustained_surface_history)",
+  );
+  const acquire = present.indexOf("self.surface.get_current_texture()");
+  const snapshot = present.indexOf(
+    "let exact_required_rejection_snapshot = self.exact_required_rejection_snapshot()",
+  );
+  const checkedInterval = present.indexOf(".checked_delta_since(", snapshot);
+  const capture = present.indexOf("let sustained_surface_capture");
+  const label = present.indexOf("browser sustained presented surface readback", capture);
+  const push = present.indexOf(".push(capture)", label);
+  const submit = present.indexOf("self.queue.submit", push);
+  const browserPresent = present.indexOf("output.present()", submit);
+  const healthyPresentation = present.indexOf(
+    "self.ensure_healthy()?",
+    browserPresent,
+  );
+  const rollingUpdate = present.indexOf(
+    "self.last_presented_exact_required_rejection_snapshot =",
+    healthyPresentation,
+  );
+  assert.ok(
+    request > -1 && request < acquire,
+    "history continuity and overflow must fail before acquiring a presentation surface",
+  );
+  assert.ok(
+    request < snapshot && snapshot < checkedInterval && checkedInterval < acquire,
+    "a sustained interval must fail closed before acquiring a presentation surface",
+  );
+  assert.ok(
+    capture > acquire && capture < label && label < push && push < submit && submit < browserPresent,
+    "same-submit capture must be enqueued and recorded before presenting",
+  );
+  assert.ok(
+    browserPresent < healthyPresentation && healthyPresentation < rollingUpdate,
+    "the rolling baseline must advance only after a healthy completed presentation",
+  );
+  for (const forbidden of ["BufferMap::new", "QueueDrain::new", "future_to_promise", ".await"]) {
+    assert.doesNotMatch(
+      present,
+      new RegExp(forbidden.replaceAll(".", "\\.")),
+      `live presentation must not contain ${forbidden}`,
+    );
+  }
+
+  const drainStart = rendererSource.indexOf(
+    "pub fn drain_sustained_presented_surface_history_rgba",
+  );
+  const drainEnd = rendererSource.indexOf(
+    "\n    #[allow(clippy::too_many_arguments)]\n    pub fn push_tev_draw",
+    drainStart,
+  );
+  const drain = rendererSource.slice(drainStart, drainEnd);
+  const take = drain.indexOf("take_complete()");
+  const queueDrain = drain.indexOf("QueueDrain::new(&queue).await");
+  const orderedLoop = drain.indexOf("for presented in presented");
+  const finish = drain.indexOf(
+    "finish_presented_surface_readback(presented.surface, &failure_state).await",
+  );
+  const interval = drain.indexOf(
+    "exact_required_rejection_snapshot_object(",
+    finish,
+  );
+  const publishInterval = drain.indexOf(
+    '"exactRequiredRejectionInterval"',
+    interval,
+  );
+  assert.ok(take > -1 && take < queueDrain);
+  assert.ok(queueDrain < orderedLoop && orderedLoop < finish);
+  assert.ok(finish < interval && interval < publishInterval);
+  assert.match(drain, /let result = Array::new\(\)/);
+  assert.match(drain, /result\.push\(&capture\)/);
+
+  const intervalSerializerStart = rendererSource.indexOf(
+    "fn exact_required_rejection_snapshot_object",
+  );
+  const intervalSerializerEnd = rendererSource.indexOf(
+    "\nfn surface_pixel_order",
+    intervalSerializerStart,
+  );
+  const intervalSerializer = rendererSource.slice(
+    intervalSerializerStart,
+    intervalSerializerEnd,
+  );
+  for (const key of ["aggregate", "reasons", "preparationReasons"]) {
+    assert.match(intervalSerializer, new RegExp(`"${key}"`));
+  }
+  assert.match(
+    intervalSerializer,
+    /for reason in ExactRequiredRejectionReason::ALL/,
+  );
+  assert.match(
+    intervalSerializer,
+    /for reason in ExactRequiredPreparationRejectionReason::ALL/,
+  );
+
+  const finishStart = rendererSource.indexOf("async fn finish_presented_surface_readback");
+  const finishEnd = rendererSource.indexOf(
+    "\nstruct EncodedXfbReadback",
+    finishStart,
+  );
+  const finishReadback = rendererSource.slice(finishStart, finishEnd);
+  assert.match(finishReadback, /"presentationSerial"/);
+  assert.match(finishReadback, /set_presented_frame_provenance/);
+  assert.match(finishReadback, /"rgba"/);
+  assert.match(finishReadback, /Uint8Array::from\(pixels\.as_slice\(\)\)/);
+
+  const resetStart = rendererSource.indexOf("pub fn reset(&mut self)");
+  const diagnosticsResetStart = rendererSource.indexOf(
+    "pub fn reset_diagnostics(&mut self)",
+    resetStart,
+  );
+  const diagnosticsResetEnd = rendererSource.indexOf(
+    "\n    pub fn diagnostics",
+    diagnosticsResetStart,
+  );
+  const reset = rendererSource.slice(resetStart, diagnosticsResetStart);
+  const diagnosticsReset = rendererSource.slice(
+    diagnosticsResetStart,
+    diagnosticsResetEnd,
+  );
+  assert.match(
+    reset,
+    /last_presented_exact_required_rejection_snapshot\s*=\s*self\.exact_required_rejection_snapshot\(\)/,
+    "gameplay reset must rebase to diagnostics that survive it",
+  );
+  assert.match(
+    diagnosticsReset,
+    /exact_required_preparation_rejection_counts[\s\S]*ExactRequiredPreparationRejectionCounts::default\(\)[\s\S]*last_presented_exact_required_rejection_snapshot\s*=\s*ExactRequiredRejectionSnapshot::default\(\)/,
+    "diagnostics reset must zero live details and the rolling baseline together",
   );
 });
 

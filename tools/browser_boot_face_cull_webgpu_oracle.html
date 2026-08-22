@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli GX face-cull WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body {
+      margin: 2rem;
+    }
+    canvas {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli GX face-cull WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildFaceCullOraclePacket,
+      evaluateFaceCullOracleCase,
+      faceCullOracleCases,
+      faceCullOracleXfb,
+    } from "./browser_boot_face_cull_oracle.mjs";
+
+    async function present(renderer, generation) {
+      const presentation = renderer.present_xfb(
+        faceCullOracleXfb.destination,
+        generation,
+        0,
+        "progressive",
+        "top",
+        generation,
+        faceCullOracleXfb.width,
+        faceCullOracleXfb.height,
+        faceCullOracleXfb.stride,
+        faceCullOracleXfb.height,
+        1,
+        false,
+        false,
+      );
+      await renderer.drain();
+      const readback = await renderer.read_presented_xfb_rgba();
+      renderer.check_health();
+      return { presentation, readback };
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      const cases = [];
+      try {
+        renderer.reset_diagnostics();
+        for (let index = 0; index < faceCullOracleCases.length; index += 1) {
+          const entry = faceCullOracleCases[index];
+          const generation = index + 1;
+          renderer.reset();
+          const before = renderer.diagnostics();
+          renderer.submit_gx_frame(
+            buildFaceCullOraclePacket(entry.id, generation),
+          );
+          const surface = await present(renderer, generation);
+          const after = renderer.diagnostics();
+          cases.push({
+            ...evaluateFaceCullOracleCase(
+              entry.id,
+              before,
+              after,
+              surface.readback,
+            ),
+            presentation: surface.presentation,
+          });
+        }
+        renderer.check_health();
+        const result = {
+          pass: cases.every((entry) => entry.pass),
+          strictWebGpu: true,
+          cases,
+          diagnostics: renderer.diagnostics(),
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliFaceCullOraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>

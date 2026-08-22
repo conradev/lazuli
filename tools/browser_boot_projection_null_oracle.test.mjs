@@ -16,6 +16,7 @@ import {
   projectionNullOracleXfb,
   projectionNullPacketLayout,
   projectionNullSourceVector,
+  projectionNullVisibleNativeCarrierPositions,
 } from "./browser_boot_projection_null_oracle.mjs";
 
 function u16(bytes, offset) {
@@ -193,6 +194,136 @@ test("native carrier is finite and degenerate while exact geometry is visible", 
       projectionNullSourceVector.exactClipPositions[0][3],
     true,
     "the W=0 source is removed by exact right-plane clipping",
+  );
+});
+
+test("projection-null packet options preserve v6 defaults and model v5 optional fallback", () => {
+  const generation = PROJECTION_NULL_HASH_GENERATION + 1;
+  const required = buildProjectionNullOraclePacket(generation, {
+    exactClipRequired: true,
+    xfClipDisable: 7,
+    visibleNativeCarrier: true,
+  });
+  const optional = buildProjectionNullOraclePacket(generation, {
+    exactClipRequired: false,
+    xfClipDisable: 7,
+    visibleNativeCarrier: true,
+  });
+  const draw = projectionNullPacketLayout.drawOffset;
+  const exact = projectionNullPacketLayout.exactChunkOffset;
+
+  assert.equal(u16(required, 0x04), 6);
+  assert.equal(u16(required, draw + 0x02), 6);
+  assert.equal(u16(optional, 0x04), 5);
+  assert.equal(u16(optional, draw + 0x02), 2);
+  assert.equal(u32(required, exact + 0x14), 7);
+  assert.equal(u32(optional, exact + 0x14), 7);
+  assert.deepEqual(
+    Array.from(required, (byte, offset) =>
+      byte === optional[offset] ? null : offset
+    ).filter((offset) => offset !== null),
+    [0x04, draw + 0x02],
+    "required and optional packets differ only in version and exact-required flag",
+  );
+
+  const positions = Array.from(
+    { length: projectionNullPacketLayout.vertexCount },
+    (_unused, vertex) =>
+      Array.from(
+        { length: 4 },
+        (_component, component) =>
+          f32(
+            optional,
+            projectionNullPacketLayout.vertexOffset +
+              vertex * projectionNullPacketLayout.vertexBytes +
+              component * 4,
+          ),
+      ),
+  );
+  assert.deepEqual(positions, projectionNullVisibleNativeCarrierPositions);
+  assert.notDeepEqual(
+    positions,
+    projectionNullSourceVector.nativeCarrierPositions,
+  );
+
+  assert.deepEqual(
+    buildProjectionNullOraclePacket(PROJECTION_NULL_HASH_GENERATION),
+    buildProjectionNullOraclePacket(PROJECTION_NULL_HASH_GENERATION, {}),
+    "the options object leaves the canonical packet byte-for-byte unchanged",
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      cullMode: 4,
+    }),
+    /cullMode must be an integer from 0 through 3/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      exactClipRequired: "yes",
+    }),
+    /exactClipRequired must be a boolean/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      reverseNativeWinding: 1,
+    }),
+    /reverseNativeWinding must be a boolean/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      xfClipDisable: 8,
+    }),
+    /xfClipDisable must be an integer from 0 through 7/,
+  );
+  assert.throws(
+    () => buildProjectionNullOraclePacket(generation, {
+      visibleNativeCarrier: 1,
+    }),
+    /visibleNativeCarrier must be a boolean/,
+  );
+});
+
+test("projection-null packet can certify both direct WebGPU face-cull modes", () => {
+  const draw = projectionNullPacketLayout.drawOffset;
+  const exact = projectionNullPacketLayout.exactChunkOffset;
+  const vertex = (packet, index) =>
+    Array.from(
+      { length: 4 },
+      (_component, component) =>
+        f32(
+          packet,
+          projectionNullPacketLayout.vertexOffset +
+            index * projectionNullPacketLayout.vertexBytes +
+            component * 4,
+        ),
+    );
+  const back = buildProjectionNullOraclePacket(41, {
+    cullMode: 1,
+    exactClipRequired: false,
+    visibleNativeCarrier: true,
+  });
+  const front = buildProjectionNullOraclePacket(42, {
+    cullMode: 2,
+    exactClipRequired: false,
+    reverseNativeWinding: true,
+    visibleNativeCarrier: true,
+  });
+
+  assert.equal(back[draw + 0x01], 1);
+  assert.equal(front[draw + 0x01], 2);
+  assert.equal(u32(back, exact + 0x04), 1 << 14);
+  assert.equal(u32(front, exact + 0x04), 2 << 14);
+  assert.deepEqual(
+    [0, 1, 2].map((index) => vertex(back, index)),
+    projectionNullVisibleNativeCarrierPositions,
+  );
+  assert.deepEqual(
+    [0, 1, 2].map((index) => vertex(front, index)),
+    [
+      projectionNullVisibleNativeCarrierPositions[0],
+      projectionNullVisibleNativeCarrierPositions[2],
+      projectionNullVisibleNativeCarrierPositions[1],
+    ],
   );
 });
 

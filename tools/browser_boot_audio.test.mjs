@@ -29,7 +29,12 @@ function extractFunction(name) {
 }
 
 const audioFunctionNames = [
+  "audioCyclesPerSample",
+  "nextAudioSampleCycle",
+  "nextAudioInterruptCycle",
+  "updateAudioSampleCounter",
   "dspAudioDmaCyclesPerBlock",
+  "nextDspAudioDmaCompletionCycle",
   "dspAudioDmaBlocksLeft",
   "publishDspAudioDmaBlocksLeft",
   "assertDspAudioDmaInterrupt",
@@ -43,6 +48,8 @@ const audioFunctionNames = [
 function audioContext() {
   const memory = new ArrayBuffer(0x10000);
   const context = {
+    aiLastCycle: 1_000,
+    aiSampleCounter: 0,
     cycles: 1_000,
     deviceEvents: new Map(),
     dspAudioDmaEnableInterruptLatencyCycles: 200,
@@ -58,6 +65,116 @@ function audioContext() {
   });
   return context;
 }
+
+function aiState(context) {
+  return {
+    aiLastCycle: context.aiLastCycle,
+    aiSampleCounter: context.aiSampleCounter,
+    control: context.view.getUint32(0x6c00, false),
+    counter: context.view.getUint32(0x6c08, false),
+    events: Object.fromEntries([...context.deviceEvents].sort()),
+    nextInterruptCycle: context.nextAudioInterruptCycle(),
+    nextSampleCycle: context.nextAudioSampleCycle(),
+  };
+}
+
+function dspAudioDmaState(context) {
+  return {
+    blocksLeft: context.view.getUint16(0x503a, false),
+    control: context.view.getUint16(0x5036, false),
+    dspStatus: context.view.getUint16(0x500a, false),
+    events: Object.fromEntries([...context.deviceEvents].sort()),
+    nextCompletionCycle: context.nextDspAudioDmaCompletionCycle(),
+    nextCycle: context.nextDspAudioDmaCycle,
+    nextInterruptCycle: context.nextDspAudioDmaInterruptCycle,
+    remainingBlocks: context.dspAudioDmaRemainingBlocks,
+  };
+}
+
+test("AI interrupt projection preserves exact stepwise sample-counter state", () => {
+  const stepwise = audioContext();
+  const batched = audioContext();
+
+  for (const context of [stepwise, batched]) {
+    context.aiLastCycle = context.cycles;
+    context.aiSampleCounter = 0xffff_fffd;
+    context.view.setUint32(0x6c00, 0x0000_0007, false);
+    context.view.setUint32(0x6c08, context.aiSampleCounter, false);
+    context.view.setUint32(0x6c0c, 1, false);
+  }
+
+  const cyclesPerSample = stepwise.audioCyclesPerSample(0x0000_0007);
+  const interruptCycle = stepwise.nextAudioInterruptCycle();
+  assert.equal(
+    interruptCycle,
+    Math.ceil(stepwise.aiLastCycle + 4 * cyclesPerSample),
+    "the wrapped AIIT target is four samples away",
+  );
+  assert.equal(batched.nextAudioInterruptCycle(), interruptCycle);
+
+  while (stepwise.nextAudioSampleCycle() <= interruptCycle) {
+    stepwise.updateAudioSampleCounter(stepwise.nextAudioSampleCycle());
+  }
+  batched.updateAudioSampleCounter(interruptCycle);
+
+  assert.deepEqual(aiState(batched), aiState(stepwise));
+  assert.equal(batched.aiSampleCounter, 1);
+  assert.equal(batched.deviceEvents.get("aiSamples"), 4);
+  assert.equal(batched.deviceEvents.get("aiInterrupt"), 1);
+  assert.equal(batched.view.getUint32(0x6c00, false) & 0x08, 0x08);
+  assert.equal(
+    batched.nextAudioInterruptCycle(),
+    null,
+    "an already-latched AI interrupt has no further interrupt deadline",
+  );
+});
+
+test("AI interrupt projection treats the current target as the next full wrap", () => {
+  const context = audioContext();
+  context.aiSampleCounter = 0x1234_5678;
+  context.view.setUint32(0x6c00, 0x0000_0007, false);
+  context.view.setUint32(0x6c08, context.aiSampleCounter, false);
+  context.view.setUint32(0x6c0c, context.aiSampleCounter, false);
+
+  assert.equal(
+    context.nextAudioInterruptCycle(),
+    Math.ceil(
+      context.aiLastCycle
+        + 0x1_0000_0000 * context.audioCyclesPerSample(0x0000_0007),
+    ),
+  );
+});
+
+test("DSP audio completion projection preserves exact stepwise block state", () => {
+  const stepwise = audioContext();
+  const batched = audioContext();
+
+  for (const context of [stepwise, batched]) {
+    context.view.setUint32(0x6c00, 0, false);
+    context.writeDspAudioDmaControl(0x8003);
+  }
+
+  const blockPeriod = stepwise.dspAudioDmaCyclesPerBlock();
+  const completionCycle = stepwise.nextDspAudioDmaCompletionCycle();
+  assert.equal(
+    completionCycle,
+    stepwise.nextDspAudioDmaCycle + 2 * blockPeriod,
+  );
+  assert.equal(batched.nextDspAudioDmaCompletionCycle(), completionCycle);
+
+  stepwise.serviceDspAudioDma(stepwise.nextDspAudioDmaInterruptCycle);
+  while (stepwise.nextDspAudioDmaCycle <= completionCycle) {
+    stepwise.serviceDspAudioDma(stepwise.nextDspAudioDmaCycle);
+  }
+  batched.serviceDspAudioDma(completionCycle);
+
+  assert.deepEqual(dspAudioDmaState(batched), dspAudioDmaState(stepwise));
+  assert.equal(batched.dspAudioDmaRemainingBlocks, 3);
+  assert.equal(batched.view.getUint16(0x503a, false), 2);
+  assert.equal(batched.deviceEvents.get("dspAudioDmaBlock"), 3);
+  assert.equal(batched.deviceEvents.get("dspAudioDmaComplete"), 1);
+  assert.equal(batched.deviceEvents.get("dspAudioDmaInitialInterrupt"), 1);
+});
 
 test("DSP audio DMA raises its initial AID and exposes zero-based blocks left", () => {
   const context = audioContext();
@@ -157,7 +274,12 @@ test("DSP audio DMA control and blocks-left registers use explicit MMIO hooks", 
   context.pcOffset = 0;
   context.dispatches = 0;
   vm.runInContext(
-    [extractFunction("readInteger"), extractFunction("writeInteger")].join("\n\n"),
+    [
+      "readInteger",
+      "writeDspControl",
+      "writeDspControlRegister",
+      "writeInteger",
+    ].map(extractFunction).join("\n\n"),
     context,
     { filename: "browser_boot.audio-mmio.js" },
   );
@@ -178,10 +300,10 @@ test("DSP audio DMA is a runtime scheduler candidate and is included in reports"
     decrementerPending: false,
     diskTransfer: null,
     nextDiskAudioCycle: null,
-    dspScheduledMail: null,
     ensureViSchedule() {},
     nextAudioSampleCycle: () => null,
     nextDecrementerCycle: null,
+    nextDspExecutionCycle: null,
     nextDspAudioDmaCycle: 125,
     nextDspAudioDmaInterruptCycle: 110,
     nextSerialPollCycle: null,
@@ -212,16 +334,11 @@ test("AID status participates in DSP interrupt masking and W1C acknowledgement",
   const context = {
     cpu: 0x8000,
     deviceEvents: new Map(),
-    dspScheduledMail: null,
-    initializeDspAudioSystem() {},
     mmio: 0,
     msrOffset: 0,
-    pushDspMail() {},
-    resetDspAudioDma() {},
-    resetDspMailbox() {},
     serviceAramDma() {},
     serviceDspAudioDma() {},
-    traceDsp() {},
+    serviceDspInterpreter() {},
     view: new DataView(memory),
   };
   context.raiseException = registers => {
@@ -261,16 +378,11 @@ test("DSP level interrupt re-enters with overlapping sources until every source 
   const context = {
     cpu: 0x8000,
     deviceEvents: new Map(),
-    dspScheduledMail: null,
-    initializeDspAudioSystem() {},
     mmio: 0,
     msrOffset: 0,
-    pushDspMail() {},
-    resetDspAudioDma() {},
-    resetDspMailbox() {},
     serviceAramDma() {},
     serviceDspAudioDma() {},
-    traceDsp() {},
+    serviceDspInterpreter() {},
     view: new DataView(memory),
   };
   context.raiseException = registers => {
@@ -314,38 +426,162 @@ test("DSP level interrupt re-enters with overlapping sources until every source 
   assert.equal(context.view.getUint32(0x3000, false) & 0x40, 0);
 });
 
-test("CPU mailbox commits raw payload only after the low-half write", () => {
-  const delivered = [];
-  const memory = new ArrayBuffer(0x6000);
+test("ARAM DMA owns DMAState and delivers a masked W1C interrupt through aligned word writes", () => {
+  const memory = new ArrayBuffer(0x50000);
+  let interrupts = 0;
+  const mmio = 0x20000;
+  const cpu = 0x40000;
   const context = {
-    dspCpuMailbox: 0,
-    handleDspCpuMail(mail) {
-      delivered.push(mail >>> 0);
+    aram: new Uint8Array(0x1000),
+    aramTransfer: null,
+    bytes: new Uint8Array(memory),
+    cpu,
+    cpControlReadEnable: 1,
+    cpFifoState: { control: 0, distance: 0 },
+    cycles: 1_000,
+    deviceEvents: new Map(),
+    ensureViSchedule() {},
+    invalidateDataReservationForExternalWrite() {},
+    mmio,
+    msrOffset: 0,
+    ram: 0,
+    ramSize: mmio,
+    ramPointer(address, size) {
+      return address + size <= mmio ? address : null;
     },
-    mmio: 0,
+    serviceAudioInterface() {},
+    serviceCommandProcessorFifo() {},
+    serviceCommandProcessorInterrupt() {},
+    serviceDecrementer() {},
+    serviceDisk() {},
+    serviceDspAudioDma() {},
+    serviceDspInterpreter() {},
+    serviceExternalInterface() {},
+    servicePixelEngine() {},
+    serviceSerial() {},
+    serviceViDueEvents() {},
+    serviceVideoInterrupt() {},
+    serviceVideoPresentation() {},
+    translateDataRange(address) {
+      return address >= 0xc0000000
+        ? (address - 0xc0000000) >>> 0
+        : address >>> 0;
+    },
     view: new DataView(memory),
+  };
+  context.raiseException = registers => {
+    interrupts += 1;
+    const msr = context.view.getUint32(registers + context.msrOffset, true);
+    context.view.setUint32(
+      registers + context.msrOffset,
+      msr & ~0x00008000,
+      true,
+    );
   };
   vm.createContext(context);
   vm.runInContext(
     [
-      extractFunction("writeDspMailboxHigh"),
-      extractFunction("writeDspMailboxLow"),
-    ].join("\n\n"),
+      "startAramDma",
+      "serviceAramDma",
+      "serviceDsp",
+      "serviceMmio",
+      "writeDspControl",
+      "writeDspControlRegister",
+      "writeInteger",
+    ].map(extractFunction).join("\n\n"),
     context,
-    { filename: "browser_boot.audio-cpu-mailbox.js" },
+    { filename: "browser_boot.aram-interrupt.js" },
   );
 
-  context.writeDspMailboxHigh(0);
-  assert.equal(context.view.getUint16(0x5000, false), 0);
-  assert.deepEqual(delivered, []);
-  context.writeDspMailboxLow(5);
-  assert.deepEqual(delivered, [5]);
-  assert.equal(context.view.getUint16(0x5000, false), 0);
+  for (let index = 0; index < 32; index += 1) {
+    context.bytes[0x100 + index] = index ^ 0x5a;
+  }
+  assert.equal(context.writeInteger(0xcc005020, 0x0000013f, 4), 1);
+  assert.equal(context.view.getUint32(mmio + 0x5020, false), 0x120);
+  assert.equal(context.writeInteger(0xcc005024, 0x0400023f, 4), 1);
+  assert.equal(context.view.getUint32(mmio + 0x5024, false), 0x220);
+  assert.equal(context.writeInteger(0xcc005020, 0x100, 4), 1);
+  assert.equal(context.writeInteger(0xcc005024, 0x200, 4), 1);
+  context.view.setUint32(mmio + 0x3004, 0x00000040, false);
 
-  context.writeDspMailboxHigh(0x80f3);
-  assert.equal(context.view.getUint16(0x5000, false), 0x00f3);
-  assert.deepEqual(delivered, [5]);
-  context.writeDspMailboxLow(0xa001);
-  assert.deepEqual(delivered, [5, 0x80f3a001]);
-  assert.equal(context.view.getUint16(0x5000, false), 0x00f3);
+  context.writeDspControl(0x0200);
+  assert.equal(
+    context.view.getUint16(mmio + 0x500a, false),
+    0,
+    "software cannot manufacture hardware-owned DMAState",
+  );
+
+  assert.equal(context.startAramDma(0x20), true);
+  const completionCycle = context.aramTransfer.completionCycle;
+  const committed = [...context.bytes.subarray(0x100, 0x120)];
+  assert.equal(completionCycle, context.cycles + 246);
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0200);
+  assert.equal(context.view.getUint32(mmio + 0x5020, false), 0x120);
+  assert.equal(context.view.getUint32(mmio + 0x5024, false), 0x220);
+  assert.equal(context.view.getUint32(mmio + 0x5028, false), 0);
+  assert.deepEqual(
+    [...context.aram.subarray(0x200, 0x220)],
+    committed,
+    "ARAM data and post-incremented registers commit at trigger time",
+  );
+  context.bytes.fill(0xee, 0x100, 0x120);
+  assert.equal(context.serviceAramDma(completionCycle - 1), false);
+  assert.deepEqual([...context.aram.subarray(0x200, 0x220)], committed);
+  const acceptedTransfer = context.aramTransfer;
+  assert.equal(context.writeInteger(0xcc005028, 0x20, 4), 1);
+  assert.equal(context.aramTransfer, acceptedTransfer);
+  assert.equal(
+    context.deviceEvents.get("aramDmaBusyRetriggerRejected"),
+    1,
+  );
+
+  assert.equal(context.writeInteger(0xcc005008, 0xabcd0000, 4), 1);
+  assert.equal(
+    context.view.getUint16(mmio + 0x500a, false),
+    0x0200,
+    "a CSR write cannot clear in-flight DMAState",
+  );
+  assert.equal(
+    context.view.getUint16(mmio + 0x5008, false),
+    0,
+    "the reserved high half of the aligned word store is ignored",
+  );
+
+  context.serviceDsp(completionCycle);
+  assert.deepEqual(
+    [...context.aram.subarray(0x200, 0x220)],
+    committed,
+  );
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0020);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
+  assert.equal(interrupts, 0, "a pending ARINT remains gated by its mask");
+
+  assert.equal(context.writeInteger(0xcc005008, 0xdead0040, 4), 1);
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0060);
+  context.view.setUint32(cpu, 0x00008000, true);
+  context.serviceDsp(completionCycle);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0x40);
+  assert.equal(interrupts, 1, "enabling ARINTMASK exposes the pending level");
+
+  assert.equal(context.writeInteger(0xcc005008, 0xbeef0060, 4), 1);
+  assert.equal(
+    context.view.getUint16(mmio + 0x500a, false),
+    0x0040,
+    "writing ARINT acknowledges only the status and preserves its mask",
+  );
+  context.view.setUint32(cpu, 0x00008000, true);
+  context.serviceDsp(completionCycle);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
+  assert.equal(interrupts, 1);
+
+  assert.equal(context.writeInteger(0xcc005008, 0, 4), 1);
+  const zeroCycle = context.cycles;
+  assert.equal(context.writeInteger(0xcc005028, 0, 4), 1);
+  assert.equal(context.aramTransfer.completionCycle, zeroCycle);
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0200);
+  context.serviceMmio(zeroCycle);
+  assert.equal(context.aramTransfer, null);
+  assert.equal(context.view.getUint16(mmio + 0x500a, false), 0x0020);
+  assert.equal(context.deviceEvents.get("aramDmaComplete"), 2);
+  assert.equal(context.view.getUint32(mmio + 0x3000, false) & 0x40, 0);
 });

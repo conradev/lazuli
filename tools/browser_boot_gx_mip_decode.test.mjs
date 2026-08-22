@@ -33,6 +33,10 @@ const decodeFunctions = [
   "gxTextureCopyIsBound",
   "gxPrearmTextureCopyProducer",
   "gxTextureLayout",
+  "gxCopyTextureLayout",
+  "gxTextureCopyDestinationMetadata",
+  "gxRecordTextureCopyGeneration",
+  "gxCommitTextureCopyMaterialization",
   "gxTextureMipCount",
   "gxStrictV7TexturePreflight",
   "gxTextureMipChainLayout",
@@ -48,7 +52,6 @@ const decodeFunctions = [
   "gxDecodeCmprBlock",
   "gxTlutColor",
   "gxTextureSamplerState",
-  "gxTextureLowerMipCopyGeneration",
   "gxDecodeTextureLevel",
   "gxDecodeTexture",
   "gxTextureSummary",
@@ -79,9 +82,14 @@ function decodeContext({ byteLength = 0x4000 } = {}) {
     gxFrameSkippedPrimitives: 0,
     gxTextureCopyProducerLateArms: 0,
     gxTextureCopyProducerPreArms: 0,
-    gxCollectFrameGeometry: false,
+    gxTextureCopyCapturedSurfacesRetained: 0,
     gxTextureDecodes: 0,
     gxTextureCacheHits: 0,
+    gxTextureSourceHashComputations: 0,
+    gxTextureSourceHashMemoHits: 0,
+    gxTexturePaletteHashComputations: 0,
+    gxTexturePaletteHashMemoHits: 0,
+    gxTlutLoads: 0,
     gxTextureDecodedBytes: 0,
     gxTextureDecodeErrors: 0,
     gxMarkTextureCopyConsumer(address) {
@@ -163,6 +171,44 @@ function rgbaAtStart(level) {
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function fnv1a(bytes) {
+  let hash = 0x811c9dc5;
+  for (const byte of bytes) {
+    hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+function commitMaterialization(context, {
+  destination,
+  generation,
+  width = 8,
+  height = 8,
+  baseFormat = 0,
+  stride = 32,
+  rowBytes = 32,
+  rowCount = 1,
+  materializedHash,
+}) {
+  context.gxCommitTextureCopyMaterialization({
+    kind: "output",
+    layout: "gx-efb-copy-tiled-bytes-v1",
+    destination,
+    generation,
+    width,
+    height,
+    copyFormat: baseFormat,
+    baseFormat,
+    format: baseFormat,
+    stride,
+    rowBytes,
+    rowCount,
+    byteLength: rowBytes * rowCount,
+    packedStride: rowBytes,
+    directCompatible: stride === rowBytes,
+  }, materializedHash);
 }
 
 test("decodes the complete GX mip chain into one allocation with an exact v6 base view", () => {
@@ -318,6 +364,45 @@ test("hashes every encoded level while min-LOD-only changes reuse decoded storag
   assert.equal(context.gxTextureCacheHits, 1);
 });
 
+test("one synchronous GX decode batch memoizes source and palette fingerprints", () => {
+  const { context, bytes } = decodeContext();
+  const address = 0x100;
+  configureTexture(context, { address, format: 8 });
+  const chain = textureChain(context, { format: 8 });
+  fillLevelBytes(bytes, address, chain, [0x11, 0x22, 0x33, 0x44]);
+  context.gxTmem.fill(0x7f, 0, 32);
+  const batch = {
+    sourceHashes: new Map(),
+    paletteHashes: new Map(),
+  };
+
+  const first = context.gxDecodeTexture(0, batch);
+  const second = context.gxDecodeTexture(0, batch);
+
+  assert.equal(second.key, first.key);
+  assert.strictEqual(second.mipPixels, first.mipPixels);
+  assert.equal(context.gxTextureSourceHashComputations, 1);
+  assert.equal(context.gxTextureSourceHashMemoHits, 1);
+  assert.equal(context.gxTexturePaletteHashComputations, 1);
+  assert.equal(context.gxTexturePaletteHashMemoHits, 1);
+  assert.equal(context.gxTextureDecodes, 1);
+  assert.equal(context.gxTextureCacheHits, 1);
+
+  bytes[address + chain.levels[1].encodedOffset] ^= 0xff;
+  context.gxTmem[1] ^= 0xff;
+  context.gxTlutLoads += 1;
+  const nextBatch = {
+    sourceHashes: new Map(),
+    paletteHashes: new Map(),
+  };
+  const changed = context.gxDecodeTexture(0, nextBatch);
+
+  assert.notEqual(changed.key, first.key);
+  assert.equal(context.gxTextureSourceHashComputations, 2);
+  assert.equal(context.gxTexturePaletteHashComputations, 2);
+  assert.equal(context.gxTextureDecodes, 2);
+});
+
 test("uses one palette identity and TLUT across every paletted mip level", () => {
   const { context, bytes } = decodeContext();
   const address = 0x100;
@@ -347,69 +432,217 @@ test("uses one palette identity and TLUT across every paletted mip level", () =>
   assert.deepEqual(rgbaAtStart(changedPalette.mipLevels[3]), [238, 238, 238, 132]);
 });
 
-test("keys the base EFB generation and rejects known lower-mip provenance before side effects", () => {
+test("one-level exact materialization selects its direct generation only while RAM matches", () => {
+  const { context, bytes } = decodeContext();
   const address = 0x100;
-  const base = decodeContext();
-  configureTexture(base.context, { address });
-  const chain = textureChain(base.context);
-  fillLevelBytes(base.bytes, address, chain, [0x11, 0x22, 0x33, 0x44]);
-  base.context.gxTextureCopyDestinations.set(address, 7);
-  const generation7 = base.context.gxDecodeTexture(0);
-  assert.equal(generation7.textureCopyIndex, 7);
-  base.context.gxTextureCopyDestinations.set(address, 8);
-  const generation8 = base.context.gxDecodeTexture(0);
-  assert.equal(generation8.textureCopyIndex, 8);
-  assert.notEqual(generation8.key, generation7.key);
+  configureTexture(context, { address, mode0: 0, mode1: 0 });
+  const chain = textureChain(context, { mode0: 0, mode1: 0 });
+  assert.equal(chain.levelCount, 1);
+  bytes.fill(0x11, address, address + chain.encodedBytes);
+  commitMaterialization(context, {
+    destination: address,
+    generation: 7,
+    materializedHash: fnv1a(bytes.subarray(address, address + chain.encodedBytes)),
+  });
 
-  const rejected = decodeContext();
-  configureTexture(rejected.context, { address });
-  rejected.context.gxTextureCopyDestinations.set(address + 40, 19);
-  let cacheReads = 0;
-  rejected.context.gxTextureCache = {
-    get() {
-      cacheReads += 1;
-      return undefined;
-    },
-    set() {
-      throw new Error("lower-mip provenance reached cache insertion");
-    },
-  };
-  assert.equal(rejected.context.gxDecodeTexture(0), null);
-  assert.equal(rejected.context.gxTextureDecodeErrors, 1);
-  assert.equal(cacheReads, 0);
-  assert.deepEqual(rejected.ramRequests, []);
-  assert.deepEqual(rejected.consumers, []);
+  const direct = context.gxDecodeTexture(0);
+  assert.equal(direct.textureCopyIndex, 7);
+  assert.deepEqual(rgbaAtStart(direct.mipLevels[0]), [17, 17, 17, 17]);
+
+  bytes[address] = 0x22;
+  const changedRam = context.gxDecodeTexture(0);
+  assert.equal("textureCopyIndex" in changedRam, false);
+  assert.deepEqual(rgbaAtStart(changedRam.mipLevels[0]), [34, 34, 34, 34]);
+  assert.equal(context.gxTextureCopyDestinations.has(address), false);
+  assert.notEqual(changedRam.key, direct.key);
 });
 
-test("recognizes sparse texture-copy destinations throughout the lower encoded span", () => {
+test("mip chains decode current base and lower materializations without a direct surface", () => {
+  const { context, bytes, consumers, ramRequests } = decodeContext();
+  const address = 0x100;
+  configureTexture(context, { address });
+  const chain = textureChain(context);
+  assert.equal(chain.levelCount, 4);
+
+  const levelBytes = [0x11, 0x22, 0x33, 0x44];
+  for (const level of chain.levels) {
+    const destination = address + level.encodedOffset;
+    bytes.fill(
+      levelBytes[level.level],
+      destination,
+      destination + level.encodedBytes,
+    );
+    commitMaterialization(context, {
+      destination,
+      generation: 20 + level.level,
+      width: level.width,
+      height: level.height,
+      materializedHash: fnv1a(
+        bytes.subarray(destination, destination + level.encodedBytes),
+      ),
+    });
+  }
+
+  const texture = context.gxDecodeTexture(0);
+  assert.notEqual(texture, null);
+  assert.equal("textureCopyIndex" in texture, false);
+  assert.deepEqual(plain(texture.mipLevels.map(rgbaAtStart)), [
+    [17, 17, 17, 17],
+    [34, 34, 34, 34],
+    [51, 51, 51, 51],
+    [68, 68, 68, 68],
+  ]);
+  assert.deepEqual(
+    consumers,
+    plain(chain.levels.map(level => address + level.encodedOffset)),
+  );
+  assert.deepEqual(ramRequests, [{ address, length: chain.encodedBytes }]);
+  assert.ok(
+    chain.levels.every(level =>
+      context.gxTextureCopyDestinations.has(address + level.encodedOffset)
+    ),
+    "base and lower-level receipt provenance remains diagnostic",
+  );
+
+  bytes[address + chain.levels[2].encodedOffset] = 0x55;
+  const refreshed = context.gxDecodeTexture(0);
+  assert.equal("textureCopyIndex" in refreshed, false);
+  assert.deepEqual(rgbaAtStart(refreshed.mipLevels[2]), [85, 85, 85, 85]);
+  assert.notEqual(refreshed.key, texture.key);
+});
+
+test("a lower-level materialized destination never fail-closes full-chain RAM decode", () => {
+  const { context, bytes, consumers, ramRequests } = decodeContext();
+  const address = 0x100;
+  configureTexture(context, { address });
+  const chain = textureChain(context);
+  fillLevelBytes(bytes, address, chain, [0x11, 0x22, 0x33, 0x44]);
+  const lower = chain.levels[1];
+  const destination = address + lower.encodedOffset;
+  commitMaterialization(context, {
+    destination,
+    generation: 19,
+    width: lower.width,
+    height: lower.height,
+    materializedHash: fnv1a(
+      bytes.subarray(destination, destination + lower.encodedBytes),
+    ),
+  });
+
+  const texture = context.gxDecodeTexture(0);
+  assert.notEqual(texture, null);
+  assert.equal("textureCopyIndex" in texture, false);
+  assert.deepEqual(rgbaAtStart(texture.mipLevels[1]), [34, 34, 34, 34]);
+  assert.deepEqual(
+    consumers,
+    plain(chain.levels.map(level => address + level.encodedOffset)),
+  );
+  assert.deepEqual(ramRequests, [{ address, length: chain.encodedBytes }]);
+  assert.equal(context.gxTextureDecodeErrors, 0);
+});
+
+test("physical stride controls direct compatibility without invalidating materialized output", () => {
+  const { context } = decodeContext();
+  const base = {
+    destination: 0x100,
+    sourceX: 0,
+    sourceY: 0,
+    width: 9,
+    sourceHeight: 9,
+    stride: 64,
+    copyState: { copyCommand: 0, pixelControl: 0 },
+  };
+  assert.deepEqual(
+    plain(context.gxTextureCopyDestinationMetadata(base, 11)),
+    {
+      kind: "output",
+      layout: "gx-efb-copy-tiled-bytes-v1",
+      destination: 0x100,
+      generation: 11,
+      width: 9,
+      height: 9,
+      copyFormat: 0,
+      baseFormat: 0,
+      format: 0,
+      stride: 64,
+      rowBytes: 64,
+      rowCount: 2,
+      byteLength: 128,
+      packedStride: 64,
+      directCompatible: true,
+    },
+  );
+  for (const [label, stride] of [
+    ["zero", 0],
+    ["undersized-overlap", 32],
+    ["padded", 96],
+  ]) {
+    const metadata = plain(context.gxTextureCopyDestinationMetadata(
+      { ...base, stride },
+      12,
+    ));
+    assert.equal(metadata.kind, "output", label);
+    assert.equal(metadata.stride, stride, label);
+    assert.equal(metadata.rowBytes, 64, label);
+    assert.equal(metadata.byteLength, 128, label);
+    assert.equal(metadata.directCompatible, false, label);
+  }
+});
+
+test("every GX copy executes while ordered no-op output retains prior provenance", () => {
   const { context } = decodeContext();
   const address = 0x100;
-  configureTexture(context, { address });
+  commitMaterialization(context, {
+    destination: address,
+    generation: 7,
+    materializedHash: 0x12345678,
+  });
+  const prior = plain(context.gxTextureCopyDestinations.get(address));
+  const output = {
+    destination: address,
+    sourceX: 0,
+    sourceY: 0,
+    width: 8,
+    sourceHeight: 8,
+    stride: 32,
+    copyState: { copyCommand: 0, pixelControl: 0 },
+  };
 
-  assert.equal(context.gxTextureCopyIsBound(address), true);
-  assert.equal(context.gxTextureCopyIsBound(address + 32), true);
-  assert.equal(context.gxTextureCopyIsBound(address + 40), true);
-  assert.equal(context.gxTextureCopyIsBound(address + 127), true);
-  assert.equal(context.gxTextureCopyIsBound(address + 128), false);
-});
+  assert.throws(
+    () => context.gxRecordTextureCopyGeneration(address, 8, false, output),
+    /cannot be presentation-gated/,
+  );
+  assert.equal(
+    context.gxRecordTextureCopyGeneration(address, 8, true, output),
+    true,
+  );
+  assert.deepEqual(
+    plain(context.gxTextureCopyDestinations.get(address)),
+    prior,
+    "new provenance waits for the exact renderer receipt",
+  );
+  assert.equal(
+    context.gxRecordTextureCopyGeneration(address, 9, true, {
+      ...output,
+      width: 1,
+      sourceHeight: 1,
+      copyState: { copyCommand: 0x200, pixelControl: 0 },
+    }),
+    false,
+  );
+  assert.deepEqual(
+    plain(context.gxTextureCopyDestinations.get(address)),
+    prior,
+    "a clipped zero-size no-op neither writes nor evicts",
+  );
 
-test("prearms a first lower-mip copy before any texture decode has registered consumers", () => {
-  const { context, consumers } = decodeContext();
-  const address = 0x100;
-  configureTexture(context, { address });
-
-  assert.equal(context.gxTextureDecodes, 0);
-  assert.deepEqual(consumers, []);
-  assert.equal(context.gxTextureCopyConsumers.size, 0);
-  assert.equal(context.gxPrearmTextureCopyProducer(address + 32), true);
-  assert.equal(context.gxTextureCopyProducerPreArms, 1);
-  assert.equal(context.gxTextureCopyProducerLateArms, 0);
-  assert.equal(context.gxCollectFrameGeometry, true);
-
-  context.gxCollectFrameGeometry = false;
-  assert.equal(context.gxPrearmTextureCopyProducer(address + 128), false);
-  assert.equal(context.gxTextureCopyProducerPreArms, 1);
-  assert.equal(context.gxCollectFrameGeometry, false);
+  assert.doesNotMatch(source, /\bgxCollectFrameGeometry\b/);
+  const bpWrite = extractFunction("recordGxBpWrite");
+  assert.match(bpWrite, /postGxFrame\(2, frame\);/);
+  assert.match(bpWrite, /postGxFrame\(1, frame\);/);
+  assert.equal(bpWrite.match(/captured: true/g)?.length, 2);
+  assert.doesNotMatch(bpWrite, /captured: false/);
+  assert.doesNotMatch(extractFunction("recordGxPrimitive"), /gxCollectFrameGeometry/);
 });
 
 test("diagnostics and base-only TEV flattening never retain mip pixel backing", () => {

@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 
 import { identifyLocalDiscImage } from "./browser_boot_disc_identity.mjs";
 import { DevToolsSession } from "./browser_boot_headless_cdp.mjs";
+import { verifyDspLleEvidence } from "./browser_dsp_lle_evidence.mjs";
 import {
   assignPublicDisc,
   expectedPublicFrameUrl,
@@ -20,10 +21,12 @@ import {
   waitForPublicSnapshot,
 } from "./browser_public_cdp.mjs";
 
-const EVIDENCE_SCHEMA = "lazuli-public-warioware-smoke-v1";
+const EVIDENCE_SCHEMA = "lazuli-public-warioware-smoke-v3";
 const IMMUTABLE_FRONTEND_PATH = /^\/assets\/frontend-[0-9a-f]{64}\.html$/;
+const IMMUTABLE_DSP_PATH = /^\/assets\/browser-dsp-([0-9a-f]{64})\.wasm$/;
 const PRODUCTION_ORIGIN = "https://gekko.free";
 const WARIOWARE_DISC_IDENTIFIER = "GZWE01";
+export const PUBLIC_WARIOWARE_DEFAULT_TIMEOUT_MS = 15 * 60 * 1_000;
 
 function evidenceFailure(path, message) {
   throw new Error(`invalid public WarioWare smoke evidence at ${path}: ${message}`);
@@ -117,6 +120,43 @@ function viPresentationIdentity(vi) {
 
 function requireZero(value, path) {
   if (value !== 0) evidenceFailure(path, "expected zero");
+}
+
+export function publicWarioWareSnapshotHasDspLleReadiness(report) {
+  if (report === null || typeof report !== "object" || Array.isArray(report)) {
+    return false;
+  }
+  const dsp = report.audioCompatibility?.dspLle;
+  const events = report.deviceEvents;
+  if (
+    dsp === null
+    || typeof dsp !== "object"
+    || Array.isArray(dsp)
+  ) {
+    return false;
+  }
+  return (
+    dsp.backend === "lle-wasm"
+    && dsp.abi === 1
+    && Number.isSafeInteger(dsp.slices)
+    && dsp.slices > 0
+    && Number.isSafeInteger(dsp.budgetedInstructions)
+    && dsp.budgetedInstructions > 0
+    && Number.isSafeInteger(dsp.executedInstructions)
+    && dsp.executedInstructions > 0
+    && Number.isSafeInteger(dsp.cpuMailboxWrites)
+    && dsp.cpuMailboxWrites > 0
+    && Number.isSafeInteger(dsp.cpuMailboxReads)
+    && dsp.cpuMailboxReads > 0
+    && Number.isSafeInteger(dsp.dspMailboxWrites)
+    && dsp.dspMailboxWrites > 0
+    && Number.isSafeInteger(dsp.dspMailboxReads)
+    && dsp.dspMailboxReads > 0
+    && Number.isSafeInteger(events?.dspAudioDmaStart)
+    && events.dspAudioDmaStart > 0
+    && Number.isSafeInteger(events?.dspAudioDmaBlock)
+    && events.dspAudioDmaBlock > 0
+  );
 }
 
 function evidenceUrl(value, path) {
@@ -277,10 +317,8 @@ export function publicWarioWareSnapshotHasCoherentXfb(report) {
 }
 
 async function capturePublicWarioWareSnapshot(session, { deadline, pollMs }) {
-  if (await requestPublicSnapshot(session) !== true) {
-    throw new Error("public WarioWare cycle runner cannot publish a snapshot");
-  }
-  return waitForPublicSnapshot(session, { deadline, pollMs });
+  const requestId = await requestPublicSnapshot(session);
+  return waitForPublicSnapshot(session, { deadline, pollMs, requestId });
 }
 
 export async function waitForCoherentPublicWarioWareSnapshot(
@@ -305,14 +343,18 @@ export async function waitForCoherentPublicWarioWareSnapshot(
         { cause: error },
       );
     }
-    if (publicWarioWareSnapshotHasCoherentXfb(lastSnapshot.report)) {
+    if (
+      publicWarioWareSnapshotHasCoherentXfb(lastSnapshot.report)
+      && publicWarioWareSnapshotHasDspLleReadiness(lastSnapshot.report)
+    ) {
       return lastSnapshot;
     }
     const remainingMs = deadline - now();
     if (remainingMs > 0) await delay(Math.min(pollMs, remainingMs));
   }
   throw new Error(
-    "public WarioWare snapshot did not present a coherent XFB before the deadline; "
+    "public WarioWare snapshot did not present a coherent XFB before the deadline "
+    + "with active DSP LLE execution and mailbox interaction; "
     + `last snapshot: ${JSON.stringify(lastSnapshot)}`,
   );
 }
@@ -348,9 +390,22 @@ export function validatePublicWarioWareSmokeEvidence(evidence) {
   if (JSON.stringify(release) !== JSON.stringify(terminalRelease)) {
     evidenceFailure("$.terminalRelease", "active release changed during the smoke run");
   }
+  if (release.schema !== 3) {
+    evidenceFailure("$.release.schema", "expected release schema 3");
+  }
   const frontend = requiredObject(release.frontend, "$.release.frontend");
   if (typeof frontend.url !== "string" || !IMMUTABLE_FRONTEND_PATH.test(frontend.url)) {
     evidenceFailure("$.release.frontend.url", "expected an immutable frontend asset path");
+  }
+  const dsp = requiredObject(release.dsp, "$.release.dsp");
+  const dspMatch = typeof dsp.url === "string" ? dsp.url.match(IMMUTABLE_DSP_PATH) : null;
+  if (
+    dspMatch === null
+    || dsp.sha256 !== dspMatch[1]
+    || !Number.isSafeInteger(dsp.bytes)
+    || dsp.bytes <= 0
+  ) {
+    evidenceFailure("$.release.dsp", "expected the content-addressed browser DSP artifact");
   }
   if (frameUrl.href !== expectedPublicFrameUrl(publicUrl.href, release)) {
     evidenceFailure("$.frameUrl", "does not match the active release frontend identity");
@@ -407,6 +462,10 @@ export function validatePublicWarioWareSmokeEvidence(evidence) {
   if (rendering.error !== undefined && rendering.error !== null) {
     evidenceFailure("$.report.rendering.error", "expected no renderer error");
   }
+  verifyDspLleEvidence(report, {
+    fail: evidenceFailure,
+    root: "$.report",
+  });
   if (!publicWarioWareSnapshotHasCoherentXfb(report)) {
     evidenceFailure(
       "$.report.rendering.selectedXfb",
@@ -582,7 +641,7 @@ function parseArguments(argv) {
     endpoint: "http://127.0.0.1:9222",
     output: null,
     pollMs: 250,
-    timeoutMs: 120_000,
+    timeoutMs: PUBLIC_WARIOWARE_DEFAULT_TIMEOUT_MS,
     url: null,
   };
   for (let index = 0; index < argv.length; index += 1) {

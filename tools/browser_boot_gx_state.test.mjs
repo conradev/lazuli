@@ -144,6 +144,18 @@ function offset(xPlus342Div2, yPlus342Div2) {
   return xPlus342Div2 | (yPlus342Div2 << 10);
 }
 
+function indirectTevState(genMode = 0, xfNumTexGens = 0) {
+  return {
+    genMode,
+    xfNumTexGens,
+    matrices: Array(9).fill(0),
+    imask: 0,
+    commands: Array(16).fill(0),
+    texScales: [0, 0],
+    iref: 0,
+  };
+}
+
 test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
   gxBpRegisters.fill(0);
   gxXfRegisters.fill(0);
@@ -168,6 +180,7 @@ test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
   gxBpRegisters[0xf5] = 0x191a1b;
   gxBpRegisters[0x59] = offset(171, 171);
   gxXfRegisters[0x101a] = 0x43a00000;
+  gxXfRegisters[0x103f] = 3;
 
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.gxDrawPipelineState())),
@@ -188,6 +201,7 @@ test("snapshots GX depth, blend, cull, and full-EFB scissor state", () => {
       fogRangeK: [0x010001, 0x010002, 0x010003, 0x010004, 0x010005],
       fogWords: [0x020001, 0x020002, 0x020003, 0x020004, 0x020005],
       viewportHalfWidthBits: 0x43a00000,
+      indirectTev: indirectTevState(2 << 14, 3),
     },
   );
 });
@@ -218,6 +232,7 @@ test("applies independent GX X/Y scissor offsets and clips to the EFB", () => {
       fogRangeK: [0, 0, 0, 0, 0],
       fogWords: [0, 0, 0, 0, 0],
       viewportHalfWidthBits: 0,
+      indirectTev: indirectTevState(),
     },
   );
 
@@ -262,7 +277,7 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
     gxFrameDrawVertices: 0,
     gxFrameSkippedPrimitives: 0,
     gxFramesSkipped: 0,
-    gxFlushSkippedCopyClears() {},
+    gxDrainSkippedCopyClears() { return []; },
     invalidateGxCopyReservation() {},
     gxSkippedFrameClearColor: null,
     gxSkippedCopyClears: [],
@@ -346,14 +361,12 @@ test("copy commands snapshot complete terminal PE state for LZGX packets", () =>
 });
 
 test("distinct skipped regional clears retain their source order", () => {
-  const messages = [];
   const clearContext = {
     gxSkippedCopyClears: [],
-    postMessage(message) { messages.push(message); },
   };
   vm.createContext(clearContext);
   vm.runInContext(
-    ["gxCopyClearOperation", "gxFlushSkippedCopyClears"]
+    ["gxCopyClearOperation", "gxDrainSkippedCopyClears"]
       .map(extractFunction)
       .join("\n\n"),
     clearContext,
@@ -379,28 +392,22 @@ test("distinct skipped regional clears retain their source order", () => {
       clearContext.gxCopyClearOperation(frame),
     );
   }
-  clearContext.gxFlushSkippedCopyClears();
+  const clears = clearContext.gxDrainSkippedCopyClears();
 
-  assert.deepEqual(JSON.parse(JSON.stringify(messages)), [
+  assert.deepEqual(JSON.parse(JSON.stringify(clears)), [
     {
-      type: "gx-clear",
-      clear: {
-        sourceX: 4,
-        sourceY: 5,
-        sourceWidth: 6,
-        sourceHeight: 7,
-        copyState: { clearRgba: [1, 2, 3, 4] },
-      },
+      sourceX: 4,
+      sourceY: 5,
+      sourceWidth: 6,
+      sourceHeight: 7,
+      copyState: { clearRgba: [1, 2, 3, 4] },
     },
     {
-      type: "gx-clear",
-      clear: {
-        sourceX: 40,
-        sourceY: 50,
-        sourceWidth: 60,
-        sourceHeight: 70,
-        copyState: { clearRgba: [5, 6, 7, 8] },
-      },
+      sourceX: 40,
+      sourceY: 50,
+      sourceWidth: 60,
+      sourceHeight: 70,
+      copyState: { clearRgba: [5, 6, 7, 8] },
     },
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(clearContext.gxSkippedCopyClears)), []);
@@ -610,7 +617,10 @@ test("deduplicates packet textures while retaining each draw's sampler bits", ()
 
 test("the main thread submits packets without rebuilding a per-draw bridge graph", () => {
   const submit = extractFunction("submitGxFrame");
-  assert.match(submit, /submit_gx_frame\(new Uint8Array\(packet\)\)/);
+  assert.match(
+    submit,
+    /submit_gx_frame\(\s*new Uint8Array\(packet\),\s*preClearWords\s*\)/,
+  );
   assert.doesNotMatch(
     submit,
     /begin_segment|push_tev_draw|has_decoded_texture|copy_texture|copy_xfb/,

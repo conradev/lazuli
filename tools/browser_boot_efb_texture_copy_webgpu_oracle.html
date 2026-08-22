@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli direct EFB texture-copy WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body { margin: 2rem; }
+    canvas {
+      width: 128px;
+      height: 128px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli direct EFB texture-copy WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildDepth24OraclePacket,
+      DEPTH24_ALWAYS_PASS,
+      DEPTH24_ALWAYS_UPDATE,
+      fullscreenDepth24Triangle,
+    } from "./browser_boot_depth24_oracle.mjs";
+    import {
+      buildManagedTexturedCoverageOraclePacket,
+      managedTexturedCoverageOracleCases,
+      managedTexturedCoveragePacketLayout,
+      managedTexturedCoverageXfb,
+    } from "./browser_boot_managed_textured_coverage_oracle.mjs";
+
+    const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+    const CONSUMER_VECTOR = "nonunit-q-linear-keep021";
+    const COPY_WIDTH = 2;
+    const COPY_HEIGHT = 2;
+    const Z_UPDATE = 1 << 4;
+    const COLOR_ALPHA_UPDATE = (1 << 3) | (1 << 4);
+    const BLACK = Object.freeze([0, 0, 0, 255]);
+    const consumerCase = managedTexturedCoverageOracleCases.find(
+      entry => entry.id === CONSUMER_VECTOR,
+    );
+    if (consumerCase === undefined) {
+      throw new Error("missing canonical copied-surface consumer vector");
+    }
+
+    const COPY_CASES = Object.freeze([
+      Object.freeze({
+        id: "color-rgb8-to-rgba8",
+        sourceRgba: Object.freeze([0x24, 0x68, 0xac, 0xff]),
+        sourceDepth: 0x123456,
+        clearRgba: Object.freeze([0xe1, 0x37, 0x79, 0xff]),
+        clearDepth: 0xabcdef,
+        expectedSource: Object.freeze([0x24, 0x68, 0xac, 0xff]),
+        expectedPostClear: Object.freeze([0xe1, 0x37, 0x79, 0xff]),
+        pixelControl: 0,
+        baseAddress: 0x00140000,
+        generationBase: 10,
+      }),
+      Object.freeze({
+        id: "depth-z24-to-rgba8",
+        sourceRgba: Object.freeze([0x35, 0x79, 0xbd, 0xff]),
+        sourceDepth: 0x123456,
+        clearRgba: Object.freeze([0xd2, 0x4b, 0x86, 0xff]),
+        clearDepth: 0xabcdef,
+        expectedSource: Object.freeze([0x12, 0x34, 0x56, 0xff]),
+        expectedPostClear: Object.freeze([0xab, 0xcd, 0xef, 0xff]),
+        pixelControl: 3,
+        baseAddress: 0x00150000,
+        generationBase: 20,
+      }),
+    ]);
+
+    function requireLoopbackOracle() {
+      if (!LOOPBACK_HOSTS.has(location.hostname)) {
+        throw new Error("direct EFB texture-copy oracle is local-only");
+      }
+    }
+
+    function traceCanvasContextRequests(canvas) {
+      const requests = [];
+      const original = canvas.getContext;
+      canvas.getContext = function getContext(type, ...options) {
+        requests.push(String(type));
+        return Reflect.apply(original, this, [type, ...options]);
+      };
+      return Object.freeze({
+        requests,
+        restore() {
+          delete canvas.getContext;
+        },
+      });
+    }
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length
+        && actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    function maskedSurface(mask, rgba) {
+      const bytes = [];
+      for (let pixel = 0; pixel < 16; pixel += 1) {
+        bytes.push(...(mask & (1 << pixel) ? rgba : BLACK));
+      }
+      return bytes;
+    }
+
+    function seedPacket(entry) {
+      const rgba = entry.sourceRgba.map(channel => channel / 255);
+      return buildDepth24OraclePacket([{
+        vertices: fullscreenDepth24Triangle(entry.sourceDepth, rgba),
+        zMode: DEPTH24_ALWAYS_UPDATE,
+        alphaTest: DEPTH24_ALWAYS_PASS,
+        pixelControl: 0,
+      }], entry.generationBase);
+    }
+
+    function copiedSurfaceConsumerPacket(address, generation, xfbGeneration) {
+      const packet = buildManagedTexturedCoverageOraclePacket(
+        CONSUMER_VECTOR,
+        xfbGeneration,
+      );
+      const layout = managedTexturedCoveragePacketLayout(CONSUMER_VECTOR);
+      const view = new DataView(
+        packet.buffer,
+        packet.byteOffset,
+        packet.byteLength,
+      );
+      view.setUint32(layout.textureOffset + 0x10, address, true);
+      view.setUint32(layout.textureOffset + 0x14, generation, true);
+      return packet;
+    }
+
+    function copyTexture(renderer, entry, address, generation, clear) {
+      renderer.copy_texture(
+        0,
+        0,
+        COPY_WIDTH,
+        COPY_HEIGHT,
+        address,
+        generation,
+        clear,
+        Z_UPDATE,
+        COLOR_ALPHA_UPDATE,
+        entry.pixelControl,
+        ...entry.clearRgba,
+        entry.clearDepth,
+      );
+    }
+
+    function clearConsumerTarget(renderer) {
+      renderer.clear_efb_copy(
+        0,
+        0,
+        640,
+        528,
+        Z_UPDATE,
+        COLOR_ALPHA_UPDATE,
+        0,
+        0,
+        0,
+        0,
+        255,
+        0x00ffffff,
+      );
+    }
+
+    function present(renderer, generation) {
+      return renderer.present_xfb(
+        managedTexturedCoverageXfb.destination,
+        generation,
+        0,
+        "progressive",
+        "top",
+        generation,
+        managedTexturedCoverageXfb.width,
+        managedTexturedCoverageXfb.height,
+        managedTexturedCoverageXfb.stride,
+        managedTexturedCoverageXfb.height,
+        1,
+        false,
+        false,
+      );
+    }
+
+    async function consumeCopiedSurface(
+      renderer,
+      address,
+      textureGeneration,
+      xfbGeneration,
+    ) {
+      clearConsumerTarget(renderer);
+      renderer.submit_gx_frame(
+        copiedSurfaceConsumerPacket(
+          address,
+          textureGeneration,
+          xfbGeneration,
+        ),
+      );
+      const presentation = present(renderer, xfbGeneration);
+      await renderer.drain();
+      const readback = await renderer.read_presented_xfb_rgba();
+      return {
+        presentation,
+        width: readback.width,
+        height: readback.height,
+        rgba: Array.from(readback.rgba),
+      };
+    }
+
+    function executionMetrics(diagnostics) {
+      return {
+        clearEfbCalls: diagnostics.clearEfbCalls,
+        copyTextureCalls: diagnostics.copyTextureCalls,
+        copyXfbCalls: diagnostics.copyXfbCalls,
+        submitGxFrameCalls: diagnostics.submitGxFrameCalls,
+        textureUploadBytes: diagnostics.textureUploadBytes,
+        textureWrites: diagnostics.textureWrites,
+      };
+    }
+
+    function subtractMetrics(after, before) {
+      return Object.fromEntries(
+        Object.keys(after).map(key => [key, after[key] - before[key]]),
+      );
+    }
+
+    async function runCase(renderer, entry) {
+      renderer.reset();
+      const before = executionMetrics(renderer.diagnostics());
+      const sourceAddress = entry.baseAddress;
+      const postClearAddress = entry.baseAddress + 0x1000;
+      const sourceGeneration = entry.generationBase + 1;
+      const postClearGeneration = entry.generationBase + 2;
+      const sourceXfbGeneration = entry.generationBase + 3;
+      const postClearXfbGeneration = entry.generationBase + 4;
+
+      renderer.submit_gx_frame(seedPacket(entry));
+      copyTexture(
+        renderer,
+        entry,
+        sourceAddress,
+        sourceGeneration,
+        true,
+      );
+      copyTexture(
+        renderer,
+        entry,
+        postClearAddress,
+        postClearGeneration,
+        false,
+      );
+
+      const source = await consumeCopiedSurface(
+        renderer,
+        sourceAddress,
+        sourceGeneration,
+        sourceXfbGeneration,
+      );
+      const postClear = await consumeCopiedSurface(
+        renderer,
+        postClearAddress,
+        postClearGeneration,
+        postClearXfbGeneration,
+      );
+      renderer.check_health();
+
+      const expectedSource = maskedSurface(
+        consumerCase.expectedMask,
+        entry.expectedSource,
+      );
+      const expectedPostClear = maskedSurface(
+        consumerCase.expectedMask,
+        entry.expectedPostClear,
+      );
+      const sourceExact = bytesEqual(source.rgba, expectedSource);
+      const postClearExact = bytesEqual(postClear.rgba, expectedPostClear);
+      const dimensionsExact = [source, postClear].every(readback =>
+        readback.width === managedTexturedCoverageXfb.width
+        && readback.height === managedTexturedCoverageXfb.height,
+      );
+      const presentationsExact = [source, postClear].every(readback =>
+        readback.presentation.accepted === true
+        && readback.presentation.presented === true,
+      );
+      const metricDelta = subtractMetrics(
+        executionMetrics(renderer.diagnostics()),
+        before,
+      );
+      const directSurfaceSelected =
+        metricDelta.textureWrites === 0
+        && metricDelta.textureUploadBytes === 0;
+      const metricsExact =
+        metricDelta.copyTextureCalls === 2
+        && metricDelta.clearEfbCalls === 3
+        && metricDelta.copyXfbCalls === 3
+        && metricDelta.submitGxFrameCalls === 3
+        && directSurfaceSelected;
+      const copyBeforeTerminalClear =
+        sourceExact
+        && postClearExact
+        && !bytesEqual(source.rgba, postClear.rgba);
+
+      return {
+        id: entry.id,
+        pass:
+          sourceExact
+          && postClearExact
+          && dimensionsExact
+          && presentationsExact
+          && metricsExact
+          && copyBeforeTerminalClear,
+        pixelControl: entry.pixelControl,
+        sourcePlane: entry.pixelControl === 3 ? "depth-z24" : "color-rgb8",
+        targetFormat: "rgba8",
+        copyBeforeTerminalClear,
+        directSurfaceSelected,
+        dimensionsExact,
+        presentationsExact,
+        metricsExact,
+        metricDelta,
+        source: {
+          address: sourceAddress,
+          generation: sourceGeneration,
+          expectedRgba: expectedSource,
+          ...source,
+          exact: sourceExact,
+        },
+        postClear: {
+          address: postClearAddress,
+          generation: postClearGeneration,
+          expectedRgba: expectedPostClear,
+          ...postClear,
+          exact: postClearExact,
+        },
+      };
+    }
+
+    async function run() {
+      requireLoopbackOracle();
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const contextTrace = traceCanvasContextRequests(canvas);
+      let renderer;
+      try {
+        renderer = await WebGpuRenderer.create(canvas);
+      } finally {
+        contextTrace.restore();
+      }
+      renderer.reset_diagnostics();
+      try {
+        const cases = [];
+        for (const entry of COPY_CASES) {
+          cases.push(await runCase(renderer, entry));
+        }
+        renderer.check_health();
+        const unexpectedCanvasContexts =
+          contextTrace.requests.filter(type => type !== "webgpu");
+        const strictWebGpu =
+          typeof navigator.gpu?.requestAdapter === "function"
+          && contextTrace.requests.length > 0
+          && contextTrace.requests.every(type => type === "webgpu");
+        const noFallback = unexpectedCanvasContexts.length === 0;
+        const diagnostics = renderer.diagnostics();
+        const result = {
+          pass:
+            strictWebGpu
+            && noFallback
+            && cases.length === COPY_CASES.length
+            && cases.every(entry => entry.pass),
+          strictWebGpu,
+          noFallback,
+          health: "clean",
+          localOnly: true,
+          backend: {
+            renderer: "WebGpuRenderer",
+            navigatorGpuAvailable:
+              typeof navigator.gpu?.requestAdapter === "function",
+            canvasContextRequests: [...contextTrace.requests],
+            unexpectedCanvasContexts,
+          },
+          cases,
+          diagnostics,
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliEfbTextureCopyOraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        strictWebGpu: false,
+        noFallback: false,
+        health: "error",
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>

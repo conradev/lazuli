@@ -290,12 +290,22 @@ function writeRaster1(view, sourceVector) {
 export function buildVaryingRasterOraclePacket(
   variant = "raster0",
   generation = VARYING_RASTER_HASH_GENERATION,
+  {
+    xfClipDisable = varyingRasterExactState.xfClipDisable,
+  } = {},
 ) {
   const entry = varyingRasterOracleCases.find(
     (candidate) => candidate.id === variant,
   );
   if (entry === undefined) {
     throw new RangeError(`unknown varying-raster oracle variant ${variant}`);
+  }
+  if (
+    !Number.isInteger(xfClipDisable) ||
+    xfClipDisable < 0 ||
+    xfClipDisable > 7
+  ) {
+    throw new RangeError("xfClipDisable must be an integer from 0 through 7");
   }
   const base = buildRasterCenterOraclePacket(
     [varyingRasterDraw(entry)],
@@ -359,7 +369,7 @@ export function buildVaryingRasterOraclePacket(
   );
   view.setUint32(
     exact + 0x14,
-    entry.exactState.xfClipDisable,
+    xfClipDisable,
     true,
   );
   entry.exactState.viewport.forEach((value, index) => {

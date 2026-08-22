@@ -2,12 +2,13 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_codegen::ir::condcodes::IntCC;
 use gekko::disasm::Ins;
-use gekko::{Exception, GPR, InsExt, SPR};
+use gekko::{Exception, GPR, InsExt, Reg, SPR};
 
 use super::BlockBuilder;
 use crate::ExitMode;
+use crate::block::ExitReason;
 use crate::builder::{Action, InstructionInfo, MEMFLAGS, MEMFLAGS_READONLY};
-use crate::hooks::STORE_CONDITIONAL_STORED;
+use crate::hooks::{READ_COMPLETE, READ_YIELD, STORE_CONDITIONAL_STORED};
 
 const fn indexed_alignment_dsisr(instruction: u32) -> u32 {
     // PowerPC OEA indexed-form projection:
@@ -117,6 +118,63 @@ impl BlockBuilder<'_> {
         self.switch_to_bb(continue_block);
     }
 
+    /// Handles the exact tri-state ABI shared by scalar slow reads and load-reserve.
+    ///
+    /// Statuses outside the public contract take the fault path. In particular, do not treat an
+    /// arbitrary nonzero status as completion: that could consume an uninitialized output slot.
+    fn finish_slow_read(
+        &mut self,
+        status: ir::Value,
+        addr: ir::Value,
+        fault_info: InstructionInfo,
+    ) {
+        // Portable Wasm lowering has no scalar i8 value type. Normalize the
+        // ABI byte before comparing statuses so native and portable blocks
+        // share the exact same tri-state control flow.
+        let status = self.bd.ins().uextend(ir::types::I32, status);
+        let check_yield_block = self.bd.create_block();
+        let fault_block = self.bd.create_block();
+        let yield_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(check_yield_block);
+        self.bd.set_cold_block(fault_block);
+        self.bd.set_cold_block(yield_block);
+
+        let complete = self
+            .bd
+            .ins()
+            .icmp_imm(IntCC::Equal, status, i64::from(READ_COMPLETE));
+        self.bd
+            .ins()
+            .brif(complete, continue_block, &[], check_yield_block, &[]);
+        self.bd.seal_block(check_yield_block);
+        self.bd.seal_block(continue_block);
+
+        self.switch_to_bb(check_yield_block);
+        let should_yield = self
+            .bd
+            .ins()
+            .icmp_imm(IntCC::Equal, status, i64::from(READ_YIELD));
+        self.bd
+            .ins()
+            .brif(should_yield, yield_block, &[], fault_block, &[]);
+        self.bd.seal_block(fault_block);
+        self.bd.seal_block(yield_block);
+
+        self.switch_to_bb(fault_block);
+        self.set(SPR::DAR, addr);
+        self.raise_exception(Exception::DSI);
+        self.exit_with(fault_info);
+
+        self.switch_to_bb(yield_block);
+        self.flush();
+        // Do not use exit_with here: the current instruction has not completed, so its PC and
+        // execution counters must remain at the retry boundary.
+        self.exit(ExitReason::YIELD);
+
+        self.switch_to_bb(continue_block);
+    }
+
     fn load_reserve_i32(&mut self, addr: ir::Value) -> ir::Value {
         let stack_slot_addr =
             self.bd
@@ -127,22 +185,8 @@ impl BlockBuilder<'_> {
             self.hooks.load_reserve,
             &[self.consts.ctx_ptr, addr, stack_slot_addr],
         );
-        let loaded = self.bd.inst_results(inst)[0];
-        let fault_block = self.bd.create_block();
-        let continue_block = self.bd.create_block();
-        self.bd.set_cold_block(fault_block);
-        self.bd
-            .ins()
-            .brif(loaded, continue_block, &[], fault_block, &[]);
-        self.bd.seal_block(fault_block);
-        self.bd.seal_block(continue_block);
-
-        self.switch_to_bb(fault_block);
-        self.set(SPR::DAR, addr);
-        self.raise_exception(Exception::DSI);
-        self.exit_with(LOAD_INFO);
-
-        self.switch_to_bb(continue_block);
+        let status = self.bd.inst_results(inst)[0];
+        self.finish_slow_read(status, addr, LOAD_INFO);
         self.bd
             .ins()
             .stack_load(ir::types::I32, self.consts.read_stack_slot, 0)
@@ -225,7 +269,11 @@ impl BlockBuilder<'_> {
         self.bd.ins().store(MEMFLAGS, value, ptr, 0);
     }
 
-    pub fn slow_mem_load<P: ReadWriteAble>(&mut self, addr: ir::Value) -> ir::Value {
+    fn slow_mem_load_with_info<P: ReadWriteAble>(
+        &mut self,
+        addr: ir::Value,
+        fault_info: InstructionInfo,
+    ) -> ir::Value {
         let func = P::read_hook(self);
         let stack_slot_addr =
             self.bd
@@ -238,24 +286,8 @@ impl BlockBuilder<'_> {
             .ins()
             .call(func, &[self.consts.ctx_ptr, addr, stack_slot_addr]);
 
-        let success = self.bd.inst_results(inst)[0];
-        let exit_block = self.bd.create_block();
-        let continue_block = self.bd.create_block();
-
-        self.bd.set_cold_block(exit_block);
-        self.bd
-            .ins()
-            .brif(success, continue_block, &[], exit_block, &[]);
-
-        self.bd.seal_block(exit_block);
-        self.bd.seal_block(continue_block);
-
-        self.switch_to_bb(exit_block);
-        self.set(SPR::DAR, addr);
-        self.raise_exception(Exception::DSI);
-        self.exit_with(LOAD_INFO);
-
-        self.switch_to_bb(continue_block);
+        let status = self.bd.inst_results(inst)[0];
+        self.finish_slow_read(status, addr, fault_info);
         self.bd
             .ins()
             .stack_load(P::IR_TYPE, self.consts.read_stack_slot, 0)
@@ -289,7 +321,11 @@ impl BlockBuilder<'_> {
         self.switch_to_bb(continue_block);
     }
 
-    pub fn mem_load<P: ReadWriteAble>(&mut self, addr: ir::Value) -> ir::Value {
+    fn mem_load_with_info<P: ReadWriteAble>(
+        &mut self,
+        addr: ir::Value,
+        fault_info: InstructionInfo,
+    ) -> ir::Value {
         if self.frontend.exit_mode == ExitMode::ReturnExecuted {
             return self.portable_mem_load::<P>(addr);
         }
@@ -334,7 +370,7 @@ impl BlockBuilder<'_> {
 
         // slow
         self.switch_to_bb(slow_block);
-        let value = self.slow_mem_load::<P>(addr);
+        let value = self.slow_mem_load_with_info::<P>(addr, fault_info);
         self.bd
             .ins()
             .jump(continue_block, &[ir::BlockArg::Value(value)]);
@@ -344,6 +380,10 @@ impl BlockBuilder<'_> {
         self.switch_to_bb(continue_block);
 
         self.bd.block_params(continue_block)[0]
+    }
+
+    pub fn mem_load<P: ReadWriteAble>(&mut self, addr: ir::Value) -> ir::Value {
+        self.mem_load_with_info::<P>(addr, LOAD_INFO)
     }
 
     pub fn mem_store<P: ReadWriteAble>(&mut self, addr: ir::Value, value: ir::Value) {
@@ -852,6 +892,12 @@ const LOAD_INFO: InstructionInfo = InstructionInfo {
     action: Action::Continue,
 };
 
+const LOAD_STRING_INDEXED_INFO: InstructionInfo = InstructionInfo {
+    cycles: 10,
+    auto_pc: true,
+    action: Action::Exit,
+};
+
 #[derive(Clone, Copy)]
 struct LoadOp {
     update: bool,
@@ -1185,6 +1231,138 @@ impl BlockBuilder<'_> {
             cycles: 10, // random, chosen by fair dice roll
             ..LOAD_INFO
         }
+    }
+
+    pub fn lswx(&mut self, ins: Ins) -> InstructionInfo {
+        // Latch every source before touching a destination. Forms where RA or RB is in the
+        // destination range are boundedly undefined, so do not invent an exception for them.
+        let addr = self.indexed_effective_address(ins);
+        let xer = self.get(SPR::XER);
+        let byte_count = self.bd.ins().band_imm(xer, 0x7f);
+
+        // MPC750 string operations raise Alignment in little-endian mode. In big-endian mode,
+        // they also raise Alignment when a non-word-aligned range crosses 4 KiB or a word-aligned
+        // range crosses 256 MiB. A zero-byte transfer has no range and cannot cross a boundary.
+        let msr = self.get(Reg::MSR);
+        let little_endian = self.get_bit(msr, 0);
+        let nonempty = self.bd.ins().icmp_imm(IntCC::NotEqual, byte_count, 0);
+        let last_offset = self.bd.ins().iadd_imm(byte_count, -1);
+        let last_addr = self.bd.ins().iadd(addr, last_offset);
+        let boundary_bits = self.bd.ins().bxor(addr, last_addr);
+        let crosses_4k_bits = self.bd.ins().band_imm(boundary_bits, 0xffff_f000);
+        let crosses_4k = self.bd.ins().icmp_imm(IntCC::NotEqual, crosses_4k_bits, 0);
+        let crosses_256m_bits = self.bd.ins().band_imm(boundary_bits, 0xf000_0000);
+        let crosses_256m = self
+            .bd
+            .ins()
+            .icmp_imm(IntCC::NotEqual, crosses_256m_bits, 0);
+        let addr_low = self.bd.ins().band_imm(addr, 3);
+        let word_aligned = self.bd.ins().icmp_imm(IntCC::Equal, addr_low, 0);
+        let not_word_aligned = self.bd.ins().icmp_imm(IntCC::NotEqual, addr_low, 0);
+        let crosses_misaligned_4k = self.bd.ins().band(not_word_aligned, crosses_4k);
+        let crosses_aligned_256m = self.bd.ins().band(word_aligned, crosses_256m);
+        let boundary_alignment = self
+            .bd
+            .ins()
+            .bor(crosses_misaligned_4k, crosses_aligned_256m);
+        let boundary_alignment = self.bd.ins().band(nonempty, boundary_alignment);
+        let alignment = self.bd.ins().bor(little_endian, boundary_alignment);
+        let alignment_block = self.bd.create_block();
+        let load_block = self.bd.create_block();
+        self.bd.set_cold_block(alignment_block);
+        self.bd
+            .ins()
+            .brif(alignment, alignment_block, &[], load_block, &[]);
+        self.bd.seal_block(alignment_block);
+        self.bd.seal_block(load_block);
+
+        self.switch_to_bb(alignment_block);
+        self.set(SPR::DAR, addr);
+        self.set(SPR::DSISR, indexed_alignment_dsisr(ins.code));
+        self.raise_exception(Exception::Alignment);
+        self.exit_with(LOAD_STRING_INDEXED_INFO);
+
+        self.switch_to_bb(load_block);
+
+        // XER supplies a runtime register range. Publish and invalidate the translation-time
+        // register cache before writing that range directly, then end the block after this
+        // instruction so the next translation reloads every possible destination.
+        self.flush();
+        self.cache.clear();
+
+        // PowerPC permits a multiple/string load to be partially executed on DSI. Commit each
+        // successfully read byte in order, matching the MPC750's discrete accesses and Dolphin's
+        // established Gekko behavior; the faulting byte itself is never committed.
+        let zero = self.ir_value(0u32);
+        let loop_header = self.bd.create_block();
+        let load_byte = self.bd.create_block();
+        let done = self.bd.create_block();
+        self.bd.append_block_param(loop_header, ir::types::I32);
+        self.bd.append_block_param(loop_header, ir::types::I32);
+
+        self.bd.ins().jump(
+            loop_header,
+            &[ir::BlockArg::Value(addr), ir::BlockArg::Value(zero)],
+        );
+
+        self.switch_to_bb(loop_header);
+        let params = self.bd.block_params(loop_header);
+        let current_addr = params[0];
+        let byte_index = params[1];
+        let has_byte = self
+            .bd
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, byte_index, byte_count);
+        self.bd.ins().brif(has_byte, load_byte, &[], done, &[]);
+        self.bd.seal_block(load_byte);
+        self.bd.seal_block(done);
+
+        self.switch_to_bb(load_byte);
+        let value = self.mem_load_with_info::<i8>(current_addr, LOAD_STRING_INDEXED_INFO);
+        let value = self.bd.ins().uextend(ir::types::I32, value);
+
+        let lane = self.bd.ins().band_imm(byte_index, 3);
+        let reverse_lane = self.bd.ins().bxor_imm(lane, 3);
+        let shift = self.bd.ins().ishl_imm(reverse_lane, 3);
+        let value = self.bd.ins().ishl(value, shift);
+
+        let word_index = self.bd.ins().ushr_imm(byte_index, 2);
+        let register_index = self
+            .bd
+            .ins()
+            .iadd_imm(word_index, i64::from(ins.field_rd()));
+        let register_index = self.bd.ins().band_imm(register_index, 31);
+        let register_offset = self.bd.ins().imul_imm(register_index, 4);
+        let register_offset = self.extend_to_pointer_type(register_offset);
+        let gpr_base = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.regs_ptr, GPR::R0.offset() as i64);
+        let register_ptr = self.bd.ins().iadd(gpr_base, register_offset);
+
+        let current = self
+            .bd
+            .ins()
+            .load(ir::types::I32, MEMFLAGS, register_ptr, 0);
+        let first_lane = self.bd.ins().icmp_imm(IntCC::Equal, lane, 0);
+        let current = self.bd.ins().select(first_lane, zero, current);
+        let value = self.bd.ins().bor(current, value);
+        self.bd.ins().store(MEMFLAGS, value, register_ptr, 0);
+
+        let next_addr = self.bd.ins().iadd_imm(current_addr, 1);
+        let next_index = self.bd.ins().iadd_imm(byte_index, 1);
+        self.bd.ins().jump(
+            loop_header,
+            &[
+                ir::BlockArg::Value(next_addr),
+                ir::BlockArg::Value(next_index),
+            ],
+        );
+        self.bd.seal_block(loop_header);
+
+        self.switch_to_bb(done);
+
+        LOAD_STRING_INDEXED_INFO
     }
 
     pub fn lfd(&mut self, ins: Ins) -> InstructionInfo {

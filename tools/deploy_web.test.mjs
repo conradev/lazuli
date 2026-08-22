@@ -31,6 +31,28 @@ test("deployment retains the public WarioWare release gate", async () => {
   );
 });
 
+test("deployment retains the private seven-game compatibility gates", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/deploy-web.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /^\s+tools\/browser_game_compatibility_\*\.test\.mjs$/m,
+  );
+});
+
+test("deployment retains the layered first-playable transcript gates", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/deploy-web.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /^\s+tools\/browser_game_first_playable_\*\.test\.mjs$/m,
+  );
+});
+
 test("deployment retains the passive public SMB observer gates", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/deploy-web.yml", import.meta.url),
@@ -84,4 +106,24 @@ test("deployment builds pinned wasm-bindgen browser renderer assets before the f
     workflow.indexOf("wasm-bindgen\n") < workflow.indexOf("Generate generic frontend"),
     "renderer bindings must be generated before the frontend",
   );
+});
+
+test("deployment validates the raw shared-memory DSP module before frontend generation", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/deploy-web.yml", import.meta.url),
+    "utf8",
+  );
+  const nativeTest = "cargo test -p browser-dsp";
+  const build = "cargo build --release --target wasm32-unknown-unknown -p browser-dsp";
+  const validate =
+    "node tools/browser_dsp_wasm_contract.mjs target/wasm32-unknown-unknown/release/browser_dsp.wasm";
+  const packageArgument = "--dsp target/wasm32-unknown-unknown/release/browser_dsp.wasm";
+  assert.match(workflow, new RegExp(nativeTest.replaceAll("-", "\\-")));
+  assert.match(workflow, new RegExp(build.replaceAll("-", "\\-")));
+  assert.match(workflow, new RegExp(validate.replaceAll(".", "\\.")));
+  assert.match(workflow, new RegExp(packageArgument.replaceAll(".", "\\.")));
+  assert.ok(workflow.indexOf(nativeTest) < workflow.indexOf(build));
+  assert.ok(workflow.indexOf(build) < workflow.indexOf(validate));
+  assert.ok(workflow.indexOf(validate) < workflow.indexOf("Generate generic frontend"));
+  assert.ok(workflow.indexOf(validate) < workflow.indexOf(packageArgument));
 });

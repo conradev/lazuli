@@ -104,6 +104,10 @@ test("producer makes the projection-null source authoritative for the whole draw
     gxExactRequiredVertices: 0,
     gxExactRequiredCaptureMisses: 0,
     gxTexturedDraws: 0,
+    gxDrawStateSnapshots: 0,
+    gxDrawStateMemoHits: 0,
+    gxVertexTransformContextSnapshots: 0,
+    gxVertexTransformContextMemoHits: 0,
     gxTevModeCounts: new Map(),
     gxFrameDraws: [],
     gxTevColorRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
@@ -132,6 +136,10 @@ test("producer makes the projection-null source authoritative for the whole draw
     },
     gxTevStageState() {
       return stage;
+    },
+    gxPrepareVertexTransformContext() {
+      context.gxVertexTransformContextSnapshots += 1;
+      return {};
     },
     gxManagedCoverageStateCandidate() {
       return false;

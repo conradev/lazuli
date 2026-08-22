@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli GX pre-clear atomicity WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body { margin: 2rem; }
+    canvas {
+      width: 128px;
+      height: 128px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli GX pre-clear atomicity WebGPU oracle</h1>
+  <canvas id="oracle" width="4" height="4"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildVaryingRasterOraclePacket,
+    } from "./browser_boot_varying_raster_oracle.mjs";
+    import {
+      buildRasterCenterOraclePacket,
+      rasterCenterOracleXfb,
+    } from "./browser_boot_raster_center_oracle.mjs";
+
+    const WIDTH = 4;
+    const HEIGHT = 4;
+    const TERMINAL_DESTINATION = 0x00120000;
+    const ATOMICITY_DESTINATION = 0x00130000;
+    const STRIPED_GENERATION = 1;
+    const TERMINAL_GENERATION = 2;
+    const ATOMICITY_GENERATION = 3;
+    const Z_UPDATE = 1 << 4;
+    const COLOR_ALPHA_UPDATE = (1 << 3) | (1 << 4);
+    const RED = [255, 0, 0, 255];
+    const GREEN = [0, 255, 0, 255];
+    const BLUE = [0, 0, 255, 255];
+    const BLACK = [0, 0, 0, 255];
+
+    function terminalClearPacket() {
+      const packet = buildRasterCenterOraclePacket(
+        [],
+        STRIPED_GENERATION,
+      ).slice();
+      const view = new DataView(
+        packet.buffer,
+        packet.byteOffset,
+        packet.byteLength,
+      );
+      view.setUint32(0x70, 1, true);
+      packet.set(BLUE, 0x74);
+      view.setUint32(0x80, Z_UPDATE, true);
+      view.setUint32(0x84, COLOR_ALPHA_UPDATE, true);
+      view.setUint32(0x8c, 0x4803, true);
+      view.setUint32(0x90, 0x00333333, true);
+      return packet;
+    }
+
+    function distinctPreClears() {
+      return new Uint32Array([
+        0, 0, 1, HEIGHT,
+        Z_UPDATE, COLOR_ALPHA_UPDATE, 0,
+        ...RED,
+        0x00111111,
+        1, 0, 1, HEIGHT,
+        Z_UPDATE, COLOR_ALPHA_UPDATE, 0,
+        ...GREEN,
+        0x00222222,
+      ]);
+    }
+
+    function invalidExecutionPacket() {
+      const packet = buildVaryingRasterOraclePacket("raster0", 99).slice();
+      const view = new DataView(
+        packet.buffer,
+        packet.byteOffset,
+        packet.byteLength,
+      );
+      // A nonempty, in-range height remains structurally valid LZGX, but it
+      // disagrees with BP4E's identity scale and must fail terminal-copy
+      // execution planning before any encoded pre-clear is submitted.
+      view.setUint32(0x60, HEIGHT - 1, true);
+      return packet;
+    }
+
+    function magentaPreClear() {
+      return new Uint32Array([
+        0, 0, WIDTH, HEIGHT,
+        0, 1 << 3, 0,
+        255, 0, 255, 255,
+        0,
+      ]);
+    }
+
+    function expectedStripedXfb() {
+      return Array.from({ length: HEIGHT }, () => [
+        ...RED,
+        ...GREEN,
+        ...BLACK,
+        ...BLACK,
+      ]).flat();
+    }
+
+    function isUniform(rgba, expected) {
+      if (rgba.length !== WIDTH * HEIGHT * 4) return false;
+      for (let offset = 0; offset < rgba.length; offset += 4) {
+        for (let channel = 0; channel < 4; channel += 1) {
+          if (rgba[offset + channel] !== expected[channel]) return false;
+        }
+      }
+      return true;
+    }
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length
+        && actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    function present(renderer, destination, generation) {
+      return renderer.present_xfb(
+        destination,
+        generation,
+        0,
+        "progressive",
+        "top",
+        generation,
+        WIDTH,
+        HEIGHT,
+        WIDTH * 4,
+        HEIGHT,
+        1,
+        false,
+        false,
+      );
+    }
+
+    async function run() {
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const renderer = await WebGpuRenderer.create(canvas);
+      try {
+        renderer.reset_diagnostics();
+        renderer.reset();
+        renderer.submit_gx_frame(
+          terminalClearPacket(),
+          distinctPreClears(),
+        );
+        const stripedPresentation = present(
+          renderer,
+          rasterCenterOracleXfb.destination,
+          STRIPED_GENERATION,
+        );
+        await renderer.drain();
+        const stripedReadback = await renderer.read_presented_xfb_rgba();
+        const stripedRgba = Array.from(stripedReadback.rgba);
+        const expectedStripedRgba = expectedStripedXfb();
+        const distinctPreClearsPreserved = bytesEqual(
+          stripedRgba,
+          expectedStripedRgba,
+        );
+
+        renderer.copy_xfb(
+          0, 0, WIDTH, HEIGHT,
+          WIDTH, HEIGHT,
+          TERMINAL_DESTINATION, WIDTH * 4, TERMINAL_GENERATION,
+          false,
+          0, 0, 0,
+          0, 0, 0, 255, 0,
+        );
+        const terminalPresentation = present(
+          renderer,
+          TERMINAL_DESTINATION,
+          TERMINAL_GENERATION,
+        );
+        await renderer.drain();
+        const terminalReadback = await renderer.read_presented_xfb_rgba();
+        const terminalRgba = Array.from(terminalReadback.rgba);
+        const terminalClearPreserved = isUniform(terminalRgba, BLUE);
+
+        renderer.reset();
+        await renderer.drain();
+        let rejection = null;
+        try {
+          renderer.submit_gx_frame(
+            invalidExecutionPacket(),
+            magentaPreClear(),
+          );
+        } catch (error) {
+          rejection = error instanceof Error ? error.message : String(error);
+        }
+        renderer.copy_xfb(
+          0, 0, WIDTH, HEIGHT,
+          WIDTH, HEIGHT,
+          ATOMICITY_DESTINATION, WIDTH * 4, ATOMICITY_GENERATION,
+          false,
+          0, 0, 0,
+          0, 0, 0, 255, 0,
+        );
+        const atomicityPresentation = present(
+          renderer,
+          ATOMICITY_DESTINATION,
+          ATOMICITY_GENERATION,
+        );
+        await renderer.drain();
+        const atomicityReadback = await renderer.read_presented_xfb_rgba();
+        const atomicityRgba = Array.from(atomicityReadback.rgba);
+        const rejectedBeforeEfbMutation = isUniform(
+          atomicityRgba,
+          BLACK,
+        );
+        renderer.check_health();
+        const result = {
+          pass:
+            distinctPreClearsPreserved
+            && terminalClearPreserved
+            && rejection?.includes(
+              "does not match copy-scale materialization",
+            ) === true
+            && stripedPresentation.accepted === true
+            && stripedPresentation.presented === true
+            && terminalPresentation.accepted === true
+            && terminalPresentation.presented === true
+            && atomicityPresentation.accepted === true
+            && atomicityPresentation.presented === true
+            && stripedReadback.width === WIDTH
+            && stripedReadback.height === HEIGHT
+            && terminalReadback.width === WIDTH
+            && terminalReadback.height === HEIGHT
+            && atomicityReadback.width === WIDTH
+            && atomicityReadback.height === HEIGHT
+            && rejectedBeforeEfbMutation,
+          strictWebGpu: true,
+          distinctPreClearsPreserved,
+          terminalClearPreserved,
+          rejectedBeforeEfbMutation,
+          rejection,
+          striped: {
+            presentation: stripedPresentation,
+            width: stripedReadback.width,
+            height: stripedReadback.height,
+            expectedRgba: expectedStripedRgba,
+            rgba: stripedRgba,
+          },
+          terminal: {
+            presentation: terminalPresentation,
+            width: terminalReadback.width,
+            height: terminalReadback.height,
+            expectedRgba: Array.from(
+              { length: WIDTH * HEIGHT },
+              () => BLUE,
+            ).flat(),
+            rgba: terminalRgba,
+          },
+          atomicity: {
+            presentation: atomicityPresentation,
+            width: atomicityReadback.width,
+            height: atomicityReadback.height,
+            rgba: atomicityRgba,
+          },
+          diagnostics: renderer.diagnostics(),
+          health: "clean",
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliPreClearAtomicityOraclePromise =
+      run().catch((error) => {
+        const result = {
+          pass: false,
+          error: error instanceof Error ? error.stack : String(error),
+        };
+        document.body.dataset.status = "error";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      });
+  </script>
+</body>
+</html>

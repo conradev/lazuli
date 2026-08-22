@@ -1,0 +1,145 @@
+{
+  "schema": "lazuli-game-compatibility-corpus-v1",
+  "renderer": "wgpu-webgpu",
+  "fallbacks": false,
+  "publicGameRoutes": false,
+  "evidence": {
+    "sustainedViFields": 120,
+    "viewportFrames": 64
+  },
+  "games": [
+    {
+      "key": "warioware-usa",
+      "priority": 1,
+      "file": "WarioWare, Inc. - Mega Party Game$! (USA).ciso",
+      "bytes": 889225792,
+      "image": {
+        "format": "ciso",
+        "sha256": "b8c33924afed0fec165afc3fe0d6e8dddfcdef53842fcae180560b3b904b4a81"
+      },
+      "disc": {
+        "identifier": "GZWE01",
+        "revision": 0
+      },
+      "milestone": {
+        "id": "live-microgame",
+        "description": "Reach a live microgame or party-game round.",
+        "inputWitness": "An A-button action is consumed and changes guest game state."
+      }
+    },
+    {
+      "key": "luigis-mansion-usa",
+      "priority": 2,
+      "file": "Luigi's Mansion (USA, Canada).ciso",
+      "bytes": 199262784,
+      "image": {
+        "format": "ciso",
+        "sha256": "a868fd4bcf4d304aae74fb32ddb067e605d64db35e035c248a630d05a7d8ac4f"
+      },
+      "disc": {
+        "identifier": "GLME01",
+        "revision": 0
+      },
+      "milestone": {
+        "id": "controllable-foyer",
+        "description": "Reach controllable mansion gameplay.",
+        "inputWitness": "Movement or turning input is consumed and changes guest game state."
+      }
+    },
+    {
+      "key": "wind-waker-usa",
+      "priority": 3,
+      "file": "Legend of Zelda, The - The Wind Waker (USA, Canada).ciso",
+      "bytes": 1088455232,
+      "image": {
+        "format": "ciso",
+        "sha256": "677726191ba8cc0829e9baa731c14eeff95ba399e1fe40a4f2473e7b8e0c80ac"
+      },
+      "disc": {
+        "identifier": "GZLE01",
+        "revision": 0
+      },
+      "milestone": {
+        "id": "controllable-outset-island",
+        "description": "Reach controllable Outset Island gameplay.",
+        "inputWitness": "Movement input is consumed and changes guest game state."
+      }
+    },
+    {
+      "key": "melee-usa-rev-2",
+      "priority": 4,
+      "file": "Super Smash Bros. Melee (USA) (En,Ja) (Rev 2).ciso",
+      "bytes": 1449165376,
+      "image": {
+        "format": "ciso",
+        "sha256": "b7de482eb955c8a96b6746dfa043b69ae7bf6c7c2a09ac382b9da126faa7055c"
+      },
+      "disc": {
+        "identifier": "GALE01",
+        "revision": 2
+      },
+      "milestone": {
+        "id": "active-match",
+        "description": "Start and sustain an active match.",
+        "inputWitness": "Movement or attack input is consumed and changes guest game state."
+      }
+    },
+    {
+      "key": "f-zero-gx-usa",
+      "priority": 5,
+      "file": "F-Zero GX (USA).ciso",
+      "bytes": 1438679616,
+      "image": {
+        "format": "ciso",
+        "sha256": "3d45ca0cdd5ed408c4dd417bc0a1691ef48b7d59fab123963bd9e934be6ee91e"
+      },
+      "disc": {
+        "identifier": "GFZE01",
+        "revision": 0
+      },
+      "milestone": {
+        "id": "active-race",
+        "description": "Reach an active race after the countdown.",
+        "inputWitness": "Steering input is consumed and changes guest game state."
+      }
+    },
+    {
+      "key": "metroid-prime-usa-rev-2",
+      "priority": 6,
+      "file": "Metroid Prime (USA) (Rev 2).ciso",
+      "bytes": 1344307776,
+      "image": {
+        "format": "ciso",
+        "sha256": "f168d1da2ab7055c1b7fa4976c69d93c17a59057dfca936871a6539958825ffd"
+      },
+      "disc": {
+        "identifier": "GM8E01",
+        "revision": 2
+      },
+      "milestone": {
+        "id": "controllable-frigate",
+        "description": "Reach live first-person gameplay on the Frigate Orpheon.",
+        "inputWitness": "Movement or view input is consumed and changes guest game state."
+      }
+    },
+    {
+      "key": "rogue-leader-usa",
+      "priority": 7,
+      "file": "Star Wars - Rogue Squadron II - Rogue Leader (USA).ciso",
+      "bytes": 1400930880,
+      "image": {
+        "format": "ciso",
+        "sha256": "f045960fc62aa885b05cb7eb725436cfbbb17221e38b0f7e8fadb8408e710686"
+      },
+      "disc": {
+        "identifier": "GSWE64",
+        "revision": 0
+      },
+      "milestone": {
+        "id": "active-flight",
+        "description": "Reach an active controllable flight mission.",
+        "inputWitness": "Steering input is consumed and changes guest game state."
+      }
+    }
+  ]
+}

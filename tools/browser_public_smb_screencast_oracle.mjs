@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+import { createHash } from "node:crypto";
+
 import { SUPER_MONKEY_BALL_READY_CHECKPOINT } from "./browser_boot_checkpoint_v3.mjs";
 import {
   validateSmbReadyPlayGameplayTranscript,
 } from "./browser_boot_gameplay_transcript.mjs";
+import {
+  SMB_SUSTAINED_PLAY_SCHEMA_V5,
+  verifySmbSustainedPlay,
+} from "./browser_boot_smb_sustained_play.mjs";
 
-const REPORT_SCHEMA = "lazuli-public-smb-screencast-v1";
+const REPORT_SCHEMA = "lazuli-public-smb-screencast-v6";
 const FRAME_COUNT = 64;
+const MIN_WINDOW_VI_RECEIPTS = 64;
 const WIDTH = 1024;
 const HEIGHT = 768;
 const PIXELS = WIDTH * HEIGHT;
@@ -63,6 +70,23 @@ function canonicalJson(value) {
     );
   }
   return value;
+}
+
+function exactJson(value, expected, path) {
+  if (
+    JSON.stringify(canonicalJson(value))
+    !== JSON.stringify(canonicalJson(expected))
+  ) {
+    fail(path, "expected an exact canonical JSON match");
+  }
+}
+
+function canonicalJsonIdentity(value) {
+  const serialized = JSON.stringify(canonicalJson(value));
+  return {
+    bytes: Buffer.byteLength(serialized),
+    sha256: createHash("sha256").update(serialized).digest("hex"),
+  };
 }
 
 function boolean(value, path) {
@@ -141,18 +165,20 @@ function releaseIdentity(value, path) {
   exactKeys(value, [
     "backend",
     "commit",
+    "dsp",
     "frontend",
     "releaseId",
     "renderer",
     "schema",
   ], path);
-  exact(value.schema, 2, `${path}.schema`);
+  exact(value.schema, 3, `${path}.schema`);
   hash(value.commit, `${path}.commit`, 40);
   hash(value.releaseId, `${path}.releaseId`);
   asset(value.frontend, `${path}.frontend`, ".html");
   exactKeys(value.renderer, ["javascript", "wasm"], `${path}.renderer`);
   asset(value.renderer.javascript, `${path}.renderer.javascript`, ".js");
   asset(value.renderer.wasm, `${path}.renderer.wasm`, ".wasm");
+  asset(value.dsp, `${path}.dsp`, ".wasm");
   exactKeys(value.backend, ["bytes", "sha256", "url"], `${path}.backend`);
   positiveInteger(value.backend.bytes, `${path}.backend.bytes`);
   hash(value.backend.sha256, `${path}.backend.sha256`);
@@ -313,9 +339,17 @@ function rgbPopulation(value, path) {
   return { black, other, unique, white };
 }
 
-function frame(value, path, ordinal, previous) {
-  exactKeys(value, ["metadata", "ordinal", "png", "receivedAtMs", "sessionId"], path);
-  exact(value.ordinal, ordinal, `${path}.ordinal`);
+function frame(value, path, selectedOrdinal, receivedOrdinal, previous) {
+  exactKeys(value, [
+    "metadata",
+    "png",
+    "receivedAtMs",
+    "receivedOrdinal",
+    "selectedOrdinal",
+    "sessionId",
+  ], path);
+  exact(value.selectedOrdinal, selectedOrdinal, `${path}.selectedOrdinal`);
+  exact(value.receivedOrdinal, receivedOrdinal, `${path}.receivedOrdinal`);
   const sessionId = positiveInteger(value.sessionId, `${path}.sessionId`);
   // CDP exposes sessionId as the opaque token for Page.screencastFrameAck;
   // Chrome may reuse it across frames. Ordinals plus the independent metadata
@@ -426,7 +460,7 @@ function navigationProof(value, path, publicUrl, release) {
   );
 }
 
-function terminalTailProof(value, path, frames) {
+function terminalTailProof(value, path, frames, terminalReceivedOrdinal) {
   exactKeys(value, [
     "firstReceivedAtMs",
     "lastReceivedAtMs",
@@ -437,11 +471,17 @@ function terminalTailProof(value, path, frames) {
     "receiptSpanMs",
     "terminalMetadataAgeMs",
     "terminalObservedAtMs",
+    "terminalReceivedOrdinal",
     "terminalTailAgeMs",
   ], path);
   const terminalObservedAtMs = positiveInteger(
     value.terminalObservedAtMs,
     `${path}.terminalObservedAtMs`,
+  );
+  exact(
+    value.terminalReceivedOrdinal,
+    terminalReceivedOrdinal,
+    `${path}.terminalReceivedOrdinal`,
   );
   const firstReceivedAtMs = positiveInteger(
     frames[0].receivedAtMs,
@@ -467,10 +507,9 @@ function terminalTailProof(value, path, frames) {
     frames.at(-1).metadata.timestamp - frames[0].metadata.timestamp
   ) * 1_000;
   const receiptSpanMs = lastReceivedAtMs - firstReceivedAtMs;
-  const terminalMetadataAgeMs = Math.abs(
-    terminalObservedAtMs - frames.at(-1).metadata.timestamp * 1_000,
-  );
-  const terminalTailAgeMs = Math.abs(terminalObservedAtMs - lastReceivedAtMs);
+  const terminalMetadataAgeMs =
+    terminalObservedAtMs - frames.at(-1).metadata.timestamp * 1_000;
+  const terminalTailAgeMs = terminalObservedAtMs - lastReceivedAtMs;
   exact(value.firstReceivedAtMs, firstReceivedAtMs, `${path}.firstReceivedAtMs`);
   exact(value.lastReceivedAtMs, lastReceivedAtMs, `${path}.lastReceivedAtMs`);
   exact(value.metadataSpanMs, metadataSpanMs, `${path}.metadataSpanMs`);
@@ -500,6 +539,8 @@ function terminalTailProof(value, path, frames) {
     || maxReceiptGapMs > MAX_FRAME_GAP_MS
     || metadataSpanMs > MAX_TAIL_SPAN_MS
     || receiptSpanMs > MAX_TAIL_SPAN_MS
+    || terminalMetadataAgeMs < 0
+    || terminalTailAgeMs < 0
     || terminalMetadataAgeMs > MAX_TERMINAL_TAIL_AGE_MS
     || terminalTailAgeMs > MAX_TERMINAL_TAIL_AGE_MS
   ) {
@@ -513,18 +554,18 @@ function terminalProof(value, path) {
     "disc",
     "gameplayTranscript",
     "rendering",
+    "report",
     "reportBytes",
     "reportSha256",
     "scenario",
     "scheduler",
     "stage",
     "status",
+    "sustainedPlay",
   ], path);
   exact(value.status, "paused", `${path}.status`);
   exact(value.stage, "scenario-complete", `${path}.stage`);
   const cycles = positiveInteger(value.cycles, `${path}.cycles`);
-  positiveInteger(value.reportBytes, `${path}.reportBytes`);
-  hash(value.reportSha256, `${path}.reportSha256`);
   exactKeys(value.disc, ["identifier", "revision", "sourceKind"], `${path}.disc`);
   exact(value.disc.identifier, "GMBE8P", `${path}.disc.identifier`);
   exact(value.disc.revision, 0, `${path}.disc.revision`);
@@ -541,19 +582,90 @@ function terminalProof(value, path) {
     "stepCount",
     "stepIndex",
   ], `${path}.scenario`);
-  exact(value.scenario.id, "smb-ready-play", `${path}.scenario.id`);
+  exact(value.scenario.id, "smb-sustained-play", `${path}.scenario.id`);
   exact(value.scenario.gameIdentifier, "GMBE8P", `${path}.scenario.gameIdentifier`);
   exact(value.scenario.status, "complete", `${path}.scenario.status`);
   exact(value.scenario.failure, null, `${path}.scenario.failure`);
   exact(value.scenario.currentStep, null, `${path}.scenario.currentStep`);
   exact(value.scenario.startCycle, 0, `${path}.scenario.startCycle`);
-  exact(value.scenario.hardCycleLimit, 30_000_000_000, `${path}.scenario.hardCycleLimit`);
+  exact(value.scenario.hardCycleLimit, 32_000_000_000, `${path}.scenario.hardCycleLimit`);
   exact(value.scenario.completedCycle, cycles, `${path}.scenario.completedCycle`);
   if (cycles >= value.scenario.hardCycleLimit) {
     fail(`${path}.scenario.completedCycle`, "scenario reached its hard cycle limit");
   }
-  const stepCount = positiveInteger(value.scenario.stepCount, `${path}.scenario.stepCount`);
-  exact(value.scenario.stepIndex, stepCount, `${path}.scenario.stepIndex`);
+  exact(value.scenario.stepCount, 15, `${path}.scenario.stepCount`);
+  exact(value.scenario.stepIndex, 15, `${path}.scenario.stepIndex`);
+
+  const report = object(value.report, `${path}.report`);
+  if (report.error !== undefined && report.error !== null) {
+    fail(`${path}.report.error`, "expected no terminal report error");
+  }
+  const serialized = JSON.stringify(report);
+  exact(
+    positiveInteger(value.reportBytes, `${path}.reportBytes`),
+    Buffer.byteLength(serialized),
+    `${path}.reportBytes`,
+  );
+  exact(
+    hash(value.reportSha256, `${path}.reportSha256`),
+    createHash("sha256").update(serialized).digest("hex"),
+    `${path}.reportSha256`,
+  );
+  exact(report.status, value.status, `${path}.report.status`);
+  exact(report.stage, value.stage, `${path}.report.stage`);
+  exact(report.cycles, value.cycles, `${path}.report.cycles`);
+  for (const name of [
+    "id",
+    "gameIdentifier",
+    "status",
+    "hardCycleLimit",
+    "startCycle",
+    "completedCycle",
+    "failure",
+    "currentStep",
+    "stepIndex",
+  ]) {
+    exact(
+      report.scenario?.[name],
+      value.scenario[name],
+      `${path}.report.scenario.${name}`,
+    );
+  }
+  exact(
+    report.scenario?.steps?.length,
+    value.scenario.stepCount,
+    `${path}.report.scenario.steps.length`,
+  );
+  exact(
+    report.disc?.identifier,
+    value.disc.identifier,
+    `${path}.report.disc.identifier`,
+  );
+  exact(
+    report.disc?.revision,
+    value.disc.revision,
+    `${path}.report.disc.revision`,
+  );
+  exact(
+    report.disc?.source?.kind,
+    value.disc.sourceKind,
+    `${path}.report.disc.source.kind`,
+  );
+  exact(
+    report.sustainedPlay?.schema,
+    SMB_SUSTAINED_PLAY_SCHEMA_V5,
+    `${path}.report.sustainedPlay.schema`,
+  );
+  let sustainedPlay;
+  try {
+    sustainedPlay = verifySmbSustainedPlay(report);
+  } catch (error) {
+    fail(
+      `${path}.report`,
+      `strict sustained-play validation failed: ${error.message ?? String(error)}`,
+    );
+  }
+  exactJson(value.sustainedPlay, sustainedPlay, `${path}.sustainedPlay`);
   try {
     validateSmbReadyPlayGameplayTranscript(value.gameplayTranscript);
   } catch (error) {
@@ -571,19 +683,173 @@ function terminalProof(value, path) {
   );
   exact(
     value.gameplayTranscript.scenario.completedCycle,
-    cycles,
+    report.sustainedPlay.readyPlayAnchor.cycles,
     `${path}.gameplayTranscript.scenario.completedCycle`,
   );
   exact(
     value.gameplayTranscript.steps.length,
-    stepCount,
+    13,
     `${path}.gameplayTranscript.steps.length`,
+  );
+  exactJson(
+    value.gameplayTranscript,
+    report.gameplayTranscript,
+    `${path}.gameplayTranscript`,
   );
   exactKeys(value.rendering, ["backend", "error"], `${path}.rendering`);
   exact(value.rendering.backend, "wgpu-webgpu", `${path}.rendering.backend`);
   exact(value.rendering.error, null, `${path}.rendering.error`);
+  exact(
+    report.rendering?.backend,
+    value.rendering.backend,
+    `${path}.report.rendering.backend`,
+  );
+  exact(
+    report.rendering?.error ?? null,
+    value.rendering.error,
+    `${path}.report.rendering.error`,
+  );
   exactKeys(value.scheduler, ["renderEvery"], `${path}.scheduler`);
   exact(value.scheduler.renderEvery, 1, `${path}.scheduler.renderEvery`);
+  exact(
+    report.execution?.scheduler?.renderEvery,
+    value.scheduler.renderEvery,
+    `${path}.report.execution.scheduler.renderEvery`,
+  );
+  return report;
+}
+
+function sustainedWindowProof(value, path, report, screencast) {
+  exactKeys(value, [
+    "acceptedReceipts",
+    "lastPresentationSerial",
+    "lastReceiptOrdinal",
+    "lastRendererSequence",
+    "observedAtMs",
+    "observedCycle",
+    "pendingReceipts",
+    "postedReceipts",
+    "receivedFramesBeforeWindow",
+    "receiptPrefixBytes",
+    "receiptPrefixSha256",
+    "scenario",
+    "snapshotRequestedAtMs",
+    "step",
+  ], path);
+  exact(value.scenario, "smb-sustained-play", `${path}.scenario`);
+  exact(value.step, "sustained-play-presented", `${path}.step`);
+  const observedAtMs = positiveInteger(value.observedAtMs, `${path}.observedAtMs`);
+  const snapshotRequestedAtMs = positiveInteger(
+    value.snapshotRequestedAtMs,
+    `${path}.snapshotRequestedAtMs`,
+  );
+  if (snapshotRequestedAtMs > observedAtMs) {
+    fail(
+      `${path}.snapshotRequestedAtMs`,
+      "snapshot request cannot postdate window observation",
+    );
+  }
+  const observedCycle = positiveInteger(value.observedCycle, `${path}.observedCycle`);
+  const receivedFramesBeforeWindow = nonNegativeInteger(
+    value.receivedFramesBeforeWindow,
+    `${path}.receivedFramesBeforeWindow`,
+  );
+  const postedReceipts = nonNegativeInteger(
+    value.postedReceipts,
+    `${path}.postedReceipts`,
+  );
+  const acceptedReceipts = nonNegativeInteger(
+    value.acceptedReceipts,
+    `${path}.acceptedReceipts`,
+  );
+  const pendingReceipts = nonNegativeInteger(
+    value.pendingReceipts,
+    `${path}.pendingReceipts`,
+  );
+  if (
+    postedReceipts
+      > report.sustainedPlay.capacity - MIN_WINDOW_VI_RECEIPTS
+    || acceptedReceipts < 2
+    || acceptedReceipts + pendingReceipts !== postedReceipts
+  ) {
+    fail(
+      path,
+      `window must leave at least ${MIN_WINDOW_VI_RECEIPTS} sustained VI receipts`,
+    );
+  }
+  if (
+    screencast.receivedFrames - receivedFramesBeforeWindow
+    < FRAME_COUNT
+    || screencast.firstReceivedOrdinal <= receivedFramesBeforeWindow
+  ) {
+    fail(path, `expected all ${FRAME_COUNT} selected frames after window entry`);
+  }
+  const receiptPrefix = report.sustainedPlay.receipts.slice(0, acceptedReceipts);
+  const lastReceipt = receiptPrefix.at(-1);
+  exact(
+    positiveInteger(value.lastReceiptOrdinal, `${path}.lastReceiptOrdinal`),
+    lastReceipt.ordinal,
+    `${path}.lastReceiptOrdinal`,
+  );
+  exact(
+    positiveInteger(value.lastRendererSequence, `${path}.lastRendererSequence`),
+    lastReceipt.rendererSequence,
+    `${path}.lastRendererSequence`,
+  );
+  const prefixIdentity = canonicalJsonIdentity(receiptPrefix);
+  exact(
+    positiveInteger(value.receiptPrefixBytes, `${path}.receiptPrefixBytes`),
+    prefixIdentity.bytes,
+    `${path}.receiptPrefixBytes`,
+  );
+  exact(
+    hash(value.receiptPrefixSha256, `${path}.receiptPrefixSha256`),
+    prefixIdentity.sha256,
+    `${path}.receiptPrefixSha256`,
+  );
+  const expectedPresentationSerial = receiptPrefix
+    .filter(receipt => receipt?.presented === true)
+    .at(-1)?.presentationSerial ?? null;
+  positiveInteger(
+    value.lastPresentationSerial,
+    `${path}.lastPresentationSerial`,
+  );
+  exact(
+    value.lastPresentationSerial,
+    expectedPresentationSerial,
+    `${path}.lastPresentationSerial`,
+  );
+  if (
+    report.sustainedPlay.posted - postedReceipts
+    < MIN_WINDOW_VI_RECEIPTS
+  ) {
+    fail(
+      `${path}.postedReceipts`,
+      `terminal report advanced fewer than ${MIN_WINDOW_VI_RECEIPTS} VI receipts`,
+    );
+  }
+  if (report.cycles <= observedCycle) {
+    fail(`${path}.observedCycle`, "terminal report did not advance past window cycle");
+  }
+  const firstFrame = screencast.frames[0];
+  if (
+    firstFrame !== undefined
+    && firstFrame.receivedAtMs < observedAtMs
+  ) {
+    fail(`${path}.observedAtMs`, "selected tail begins before window observation");
+  }
+  if (
+    firstFrame !== undefined
+    && firstFrame.metadata.timestamp * 1_000 < observedAtMs
+  ) {
+    fail(
+      `${path}.observedAtMs`,
+      "selected tail contains a frame captured before window observation",
+    );
+  }
+  if (screencast.terminalTail?.terminalObservedAtMs < observedAtMs) {
+    fail(`${path}.observedAtMs`, "terminal observation predates window entry");
+  }
 }
 
 export function verifyPublicSmbScreencastReport(report) {
@@ -606,8 +872,8 @@ export function verifyPublicSmbScreencastReport(report) {
     "terminalRelease",
   ], "$");
   exact(report.schema, REPORT_SCHEMA, "$.schema");
-  exact(report.mode, "passive-public-viewport", "$.mode");
-  exact(report.alignment, "non-serial-aligned", "$.alignment");
+  exact(report.mode, "sustained-public-viewport", "$.mode");
+  exact(report.alignment, "sustained-window-bounded", "$.alignment");
   exactKeys(report.rendererControl, [
     "compositorHandshake",
     "renderEveryOverride",
@@ -630,7 +896,7 @@ export function verifyPublicSmbScreencastReport(report) {
   exact(report.discImage.sha256, expectedImage.sha256, "$.discImage.sha256");
   captureState(report.before, "$.before", publicUrl, report.release, "running");
   captureState(report.after, "$.after", publicUrl, report.release, "paused");
-  terminalProof(report.terminal, "$.terminal");
+  const terminalReport = terminalProof(report.terminal, "$.terminal");
   if (JSON.stringify(report.before.geometry) !== JSON.stringify(report.after.geometry)) {
     fail("$.after.geometry", "public iframe/canvas geometry changed during the screencast");
   }
@@ -648,17 +914,23 @@ export function verifyPublicSmbScreencastReport(report) {
     "height",
     "lastReceivedOrdinal",
     "protocol",
+    "postTerminalFrames",
     "receivedFrames",
     "selection",
     "terminalTail",
     "width",
+    "window",
   ], "$.screencast");
   exact(report.screencast.protocol, "cdp-page-screencast-v1", "$.screencast.protocol");
   exact(report.screencast.format, "png", "$.screencast.format");
   exact(report.screencast.everyNthFrame, 1, "$.screencast.everyNthFrame");
   exact(report.screencast.width, WIDTH, "$.screencast.width");
   exact(report.screencast.height, HEIGHT, "$.screencast.height");
-  exact(report.screencast.selection, "rolling-tail", "$.screencast.selection");
+  exact(
+    report.screencast.selection,
+    "sustained-window-tail",
+    "$.screencast.selection",
+  );
   exact(report.screencast.capacityFrames, FRAME_COUNT, "$.screencast.capacityFrames");
   const received = positiveInteger(report.screencast.receivedFrames, "$.screencast.receivedFrames");
   if (received < FRAME_COUNT) fail("$.screencast.receivedFrames", `expected at least ${FRAME_COUNT}`);
@@ -667,19 +939,35 @@ export function verifyPublicSmbScreencastReport(report) {
     received,
     "$.screencast.acknowledgedFrames",
   );
+  const lastReceivedOrdinal = positiveInteger(
+    report.screencast.lastReceivedOrdinal,
+    "$.screencast.lastReceivedOrdinal",
+  );
+  if (lastReceivedOrdinal > received) {
+    fail("$.screencast.lastReceivedOrdinal", "terminal ordinal exceeds received frames");
+  }
   exact(
     report.screencast.firstReceivedOrdinal,
-    received - FRAME_COUNT + 1,
+    lastReceivedOrdinal - FRAME_COUNT + 1,
     "$.screencast.firstReceivedOrdinal",
   );
   exact(
-    report.screencast.lastReceivedOrdinal,
-    received,
-    "$.screencast.lastReceivedOrdinal",
+    nonNegativeInteger(
+      report.screencast.postTerminalFrames,
+      "$.screencast.postTerminalFrames",
+    ),
+    received - lastReceivedOrdinal,
+    "$.screencast.postTerminalFrames",
   );
   if (!Array.isArray(report.screencast.frames) || report.screencast.frames.length !== FRAME_COUNT) {
     fail("$.screencast.frames", `expected exactly ${FRAME_COUNT} summarized frames`);
   }
+  sustainedWindowProof(
+    report.screencast.window,
+    "$.screencast.window",
+    terminalReport,
+    report.screencast,
+  );
   boolean(report.oraclePassed, "$.oraclePassed");
   const pendingOracle = report.oracle === null && report.oraclePassed === false;
   const storedOracle = report.oracle !== null;
@@ -703,6 +991,7 @@ export function verifyPublicSmbScreencastReport(report) {
       entry,
       `$.screencast.frames[${index}]`,
       index + 1,
+      report.screencast.firstReceivedOrdinal + index,
       previous,
     );
     distinctPng.add(entry.png.pngSha256);
@@ -726,13 +1015,16 @@ export function verifyPublicSmbScreencastReport(report) {
         toOrdinal: index + 1,
       });
     }
-    previousExtreme = extreme === null ? null : { color: extreme, ordinal: index + 1 };
+    if (extreme !== null) {
+      previousExtreme = { color: extreme, ordinal: index + 1 };
+    }
     previous = validated;
   }
   terminalTailProof(
     report.screencast.terminalTail,
     "$.screencast.terminalTail",
     report.screencast.frames,
+    lastReceivedOrdinal,
   );
 
   const oracle = {
@@ -765,6 +1057,24 @@ export function verifyPublicSmbScreencastReport(report) {
     fail(
       "$.oracle.oppositeExtremeTransitions",
       `observed ${oppositeExtremeTransitions.length} near-black/near-white transitions`,
+    );
+  }
+  if (nearBlackOrdinals.length !== 0) {
+    fail(
+      "$.oracle.nearBlackOrdinals",
+      `observed ${nearBlackOrdinals.length} near-black viewport frames`,
+    );
+  }
+  if (nearWhiteOrdinals.length !== 0) {
+    fail(
+      "$.oracle.nearWhiteOrdinals",
+      `observed ${nearWhiteOrdinals.length} near-white viewport frames`,
+    );
+  }
+  if (monochromeOrdinals.length !== 0) {
+    fail(
+      "$.oracle.monochromeOrdinals",
+      `observed ${monochromeOrdinals.length} monochrome viewport frames`,
     );
   }
   if (storedOracle && report.oraclePassed === false) {

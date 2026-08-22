@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  CLIP_DISABLE_GUARDBAND_ADJACENT_OUTWARD,
+  CLIP_DISABLE_GUARDBAND_MODES,
+  CLIP_DISABLE_GUARDBAND_RUN_COUNT,
+  CLIP_DISABLE_GUARDBAND_SCOPE,
+  buildClipDisableGuardbandOraclePacket,
+  clipDisableGuardbandCases,
+  clipDisableGuardbandCertificationMatrix,
+  clipDisableGuardbandExactState,
+  clipDisableGuardbandExpectation,
+  clipDisableGuardbandMaskRows,
+  clipDisableGuardbandOracleXfb,
+  clipDisableGuardbandPacketLayout,
+  evaluateClipDisableGuardband,
+  nextDownF32,
+} from "./browser_boot_clip_disable_guardband_oracle.mjs";
+import {
+  RASTER_BLEND_ADDITIVE_ONE_ONE,
+} from "./browser_boot_raster_center_oracle.mjs";
+
+const f32 = Math.fround;
+
+function float32Bits(value) {
+  const bytes = new ArrayBuffer(4);
+  const view = new DataView(bytes);
+  view.setFloat32(0, value);
+  return view.getUint32(0);
+}
+
+function caseById(caseId) {
+  const entry = clipDisableGuardbandCases.find(
+    (candidate) => candidate.id === caseId,
+  );
+  assert.notEqual(entry, undefined);
+  return entry;
+}
+
+function expectedRows(entries) {
+  const rows = new Array(16).fill(0);
+  for (const [row, mask] of entries) rows[row] = mask;
+  return rows;
+}
+
+function diagnostics() {
+  return {
+    exactRequiredRejectedDraws: 0,
+    exactRequiredRejectionReasons: {
+      exactPreparation: 0,
+      scissor: 0,
+      primitive: 0,
+    },
+    exactRequiredPreparationRejectionReasons: {
+      unsupportedClipDisable1: 0,
+      unsupportedClipDisable2: 0,
+      unsupportedClipDisable3: 0,
+      unsupportedClipDisable4: 0,
+      unsupportedClipDisable5: 0,
+      unsupportedClipDisable6: 0,
+      unsupportedClipDisable7: 0,
+      unsupportedClipDisableOther: 0,
+      invalidPreparedScissor: 0,
+      uncertifiedFaceCull: 0,
+    },
+    managedCoverageDraws: 0,
+    managedCoverageTriangles: 0,
+    exactRasterEmptyDraws: 0,
+    pushTevDrawCalls: 0,
+    submitGxFrameCalls: 0,
+  };
+}
+
+function afterForExpectation(expected) {
+  const after = structuredClone(diagnostics());
+  const rejection = expected.expectedRejection;
+  after.exactRequiredRejectedDraws = rejection.aggregate;
+  after.exactRequiredRejectionReasons.exactPreparation =
+    rejection.exactPreparation;
+  if (rejection.preparationReason !== null) {
+    after.exactRequiredPreparationRejectionReasons[
+      rejection.preparationReason
+    ] = 1;
+  }
+  after.managedCoverageDraws =
+    expected.expectedManagedCoverage.draws;
+  after.managedCoverageTriangles =
+    expected.expectedManagedCoverage.triangles;
+  after.exactRasterEmptyDraws =
+    expected.expectedExactRasterEmptyDraws;
+  after.pushTevDrawCalls = expected.expectedPushTevDrawCalls;
+  after.submitGxFrameCalls = expected.expectedSubmitGxFrameCalls;
+  return after;
+}
+
+function readbackForExpectation(expected) {
+  return {
+    width: clipDisableGuardbandOracleXfb.width,
+    height: clipDisableGuardbandOracleXfb.height,
+    rgba: expected.expectedRgba,
+  };
+}
+
+test("guardband boundary uses exact -2W and its adjacent outward f32", () => {
+  assert.equal(float32Bits(-2), 0xc0000000);
+  assert.equal(float32Bits(nextDownF32(-2)), 0xc0000001);
+  assert.equal(float32Bits(CLIP_DISABLE_GUARDBAND_ADJACENT_OUTWARD), 0xc0000001);
+  assert.equal(
+    CLIP_DISABLE_GUARDBAND_ADJACENT_OUTWARD,
+    -2.000000238418579,
+  );
+
+  const exactX = caseById("negative-x-exact-boundary");
+  const adjacentX = caseById("negative-x-adjacent-outward");
+  assert.equal(exactX.exactClipPositions[0][0], -2);
+  assert.equal(
+    adjacentX.exactClipPositions[0][0],
+    CLIP_DISABLE_GUARDBAND_ADJACENT_OUTWARD,
+  );
+
+  const exactY = caseById("top-y-exact-boundary");
+  const adjacentY = caseById("top-y-adjacent-outward");
+  assert.equal(exactY.exactClipPositions[0][1], 2);
+  assert.equal(float32Bits(adjacentY.exactClipPositions[0][1]), 0x40000001);
+});
+
+test("oracle is explicitly bounded to positive-W, in-EFB unsigned payloads", () => {
+  assert.equal(
+    CLIP_DISABLE_GUARDBAND_SCOPE,
+    "unit-positive-w-in-efb-unsigned",
+  );
+  assert.deepEqual(clipDisableGuardbandOracleXfb, {
+    destination: 0x00110000,
+    width: 16,
+    height: 16,
+    stride: 64,
+  });
+  assert.deepEqual(clipDisableGuardbandExactState.viewport, [
+    2,
+    -2,
+    0x00ffffff,
+    350,
+    350,
+    0x00ffffff,
+  ]);
+
+  for (const entry of clipDisableGuardbandCases) {
+    for (const position of entry.exactClipPositions) {
+      assert.ok(position[3] > 0, `${entry.id} must keep W positive`);
+      const projected = [
+        f32(
+          f32(
+            f32(f32(position[0] / position[3]) * 2) + 350,
+          ) - 342,
+        ),
+        f32(
+          f32(
+            f32(f32(position[1] / position[3]) * -2) + 350,
+          ) - 342,
+        ),
+      ];
+      assert.ok(projected[0] >= 0 && projected[0] <= 16);
+      assert.ok(projected[1] >= 0 && projected[1] <= 16);
+    }
+  }
+});
+
+test("packet builder carries one required-exact additive quad", () => {
+  const generation = 41;
+  const mode = 7;
+  const entry = caseById("negative-x-exact-boundary");
+  const packet = buildClipDisableGuardbandOraclePacket(
+    entry.id,
+    mode,
+    generation,
+  );
+  const view = new DataView(
+    packet.buffer,
+    packet.byteOffset,
+    packet.byteLength,
+  );
+  const layout = clipDisableGuardbandPacketLayout;
+  assert.equal(packet.length, layout.packetBytes);
+  assert.equal(view.getUint16(0x04, true), 6);
+  assert.equal(view.getUint32(0x08, true), packet.length);
+  assert.equal(view.getUint32(0x54, true), 16);
+  assert.equal(view.getUint32(0x58, true), 16);
+  assert.equal(view.getUint32(0x5c, true), 16);
+  assert.equal(view.getUint32(0x60, true), 16);
+  assert.equal(
+    view.getUint32(0x64, true),
+    clipDisableGuardbandOracleXfb.destination,
+  );
+  assert.equal(
+    view.getUint32(0x68, true),
+    clipDisableGuardbandOracleXfb.stride,
+  );
+  assert.equal(view.getUint32(0x6c, true), generation);
+
+  assert.equal(packet[layout.drawOffset], 0);
+  assert.equal(
+    view.getUint16(layout.drawOffset + 0x02, true),
+    layout.drawFlag,
+  );
+  assert.equal(
+    view.getUint32(layout.drawOffset + 0x04, true),
+    layout.vertexCount,
+  );
+  assert.equal(
+    view.getUint32(layout.drawOffset + 0x14, true),
+    RASTER_BLEND_ADDITIVE_ONE_ONE,
+  );
+  assert.deepEqual(
+    [0x1c, 0x20, 0x24, 0x28].map((offset) =>
+      view.getUint32(layout.drawOffset + offset, true)
+    ),
+    [0, 0, 16, 16],
+  );
+  assert.equal(
+    view.getFloat32(layout.drawOffset + 0xac, true),
+    clipDisableGuardbandExactState.viewport[0],
+  );
+
+  const exact = layout.exactChunkOffset;
+  assert.equal(view.getUint32(exact + 0x00, true), 1);
+  assert.equal(
+    view.getUint32(exact + 0x04, true),
+    clipDisableGuardbandExactState.bpGenMode,
+  );
+  assert.equal(
+    view.getUint32(exact + 0x08, true),
+    clipDisableGuardbandExactState.bpScissorTopLeft,
+  );
+  assert.equal(
+    view.getUint32(exact + 0x0c, true),
+    clipDisableGuardbandExactState.bpScissorBottomRight,
+  );
+  assert.equal(
+    view.getUint32(exact + 0x10, true),
+    clipDisableGuardbandExactState.bpScissorOffset,
+  );
+  assert.equal(view.getUint32(exact + 0x14, true), mode);
+  assert.deepEqual(
+    Array.from(
+      { length: clipDisableGuardbandExactState.viewport.length },
+      (_unused, index) =>
+        view.getFloat32(exact + 0x18 + index * 4, true),
+    ),
+    clipDisableGuardbandExactState.viewport,
+  );
+  assert.deepEqual(
+    Array.from(
+      { length: layout.vertexCount * 4 },
+      (_unused, index) =>
+        view.getFloat32(exact + 0x30 + index * 4, true),
+    ),
+    entry.exactClipPositions.flat(),
+  );
+
+  const vertexOffset = layout.vertexOffset;
+  assert.deepEqual(
+    [
+      view.getFloat32(vertexOffset, true),
+      view.getFloat32(vertexOffset + 4, true),
+    ],
+    [4, 6.5],
+  );
+  assert.equal(
+    view.getFloat32(vertexOffset + 2 * 4, true),
+    f32(0x00ffffff / 2),
+  );
+  assert.deepEqual(
+    Array.from({ length: 4 }, (_unused, index) =>
+      view.getFloat32(vertexOffset + (4 + index) * 4, true)
+    ),
+    [f32(64 / 255), 0, 0, 1],
+  );
+});
+
+test("packet builder rejects invalid matrix coordinates", () => {
+  assert.throws(
+    () => buildClipDisableGuardbandOraclePacket("missing", 0, 1),
+    /unknown clip-disable guardband case/,
+  );
+  assert.throws(
+    () =>
+      buildClipDisableGuardbandOraclePacket(
+        "negative-x-inside-guardband",
+        8,
+        1,
+      ),
+    /mode must be an integer/,
+  );
+  assert.throws(
+    () =>
+      buildClipDisableGuardbandOraclePacket(
+        "negative-x-inside-guardband",
+        0,
+        -1,
+      ),
+    /generation must be a non-negative safe integer/,
+  );
+});
+
+test("f32 projection and the GX 7/12 sample derive the pinned masks", () => {
+  const xWide = expectedRows([
+    [6, 0x0070],
+    [7, 0x0070],
+    [8, 0x0070],
+  ]);
+  const xUniform = expectedRows([
+    [6, 0x0030],
+    [7, 0x0030],
+    [8, 0x0030],
+  ]);
+  const yWide = expectedRows([
+    [4, 0x01c0],
+    [5, 0x01c0],
+    [6, 0x01c0],
+  ]);
+  const yUniform = expectedRows([
+    [4, 0x01c0],
+    [5, 0x01c0],
+  ]);
+  const fixtures = [
+    ["negative-x-inside-guardband", 0, xWide, 9, "0xd142e6c777351b65"],
+    ["negative-x-exact-boundary", 7, xWide, 9, "0xd142e6c777351b65"],
+    ["negative-x-adjacent-outward", 0, xWide, 9, "0xd142e6c777351b65"],
+    ["negative-x-bounded-outside", 0, xWide, 9, "0xd142e6c777351b65"],
+    ["negative-x-uniform-same-side", 2, xUniform, 6, "0x114795d883ce7125"],
+    ["top-y-inside-guardband", 0, yWide, 9, "0x1c2a04a47a98a2e5"],
+    ["top-y-exact-boundary", 7, yWide, 9, "0x1c2a04a47a98a2e5"],
+    ["top-y-adjacent-outward", 0, yWide, 9, "0x1c2a04a47a98a2e5"],
+    ["top-y-bounded-outside", 0, yWide, 9, "0x1c2a04a47a98a2e5"],
+    ["top-y-uniform-same-side", 2, yUniform, 6, "0xafbca7d5c1118b25"],
+  ];
+  for (const [caseId, mode, rows, pixels, hash] of fixtures) {
+    const expected = clipDisableGuardbandExpectation(caseId, mode);
+    assert.deepEqual(expected.expectedMaskRows, rows, caseId);
+    assert.deepEqual(
+      clipDisableGuardbandMaskRows(expected.expectedRgba),
+      rows,
+      caseId,
+    );
+    assert.equal(expected.expectedPixelCount, pixels, caseId);
+    assert.equal(expected.expectedRgbaFnv1a64, hash, caseId);
+  }
+
+  for (const fixture of [
+    ["negative-x-adjacent-outward", 1],
+    ["negative-x-bounded-outside", 5],
+    ["top-y-adjacent-outward", 7],
+    ["top-y-bounded-outside", 3],
+    ["negative-x-uniform-same-side", 0],
+    ["top-y-uniform-same-side", 5],
+  ]) {
+    const expected = clipDisableGuardbandExpectation(...fixture);
+    assert.deepEqual(expected.expectedMaskRows, new Array(16).fill(0));
+    assert.equal(expected.expectedPixelCount, 0);
+    assert.equal(expected.expectedRgbaFnv1a64, "0x01ebcdb597074b25");
+  }
+});
+
+test("all eight modes select the intended guardband path and triangle count", () => {
+  for (const axis of ["negative-x", "top-y"]) {
+    for (const suffix of ["inside-guardband", "exact-boundary"]) {
+      for (const mode of CLIP_DISABLE_GUARDBAND_MODES) {
+        const expected = clipDisableGuardbandExpectation(
+          `${axis}-${suffix}`,
+          mode,
+        );
+        assert.equal(expected.path, "guardband-accepted");
+        assert.equal(expected.visible, true);
+        assert.deepEqual(expected.expectedManagedCoverage, {
+          draws: 1,
+          triangles: 2,
+        });
+      }
+    }
+
+    for (const [suffix, managedTriangles] of [
+      ["adjacent-outward", 2],
+      ["bounded-outside", 3],
+    ]) {
+      const outward = CLIP_DISABLE_GUARDBAND_MODES.map((mode) =>
+        clipDisableGuardbandExpectation(`${axis}-${suffix}`, mode),
+      );
+      assert.deepEqual(
+        outward.map(
+          (entry) => entry.expectedManagedCoverage.triangles,
+        ),
+        [
+          managedTriangles,
+          0,
+          managedTriangles,
+          0,
+          managedTriangles,
+          0,
+          managedTriangles,
+          0,
+        ],
+      );
+      assert.deepEqual(
+        outward.map((entry) => entry.path),
+        [
+          "guardband-clipped",
+          "policy-fail-closed",
+          "guardband-clipped",
+          "policy-fail-closed",
+          "guardband-clipped",
+          "policy-fail-closed",
+          "guardband-clipped",
+          "policy-fail-closed",
+        ],
+      );
+      for (const mode of [1, 3, 5, 7]) {
+        assert.deepEqual(outward[mode].expectedRejection, {
+          aggregate: 1,
+          exactPreparation: 1,
+          preparationReason: `unsupportedClipDisable${mode}`,
+        });
+        assert.equal(outward[mode].expectedExactRasterEmptyDraws, 0);
+      }
+    }
+    assert.deepEqual(
+      CLIP_DISABLE_GUARDBAND_MODES.map((mode) =>
+        clipDisableGuardbandExpectation(
+          `${axis}-adjacent-outward`,
+          mode,
+        ).expectedGeneratedTriangles,
+      ),
+      [3, 0, 3, 0, 3, 0, 3, 0],
+    );
+
+    const uniform = CLIP_DISABLE_GUARDBAND_MODES.map((mode) =>
+      clipDisableGuardbandExpectation(
+        `${axis}-uniform-same-side`,
+        mode,
+      ),
+    );
+    assert.deepEqual(
+      uniform.map((entry) => entry.expectedManagedCoverage.triangles),
+      [0, 0, 2, 2, 0, 0, 2, 2],
+    );
+    assert.deepEqual(
+      uniform.map((entry) => entry.expectedExactRasterEmptyDraws),
+      [1, 1, 0, 0, 1, 1, 0, 0],
+    );
+    for (const mode of [2, 3, 6, 7]) {
+      assert.equal(uniform[mode].path, "trivial-rejection-bypassed");
+      assert.equal(
+        uniform[mode].evidence.classification,
+        "manual-register-inference",
+      );
+    }
+  }
+});
+
+test("two-run certification matrix covers every case and mode twice", () => {
+  const matrix = clipDisableGuardbandCertificationMatrix();
+  assert.equal(CLIP_DISABLE_GUARDBAND_RUN_COUNT, 2);
+  assert.equal(matrix.length, 160);
+  assert.deepEqual(
+    matrix.map((entry) => entry.generation),
+    Array.from({ length: 160 }, (_unused, index) => index + 1),
+  );
+  for (const entry of clipDisableGuardbandCases) {
+    for (const mode of CLIP_DISABLE_GUARDBAND_MODES) {
+      assert.equal(
+        matrix.filter(
+          (candidate) =>
+            candidate.caseId === entry.id && candidate.mode === mode,
+        ).length,
+        2,
+      );
+    }
+  }
+});
+
+test("synthetic readback and telemetry pass all 160 certification entries", () => {
+  const totals = {
+    draws: 0,
+    triangles: 0,
+    empty: 0,
+    rejected: 0,
+    push: 0,
+    submit: 0,
+  };
+  for (const { caseId, mode, expectation } of
+    clipDisableGuardbandCertificationMatrix()) {
+    const result = evaluateClipDisableGuardband(
+      caseId,
+      mode,
+      diagnostics(),
+      afterForExpectation(expectation),
+      readbackForExpectation(expectation),
+    );
+    assert.equal(result.pass, true, `${caseId} mode ${mode}`);
+    totals.draws += expectation.expectedManagedCoverage.draws;
+    totals.triangles += expectation.expectedManagedCoverage.triangles;
+    totals.empty += expectation.expectedExactRasterEmptyDraws;
+    totals.rejected += expectation.expectedRejection.aggregate;
+    totals.push += expectation.expectedPushTevDrawCalls;
+    totals.submit += expectation.expectedSubmitGxFrameCalls;
+  }
+  assert.deepEqual(totals, {
+    draws: 112,
+    triangles: 240,
+    empty: 16,
+    rejected: 32,
+    push: 160,
+    submit: 160,
+  });
+});
+
+test("evaluator rejects missing policy evidence and wrong preparation reason", () => {
+  const expected = clipDisableGuardbandExpectation(
+    "negative-x-adjacent-outward",
+    1,
+  );
+  const missing = afterForExpectation(expected);
+  missing.exactRequiredRejectedDraws = 0;
+  missing.exactRequiredRejectionReasons.exactPreparation = 0;
+  missing.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable1 = 0;
+  const missingResult = evaluateClipDisableGuardband(
+    expected.caseId,
+    expected.mode,
+    diagnostics(),
+    missing,
+    readbackForExpectation(expected),
+  );
+  assert.equal(missingResult.pass, false);
+  assert.equal(missingResult.rejectionExact, false);
+
+  const wrong = afterForExpectation(expected);
+  wrong.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable1 = 0;
+  wrong.exactRequiredPreparationRejectionReasons
+    .unsupportedClipDisable7 = 1;
+  const wrongResult = evaluateClipDisableGuardband(
+    expected.caseId,
+    expected.mode,
+    diagnostics(),
+    wrong,
+    readbackForExpectation(expected),
+  );
+  assert.equal(wrongResult.pass, false);
+  assert.equal(wrongResult.rejectionExact, false);
+});
+
+test("evaluator rejects managed-coverage and pixel false positives", () => {
+  const suppressed = clipDisableGuardbandExpectation(
+    "top-y-adjacent-outward",
+    3,
+  );
+  const falseCoverage = afterForExpectation(suppressed);
+  falseCoverage.managedCoverageDraws = 1;
+  falseCoverage.managedCoverageTriangles = 2;
+  const coverageResult = evaluateClipDisableGuardband(
+    suppressed.caseId,
+    suppressed.mode,
+    diagnostics(),
+    falseCoverage,
+    readbackForExpectation(suppressed),
+  );
+  assert.equal(coverageResult.pass, false);
+  assert.equal(coverageResult.managedCoverageExact, false);
+
+  const visible = clipDisableGuardbandExpectation(
+    "negative-x-inside-guardband",
+    0,
+  );
+  const falsePixels = Array.from(visible.expectedRgba);
+  falsePixels[0] = 64;
+  const pixelResult = evaluateClipDisableGuardband(
+    visible.caseId,
+    visible.mode,
+    diagnostics(),
+    afterForExpectation(visible),
+    {
+      width: 16,
+      height: 16,
+      rgba: falsePixels,
+    },
+  );
+  assert.equal(pixelResult.pass, false);
+  assert.equal(pixelResult.byteExact, false);
+  assert.equal(pixelResult.maskExact, false);
+  assert.equal(pixelResult.hashExact, false);
+});

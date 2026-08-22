@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  PUBLIC_WARIOWARE_DEFAULT_TIMEOUT_MS,
   configuredPublicWarioWareUrl,
   waitForCoherentPublicWarioWareSnapshot,
   validatePublicWarioWareSmokeEvidence,
@@ -12,7 +13,7 @@ import {
 
 function activeRelease() {
   return {
-    schema: 2,
+    schema: 3,
     releaseId: "1".repeat(64),
     commit: "2".repeat(40),
     frontend: {
@@ -20,13 +21,18 @@ function activeRelease() {
       sha256: "b".repeat(64),
       bytes: 1_000,
     },
+    dsp: {
+      url: `/assets/browser-dsp-${"c".repeat(64)}.wasm`,
+      sha256: "c".repeat(64),
+      bytes: 2_000,
+    },
   };
 }
 
 function validEvidence() {
   const release = activeRelease();
   return {
-    schema: "lazuli-public-warioware-smoke-v1",
+    schema: "lazuli-public-warioware-smoke-v3",
     dataset: { renderer: "wgpu-webgpu", status: "running" },
     devtoolsExceptions: [],
     discImage: {
@@ -48,6 +54,10 @@ function validEvidence() {
         identifier: "GZWE01",
         revision: 0,
         source: { kind: "local-file" },
+      },
+      deviceEvents: {
+        dspAudioDmaStart: 1,
+        dspAudioDmaBlock: 100,
       },
       gxFifo: {
         bytes: 3_320,
@@ -100,7 +110,46 @@ function validEvidence() {
           rgb: { black: 275_074, white: 0, other: 11_646, unique: 2 },
         },
       },
+      audioCompatibility: {
+        dspLle: {
+          backend: "lle-wasm",
+          abi: 1,
+          slices: 1_000,
+          budgetedInstructions: 1_000_000,
+          executedInstructions: 60_000,
+          lastExecutionCycle: 12_000_000,
+          pendingCpuCycles: 0,
+          lastServiceCycle: 12_000_000,
+          nextExecutionCycle: 12_000_768,
+          lastStopReason: {
+            code: 3,
+            name: "cpu-mailbox-empty",
+          },
+          stopReasonCounts: {
+            "instruction-budget": 900,
+            "cpu-mailbox-empty": 100,
+          },
+          pc: 0x0100,
+          cpuMailboxWrites: 4,
+          cpuMailboxReads: 4,
+          cpuMailboxHighWrites: 1,
+          mailboxReadAccesses: 5,
+          dspMailboxWrites: 4,
+          dspMailboxReads: 4,
+          dspInterruptAssertions: 2,
+          fault: null,
+        },
+      },
       mmioState: {
+        dspAudioDma: {
+          enabled: true,
+          configuredBlocks: 16,
+          remainingBlocks: 8,
+          blocksLeft: 7,
+          cyclesPerBlock: 80_928,
+          nextInterruptCycle: null,
+          nextCycle: 12_080_928,
+        },
         viInterruptModel: {
           presentationCount: 11,
           hostPresentationCount: 5,
@@ -121,6 +170,14 @@ function validEvidence() {
     terminalRelease: structuredClone(release),
   };
 }
+
+test("public WarioWare smoke budgets the measured game bring-up window", () => {
+  assert.equal(PUBLIC_WARIOWARE_DEFAULT_TIMEOUT_MS, 15 * 60 * 1_000);
+  assert.ok(
+    PUBLIC_WARIOWARE_DEFAULT_TIMEOUT_MS >= 2 * 448_000,
+    "the default retains two-times headroom over the measured first playable frame",
+  );
+});
 
 const HOST_PRESENTATION_PROPERTIES = [
   "lastHostPresentationField",
@@ -157,6 +214,182 @@ function setNoHostPresentation(report) {
 test("public WarioWare smoke accepts a healthy queryless release snapshot", () => {
   const evidence = validEvidence();
   assert.strictEqual(validatePublicWarioWareSmokeEvidence(evidence), evidence);
+  assert.equal(evidence.report.audioCompatibility.dspLle.backend, "lle-wasm");
+});
+
+test("public WarioWare smoke requires active, coherent DSP LLE execution", () => {
+  const cases = [
+    [
+      value => { value.report.audioCompatibility.dspLle.backend = "hle"; },
+      /dspLle\.backend/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.abi = 2; },
+      /dspLle\.abi/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.slices = 0; },
+      /dspLle\.slices/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.budgetedInstructions = 0; },
+      /dspLle\.budgetedInstructions/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.executedInstructions = 0; },
+      /dspLle\.executedInstructions/,
+    ],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.slices = Math.floor(dsp.budgetedInstructions / 64) + 1;
+      },
+      /at least 64 budgeted instructions/,
+    ],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.executedInstructions = dsp.budgetedInstructions + 1;
+      },
+      /no more executed instructions/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.pendingCpuCycles = 768; },
+      /0 through 767/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastServiceCycle -= 1; },
+      /exact cumulative budget and pending-cycle accounting/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastExecutionCycle = 0; },
+      /last execution cycle to match the cumulative instruction budget/,
+    ],
+    [
+      value => { value.report.cycles += 1; },
+      /lastExecutionCycle <= lastServiceCycle === report\.cycles/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.nextExecutionCycle -= 1; },
+      /next coherent 768-CPU-cycle DSP boundary/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastStopReason.code = 4; },
+      /non-fault DSP stop reason from 0 through 3/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.lastStopReason.name = "halted"; },
+      /lastStopReason\.name/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.fault = { operation: 1 }; },
+      /dspLle\.fault/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.pc = "0x0100"; },
+      /dspLle\.pc/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.pc = 0x1_0000; },
+      /unsigned 16-bit/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.cpuMailboxWrites = 0; },
+      /cpuMailboxWrites/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.cpuMailboxReads = 0; },
+      /cpuMailboxReads/,
+    ],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.cpuMailboxReads = dsp.cpuMailboxWrites + 1;
+      },
+      /no more DSP consumes than CPU mailbox commits/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.dspMailboxWrites = 0; },
+      /dspMailboxWrites/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.dspMailboxReads = 0; },
+      /dspMailboxReads/,
+    ],
+    [
+      value => {
+        const dsp = value.report.audioCompatibility.dspLle;
+        dsp.dspMailboxReads = dsp.dspMailboxWrites + 1;
+      },
+      /no more consuming reads than DSP mailbox writes/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspLle.mailboxReadAccesses = 3; },
+      /mailboxReadAccesses/,
+    ],
+    [
+      value => {
+        value.report.audioCompatibility.dspLle.stopReasonCounts["instruction-budget"] -= 1;
+      },
+      /stopReasonCounts: expected 1000/,
+    ],
+    [
+      value => { value.report.deviceEvents.dspAudioDmaStart = 0; },
+      /dspAudioDmaStart/,
+    ],
+    [
+      value => { value.report.deviceEvents.dspAudioDmaBlock = 0; },
+      /dspAudioDmaBlock/,
+    ],
+    [
+      value => { value.report.mmioState.dspAudioDma.enabled = false; },
+      /dspAudioDma\.enabled/,
+    ],
+    [
+      value => { value.report.mmioState.dspAudioDma.configuredBlocks = 0; },
+      /configuredBlocks/,
+    ],
+    [
+      value => { value.report.mmioState.dspAudioDma.remainingBlocks = 17; },
+      /remainingBlocks/,
+    ],
+    [
+      value => { value.report.mmioState.dspAudioDma.blocksLeft = 8; },
+      /blocksLeft/,
+    ],
+    [
+      value => { value.report.mmioState.dspAudioDma.cyclesPerBlock = 0; },
+      /cyclesPerBlock/,
+    ],
+    [
+      value => { value.report.mmioState.dspAudioDma.nextCycle = value.report.cycles; },
+      /dspAudioDma\.nextCycle/,
+    ],
+    [
+      value => { value.report.audioCompatibility.dspFirstUnsupported = null; },
+      /legacy HLE evidence to be absent/,
+    ],
+    [
+      value => { value.report.mmioState.dspAxCommand = {}; },
+      /legacy HLE evidence to be absent/,
+    ],
+    [
+      value => { value.report.deviceEvents.dspZeldaCommandRejected = 1; },
+      /dspZeldaCommandRejected.*legacy or unknown DSP event evidence to be absent/,
+    ],
+    [
+      value => { value.report.deviceEvents.dspAxVoiceRender = 1; },
+      /dspAxVoiceRender.*legacy or unknown DSP event evidence to be absent/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const evidence = validEvidence();
+    mutate(evidence);
+    assert.throws(
+      () => validatePublicWarioWareSmokeEvidence(evidence),
+      pattern,
+    );
+  }
 });
 
 test("public WarioWare smoke prefers explicit host presentation identity", () => {
@@ -212,6 +445,24 @@ test("public WarioWare smoke rejects a mutable frontend path", () => {
   );
 });
 
+test("public WarioWare smoke requires the schema-3 DSP identity", () => {
+  const missing = validEvidence();
+  delete missing.release.dsp;
+  missing.terminalRelease = structuredClone(missing.release);
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(missing),
+    /\$\.release\.dsp/,
+  );
+
+  const stale = validEvidence();
+  stale.release.schema = 2;
+  stale.terminalRelease.schema = 2;
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence(stale),
+    /\$\.release\.schema: expected release schema 3/,
+  );
+});
+
 test("public WarioWare smoke binds its same-origin iframe to the active release", () => {
   const crossOrigin = validEvidence();
   crossOrigin.frameUrl =
@@ -263,6 +514,9 @@ test("public WarioWare smoke rejects URL state leakage and unhealthy evidence", 
     ["disc source", value => { value.report.disc.source.kind = "http-range"; }, /disc\.source\.kind/],
     ["renderer", value => { value.report.rendering.backend = "fallback"; }, /rendering\.backend/],
     ["renderer error", value => { value.report.rendering.error = "lost"; }, /rendering\.error/],
+    ["DSP compatibility", value => {
+      value.report.audioCompatibility.dspLle.fault = { operation: 1 };
+    }, /audioCompatibility\.dspLle\.fault/],
     ["VI presentation count", value => {
       value.report.mmioState.viInterruptModel.presentationCount = 0;
     }, /viInterruptModel\.presentationCount/],
@@ -367,6 +621,64 @@ test("public WarioWare snapshot wait retries early null then accepts generation 
   assert.equal(result.report.rendering.selectedXfb.generation, 3);
   assert.deepEqual(result.state, { attempt: "generation-3" });
   assert.deepEqual(delays, [2]);
+});
+
+test("public WarioWare snapshot wait retries until DSP LLE is active", async () => {
+  const preExecution = structuredClone(validEvidence().report);
+  preExecution.audioCompatibility.dspLle.slices = 0;
+  preExecution.audioCompatibility.dspLle.budgetedInstructions = 0;
+  preExecution.audioCompatibility.dspLle.executedInstructions = 0;
+  preExecution.audioCompatibility.dspLle.stopReasonCounts = {};
+  const preMailbox = structuredClone(validEvidence().report);
+  preMailbox.audioCompatibility.dspLle.dspMailboxReads = 0;
+  const preAudioDma = structuredClone(validEvidence().report);
+  preAudioDma.deviceEvents.dspAudioDmaBlock = 0;
+  const ready = structuredClone(validEvidence().report);
+  const snapshots = [
+    { report: preExecution, state: { attempt: "coherent-pre-execution" } },
+    { report: preMailbox, state: { attempt: "pre-mailbox" } },
+    { report: preAudioDma, state: { attempt: "pre-audio-dma" } },
+    { report: ready, state: { attempt: "lle-ready" } },
+  ];
+  const delays = [];
+  const result = await waitForCoherentPublicWarioWareSnapshot(null, {
+    captureSnapshot: async () => snapshots.shift(),
+    deadline: 10,
+    delay: async milliseconds => { delays.push(milliseconds); },
+    now: () => 0,
+    pollMs: 2,
+  });
+  assert.deepEqual(result.state, { attempt: "lle-ready" });
+  assert.equal(result.report.audioCompatibility.dspLle.executedInstructions, 60_000);
+  assert.deepEqual(delays, [2, 2, 2]);
+});
+
+test("public WarioWare DSP readiness returns fatal state for strict rejection", async () => {
+  const report = structuredClone(validEvidence().report);
+  report.audioCompatibility.dspLle.fault = { operation: 1 };
+  const snapshot = { report, state: { attempt: "ready-with-failure" } };
+  let captures = 0;
+  const result = await waitForCoherentPublicWarioWareSnapshot(null, {
+    captureSnapshot: async () => {
+      captures += 1;
+      return snapshot;
+    },
+    deadline: 10,
+    delay: async () => {
+      throw new Error("LLE-ready evidence must not be retried");
+    },
+    now: () => 0,
+    pollMs: 2,
+  });
+  assert.strictEqual(result, snapshot);
+  assert.equal(captures, 1);
+  assert.throws(
+    () => validatePublicWarioWareSmokeEvidence({
+      ...validEvidence(),
+      report,
+    }),
+    /dspLle\.fault: expected null/,
+  );
 });
 
 test("public WarioWare snapshot wait hard-fails mismatched presentation provenance", async () => {

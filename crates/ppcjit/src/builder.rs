@@ -78,8 +78,6 @@ fn is_cacheable(reg: Reg) -> bool {
 
 #[derive(Debug, Error)]
 pub enum BuilderError {
-    #[error("illegal instruction {f0:?}")]
-    Illegal(Ins),
     #[error("unimplemented instruction {f0:?}")]
     Unimplemented(Ins),
     #[error("hook cycle publication requires a portable exit mode")]
@@ -650,7 +648,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Dcbt => self.nop(Action::Continue),
             Opcode::Dcbtst => self.nop(Action::Continue),
             Opcode::Dcbz => self.dcbz(ins),
-            Opcode::DcbzL => self.stub(ins),
+            Opcode::DcbzL => self.dcbz_l(ins),
             Opcode::Divw => self.divw(ins),
             Opcode::Divwu => self.divwu(ins),
             Opcode::Eqv => self.eqv(ins),
@@ -709,6 +707,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Lhzx => self.lhzx(ins),
             Opcode::Lmw => self.lmw(ins),
             Opcode::Lswi => self.lswi(ins),
+            Opcode::Lswx => self.lswx(ins),
             Opcode::Lwarx => self.lwarx(ins),
             Opcode::Lwbrx => self.lwbrx(ins),
             Opcode::Lwz => self.lwz(ins),
@@ -729,6 +728,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Mtfsb0 => self.mtfsb0(ins),
             Opcode::Mtfsb1 => self.mtfsb1(ins),
             Opcode::Mtfsf => self.mtfsf(ins),
+            Opcode::Mtfsfi => self.mtfsfi(ins),
             Opcode::Mtmsr => self.mtmsr(ins),
             Opcode::Mtspr => self.mtspr(ins),
             Opcode::Mtsr => self.mtsr(ins),
@@ -744,6 +744,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Orc => self.orc(ins),
             Opcode::Ori => self.ori(ins),
             Opcode::Oris => self.oris(ins),
+            Opcode::PsAbs => self.ps_abs(ins),
             Opcode::PsAdd => self.ps_add(ins),
             Opcode::PsCmpo0 => self.ps_cmpo0(ins),
             Opcode::PsCmpo1 => self.ps_cmpo1(ins),
@@ -762,6 +763,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::PsMul => self.ps_mul(ins),
             Opcode::PsMuls0 => self.ps_muls0(ins),
             Opcode::PsMuls1 => self.ps_muls1(ins),
+            Opcode::PsNabs => self.ps_nabs(ins),
             Opcode::PsNeg => self.ps_neg(ins),
             Opcode::PsNmadd => self.ps_nmadd(ins),
             Opcode::PsNmsub => self.ps_nmsub(ins),
@@ -823,16 +825,12 @@ impl<'ctx> BlockBuilder<'ctx> {
             Opcode::Sync => self.nop(Action::Exit),
             Opcode::Tlbie => self.tlbie(ins),
             Opcode::Tlbsync => self.tlbsync(ins),
+            Opcode::Tw => self.tw(ins),
+            Opcode::Twi => self.twi(ins),
             Opcode::Xor => self.xor(ins),
             Opcode::Xori => self.xori(ins),
             Opcode::Xoris => self.xoris(ins),
-            Opcode::Illegal => {
-                if self.frontend.settings.ignore_unimplemented {
-                    self.stub(ins)
-                } else {
-                    return Err(BuilderError::Illegal(ins));
-                }
-            }
+            Opcode::Illegal => self.illegal(ins),
             _ => {
                 if self.frontend.settings.ignore_unimplemented {
                     self.stub(ins)

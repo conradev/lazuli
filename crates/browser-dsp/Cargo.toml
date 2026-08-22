@@ -1,0 +1,15 @@
+[package]
+name = "browser-dsp"
+description = "Raw shared-memory DSP interpreter for the browser runtime"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+dspint.workspace = true

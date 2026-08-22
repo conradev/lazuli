@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Lazuli tiled EFB-copy RAM WebGPU oracle</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 ui-monospace, monospace;
+      background: #0b0c0f;
+      color: #f1f3f5;
+    }
+    body { margin: 2rem; }
+    canvas {
+      width: 128px;
+      height: 128px;
+      image-rendering: pixelated;
+      border: 1px solid #59636e;
+    }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body data-status="running">
+  <h1>Lazuli tiled EFB-copy RAM WebGPU oracle</h1>
+  <canvas id="oracle" width="8" height="8"></canvas>
+  <pre id="result">running</pre>
+  <script type="module">
+    import init, {
+      WebGpuRenderer,
+    } from "../target/gekko-web/browser_renderer.js";
+    import {
+      buildDepth24OraclePacket,
+      DEPTH24_ALWAYS_PASS,
+      DEPTH24_ALWAYS_UPDATE,
+      fullscreenDepth24Triangle,
+    } from "./browser_boot_depth24_oracle.mjs";
+    import {
+      buildGxMipUploadOraclePacket,
+    } from "./browser_boot_gx_mip_upload_oracle.mjs";
+
+    const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+    const HEADER_BYTES = 160;
+    const DRAW_BYTES = 176;
+    const SOURCE_X = 64;
+    const SOURCE_Y = 64;
+    const COPY_WIDTH = 5;
+    const COPY_HEIGHT = 5;
+    const PADDED_WIDTH = 8;
+    const PADDED_HEIGHT = 8;
+    const PHYSICAL_STRIDE = 160;
+    const Z_UPDATE = 1 << 4;
+    const COLOR_ALPHA_UPDATE = (1 << 3) | (1 << 4);
+    const IDENTITY_FILTER_0 = (21 << 12) | (22 << 18);
+    const IDENTITY_FILTER_1 = 21;
+    const TEXTURE_COPY_LAYOUT_V1 = 1;
+    const CLEAR_AFTER_COPY = 1 << 11;
+    const CLEAR_RGBA = Object.freeze([36, 89, 166, 223]);
+    const CLEAR_DEPTH = 0x654321;
+
+    // encodedTarget is BP52's physically rotated four-bit field. copyFormat
+    // is the independently decoded GX tile-encoder mode reported by receipts.
+    const COPY_CASES = Object.freeze([
+      Object.freeze({
+        id: "r4",
+        copyFormat: 0,
+        encodedTarget: 0,
+        baseFormat: 0,
+        blockWidth: 8,
+        blockHeight: 8,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "r8-0x1",
+        copyFormat: 1,
+        encodedTarget: 2,
+        baseFormat: 1,
+        blockWidth: 8,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "ra4",
+        copyFormat: 2,
+        encodedTarget: 4,
+        baseFormat: 2,
+        blockWidth: 8,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "ra8",
+        copyFormat: 3,
+        encodedTarget: 6,
+        baseFormat: 3,
+        blockWidth: 4,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "rgb565",
+        copyFormat: 4,
+        encodedTarget: 8,
+        baseFormat: 4,
+        blockWidth: 4,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "rgb5a3",
+        copyFormat: 5,
+        encodedTarget: 10,
+        baseFormat: 5,
+        blockWidth: 4,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "rgba8",
+        copyFormat: 6,
+        encodedTarget: 12,
+        baseFormat: 6,
+        blockWidth: 4,
+        blockHeight: 4,
+        blockBytes: 64,
+      }),
+      Object.freeze({
+        id: "a8",
+        copyFormat: 7,
+        encodedTarget: 14,
+        baseFormat: 1,
+        blockWidth: 8,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "r8",
+        copyFormat: 8,
+        encodedTarget: 1,
+        baseFormat: 1,
+        blockWidth: 8,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "g8",
+        copyFormat: 9,
+        encodedTarget: 3,
+        baseFormat: 1,
+        blockWidth: 8,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "b8",
+        copyFormat: 10,
+        encodedTarget: 5,
+        baseFormat: 1,
+        blockWidth: 8,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "rg8",
+        copyFormat: 11,
+        encodedTarget: 7,
+        baseFormat: 3,
+        blockWidth: 4,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+      Object.freeze({
+        id: "gb8",
+        copyFormat: 12,
+        encodedTarget: 9,
+        baseFormat: 3,
+        blockWidth: 4,
+        blockHeight: 4,
+        blockBytes: 32,
+      }),
+    ]);
+    const DEPTH_COPY_CASE = Object.freeze({
+      ...COPY_CASES[6],
+      id: "depth-rgba8",
+      pixelControl: 3,
+      sourcePlane: "depth-z24",
+    });
+    const V7_COPY_CASE = Object.freeze({
+      ...COPY_CASES[6],
+      id: "rgba8-v7-genuine-mip",
+      packetVersion: 7,
+      sourcePlane: "color-rgba6",
+    });
+    const ORACLE_CASES = Object.freeze([
+      ...COPY_CASES,
+      DEPTH_COPY_CASE,
+      V7_COPY_CASE,
+    ]);
+
+    function requireLoopbackOracle() {
+      if (!LOOPBACK_HOSTS.has(location.hostname)) {
+        throw new Error("tiled EFB-copy RAM WebGPU oracle is local-only");
+      }
+    }
+
+    function traceCanvasContextRequests(canvas) {
+      const requests = [];
+      const original = canvas.getContext;
+      canvas.getContext = function getContext(type, ...options) {
+        requests.push(String(type));
+        return Reflect.apply(original, this, [type, ...options]);
+      };
+      return Object.freeze({
+        requests,
+        restore() {
+          delete canvas.getContext;
+        },
+      });
+    }
+
+    function putU16(view, offset, value) {
+      view.setUint16(offset, value, true);
+    }
+
+    function putU32(view, offset, value) {
+      view.setUint32(offset, value >>> 0, true);
+    }
+
+    function expand6(value) {
+      return ((value << 2) | (value >> 4)) & 0xff;
+    }
+
+    // Every channel is exactly representable in RGBA6. The spatial variation
+    // makes zero-filled or edge-clamped partial tiles observably incorrect.
+    function patternPixel(x, y) {
+      return [
+        expand6((1 + x * 7 + y * 3) & 63),
+        expand6((9 + x * 5 + y * 11) & 63),
+        expand6((17 + x * 13 + y * 7) & 63),
+        expand6((8 + x * 7 + y * 9) & 63),
+      ];
+    }
+
+    function patternDepth(x, y) {
+      return 0x400000 + y * PADDED_WIDTH + x;
+    }
+
+    function depthPatternPixel(x, y) {
+      const depth = patternDepth(x, y);
+      return [
+        (depth >>> 16) & 0xff,
+        (depth >>> 8) & 0xff,
+        depth & 0xff,
+        0xff,
+      ];
+    }
+
+    function seedPatternPacket(generation) {
+      const draws = [];
+      for (let y = 0; y < PADDED_HEIGHT; y += 1) {
+        for (let x = 0; x < PADDED_WIDTH; x += 1) {
+          const rgba = patternPixel(x, y).map(channel => channel / 255);
+          draws.push({
+            vertices: fullscreenDepth24Triangle(
+              patternDepth(x, y),
+              rgba,
+            ),
+            zMode: DEPTH24_ALWAYS_UPDATE,
+            alphaTest: DEPTH24_ALWAYS_PASS,
+            pixelControl: 1,
+          });
+        }
+      }
+      const packet = buildDepth24OraclePacket(draws, generation);
+      const view = new DataView(
+        packet.buffer,
+        packet.byteOffset,
+        packet.byteLength,
+      );
+      for (let index = 0; index < draws.length; index += 1) {
+        const x = index % PADDED_WIDTH;
+        const y = Math.floor(index / PADDED_WIDTH);
+        const record = HEADER_BYTES + index * DRAW_BYTES;
+        putU32(view, record + 0x14, COLOR_ALPHA_UPDATE);
+        putU32(view, record + 0x1c, SOURCE_X + x);
+        putU32(view, record + 0x20, SOURCE_Y + y);
+        putU32(view, record + 0x24, 1);
+        putU32(view, record + 0x28, 1);
+      }
+      return packet;
+    }
+
+    function textureCopyCommand(entry, clear) {
+      return (entry.encodedTarget << 3) | (clear ? CLEAR_AFTER_COPY : 0);
+    }
+
+    // This is a canonical empty LZGX v4 segment whose sole action is a
+    // flagged physical-layout texture copy. It does not use the legacy public
+    // copy_texture bridge, which intentionally cannot return RAM receipts.
+    function buildTextureCopyPacket(entry, specification) {
+      const packet = entry.packetVersion === 7
+        ? buildGxMipUploadOraclePacket({
+            generation: specification.generation,
+            resident: false,
+          })
+        : new Uint8Array(HEADER_BYTES);
+      const view = new DataView(packet.buffer);
+      if (entry.packetVersion !== 7) {
+        packet.set([0x4c, 0x5a, 0x47, 0x58], 0);
+        putU16(view, 0x04, 4);
+        putU16(view, 0x06, HEADER_BYTES);
+        putU32(view, 0x08, packet.byteLength);
+        for (const offset of [0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30]) {
+          putU32(view, offset, HEADER_BYTES);
+        }
+        putU16(view, 0x78, DRAW_BYTES);
+        putU16(view, 0x7a, 64);
+      }
+      putU32(view, 0x0c, TEXTURE_COPY_LAYOUT_V1);
+      putU32(view, 0x10, 1);
+      putU32(view, 0x4c, SOURCE_X);
+      putU32(view, 0x50, SOURCE_Y);
+      putU32(view, 0x54, COPY_WIDTH);
+      putU32(view, 0x58, COPY_HEIGHT);
+      putU32(view, 0x5c, COPY_WIDTH);
+      putU32(view, 0x60, COPY_HEIGHT);
+      putU32(view, 0x64, specification.destination);
+      putU32(view, 0x68, PHYSICAL_STRIDE);
+      putU32(view, 0x6c, specification.generation);
+      putU32(view, 0x70, specification.clear ? 1 : 0);
+      packet.set(CLEAR_RGBA, 0x74);
+      putU32(view, 0x80, Z_UPDATE);
+      putU32(view, 0x84, COLOR_ALPHA_UPDATE);
+      putU32(view, 0x88, entry.pixelControl ?? 1);
+      putU32(view, 0x8c, textureCopyCommand(entry, specification.clear));
+      putU32(view, 0x90, CLEAR_DEPTH);
+      putU32(view, 0x94, 256);
+      putU32(view, 0x98, IDENTITY_FILTER_0);
+      putU32(view, 0x9c, IDENTITY_FILTER_1);
+      return packet;
+    }
+
+    function copyLayout(entry) {
+      const blocksWide = Math.ceil(COPY_WIDTH / entry.blockWidth);
+      const rowCount = Math.ceil(COPY_HEIGHT / entry.blockHeight);
+      const rowBytes = blocksWide * entry.blockBytes;
+      return {
+        blocksWide,
+        rowCount,
+        rowBytes,
+        denseBytes: rowBytes * rowCount,
+      };
+    }
+
+    function pushU16Be(bytes, value) {
+      bytes.push((value >>> 8) & 0xff, value & 0xff);
+    }
+
+    // An independent, byte-oriented Flipper tile model. It consumes physical
+    // EFB coordinates for complete blocks, including texels beyond 5x5.
+    function encodeExpectedBytes(entry, sample) {
+      const layout = copyLayout(entry);
+      const bytes = [];
+      for (let blockY = 0; blockY < layout.rowCount; blockY += 1) {
+        for (let blockX = 0; blockX < layout.blocksWide; blockX += 1) {
+          const originX = blockX * entry.blockWidth;
+          const originY = blockY * entry.blockHeight;
+          const texel = (x, y) => sample(originX + x, originY + y);
+          switch (entry.copyFormat) {
+            case 0:
+              for (let y = 0; y < 8; y += 1) {
+                for (let x = 0; x < 8; x += 2) {
+                  bytes.push((texel(x, y)[0] & 0xf0) | (texel(x + 1, y)[0] >> 4));
+                }
+              }
+              break;
+            case 1:
+            case 7:
+            case 8:
+            case 9:
+            case 10: {
+              const channel = entry.copyFormat === 7
+                ? 3
+                : entry.copyFormat >= 8
+                  ? entry.copyFormat - 8
+                  : 0;
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 8; x += 1) {
+                  bytes.push(texel(x, y)[channel]);
+                }
+              }
+              break;
+            }
+            case 2:
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 8; x += 1) {
+                  const rgba = texel(x, y);
+                  bytes.push((rgba[3] & 0xf0) | (rgba[0] >> 4));
+                }
+              }
+              break;
+            case 3:
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 4; x += 1) {
+                  const rgba = texel(x, y);
+                  bytes.push(rgba[3], rgba[0]);
+                }
+              }
+              break;
+            case 4:
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 4; x += 1) {
+                  const rgba = texel(x, y);
+                  pushU16Be(
+                    bytes,
+                    ((rgba[0] >> 3) << 11)
+                      | ((rgba[1] >> 2) << 5)
+                      | (rgba[2] >> 3),
+                  );
+                }
+              }
+              break;
+            case 5:
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 4; x += 1) {
+                  const rgba = texel(x, y);
+                  const packed = (rgba[3] & 0xe0) === 0xe0
+                    ? 0x8000
+                      | ((rgba[0] >> 3) << 10)
+                      | ((rgba[1] >> 3) << 5)
+                      | (rgba[2] >> 3)
+                    : ((rgba[3] >> 5) << 12)
+                      | ((rgba[0] >> 4) << 8)
+                      | ((rgba[1] >> 4) << 4)
+                      | (rgba[2] >> 4);
+                  pushU16Be(bytes, packed);
+                }
+              }
+              break;
+            case 6:
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 4; x += 1) {
+                  const rgba = texel(x, y);
+                  bytes.push(rgba[3], rgba[0]);
+                }
+              }
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 4; x += 1) {
+                  const rgba = texel(x, y);
+                  bytes.push(rgba[1], rgba[2]);
+                }
+              }
+              break;
+            case 11:
+            case 12:
+              for (let y = 0; y < 4; y += 1) {
+                for (let x = 0; x < 4; x += 1) {
+                  const rgba = texel(x, y);
+                  bytes.push(
+                    entry.copyFormat === 11 ? rgba[1] : rgba[2],
+                    entry.copyFormat === 11 ? rgba[0] : rgba[1],
+                  );
+                }
+              }
+              break;
+            default:
+              throw new Error(`missing expected-byte model for ${entry.id}`);
+          }
+        }
+      }
+      if (bytes.length !== layout.denseBytes) {
+        throw new Error(
+          `${entry.id} model emitted ${bytes.length} bytes, expected ${layout.denseBytes}`,
+        );
+      }
+      return { layout, bytes: Uint8Array.from(bytes) };
+    }
+
+    function bytesEqual(actual, expected) {
+      return (
+        actual.length === expected.length
+        && actual.every((value, index) => value === expected[index])
+      );
+    }
+
+    function originalSample(x, y) {
+      return patternPixel(x, y);
+    }
+
+    function depthSample(x, y) {
+      return depthPatternPixel(x, y);
+    }
+
+    function postClearSample(x, y) {
+      return x < COPY_WIDTH && y < COPY_HEIGHT
+        ? CLEAR_RGBA
+        : patternPixel(x, y);
+    }
+
+    function logicalOnlySample(x, y) {
+      return x < COPY_WIDTH && y < COPY_HEIGHT
+        ? patternPixel(x, y)
+        : [0, 0, 0, 0];
+    }
+
+    function clearEverywhereSample() {
+      return CLEAR_RGBA;
+    }
+
+    function receiptResult(receipt, entry, specification, sample, alternative) {
+      const expected = encodeExpectedBytes(entry, sample);
+      const alternativeBytes = encodeExpectedBytes(entry, alternative).bytes;
+      const typedBytes = Object.prototype.toString.call(receipt?.bytes)
+        === "[object Uint8Array]";
+      const ownedBytes = typedBytes
+        && receipt.bytes.byteOffset === 0
+        && receipt.bytes.byteLength === receipt.bytes.buffer.byteLength;
+      const metadataExact = receipt?.destination === specification.destination
+        && receipt?.generation === specification.generation
+        && receipt?.width === COPY_WIDTH
+        && receipt?.height === COPY_HEIGHT
+        && receipt?.copyFormat === entry.copyFormat
+        && receipt?.baseFormat === entry.baseFormat
+        && receipt?.stride === PHYSICAL_STRIDE
+        && receipt?.rowBytes === expected.layout.rowBytes
+        && receipt?.rowCount === expected.layout.rowCount
+        && receipt?.layout === "gx-efb-copy-tiled-bytes-v1";
+      const bytesExact = typedBytes && bytesEqual(receipt.bytes, expected.bytes);
+      const paddedBytesDiscriminate = !bytesEqual(expected.bytes, alternativeBytes);
+      return {
+        id: entry.id,
+        pass:
+          metadataExact
+          && ownedBytes
+          && bytesExact
+          && paddedBytesDiscriminate,
+        metadataExact,
+        ownedBytes,
+        bytesExact,
+        paddedBytesDiscriminate,
+        expectedLength: expected.bytes.length,
+        actualLength: typedBytes ? receipt.bytes.length : null,
+        receipt: typedBytes
+          ? {
+              destination: receipt.destination,
+              generation: receipt.generation,
+              width: receipt.width,
+              height: receipt.height,
+              copyFormat: receipt.copyFormat,
+              baseFormat: receipt.baseFormat,
+              stride: receipt.stride,
+              rowBytes: receipt.rowBytes,
+              rowCount: receipt.rowCount,
+              layout: receipt.layout,
+              bytes: Array.from(receipt.bytes),
+            }
+          : receipt,
+        expectedBytes: Array.from(expected.bytes),
+      };
+    }
+
+    function submission(entry, index, baseAddress, generation, clear = false) {
+      return {
+        destination: baseAddress + index * 0x1000,
+        generation: generation + index,
+        clear,
+      };
+    }
+
+    async function runAllModes(renderer) {
+      renderer.reset();
+      renderer.submit_gx_frame(seedPatternPacket(1));
+      const specifications = ORACLE_CASES.map((entry, index) => {
+        const specification = submission(entry, index, 0x00180000, 100, false);
+        renderer.submit_gx_frame(buildTextureCopyPacket(entry, specification));
+        return specification;
+      });
+      const receipts = await renderer.drain();
+      const arrayReceipt = Array.isArray(receipts);
+      const uniqueReceiptBuffers = arrayReceipt
+        && receipts.every((receipt, index) => receipts.findIndex(
+          candidate => candidate?.bytes?.buffer === receipt?.bytes?.buffer,
+        ) === index);
+      const cases = ORACLE_CASES.map((entry, index) => receiptResult(
+        receipts[index],
+        entry,
+        specifications[index],
+        entry === DEPTH_COPY_CASE ? depthSample : originalSample,
+        entry === DEPTH_COPY_CASE
+          ? (x, y) => x < COPY_WIDTH && y < COPY_HEIGHT
+            ? depthPatternPixel(x, y)
+            : [0, 0, 0, 0]
+          : logicalOnlySample,
+      ));
+      return {
+        pass:
+          arrayReceipt
+          && uniqueReceiptBuffers
+          && receipts.length === ORACLE_CASES.length
+          && cases.every(entry => entry.pass),
+        arrayReceipt,
+        uniqueReceiptBuffers,
+        receiptCount: receipts.length,
+        cases,
+      };
+    }
+
+    async function runCopyBeforeClear(renderer) {
+      const entry = COPY_CASES.find(candidate => candidate.id === "rgba8");
+      if (entry === undefined) throw new Error("missing RGBA8 clear-order case");
+      renderer.reset();
+      renderer.submit_gx_frame(seedPatternPacket(2));
+      const beforeClear = submission(entry, 0, 0x00280000, 200, true);
+      const afterClear = submission(entry, 1, 0x00280000, 200, false);
+      renderer.submit_gx_frame(buildTextureCopyPacket(entry, beforeClear));
+      renderer.submit_gx_frame(buildTextureCopyPacket(entry, afterClear));
+      const receipts = await renderer.drain();
+      const uniqueReceiptBuffers = Array.isArray(receipts)
+        && receipts.every((receipt, index) => receipts.findIndex(
+          candidate => candidate?.bytes?.buffer === receipt?.bytes?.buffer,
+        ) === index);
+      const source = receiptResult(
+        receipts[0],
+        entry,
+        beforeClear,
+        originalSample,
+        logicalOnlySample,
+      );
+      const postClear = receiptResult(
+        receipts[1],
+        entry,
+        afterClear,
+        postClearSample,
+        clearEverywhereSample,
+      );
+      const sourceBytes = receipts[0]?.bytes;
+      const postClearBytes = receipts[1]?.bytes;
+      const copyBeforeTerminalClear = source.pass
+        && postClear.pass
+        && !bytesEqual(sourceBytes, postClearBytes);
+      return {
+        pass:
+          Array.isArray(receipts)
+          && uniqueReceiptBuffers
+          && receipts.length === 2
+          && copyBeforeTerminalClear,
+        receiptCount: receipts.length,
+        uniqueReceiptBuffers,
+        copyBeforeTerminalClear,
+        paddedRightBottomSurvivesTerminalClear:
+          postClear.paddedBytesDiscriminate && postClear.bytesExact,
+        source,
+        postClear,
+      };
+    }
+
+    function executionMetrics(diagnostics) {
+      return {
+        clearEfbCalls: diagnostics.clearEfbCalls,
+        copyTextureCalls: diagnostics.copyTextureCalls,
+        copyXfbCalls: diagnostics.copyXfbCalls,
+        drainCalls: diagnostics.drainCalls,
+        submitGxFrameCalls: diagnostics.submitGxFrameCalls,
+      };
+    }
+
+    function subtractMetrics(after, before) {
+      return Object.fromEntries(
+        Object.keys(after).map(key => [key, after[key] - before[key]]),
+      );
+    }
+
+    async function run() {
+      requireLoopbackOracle();
+      await init();
+      const canvas = document.querySelector("#oracle");
+      const contextTrace = traceCanvasContextRequests(canvas);
+      let renderer;
+      try {
+        renderer = await WebGpuRenderer.create(canvas);
+      } finally {
+        contextTrace.restore();
+      }
+      renderer.reset_diagnostics();
+      try {
+        const before = executionMetrics(renderer.diagnostics());
+        const allModes = await runAllModes(renderer);
+        const clearOrder = await runCopyBeforeClear(renderer);
+        renderer.check_health();
+        const metricDelta = subtractMetrics(
+          executionMetrics(renderer.diagnostics()),
+          before,
+        );
+        const metricsExact = metricDelta.copyTextureCalls === 17
+          && metricDelta.copyXfbCalls === 2
+          && metricDelta.clearEfbCalls === 1
+          && metricDelta.submitGxFrameCalls === 19
+          && metricDelta.drainCalls === 2;
+        const unexpectedCanvasContexts = contextTrace.requests.filter(
+          type => type !== "webgpu",
+        );
+        const strictWebGpu =
+          typeof navigator.gpu?.requestAdapter === "function"
+          && contextTrace.requests.length > 0
+          && contextTrace.requests.every(type => type === "webgpu");
+        const noFallback = unexpectedCanvasContexts.length === 0;
+        const result = {
+          pass:
+            strictWebGpu
+            && noFallback
+            && metricsExact
+            && allModes.pass
+            && clearOrder.pass,
+          strictWebGpu,
+          noFallback,
+          health: "clean",
+          localOnly: true,
+          backend: {
+            renderer: "WebGpuRenderer",
+            navigatorGpuAvailable:
+              typeof navigator.gpu?.requestAdapter === "function",
+            canvasContextRequests: [...contextTrace.requests],
+            unexpectedCanvasContexts,
+          },
+          contract: {
+            packetVersions: [4, 7],
+            packetFlag: "texture-copy-layout-v1",
+            receiptLayout: "gx-efb-copy-tiled-bytes-v1",
+            colorCopyModes: COPY_CASES.length,
+            depthCopyModes: 1,
+            genuineV7CopyModes: 1,
+            logicalExtent: [COPY_WIDTH, COPY_HEIGHT],
+            seededPhysicalExtent: [PADDED_WIDTH, PADDED_HEIGHT],
+            physicalStride: PHYSICAL_STRIDE,
+          },
+          metricsExact,
+          metricDelta,
+          allModes,
+          clearOrder,
+          diagnostics: renderer.diagnostics(),
+        };
+        document.body.dataset.status = result.pass ? "pass" : "fail";
+        document.querySelector("#result").textContent =
+          JSON.stringify(result, null, 2);
+        return result;
+      } finally {
+        renderer.free();
+      }
+    }
+
+    window.__lazuliEfbTextureCopyRamOraclePromise = run().catch(error => {
+      const result = {
+        pass: false,
+        strictWebGpu: false,
+        noFallback: false,
+        health: "error",
+        error: error instanceof Error ? error.stack : String(error),
+      };
+      document.body.dataset.status = "error";
+      document.querySelector("#result").textContent =
+        JSON.stringify(result, null, 2);
+      return result;
+    });
+  </script>
+</body>
+</html>

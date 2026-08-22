@@ -19,6 +19,7 @@ ppcjit.workspace = true
 wasm-encoder.workspace = true
 
 [dev-dependencies]
+browser-dsp.workspace = true
 disks.workspace = true
 ppcjit = { workspace = true, features = ["native"] }
 wasmparser.workspace = true

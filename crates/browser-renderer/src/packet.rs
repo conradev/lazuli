@@ -8,7 +8,15 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::tev::{MAX_TEV_STAGES, MAX_TEV_TEXTURES, required_texture_maps};
+use crate::tev::{
+    INDIRECT_TEV_COMMAND_MASK, IndirectTevState, MAX_TEV_STAGES, MAX_TEV_TEXTURES,
+    direct_texture_requires_gen_mode, required_texture_maps,
+    required_texture_maps_with_indirect,
+};
+use crate::{
+    EFB_HEIGHT, EFB_WIDTH, GxEfbFormat, GxTextureCopyPlanError, clipped_copy_extent,
+    gx_efb_depth_encoding, gx_efb_format, gx_texture_copy_plan,
+};
 
 pub(crate) const GX_PACKET_MAGIC: [u8; 4] = *b"LZGX";
 pub(crate) const GX_PACKET_VERSION: u16 = 4;
@@ -27,6 +35,8 @@ pub(crate) const GX_PACKET_VERSION_V7: u16 = 7;
 const GX_DRAW_RECORD_BYTES_V2: u16 = 128;
 const PACKET_ALIGNMENT: u32 = 16;
 const COPY_FLAG_CLEAR: u32 = 1;
+pub(crate) const PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1: u32 = 1;
+pub(crate) const PACKET_FLAG_INDIRECT_TEV_STATE_V1: u32 = 1 << 1;
 const DRAW_FLAG_POST_CULL_IN_CLIP_F32_V1_COMPLETE: u16 = 1;
 const DRAW_FLAG_EXACT_CLIP_INPUT_F32_V1_COMPLETE: u16 = 1 << 1;
 const DRAW_FLAG_EXACT_CLIP_REQUIRED: u16 = 1 << 2;
@@ -39,6 +49,9 @@ const SAMPLER_BITS_MASK_V4: u32 = SAMPLER_BITS_MASK_V3 | (3 << 19);
 const SAMPLER_MODE0_MASK_V7: u32 = 0x0039_ffff;
 const SAMPLER_MODE1_MASK_V7: u32 = 0xffff;
 const GX_MODE1_TAIL_BYTES_PER_DRAW: u32 = (MAX_TEV_TEXTURES as u32) * 4;
+const GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW: u32 = 128;
+const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1: u32 = 1;
+const INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2: u32 = 2;
 const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
 const FOG_RANGE_ADJUSTMENT_ENABLE: u32 = 1 << 10;
 
@@ -46,6 +59,7 @@ const FOG_RANGE_ADJUSTMENT_ENABLE: u32 = 1 << 10;
 pub(crate) enum GxCopyKind {
     Texture,
     Xfb,
+    Peek,
 }
 
 impl GxCopyKind {
@@ -53,12 +67,78 @@ impl GxCopyKind {
         match value {
             1 => Ok(Self::Texture),
             2 => Ok(Self::Xfb),
+            3 => Ok(Self::Peek),
             _ => Err(GxPacketError::InvalidField {
-                field: "copy kind",
+                field: "terminal kind",
                 value: u64::from(value),
             }),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxEfbPeekPlane {
+    Color,
+    Depth,
+}
+
+impl GxEfbPeekPlane {
+    fn parse(value: u32) -> Result<Self, GxPacketError> {
+        match value {
+            0 => Ok(Self::Color),
+            1 => Ok(Self::Depth),
+            _ => Err(GxPacketError::InvalidField {
+                field: "EFB peek plane",
+                value: u64::from(value),
+            }),
+        }
+    }
+
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Color => 0,
+            Self::Depth => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GxEfbPeekAlphaMode {
+    Read00,
+    ReadFf,
+    ReadNone,
+}
+
+impl GxEfbPeekAlphaMode {
+    fn parse(value: u32) -> Result<Self, GxPacketError> {
+        match value {
+            0 => Ok(Self::Read00),
+            1 => Ok(Self::ReadFf),
+            2 => Ok(Self::ReadNone),
+            _ => Err(GxPacketError::InvalidField {
+                field: "EFB peek alpha-read mode",
+                value: u64::from(value),
+            }),
+        }
+    }
+
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Read00 => 0,
+            Self::ReadFf => 1,
+            Self::ReadNone => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GxEfbPeekState {
+    pub(crate) source_x: u32,
+    pub(crate) source_y: u32,
+    pub(crate) request_sequence: u32,
+    pub(crate) plane: GxEfbPeekPlane,
+    pub(crate) alpha_mode: GxEfbPeekAlphaMode,
+    pub(crate) pixel_control: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +181,10 @@ pub(crate) struct GxPacketHeader {
     pub(crate) stride: u32,
     pub(crate) generation: u32,
     pub(crate) clear: bool,
+    pub(crate) texture_copy_layout_v1: bool,
+    pub(crate) indirect_tev_state_v1: bool,
     pub(crate) copy_state: GxCopyState,
+    pub(crate) efb_peek: Option<GxEfbPeekState>,
     pub(crate) total_vertex_count: u32,
 }
 
@@ -122,6 +205,64 @@ pub(crate) struct GxFragmentTailState {
     pub(crate) fog_range_k: [u32; 5],
     pub(crate) fog_words: [u32; 5],
     pub(crate) viewport_half_width_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GxIndirectTevState {
+    pub(crate) gen_mode: u32,
+    pub(crate) xf_num_tex_gens: u32,
+    pub(crate) matrices: [u32; 9],
+    pub(crate) imask: u32,
+    pub(crate) commands: [u32; 16],
+    pub(crate) tex_scales: [u32; 2],
+    pub(crate) iref: u32,
+}
+
+#[cfg(test)]
+fn indirect_texture_dependencies(
+    state: &GxIndirectTevState,
+) -> impl Iterator<Item = (usize, Option<usize>)> + '_ {
+    let direct_tev_stage_count = (((state.gen_mode >> 10) & 0xf) + 1) as usize;
+    let indirect_stage_count = ((state.gen_mode >> 16) & 7) as usize;
+    let texture_generator_count = state.xf_num_tex_gens as usize;
+    state.commands[..direct_tev_stage_count]
+        .iter()
+        .filter_map(move |command| {
+            let indirect_stage = (command & 3) as usize;
+            let bump_alpha = (command >> 7) & 3;
+            let matrix_index = (command >> 9) & 3;
+            if (bump_alpha == 0 && matrix_index == 0) || indirect_stage >= indirect_stage_count {
+                return None;
+            }
+
+            let reference_shift = indirect_stage * 6;
+            let texture_map = ((state.iref >> reference_shift) & 7) as usize;
+            let texture_coord = ((state.iref >> (reference_shift + 3)) & 7) as usize;
+            // With no active texture generators GX synthesizes the zero
+            // coordinate. Otherwise an IREF coordinate beyond XF's
+            // active range falls back to coordinate zero. The texture-map
+            // dependency remains live in both cases, including all-zero IREF.
+            let effective_texture_coord = if texture_generator_count == 0 {
+                None
+            } else if texture_coord < texture_generator_count {
+                Some(texture_coord)
+            } else {
+                Some(0)
+            };
+            Some((texture_map, effective_texture_coord))
+        })
+}
+
+fn renderer_indirect_tev_state(state: &GxIndirectTevState) -> IndirectTevState {
+    let effective_gen_mode = (state.gen_mode & !0xf) | state.xf_num_tex_gens;
+    IndirectTevState::from_bp(
+        effective_gen_mode,
+        state.matrices,
+        state.imask,
+        state.commands,
+        state.tex_scales,
+        state.iref,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +303,7 @@ pub(crate) struct GxDrawRecord {
     pub(crate) scissor_height: u32,
     pub(crate) textures: [GxTextureSlot; MAX_TEV_TEXTURES],
     pub(crate) fragment_tail: GxFragmentTailState,
+    pub(crate) indirect_tev: Option<GxIndirectTevState>,
     pub(crate) post_cull_actions: Option<Vec<GxTriangleAction>>,
     pub(crate) exact_clip_required: bool,
     exact_clip: Option<GxExactClipRecord>,
@@ -303,7 +445,28 @@ impl<'a> GxFramePacket<'a> {
                 actual: bytes.len(),
             });
         }
-        expect_u32("packet flags", read_u32(bytes, 0x0c), 0)?;
+        let packet_flags = read_u32(bytes, 0x0c);
+        let permitted_packet_flags =
+            PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1 | PACKET_FLAG_INDIRECT_TEV_STATE_V1;
+        if packet_flags & !permitted_packet_flags != 0 {
+            return Err(GxPacketError::InvalidField {
+                field: "packet flags",
+                value: u64::from(packet_flags),
+            });
+        }
+        let texture_copy_layout_v1 = packet_flags & PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1 != 0;
+        let indirect_tev_state_v1 = packet_flags & PACKET_FLAG_INDIRECT_TEV_STATE_V1 != 0;
+        if texture_copy_layout_v1 && matches!(version, GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3)
+        {
+            return Err(GxPacketError::NonCanonical(
+                "texture-copy layout provenance requires LZGX v4 or later",
+            ));
+        }
+        if indirect_tev_state_v1 && matches!(version, GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3) {
+            return Err(GxPacketError::NonCanonical(
+                "indirect TEV state requires LZGX v4 or later",
+            ));
+        }
         let copy_kind = GxCopyKind::parse(read_u32(bytes, 0x10))?;
         let draw_count = read_u32(bytes, 0x14);
         let texture_count = read_u32(bytes, 0x18);
@@ -359,16 +522,39 @@ impl<'a> GxFramePacket<'a> {
             read_bp_word(bytes, 0x98, "copy filter 0")?,
             read_bp_word(bytes, 0x9c, "copy filter 1")?,
         ];
+        let copy_state = GxCopyState {
+            z_mode: terminal_z_mode,
+            blend_mode: terminal_blend_mode,
+            pixel_control,
+            copy_command,
+            clear_rgba,
+            clear_depth,
+            copy_scale,
+            copy_filter,
+        };
 
         if (copy_flags & COPY_FLAG_CLEAR != 0) != (copy_command & 0x0800 != 0) {
             return Err(GxPacketError::NonCanonical(
                 "copy clear flag must match the raw copy command",
             ));
         }
-        if (copy_kind == GxCopyKind::Xfb) != (copy_command & 0x4000 != 0) {
-            return Err(GxPacketError::NonCanonical(
-                "copy kind must match the raw copy command",
-            ));
+        match copy_kind {
+            GxCopyKind::Texture if copy_command & 0x4000 != 0 => {
+                return Err(GxPacketError::NonCanonical(
+                    "copy kind must match the raw copy command",
+                ));
+            }
+            GxCopyKind::Xfb if copy_command & 0x4000 == 0 => {
+                return Err(GxPacketError::NonCanonical(
+                    "copy kind must match the raw copy command",
+                ));
+            }
+            GxCopyKind::Peek if copy_command != 0 => {
+                return Err(GxPacketError::NonCanonical(
+                    "EFB peek cannot carry a copy command",
+                ));
+            }
+            _ => {}
         }
 
         if source_width == 0 || source_height == 0 {
@@ -377,15 +563,50 @@ impl<'a> GxFramePacket<'a> {
                 value: 0,
             });
         }
-        match copy_kind {
-            GxCopyKind::Texture => {
+        let efb_peek = match (copy_kind, texture_copy_layout_v1) {
+            (GxCopyKind::Texture, false) => {
                 if output_width != 0 || output_height != 0 || stride != 0 {
                     return Err(GxPacketError::NonCanonical(
                         "texture copies must have zero output width, output height, and stride",
                     ));
                 }
+                None
             }
-            GxCopyKind::Xfb => {
+            (GxCopyKind::Texture, true) => {
+                if !stride.is_multiple_of(32) || stride > 0x1fff_ffe0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "texture copy physical stride",
+                        value: u64::from(stride),
+                    });
+                }
+                let (clipped_width, clipped_height) =
+                    clipped_copy_extent(source_x, source_y, source_width, source_height).ok_or(
+                        GxPacketError::NonCanonical(
+                            "texture-copy layout source must overlap the EFB",
+                        ),
+                    )?;
+                let plan = gx_texture_copy_plan(clipped_width, clipped_height, copy_state)
+                    .map_err(GxPacketError::InvalidTextureCopyPlan)?;
+                if output_width == 0 || output_height == 0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "texture copy output extent",
+                        value: 0,
+                    });
+                }
+                expect_u32("texture copy output width", output_width, plan.output_width)?;
+                expect_u32(
+                    "texture copy output height",
+                    output_height,
+                    plan.output_height,
+                )?;
+                None
+            }
+            (GxCopyKind::Xfb, true) => {
+                return Err(GxPacketError::NonCanonical(
+                    "XFB copies cannot carry texture-copy layout provenance",
+                ));
+            }
+            (GxCopyKind::Xfb, false) => {
                 if output_width == 0 || output_height == 0 || stride == 0 {
                     return Err(GxPacketError::InvalidField {
                         field: "XFB output extent/stride",
@@ -399,8 +620,80 @@ impl<'a> GxFramePacket<'a> {
                         value: u64::from(maximum_output_dimension),
                     });
                 }
+                None
             }
-        }
+            (GxCopyKind::Peek, true) => {
+                return Err(GxPacketError::NonCanonical(
+                    "EFB peeks cannot carry texture-copy layout provenance",
+                ));
+            }
+            (GxCopyKind::Peek, false) => {
+                if source_width != 1 || source_height != 1 {
+                    return Err(GxPacketError::NonCanonical(
+                        "EFB peek source extent must be exactly one pixel",
+                    ));
+                }
+                if source_x >= EFB_WIDTH || source_y >= EFB_HEIGHT {
+                    return Err(GxPacketError::InvalidField {
+                        field: "EFB peek source coordinate",
+                        value: (u64::from(source_y) << 32) | u64::from(source_x),
+                    });
+                }
+                if output_width != 0 || output_height != 0 {
+                    return Err(GxPacketError::NonCanonical(
+                        "EFB peeks must have zero output width and height",
+                    ));
+                }
+                if generation == 0 {
+                    return Err(GxPacketError::InvalidField {
+                        field: "EFB peek request sequence",
+                        value: 0,
+                    });
+                }
+                if copy_flags != 0
+                    || terminal_z_mode != 0
+                    || terminal_blend_mode != 0
+                    || copy_command != 0
+                    || clear_rgba != [0; 4]
+                    || clear_depth != 0
+                    || copy_scale != 0
+                    || copy_filter != [0; 2]
+                {
+                    return Err(GxPacketError::NonCanonical(
+                        "EFB peeks cannot carry copy or clear state",
+                    ));
+                }
+                let plane = GxEfbPeekPlane::parse(destination)?;
+                let alpha_mode = GxEfbPeekAlphaMode::parse(stride)?;
+                match plane {
+                    GxEfbPeekPlane::Color => match gx_efb_format(pixel_control) {
+                        GxEfbFormat::Rgb8Z24 | GxEfbFormat::Rgba6Z24 | GxEfbFormat::Rgb565Z16 => {}
+                        GxEfbFormat::Z24 | GxEfbFormat::OtherNoAlpha => {
+                            return Err(GxPacketError::InvalidField {
+                                field: "EFB peek color format",
+                                value: u64::from(pixel_control & 7),
+                            });
+                        }
+                    },
+                    GxEfbPeekPlane::Depth => {
+                        gx_efb_depth_encoding(pixel_control).map_err(|_| {
+                            GxPacketError::InvalidField {
+                                field: "EFB peek depth encoding",
+                                value: u64::from(pixel_control & 0x3f),
+                            }
+                        })?;
+                    }
+                }
+                Some(GxEfbPeekState {
+                    source_x,
+                    source_y,
+                    request_sequence: generation,
+                    plane,
+                    alpha_mode,
+                    pixel_control,
+                })
+            }
+        };
 
         let expected_draw_bytes =
             checked_mul(draw_count, u32::from(draw_record_bytes), "draw table size")?;
@@ -508,22 +801,14 @@ impl<'a> GxFramePacket<'a> {
             stride,
             generation,
             clear: copy_flags & COPY_FLAG_CLEAR != 0,
-            copy_state: GxCopyState {
-                z_mode: terminal_z_mode,
-                blend_mode: terminal_blend_mode,
-                pixel_control,
-                copy_command,
-                clear_rgba,
-                clear_depth,
-                copy_scale,
-                copy_filter,
-            },
+            texture_copy_layout_v1,
+            indirect_tev_state_v1,
+            copy_state,
+            efb_peek,
             total_vertex_count,
         };
 
         let texture_count_usize = to_usize(texture_count);
-        let mut seen_textures = vec![false; texture_count_usize];
-        let mut next_first_texture = 0usize;
         let mut draws = Vec::with_capacity(to_usize(draw_count));
         let mut next_vertex_relative_offset = 0u32;
         let mut counted_vertices = 0u32;
@@ -775,11 +1060,6 @@ impl<'a> GxFramePacket<'a> {
                     });
                 }
             }
-            let required_maps =
-                required_texture_maps(tev_state).map_err(|_| GxPacketError::InvalidField {
-                    field: "TEV state",
-                    value: 0,
-                })?;
             let mut texture_slots = [GxTextureSlot {
                 texture: None,
                 sampler_bits: 0,
@@ -811,45 +1091,21 @@ impl<'a> GxFramePacket<'a> {
                         sampler_bits,
                     });
                 }
-                if !required_maps[map] {
-                    if reference != GX_TEXTURE_REFERENCE_ABSENT || sampler_bits != 0 {
-                        return Err(GxPacketError::UnexpectedTextureReference {
+                let texture = if reference == GX_TEXTURE_REFERENCE_ABSENT {
+                    None
+                } else {
+                    if to_usize(reference) >= texture_count_usize {
+                        return Err(GxPacketError::InvalidTextureReference {
                             draw: draw_index,
                             map,
+                            reference,
+                            texture_count,
                         });
                     }
-                    continue;
-                }
-                if reference == GX_TEXTURE_REFERENCE_ABSENT {
-                    return Err(GxPacketError::MissingTextureReference {
-                        draw: draw_index,
-                        map,
-                    });
-                }
-                let reference_usize = to_usize(reference);
-                if reference_usize >= texture_count_usize {
-                    return Err(GxPacketError::InvalidTextureReference {
-                        draw: draw_index,
-                        map,
-                        reference,
-                        texture_count,
-                    });
-                }
-                if !seen_textures[reference_usize] {
-                    if reference_usize != next_first_texture {
-                        return Err(GxPacketError::NonCanonicalTextureFirstUse {
-                            draw: draw_index,
-                            map,
-                            expected: u32::try_from(next_first_texture)
-                                .expect("texture count originated as u32"),
-                            actual: reference,
-                        });
-                    }
-                    seen_textures[reference_usize] = true;
-                    next_first_texture += 1;
-                }
+                    Some(reference)
+                };
                 texture_slots[map] = GxTextureSlot {
-                    texture: Some(reference),
+                    texture,
                     sampler_bits,
                     mode1: 0,
                 };
@@ -870,6 +1126,7 @@ impl<'a> GxFramePacket<'a> {
                 scissor_height: read_u32(record, 0x28),
                 textures: texture_slots,
                 fragment_tail,
+                indirect_tev: None,
                 post_cull_actions: has_post_cull_actions.then(Vec::new),
                 exact_clip_required,
                 exact_clip: None,
@@ -881,13 +1138,6 @@ impl<'a> GxFramePacket<'a> {
             next_vertex_relative_offset,
             vertex_bytes,
         )?;
-        if next_first_texture != texture_count_usize {
-            return Err(GxPacketError::UnusedTextureRecord {
-                texture: u32::try_from(next_first_texture)
-                    .expect("texture count originated as u32"),
-            });
-        }
-
         let evidence_end = checked_add(
             packet_base_bytes,
             evidence_tail_bytes,
@@ -915,7 +1165,7 @@ impl<'a> GxFramePacket<'a> {
         } else {
             0
         };
-        let expected_packet_bytes = match version {
+        let version_tail_end = match version {
             GX_PACKET_VERSION_V2 | GX_PACKET_VERSION_V3 => packet_base_bytes,
             GX_PACKET_VERSION => exact_clip_start,
             GX_PACKET_VERSION_V5 => {
@@ -939,6 +1189,20 @@ impl<'a> GxFramePacket<'a> {
             }
             _ => unreachable!("validated LZGX packet version"),
         };
+        let indirect_tev_tail_bytes = if indirect_tev_state_v1 {
+            checked_mul(
+                draw_count,
+                GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW,
+                "indirect TEV tail byte length",
+            )?
+        } else {
+            0
+        };
+        let expected_packet_bytes = checked_add(
+            version_tail_end,
+            indirect_tev_tail_bytes,
+            "indirect TEV tail end",
+        )?;
         expect_u32("packet bytes", packet_bytes, expected_packet_bytes)?;
 
         let mut evidence_offset = to_usize(packet_base_bytes);
@@ -1077,7 +1341,7 @@ impl<'a> GxFramePacket<'a> {
             }
             debug_assert_eq!(exact_clip_offset, exact_clip_end);
         } else {
-            require_zero(bytes, evidence_offset, to_usize(expected_packet_bytes))?;
+            require_zero(bytes, evidence_offset, to_usize(version_tail_end))?;
         }
 
         if version == GX_PACKET_VERSION_V7 {
@@ -1112,19 +1376,206 @@ impl<'a> GxFramePacket<'a> {
                             mode1,
                         });
                     }
-                    let slot = &mut draw.textures[map];
-                    if slot.texture.is_none() {
-                        if mode1 != 0 {
-                            return Err(GxPacketError::UnexpectedTextureReference {
-                                draw: draw_index,
-                                map,
-                            });
-                        }
-                    } else {
-                        slot.mode1 = mode1;
-                    }
+                    draw.textures[map].mode1 = mode1;
                 }
             }
+        }
+
+        if indirect_tev_state_v1 {
+            let mut has_semantic_indirect_tev = false;
+            for (draw_index, draw) in draws.iter_mut().enumerate() {
+                let tail_offset = checked_add(
+                    version_tail_end,
+                    checked_mul(
+                        u32::try_from(draw_index).expect("draw count originated as u32"),
+                        GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW,
+                        "draw indirect TEV tail offset",
+                    )?,
+                    "draw indirect TEV tail offset",
+                )?;
+                let offset = to_usize(tail_offset);
+                let state_encoding = read_u32(bytes, offset);
+                if !matches!(
+                    state_encoding,
+                    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1
+                        | INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2
+                ) {
+                    return Err(GxPacketError::InvalidField {
+                        field: "indirect TEV state encoding",
+                        value: u64::from(state_encoding),
+                    });
+                }
+                let gen_mode = read_bp_word(bytes, offset + 0x04, "indirect TEV generation mode")?;
+                let direct_tev_stage_count = read_u32(
+                    bytes,
+                    to_usize(checked_add(
+                        checked_add(tev_offset, draw.tev_relative_offset, "draw TEV start")?,
+                        448,
+                        "draw TEV stage count",
+                    )?),
+                );
+                expect_u32(
+                    "indirect TEV generation stage count",
+                    ((gen_mode >> 10) & 0xf) + 1,
+                    direct_tev_stage_count,
+                )?;
+                expect_u32(
+                    "indirect TEV generation cull mode",
+                    (gen_mode >> 14) & 3,
+                    u32::from(draw.cull_mode),
+                )?;
+                if let Some(exact_clip) = draw.exact_clip {
+                    expect_u32(
+                        "indirect TEV exact-clip generation mode",
+                        gen_mode,
+                        exact_clip.state.bp_gen_mode,
+                    )?;
+                }
+                let mut matrices = [0; 9];
+                for (index, matrix) in matrices.iter_mut().enumerate() {
+                    *matrix =
+                        read_bp_word(bytes, offset + 0x08 + index * 4, "indirect TEV matrix word")?;
+                }
+                let imask = read_bp_word(bytes, offset + 0x2c, "indirect TEV mask")?;
+                let mut commands = [0; 16];
+                for (index, command) in commands.iter_mut().enumerate() {
+                    *command =
+                        read_bp_word(bytes, offset + 0x30 + index * 4, "indirect TEV command")?;
+                }
+                let tex_scales = [
+                    read_bp_word(bytes, offset + 0x70, "indirect TEV texture scale")?,
+                    read_bp_word(bytes, offset + 0x74, "indirect TEV texture scale")?,
+                ];
+                let iref = read_bp_word(bytes, offset + 0x78, "indirect TEV reference")?;
+                let xf_num_tex_gens = match state_encoding {
+                    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1 => {
+                        expect_u32(
+                            "indirect TEV reserved word",
+                            read_u32(bytes, offset + 0x7c),
+                            0,
+                        )?;
+                        gen_mode & 0xf
+                    }
+                    INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2 => {
+                        let xf_num_tex_gens = read_u32(bytes, offset + 0x7c);
+                        if xf_num_tex_gens > MAX_TEV_TEXTURES as u32 {
+                            return Err(GxPacketError::InvalidField {
+                                field: "indirect TEV XF texture generator count",
+                                value: u64::from(xf_num_tex_gens),
+                            });
+                        }
+                        xf_num_tex_gens
+                    }
+                    _ => unreachable!("validated indirect TEV state encoding"),
+                };
+                let indirect_tev = GxIndirectTevState {
+                    gen_mode,
+                    xf_num_tex_gens,
+                    matrices,
+                    imask,
+                    commands,
+                    tex_scales,
+                    iref,
+                };
+                let tev_start = checked_add(
+                    tev_offset,
+                    draw.tev_relative_offset,
+                    "draw indirect TEV direct-state start",
+                )?;
+                let tev_end = checked_add(
+                    tev_start,
+                    GX_TEV_STATE_BYTES,
+                    "draw indirect TEV direct-state end",
+                )?;
+                let direct_state = &bytes[to_usize(tev_start)..to_usize(tev_end)];
+                has_semantic_indirect_tev |= ((gen_mode >> 16) & 7) != 0
+                    || direct_texture_requires_gen_mode(
+                        direct_state,
+                        xf_num_tex_gens as usize,
+                    )
+                    .map_err(|_| GxPacketError::InvalidField {
+                        field: "TEV state",
+                        value: 0,
+                    })?
+                    || commands[..to_usize(direct_tev_stage_count)]
+                        .iter()
+                        .any(|command| *command & INDIRECT_TEV_COMMAND_MASK != 0);
+                draw.indirect_tev = Some(indirect_tev);
+            }
+            if !has_semantic_indirect_tev {
+                return Err(GxPacketError::NonCanonical(
+                    "indirect TEV state requires at least one semantically live draw",
+                ));
+            }
+        }
+
+        let mut seen_textures = vec![false; texture_count_usize];
+        let mut next_first_texture = 0usize;
+        for (draw_index, draw) in draws.iter().enumerate() {
+            let tev_start = checked_add(
+                tev_offset,
+                draw.tev_relative_offset,
+                "draw TEV resource-validation start",
+            )?;
+            let tev_end = checked_add(
+                tev_start,
+                GX_TEV_STATE_BYTES,
+                "draw TEV resource-validation end",
+            )?;
+            let direct_state = &bytes[to_usize(tev_start)..to_usize(tev_end)];
+            let required_maps = if let Some(indirect_tev) = &draw.indirect_tev {
+                required_texture_maps_with_indirect(
+                    direct_state,
+                    &renderer_indirect_tev_state(indirect_tev),
+                )
+            } else {
+                required_texture_maps(direct_state)
+            }
+            .map_err(|_| GxPacketError::InvalidField {
+                field: "TEV state",
+                value: 0,
+            })?;
+
+            for (map, required) in required_maps.into_iter().enumerate() {
+                let slot = draw.textures[map];
+                if !required {
+                    if slot.texture.is_some() || slot.sampler_bits != 0 || slot.mode1 != 0 {
+                        return Err(GxPacketError::UnexpectedTextureReference {
+                            draw: draw_index,
+                            map,
+                        });
+                    }
+                    continue;
+                }
+
+                let Some(reference) = slot.texture else {
+                    return Err(GxPacketError::MissingTextureReference {
+                        draw: draw_index,
+                        map,
+                    });
+                };
+                let reference_usize = to_usize(reference);
+                debug_assert!(reference_usize < texture_count_usize);
+                if !seen_textures[reference_usize] {
+                    if reference_usize != next_first_texture {
+                        return Err(GxPacketError::NonCanonicalTextureFirstUse {
+                            draw: draw_index,
+                            map,
+                            expected: u32::try_from(next_first_texture)
+                                .expect("texture count originated as u32"),
+                            actual: reference,
+                        });
+                    }
+                    seen_textures[reference_usize] = true;
+                    next_first_texture += 1;
+                }
+            }
+        }
+        if next_first_texture != texture_count_usize {
+            return Err(GxPacketError::UnusedTextureRecord {
+                texture: u32::try_from(next_first_texture)
+                    .expect("texture count originated as u32"),
+            });
         }
 
         let mut textures = Vec::with_capacity(texture_count_usize);
@@ -1454,6 +1905,7 @@ pub(crate) enum GxPacketError {
         expected: Option<u32>,
         actual: u32,
     },
+    InvalidTextureCopyPlan(GxTextureCopyPlanError),
 }
 
 impl fmt::Display for GxPacketError {
@@ -1571,6 +2023,9 @@ impl fmt::Display for GxPacketError {
                     "LZGX texture {texture} has invalid zero extent {width}x{height}"
                 ),
             },
+            Self::InvalidTextureCopyPlan(error) => {
+                write!(formatter, "invalid LZGX texture-copy plan: {error}")
+            }
         }
     }
 }
@@ -1751,6 +2206,32 @@ mod tests {
         bytes
     }
 
+    fn empty_texture_copy_v4() -> Vec<u8> {
+        let mut bytes = empty_texture_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u16(&mut bytes, 0x78, GX_DRAW_RECORD_BYTES);
+        bytes
+    }
+
+    fn empty_efb_peek() -> Vec<u8> {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x10, 3);
+        put_u32(&mut bytes, 0x4c, 320);
+        put_u32(&mut bytes, 0x50, 240);
+        put_u32(&mut bytes, 0x54, 1);
+        put_u32(&mut bytes, 0x58, 1);
+        put_u32(&mut bytes, 0x64, 1);
+        put_u32(&mut bytes, 0x68, 2);
+        put_u32(&mut bytes, 0x6c, 0x1122_3344);
+        put_u32(&mut bytes, 0x70, 0);
+        bytes[0x74..0x78].fill(0);
+        for offset in [0x80, 0x84, 0x8c, 0x90, 0x94, 0x98, 0x9c] {
+            put_u32(&mut bytes, offset, 0);
+        }
+        put_u32(&mut bytes, 0x88, 0x41);
+        bytes
+    }
+
     fn single_draw_v2_texture_copy() -> Vec<u8> {
         const PACKET_BYTES: usize = 752;
         const DRAW_OFFSET: usize = 160;
@@ -1877,6 +2358,81 @@ mod tests {
                     triangle_action_bytes(source_triangle_count(*topology, *vertex_count)) as usize
                 })
                 .unwrap_or(0);
+        }
+        bytes
+    }
+
+    fn indirect_tev_state(
+        seed: u32,
+        indirect_stage_count: u32,
+        tev_stage_count: u32,
+        cull_mode: u32,
+    ) -> GxIndirectTevState {
+        assert!((1..=MAX_TEV_STAGES as u32).contains(&tev_stage_count));
+        assert!(cull_mode <= 3);
+        let word = |offset: u32| seed.wrapping_add(offset * 0x01_0101) & 0x00ff_ffff;
+        let gen_mode = (word(29) & !((0xf << 10) | (3 << 14) | (7 << 16)))
+                | ((tev_stage_count - 1) << 10)
+                | (cull_mode << 14)
+                | (indirect_stage_count << 16);
+        GxIndirectTevState {
+            gen_mode,
+            xf_num_tex_gens: 8,
+            matrices: std::array::from_fn(|index| word(index as u32)),
+            imask: word(9),
+            // Generic transport fixtures exercise arbitrary indirect command
+            // payloads without implicitly claiming texture resources. Tests
+            // for live sampling dependencies set BS or the matrix index
+            // explicitly.
+            commands: std::array::from_fn(|index| word(10 + index as u32) & !((3 << 7) | (3 << 9))),
+            tex_scales: [word(26), word(27)],
+            iref: word(28),
+        }
+    }
+
+    fn set_tev_stage_count(bytes: &mut [u8], draw_index: usize, stage_count: u32) {
+        let tev_offset = read_u32(bytes, 0x24) as usize;
+        put_u32(
+            bytes,
+            tev_offset + draw_index * GX_TEV_STATE_BYTES as usize + 448,
+            stage_count,
+        );
+    }
+
+    fn append_indirect_tev_tail(mut bytes: Vec<u8>, states: &[GxIndirectTevState]) -> Vec<u8> {
+        assert!(matches!(
+            read_u16(&bytes, 0x04),
+            GX_PACKET_VERSION | GX_PACKET_VERSION_V5 | GX_PACKET_VERSION_V6 | GX_PACKET_VERSION_V7
+        ));
+        assert_eq!(read_u32(&bytes, 0x14) as usize, states.len());
+        let tail_offset = bytes.len();
+        bytes.resize(
+            tail_offset + states.len() * GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW as usize,
+            0,
+        );
+        let packet_flags = read_u32(&bytes, 0x0c) | PACKET_FLAG_INDIRECT_TEV_STATE_V1;
+        put_u32(&mut bytes, 0x0c, packet_flags);
+        let packet_bytes = bytes.len() as u32;
+        put_u32(&mut bytes, 0x08, packet_bytes);
+        for (draw_index, state) in states.iter().enumerate() {
+            let offset = tail_offset + draw_index * GX_INDIRECT_TEV_TAIL_BYTES_PER_DRAW as usize;
+            put_u32(
+                &mut bytes,
+                offset,
+                INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2,
+            );
+            put_u32(&mut bytes, offset + 0x04, state.gen_mode);
+            for (index, word) in state.matrices.iter().enumerate() {
+                put_u32(&mut bytes, offset + 0x08 + index * 4, *word);
+            }
+            put_u32(&mut bytes, offset + 0x2c, state.imask);
+            for (index, word) in state.commands.iter().enumerate() {
+                put_u32(&mut bytes, offset + 0x30 + index * 4, *word);
+            }
+            put_u32(&mut bytes, offset + 0x70, state.tex_scales[0]);
+            put_u32(&mut bytes, offset + 0x74, state.tex_scales[1]);
+            put_u32(&mut bytes, offset + 0x78, state.iref);
+            put_u32(&mut bytes, offset + 0x7c, state.xf_num_tex_gens);
         }
         bytes
     }
@@ -2296,6 +2852,7 @@ mod tests {
         let packet = GxFramePacket::parse(&bytes).unwrap();
         assert_eq!(packet.header().copy_kind, GxCopyKind::Texture);
         assert!(packet.header().clear);
+        assert!(!packet.header().texture_copy_layout_v1);
         assert_eq!(
             packet.header().copy_state,
             GxCopyState {
@@ -2311,6 +2868,809 @@ mod tests {
         );
         assert_eq!(packet.draws().len(), 0);
         assert_eq!(packet.textures().len(), 0);
+    }
+
+    #[test]
+    fn parses_canonical_one_pixel_efb_peek_terminal() {
+        let bytes = empty_efb_peek();
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(packet.header().copy_kind, GxCopyKind::Peek);
+        assert_eq!(
+            packet.header().efb_peek,
+            Some(GxEfbPeekState {
+                source_x: 320,
+                source_y: 240,
+                request_sequence: 0x1122_3344,
+                plane: GxEfbPeekPlane::Depth,
+                alpha_mode: GxEfbPeekAlphaMode::ReadNone,
+                pixel_control: 0x41,
+            })
+        );
+        assert!(!packet.header().clear);
+        assert!(!packet.header().texture_copy_layout_v1);
+    }
+
+    #[test]
+    fn efb_peek_terminal_fields_are_strict_and_fail_closed() {
+        for (offset, value, expected) in [
+            (
+                0x54,
+                2,
+                GxPacketError::NonCanonical("EFB peek source extent must be exactly one pixel"),
+            ),
+            (
+                0x5c,
+                1,
+                GxPacketError::NonCanonical("EFB peeks must have zero output width and height"),
+            ),
+            (
+                0x64,
+                2,
+                GxPacketError::InvalidField {
+                    field: "EFB peek plane",
+                    value: 2,
+                },
+            ),
+            (
+                0x68,
+                3,
+                GxPacketError::InvalidField {
+                    field: "EFB peek alpha-read mode",
+                    value: 3,
+                },
+            ),
+            (
+                0x6c,
+                0,
+                GxPacketError::InvalidField {
+                    field: "EFB peek request sequence",
+                    value: 0,
+                },
+            ),
+            (
+                0x8c,
+                1,
+                GxPacketError::NonCanonical("EFB peek cannot carry a copy command"),
+            ),
+            (
+                0x90,
+                1,
+                GxPacketError::NonCanonical("EFB peeks cannot carry copy or clear state"),
+            ),
+        ] {
+            let mut bytes = empty_efb_peek();
+            put_u32(&mut bytes, offset, value);
+            assert_eq!(GxFramePacket::parse(&bytes).unwrap_err(), expected);
+        }
+
+        let mut out_of_bounds = empty_efb_peek();
+        put_u32(&mut out_of_bounds, 0x4c, EFB_WIDTH);
+        assert!(matches!(
+            GxFramePacket::parse(&out_of_bounds),
+            Err(GxPacketError::InvalidField {
+                field: "EFB peek source coordinate",
+                ..
+            })
+        ));
+
+        let mut layout = empty_efb_peek();
+        put_u32(&mut layout, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        assert_eq!(
+            GxFramePacket::parse(&layout).unwrap_err(),
+            GxPacketError::NonCanonical("EFB peeks cannot carry texture-copy layout provenance")
+        );
+    }
+
+    #[test]
+    fn efb_peek_validates_color_format_and_z16_encoding() {
+        let mut color = empty_efb_peek();
+        put_u32(&mut color, 0x64, 0);
+        put_u32(&mut color, 0x88, 1);
+        assert_eq!(
+            GxFramePacket::parse(&color).unwrap().header().efb_peek,
+            Some(GxEfbPeekState {
+                source_x: 320,
+                source_y: 240,
+                request_sequence: 0x1122_3344,
+                plane: GxEfbPeekPlane::Color,
+                alpha_mode: GxEfbPeekAlphaMode::ReadNone,
+                pixel_control: 1,
+            })
+        );
+        put_u32(&mut color, 0x88, 3);
+        assert_eq!(
+            GxFramePacket::parse(&color).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "EFB peek color format",
+                value: 3,
+            }
+        );
+
+        let mut invalid_z16 = empty_efb_peek();
+        put_u32(&mut invalid_z16, 0x88, 2 | (4 << 3));
+        assert_eq!(
+            GxFramePacket::parse(&invalid_z16).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "EFB peek depth encoding",
+                value: 2 | (4 << 3),
+            }
+        );
+    }
+
+    #[test]
+    fn flagged_texture_copy_layout_clips_source_and_preserves_physical_stride() {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        put_u32(&mut bytes, 0x4c, 639);
+        put_u32(&mut bytes, 0x50, 527);
+        put_u32(&mut bytes, 0x54, 4);
+        put_u32(&mut bytes, 0x58, 4);
+        put_u32(&mut bytes, 0x5c, 1);
+        put_u32(&mut bytes, 0x60, 1);
+        put_u32(&mut bytes, 0x68, 0x3440);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert!(packet.header().texture_copy_layout_v1);
+        assert_eq!(packet.header().output_width, 1);
+        assert_eq!(packet.header().output_height, 1);
+        assert_eq!(packet.header().stride, 0x3440);
+
+        put_u32(&mut bytes, 0x68, 0);
+        assert_eq!(GxFramePacket::parse(&bytes).unwrap().header().stride, 0);
+
+        put_u32(&mut bytes, 0x4c, 638);
+        put_u32(&mut bytes, 0x50, 526);
+        put_u32(&mut bytes, 0x8c, 0x0000_0a00);
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap().header().output_width,
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_texture_copy_still_requires_zero_layout_fields() {
+        for offset in [0x5c, 0x60, 0x68] {
+            let mut bytes = empty_texture_copy();
+            put_u32(&mut bytes, offset, 1);
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::NonCanonical(
+                    "texture copies must have zero output width, output height, and stride"
+                ),
+                "layout field at {offset:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn flagged_texture_copy_rejects_layout_mismatch() {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        put_u32(&mut bytes, 0x5c, 2);
+        put_u32(&mut bytes, 0x60, 4);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "texture copy output width",
+                expected: 3,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_packet_flag() {
+        let mut bytes = empty_texture_copy();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_INDIRECT_TEV_STATE_V1 << 1);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "packet flags",
+                value: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_fixed_indirect_tev_tails_without_widening_direct_tev_state() {
+        let states = [
+            indirect_tev_state(0x01_0203, 3, 1, 0),
+            indirect_tev_state(0x04_0506, 0, 1, 0),
+        ];
+        let mut base = v4_texture_copy(&[(2, 0, 3, None), (2, 0, 3, None)]);
+        set_tev_stage_count(&mut base, 0, 1);
+        set_tev_stage_count(&mut base, 1, 1);
+        let base_len = base.len();
+        let bytes = append_indirect_tev_tail(base, &states);
+        assert_eq!(bytes.len(), base_len + states.len() * 128);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert!(packet.header().indirect_tev_state_v1);
+        assert_eq!(packet.header().tev_bytes, 2 * GX_TEV_STATE_BYTES);
+        for (draw_index, expected) in states.iter().enumerate() {
+            let draw = packet.draw(draw_index).unwrap();
+            assert_eq!(draw.tev_state.len(), GX_TEV_STATE_BYTES as usize);
+            assert_eq!(draw.record.indirect_tev, Some(*expected));
+        }
+    }
+
+    #[test]
+    fn indirect_tev_tail_versions_legacy_padding_and_explicit_xf_state() {
+        let mut state = GxIndirectTevState {
+            gen_mode: 1,
+            xf_num_tex_gens: 7,
+            ..GxIndirectTevState::default()
+        };
+        state.commands[0] = 6 << 13;
+        let mut base = v4_texture_copy(&[(2, 0, 3, None)]);
+        set_tev_stage_count(&mut base, 0, 1);
+        let tail_offset = base.len();
+        let current = append_indirect_tev_tail(base, &[state]);
+
+        assert_eq!(
+            read_u32(&current, tail_offset),
+            INDIRECT_TEV_STATE_ENCODING_BP_WORDS_XF_V2
+        );
+        assert_eq!(
+            GxFramePacket::parse(&current)
+                .unwrap()
+                .draw(0)
+                .unwrap()
+                .record
+                .indirect_tev,
+            Some(state),
+        );
+
+        let mut legacy = current.clone();
+        put_u32(
+            &mut legacy,
+            tail_offset,
+            INDIRECT_TEV_STATE_ENCODING_BP_WORDS_V1,
+        );
+        put_u32(&mut legacy, tail_offset + 0x7c, 0);
+        let legacy_state = GxFramePacket::parse(&legacy)
+            .unwrap()
+            .draw(0)
+            .unwrap()
+            .record
+            .indirect_tev
+            .unwrap();
+        assert_eq!(legacy_state.gen_mode, state.gen_mode);
+        assert_eq!(legacy_state.xf_num_tex_gens, state.gen_mode & 0xf);
+
+        put_u32(&mut legacy, tail_offset + 0x7c, 1);
+        assert_eq!(
+            GxFramePacket::parse(&legacy).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "indirect TEV reserved word",
+                expected: 0,
+                actual: 1,
+            }
+        );
+
+        let mut unknown = current;
+        put_u32(&mut unknown, tail_offset, 3);
+        assert_eq!(
+            GxFramePacket::parse(&unknown).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "indirect TEV state encoding",
+                value: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn indirect_tev_tail_carries_direct_gen_mode_fallback_without_claiming_a_texture() {
+        let mut base = v4_texture_copy(&[(2, 0, 3, None)]);
+        set_tev_stage_count(&mut base, 0, 1);
+        let tev_offset = read_u32(&base, 0x24) as usize;
+        // Even with texture order disabled, TEXC/TEXA combiner inputs are
+        // black at XF NUMTEXGENS zero. Carry the side state without claiming
+        // map four.
+        put_u32(&mut base, tev_offset, 8 << 12);
+        put_u32(&mut base, tev_offset + 0x04, 4 << 13);
+        put_u32(&mut base, tev_offset + 0x08, (7 << 3) | 4);
+        let state = GxIndirectTevState::default();
+        let bytes = append_indirect_tev_tail(base, &[state]);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(packet.draw(0).unwrap().record.indirect_tev, Some(state));
+        assert_eq!(packet.header().texture_count, 0);
+    }
+
+    #[test]
+    fn indirect_tev_tail_carries_out_of_range_direct_coordinate_fallback() {
+        let mut base = textured_xfb_copy();
+        put_u16(&mut base, 0x04, GX_PACKET_VERSION);
+        // Both live direct stages use map zero/two as before, but stage zero's
+        // requested coordinate is beyond the single active generator.
+        put_u32(&mut base, V3_TEV_OFFSET + 0x08, (1 << 6) | (7 << 3));
+        let states = [
+            GxIndirectTevState {
+                gen_mode: 1 | (1 << 10) | (2 << 14),
+                xf_num_tex_gens: 1,
+                ..GxIndirectTevState::default()
+            },
+            GxIndirectTevState {
+                gen_mode: 1 | (1 << 14),
+                xf_num_tex_gens: 1,
+                ..GxIndirectTevState::default()
+            },
+        ];
+        let bytes = append_indirect_tev_tail(base, &states);
+
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(packet.draw(0).unwrap().record.indirect_tev, Some(states[0]));
+    }
+
+    #[test]
+    fn indirect_texture_dependencies_include_zero_iref_and_apply_coord_zero_fallback() {
+        let sampling_state = |iref| {
+            let mut state = GxIndirectTevState {
+                // Two direct TEV stages, cull mode two, one texture generator,
+                // and one indirect stage.
+                gen_mode: 1 | (1 << 10) | (2 << 14) | (1 << 16),
+                xf_num_tex_gens: 1,
+                iref,
+                ..GxIndirectTevState::default()
+            };
+            state.commands[0] = 1 << 7;
+            state
+        };
+
+        let zero_iref = sampling_state(0);
+        assert_eq!(
+            indirect_texture_dependencies(&zero_iref).collect::<Vec<_>>(),
+            [(0, Some(0))]
+        );
+        let no_texture_generators = GxIndirectTevState {
+            xf_num_tex_gens: 0,
+            ..zero_iref
+        };
+        assert_eq!(no_texture_generators.gen_mode, zero_iref.gen_mode);
+        assert_eq!(renderer_indirect_tev_state(&zero_iref).num_tex_gens(), 1);
+        assert_eq!(
+            renderer_indirect_tev_state(&no_texture_generators).num_tex_gens(),
+            0
+        );
+        assert_eq!(
+            indirect_texture_dependencies(&no_texture_generators).collect::<Vec<_>>(),
+            [(0, None)]
+        );
+        let in_range_coord = GxIndirectTevState {
+            xf_num_tex_gens: 4,
+            iref: 3 << 3,
+            ..zero_iref
+        };
+        assert_eq!(in_range_coord.gen_mode, zero_iref.gen_mode);
+        assert_eq!(renderer_indirect_tev_state(&in_range_coord).num_tex_gens(), 4);
+        assert_eq!(
+            indirect_texture_dependencies(&in_range_coord).collect::<Vec<_>>(),
+            [(0, Some(3))]
+        );
+        let out_of_range_coord = sampling_state(7 << 3);
+        assert_eq!(
+            indirect_texture_dependencies(&out_of_range_coord).collect::<Vec<_>>(),
+            [(0, Some(0))]
+        );
+
+        let second_draw_state = GxIndirectTevState {
+            gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        for (mut base, state) in [
+            (
+                {
+                    let mut bytes = textured_xfb_copy();
+                    put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+                    bytes
+                },
+                zero_iref,
+            ),
+            (textured_xfb_copy_v7(), out_of_range_coord),
+        ] {
+            // Map zero is not used by direct TEV, but remains a live binding
+            // through indirect stage zero. In v7 this also retains MODE1.
+            put_u32(&mut base, V3_TEV_OFFSET + 0x08, 0);
+            let packet = append_indirect_tev_tail(base, &[state, second_draw_state]);
+            let parsed = GxFramePacket::parse(&packet).unwrap();
+            assert_eq!(parsed.draw(0).unwrap().record.textures[0].texture, Some(0));
+        }
+    }
+
+    #[test]
+    fn indirect_texture_dependencies_ignore_unclaimed_commands() {
+        let base_state = GxIndirectTevState {
+            gen_mode: 1 | (1 << 10) | (2 << 14) | (1 << 16),
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        let second_draw_state = GxIndirectTevState {
+            gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        let mut stages = Vec::new();
+
+        let mut out_of_range_bt = base_state;
+        out_of_range_bt.commands[0] = 1 | (1 << 7);
+        stages.push(out_of_range_bt);
+
+        let mut inactive_direct_stage = base_state;
+        inactive_direct_stage.commands[7] = 1 << 7;
+        stages.push(inactive_direct_stage);
+
+        let mut wrap_only = base_state;
+        wrap_only.commands[0] = 6 << 13;
+        stages.push(wrap_only);
+
+        for state in stages {
+            assert!(indirect_texture_dependencies(&state).next().is_none());
+            let mut base = textured_xfb_copy();
+            put_u16(&mut base, 0x04, GX_PACKET_VERSION);
+            put_u32(&mut base, V3_TEV_OFFSET + 0x08, 0);
+            let packet = append_indirect_tev_tail(base, &[state, second_draw_state]);
+            assert_eq!(
+                GxFramePacket::parse(&packet).unwrap_err(),
+                GxPacketError::UnexpectedTextureReference { draw: 0, map: 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn indirect_texture_dependencies_preserve_missing_and_first_use_validation() {
+        let mut state = GxIndirectTevState {
+            gen_mode: 1 | (1 << 10) | (2 << 14) | (1 << 16),
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        let second_draw_state = GxIndirectTevState {
+            gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+
+        // A nonzero matrix index is independently sufficient to sample the
+        // indirect stage and therefore claim IREF's map-zero binding.
+        state.commands[0] = 1 << 9;
+        let mut noncanonical = textured_xfb_copy();
+        put_u16(&mut noncanonical, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut noncanonical, V3_TEV_OFFSET + 0x08, 0);
+        put_u32(&mut noncanonical, V3_DRAW_OFFSET + 0x30, 1);
+        let noncanonical = append_indirect_tev_tail(noncanonical, &[state, second_draw_state]);
+        assert_eq!(
+            GxFramePacket::parse(&noncanonical).unwrap_err(),
+            GxPacketError::NonCanonicalTextureFirstUse {
+                draw: 0,
+                map: 0,
+                expected: 0,
+                actual: 1,
+            }
+        );
+
+        state.commands[0] = 1 << 7;
+        let mut missing = textured_xfb_copy();
+        put_u16(&mut missing, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut missing, V3_TEV_OFFSET + 0x08, 0);
+        put_u32(
+            &mut missing,
+            V3_DRAW_OFFSET + 0x30,
+            GX_TEXTURE_REFERENCE_ABSENT,
+        );
+        let missing = append_indirect_tev_tail(missing, &[state, second_draw_state]);
+        assert_eq!(
+            GxFramePacket::parse(&missing).unwrap_err(),
+            GxPacketError::MissingTextureReference { draw: 0, map: 0 }
+        );
+    }
+
+    #[test]
+    fn indirect_tev_tail_composes_with_v7_and_rejects_inert_or_malformed_features() {
+        let states = [
+            indirect_tev_state(0x10_2030, 1, 2, 2),
+            indirect_tev_state(0x40_5060, 0, 1, 1),
+        ];
+        let bytes = append_indirect_tev_tail(textured_xfb_copy_v7(), &states);
+        let packet = GxFramePacket::parse(&bytes).unwrap();
+        assert_eq!(packet.draw(0).unwrap().record.indirect_tev, Some(states[0]));
+        assert_eq!(packet.draw(1).unwrap().record.indirect_tev, Some(states[1]));
+
+        let mut command_only = GxIndirectTevState {
+            gen_mode: 1,
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        command_only.commands[0] = 6 << 13;
+        let mut command_only_base = v4_texture_copy(&[(2, 0, 3, None)]);
+        set_tev_stage_count(&mut command_only_base, 0, 1);
+        let command_only_bytes = append_indirect_tev_tail(command_only_base, &[command_only]);
+        assert_eq!(
+            GxFramePacket::parse(&command_only_bytes)
+                .unwrap()
+                .draw(0)
+                .unwrap()
+                .record
+                .indirect_tev,
+            Some(command_only)
+        );
+
+        let mut stale_command = GxIndirectTevState {
+            gen_mode: 1,
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        stale_command.commands[7] = 6 << 13;
+        let mut stale_command_base = v4_texture_copy(&[(2, 0, 3, None)]);
+        set_tev_stage_count(&mut stale_command_base, 0, 1);
+        let stale_command_bytes = append_indirect_tev_tail(stale_command_base, &[stale_command]);
+        assert_eq!(
+            GxFramePacket::parse(&stale_command_bytes).unwrap_err(),
+            GxPacketError::NonCanonical(
+                "indirect TEV state requires at least one semantically live draw"
+            )
+        );
+
+        let mut reserved_only = GxIndirectTevState {
+            gen_mode: 1,
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        reserved_only.commands[0] = !INDIRECT_TEV_COMMAND_MASK & 0x00ff_ffff;
+        let mut reserved_only_base = v4_texture_copy(&[(2, 0, 3, None)]);
+        set_tev_stage_count(&mut reserved_only_base, 0, 1);
+        let reserved_only_bytes = append_indirect_tev_tail(reserved_only_base, &[reserved_only]);
+        assert_eq!(
+            GxFramePacket::parse(&reserved_only_bytes).unwrap_err(),
+            GxPacketError::NonCanonical(
+                "indirect TEV state requires at least one semantically live draw"
+            ),
+            "IND_CMD reserved bits 21 through 23 are semantically inert"
+        );
+
+        let inert = [
+            GxIndirectTevState {
+                gen_mode: 1 | (1 << 10) | (2 << 14),
+                xf_num_tex_gens: 1,
+                ..GxIndirectTevState::default()
+            },
+            GxIndirectTevState {
+                gen_mode: 1 | (1 << 14),
+                xf_num_tex_gens: 1,
+                iref: 1,
+                ..GxIndirectTevState::default()
+            },
+        ];
+        let inert_bytes = append_indirect_tev_tail(textured_xfb_copy_v7(), &inert);
+        assert_eq!(
+            GxFramePacket::parse(&inert_bytes).unwrap_err(),
+            GxPacketError::NonCanonical(
+                "indirect TEV state requires at least one semantically live draw"
+            )
+        );
+
+        let mut malformed = bytes;
+        let xf_count_offset = malformed.len() - states.len() * 128 + 0x7c;
+        put_u32(&mut malformed, xf_count_offset, 9);
+        assert_eq!(
+            GxFramePacket::parse(&malformed).unwrap_err(),
+            GxPacketError::InvalidField {
+                field: "indirect TEV XF texture generator count",
+                value: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn indirect_tev_tail_rejects_contradictory_generation_state() {
+        let state = indirect_tev_state(0, 1, 1, 0);
+        let mut base = v4_texture_copy(&[(2, 0, 3, None)]);
+        set_tev_stage_count(&mut base, 0, 1);
+        let tail_offset = base.len();
+        let valid = append_indirect_tev_tail(base, &[state]);
+
+        let mut stage_mismatch = valid.clone();
+        put_u32(
+            &mut stage_mismatch,
+            tail_offset + 0x04,
+            state.gen_mode | (1 << 10),
+        );
+        assert_eq!(
+            GxFramePacket::parse(&stage_mismatch).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "indirect TEV generation stage count",
+                expected: 1,
+                actual: 2,
+            }
+        );
+
+        let mut cull_mismatch = valid;
+        put_u32(
+            &mut cull_mismatch,
+            tail_offset + 0x04,
+            state.gen_mode | (1 << 14),
+        );
+        assert_eq!(
+            GxFramePacket::parse(&cull_mismatch).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "indirect TEV generation cull mode",
+                expected: 0,
+                actual: 1,
+            }
+        );
+
+        let positions = exact_clip_positions();
+        let mut exact_base = single_draw_v4_texture_copy(2, 2, 3, None);
+        set_tev_stage_count(&mut exact_base, 0, 1);
+        let v5 = promote_v4_to_v5(
+            exact_base,
+            &[(0, exact_clip_state(2), positions.as_slice())],
+        );
+        let exact_state = GxIndirectTevState {
+            gen_mode: (2 << 14) | (1 << 16),
+            ..GxIndirectTevState::default()
+        };
+        let exact_mismatch = append_indirect_tev_tail(v5, &[exact_state]);
+        assert_eq!(
+            GxFramePacket::parse(&exact_mismatch).unwrap_err(),
+            GxPacketError::FieldMismatch {
+                field: "indirect TEV exact-clip generation mode",
+                expected: 2 << 14,
+                actual: (2 << 14) | (1 << 16),
+            }
+        );
+    }
+
+    #[test]
+    fn indirect_tev_tail_follows_every_v4_through_v7_terminal_layout() {
+        let positions = exact_clip_positions();
+        let state = indirect_tev_state(0x01_0203, 1, 1, 2);
+
+        let mut v4 = single_draw_v4_texture_copy(2, 2, 3, None);
+        set_tev_stage_count(&mut v4, 0, 1);
+        let mut clip_state = exact_clip_state(2);
+        clip_state.bp_gen_mode = state.gen_mode;
+        let v5 = promote_v4_to_v5(v4.clone(), &[(0, clip_state, positions.as_slice())]);
+        let v6 = promote_v5_to_v6(v5.clone(), &[0]);
+
+        for base in [v4, v5, v6] {
+            let base_len = base.len();
+            let packet_bytes = append_indirect_tev_tail(base, &[state]);
+            assert_eq!(packet_bytes.len(), base_len + 128);
+            let packet = GxFramePacket::parse(&packet_bytes).unwrap();
+            assert_eq!(packet.draw(0).unwrap().record.indirect_tev, Some(state));
+            assert_eq!(packet.draw(0).unwrap().tev_state.len(), 464);
+        }
+
+        let mut v7 = textured_xfb_copy_v7_with_exact();
+        let mode1_bytes = 2 * GX_MODE1_TAIL_BYTES_PER_DRAW as usize;
+        let exact_bytes =
+            EXACT_CLIP_STATE_BYTES as usize + positions.len() * EXACT_CLIP_VERTEX_BYTES as usize;
+        let exact_offset = v7.len() - mode1_bytes - exact_bytes;
+        let first_v7_gen_mode = 1 | (1 << 10) | (2 << 14);
+        put_u32(&mut v7, exact_offset + 0x04, first_v7_gen_mode);
+        let mut first_v7_state = GxIndirectTevState {
+            gen_mode: first_v7_gen_mode,
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        first_v7_state.commands[0] = 6 << 13;
+        let second_v7_state = GxIndirectTevState {
+            gen_mode: 1 | (1 << 14),
+            xf_num_tex_gens: 1,
+            ..GxIndirectTevState::default()
+        };
+        let v7_len = v7.len();
+        let v7_bytes = append_indirect_tev_tail(v7, &[first_v7_state, second_v7_state]);
+        assert_eq!(v7_bytes.len(), v7_len + 256);
+        let packet = GxFramePacket::parse(&v7_bytes).unwrap();
+        assert_eq!(
+            packet.draw(0).unwrap().record.indirect_tev,
+            Some(first_v7_state)
+        );
+        assert_eq!(
+            packet.draw(1).unwrap().record.indirect_tev,
+            Some(second_v7_state)
+        );
+    }
+
+    #[test]
+    fn xfb_copy_rejects_texture_layout_flag() {
+        let mut bytes = textured_xfb_copy();
+        put_u16(&mut bytes, 0x04, GX_PACKET_VERSION);
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::NonCanonical("XFB copies cannot carry texture-copy layout provenance")
+        );
+    }
+
+    #[test]
+    fn flagged_texture_copy_rejects_unsupported_source_before_rendering() {
+        let mut bytes = empty_texture_copy_v4();
+        put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+        put_u32(&mut bytes, 0x5c, 3);
+        put_u32(&mut bytes, 0x60, 4);
+        put_u32(&mut bytes, 0x88, 4);
+
+        assert_eq!(
+            GxFramePacket::parse(&bytes).unwrap_err(),
+            GxPacketError::InvalidTextureCopyPlan(GxTextureCopyPlanError::UnsupportedSourceFormat(
+                crate::GxEfbFormat::OtherNoAlpha
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_versions_reject_texture_layout_provenance() {
+        for version in [GX_PACKET_VERSION_V2, GX_PACKET_VERSION_V3] {
+            let mut bytes = empty_texture_copy();
+            put_u16(&mut bytes, 0x04, version);
+            if version == GX_PACKET_VERSION_V3 {
+                put_u16(&mut bytes, 0x78, GX_DRAW_RECORD_BYTES);
+            }
+            put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::NonCanonical(
+                    "texture-copy layout provenance requires LZGX v4 or later"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn flagged_texture_copy_rejects_nonphysical_stride() {
+        for stride in [1, 0x2000_0000] {
+            let mut bytes = empty_texture_copy_v4();
+            put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+            put_u32(&mut bytes, 0x5c, 3);
+            put_u32(&mut bytes, 0x60, 4);
+            put_u32(&mut bytes, 0x68, stride);
+            assert_eq!(
+                GxFramePacket::parse(&bytes).unwrap_err(),
+                GxPacketError::InvalidField {
+                    field: "texture copy physical stride",
+                    value: u64::from(stride),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn texture_layout_feature_composes_with_every_v4_through_v7_tail() {
+        let mut v4 = textured_xfb_copy();
+        put_u16(&mut v4, 0x04, GX_PACKET_VERSION);
+
+        let mut exact_base = v4.clone();
+        put_u32(&mut exact_base, V3_DRAW_OFFSET + 0x04, 3);
+        let second_draw = V3_DRAW_OFFSET + usize::from(GX_DRAW_RECORD_BYTES);
+        put_u32(&mut exact_base, second_draw + 0x04, 0);
+        put_u32(&mut exact_base, second_draw + 0x08, 3 * GX_VERTEX_BYTES);
+        let positions = exact_clip_positions();
+        let v5 = promote_v4_to_v5(
+            exact_base,
+            &[(0, exact_clip_state(2), positions.as_slice())],
+        );
+        let v6 = promote_v5_to_v6(v5.clone(), &[0]);
+        let v7 = textured_xfb_copy_v7();
+
+        for (version, mut bytes) in [(4, v4), (5, v5), (6, v6), (7, v7)] {
+            put_u32(&mut bytes, 0x0c, PACKET_FLAG_TEXTURE_COPY_LAYOUT_V1);
+            put_u32(&mut bytes, 0x10, 1);
+            put_u32(&mut bytes, 0x5c, 320);
+            put_u32(&mut bytes, 0x60, 240);
+            put_u32(&mut bytes, 0x8c, 0x0000_0800);
+
+            let packet = GxFramePacket::parse(&bytes).unwrap();
+            assert_eq!(read_u16(&bytes, 0x04), version);
+            assert!(packet.header().texture_copy_layout_v1);
+            assert_eq!(packet.header().output_width, 320);
+            assert_eq!(packet.header().output_height, 240);
+        }
     }
 
     #[test]

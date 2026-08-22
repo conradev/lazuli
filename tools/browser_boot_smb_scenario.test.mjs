@@ -1016,9 +1016,14 @@ test("host turns a drained VI present into metadata without selected-XFB readbac
   assert.deepEqual(JSON.parse(JSON.stringify(captured)), receipt);
   const body = extractFunction("captureSmbSustainedViReceipt");
   assert.doesNotMatch(body, /readSelectedXfb|readPresentedSurface|map_readback/);
+  const rendererFrame = extractFunction("handleRendererFrame");
   assert.match(
-    source,
-    /await drainWebGpuRenderer\([^)]*\);[\s\S]*?captureSmbSustainedViReceipt\(message, value\)/,
+    rendererFrame,
+    /const xfbOnly = message\.type === "gx-frame"[\s\S]*?const textureCopyReceipts = drainRequired\s*\? await drainWebGpuRenderer\(phases\)\s*:\s*\[\];/,
+  );
+  assert.ok(
+    rendererFrame.indexOf("await drainWebGpuRenderer(phases)")
+      < rendererFrame.indexOf("captureSmbSustainedViReceipt(message, value)"),
   );
 });
 

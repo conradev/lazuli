@@ -64,6 +64,7 @@ const pureFunctions = [
 function pureContext() {
   const context = {
     Array,
+    Float32Array,
     Math,
     Number,
     Object,
@@ -76,6 +77,108 @@ function pureContext() {
   });
   return context;
 }
+
+test("V6 transport compacts adjacent native triangle fans with identical state", () => {
+  const context = pureContext();
+  Object.assign(context, {
+    gxFanCompactionFrames: 0,
+    gxFanCompactionSourceDraws: 0,
+    gxFanCompactionOutputDraws: 0,
+    gxFanCompactionExpandedVertices: 0,
+  });
+  vm.runInContext(extractFunction("gxCompactNativeTriangleFans"), context, {
+    filename: "browser_boot.gx-fan-compaction.js",
+  });
+  const pipeline = {};
+  const textures = [];
+  const tevState = new Uint8Array(464);
+  const fan = (vertexCount, start, extra = {}) => {
+    const vertices = new Float32Array(vertexCount * 36);
+    for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+      vertices[vertex * 36] = start + vertex;
+    }
+    return {
+      topology: 4,
+      vertexCount,
+      vertices,
+      pipeline,
+      textures,
+      tevState,
+      ...extra,
+    };
+  };
+  const first = fan(3, 10);
+  const second = fan(4, 20);
+  const differentState = fan(3, 30, { pipeline: {} });
+  const differentTextures = fan(3, 35, { textures: [] });
+  const differentTev = fan(3, 37, { tevState: new Uint8Array(464) });
+  const evidenced = fan(3, 40, {
+    postCullEvidence: new Uint8Array([2]),
+  });
+  const frame = {
+    geometry: {
+      drawCalls: 6,
+      vertices: 19,
+      draws: [
+        first,
+        second,
+        differentState,
+        differentTextures,
+        differentTev,
+        evidenced,
+      ],
+    },
+  };
+
+  const compacted = context.gxCompactNativeTriangleFans(frame);
+  assert.notStrictEqual(compacted, frame);
+  assert.equal(compacted.geometry.drawCalls, 5);
+  assert.equal(compacted.geometry.vertices, 21);
+  assert.deepEqual(
+    plain(Array.from(
+      { length: 9 },
+      (_unused, vertex) => compacted.geometry.draws[0].vertices[vertex * 36],
+    )),
+    [10, 11, 12, 20, 21, 22, 20, 22, 23],
+  );
+  assert.equal(compacted.geometry.draws[0].topology, 2);
+  assert.equal(compacted.geometry.draws[0].vertexCount, 9);
+  assert.strictEqual(compacted.geometry.draws[1], differentState);
+  assert.strictEqual(compacted.geometry.draws[2], differentTextures);
+  assert.strictEqual(compacted.geometry.draws[3], differentTev);
+  assert.strictEqual(compacted.geometry.draws[4], evidenced);
+  assert.deepEqual(
+    {
+      frames: context.gxFanCompactionFrames,
+      sourceDraws: context.gxFanCompactionSourceDraws,
+      outputDraws: context.gxFanCompactionOutputDraws,
+      expandedVertices: context.gxFanCompactionExpandedVertices,
+    },
+    {
+      frames: 1,
+      sourceDraws: 2,
+      outputDraws: 1,
+      expandedVertices: 2,
+    },
+  );
+
+  const mip = fan(3, 50, {
+    textures: [{
+      strictV7Preflight: {
+        accepted: true,
+        classification: "genuine-mip",
+      },
+    }],
+  });
+  const v7Frame = {
+    geometry: {
+      drawCalls: 2,
+      vertices: 6,
+      draws: [mip, mip],
+    },
+  };
+  assert.strictEqual(context.gxCompactNativeTriangleFans(v7Frame), v7Frame);
+});
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
@@ -115,14 +218,24 @@ function recoveryDecodedVertex(index, projected) {
 
 function recoveryContext({
   decodedVertices,
+  exactFailureReason = null,
   exactResult = { tag: "exact-input" },
   collectCullSources = false,
+  cullMode = 1,
+  useRealManagedCandidate = false,
+  verticesCandidate = true,
   postCullResult = null,
   textureEnabled = false,
 } = {}) {
   const exactCalls = [];
+  const exactFailureCalls = [];
   const postCullCalls = [];
   const textureCalls = [];
+  const transformContexts = [];
+  const decodedTransformContexts = [];
+  const preparedVertexDecodePlans = [];
+  const decodedVertexDecodePlans = [];
+  const normalCacheCommitFlags = [];
   const stage = {
     index: 0,
     order: 0,
@@ -156,34 +269,77 @@ function recoveryContext({
     gxDecodedVertices: 0,
     gxProjectedVertices: 0,
     gxDroppedVertices: 0,
+    gxPositionIndexSkips: 0,
     gxLegacyProjectionNullVertices: 0,
     gxExactRequiredDraws: 0,
     gxExactRequiredVertices: 0,
     gxExactRequiredCaptureMisses: 0,
     gxTexturedDraws: 0,
+    gxCpLoads: 0,
+    gxXfLoads: 0,
+    gxIndexedXfLoads: 0,
+    gxBpLoads: 0,
+    gxDrawStateSnapshots: 0,
+    gxDrawStateMemoHits: 0,
+    gxVertexTransformContextSnapshots: 0,
+    gxVertexTransformContextMemoHits: 0,
     statusDataset: {},
     gxTevModeCounts: new Map(),
     gxFrameDraws: [],
     gxTevColorRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
     gxTevKonstRegisters: Array.from({ length: 4 }, () => [0, 0, 0, 0]),
+    gxPrimitiveSampleStride: 256,
+    gxPrimitives: 0,
     gxPrimitiveSamples: [],
     gxRecentPrimitiveSamples: [],
     cycles: 11,
     dispatches: 13,
     gxDrawPipelineState() {
-      return { cullMode: 1 };
+      return {
+        cullMode,
+        pixelControl: 0,
+        zTextureMode: 0,
+        fogWords: [0, 0, 0, 0, 0],
+      };
     },
     gxTevStageState() {
       return stage;
     },
+    gxPrepareVertexTransformContext() {
+      context.gxVertexTransformContextSnapshots += 1;
+      const prepared = { ordinal: transformContexts.length };
+      transformContexts.push(prepared);
+      return prepared;
+    },
+    gxPrepareVertexDecodePlan(vatIndex) {
+      const prepared = {
+        vatIndex,
+        ordinal: preparedVertexDecodePlans.length,
+      };
+      preparedVertexDecodePlans.push(prepared);
+      return prepared;
+    },
     gxManagedCoverageStateCandidate() {
       return collectCullSources;
     },
-    gxDecodeVertex(_source, start) {
+    gxDecodeVertex(
+      _source,
+      start,
+      _vat,
+      transformContext,
+      commitNormalCache,
+      vertexDecodePlan,
+    ) {
+      decodedTransformContexts.push(transformContext);
+      decodedVertexDecodePlans.push(vertexDecodePlan);
+      normalCacheCommitFlags.push(commitNormalCache);
       const decoded = decodedVertices[start];
       return { ...decoded, cursor: start + 1 };
     },
     gxTevCoordsValid() {
+      return true;
+    },
+    gxTevCoordsTransportable() {
       return true;
     },
     gxTevTextures() {
@@ -194,7 +350,7 @@ function recoveryContext({
       if (!collectCullSources) {
         throw new Error("required recovery consulted optional vertex evidence");
       }
-      return true;
+      return verticesCandidate;
     },
     gxManagedCoveragePostCullEvidence(...args) {
       postCullCalls.push(args);
@@ -202,7 +358,16 @@ function recoveryContext({
     },
     gxManagedCoverageExactClipInput(...args) {
       exactCalls.push(args);
+      if (exactResult === null && exactFailureReason !== null) {
+        const failure = args[4];
+        failure.reason = exactFailureReason;
+        failure.vertex = 1;
+        failure.matrixIndex = decodedVertices[1]?.positionMatrix ?? null;
+      }
       return exactResult;
+    },
+    gxRecordExactRequiredCaptureFailure(...args) {
+      exactFailureCalls.push(args);
     },
     gxXfFloat() {
       return 264;
@@ -218,11 +383,186 @@ function recoveryContext({
     },
   };
   vm.createContext(context);
+  if (useRealManagedCandidate) {
+    vm.runInContext(
+      [
+        extractFunction("gxSourceTriangleCount"),
+        extractFunction("gxManagedCoverageStateCandidate"),
+      ].join("\n\n"),
+      context,
+      { filename: "browser_boot.gx-managed-coverage-candidate.js" },
+    );
+  }
   vm.runInContext(extractFunction("recordGxPrimitive"), context, {
     filename: "browser_boot.gx-projection-recovery.js",
   });
-  return { context, exactCalls, postCullCalls, textureCalls };
+  return {
+    context,
+    decodedTransformContexts,
+    decodedVertexDecodePlans,
+    exactCalls,
+    exactFailureCalls,
+    normalCacheCommitFlags,
+    postCullCalls,
+    preparedVertexDecodePlans,
+    textureCalls,
+    transformContexts,
+  };
 }
+
+test("full primitive diagnostics retain startup evidence then sample the live stream", () => {
+  const decodedVertices = [recoveryDecodedVertex(0, [0, 0, 0, 1])];
+  const { context } = recoveryContext({ decodedVertices });
+
+  for (let primitive = 1; primitive <= 512; primitive += 1) {
+    context.gxPrimitives = primitive;
+    context.cycles = primitive;
+    context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1);
+  }
+
+  assert.deepEqual(
+    plain(context.gxPrimitiveSamples.map(sample => sample.cycle)),
+    Array.from({ length: 16 }, (_unused, index) => index + 1),
+    "boot diagnostics preserve the first sixteen primitives exactly",
+  );
+  assert.deepEqual(
+    plain(context.gxRecentPrimitiveSamples.map(sample => sample.cycle)),
+    [
+      ...Array.from({ length: 14 }, (_unused, index) => index + 3),
+      256,
+      512,
+    ],
+    "rolling diagnostics sample one full primitive per stride",
+  );
+  assert.equal(context.gxFrameDraws.length, 512);
+});
+
+test("one decode batch invalidates interned draw state on every GX register class", () => {
+  for (const serialComponent of [
+    "gxCpLoads",
+    "gxXfLoads",
+    "gxIndexedXfLoads",
+    "gxBpLoads",
+  ]) {
+    const decodedVertices = [recoveryDecodedVertex(0, [0, 0, 0, 1])];
+    const {
+      context,
+      decodedTransformContexts,
+      textureCalls,
+      transformContexts,
+    } = recoveryContext({ decodedVertices });
+    const batch = {
+      sourceHashes: new Map(),
+      paletteHashes: new Map(),
+    };
+
+    context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+    context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+    context[serialComponent] += 1;
+    context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+
+    assert.equal(context.gxDrawStateSnapshots, 2, serialComponent);
+    assert.equal(context.gxDrawStateMemoHits, 1, serialComponent);
+    assert.equal(context.gxVertexTransformContextSnapshots, 2, serialComponent);
+    assert.equal(context.gxVertexTransformContextMemoHits, 1, serialComponent);
+    assert.equal(transformContexts.length, 2, serialComponent);
+    assert.equal(textureCalls.length, 2, serialComponent);
+    assert.strictEqual(
+      decodedTransformContexts[0],
+      decodedTransformContexts[1],
+      serialComponent,
+    );
+    assert.notStrictEqual(
+      decodedTransformContexts[1],
+      decodedTransformContexts[2],
+      serialComponent,
+    );
+    assert.strictEqual(
+      context.gxFrameDraws[0].pipeline,
+      context.gxFrameDraws[1].pipeline,
+      serialComponent,
+    );
+    assert.strictEqual(
+      context.gxFrameDraws[0].tevState,
+      context.gxFrameDraws[1].tevState,
+      serialComponent,
+    );
+    assert.notStrictEqual(
+      context.gxFrameDraws[1].pipeline,
+      context.gxFrameDraws[2].pipeline,
+      serialComponent,
+    );
+  }
+});
+
+test("one draw state caches vertex decode plans by VAT and CP serial", () => {
+  const decodedVertices = [recoveryDecodedVertex(0, [0, 0, 0, 1])];
+  const {
+    context,
+    decodedVertexDecodePlans,
+    preparedVertexDecodePlans,
+  } = recoveryContext({ decodedVertices });
+  const batch = {
+    sourceHashes: new Map(),
+    paletteHashes: new Map(),
+  };
+
+  context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+  context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+  context.recordGxPrimitive(0x81, new Uint8Array(1), 0, 1, 1, batch);
+  context.gxCpLoads += 1;
+  context.recordGxPrimitive(0x80, new Uint8Array(1), 0, 1, 1, batch);
+
+  assert.deepEqual(
+    preparedVertexDecodePlans.map(plan => plan.vatIndex),
+    [0, 1, 0],
+  );
+  assert.strictEqual(decodedVertexDecodePlans[0], preparedVertexDecodePlans[0]);
+  assert.strictEqual(decodedVertexDecodePlans[1], preparedVertexDecodePlans[0]);
+  assert.strictEqual(decodedVertexDecodePlans[2], preparedVertexDecodePlans[1]);
+  assert.strictEqual(decodedVertexDecodePlans[3], preparedVertexDecodePlans[2]);
+  assert.notStrictEqual(decodedVertexDecodePlans[0], decodedVertexDecodePlans[3]);
+  assert.equal(context.gxDrawStateSnapshots, 2);
+  assert.equal(context.gxDrawStateMemoHits, 2);
+});
+
+test("separate decode batches never share vertex transform context", () => {
+  const decodedVertices = [recoveryDecodedVertex(0, [0, 0, 0, 1])];
+  const {
+    context,
+    decodedTransformContexts,
+    transformContexts,
+  } = recoveryContext({ decodedVertices });
+  const batch = () => ({
+    sourceHashes: new Map(),
+    paletteHashes: new Map(),
+  });
+
+  context.recordGxPrimitive(
+    0x80,
+    new Uint8Array(1),
+    0,
+    1,
+    1,
+    batch(),
+  );
+  context.recordGxPrimitive(
+    0x80,
+    new Uint8Array(1),
+    0,
+    1,
+    1,
+    batch(),
+  );
+
+  assert.equal(context.gxVertexTransformContextSnapshots, 2);
+  assert.equal(context.gxVertexTransformContextMemoHits, 0);
+  assert.equal(transformContexts.length, 2);
+  assert.notStrictEqual(
+    decodedTransformContexts[0],
+    decodedTransformContexts[1],
+  );
+});
 
 const front012 = [
   [0, 0, 0, 1],
@@ -694,6 +1034,8 @@ test("producer gates exact cull work to the receiver's current managed subset", 
     true,
   );
   for (const override of [
+    { cullMode: 1 },
+    { cullMode: 2 },
     { cullMode: 3 },
     { pixelControl: 2 },
     { zTextureMode: 1 << 2 },
@@ -886,7 +1228,7 @@ test("producer gates exact cull work to the receiver's current managed subset", 
   assert.equal(
     candidate(0, 4, pipeline, [stage(0, 0)]),
     false,
-    "strict V7 preserves the anisotropy rejection",
+    "strict V7 rejects anisotropy with non-linear filters",
   );
   setTextureMode(0, 0, 1);
   const texture0 = context.gxTextureRegisters(0);
@@ -909,7 +1251,13 @@ test("producer gates exact cull work to the receiver's current managed subset", 
   assert.equal(
     candidate(0, 4, pipeline, [stage(0, 0)]),
     false,
-    "anisotropic sampling exceeds the managed sampler contract",
+    "base-only anisotropy remains outside the certified WebGPU contract",
+  );
+  setTextureMode(0, 1, 6, 2);
+  assert.equal(
+    candidate(0, 4, pipeline, [stage(0, 0)]),
+    true,
+    "F-Zero's 4x linear mip state enters managed native WebGPU sampling",
   );
   setTextureMode(0, 1, 4);
   assert.equal(
@@ -1018,6 +1366,14 @@ test("saved-SMB-shaped textured quad keeps only depth and raster flatness gates"
     true,
     "varying W, live STQ, and unused STQ do not defeat producer evidence",
   );
+  assert.equal(
+    context.gxManagedCoverageVerticesCandidate(
+      0,
+      Float32Array.from(savedSmbVertices),
+    ),
+    true,
+    "the direct transport representation retains identical evidence",
+  );
 
   const varyingRaster = savedSmbVertices.slice();
   varyingRaster[2 * 36 + 4] = 0.5;
@@ -1036,6 +1392,13 @@ test("saved-SMB-shaped textured quad keeps only depth and raster flatness gates"
   const invalidW = savedSmbVertices.slice();
   invalidW[3] = 0;
   assert.equal(context.gxManagedCoverageVerticesCandidate(0, invalidW), false);
+
+  const nonFiniteStq = savedSmbVertices.slice();
+  nonFiniteStq[12] = Number.NaN;
+  assert.equal(
+    context.gxManagedCoverageVerticesCandidate(0, nonFiniteStq),
+    false,
+  );
 });
 
 test("draw capture keeps raw position provenance independent of managed eligibility", () => {
@@ -1106,14 +1469,21 @@ test("projection-null recovery emits one required draw with canonical source pay
   assert.equal(context.gxFrameDrawVertices, 3);
 });
 
-test("required capture failure suppresses draw and all committed-draw telemetry", () => {
+test("required capture failure suppresses draw and records its reason", () => {
   const decodedVertices = [
     recoveryDecodedVertex(0, [10, 20, 30, 2]),
     recoveryDecodedVertex(1, null),
     recoveryDecodedVertex(2, [50, 60, 70, 4]),
   ];
-  const { context, exactCalls, postCullCalls, textureCalls } = recoveryContext({
+  const {
+    context,
+    exactCalls,
+    exactFailureCalls,
+    postCullCalls,
+    textureCalls,
+  } = recoveryContext({
     decodedVertices,
+    exactFailureReason: "position-matrix",
     exactResult: null,
     textureEnabled: true,
   });
@@ -1132,6 +1502,10 @@ test("required capture failure suppresses draw and all committed-draw telemetry"
   assert.equal(context.gxExactRequiredVertices, 0);
   assert.equal(context.gxExactRequiredCaptureMisses, 1);
   assert.equal(context.gxDroppedVertices, 1);
+  assert.equal(exactFailureCalls.length, 1);
+  assert.equal(exactFailureCalls[0][0], "position-matrix");
+  assert.equal(exactFailureCalls[0][1].failure.vertex, 1);
+  assert.equal(exactFailureCalls[0][1].legacyProjectionNullVertices, 1);
 });
 
 test("required recovery rejects nonfinite transported source attributes", () => {
@@ -1141,7 +1515,7 @@ test("required recovery rejects nonfinite transported source attributes", () => 
     recoveryDecodedVertex(2, [50, 60, 70, 4]),
   ];
   decodedVertices[1].texCoords[7][2] = Number.MAX_VALUE;
-  const { context, exactCalls, postCullCalls } = recoveryContext({
+  const { context, exactCalls, exactFailureCalls, postCullCalls } = recoveryContext({
     decodedVertices,
   });
 
@@ -1153,6 +1527,11 @@ test("required recovery rejects nonfinite transported source attributes", () => 
   assert.equal(context.gxFrameDrawVertices, 0);
   assert.equal(context.gxExactRequiredCaptureMisses, 1);
   assert.equal(context.gxDroppedVertices, 1);
+  assert.equal(exactFailureCalls.length, 1);
+  assert.equal(exactFailureCalls[0][0], "carrier-nonfinite");
+  const carrierFailure = exactFailureCalls[0][1];
+  assert.ok(carrierFailure.carrierNonFiniteLane >= 0);
+  assert.equal(Number.isFinite(carrierFailure.carrierNonFiniteValue), false);
 });
 
 test("a later skipped vertex drops an earlier unrecovered projection-null vertex", () => {
@@ -1182,6 +1561,127 @@ test("a later skipped vertex drops an earlier unrecovered projection-null vertex
   assert.equal(context.gxTevModeCounts.size, 0);
 });
 
+test("position-index sentinels compact one primitive without a decode failure", () => {
+  const decodedVertices = [
+    recoveryDecodedVertex(0, [10, 20, 30, 2]),
+    { skipped: true, positionIndexSkipped: true },
+    recoveryDecodedVertex(2, [30, 40, 50, 3]),
+    recoveryDecodedVertex(3, [40, 50, 60, 4]),
+  ];
+  const { context, exactCalls, normalCacheCommitFlags, postCullCalls } = recoveryContext({
+    decodedVertices,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(4), 0, 4, 1);
+
+  assert.equal(context.gxFrameDraws.length, 1);
+  const draw = context.gxFrameDraws[0];
+  assert.equal(draw.vertexCount, 3);
+  assert.equal(draw.vertices.length, 3 * 36);
+  assert.deepEqual(
+    [draw.vertices[0], draw.vertices[36], draw.vertices[72]],
+    [10, 30, 40],
+  );
+  assert.equal(context.gxDecodedVertices, 3);
+  assert.equal(context.gxProjectedVertices, 3);
+  assert.equal(context.gxPositionIndexSkips, 1);
+  assert.equal(context.gxDroppedVertices, 0);
+  assert.equal(context.gxFrameDrawVertices, 3);
+  assert.equal(context.gxExactRequiredCaptureMisses, 0);
+  assert.equal(exactCalls.length, 0);
+  assert.deepEqual(normalCacheCommitFlags, [false, false, false, true]);
+  assert.equal(postCullCalls.length, 0);
+});
+
+test("position-index compaction keeps exact-projection inputs aligned", () => {
+  const decodedVertices = [
+    recoveryDecodedVertex(0, [10, 20, 30, 2]),
+    { skipped: true, positionIndexSkipped: true },
+    recoveryDecodedVertex(2, null),
+    recoveryDecodedVertex(3, [40, 50, 60, 4]),
+  ];
+  const { context, exactCalls, postCullCalls } = recoveryContext({
+    decodedVertices,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(4), 0, 4, 1);
+
+  assert.equal(context.gxFrameDraws.length, 1);
+  const draw = context.gxFrameDraws[0];
+  assert.equal(draw.vertexCount, 3);
+  assert.equal(draw.vertices.length, 3 * 36);
+  assert.equal(draw.exactGeometryRequired, true);
+  assert.equal(exactCalls.length, 1);
+  assert.equal(postCullCalls.length, 0);
+  assert.deepEqual(
+    plain(exactCalls[0][2]),
+    [decodedVertices[0].position, decodedVertices[2].position, decodedVertices[3].position],
+  );
+  assert.deepEqual(
+    plain(exactCalls[0][3]),
+    [
+      decodedVertices[0].positionMatrix,
+      decodedVertices[2].positionMatrix,
+      decodedVertices[3].positionMatrix,
+    ],
+  );
+  assert.equal(context.gxPositionIndexSkips, 1);
+  assert.equal(context.gxLegacyProjectionNullVertices, 1);
+  assert.equal(context.gxExactRequiredDraws, 1);
+  assert.equal(context.gxExactRequiredVertices, 3);
+  assert.equal(context.gxExactRequiredCaptureMisses, 0);
+  assert.equal(context.gxDroppedVertices, 0);
+});
+
+test("an all-sentinel primitive emits nothing without reporting decode loss", () => {
+  const decodedVertices = Array.from(
+    { length: 3 },
+    () => ({ skipped: true, positionIndexSkipped: true }),
+  );
+  const { context, exactCalls, postCullCalls, textureCalls } = recoveryContext({
+    decodedVertices,
+    textureEnabled: true,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(3), 0, 3, 1);
+
+  assert.equal(context.gxFrameDraws.length, 0);
+  assert.equal(context.gxDecodedVertices, 0);
+  assert.equal(context.gxProjectedVertices, 0);
+  assert.equal(context.gxPositionIndexSkips, 3);
+  assert.equal(context.gxDroppedVertices, 0);
+  assert.equal(context.gxFrameDrawVertices, 0);
+  assert.equal(context.gxExactRequiredCaptureMisses, 0);
+  assert.equal(exactCalls.length, 0);
+  assert.equal(postCullCalls.length, 0);
+  assert.equal(textureCalls.length, 0);
+});
+
+test("a position sentinel does not mask a separate decode failure", () => {
+  const decodedVertices = [
+    recoveryDecodedVertex(0, [10, 20, 30, 2]),
+    { skipped: true, positionIndexSkipped: true },
+    { skipped: true },
+    recoveryDecodedVertex(3, [40, 50, 60, 4]),
+  ];
+  const { context, exactCalls, postCullCalls, textureCalls } = recoveryContext({
+    decodedVertices,
+    textureEnabled: true,
+  });
+
+  context.recordGxPrimitive(0x90, new Uint8Array(4), 0, 4, 1);
+
+  assert.equal(context.gxFrameDraws.length, 0);
+  assert.equal(context.gxDecodedVertices, 2);
+  assert.equal(context.gxProjectedVertices, 2);
+  assert.equal(context.gxPositionIndexSkips, 1);
+  assert.equal(context.gxDroppedVertices, 1);
+  assert.equal(context.gxFrameDrawVertices, 0);
+  assert.equal(exactCalls.length, 0);
+  assert.equal(postCullCalls.length, 0);
+  assert.equal(textureCalls.length, 0);
+});
+
 test("all-projected draws preserve post-cull and optional exact behavior", () => {
   const decodedVertices = [
     recoveryDecodedVertex(0, [10, 20, 30, 2]),
@@ -1192,6 +1692,7 @@ test("all-projected draws preserve post-cull and optional exact behavior", () =>
   const evidenced = recoveryContext({
     decodedVertices,
     collectCullSources: true,
+    cullMode: 0,
     postCullResult: postCullEvidence,
   });
   evidenced.context.recordGxPrimitive(0x90, new Uint8Array(3), 0, 3, 1);
@@ -1204,6 +1705,7 @@ test("all-projected draws preserve post-cull and optional exact behavior", () =>
   const optional = recoveryContext({
     decodedVertices,
     collectCullSources: true,
+    cullMode: 0,
     postCullResult: null,
   });
   optional.context.recordGxPrimitive(0x90, new Uint8Array(3), 0, 3, 1);
@@ -1213,27 +1715,155 @@ test("all-projected draws preserve post-cull and optional exact behavior", () =>
   assert.equal(Object.hasOwn(optionalDraw, "exactGeometryRequired"), false);
   assert.equal(optional.postCullCalls.length, 1);
   assert.equal(optional.exactCalls.length, 1);
+
+  const finiteOutsidePostCullSubset = recoveryContext({
+    decodedVertices,
+    collectCullSources: true,
+    cullMode: 0,
+    verticesCandidate: false,
+  });
+  finiteOutsidePostCullSubset.context.recordGxPrimitive(
+    0x90,
+    new Uint8Array(3),
+    0,
+    3,
+    1,
+  );
+  const finiteOutsideDraw =
+    finiteOutsidePostCullSubset.context.gxFrameDraws[0];
+  assert.deepEqual(
+    plain(finiteOutsideDraw.exactClipInput),
+    { tag: "exact-input" },
+  );
+  assert.equal(finiteOutsidePostCullSubset.postCullCalls.length, 0);
+  assert.equal(finiteOutsidePostCullSubset.exactCalls.length, 1);
+
+  const nonFiniteVertices = decodedVertices.map(vertex => ({
+    ...vertex,
+    texCoords: vertex.texCoords.map(coord => coord.slice()),
+  }));
+  nonFiniteVertices[0].texCoords[0][0] = Number.NaN;
+  const native = recoveryContext({
+    decodedVertices: nonFiniteVertices,
+    collectCullSources: true,
+    cullMode: 0,
+    verticesCandidate: false,
+    textureEnabled: true,
+  });
+  native.context.recordGxPrimitive(0x90, new Uint8Array(3), 0, 3, 1);
+  const nativeDraw = native.context.gxFrameDraws[0];
+  assert.ok(Number.isNaN(nativeDraw.vertices[12]));
+  assert.equal(Object.hasOwn(nativeDraw, "postCullEvidence"), false);
+  assert.equal(Object.hasOwn(nativeDraw, "exactClipInput"), false);
+  assert.equal(Object.hasOwn(nativeDraw, "exactGeometryRequired"), false);
+  assert.equal(native.postCullCalls.length, 0);
+  assert.equal(native.exactCalls.length, 0);
+});
+
+test("raw face-cull draws bypass optional CPU cull evidence", () => {
+  const decodedVertices = [
+    recoveryDecodedVertex(0, [10, 20, 30, 2]),
+    recoveryDecodedVertex(1, [20, 30, 40, 3]),
+    recoveryDecodedVertex(2, [50, 60, 70, 4]),
+  ];
+
+  for (const cullMode of [1, 2]) {
+    const native = recoveryContext({
+      decodedVertices,
+      cullMode,
+      useRealManagedCandidate: true,
+    });
+    native.context.recordGxPrimitive(0x90, new Uint8Array(3), 0, 3, 1);
+
+    assert.equal(native.context.gxFrameDraws.length, 1);
+    const draw = native.context.gxFrameDraws[0];
+    assert.equal(draw.pipeline.cullMode, cullMode);
+    assert.equal(Object.hasOwn(draw, "postCullEvidence"), false);
+    assert.equal(Object.hasOwn(draw, "exactClipInput"), false);
+    assert.equal(Object.hasOwn(draw, "exactGeometryRequired"), false);
+    assert.equal(native.postCullCalls.length, 0);
+    assert.equal(native.exactCalls.length, 0);
+  }
 });
 
 test("projection recovery and lighting rejection counters are exposed in decoder telemetry", () => {
   for (const counter of [
     "gxLightingRejectedVertices",
+    "gxPositionIndexSkips",
     "gxLegacyProjectionNullVertices",
     "gxExactRequiredDraws",
     "gxExactRequiredVertices",
     "gxExactRequiredCaptureMisses",
+    "gxVertexTransformContextSnapshots",
+    "gxVertexTransformContextMemoHits",
+    "gxVertexTransformCacheSnapshots",
+    "gxVertexTransformCacheMemoHits",
+    "gxTexgenNonFiniteTransforms",
   ]) {
     assert.match(source, new RegExp(`let ${counter} = 0;`));
   }
   for (const [field, counter] of [
     ["lightingRejectedVertices", "gxLightingRejectedVertices"],
+    ["positionIndexSkips", "gxPositionIndexSkips"],
     ["legacyProjectionNullVertices", "gxLegacyProjectionNullVertices"],
     ["exactRequiredDraws", "gxExactRequiredDraws"],
     ["exactRequiredVertices", "gxExactRequiredVertices"],
     ["exactRequiredCaptureMisses", "gxExactRequiredCaptureMisses"],
+    [
+      "vertexTransformContextSnapshots",
+      "gxVertexTransformContextSnapshots",
+    ],
+    [
+      "vertexTransformContextMemoHits",
+      "gxVertexTransformContextMemoHits",
+    ],
+    ["vertexTransformCacheSnapshots", "gxVertexTransformCacheSnapshots"],
+    ["vertexTransformCacheMemoHits", "gxVertexTransformCacheMemoHits"],
+    ["texgenNonFiniteTransforms", "gxTexgenNonFiniteTransforms"],
   ]) {
     assert.match(source, new RegExp(`${field}: ${counter}`));
   }
+});
+
+test("exact-capture failures expose a fixed bounded reason taxonomy", () => {
+  const capture = extractFunction("gxManagedCoverageExactClipInput");
+  assert.match(capture, /matrixIndices,\s*failure = null/);
+  assert.match(
+    capture,
+    /failure\.reason === undefined[\s\S]*failure\.reason = reason;[\s\S]*return null;/,
+  );
+  for (const reason of [
+    "source-geometry",
+    "bp-state",
+    "clip-disable",
+    "viewport",
+    "projection-state",
+    "position",
+    "position-matrix-index",
+    "position-matrix",
+    "view-nonfinite",
+    "clip-nonfinite",
+  ]) {
+    assert.match(capture, new RegExp(`reject\\("${reason}"`), reason);
+  }
+  const record = extractFunction("recordGxPrimitive");
+  assert.match(
+    record,
+    /const carrierNonFiniteLane = sourceVertices\.findIndex\([\s\S]*gxRecordExactRequiredCaptureFailure\([\s\S]*"carrier-nonfinite"[\s\S]*gxExactRequiredCaptureMisses \+= 1/,
+  );
+  assert.match(
+    source,
+    /exactRequiredCaptureFailures:\s*snapshotGxExactRequiredCaptureFailures\(\)/,
+  );
+  assert.match(
+    extractFunction("snapshotGxExactRequiredCaptureFailures"),
+    /schema: "lazuli-gx-exact-required-capture-failures-v1"[\s\S]*total: gxExactRequiredCaptureMisses[\s\S]*reasonCounts[\s\S]*firstFailure[\s\S]*countLimit/,
+  );
+  assert.doesNotMatch(source, /gxExactRequiredCaptureFailureTotal/);
+  assert.match(
+    extractFunction("gxRecordExactRequiredCaptureFailure"),
+    /carrierNonFiniteVertex:[\s\S]*carrierNonFiniteComponent:[\s\S]*carrierNonFiniteValue:/,
+  );
 });
 
 test("canonical cull clip transform rounds every scalar operation to f32", () => {
@@ -1454,8 +2084,8 @@ test("exact projection and viewport model pins scalar f32 operation order", () =
   );
   assert.match(
     extractFunction("recordGxPrimitive"),
-    /!exactGeometryRequired[\s\S]*gxManagedCoveragePostCullEvidence\([\s\S]*!exactGeometryRequired[\s\S]*postCullEvidence === null[\s\S]*gxManagedCoverageExactClipInput\(/,
-    "ordinary draws preserve the optional post-cull then exact-input path",
+    /const collectCullVertices = \(\s*!exactGeometryRequired\s*&& collectCullSources\s*&& gxManagedCoverageVerticesCandidate\([\s\S]*const postCullEvidence = \(\s*collectCullVertices\s*\)[\s\S]*if \(\s*!exactGeometryRequired\s*&& collectCullSources\s*&& postCullEvidence === null\s*&& sourceVertices\.every\(Number\.isFinite\)\s*\)[\s\S]*gxManagedCoverageExactClipInput\(/,
+    "ordinary finite draws preserve the optional post-cull then exact-input path while native non-finite draws bypass it",
   );
   assert.match(
     extractFunction("postGxFrame"),
@@ -1659,28 +2289,109 @@ test("exact input capture rejects incomplete or noncanonical GX state", () => {
   const matrices = [0, 0, 0];
   const capture = () =>
     context.gxManagedCoverageExactClipInput(2, 1, positions, matrices);
+  const rejectAs = (expectedReason, rejectedPositions, rejectedMatrices, cull = 1) => {
+    const failure = {};
+    assert.equal(
+      context.gxManagedCoverageExactClipInput(
+        2,
+        cull,
+        rejectedPositions,
+        rejectedMatrices,
+        failure,
+      ),
+      null,
+    );
+    assert.equal(failure.reason, expectedReason);
+    return failure;
+  };
 
   assert.notEqual(capture(), null);
-  assert.equal(
-    context.gxManagedCoverageExactClipInput(2, 1, positions, [0, 0]),
-    null,
-  );
-  assert.equal(
-    context.gxManagedCoverageExactClipInput(2, 2, positions, matrices),
-    null,
-  );
-  assert.equal(
-    context.gxManagedCoverageExactClipInput(2, 1, positions.slice(0, 2), [0, 0]),
-    null,
-  );
+  rejectAs("source-geometry", positions, [0, 0]);
+  rejectAs("bp-state", positions, matrices, 2);
+  rejectAs("source-geometry", positions.slice(0, 2), [0, 0]);
   registers[0x1005] = 8;
-  assert.equal(capture(), null);
+  rejectAs("clip-disable", positions, matrices);
   registers[0x1005] = 0;
   registers[0x101a] = 0;
-  assert.equal(capture(), null);
+  rejectAs("viewport", positions, matrices);
   registers[0x101a] = f32Bits(320);
   registers[0x101b] = 0x7fc00000;
-  assert.equal(capture(), null);
+  rejectAs("viewport", positions, matrices);
+  registers[0x101b] = f32Bits(-264);
+
+  registers[0x1026] = 2;
+  rejectAs("projection-state", positions, matrices);
+  registers[0x1026] = 0;
+  const badPosition = positions.map(position => position.slice());
+  badPosition[0][0] = Number.NaN;
+  const positionFailure = rejectAs("position", badPosition, matrices);
+  assert.equal(positionFailure.vertex, 0);
+
+  const matrixIndexFailure = rejectAs(
+    "position-matrix-index",
+    positions,
+    [62, 0, 0],
+  );
+  assert.equal(matrixIndexFailure.matrixIndex, 62);
+
+  const zeroMatrixState = context.gxCullTransformState();
+  assert.deepEqual(
+    Array.from(context.gxCullViewPosition(positions[0], 4, zeroMatrixState)),
+    [0, 0, 0],
+    "finite all-zero position matrices transform rather than reject",
+  );
+  const zeroMatrixFailure = {};
+  const zeroMatrixCapture = context.gxManagedCoverageExactClipInput(
+    2,
+    1,
+    positions,
+    [4, 4, 4],
+    zeroMatrixFailure,
+  );
+  assert.notEqual(zeroMatrixCapture, null);
+  assert.deepEqual(zeroMatrixFailure, {});
+  assert.deepEqual(
+    f32BitPatterns(zeroMatrixCapture.clipPositions),
+    Array.from({ length: 3 }, () => [0, 0, 0, 0x80000000]).flat(),
+    "exact capture preserves the perspective -0 clip W for homogeneous clipping",
+  );
+
+  registers[0x1026] = 1;
+  const zeroMatrixOrthoCapture = context.gxManagedCoverageExactClipInput(
+    2,
+    1,
+    positions,
+    [4, 4, 4],
+  );
+  assert.notEqual(zeroMatrixOrthoCapture, null);
+  assert.deepEqual(
+    f32BitPatterns(zeroMatrixOrthoCapture.clipPositions),
+    Array.from({ length: 3 }, () => [0, 0, 0, 0x3f800000]).flat(),
+    "orthographic projection retains finite zero-matrix geometry with W equal to one",
+  );
+  registers[0x1026] = 0;
+
+  registers[16] = 0x7fc00000;
+  rejectAs("position-matrix", positions, [4, 4, 4]);
+
+  const maxF32 = 3.4028234663852886e38;
+  xf.set([
+    maxF32, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+  ], 16);
+  rejectAs(
+    "view-nonfinite",
+    [[maxF32, 0, -1], positions[1], positions[2]],
+    [4, 0, 0],
+  );
+
+  xf[0x1020] = maxF32;
+  rejectAs(
+    "clip-nonfinite",
+    [[2, 0, -1], positions[1], positions[2]],
+    matrices,
+  );
 });
 
 test("one per-draw cull state reuses exact position matrices", () => {

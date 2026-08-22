@@ -93,7 +93,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.doesNotMatch(preparationTypes, /vertices: Vec<f32>|expanded: Vec<usize>/);
   assert.match(
     preparationTypes,
-    /struct PreparedExactDraw \{\s*required: bool,\s*required_managed_safe: bool,\s*qualified: Option<QualifiedExactDraw>,\s*\}/,
+    /struct PreparedExactDraw \{\s*required: bool,\s*required_managed_safe: bool,\s*qualified: Option<QualifiedExactDraw>,\s*preparation_failure: Option<GxExactPreparationFailure>,\s*\}/,
   );
   assert.match(
     preparationTypes,
@@ -111,8 +111,9 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   );
   for (const requirement of [
     "draw_depth_encoding",
-    "required_texture_maps",
-    "required_texture_coords",
+    "tev_resource_requirements",
+    "required_maps",
+    "required_coords",
     "gx_z_texture_state",
     "gx_fog_state",
     "prepare_managed_coverage_vertices",
@@ -151,7 +152,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.match(prepare, /let required = draw\.record\.exact_clip_required;/);
   assert.match(
     prepare,
-    /let Ok\(geometry\) = gx_exact_draw_raster_geometry\(draw, source_vertices\) else \{\s*return Some\(PreparedExactDraw \{\s*required,\s*required_managed_safe: false,\s*qualified: None,\s*\}\);/,
+    /let geometry = match gx_exact_draw_raster_geometry\(draw, source_vertices\) \{\s*Ok\(geometry\) => geometry,\s*Err\(error\) => \{\s*return Some\(PreparedExactDraw \{\s*required,\s*required_managed_safe: false,\s*qualified: None,\s*preparation_failure: Some\(error\.into\(\)\),\s*\}\);/,
   );
   assert.match(
     prepare,
@@ -165,7 +166,7 @@ test("absent, optional, and required exact inputs remain distinct", () => {
   assert.doesNotMatch(prepare, /right - left \+ 1|bottom - top \+ 1/);
   assert.match(
     prepare,
-    /let exact_vertices = geometry\.into_vertices\(\);[\s\S]*let exact_empty = expanded\.is_empty\(\)[\s\S]*exact_geometry_is_raster_empty\(&exact_vertices, &expanded, scissor\)[\s\S]*let managed = \(!exact_empty\)[\s\S]*prepare_exact_managed_vertices\(\s*draw,\s*&exact_vertices,\s*&expanded,\s*scissor,\s*sampler_states,\s*\)[\s\S]*let qualified = QualifiedExactDraw \{\s*scissor,\s*managed_vertices: managed\.as_ref\(\)\.map\(\|prepared\| prepared\.vertices\.clone\(\)\),\s*managed_tex_coord_sidecar: managed\.and_then\(\|prepared\| prepared\.tex_coord_sidecar\),\s*exact_empty,\s*\};[\s\S]*let required_managed_safe = required && qualified\.managed_vertices\.is_some\(\);/,
+    /let bypasses_depth_clip = geometry\.bypasses_depth_clip\(\);[\s\S]*let exact_vertices = geometry\.into_vertices\(\);[\s\S]*let exact_empty = expanded\.is_empty\(\)[\s\S]*exact_geometry_is_raster_empty\(&exact_vertices, &expanded, scissor\)[\s\S]*let managed = \(!exact_empty\)[\s\S]*prepare_exact_managed_vertices\(\s*draw,\s*&exact_vertices,\s*&expanded,\s*scissor,\s*sampler_states,\s*bypasses_depth_clip,\s*\)[\s\S]*let qualified = QualifiedExactDraw \{\s*scissor,\s*managed_vertices: managed\.as_ref\(\)\.map\(\|prepared\| prepared\.vertices\.clone\(\)\),\s*managed_tex_coord_sidecar: managed\.and_then\(\|prepared\| prepared\.tex_coord_sidecar\),\s*exact_empty,\s*\};[\s\S]*let required_managed_safe = required && qualified\.managed_vertices\.is_some\(\);/,
   );
 });
 
@@ -183,7 +184,7 @@ test("authoritative no-op and depth routing precede all TEV gates", () => {
     "gx_early_depth_plan",
     "required_exact && early_depth != GxEarlyDepthPlan::FixedFunction",
     "GxEarlyDepthPlan::DepthOnly",
-    "required_texture_maps",
+    "tev_resource_requirements",
   ]);
   assert.match(
     draw,

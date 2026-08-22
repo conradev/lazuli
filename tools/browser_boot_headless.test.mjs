@@ -146,7 +146,7 @@ test("headless capture pins the validated active deployed release twice", async 
     Error,
     JSON,
     async validateRelease(release) {
-      assert.equal(release.schema, 2);
+      assert.equal(release.schema, 3);
       assert.equal(Object.hasOwn(release, "cacheName"), false);
       return release;
     },
@@ -157,7 +157,7 @@ test("headless capture pins the validated active deployed release twice", async 
     extractFunction("validateObservedActiveRelease"),
   ].join("\n\n"), context);
   const release = {
-    schema: 2,
+    schema: 3,
     releaseId: "a".repeat(64),
     source: { commit: "b".repeat(40) },
     frontend: { url: `/assets/frontend-${"c".repeat(64)}.html`, sha256: "c".repeat(64), bytes: 10 },
@@ -165,6 +165,7 @@ test("headless capture pins the validated active deployed release twice", async 
       javascript: { url: `/assets/renderer-${"d".repeat(64)}.js`, sha256: "d".repeat(64), bytes: 20 },
       wasm: { url: `/assets/renderer-${"e".repeat(64)}.wasm`, sha256: "e".repeat(64), bytes: 30 },
     },
+    dsp: { url: `/assets/browser-dsp-${"1".repeat(64)}.wasm`, sha256: "1".repeat(64), bytes: 35 },
     backend: {
       url: "/ppcwasmjit.wasm",
       sha256: "f".repeat(64),
@@ -190,6 +191,7 @@ test("headless capture pins the validated active deployed release twice", async 
     "commit",
     "frontend",
     "renderer",
+    "dsp",
     "backend",
   ]);
   assert.equal(Object.hasOwn(identity.backend, "chunks"), false);
@@ -466,6 +468,7 @@ test("headless scenarios are selected before a fresh worker starts", () => {
   assert.match(source, /case "--scenario":/);
   assert.match(source, /--scenario cannot start inside a reused worker/);
   assert.match(source, /--scenario cannot be combined with --pulse/);
+  assert.match(source, /--pulse requires --reuse/);
   assert.match(source, /select scenarios with --scenario, not the --url query/);
   assert.match(
     source,
@@ -487,6 +490,164 @@ test("headless scenarios are selected before a fresh worker starts", () => {
   assert.match(
     source,
     /await persist\(options\.output, report\);\s*if \(scenarioError !== null\) throw scenarioError/,
+  );
+});
+
+test("headless controller pulses cannot be silently ignored by a fresh run", () => {
+  const context = vm.createContext({ Error, Number, Set, URL });
+  vm.runInContext(extractFunction("parseArguments"), context);
+  assert.throws(
+    () => context.parseArguments([
+      "--url",
+      "http://127.0.0.1:8765/index.html",
+      "--pulse",
+      "a",
+    ]),
+    /--pulse requires --reuse/,
+  );
+  const options = context.parseArguments([
+    "--reuse",
+    "--extend-cycles",
+    "1000000",
+    "--pulse",
+    "a:250",
+  ]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(options.pulses)),
+    [{ delayMs: 250, name: "a" }],
+  );
+});
+
+function makeHeadlessReusePulseHarness() {
+  const events = [];
+  const previous = {
+    cycles: 100,
+    dispatches: 20,
+    instructions: 300,
+    pc: "0x80001000",
+    stage: "snapshot",
+    status: "running",
+  };
+  const host = vm.createContext({
+    JSON,
+    parseReport: text => JSON.parse(text),
+    waitForRunner: async () => {
+      events.push("baseline");
+      return {
+        result: JSON.stringify(previous),
+        url: "http://127.0.0.1:8765/index.html?headlessRun=compatibility",
+      };
+    },
+  });
+  vm.runInContext([
+    extractFunction("cancelHeadlessControllerPulses"),
+    extractFunction("extendExistingRun"),
+  ].join("\n\n"), host);
+
+  const timers = new Map();
+  let nextTimer = 0;
+  const output = { textContent: JSON.stringify(previous) };
+  const page = vm.createContext({
+    document: {
+      querySelector(selector) {
+        assert.equal(selector, "#result");
+        return output;
+      },
+    },
+    lazuliController: {
+      pulseA(duration) {
+        events.push(`pulse-a:${duration}`);
+      },
+      pulseB(duration) {
+        events.push(`pulse-b:${duration}`);
+      },
+    },
+    lazuliCycleRunner: {
+      extendCycles(cycles, dispatches) {
+        events.push(`extend:${cycles}:${String(dispatches)}`);
+      },
+      setRenderEvery() {
+        assert.fail("unexpected render interval");
+      },
+    },
+    setTimeout(callback, delay) {
+      const timer = ++nextTimer;
+      timers.set(timer, { callback, cancelled: false, delay });
+      events.push(`schedule:${timer}:${delay}`);
+      return timer;
+    },
+    clearTimeout(timer) {
+      const pending = timers.get(timer);
+      if (pending !== undefined) pending.cancelled = true;
+      events.push(`cancel:${timer}`);
+    },
+  });
+  const session = {
+    async evaluate(script) {
+      return vm.runInContext(script, page);
+    },
+  };
+
+  return {
+    events,
+    fireAllTimerCallbacks() {
+      for (const pending of timers.values()) pending.callback();
+    },
+    output,
+    previous,
+    run(pulses) {
+      return host.extendExistingRun(session, {
+        extendCycles: 1_000_000,
+        extendDispatches: undefined,
+        pollMs: 10,
+        pulseMs: 500,
+        pulses,
+        renderEvery: null,
+      }, Date.now() + 1_000);
+    },
+    timers,
+  };
+}
+
+test("a zero-delay reused pulse is published before the worker resumes", async () => {
+  const harness = makeHeadlessReusePulseHarness();
+  const reuse = await harness.run([{ delayMs: 0, name: "a" }]);
+
+  assert.deepEqual(harness.events, [
+    "baseline",
+    "pulse-a:500",
+    "extend:1000000:undefined",
+  ]);
+  assert.equal(harness.output.textContent, "");
+  assert.equal(reuse.previous.cycles, harness.previous.cycles);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(reuse.action.pulses)),
+    [{ delayMs: 0, name: "a" }],
+  );
+});
+
+test("a later reuse action cancels and disowns delayed predecessor pulses", async () => {
+  const harness = makeHeadlessReusePulseHarness();
+  await harness.run([{ delayMs: 250, name: "b" }]);
+  assert.equal(harness.timers.get(1).cancelled, false);
+
+  await harness.run([{ delayMs: 0, name: "a" }]);
+  assert.equal(harness.timers.get(1).cancelled, true);
+  harness.fireAllTimerCallbacks();
+
+  assert.deepEqual(harness.events, [
+    "baseline",
+    "schedule:1:250",
+    "extend:1000000:undefined",
+    "cancel:1",
+    "baseline",
+    "pulse-a:500",
+    "extend:1000000:undefined",
+  ]);
+  assert.doesNotMatch(harness.events.join("\n"), /pulse-b/);
+  assert.match(
+    source,
+    /finally \{\s+try \{\s+if \(options\.reuse\) \{\s+await cancelHeadlessControllerPulses\(session\);/,
   );
 });
 

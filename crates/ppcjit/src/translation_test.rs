@@ -5,7 +5,7 @@ use cranelift_codegen::ir::{self, Endianness, ExternalName, InstructionData, Opc
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::{settings, verify_function};
 use gekko::disasm::{Extensions, Ins, Opcode as GuestOpcode};
-use gekko::{Exception, FPR, GPR, Reg, SPR};
+use gekko::{Exception, FPR, GPR, ProgramExceptionCause, Reg, SPR};
 
 use crate::builder::BuilderError;
 use crate::hooks::HookKind;
@@ -163,6 +163,16 @@ fn lwarx(rd: u8, ra: u8, rb: u8) -> Ins {
     )
 }
 
+fn lswx(rd: u8, ra: u8, rb: u8) -> Ins {
+    instruction(
+        31 << 26 | u32::from(rd) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 533 << 1,
+    )
+}
+
+fn dcbz_l(ra: u8, rb: u8) -> Ins {
+    instruction(0x1000_07ec | u32::from(ra) << 16 | u32::from(rb) << 11)
+}
+
 fn stwcx(rs: u8, ra: u8, rb: u8) -> Ins {
     instruction(
         31 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 150 << 1 | 1,
@@ -171,6 +181,35 @@ fn stwcx(rs: u8, ra: u8, rb: u8) -> Ins {
 
 fn mtmsr(rs: u8) -> Ins {
     instruction(31 << 26 | u32::from(rs) << 21 | 146 << 1)
+}
+
+fn tw(to: u8, ra: u8, rb: u8) -> Ins {
+    instruction(
+        31 << 26 | u32::from(to & 0x1f) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 4 << 1,
+    )
+}
+
+fn twi(to: u8, ra: u8, immediate: i16) -> Ins {
+    instruction(
+        3 << 26 | u32::from(to & 0x1f) << 21 | u32::from(ra) << 16 | u32::from(immediate as u16),
+    )
+}
+
+fn ps_abs(fd: u8, fb: u8, record: bool) -> Ins {
+    instruction(0x1000_0210 | u32::from(fd) << 21 | u32::from(fb) << 11 | u32::from(record))
+}
+
+fn ps_nabs(fd: u8, fb: u8, record: bool) -> Ins {
+    instruction(0x1000_0110 | u32::from(fd) << 21 | u32::from(fb) << 11 | u32::from(record))
+}
+
+fn mtfsfi(field: u8, immediate: u8, record: bool) -> Ins {
+    instruction(
+        0xfc00_010c
+            | u32::from(field & 7) << 23
+            | u32::from(immediate & 0xf) << 12
+            | u32::from(record),
+    )
 }
 
 fn tlbie(rb: u8) -> Ins {
@@ -285,6 +324,943 @@ fn portable_fastmem_uses_configured_pointer_width() {
     let clif = translated.function.display().to_string();
     assert!(!clif.contains(" call "));
     assert!(!clif.contains("brif"));
+}
+
+#[test]
+fn illegal_instruction_raises_program_after_the_portable_exception_hook() {
+    let illegal = instruction(0);
+    assert_eq!(illegal.op, GuestOpcode::Illegal);
+
+    let translated = translate_with_cycle_publication([illegal]);
+    assert_eq!(translated.sequence.0, [illegal]);
+    assert_eq!(translated.cycles, 2);
+    assert_eq!(translated.exit, TranslationExit::Synchronous);
+    assert_eq!(
+        hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET),
+        [(1, 0, 0)]
+    );
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let wasm = lower_portable(&translated.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let script = r#"
+const [
+  wasmHex,
+  cycleOffset,
+  pcOffset,
+  srr1Offset,
+  programException,
+  illegalCause,
+] = process.argv.slice(1).map((value, index) => index === 0 ? value : Number(value));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const initialPc = 0x80001234;
+const initialSrr1 = 0x7ffc1234;
+const postHookSrr1 = 0x80010042;
+const memory = new WebAssembly.Memory({ initial: 2 });
+const view = new DataView(memory.buffer);
+const events = [];
+view.setUint32(cpu + pcOffset, initialPc, true);
+view.setUint32(cpu + srr1Offset, initialSrr1, true);
+
+const hooks = {
+  user_1_0(registers, exception) {
+    events.push([
+      view.getUint32(context + cycleOffset, true),
+      registers,
+      exception,
+      view.getUint32(registers + srr1Offset, true),
+    ]);
+    view.setUint32(registers + srr1Offset, postHookSrr1, true);
+  },
+};
+const { instance } = await WebAssembly.instantiate(Buffer.from(wasmHex, "hex"), {
+  lazuli: { memory },
+  lazuli_hooks: hooks,
+});
+const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+if (executed !== 0x00020001) {
+  throw new Error(`illegal instruction returned 0x${executed.toString(16)}`);
+}
+const expectedEvents = [[0, cpu, programException, initialSrr1]];
+if (JSON.stringify(events) !== JSON.stringify(expectedEvents)) {
+  throw new Error(`exception hook observed ${JSON.stringify(events)}`);
+}
+if (view.getUint32(cpu + srr1Offset, true) !== (postHookSrr1 | illegalCause) >>> 0) {
+  throw new Error(
+    `illegal cause did not modify post-hook SRR1: 0x${view.getUint32(cpu + srr1Offset, true).toString(16)}`,
+  );
+}
+if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+  throw new Error("illegal instruction advanced PC");
+}
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &wasm,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &SPR::SRR1.offset().to_string(),
+            &(Exception::Program as u16).to_string(),
+            &ProgramExceptionCause::IllegalInstruction
+                .srr1_bits()
+                .to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_dcbz_l_certifies_locked_cache_fast_slow_and_exception_paths() {
+    let zero_base = dcbz_l(0, 3);
+    let corpus_indexed = dcbz_l(6, 3);
+    assert_eq!(zero_base.code, 0x1000_1fec);
+    assert_eq!(corpus_indexed.code, 0x1006_1fec);
+    assert_eq!(zero_base.op, GuestOpcode::DcbzL);
+    assert_eq!(corpus_indexed.op, GuestOpcode::DcbzL);
+
+    // addi r5,r5,1 verifies that an enabled dcbz_l is a continuing instruction.
+    let trailing = instruction(0x38a5_0001);
+    let zero_slow = translate_with_cycle_publication([zero_base, trailing]);
+    let indexed_slow = translate_with_cycle_publication([corpus_indexed, trailing]);
+    for (translated, expected) in [
+        (&zero_slow, [zero_base, trailing]),
+        (&indexed_slow, [corpus_indexed, trailing]),
+    ] {
+        verify_function(
+            &translated.function,
+            &settings::Flags::new(settings::builder()),
+        )
+        .unwrap();
+        assert_eq!(translated.sequence.0, expected);
+        assert_eq!(translated.cycles, 4);
+        assert_eq!(translated.exit, TranslationExit::Fallthrough);
+        assert_eq!(
+            user_hook_call_count(&translated.function, HookKind::WriteI32),
+            8
+        );
+        let write_cycles = hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET)
+            .into_iter()
+            .filter(|(namespace, index, _)| *namespace == 0 && *index == HookKind::WriteI32 as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(write_cycles, vec![(0, HookKind::WriteI32 as u32, 0); 8]);
+    }
+
+    let mut direct_translator = Translator::new(cycle_config(ExitMode::ReturnExecuted));
+    let indexed_direct = direct_translator
+        .translate([corpus_indexed, trailing].into_iter())
+        .unwrap();
+    verify_function(
+        &indexed_direct.function,
+        &settings::Flags::new(settings::builder()),
+    )
+    .unwrap();
+    assert_eq!(indexed_direct.sequence.0, [corpus_indexed, trailing]);
+    assert_eq!(indexed_direct.cycles, 4);
+    assert_eq!(indexed_direct.exit, TranslationExit::Fallthrough);
+    assert_eq!(
+        user_hook_call_count(&indexed_direct.function, HookKind::WriteI32),
+        0
+    );
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let zero_slow = lower_portable(&zero_slow.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let indexed_slow = lower_portable(&indexed_slow.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let indexed_direct = lower_portable(&indexed_direct.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let script = r#"
+const [
+  zeroSlowHex,
+  indexedSlowHex,
+  indexedDirectHex,
+  cycleOffset,
+  pcOffset,
+  r3Offset,
+  r5Offset,
+  r6Offset,
+  hid2Offset,
+  srr1Offset,
+  darOffset,
+  dsisrOffset,
+  writeI32Hook,
+  programException,
+  dsiException,
+  illegalCause,
+] = process.argv.slice(1).map((value, index) => index < 3 ? value : Number(value));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const lockedCachePage = 0x40000;
+const lockedCacheBase = 0xe0000000;
+const lockedCacheLine = 0x20;
+const hid2Lce = 0x10000000;
+const initialPc = 0x80006000;
+const guard = 0xa5;
+
+function createState() {
+  const memory = new WebAssembly.Memory({ initial: 8 });
+  const view = new DataView(memory.buffer);
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  return { memory, view };
+}
+
+function mapLockedCache(view) {
+  view.setUint32(fastmem + (lockedCacheBase >>> 17) * 4, lockedCachePage, true);
+}
+
+function guardedCache(memory, page = lockedCachePage) {
+  const bytes = new Uint8Array(memory.buffer, page, 0x60);
+  bytes.fill(guard);
+  return bytes;
+}
+
+function assertGuardedZeroLine(bytes, label) {
+  for (let index = 0; index < bytes.length; index++) {
+    const expected = index >= lockedCacheLine && index < lockedCacheLine + 32 ? 0 : guard;
+    if (bytes[index] !== expected) {
+      throw new Error(`${label} changed cache byte 0x${index.toString(16)} to 0x${bytes[index].toString(16)}`);
+    }
+  }
+}
+
+function assertGuardOnly(bytes, label) {
+  if (!bytes.every((byte) => byte === guard)) {
+    throw new Error(`${label} modified locked-cache backing`);
+  }
+}
+
+async function instantiate(hex, memory, hooks) {
+  return WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+}
+
+async function executeSlowSuccess() {
+  const { memory, view } = createState();
+  const cache = new Uint8Array(0x60).fill(guard);
+  const cacheView = new DataView(cache.buffer);
+  const events = [];
+  view.setUint32(cpu + hid2Offset, hid2Lce, true);
+  view.setUint32(cpu + r3Offset, lockedCacheBase + 0x3d, true);
+  view.setUint32(cpu + r5Offset, 0x1234, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`](hookContext, address, value) {
+      const unsignedAddress = address >>> 0;
+      events.push([
+        "write",
+        view.getUint32(hookContext + cycleOffset, true),
+        unsignedAddress,
+        value >>> 0,
+      ]);
+      const offset = unsignedAddress - lockedCacheBase;
+      cacheView.setInt32(offset, value, false);
+      return 1;
+    },
+    user_1_0() {
+      throw new Error("slow dcbz_l success raised an exception");
+    },
+  };
+  const { instance } = await instantiate(zeroSlowHex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00040002) {
+    throw new Error(`slow dcbz_l returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 8) {
+    throw new Error("slow dcbz_l did not continue through trailing addi");
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 0x1235) {
+    throw new Error("slow dcbz_l did not execute trailing addi");
+  }
+  const expected = Array.from({ length: 8 }, (_, index) => [
+    "write",
+    0,
+    lockedCacheBase + lockedCacheLine + index * 4,
+    0,
+  ]);
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`slow dcbz_l observed ${JSON.stringify(events)}`);
+  }
+  assertGuardedZeroLine(cache, "slow dcbz_l");
+}
+
+async function executeSlowFault() {
+  const { memory, view } = createState();
+  const cache = new Uint8Array(0x60).fill(guard);
+  const events = [];
+  view.setUint32(cpu + hid2Offset, hid2Lce, true);
+  view.setUint32(cpu + r3Offset, lockedCacheBase + 0x3d, true);
+  view.setUint32(cpu + r5Offset, 0x55aa, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`](hookContext, address, value) {
+      events.push([
+        "write",
+        view.getUint32(hookContext + cycleOffset, true),
+        address >>> 0,
+        value >>> 0,
+      ]);
+      view.setUint32(cpu + dsisrOffset, 0x42000000, true);
+      return 0;
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + darOffset, true),
+        view.getUint32(registers + dsisrOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await instantiate(zeroSlowHex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00020001) {
+    throw new Error(`faulting dcbz_l crossed its boundary: 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("faulting dcbz_l advanced PC");
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 0x55aa) {
+    throw new Error("faulting dcbz_l executed trailing addi");
+  }
+  const expectedAddress = lockedCacheBase + lockedCacheLine;
+  if (view.getUint32(cpu + darOffset, true) !== expectedAddress) {
+    throw new Error("faulting dcbz_l recorded an unaligned DAR");
+  }
+  const expected = [
+    ["write", 0, expectedAddress, 0],
+    ["exception", 0, cpu, dsiException, expectedAddress, 0x42000000],
+  ];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`faulting dcbz_l observed ${JSON.stringify(events)}`);
+  }
+  assertGuardOnly(cache, "faulting dcbz_l");
+}
+
+async function executeDisabled() {
+  const { memory, view } = createState();
+  const cache = new Uint8Array(0x60).fill(guard);
+  const events = [];
+  const postHookSrr1 = 0x80010042;
+  view.setUint32(cpu + r6Offset, lockedCacheBase + 0x20, true);
+  view.setUint32(cpu + r3Offset, 0x1d, true);
+  view.setUint32(cpu + r5Offset, 0x55aa, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`]() {
+      throw new Error("disabled dcbz_l reached memory");
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+      ]);
+      view.setUint32(registers + srr1Offset, postHookSrr1, true);
+    },
+  };
+  const { instance } = await instantiate(indexedSlowHex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00020001) {
+    throw new Error(`disabled dcbz_l returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc) {
+    throw new Error("disabled dcbz_l advanced PC");
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 0x55aa) {
+    throw new Error("disabled dcbz_l executed trailing addi");
+  }
+  if (view.getUint32(cpu + srr1Offset, true) !== (postHookSrr1 | illegalCause) >>> 0) {
+    throw new Error("disabled dcbz_l did not record Illegal Instruction");
+  }
+  const expected = [[0, cpu, programException]];
+  if (JSON.stringify(events) !== JSON.stringify(expected)) {
+    throw new Error(`disabled dcbz_l observed ${JSON.stringify(events)}`);
+  }
+  assertGuardOnly(cache, "disabled dcbz_l");
+}
+
+async function executeFast(hex, label) {
+  const { memory, view } = createState();
+  mapLockedCache(view);
+  const cache = guardedCache(memory);
+  view.setUint32(cpu + hid2Offset, hid2Lce, true);
+  view.setUint32(cpu + r6Offset, lockedCacheBase + 0x20, true);
+  view.setUint32(cpu + r3Offset, 0x1d, true);
+  view.setUint32(cpu + r5Offset, 9, true);
+  const hooks = {
+    [`user_0_${writeI32Hook}`]() {
+      throw new Error(`${label} called the slow write hook`);
+    },
+    user_1_0() {
+      throw new Error(`${label} raised an exception`);
+    },
+  };
+  const { instance } = await instantiate(hex, memory, hooks);
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  if (executed !== 0x00040002) {
+    throw new Error(`${label} returned 0x${executed.toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 8) {
+    throw new Error(`${label} did not continue through trailing addi`);
+  }
+  if (view.getUint32(cpu + r5Offset, true) !== 10) {
+    throw new Error(`${label} did not execute trailing addi`);
+  }
+  assertGuardedZeroLine(cache, label);
+}
+
+await executeSlowSuccess();
+await executeSlowFault();
+await executeDisabled();
+await executeFast(indexedSlowHex, "slow-capable fastmem dcbz_l");
+await executeFast(indexedDirectHex, "direct fastmem dcbz_l");
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &zero_slow,
+            &indexed_slow,
+            &indexed_direct,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &GPR::R3.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &GPR::R6.offset().to_string(),
+            &SPR::HID2.offset().to_string(),
+            &SPR::SRR1.offset().to_string(),
+            &SPR::DAR.offset().to_string(),
+            &SPR::DSISR.offset().to_string(),
+            &(HookKind::WriteI32 as u32).to_string(),
+            &(Exception::Program as u16).to_string(),
+            &(Exception::DSI as u16).to_string(),
+            &ProgramExceptionCause::IllegalInstruction
+                .srr1_bits()
+                .to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_trap_word_predicates_preserve_the_exact_exception_boundary() {
+    let prefix = instruction(14 << 26 | 6 << 21 | 6 << 16); // addi r6,r6,0
+    let later = instruction(14 << 26 | 5 << 21 | 0x55aa); // addi r5,r0,0x55aa
+    let traps = [
+        ("tw_slt", tw(0x10, 3, 4)),
+        ("tw_sgt", tw(0x08, 3, 4)),
+        ("tw_eq", tw(0x04, 3, 4)),
+        ("tw_ult", tw(0x02, 3, 4)),
+        ("tw_ugt", tw(0x01, 3, 4)),
+        ("tw_combined", tw(0x14, 3, 4)),
+        ("tw_none", tw(0x00, 3, 4)),
+        ("twi_sgt_neg1", twi(0x08, 3, -1)),
+        ("twi_ult_neg1", twi(0x02, 3, -1)),
+        ("twi_eq_min", twi(0x04, 3, i16::MIN)),
+    ];
+    for (name, trap) in traps {
+        assert!(
+            matches!(trap.op, GuestOpcode::Tw | GuestOpcode::Twi),
+            "{name} decoded as {:?}",
+            trap.op
+        );
+    }
+
+    let modules = traps
+        .into_iter()
+        .map(|(name, trap)| {
+            let translated = translate_with_cycle_publication([prefix, trap, later]);
+            assert_eq!(translated.sequence.0, [prefix, trap, later]);
+            assert_eq!(translated.cycles, 6);
+            assert_eq!(translated.exit, TranslationExit::Fallthrough);
+            assert_eq!(
+                hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET),
+                [(1, 0, 2)]
+            );
+
+            let wasm = lower_portable(&translated.function)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("{name}:{wasm}")
+        })
+        .collect::<Vec<_>>();
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let script = r#"
+const [
+  cycleOffsetText,
+  pcOffsetText,
+  r3OffsetText,
+  r4OffsetText,
+  r5OffsetText,
+  srr0OffsetText,
+  srr1OffsetText,
+  programExceptionText,
+  trapCauseText,
+  ...moduleSpecs
+] = process.argv.slice(1);
+const [
+  cycleOffset,
+  pcOffset,
+  r3Offset,
+  r4Offset,
+  r5Offset,
+  srr0Offset,
+  srr1Offset,
+  programException,
+  trapCause,
+] = [
+  cycleOffsetText,
+  pcOffsetText,
+  r3OffsetText,
+  r4OffsetText,
+  r5OffsetText,
+  srr0OffsetText,
+  srr1OffsetText,
+  programExceptionText,
+  trapCauseText,
+].map(Number);
+const modules = new Map(moduleSpecs.map((spec) => {
+  const separator = spec.indexOf(":");
+  return [spec.slice(0, separator), spec.slice(separator + 1)];
+}));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const initialPc = 0x80003000;
+const initialSrr0 = 0xaabbccdd;
+const initialSrr1 = 0x13572468;
+const postHookSrr1 = 0x80010042;
+const exceptionVector = 0xfff00700;
+const untouchedR5 = 0xdeadbeef;
+
+async function execute(name, lhs, rhs, shouldTrap, label) {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + r3Offset, lhs, true);
+  view.setUint32(cpu + r4Offset, rhs, true);
+  view.setUint32(cpu + r5Offset, untouchedR5, true);
+  view.setUint32(cpu + srr0Offset, initialSrr0, true);
+  view.setUint32(cpu + srr1Offset, initialSrr1, true);
+
+  const hooks = {
+    user_1_0(registers, exception) {
+      const trapPc = view.getUint32(registers + pcOffset, true);
+      events.push([
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        trapPc,
+      ]);
+      view.setUint32(registers + srr0Offset, trapPc, true);
+      view.setUint32(registers + srr1Offset, postHookSrr1, true);
+      view.setUint32(registers + pcOffset, exceptionVector, true);
+    },
+  };
+  const hex = modules.get(name);
+  if (hex === undefined) throw new Error(`missing module ${name}`);
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: hooks,
+  });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+
+  if (shouldTrap) {
+    if (executed !== 0x00040002) {
+      throw new Error(`${label} returned taken counters 0x${executed.toString(16)}`);
+    }
+    const expectedEvents = [[2, cpu, programException, initialPc + 4]];
+    if (JSON.stringify(events) !== JSON.stringify(expectedEvents)) {
+      throw new Error(`${label} observed ${JSON.stringify(events)}`);
+    }
+    if (view.getUint32(cpu + pcOffset, true) !== exceptionVector) {
+      throw new Error(`${label} did not retain the Program vector`);
+    }
+    if (view.getUint32(cpu + srr0Offset, true) !== initialPc + 4) {
+      throw new Error(`${label} did not retain the trapping PC in SRR0`);
+    }
+    if (view.getUint32(cpu + srr1Offset, true) !== (postHookSrr1 | trapCause) >>> 0) {
+      throw new Error(`${label} did not retain the Trap cause`);
+    }
+    if (view.getUint32(cpu + r5Offset, true) !== untouchedR5) {
+      throw new Error(`${label} executed beyond the taken trap`);
+    }
+  } else {
+    if (executed !== 0x00060003) {
+      throw new Error(`${label} returned untaken counters 0x${executed.toString(16)}`);
+    }
+    if (events.length !== 0) {
+      throw new Error(`${label} raised an untaken trap`);
+    }
+    if (view.getUint32(cpu + pcOffset, true) !== initialPc + 12) {
+      throw new Error(`${label} did not continue after an untaken trap`);
+    }
+    if (view.getUint32(cpu + srr0Offset, true) !== initialSrr0
+        || view.getUint32(cpu + srr1Offset, true) !== initialSrr1) {
+      throw new Error(`${label} changed exception state without trapping`);
+    }
+    if (view.getUint32(cpu + r5Offset, true) !== 0x55aa) {
+      throw new Error(`${label} did not execute after an untaken trap`);
+    }
+  }
+}
+
+await execute("tw_slt", 0x80000000, 0x7fffffff, true, "signed LT taken");
+await execute("tw_slt", 0x7fffffff, 0x80000000, false, "signed LT untaken");
+await execute("tw_sgt", 0x7fffffff, 0x80000000, true, "signed GT taken");
+await execute("tw_sgt", 0x80000000, 0x7fffffff, false, "signed GT untaken");
+await execute("tw_eq", 0x80000000, 0x80000000, true, "EQ taken");
+await execute("tw_eq", 1, 2, false, "EQ untaken");
+await execute("tw_ult", 0, 0xffffffff, true, "unsigned LT taken");
+await execute("tw_ult", 0xffffffff, 0, false, "unsigned LT untaken");
+await execute("tw_ugt", 0xffffffff, 0, true, "unsigned GT taken");
+await execute("tw_ugt", 0, 0xffffffff, false, "unsigned GT untaken");
+await execute("tw_combined", 0x12345678, 0x12345678, true, "combined EQ taken");
+await execute("tw_combined", 5, 4, false, "combined untaken");
+await execute("tw_none", 0x12345678, 0x12345678, false, "empty TO");
+await execute("twi_sgt_neg1", 0, 0, true, "twi signed sign extension");
+await execute("twi_sgt_neg1", 0xffffffff, 0, false, "twi signed equality");
+await execute("twi_ult_neg1", 0xfffffffe, 0, true, "twi unsigned sign extension");
+await execute("twi_ult_neg1", 0xffffffff, 0, false, "twi unsigned equality");
+await execute("twi_eq_min", 0xffff8000, 0, true, "twi minimum equality");
+await execute("twi_eq_min", 0x00008000, 0, false, "twi minimum mismatch");
+"#;
+    let mut command = Command::new("node");
+    command.args([
+        "--input-type=module",
+        "--eval",
+        script,
+        &TEST_HOOK_CYCLE_OFFSET.to_string(),
+        &Reg::PC.offset().to_string(),
+        &GPR::R3.offset().to_string(),
+        &GPR::R4.offset().to_string(),
+        &GPR::R5.offset().to_string(),
+        &SPR::SRR0.offset().to_string(),
+        &SPR::SRR1.offset().to_string(),
+        &(Exception::Program as u16).to_string(),
+        &ProgramExceptionCause::Trap.srr1_bits().to_string(),
+    ]);
+    command.args(&modules);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_paired_sign_moves_and_mtfsfi_preserve_exact_bits() {
+    let instructions = [
+        ("ps_abs_rc0", ps_abs(2, 1, false), 2u16),
+        ("ps_abs_rc1", ps_abs(2, 1, true), 2),
+        ("ps_nabs_rc0", ps_nabs(2, 1, false), 2),
+        ("ps_nabs_rc1", ps_nabs(2, 1, true), 2),
+        ("mtfs_bf0_rc0", mtfsfi(0, 0xf, false), 1),
+        ("mtfs_bf3_rc1", mtfsfi(3, 0x8, true), 1),
+        ("mtfs_bf6_rc0", mtfsfi(6, 0x4, false), 1),
+        ("mtfs_bf7_rc1", mtfsfi(7, 0x5, true), 1),
+    ];
+    let modules = instructions
+        .into_iter()
+        .map(|(name, instruction, cycles)| {
+            assert!(
+                matches!(
+                    instruction.op,
+                    GuestOpcode::PsAbs | GuestOpcode::PsNabs | GuestOpcode::Mtfsfi
+                ),
+                "{name} decoded as {:?}",
+                instruction.op
+            );
+            let translated = translate_with_cycle_publication([instruction]);
+            assert_eq!(translated.sequence.0, [instruction]);
+            assert_eq!(translated.cycles, cycles);
+            assert_eq!(translated.exit, TranslationExit::Fallthrough);
+            assert_eq!(
+                hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET),
+                [(1, 0, 0)]
+            );
+
+            let wasm = lower_portable(&translated.function)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("{name}:{wasm}")
+        })
+        .collect::<Vec<_>>();
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let script = r#"
+const [
+  cycleOffsetText,
+  pcOffsetText,
+  msrOffsetText,
+  crOffsetText,
+  fpscrOffsetText,
+  f1OffsetText,
+  f2OffsetText,
+  srr0OffsetText,
+  floatUnavailableText,
+  ...moduleSpecs
+] = process.argv.slice(1);
+const [
+  cycleOffset,
+  pcOffset,
+  msrOffset,
+  crOffset,
+  fpscrOffset,
+  f1Offset,
+  f2Offset,
+  srr0Offset,
+  floatUnavailable,
+] = [
+  cycleOffsetText,
+  pcOffsetText,
+  msrOffsetText,
+  crOffsetText,
+  fpscrOffsetText,
+  f1OffsetText,
+  f2OffsetText,
+  srr0OffsetText,
+  floatUnavailableText,
+].map(Number);
+const modules = new Map(moduleSpecs.map((spec) => {
+  const separator = spec.indexOf(":");
+  return [spec.slice(0, separator), spec.slice(separator + 1)];
+}));
+
+const context = 32;
+const cpu = 128;
+const initialPc = 0x80005000;
+const initialCr = 0xa5ffffff;
+const floatAvailable = 1 << 13;
+const cr1Mask = 0x0f000000;
+const derivedMask = 0x60000000;
+
+function normalizeFpscr(raw) {
+  let value = raw >>> 0;
+  const invalid = value & 0x01f80700;
+  value = invalid !== 0 ? (value | 0x20000000) >>> 0 : (value & ~0x20000000) >>> 0;
+  const exceptions = value >>> 22;
+  const enables = value & 0x000000f8;
+  value = (exceptions & enables) !== 0
+    ? (value | 0x40000000) >>> 0
+    : (value & ~0x40000000) >>> 0;
+  return value;
+}
+
+function expectedCr1(cr, fpscr) {
+  return ((cr & ~cr1Mask) | ((fpscr >>> 4) & cr1Mask)) >>> 0;
+}
+
+async function instantiate(name, setup, hook) {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const view = new DataView(memory.buffer);
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  setup(view);
+  const hex = modules.get(name);
+  if (hex === undefined) throw new Error(`missing module ${name}`);
+  const { instance } = await WebAssembly.instantiate(Buffer.from(hex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: { user_1_0: hook ?? (() => {
+      throw new Error(`${name} raised an unexpected floating-point exception`);
+    }) },
+  });
+  const executed = instance.exports.run(context, cpu, 0) >>> 0;
+  return { view, executed };
+}
+
+async function executeSignMove(name, input, expected, record) {
+  const initialFpscr = 0x90000000;
+  const { view, executed } = await instantiate(name, (view) => {
+    view.setUint32(cpu + msrOffset, floatAvailable, true);
+    view.setUint32(cpu + crOffset, initialCr, true);
+    view.setUint32(cpu + fpscrOffset, initialFpscr, true);
+    view.setBigUint64(cpu + f1Offset, input[0], true);
+    view.setBigUint64(cpu + f1Offset + 8, input[1], true);
+  });
+  if (executed !== 0x00020001) {
+    throw new Error(`${name} returned 0x${executed.toString(16)}`);
+  }
+  const actual = [
+    view.getBigUint64(cpu + f2Offset, true),
+    view.getBigUint64(cpu + f2Offset + 8, true),
+  ];
+  if (actual[0] !== expected[0] || actual[1] !== expected[1]) {
+    throw new Error(`${name} produced ${actual.map((bits) => bits.toString(16)).join(",")}`);
+  }
+  if (view.getUint32(cpu + fpscrOffset, true) !== initialFpscr) {
+    throw new Error(`${name} changed FPSCR`);
+  }
+  const expectedCr = record ? expectedCr1(initialCr, initialFpscr) : initialCr;
+  if (view.getUint32(cpu + crOffset, true) !== expectedCr) {
+    throw new Error(`${name} produced CR 0x${view.getUint32(cpu + crOffset, true).toString(16)}`);
+  }
+  if (view.getUint32(cpu + pcOffset, true) !== initialPc + 4) {
+    throw new Error(`${name} did not advance PC once`);
+  }
+}
+
+const negativeZeroAndNan = [0x8000000000000000n, 0xfff8123456789abcn];
+const absoluteZeroAndNan = [0x0000000000000000n, 0x7ff8123456789abcn];
+const positiveInfinityAndNan = [0x7ff0000000000000n, 0x7ff8deadbeef0042n];
+const negativeInfinityAndNan = [0xfff0000000000000n, 0xfff8deadbeef0042n];
+await executeSignMove("ps_abs_rc0", negativeZeroAndNan, absoluteZeroAndNan, false);
+await executeSignMove("ps_abs_rc1", negativeZeroAndNan, absoluteZeroAndNan, true);
+await executeSignMove("ps_nabs_rc0", positiveInfinityAndNan, negativeInfinityAndNan, false);
+await executeSignMove("ps_nabs_rc1", positiveInfinityAndNan, negativeInfinityAndNan, true);
+
+async function executeMtfs(name, bf, immediate, record, initialFpscr) {
+  const { view, executed } = await instantiate(name, (view) => {
+    view.setUint32(cpu + msrOffset, floatAvailable, true);
+    view.setUint32(cpu + crOffset, initialCr, true);
+    view.setUint32(cpu + fpscrOffset, initialFpscr, true);
+  });
+  if (executed !== 0x00010001) {
+    throw new Error(`${name} returned 0x${executed.toString(16)}`);
+  }
+  const shift = 28 - 4 * bf;
+  const selectedMask = (0xf << shift) >>> 0;
+  const direct = ((initialFpscr & ~selectedMask) | ((immediate << shift) & selectedMask)) >>> 0;
+  const expected = normalizeFpscr(direct);
+  const actual = view.getUint32(cpu + fpscrOffset, true);
+  if (actual !== expected) {
+    throw new Error(`${name} produced FPSCR 0x${actual.toString(16)}, expected 0x${expected.toString(16)}`);
+  }
+  const preservedMask = ~(selectedMask | derivedMask) >>> 0;
+  if ((actual & preservedMask) !== (initialFpscr & preservedMask)) {
+    throw new Error(`${name} changed a non-selected, non-derived FPSCR bit`);
+  }
+  const selectedNonDerived = selectedMask & ~derivedMask;
+  if ((actual & selectedNonDerived) !== (direct & selectedNonDerived)) {
+    throw new Error(`${name} did not replace the selected FPSCR nibble`);
+  }
+  if ((actual & derivedMask) !== (expected & derivedMask)) {
+    throw new Error(`${name} did not normalize VX/FEX`);
+  }
+  const expectedCr = record ? expectedCr1(initialCr, expected) : initialCr;
+  if (view.getUint32(cpu + crOffset, true) !== expectedCr) {
+    throw new Error(`${name} produced CR 0x${view.getUint32(cpu + crOffset, true).toString(16)}`);
+  }
+}
+
+await executeMtfs("mtfs_bf0_rc0", 0, 0xf, false, 0x00010004);
+await executeMtfs("mtfs_bf3_rc1", 3, 0x8, true, 0x80000080);
+await executeMtfs("mtfs_bf6_rc0", 6, 0x4, false, 0x10000000);
+await executeMtfs("mtfs_bf7_rc1", 7, 0x5, true, 0x81a50780);
+
+const disabledFpscr = 0x12345678;
+const disabledCr = 0xa5ffffff;
+const disabledEvents = [];
+let disabledView;
+const disabled = await instantiate("mtfs_bf3_rc1", (view) => {
+  disabledView = view;
+  view.setUint32(cpu + msrOffset, 0, true);
+  view.setUint32(cpu + crOffset, disabledCr, true);
+  view.setUint32(cpu + fpscrOffset, disabledFpscr, true);
+  view.setUint32(cpu + srr0Offset, 0, true);
+}, (registers, exception) => {
+  const view = disabledView;
+  const faultPc = view.getUint32(registers + pcOffset, true);
+  disabledEvents.push([
+    view.getUint32(context + cycleOffset, true),
+    registers,
+    exception,
+    faultPc,
+  ]);
+  view.setUint32(registers + srr0Offset, faultPc, true);
+  view.setUint32(registers + pcOffset, 0xfff00800, true);
+});
+if (disabled.executed !== 0x00020001) {
+  throw new Error(`disabled mtfsfi returned 0x${disabled.executed.toString(16)}`);
+}
+const expectedDisabledEvents = [[0, cpu, floatUnavailable, initialPc]];
+if (JSON.stringify(disabledEvents) !== JSON.stringify(expectedDisabledEvents)) {
+  throw new Error(`disabled mtfsfi observed ${JSON.stringify(disabledEvents)}`);
+}
+if (disabledView.getUint32(cpu + pcOffset, true) !== 0xfff00800
+    || disabledView.getUint32(cpu + srr0Offset, true) !== initialPc) {
+  throw new Error("disabled mtfsfi lost its exception boundary");
+}
+if (disabledView.getUint32(cpu + fpscrOffset, true) !== disabledFpscr
+    || disabledView.getUint32(cpu + crOffset, true) !== disabledCr) {
+  throw new Error("disabled mtfsfi changed floating-point state");
+}
+"#;
+    let mut command = Command::new("node");
+    command.args([
+        "--input-type=module",
+        "--eval",
+        script,
+        &TEST_HOOK_CYCLE_OFFSET.to_string(),
+        &Reg::PC.offset().to_string(),
+        &Reg::MSR.offset().to_string(),
+        &Reg::CR.offset().to_string(),
+        &Reg::FPSCR.offset().to_string(),
+        &FPR::R1.offset().to_string(),
+        &FPR::R2.offset().to_string(),
+        &SPR::SRR0.offset().to_string(),
+        &(Exception::FloatUnavailable as u16).to_string(),
+    ]);
+    command.args(&modules);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]
@@ -917,6 +1893,325 @@ await storeAlignment();
             &SPR::DSISR.offset().to_string(),
             &(HookKind::LoadReserve as u32).to_string(),
             &(HookKind::StoreConditional as u32).to_string(),
+            &(Exception::DSI as u16).to_string(),
+            &(Exception::Alignment as u16).to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "node failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn portable_lswx_observes_runtime_count_partial_completion_and_alignment_boundaries() {
+    let prefix = instruction(0x38c6_0000); // addi r6,r6,0
+    let indexed = lswx(30, 3, 4);
+    assert_eq!(indexed.op, GuestOpcode::Lswx);
+    let trailing = instruction(0x38a0_55aa); // addi r5,r0,0x55aa
+    let fixture = [prefix, indexed, trailing];
+
+    let translated = translate_with_cycle_publication(fixture);
+    assert_eq!(translated.sequence.0, fixture[..2]);
+    assert_eq!(translated.cycles, 12);
+    assert_eq!(translated.exit, TranslationExit::Synchronous);
+    assert_eq!(
+        user_hook_call_count(&translated.function, HookKind::ReadI8),
+        1
+    );
+    assert_eq!(
+        hook_call_cycles(&translated.function, TEST_HOOK_CYCLE_OFFSET)
+            .into_iter()
+            .filter(|(namespace, index, _)| {
+                *namespace == 0 && *index == HookKind::ReadI8 as u32
+            })
+            .collect::<Vec<_>>(),
+        [(0, HookKind::ReadI8 as u32, 2)]
+    );
+
+    // The no-slow-memory portable mode must still lower the dynamic loop, but it uses its
+    // direct fast-memory path instead of importing ReadI8.
+    let direct = Translator::new(TranslationConfig::new(
+        CodegenSettings::default(),
+        ir::types::I32,
+        CallConv::Fast,
+        ExitMode::ReturnExecuted,
+    ))
+    .translate(fixture.into_iter())
+    .unwrap();
+    assert_eq!(direct.sequence.0, fixture[..2]);
+    assert_eq!(direct.cycles, 12);
+    assert_eq!(direct.exit, TranslationExit::Synchronous);
+    assert_eq!(user_hook_call_count(&direct.function, HookKind::ReadI8), 0);
+    let direct_wasm = lower_portable(&direct.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("node is unavailable; skipping WebAssembly runtime smoke test");
+        return;
+    }
+
+    let wasm = lower_portable(&translated.function)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let script = r#"
+const [
+  hex,
+  directHex,
+  cycleOffset,
+  pcOffset,
+  msrOffset,
+  r0Offset,
+  r3Offset,
+  r4Offset,
+  r5Offset,
+  r6Offset,
+  r30Offset,
+  r31Offset,
+  xerOffset,
+  darOffset,
+  dsisrOffset,
+  readI8Hook,
+  dsiException,
+  alignmentException,
+] = process.argv.slice(1).map((value, index) => index < 2 ? value : Number(value));
+
+const context = 32;
+const cpu = 128;
+const fastmem = 0x10000;
+const initialPc = 0x80005000;
+const expectedExecuted = 0x000c0002;
+const source = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa];
+const initial = {
+  r0: 0x0badcafe,
+  r30: 0x30303030,
+  r31: 0x31313131,
+  r5: 0xdeadbeef,
+  r6: 0xabcdef01,
+  dar: 0xaabbccdd,
+  dsisr: 0x11223344,
+};
+
+async function execute({
+  base,
+  offset = 0,
+  count,
+  msr = 0,
+  failAt = -1,
+  moduleHex = hex,
+  useFastmem = false,
+}) {
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const view = new DataView(memory.buffer);
+  const events = [];
+  let ordinal = 0;
+
+  view.setUint32(cpu + pcOffset, initialPc, true);
+  view.setUint32(cpu + msrOffset, msr, true);
+  view.setUint32(cpu + r0Offset, initial.r0, true);
+  view.setUint32(cpu + r3Offset, base, true);
+  view.setUint32(cpu + r4Offset, offset, true);
+  view.setUint32(cpu + r5Offset, initial.r5, true);
+  view.setUint32(cpu + r6Offset, initial.r6, true);
+  view.setUint32(cpu + r30Offset, initial.r30, true);
+  view.setUint32(cpu + r31Offset, initial.r31, true);
+  view.setUint32(cpu + xerOffset, (0xc0000000 | count) >>> 0, true);
+  view.setUint32(cpu + darOffset, initial.dar, true);
+  view.setUint32(cpu + dsisrOffset, initial.dsisr, true);
+  if (useFastmem) {
+    const address = (base + offset) >>> 0;
+    const page = 0x18000;
+    view.setUint32(fastmem + (address >>> 17) * 4, page, true);
+    new Uint8Array(memory.buffer, page + (address & 0x1ffff), source.length).set(source);
+  }
+
+  const imports = {
+    [`user_0_${readI8Hook}`](hookContext, address, output) {
+      const current = ordinal++;
+      events.push(["read", view.getUint32(hookContext + cycleOffset, true), address >>> 0]);
+      if (current === failAt) {
+        view.setUint32(cpu + dsisrOffset, 0x42000000, true);
+        return 0;
+      }
+      view.setUint8(output, source[current]);
+      return 1;
+    },
+    user_1_0(registers, exception) {
+      events.push([
+        "exception",
+        view.getUint32(context + cycleOffset, true),
+        registers,
+        exception,
+        view.getUint32(registers + darOffset, true),
+        view.getUint32(registers + dsisrOffset, true),
+      ]);
+    },
+  };
+  const { instance } = await WebAssembly.instantiate(Buffer.from(moduleHex, "hex"), {
+    lazuli: { memory },
+    lazuli_hooks: imports,
+  });
+  const executed = instance.exports.run(context, cpu, fastmem) >>> 0;
+  return { view, events, executed, base, offset, count };
+}
+
+function assertBoundary(result, label, expectedDar, expectedDsisr = 0x0000a3c3) {
+  if (result.executed !== expectedExecuted) {
+    throw new Error(`${label} returned 0x${result.executed.toString(16)}`);
+  }
+  if (result.view.getUint32(cpu + pcOffset, true) !== initialPc + 4) {
+    throw new Error(`${label} did not preserve the faulting instruction PC`);
+  }
+  if (result.view.getUint32(cpu + r0Offset, true) !== initial.r0
+      || result.view.getUint32(cpu + r30Offset, true) !== initial.r30
+      || result.view.getUint32(cpu + r31Offset, true) !== initial.r31) {
+    throw new Error(`${label} changed a destination register`);
+  }
+  const expected = [["exception", 2, cpu, alignmentException, expectedDar, expectedDsisr]];
+  if (JSON.stringify(result.events) !== JSON.stringify(expected)) {
+    throw new Error(`${label} observed ${JSON.stringify(result.events)}`);
+  }
+}
+
+const success = await execute({ base: 0x2ff0, offset: 0x10, count: 10 });
+if (success.executed !== expectedExecuted) {
+  throw new Error(`completed lswx returned 0x${success.executed.toString(16)}`);
+}
+if (success.view.getUint32(cpu + pcOffset, true) !== initialPc + 8) {
+  throw new Error("completed lswx did not advance PC through the barrier");
+}
+if (success.view.getUint32(cpu + r30Offset, true) !== 0x11223344
+    || success.view.getUint32(cpu + r31Offset, true) !== 0x55667788
+    || success.view.getUint32(cpu + r0Offset, true) !== 0x99aa0000) {
+  throw new Error("completed lswx lost register wrap, byte order, or partial-word clearing");
+}
+if (success.view.getUint32(cpu + r3Offset, true) !== 0x2ff0
+    || success.view.getUint32(cpu + r4Offset, true) !== 0x10
+    || success.view.getUint32(cpu + r5Offset, true) !== initial.r5
+    || success.view.getUint32(cpu + r6Offset, true) !== initial.r6
+    || success.view.getUint32(cpu + xerOffset, true) !== 0xc000000a) {
+  throw new Error("completed lswx changed a source, XER, or post-barrier register");
+}
+if (success.view.getUint32(cpu + darOffset, true) !== initial.dar
+    || success.view.getUint32(cpu + dsisrOffset, true) !== initial.dsisr) {
+  throw new Error("completed lswx changed exception state");
+}
+const expectedSuccessEvents = source.map(
+  (_byte, index) => ["read", 2, 0x3000 + index],
+);
+if (JSON.stringify(success.events) !== JSON.stringify(expectedSuccessEvents)) {
+  throw new Error(`completed lswx observed ${JSON.stringify(success.events)}`);
+}
+
+for (const [label, moduleHex] of [
+  ["slow-capable fast-memory lswx", hex],
+  ["direct fast-memory lswx", directHex],
+]) {
+  const fast = await execute({
+    base: 0x2ff0,
+    offset: 0x10,
+    count: 10,
+    moduleHex,
+    useFastmem: true,
+  });
+  if (fast.executed !== expectedExecuted
+      || fast.view.getUint32(cpu + pcOffset, true) !== initialPc + 8
+      || fast.view.getUint32(cpu + r30Offset, true) !== 0x11223344
+      || fast.view.getUint32(cpu + r31Offset, true) !== 0x55667788
+      || fast.view.getUint32(cpu + r0Offset, true) !== 0x99aa0000
+      || fast.events.length !== 0) {
+    throw new Error(`${label} failed or unexpectedly called a hook: ${JSON.stringify(fast.events)}`);
+  }
+}
+
+// XER[25:31] is a literal zero count for lswx. In particular, addr + count - 1
+// must not manufacture a range-crossing exception.
+const zero = await execute({ base: 0x0fffffff, count: 0 });
+if (zero.executed !== expectedExecuted
+    || zero.view.getUint32(cpu + pcOffset, true) !== initialPc + 8) {
+  throw new Error("zero-count lswx did not complete at the barrier");
+}
+if (zero.events.length !== 0
+    || zero.view.getUint32(cpu + r0Offset, true) !== initial.r0
+    || zero.view.getUint32(cpu + r30Offset, true) !== initial.r30
+    || zero.view.getUint32(cpu + r31Offset, true) !== initial.r31
+    || zero.view.getUint32(cpu + xerOffset, true) !== 0xc0000000) {
+  throw new Error(`zero-count lswx changed state or observed ${JSON.stringify(zero.events)}`);
+}
+
+const fault = await execute({ base: 0x3000, offset: 0x20, count: 7, failAt: 6 });
+if (fault.executed !== expectedExecuted
+    || fault.view.getUint32(cpu + pcOffset, true) !== initialPc + 4) {
+  throw new Error("faulting lswx lost its instruction boundary");
+}
+if (fault.view.getUint32(cpu + r30Offset, true) !== 0x11223344
+    || fault.view.getUint32(cpu + r31Offset, true) !== 0x55660000
+    || fault.view.getUint32(cpu + r0Offset, true) !== initial.r0) {
+  throw new Error("faulting lswx did not retain exactly the successfully read bytes");
+}
+const expectedFaultEvents = [
+  ["read", 2, 0x3020],
+  ["read", 2, 0x3021],
+  ["read", 2, 0x3022],
+  ["read", 2, 0x3023],
+  ["read", 2, 0x3024],
+  ["read", 2, 0x3025],
+  ["read", 2, 0x3026],
+  ["exception", 2, cpu, dsiException, 0x3026, 0x42000000],
+];
+if (JSON.stringify(fault.events) !== JSON.stringify(expectedFaultEvents)) {
+  throw new Error(`faulting lswx observed ${JSON.stringify(fault.events)}`);
+}
+
+assertBoundary(
+  await execute({ base: 0x00000ffd, count: 4 }),
+  "misaligned 4 KiB crossing",
+  0x00000ffd,
+);
+assertBoundary(
+  await execute({ base: 0x0ffffffc, count: 8 }),
+  "aligned 256 MiB crossing",
+  0x0ffffffc,
+);
+assertBoundary(
+  await execute({ base: 0x4000, offset: 0x20, count: 7, msr: 1 }),
+  "little-endian lswx",
+  0x4020,
+);
+// Little-endian mode is an instruction-form precheck, even when the dynamic byte count is zero.
+assertBoundary(
+  await execute({ base: 0x5000, count: 0, msr: 1 }),
+  "little-endian zero-count lswx",
+  0x5000,
+);
+"#;
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            &wasm,
+            &direct_wasm,
+            &TEST_HOOK_CYCLE_OFFSET.to_string(),
+            &Reg::PC.offset().to_string(),
+            &Reg::MSR.offset().to_string(),
+            &GPR::R0.offset().to_string(),
+            &GPR::R3.offset().to_string(),
+            &GPR::R4.offset().to_string(),
+            &GPR::R5.offset().to_string(),
+            &GPR::R6.offset().to_string(),
+            &GPR::R30.offset().to_string(),
+            &GPR::R31.offset().to_string(),
+            &SPR::XER.offset().to_string(),
+            &SPR::DAR.offset().to_string(),
+            &SPR::DSISR.offset().to_string(),
+            &(HookKind::ReadI8 as u32).to_string(),
             &(Exception::DSI as u16).to_string(),
             &(Exception::Alignment as u16).to_string(),
         ])

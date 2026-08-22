@@ -41,6 +41,7 @@ test("release markup retains one hidden terminal report sink", () => {
 const genericDiscSourceConfig = `const defaultDiscSourceConfig = false
       ? {
           kind: "logical-range-endpoint",
+          logicalSize: 0,
           url: new URL("/disc", location.href).href,
         }
       : false
@@ -74,13 +75,14 @@ test("builds a deterministic licensed release from a generic generated frontend"
   temporaryDirectories.push(directory);
   const appPath = join(directory, "index.html");
   const wasmPath = join(directory, "ppcwasmjit.wasm");
+  const dspPath = join(directory, "browser_dsp.wasm");
   const rendererJavascriptPath = join(directory, "browser_renderer.js");
   const rendererWasmPath = join(directory, "browser_renderer_bg.wasm");
   const outputPath = join(directory, "dist");
   const sourceAnchor = '<a href="https://github.com/conradev/lazuli" target="_blank" rel="source noopener">Source</a>';
   await writeFile(
     appPath,
-    `<!doctype html><body>${sourceAnchor}<main class="shell" data-surface="debug">
+    `<!doctype html><body><main class="shell" data-surface="debug">
 <!-- LAZULI DEBUG UI START -->
 <div id="runner-controls">
 <button id="pause-runner">Pause</button>
@@ -93,12 +95,14 @@ test("builds a deterministic licensed release from a generic generated frontend"
 <!-- LAZULI DEBUG UI END -->
 <script type="module">import initRenderer from "/browser_renderer.js";
 new URL("/ppcwasmjit.wasm", location.href);
+new URL("/browser_dsp.wasm", location.href);
 ${genericDiscSourceConfig}
-</script></main></body>`,
+</script><footer>${sourceAnchor}</footer></main></body>`,
   );
   const wasm = Buffer.alloc(WASM_CHUNK_SIZE * 2 + 17);
   for (let index = 0; index < wasm.length; index += 1) wasm[index] = index * 31 & 0xff;
   await writeFile(wasmPath, wasm);
+  const dspWasm = Buffer.from("browser DSP wasm fixture");
   const rendererWasm = Buffer.from("renderer wasm fixture");
   const rendererJavascript = [
     "let wasm;",
@@ -109,12 +113,13 @@ ${genericDiscSourceConfig}
     "",
   ].join("\n");
   await Promise.all([
+    writeFile(dspPath, dspWasm),
     writeFile(rendererJavascriptPath, rendererJavascript),
     writeFile(rendererWasmPath, rendererWasm),
   ]);
 
   const commit = "0123456789abcdef0123456789abcdef01234567";
-  const release = await buildWeb({ appPath, wasmPath, outputPath, commit });
+  const release = await buildWeb({ appPath, wasmPath, dspPath, outputPath, commit });
   await validateRelease(release);
   assert.equal(release.backend.chunks.length, 3);
   assert.deepEqual(release.backend.chunks.map(chunk => chunk.bytes), [
@@ -135,6 +140,10 @@ ${genericDiscSourceConfig}
     join(outputPath, release.renderer.wasm.url.slice(1)),
   );
   assert.deepEqual(builtRendererWasm, rendererWasm);
+  assert.deepEqual(
+    await readFile(join(outputPath, release.dsp.url.slice(1))),
+    dspWasm,
+  );
   const builtRendererJavascript = await readFile(
     join(outputPath, release.renderer.javascript.url.slice(1)),
     "utf8",
@@ -151,6 +160,14 @@ ${genericDiscSourceConfig}
     frontend,
     /href="\/source\/"[^>]*>Legal<\/a>/,
   );
+  assert.match(
+    frontend,
+    /<footer><button id="capture-diagnostics" type="button" aria-controls="result" data-capture-state="unavailable" disabled>Capture diagnostics<\/button> · <a [^>]*>Source<\/a> · <a [^>]*>Legal<\/a><\/footer>/,
+  );
+  assert.doesNotMatch(
+    frontend.match(/<button id="capture-diagnostics"[^>]*>[\s\S]*?<\/button>/)?.[0] ?? "",
+    /download|formaction|type="file"|fetch\(|XMLHttpRequest/,
+  );
   assert.doesNotMatch(frontend, />GPL-3\.0-only<|>Apache-2\.0 font notice</);
   assert.doesNotMatch(frontend, /href="https:\/\/github\.com\/conradev\/lazuli"/);
   assert.doesNotMatch(frontend, /(?:Pause|Resume|Stop|Options and diagnostics)/);
@@ -160,6 +177,8 @@ ${genericDiscSourceConfig}
   assert.match(frontend, /<main>Play<\/main>/);
   assert.ok(frontend.includes(release.renderer.javascript.url));
   assert.ok(!frontend.includes("/browser_renderer.js"));
+  assert.ok(frontend.includes(release.dsp.url));
+  assert.ok(!frontend.includes("/browser_dsp.wasm"));
 
   const [sourcePage, thirdPartyNotices, vendoredFontLicense] = await Promise.all([
     readFile(join(outputPath, "source", "index.html"), "utf8"),
@@ -179,7 +198,7 @@ ${genericDiscSourceConfig}
   );
   assert.match(
     sourcePage,
-    /Lazuli's code is GPL-3\.0-only\. This release also includes Apache-2\.0 alternative IPL font data\./,
+    /Lazuli's code is GPL-3\.0-only\. This release also includes Apache-2\.0 alternative IPL font data and Dolphin's free replacement DSP ROM images\./,
   );
   assert.match(
     sourcePage,
@@ -191,6 +210,14 @@ ${genericDiscSourceConfig}
   );
   assert.match(
     sourcePage,
+    /DSP ROM attribution[\s\S]*provenance and hashes[\s\S]*upstream source and contributor history/,
+  );
+  assert.match(
+    sourcePage,
+    /dolphin-emu\/dolphin\/blob\/a5e2a0d97307ef146879a6f46a86d728a3ac2e97\/docs\/DSP\/free_dsp_rom\/dsp_rom_readme\.txt/,
+  );
+  assert.match(
+    sourcePage,
     new RegExp(
       `/blob/${commit}/licenses/Dolphin-fonts-Apache-2\\.0\\.txt`,
     ),
@@ -198,9 +225,13 @@ ${genericDiscSourceConfig}
   assert.doesNotMatch(sourcePage, /This release is GPL-3\.0-only\./);
 
   const firstManifest = await readFile(join(outputPath, "release.json"), "utf8");
-  const secondRelease = await buildWeb({ appPath, wasmPath, outputPath, commit });
+  const secondRelease = await buildWeb({ appPath, wasmPath, dspPath, outputPath, commit });
   assert.equal(secondRelease.releaseId, release.releaseId);
   assert.equal(await readFile(join(outputPath, "release.json"), "utf8"), firstManifest);
+  await writeFile(dspPath, Buffer.from("changed browser DSP wasm fixture"));
+  const changedDspRelease = await buildWeb({ appPath, wasmPath, dspPath, outputPath, commit });
+  assert.notEqual(changedDspRelease.dsp.sha256, release.dsp.sha256);
+  assert.notEqual(changedDspRelease.releaseId, release.releaseId);
   const headers = await readFile(join(outputPath, "_headers"), "utf8");
   assert.match(headers, /\/release\.json\n  Cache-Control: no-store/);
   assert.match(headers, /\/source\/\n  Cache-Control: no-store/);
@@ -219,13 +250,14 @@ ${genericDiscSourceConfig}
   assert.ok(!rootFiles.includes("ppcwasmjit.wasm"), "backend must remain chunk-only");
   assert.ok(!rootFiles.includes("browser_renderer.js"), "renderer JavaScript must be content-addressed");
   assert.ok(!rootFiles.includes("browser_renderer_bg.wasm"), "renderer wasm must be content-addressed");
+  assert.ok(!rootFiles.includes("browser_dsp.wasm"), "DSP wasm must be content-addressed");
 });
 
 test("release validation requires both renderer assets", async () => {
   const hash = "0".repeat(64);
   const commit = "0".repeat(40);
   const release = {
-    schema: 2,
+    schema: RELEASE_SCHEMA,
     releaseId: hash,
     source: {
       repository: "https://github.com/conradev/lazuli",
@@ -248,11 +280,59 @@ test("release validation requires both renderer assets", async () => {
     },
   };
   await assert.rejects(validateRelease(release), /renderer is missing/);
+  release.renderer = {
+    javascript: { url: `/assets/browser-renderer-${hash}.js`, sha256: hash, bytes: 1 },
+    wasm: { url: `/assets/browser-renderer-wasm-${hash}.wasm`, sha256: hash, bytes: 1 },
+  };
+  await assert.rejects(validateRelease(release), /DSP wasm is missing/);
+});
+
+test("preserves historical schema-1 and schema-2 release identities", async () => {
+  const hash = "0".repeat(64);
+  const commit = "0".repeat(40);
+  const common = {
+    source: {
+      repository: "https://github.com/conradev/lazuli",
+      commit,
+      tree: `https://github.com/conradev/lazuli/tree/${commit}`,
+      archive: `https://github.com/conradev/lazuli/archive/${commit}.tar.gz`,
+      license: {
+        expression: "GPL-3.0-only",
+        text: "/LICENSE.txt",
+        source: `https://github.com/conradev/lazuli/blob/${commit}/licenses/GPL-3.0-only.txt`,
+      },
+    },
+    frontend: { url: `/assets/frontend-${hash}.html`, sha256: hash, bytes: 1 },
+    renderer: {
+      javascript: { url: `/assets/browser-renderer-${hash}.js`, sha256: hash, bytes: 1 },
+      wasm: { url: `/assets/browser-renderer-wasm-${hash}.wasm`, sha256: hash, bytes: 1 },
+    },
+    backend: {
+      url: "/ppcwasmjit.wasm",
+      sha256: hash,
+      bytes: 1,
+      chunkSize: WASM_CHUNK_SIZE,
+      chunks: [{ url: `/assets/backend-${hash}.wasm.chunk`, sha256: hash, bytes: 1 }],
+    },
+  };
+  const identities = await Promise.all([1, 2].map(async schema =>
+    sha256Hex(JSON.stringify(releaseIdentityPayload({ schema, ...common })))
+  ));
+  assert.deepEqual(identities, [
+    "72e80c8a319bb827bed4e70498dc5a7f0b099fd4e9f6b8c7db567ec18db63b35",
+    "1d07092a58d2990afe165cc35d49b209acd32c1c9d87bbb0a62484366cd42a36",
+  ]);
 });
 
 test("rejects a non-exact source revision", async () => {
   await assert.rejects(
-    buildWeb({ appPath: "missing", wasmPath: "missing", outputPath: "dist", commit: "HEAD" }),
+    buildWeb({
+      appPath: "missing",
+      wasmPath: "missing",
+      dspPath: "missing",
+      outputPath: "dist",
+      commit: "HEAD",
+    }),
     /lowercase 40-character Git commit/,
   );
 });
@@ -394,7 +474,7 @@ test("public shell exposes no compatibility route parameters", async () => {
   );
 });
 
-test("public shell requires a schema-2 worker and never launches a legacy release", async () => {
+test("public shell requires a schema-3 worker and never launches a stored release", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   assert.match(
     shell,

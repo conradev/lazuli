@@ -141,6 +141,7 @@ function makeContext() {
     instructionAddressSpaceGeneration: 0,
     instructionAddressSpaceKey: null,
     instructionAddressSpaceSignature: null,
+    instructionDependencyFreeLinkedRegions: new WeakSet(),
     instructionBatOffsets: [
       [0x40, 0x44],
       [0x48, 0x4c],
@@ -423,8 +424,10 @@ test("stable instruction namespaces isolate IR, PR, and IBAT mappings", () => {
   assert.equal(context.instructionAddressSpaceGeneration, 1);
   const supervisorKey = context.instructionBlockKey(0x80001000);
   const supervisorRegionKey = context.instructionRegionKey(0x80001000);
+  const supervisorRegion = { pcs: [0x80001000] };
   context.blocks.set(supervisorKey, { mapping: "supervisor" });
-  context.regionsByPc.set(supervisorRegionKey, { pcs: [0x80001000] });
+  context.regionsByPc.set(supervisorRegionKey, supervisorRegion);
+  context.instructionDependencyFreeLinkedRegions.add(supervisorRegion);
 
   assert.equal(context.blocks.get(supervisorKey).mapping, "supervisor");
   assert.equal(context.regionsByPc.has(supervisorRegionKey), true);
@@ -470,6 +473,10 @@ test("stable instruction namespaces isolate IR, PR, and IBAT mappings", () => {
   );
   assert.equal(context.blocks.size, 0);
   assert.equal(context.regionsByPc.size, 0);
+  assert.equal(
+    context.instructionDependencyFreeLinkedRegions.has(supervisorRegion),
+    false,
+  );
   assert.notEqual(context.instructionBlockKey(0x80001000), supervisorKey);
 });
 
@@ -955,7 +962,7 @@ test("IBAT and MSR hooks synchronize fetch mappings before another block", () =>
   assert.match(source, /const retainedRegion = compiledRegion\(pc\)/);
   assert.match(
     source,
-    /const region = retainedRegion !== undefined\s*&& compiledRegionIsExecutable\(retainedRegion\)/,
+    /const region = retainedRegion !== undefined\s*&& warioWareNextMicrogameOverrideRegionSafe\(\s*retainedRegion,\s*wariowareNextMicrogameOverride,\s*wariowareActiveMicrogameId\s*\)\s*&& luigisMansionGxLoadTexMtxImmProbeRegionSafe\(retainedRegion\)\s*&& compiledRegionIsExecutable\(retainedRegion\)/,
     "a retained region must pass translation-dependency validation before execution",
   );
 });

@@ -88,6 +88,7 @@ function makeContext({
   vertexSize = 2,
 } = {}) {
   const semanticEvents = [];
+  const textureHashBatches = [];
   const memory = new ArrayBuffer(128);
   const context = {
     beginWorkerPhaseTiming() { return null; },
@@ -105,6 +106,7 @@ function makeContext({
     gxDecodeMaximumBufferedBytes: maximumBufferedBytes,
     gxDecodeRetryAtBufferedBytes: 1,
     gxDecodedCommands: 0,
+    gxDeferredDisplayListSegments: [],
     gxDisplayListBytes: 0,
     gxDisplayListErrors: 0,
     gxDisplayLists: 0,
@@ -122,6 +124,8 @@ function makeContext({
     gxFifoStores: 0,
     gxIndexedXfLoads: 0,
     gxPrimitives: 0,
+    gxTextureCopyDecoderBarrierResumes: 0,
+    gxTextureCopyDecoderBarrierStops: 0,
     gxUnknownOpcodes: 0,
     gxVertices: 0,
     gxXfLoads: 0,
@@ -133,7 +137,15 @@ function makeContext({
     recordGxIndexedXfWrite(opcode, word) {
       semanticEvents.push(["indexed-xf", opcode, word >>> 0]);
     },
-    recordGxPrimitive(opcode, primitiveSource, offset, vertices, bytesPerVertex) {
+    recordGxPrimitive(
+      opcode,
+      primitiveSource,
+      offset,
+      vertices,
+      bytesPerVertex,
+      textureHashBatch,
+    ) {
+      textureHashBatches.push(textureHashBatch);
       semanticEvents.push([
         "primitive",
         opcode,
@@ -151,6 +163,7 @@ function makeContext({
       semanticEvents.push(["xf", address, word >>> 0]);
     },
     recordWorkerPhaseTiming() {},
+    rendererTextureCopyBarrierSequence: null,
     view: new DataView(memory),
     workerHostTimings: { fifoDecode: {}, fifoStagingDrainInclusive: {} },
     gxVertexSize() { return vertexSize; },
@@ -165,6 +178,7 @@ function makeContext({
     { filename: "browser_boot.gx_fifo.js" },
   );
   context.semanticEvents = semanticEvents;
+  context.textureHashBatches = textureHashBatches;
   return context;
 }
 
@@ -397,6 +411,37 @@ test("an incomplete display list cannot poison the top-level retry threshold", (
   assert.deepEqual(liveBytes(context), []);
 });
 
+test("one outer decode shares texture fingerprints with its display lists only", () => {
+  const context = makeContext({ vertexSize: 1 });
+  context.bytes.set([0x80, 0x00, 0x01, 0x31], 16);
+  context.ramPointer = (address, size) =>
+    address === 0x20 && size === 4 ? 16 : null;
+
+  append(context, Uint8Array.from([
+    0x80, 0x00, 0x01, 0x21,
+    0x40, ...be32(0x20), ...be32(4),
+  ]));
+  append(context, Uint8Array.from([
+    0x80, 0x00, 0x01, 0x41,
+  ]));
+
+  assert.equal(context.textureHashBatches.length, 3);
+  assert.strictEqual(
+    context.textureHashBatches[0],
+    context.textureHashBatches[1],
+    "recursive display-list decode inherits the outer fingerprint batch",
+  );
+  assert.notStrictEqual(
+    context.textureHashBatches[1],
+    context.textureHashBatches[2],
+    "a later outer decode cannot reuse a stale RAM fingerprint",
+  );
+  assert.ok(context.textureHashBatches.every(batch =>
+    typeof batch?.sourceHashes?.get === "function"
+      && typeof batch?.paletteHashes?.get === "function"
+  ));
+});
+
 test("bounded GX FIFO carry fails closed before its configured byte bound", () => {
   const context = makeContext({ capacityWatermarkBytes: 16, maximumBufferedBytes: 128 });
   assert.throws(
@@ -503,7 +548,9 @@ test("FIFO optimization preserves the existing semantic drain boundaries", () =>
     true,
   );
 
-  const execution = source.indexOf("if (executedBlocks === 0)");
+  const execution = source.indexOf(
+    "if (executedBlocks === 0 && !efbPeekYieldRequested)",
+  );
   const observedCycles = source.indexOf("const observedCycles = cycles + executedCycles;", execution);
   const executionDrain = source.indexOf("drainGxFifoStagingAtCycle(observedCycles);", observedCycles);
   const mmioService = source.indexOf("serviceMmio(observedCycles);", executionDrain);

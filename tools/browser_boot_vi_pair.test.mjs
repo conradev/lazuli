@@ -29,7 +29,15 @@ function extractFunction(name) {
 }
 
 function evaluateFunctions(names, bindings = {}) {
-  const context = { ...bindings };
+  const context = {
+    ArrayBuffer,
+    Uint8Array,
+    runnerRenderEvery: 1,
+    viHostPresentationCount: 0,
+    viPresentationGatedPairs: 0,
+    viPresentationPairCount: 0,
+    ...bindings,
+  };
   vm.createContext(context);
   vm.runInContext(names.map(extractFunction).join("\n\n"), context, {
     filename: "browser_boot.vi-pair.js",
@@ -88,6 +96,8 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
     [
       "appendRendererOperation",
       "enqueueRendererOperation",
+      "requireTextureCopyReceiptArray",
+      "prepareTextureCopyReceiptTransfer",
       "validateViPresentationResult",
       "handleRendererFrame",
       "handleWorkerMessage",
@@ -102,7 +112,7 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
       },
       compositorCaptureEnabled: true,
       document: { body: { dataset: {} } },
-      drainWebGpuRenderer() { return Promise.resolve(); },
+      drainWebGpuRenderer() { return Promise.resolve([]); },
       handleRendererError(error) { throw error; },
       rendererHostMetrics: {
         operations: { enqueued: 0, pending: 0, highWater: 0 },
@@ -136,6 +146,7 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
   assert.deepEqual(JSON.parse(JSON.stringify(workerMessages)), [{
     type: "renderer-frame-complete",
     rendererSequence: 31,
+    textureCopyReceipts: [],
     viPresentationResult: {
       accepted: true,
       presented: false,
@@ -174,6 +185,7 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
       240,
       2,
       false,
+      false,
     ],
     [
       0x01200500,
@@ -188,6 +200,7 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
       240,
       2,
       true,
+      false,
     ],
   ]);
   assert.equal(context.document.body.dataset.viFields, "2");
@@ -200,6 +213,7 @@ test("VI bridge consumes exact Awaiting and Ready field-pair results", async () 
   assert.deepEqual(JSON.parse(JSON.stringify(workerMessages.at(-1))), {
     type: "renderer-frame-complete",
     rendererSequence: 32,
+    textureCopyReceipts: [],
     viPresentationResult: {
       accepted: true,
       presented: true,
@@ -463,6 +477,6 @@ test("VI browser protocol resets ownership across timing changes", () => {
   assert.match(host, /frame\.pairEpoch/);
   assert.match(
     host,
-    /present_xfb\(\s*frame\.address,\s*frame\.copyIndex,\s*frame\.copyRow,\s*frame\.presentationMode,\s*frame\.field,\s*frame\.pairEpoch,\s*frame\.width,\s*frame\.height,\s*frame\.fieldStrideBytes,\s*frame\.fieldHeight,\s*frame\.rowRepeat,\s*frame\.temporalXfbCapture !== undefined\s*\)/,
+    /present_xfb\(\s*frame\.address,\s*frame\.copyIndex,\s*frame\.copyRow,\s*frame\.presentationMode,\s*frame\.field,\s*frame\.pairEpoch,\s*frame\.width,\s*frame\.height,\s*frame\.fieldStrideBytes,\s*frame\.fieldHeight,\s*frame\.rowRepeat,\s*frame\.temporalXfbCapture !== undefined,\s*frame\.sustainedPlayReceipt !== undefined\s*\)/,
   );
 });
