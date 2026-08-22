@@ -20,37 +20,19 @@ import {
 import {
   smbSustainedPlayReport,
 } from "./browser_boot_smb_sustained_play_test_fixture.mjs";
+import {
+  compactSchema4ReleaseIdentityFixture,
+} from "./browser_public_release_identity.test_fixture.mjs";
 
 const WIDTH = 1024;
 const HEIGHT = 768;
 const PIXELS = WIDTH * HEIGHT;
 
-function asset(name, extension, digit, bytes = 1000) {
-  const sha256 = digit.repeat(64);
-  return {
-    url: `/assets/${name}-${sha256}.${extension}`,
-    sha256,
-    bytes,
-  };
-}
-
 function release() {
-  return {
-    schema: 3,
-    releaseId: "1".repeat(64),
+  return compactSchema4ReleaseIdentityFixture({
+    assetHash: "3".repeat(64),
     commit: "2".repeat(40),
-    frontend: asset("frontend", "html", "3"),
-    renderer: {
-      javascript: asset("browser-renderer", "js", "4"),
-      wasm: asset("browser-renderer-wasm", "wasm", "5"),
-    },
-    dsp: asset("browser-dsp", "wasm", "7"),
-    backend: {
-      url: "/ppcwasmjit.wasm",
-      sha256: "6".repeat(64),
-      bytes: 10_000,
-    },
-  };
+  });
 }
 
 function geometry() {
@@ -634,6 +616,39 @@ test("passive oracle requires immutable public frame and active release stabilit
     () => verifyPublicSmbScreencastReport(releaseChanged),
     /active release changed/,
   );
+
+  const identityCases = [
+    [
+      "runtime",
+      value => { delete value.runtime.dispatcher; },
+      /\$\.release\.runtime.*dispatcher/,
+    ],
+    [
+      "runtime ABI",
+      value => { value.runtime.abi.gameFidelityBytes += 1; },
+      /\$\.release\.runtime\.abi\.gameFidelityBytes/,
+    ],
+    [
+      "bootstrap",
+      value => { value.bootstrap.releaseModule.url = "/assets/release.mjs"; },
+      /\$\.release\.bootstrap\.releaseModule\.url/,
+    ],
+    [
+      "nested rollback",
+      value => { value.rollback.release.schema = 4; },
+      /\$\.release\.rollback\.release\.schema/,
+    ],
+  ];
+  for (const [label, mutate, pattern] of identityCases) {
+    const report = validReport();
+    mutate(report.release);
+    report.terminalRelease = structuredClone(report.release);
+    assert.throws(
+      () => verifyPublicSmbScreencastReport(report),
+      pattern,
+      label,
+    );
+  }
 
   const geometryChanged = validReport();
   geometryChanged.after.geometry.canvas.bufferWidth = 608;

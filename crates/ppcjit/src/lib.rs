@@ -98,6 +98,27 @@ pub enum ExitMode {
     ReturnExecutedWithSlowMemory,
 }
 
+/// Optional tagged fast-memory sidecar consulted after the primary 128 KiB LUT misses.
+///
+/// Offsets are relative to the primary fast-memory pointer. Every table entry is a little-endian
+/// `i32`; pointer tables contain the host linear-memory offset of the beginning of a 4 KiB guest
+/// page. A zero control word disables the sidecar without destroying its retained tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecondaryFastmemConfig {
+    pub page_shift: u8,
+    /// Number of two-way translation sets. Must be a power of two.
+    pub set_count: u32,
+    pub control_offset: i32,
+    /// One `i32` replacement-way word per set.
+    pub lru_offset: i32,
+    pub tag_offset: i32,
+    pub read_pointer_offset: i32,
+    pub write_pointer_offset: i32,
+    pub read_hit_count_offset: i32,
+    pub write_hit_count_offset: i32,
+    pub miss_count_offset: i32,
+}
+
 /// Target-independent inputs needed by the PowerPC-to-CLIF frontend.
 #[derive(Debug, Clone)]
 pub struct TranslationConfig {
@@ -114,6 +135,16 @@ pub struct TranslationConfig {
     ///
     /// Native translations do not support this portable context ABI.
     pub hook_cycle_offset: Option<i32>,
+    /// Optional byte offset in the caller context containing a little-endian `u32` exit request.
+    ///
+    /// A completed checked-memory hook may request that the current guest instruction retire at
+    /// an exact synchronous boundary. Portable blocks sample this word only after every
+    /// architectural effect of that instruction (including automatic PC advance) has committed,
+    /// then return its exact prefix without executing a following instruction.
+    pub hook_exit_requested_offset: Option<i32>,
+    /// Optional browser-managed tagged page cache for translations that cannot occupy the primary
+    /// 128 KiB LUT (notably hashed 4 KiB pages).
+    pub secondary_fastmem: Option<SecondaryFastmemConfig>,
 }
 
 impl TranslationConfig {
@@ -130,6 +161,8 @@ impl TranslationConfig {
             call_conv,
             exit_mode,
             hook_cycle_offset: None,
+            hook_exit_requested_offset: None,
+            secondary_fastmem: None,
         }
     }
 
@@ -201,7 +234,10 @@ impl Translator {
         &mut self,
         instructions: impl Iterator<Item = Ins>,
     ) -> Result<Translation, BuildError> {
-        if self.config.hook_cycle_offset.is_some() && self.config.exit_mode == ExitMode::Native {
+        if (self.config.hook_cycle_offset.is_some()
+            || self.config.hook_exit_requested_offset.is_some())
+            && self.config.exit_mode == ExitMode::Native
+        {
             return Err(BuildError::Builder {
                 source: builder::BuilderError::HookCycleOffsetRequiresPortableExit,
             });

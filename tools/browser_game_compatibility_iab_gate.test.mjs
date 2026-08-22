@@ -15,8 +15,6 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
-  WASM_CHUNK_SIZE,
-  releaseIdentityPayload,
   sha256Hex,
 } from "../web/release.mjs";
 import {
@@ -71,9 +69,9 @@ import {
 import {
   makeWindWakerFirstPlayableReportPair,
 } from "./browser_game_first_playable_wind_waker_test_fixture.mjs";
+import { schema4ReleaseFixture } from "./browser_public_release_identity.test_fixture.mjs";
 
 const COMMIT = "1".repeat(40);
-const ASSET_HASH = "2".repeat(64);
 const PAGE_URL = "http://127.0.0.1:8768/";
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -108,46 +106,8 @@ const FIRST_PLAYABLE_FIXTURES = Object.freeze({
   }),
 });
 
-function asset(prefix, extension, bytes, hash = ASSET_HASH) {
-  return {
-    url: `/assets/${prefix}-${hash}.${extension}`,
-    sha256: hash,
-    bytes,
-  };
-}
-
-async function release({ assetHash = ASSET_HASH, commit = COMMIT } = {}) {
-  const repository = "https://github.com/conradev/lazuli";
-  const value = {
-    schema: 3,
-    releaseId: "0".repeat(64),
-    source: {
-      repository,
-      commit,
-      tree: `${repository}/tree/${commit}`,
-      archive: `${repository}/archive/${commit}.tar.gz`,
-      license: {
-        expression: "GPL-3.0-only",
-        text: "/LICENSE.txt",
-        source: `${repository}/blob/${commit}/licenses/GPL-3.0-only.txt`,
-      },
-    },
-    frontend: asset("frontend", "html", 1_234, assetHash),
-    renderer: {
-      javascript: asset("renderer", "js", 2_345, assetHash),
-      wasm: asset("renderer-wasm", "wasm", 3_456, assetHash),
-    },
-    dsp: asset("browser-dsp", "wasm", 4_000, assetHash),
-    backend: {
-      url: "/ppcwasmjit.wasm",
-      sha256: assetHash,
-      bytes: WASM_CHUNK_SIZE,
-      chunkSize: WASM_CHUNK_SIZE,
-      chunks: [asset("ppcwasmjit-0000", "wasm", WASM_CHUNK_SIZE, assetHash)],
-    },
-  };
-  value.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(value)));
-  return value;
+async function release({ assetHash = "2".repeat(64), commit = COMMIT } = {}) {
+  return schema4ReleaseFixture({ assetHash, commit });
 }
 
 function documentId(ordinal) {

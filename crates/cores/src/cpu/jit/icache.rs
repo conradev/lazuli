@@ -30,7 +30,7 @@ fn addr_to_icache_idx(addr: Address) -> (usize, usize, usize) {
 pub struct Cache(Table<Table<Table<CacheLine, ICACHE_L2_COUNT>, ICACHE_L1_COUNT>, ICACHE_L0_COUNT>);
 
 impl Cache {
-    pub fn get(&mut self, sys: &mut System, physical: Address) -> Ins {
+    pub fn get(&mut self, sys: &mut System, physical: Address) -> Option<Ins> {
         let (idx0, idx1, idx2) = addr_to_icache_idx(physical);
         let level1 = self.0.get_or_default(idx0);
         let level2 = level1.get_or_default(idx1);
@@ -41,7 +41,7 @@ impl Cache {
 
                 let mut cacheline = [0; 8];
                 for (index, word) in cacheline.iter_mut().enumerate() {
-                    *word = sys.read_phys_slow::<u32>(base + 4 * index as u32);
+                    *word = sys.read_instruction_phys::<u32>(base + 4 * index as u32)?;
                 }
 
                 level2.insert(idx2, cacheline)
@@ -49,7 +49,10 @@ impl Cache {
         };
 
         let offset = (physical.value() % 32) / 4;
-        Ins::new(cacheline[offset as usize], Extensions::gekko_broadway())
+        Some(Ins::new(
+            cacheline[offset as usize],
+            Extensions::gekko_broadway(),
+        ))
     }
 
     pub fn invalidate(&mut self, physical: Address) {

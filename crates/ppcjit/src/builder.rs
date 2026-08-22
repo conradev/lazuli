@@ -196,6 +196,7 @@ pub struct BlockBuilder<'ctx> {
     executed_instructions: u16,
 
     floats_checked: bool,
+    checked_memory_hook_emitted: bool,
 }
 
 impl<'ctx> BlockBuilder<'ctx> {
@@ -367,6 +368,7 @@ impl<'ctx> BlockBuilder<'ctx> {
             executed_instructions: 0,
 
             floats_checked: false,
+            checked_memory_hook_emitted: false,
         }
     }
 
@@ -475,6 +477,14 @@ impl<'ctx> BlockBuilder<'ctx> {
         self.publish_hook_cycle_offset_at(self.executed_cycles);
     }
 
+    /// Marks one instruction as containing a checked-memory hook before publishing its exact
+    /// instruction-start cycle. Resident hooks can request an outer Rust boundary dynamically;
+    /// the request is sampled only after the complete guest instruction has committed.
+    fn publish_checked_memory_hook_cycle_offset(&mut self) {
+        self.checked_memory_hook_emitted = true;
+        self.publish_hook_cycle_offset();
+    }
+
     /// Publishes a semantic hook's instruction-start cycle offset.
     fn publish_hook_cycle_offset_at(&mut self, cycles: u16) {
         let Some(offset) = self.frontend.hook_cycle_offset else {
@@ -488,6 +498,40 @@ impl<'ctx> BlockBuilder<'ctx> {
         self.bd
             .ins()
             .store(flags, cycles, self.consts.ctx_ptr, offset);
+    }
+
+    /// Returns an exact completed-instruction prefix when a checked-memory hook requested the
+    /// outer runtime. This runs after automatic PC advance and all instruction-owned register
+    /// writes, so update-form loads/stores and quantized operations cannot be partially retired.
+    fn exit_if_checked_memory_hook_requested(&mut self) {
+        if !self.checked_memory_hook_emitted {
+            return;
+        }
+        let Some(offset) = self.frontend.hook_exit_requested_offset else {
+            return;
+        };
+
+        let flags = ir::MemFlags::new()
+            .with_notrap()
+            .with_endianness(ir::Endianness::Little);
+        let requested = self
+            .bd
+            .ins()
+            .load(ir::types::I32, flags, self.consts.ctx_ptr, offset);
+        let exit_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd.set_cold_block(exit_block);
+        self.bd
+            .ins()
+            .brif(requested, exit_block, &[], continue_block, &[]);
+        self.bd.seal_block(exit_block);
+        self.bd.seal_block(continue_block);
+
+        self.switch_to_bb(exit_block);
+        self.flush();
+        self.exit(ExitReason::SYNC);
+
+        self.switch_to_bb(continue_block);
     }
 
     fn create_exit_data(&mut self) -> ir::Value {
@@ -609,6 +653,7 @@ impl<'ctx> BlockBuilder<'ctx> {
 
     /// Emits the given instruction into the block.
     fn emit(&mut self, ins: Ins) -> Result<Action, BuilderError> {
+        self.checked_memory_hook_emitted = false;
         self.bd
             .set_srcloc(ir::SourceLoc::new(self.executed_instructions as u32));
         let info: InstructionInfo = match ins.op {
@@ -848,6 +893,8 @@ impl<'ctx> BlockBuilder<'ctx> {
             let new_pc = self.bd.ins().iadd_imm(old_pc, 4);
             self.set(Reg::PC, new_pc);
         }
+
+        self.exit_if_checked_memory_hook_requested();
 
         Ok(info.action)
     }

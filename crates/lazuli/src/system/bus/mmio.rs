@@ -66,6 +66,7 @@ mmio! {
     0x003E, 2, CpFifoBreakpointHigh;
 
     // === Pixel Engine ===
+    0x1008, 2, PixelAlphaRead;
     0x100A, 2, PixelInterruptStatus;
     0x100E, 2, PixelToken;
 
@@ -109,6 +110,7 @@ mmio! {
     0x300C, 4, ProcessorFifoStart;
     0x3010, 4, ProcessorFifoEnd;
     0x3014, 4, ProcessorFifoCurrent;
+    0x3018, 4, ProcessorFifoReset;
     0x3024, 4, ProcessorDvdReset;
     0x302C, 4, ProcessorConsoleType;
 

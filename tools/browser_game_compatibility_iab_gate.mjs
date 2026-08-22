@@ -230,7 +230,7 @@ async function validateObservation(value, expectedRelease, path) {
     activeRelease,
     expectedRelease,
     `${path}.activeRelease`,
-    "observed active release does not match the expected schema-3 manifest",
+    "observed active release does not match the expected schema-4 manifest",
   );
   const pageUrl = loopbackRoot(observation.pageUrl, `${path}.pageUrl`);
   exact(

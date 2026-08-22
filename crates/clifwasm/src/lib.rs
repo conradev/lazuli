@@ -3,6 +3,7 @@
 //! Guest instruction decoding and runtime naming stay in callers. The current module ABI imports
 //! one 32-bit linear memory and exports the lowered CLIF function under caller-selected names.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -13,10 +14,34 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::{settings, verify_function};
 use wasm_encoder::{
-    BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    Ieee32 as WasmIeee32, Ieee64 as WasmIeee64, ImportSection, Instruction, MemArg, MemoryType,
-    Module, TypeSection, ValType,
+    BlockType, CodeSection, ElementSection, Elements, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, HeapType, Ieee32 as WasmIeee32, Ieee64 as WasmIeee64, ImportSection,
+    Instruction, MemArg, MemoryType, Module, RefType, TableType, TypeSection, ValType,
 };
+
+/// Optional self-installer appended to a lowered function module.
+///
+/// Every identity word is embedded as a constant. The generated export grows the imported typed
+/// function table, calls the begin authorizer, stores only `ref.func` of the lowered function, and
+/// calls the commit authorizer. Hosts can instantiate and invoke the export but never select the
+/// function reference written into the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionSelfInstall<'a> {
+    pub table_import_module: &'a str,
+    pub table_import_name: &'a str,
+    pub begin_import_module: &'a str,
+    pub begin_import_name: &'a str,
+    pub commit_import_module: &'a str,
+    pub commit_import_name: &'a str,
+    pub install_export_name: &'a str,
+    pub identity_words: [u32; 8],
+    pub authorized_value: u32,
+    pub table_unavailable_value: u32,
+    pub table_minimum: u64,
+    pub table_maximum: Option<u64>,
+    /// Test-only fault injection proving publication stays closed after the table write.
+    pub trap_after_table_set: bool,
+}
 
 /// WebAssembly module ABI used by the lowerer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +60,8 @@ pub struct ModuleConfig<'a> {
     pub maximum_memory_pages: Option<u64>,
     /// Optional `(base parameter, byte offset, byte size)` scratch window for explicit stack slots.
     pub stack_scratch: Option<(u32, u32, u32)>,
+    /// Optional Rust-authorized typed-table self-installer.
+    pub self_install: Option<FunctionSelfInstall<'a>>,
 }
 
 impl<'a> ModuleConfig<'a> {
@@ -52,6 +79,7 @@ impl<'a> ModuleConfig<'a> {
             minimum_memory_pages: 1,
             maximum_memory_pages: None,
             stack_scratch: None,
+            self_install: None,
         }
     }
 
@@ -78,6 +106,12 @@ impl<'a> ModuleConfig<'a> {
         self.stack_scratch = Some((base_parameter, byte_offset, byte_size));
         self
     }
+
+    /// Appends a typed-table installer around the lowered function.
+    pub const fn with_self_install(mut self, install: FunctionSelfInstall<'a>) -> Self {
+        self.self_install = Some(install);
+        self
+    }
 }
 
 /// Failure while lowering the portable CLIF subset to WebAssembly.
@@ -92,6 +126,8 @@ pub enum LowerError {
         /// Maximum requested pages.
         maximum: Option<u64>,
     },
+    /// The optional self-install table limits are empty, inverted, or exceed wasm32.
+    InvalidTableLimits { minimum: u64, maximum: Option<u64> },
     /// A CLIF type has no mapping in the current WebAssembly subset.
     UnsupportedType(Type),
     /// An instruction has not been added to the current WebAssembly subset.
@@ -123,6 +159,12 @@ impl fmt::Display for LowerError {
                 write!(
                     f,
                     "invalid wasm32 memory limits: minimum {minimum}, maximum {maximum:?}"
+                )
+            }
+            Self::InvalidTableLimits { minimum, maximum } => {
+                write!(
+                    f,
+                    "invalid wasm32 function-table limits: minimum {minimum}, maximum {maximum:?}"
                 )
             }
             Self::UnsupportedType(ty) => write!(f, "unsupported CLIF type {ty}"),
@@ -168,6 +210,18 @@ pub fn function(function: &ir::Function, config: &ModuleConfig<'_>) -> Result<Ve
         return Err(LowerError::InvalidMemoryLimits {
             minimum: config.minimum_memory_pages,
             maximum: config.maximum_memory_pages,
+        });
+    }
+    if let Some(install) = config.self_install
+        && (install.table_minimum == 0
+            || install.table_minimum > u64::from(u32::MAX)
+            || install.table_maximum.is_some_and(|maximum| {
+                maximum < install.table_minimum || maximum > u64::from(u32::MAX)
+            }))
+    {
+        return Err(LowerError::InvalidTableLimits {
+            minimum: install.table_minimum,
+            maximum: install.table_maximum,
         });
     }
 
@@ -357,6 +411,12 @@ pub fn function(function: &ir::Function, config: &ModuleConfig<'_>) -> Result<Ve
     }
     let function_type_index = call_imports.len() as u32;
     types.ty().function(params, returns);
+    let install_callback_type_index = function_type_index + 1;
+    let installer_type_index = function_type_index + 2;
+    if config.self_install.is_some() {
+        types.ty().function([ValType::I32; 8], [ValType::I32]);
+        types.ty().function([], [ValType::I32]);
+    }
 
     let mut imports = ImportSection::new();
     imports.import(
@@ -378,24 +438,128 @@ pub fn function(function: &ir::Function, config: &ModuleConfig<'_>) -> Result<Ve
         );
     }
 
+    let semantic_import_count = call_imports.len() as u32;
+    if let Some(install) = config.self_install {
+        imports.import(
+            install.begin_import_module,
+            install.begin_import_name,
+            EntityType::Function(install_callback_type_index),
+        );
+        imports.import(
+            install.commit_import_module,
+            install.commit_import_name,
+            EntityType::Function(install_callback_type_index),
+        );
+        imports.import(
+            install.table_import_module,
+            install.table_import_name,
+            EntityType::Table(TableType {
+                element_type: RefType {
+                    nullable: true,
+                    heap_type: HeapType::Concrete(function_type_index),
+                },
+                table64: false,
+                minimum: install.table_minimum,
+                maximum: install.table_maximum,
+                shared: false,
+            }),
+        );
+    }
+
     let mut functions = FunctionSection::new();
     functions.function(function_type_index);
+    if config.self_install.is_some() {
+        functions.function(installer_type_index);
+    }
+
+    let run_function_index =
+        semantic_import_count + if config.self_install.is_some() { 2 } else { 0 };
 
     let mut exports = ExportSection::new();
     exports.export(
         config.function_export_name,
         ExportKind::Func,
-        call_imports.len() as u32,
+        run_function_index,
     );
+
+    let mut elements = ElementSection::new();
+    let mut installer = None;
+    if let Some(install) = config.self_install {
+        let installer_function_index = run_function_index + 1;
+        exports.export(
+            install.install_export_name,
+            ExportKind::Func,
+            installer_function_index,
+        );
+        elements.declared(Elements::Functions(Cow::Owned(vec![run_function_index])));
+
+        // No parameters; local zero retains the begin status for a structured early return.
+        let mut body = Function::new([(1, ValType::I32)]);
+
+        // Grow before authorization, so capacity failure cannot strand an Installing request.
+        body.instruction(&Instruction::I32Const(install.identity_words[1] as i32));
+        body.instruction(&Instruction::TableSize(0));
+        body.instruction(&Instruction::I32GeU);
+        body.instruction(&Instruction::If(BlockType::Empty));
+        body.instruction(&Instruction::RefNull(HeapType::Concrete(
+            function_type_index,
+        )));
+        body.instruction(&Instruction::I32Const(install.identity_words[1] as i32));
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::TableSize(0));
+        body.instruction(&Instruction::I32Sub);
+        body.instruction(&Instruction::TableGrow(0));
+        body.instruction(&Instruction::I32Const(-1));
+        body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::If(BlockType::Empty));
+        body.instruction(&Instruction::I32Const(
+            install.table_unavailable_value as i32,
+        ));
+        body.instruction(&Instruction::Return);
+        body.instruction(&Instruction::End);
+        body.instruction(&Instruction::End);
+
+        for word in install.identity_words {
+            body.instruction(&Instruction::I32Const(word as i32));
+        }
+        body.instruction(&Instruction::Call(semantic_import_count));
+        body.instruction(&Instruction::LocalTee(0));
+        body.instruction(&Instruction::I32Const(install.authorized_value as i32));
+        body.instruction(&Instruction::I32Ne);
+        body.instruction(&Instruction::If(BlockType::Empty));
+        body.instruction(&Instruction::LocalGet(0));
+        body.instruction(&Instruction::Return);
+        body.instruction(&Instruction::End);
+
+        body.instruction(&Instruction::I32Const(install.identity_words[1] as i32));
+        body.instruction(&Instruction::RefFunc(run_function_index));
+        body.instruction(&Instruction::TableSet(0));
+        if install.trap_after_table_set {
+            body.instruction(&Instruction::Unreachable);
+        }
+        for word in install.identity_words {
+            body.instruction(&Instruction::I32Const(word as i32));
+        }
+        body.instruction(&Instruction::Call(semantic_import_count + 1));
+        body.instruction(&Instruction::End);
+        installer = Some(body);
+    }
 
     let mut code = CodeSection::new();
     code.function(&wasm);
+    if let Some(installer) = installer.as_ref() {
+        code.function(installer);
+    }
 
     let mut module = Module::new();
     module.section(&types);
     module.section(&imports);
     module.section(&functions);
     module.section(&exports);
+    if !elements.is_empty() {
+        module.section(&elements);
+    }
     module.section(&code);
 
     Ok(module.finish())
@@ -807,14 +971,10 @@ fn lower_instruction(
             get_value(function, locals, args[0], wasm)?;
             get_value(function, locals, args[1], wasm)?;
             wasm.instruction(&Instruction::I32Add);
-            wasm.instruction(&Instruction::LocalTee(local(
-                function, &locals, results[0],
-            )?));
+            wasm.instruction(&Instruction::LocalTee(local(function, locals, results[0])?));
             get_value(function, locals, args[0], wasm)?;
             wasm.instruction(&Instruction::I32LtU);
-            wasm.instruction(&Instruction::LocalSet(local(
-                function, &locals, results[1],
-            )?));
+            wasm.instruction(&Instruction::LocalSet(local(function, locals, results[1])?));
             Control::None
         }
         InstructionData::Binary {
@@ -836,23 +996,17 @@ fn lower_instruction(
             get_value(function, locals, args[0], wasm)?;
             get_value(function, locals, args[1], wasm)?;
             wasm.instruction(&Instruction::I32Mul);
-            wasm.instruction(&Instruction::LocalSet(local(
-                function, &locals, results[0],
-            )?));
+            wasm.instruction(&Instruction::LocalSet(local(function, locals, results[0])?));
 
             get_value(function, locals, args[0], wasm)?;
             wasm.instruction(&Instruction::I64ExtendI32S);
             get_value(function, locals, args[1], wasm)?;
             wasm.instruction(&Instruction::I64ExtendI32S);
             wasm.instruction(&Instruction::I64Mul);
-            wasm.instruction(&Instruction::LocalGet(local(
-                function, &locals, results[0],
-            )?));
+            wasm.instruction(&Instruction::LocalGet(local(function, locals, results[0])?));
             wasm.instruction(&Instruction::I64ExtendI32S);
             wasm.instruction(&Instruction::I64Ne);
-            wasm.instruction(&Instruction::LocalSet(local(
-                function, &locals, results[1],
-            )?));
+            wasm.instruction(&Instruction::LocalSet(local(function, locals, results[1])?));
             Control::None
         }
         InstructionData::BinaryImm64 { opcode, arg, imm }
@@ -1715,6 +1869,7 @@ fn allocate_local(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_dispatcher(
     function: &ir::Function,
     blocks: &[Block],

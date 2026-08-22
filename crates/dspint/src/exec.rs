@@ -259,7 +259,7 @@ impl Interpreter {
         let s = ins.base.bit(9) as usize;
 
         let product = self.regs.product.resolve();
-        let ax_high = ((self.regs.acc32[s] as i32 as i64) >> 16) << 16;
+        let ax_high = (i64::from(self.regs.acc32[s]) >> 16) << 16;
         let sum = add_40(product.value, ax_high);
         let rounded = round_40_ties_to_even_with_flags(sum.value);
         let new = self.regs.acc40[d].set(rounded.value);

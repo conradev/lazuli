@@ -7,11 +7,6 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
-  WASM_CHUNK_SIZE,
-  releaseIdentityPayload,
-  sha256Hex,
-} from "../web/release.mjs";
-import {
   BROWSER_GAME_COMPATIBILITY_IAB_CAPTURE_DEFAULTS,
   BROWSER_GAME_COMPATIBILITY_IAB_WITNESS_BUTTONS,
   browserGameCompatibilityIabCaptureStatus,
@@ -29,50 +24,11 @@ import {
   BROWSER_GAME_COMPATIBILITY_IAB_SESSION_SCHEMA,
 } from "./browser_game_compatibility_iab_gate.mjs";
 import { readGameCompatibilityCorpus } from "./browser_game_compatibility_corpus.mjs";
+import { schema4ReleaseFixture } from "./browser_public_release_identity.test_fixture.mjs";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
-const ASSET_HASH = "2".repeat(64);
-
-function asset(prefix, extension, bytes, hash = ASSET_HASH) {
-  return {
-    url: `/assets/${prefix}-${hash}.${extension}`,
-    sha256: hash,
-    bytes,
-  };
-}
-
 async function release(commit = "1".repeat(40)) {
-  const repository = "https://github.com/conradev/lazuli";
-  const value = {
-    schema: 3,
-    releaseId: "0".repeat(64),
-    source: {
-      repository,
-      commit,
-      tree: `${repository}/tree/${commit}`,
-      archive: `${repository}/archive/${commit}.tar.gz`,
-      license: {
-        expression: "GPL-3.0-only",
-        text: "/LICENSE.txt",
-        source: `${repository}/blob/${commit}/licenses/GPL-3.0-only.txt`,
-      },
-    },
-    frontend: asset("frontend", "html", 1_234),
-    renderer: {
-      javascript: asset("renderer", "js", 2_345),
-      wasm: asset("renderer-wasm", "wasm", 3_456),
-    },
-    dsp: asset("browser-dsp", "wasm", 4_000),
-    backend: {
-      url: "/ppcwasmjit.wasm",
-      sha256: ASSET_HASH,
-      bytes: WASM_CHUNK_SIZE,
-      chunkSize: WASM_CHUNK_SIZE,
-      chunks: [asset("ppcwasmjit-0000", "wasm", WASM_CHUNK_SIZE)],
-    },
-  };
-  value.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(value)));
-  return value;
+  return schema4ReleaseFixture({ commit });
 }
 
 function partialSession(captures = [], smb = null) {

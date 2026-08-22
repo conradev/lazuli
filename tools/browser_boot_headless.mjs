@@ -4,6 +4,10 @@
 import { rename, writeFile } from "node:fs/promises";
 
 import { validateRelease } from "../web/release.mjs";
+import {
+  compactPublicActiveRelease,
+  validateCompactPublicActiveRelease,
+} from "./browser_public_release_identity.mjs";
 
 import {
   readCheckpointManifest,
@@ -267,27 +271,8 @@ const ACTIVE_RELEASE_OBSERVATION = `(async () => {
   }
 })()`;
 
-function compactReleaseAsset(asset) {
-  return { url: asset.url, sha256: asset.sha256, bytes: asset.bytes };
-}
-
 function compactActiveRelease(release) {
-  return {
-    schema: release.schema,
-    releaseId: release.releaseId,
-    commit: release.source.commit,
-    frontend: compactReleaseAsset(release.frontend),
-    renderer: {
-      javascript: compactReleaseAsset(release.renderer.javascript),
-      wasm: compactReleaseAsset(release.renderer.wasm),
-    },
-    dsp: compactReleaseAsset(release.dsp),
-    backend: {
-      url: release.backend.url,
-      sha256: release.backend.sha256,
-      bytes: release.backend.bytes,
-    },
-  };
+  return compactPublicActiveRelease(release);
 }
 
 async function validateObservedActiveRelease(observation, options, expectedIdentity = null) {
@@ -311,6 +296,7 @@ async function validateObservedActiveRelease(observation, options, expectedIdent
   }
   await validateRelease(manifest);
   const identity = compactActiveRelease(manifest);
+  validateCompactPublicActiveRelease(identity);
   if (observation.pathname !== identity.frontend.url) {
     throw new Error(
       `headless page is not the active immutable frontend: ${JSON.stringify({

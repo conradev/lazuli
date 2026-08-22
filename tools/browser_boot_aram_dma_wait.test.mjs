@@ -474,7 +474,7 @@ test("runner excludes the wait from regions and handles it before compilation", 
     /isAramDmaBusyWaitCandidate\(candidatePc\)/,
   );
   const integration = source.indexOf(
-    "if (await accelerateAramDmaBusyWait(pc))",
+    "const aramDmaAcceleration = pendingAramDmaBusyWaitAcceleration(pc);",
   );
   assert.notEqual(integration, -1);
   const compilation = source.indexOf('stage = "compile"', integration);
@@ -482,7 +482,7 @@ test("runner excludes the wait from regions and handles it before compilation", 
   assert.ok(integration < compilation, "the authenticated call must not execute");
   assert.match(
     source.slice(integration, compilation),
-    /await finishTerminalControllerScenario\(\);\s*continue;/,
+    /if \(aramDmaAcceleration !== false && await aramDmaAcceleration\) \{\s*const terminalCompletion = pendingTerminalControllerScenarioCompletion\(\);\s*if \(terminalCompletion !== false\) await terminalCompletion;\s*continue;/,
   );
 
   const accelerator = extractFunction("accelerateAramDmaBusyWait");

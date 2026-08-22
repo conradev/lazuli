@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use indexmap::IndexSet;
 use lazuli::cores::{CpuCore, Info};
-use lazuli::gekko::{self, Cpu, DEQUANTIZATION_LUT, QUANTIZATION_LUT, QuantReg, QuantizedType};
+use lazuli::gekko::{self, Cpu, QuantReg};
+use lazuli::runtime_hooks::{HookOutcome, INVALIDATION_HAS_PHYSICAL, MachineRuntimeHooks};
+use lazuli::system::mmu::{TranslationEffect, TranslationFault};
 use lazuli::system::{self, System};
 use lazuli::{Address, Cycles, Primitive};
 use mapping::Mapping;
@@ -246,69 +248,26 @@ fn reset_address_space_links(ctx: &mut Context, clear_mappings: bool) {
     ctx.address_space_changed = true;
 }
 
-fn invalidate_dcache_dma_destination(
-    reservation: &mut gekko::LoadStoreReservation,
-    direction: gekko::DmaDirection,
-    ram_address: Address,
-    cache_address: Address,
-    length: usize,
-) {
-    let destination = match direction {
-        gekko::DmaDirection::FromCacheToRam => ram_address,
-        gekko::DmaDirection::FromRamToCache => cache_address,
-    };
-    reservation.invalidate_range(destination, length);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstructionFetchFault {
+    Translation(TranslationFault),
+    Unbacked {
+        effective: Address,
+        physical: Address,
+    },
 }
 
-fn record_data_reservation_fault(
-    sys: &mut System,
-    fault: system::bus::DataReservationFault,
-    write: bool,
-) {
-    sys.cpu.supervisor.exception.dsisr = fault.dsisr(write);
-}
-
-fn load_reserve_system(sys: &mut System, addr: Address, value: &mut i32) -> bool {
-    let physical = match sys.translate_data_reservation_addr(addr, false) {
-        Ok(physical) => physical,
-        Err(fault) => {
-            record_data_reservation_fault(sys, fault, false);
-            return false;
-        }
-    };
-    let Some(loaded) = sys.read_data_reservation_phys(physical) else {
-        record_data_reservation_fault(sys, system::bus::DataReservationFault::Backing, false);
+fn raise_instruction_fetch_fault(sys: &mut System, fault: InstructionFetchFault) -> bool {
+    let InstructionFetchFault::Translation(fault) = fault else {
         return false;
     };
-
-    *value = loaded;
-    sys.cpu.reservation.reserve(physical);
-    true
-}
-
-fn store_conditional_system(sys: &mut System, addr: Address, value: i32) -> u8 {
-    let physical = match sys.translate_data_reservation_addr(addr, true) {
-        Ok(physical) => physical,
-        Err(fault) => {
-            record_data_reservation_fault(sys, fault, true);
-            return STORE_CONDITIONAL_FAULT;
+    match fault.instruction_storage_cause() {
+        Some(cause) => {
+            sys.cpu.raise_instruction_storage_exception(cause);
+            true
         }
-    };
-
-    // A reservation-less stwcx. still performs write-class translation and protection, but it
-    // completes as failed without probing whether the translated physical address has backing.
-    if !sys.cpu.reservation.is_valid() {
-        return STORE_CONDITIONAL_NOT_STORED;
+        None => false,
     }
-
-    // MPC750 reservations are nonspecific to their owning processor: any completed stwcx.
-    // succeeds while the reservation is live, even when its address differs from lwarx.
-    if !sys.write_data_reservation_phys(physical, value) {
-        record_data_reservation_fault(sys, system::bus::DataReservationFault::Backing, true);
-        return STORE_CONDITIONAL_FAULT;
-    }
-    sys.cpu.reservation.clear();
-    STORE_CONDITIONAL_STORED
 }
 
 const CTX_HOOKS: Hooks = {
@@ -318,9 +277,9 @@ const CTX_HOOKS: Hooks = {
 
     extern "C-unwind" fn get_fastmem<'a>(ctx: &'a mut Context) -> &'a FastmemLut {
         if ctx.sys.cpu.supervisor.config.msr.data_addr_translation() {
-            ctx.sys.mem.data_fastmem_lut_logical()
+            ctx.sys.mem.data_fastmem_lut_logical_write()
         } else {
-            ctx.sys.mem.data_fastmem_lut_physical()
+            ctx.sys.mem.data_fastmem_lut_physical_write()
         }
     }
 
@@ -436,55 +395,56 @@ const CTX_HOOKS: Hooks = {
         linked
     }
 
-    extern "C-unwind" fn read<P: Primitive>(
-        ctx: &mut Context,
-        addr: Address,
-        value: &mut P,
-    ) -> u8 {
-        if let Some(read) = ctx.sys.read_slow(addr) {
-            *value = read;
-            READ_COMPLETE
-        } else {
-            std::hint::cold_path();
-            tracing::error!(pc = ?ctx.sys.cpu.pc, "failed to translate address {addr}");
-            READ_FAULT
+    extern "C-unwind" fn read<P: Primitive>(ctx: &mut Context, addr: Address, value: &mut P) -> u8 {
+        let result = MachineRuntimeHooks::read_slow(ctx.sys, addr, value);
+        match result.outcome {
+            HookOutcome::Complete => READ_COMPLETE,
+            HookOutcome::Yield => READ_YIELD,
+            HookOutcome::Fault | HookOutcome::Invalidated => {
+                std::hint::cold_path();
+                tracing::error!(pc = ?ctx.sys.cpu.pc, dsisr = result.detail, "failed data read at {addr}");
+                READ_FAULT
+            }
         }
     }
 
     extern "C-unwind" fn write<P: Primitive>(ctx: &mut Context, addr: Address, value: P) -> bool {
-        if ctx.sys.write_slow(addr, value) {
-            true
-        } else {
-            std::hint::cold_path();
-            tracing::error!(pc = ?ctx.sys.cpu.pc, "failed to translate address {addr}");
-            false
+        let result = MachineRuntimeHooks::write_slow(ctx.sys, addr, value);
+        match result.outcome {
+            HookOutcome::Complete => true,
+            HookOutcome::Fault | HookOutcome::Yield | HookOutcome::Invalidated => {
+                std::hint::cold_path();
+                tracing::error!(pc = ?ctx.sys.cpu.pc, dsisr = result.detail, "failed data write at {addr}");
+                false
+            }
         }
     }
 
-    extern "C-unwind" fn load_reserve(
-        ctx: &mut Context,
-        addr: Address,
-        value: &mut i32,
-    ) -> u8 {
-        if load_reserve_system(ctx.sys, addr, value) {
-            LOAD_RESERVE_LOADED
-        } else {
-            std::hint::cold_path();
-            tracing::error!(pc = ?ctx.sys.cpu.pc, "failed load-reserve access at {addr}");
-            LOAD_RESERVE_FAULT
+    extern "C-unwind" fn load_reserve(ctx: &mut Context, addr: Address, value: &mut i32) -> u8 {
+        let result = MachineRuntimeHooks::load_reserve(ctx.sys, addr, value);
+        match result.outcome {
+            HookOutcome::Complete => LOAD_RESERVE_LOADED,
+            HookOutcome::Yield => READ_YIELD,
+            HookOutcome::Fault | HookOutcome::Invalidated => {
+                std::hint::cold_path();
+                tracing::error!(pc = ?ctx.sys.cpu.pc, dsisr = result.detail, "failed load-reserve access at {addr}");
+                LOAD_RESERVE_FAULT
+            }
         }
     }
 
     extern "C-unwind" fn store_conditional(ctx: &mut Context, addr: Address, value: i32) -> u8 {
-        let status = store_conditional_system(ctx.sys, addr, value);
-        if status == STORE_CONDITIONAL_FAULT {
-            std::hint::cold_path();
-            tracing::error!(
-                pc = ?ctx.sys.cpu.pc,
-                "failed store-conditional access at {addr}"
-            );
+        let mut stored = false;
+        let result = MachineRuntimeHooks::store_conditional(ctx.sys, addr, value, &mut stored);
+        match result.outcome {
+            HookOutcome::Complete if stored => STORE_CONDITIONAL_STORED,
+            HookOutcome::Complete => STORE_CONDITIONAL_NOT_STORED,
+            HookOutcome::Fault | HookOutcome::Yield | HookOutcome::Invalidated => {
+                std::hint::cold_path();
+                tracing::error!(pc = ?ctx.sys.cpu.pc, dsisr = result.detail, "failed store-conditional access at {addr}");
+                STORE_CONDITIONAL_FAULT
+            }
         }
-        status
     }
 
     extern "C-unwind" fn read_quantized(
@@ -493,31 +453,16 @@ const CTX_HOOKS: Hooks = {
         gqr: QuantReg,
         value: &mut f64,
     ) -> u8 {
-        let ty = gqr.load_type();
-        let scale = if ty != QuantizedType::Float {
-            gqr.load_scale().value()
-        } else {
-            0
-        };
-
-        let read = match ty {
-            QuantizedType::U8 => ctx.sys.read::<u8>(addr).map(|x| x as f64),
-            QuantizedType::U16 => ctx.sys.read::<u16>(addr).map(|x| x as f64),
-            QuantizedType::I8 => ctx.sys.read::<i8>(addr).map(|x| x as f64),
-            QuantizedType::I16 => ctx.sys.read::<i16>(addr).map(|x| x as f64),
-            _ => ctx.sys.read::<u32>(addr).map(|x| f32::from_bits(x) as f64),
-        };
-
-        let Some(read) = read else {
+        let mut size = 0;
+        let result = MachineRuntimeHooks::read_quantized(ctx.sys, addr, gqr, value, &mut size);
+        if result.outcome != HookOutcome::Complete {
             std::hint::cold_path();
-            tracing::error!("failed to translate address {addr}");
-            return 0;
-        };
-
-        let scaled = read * DEQUANTIZATION_LUT[(scale as usize) & 0b0011_1111];
-        *value = scaled;
-
-        ty.size()
+            tracing::error!(
+                dsisr = result.detail,
+                "failed quantized data read at {addr}"
+            );
+        }
+        size
     }
 
     extern "C-unwind" fn write_quantized(
@@ -526,48 +471,36 @@ const CTX_HOOKS: Hooks = {
         gqr: QuantReg,
         value: f64,
     ) -> u8 {
-        let ty = gqr.store_type();
-        let scale = if ty != QuantizedType::Float {
-            gqr.store_scale().value()
-        } else {
-            0
-        };
-
-        let scaled = value * QUANTIZATION_LUT[(scale as usize) & 0b0011_1111];
-        let success = match ty {
-            QuantizedType::U8 => ctx.sys.write(addr, scaled as u8),
-            QuantizedType::U16 => ctx.sys.write(addr, scaled as u16),
-            QuantizedType::I8 => ctx.sys.write(addr, scaled as i8),
-            QuantizedType::I16 => ctx.sys.write(addr, scaled as i16),
-            _ => ctx.sys.write(addr, (scaled as f32).to_bits()),
-        };
-
-        if !success {
+        let mut size = 0;
+        let result = MachineRuntimeHooks::write_quantized(ctx.sys, addr, gqr, value, &mut size);
+        if result.outcome != HookOutcome::Complete {
             std::hint::cold_path();
-            tracing::error!("failed to translate address {addr}");
-            return 0;
+            tracing::error!(
+                dsisr = result.detail,
+                "failed quantized data write at {addr}"
+            );
         }
-
-        ty.size()
+        size
     }
 
     extern "C-unwind" fn invalidate_icache(ctx: &mut Context, addr: Address) {
-        let cacheline_base = addr.align_down(32);
         let is_logical = ctx.sys.cpu.supervisor.config.msr.instr_addr_translation();
+        let result = MachineRuntimeHooks::invalidate_instruction_cache_line(ctx.sys, addr);
+        let invalidation = result.invalidation;
+        let cacheline_base = Address(invalidation.effective);
 
         if is_logical {
             for offset in 0..32 {
                 let logical = cacheline_base + offset;
-                let physical = ctx.sys.translate_inst_addr(logical);
-
                 ctx.blocks.invalidate(true, logical);
-                if let Some(physical) = physical {
-                    ctx.blocks.invalidate(false, physical);
+                if invalidation.flags & INVALIDATION_HAS_PHYSICAL != 0 {
+                    ctx.blocks
+                        .invalidate(false, Address(invalidation.physical) + offset);
                 }
             }
 
-            if let Some(physical) = ctx.sys.translate_inst_addr(cacheline_base) {
-                ctx.icache.invalidate(physical);
+            if invalidation.flags & INVALIDATION_HAS_PHYSICAL != 0 {
+                ctx.icache.invalidate(Address(invalidation.physical));
             }
         } else {
             for offset in 0..32 {
@@ -583,54 +516,30 @@ const CTX_HOOKS: Hooks = {
         ctx.icache.clear();
     }
 
-    extern "C-unwind" fn tlbie(ctx: &mut Context, _address: Address) {
-        // Native page translation is not modeled yet, so conservatively discard every retained
-        // instruction mapping and unlink the current chain.
+    extern "C-unwind" fn tlbie(ctx: &mut Context, address: Address) {
+        MachineRuntimeHooks::tlbie(ctx.sys, address);
+        // The native cache does not yet index hashed dependencies by TLB set, so it still retires
+        // every linked address-space edge. Translation residency itself is now exact and shared
+        // with the browser machine.
         reset_address_space_links(ctx, true);
     }
 
-    extern "C-unwind" fn tlbsync(_ctx: &mut Context) {
+    extern "C-unwind" fn tlbsync(ctx: &mut Context) {
         // The MPC750 has no local synchronization side effect when its external TLBISYNC input
         // permits execution to continue. The JIT boundary itself provides the ordering point.
+        MachineRuntimeHooks::tlbsync(ctx.sys);
     }
 
     extern "C-unwind" fn dcache_dma(ctx: &mut Context) {
-        let dma = ctx.sys.cpu.supervisor.config.dma.clone();
-
-        if dma.lower.trigger() {
-            let regions = ctx.sys.mem.regions();
-            let ram =
-                &mut regions.ram[dma.mem_address().value() as usize..][..dma.length() as usize];
-            let l2c = &mut regions.l2c[dma.cache_address().value() as usize - 0xE000_0000..]
-                [..dma.length() as usize];
-
-            debug_assert!(dma.length() <= 4096);
-
-            match dma.lower.direction() {
-                gekko::DmaDirection::FromCacheToRam => {
-                    ram.copy_from_slice(l2c);
-                }
-                gekko::DmaDirection::FromRamToCache => {
-                    l2c.copy_from_slice(ram);
-                }
-            }
-            invalidate_dcache_dma_destination(
-                &mut ctx.sys.cpu.reservation,
-                dma.lower.direction(),
-                dma.mem_address(),
-                dma.cache_address(),
-                dma.length() as usize,
-            );
-        }
-
-        ctx.sys.cpu.supervisor.config.dma.lower.set_trigger(false);
-        ctx.sys.cpu.supervisor.config.dma.lower.set_flush(false);
+        MachineRuntimeHooks::locked_cache_dma(ctx.sys);
     }
 
     extern "C-unwind" fn msr_changed(ctx: &mut Context) {
-        // Instruction mappings are already partitioned by MSR[IR]. Keep them across common
-        // EE-only changes; PR-specific translation is not modeled by the native LUT yet.
-        reset_address_space_links(ctx, false);
+        // The legacy native mapping key contains IR but not PR. Conservatively retire mappings on
+        // every MSR publication so a privilege transition cannot reuse code translated in the
+        // other address space. The browser-resident Rust directory uses full generations instead.
+        ctx.sys.refresh_data_fastmem_luts();
+        reset_address_space_links(ctx, true);
         ctx.sys.scheduler.schedule_now(system::pi::check_interrupts);
     }
 
@@ -654,9 +563,7 @@ const CTX_HOOKS: Hooks = {
 
     extern "C-unwind" fn dbat_changed(ctx: &mut Context) {
         tracing::info!("dbats changed - rebuilding dbat lut");
-        ctx.sys
-            .mem
-            .build_data_bat_lut(&ctx.sys.cpu.supervisor.memory.dbat);
+        MachineRuntimeHooks::data_bat_changed(ctx.sys);
     }
 
     extern "C-unwind" fn dec_read(ctx: &mut Context) {
@@ -664,15 +571,9 @@ const CTX_HOOKS: Hooks = {
     }
 
     extern "C-unwind" fn dec_changed(ctx: &mut Context) {
-        ctx.sys.lazy.last_updated_dec = ctx.sys.scheduler.elapsed();
-        ctx.sys.scheduler.cancel(System::decrementer_overflow);
-
-        let dec = ctx.sys.cpu.supervisor.misc.dec;
-        tracing::trace!("decrementer changed to {dec}");
-
         ctx.sys
-            .scheduler
-            .schedule(dec as u64, System::decrementer_overflow);
+            .decrementer_changed()
+            .expect("native decrementer deadline overflowed scheduler time");
     }
 
     extern "C-unwind" fn tb_read(ctx: &mut Context) {
@@ -845,22 +746,45 @@ impl Core {
     }
 
     /// Compiles a sequence of at most `limit` instructions starting at `addr` into a JIT block.
-    fn compile(&mut self, sys: &mut System, addr: Address, limit: u32) -> ppcjit::Block {
+    fn compile(
+        &mut self,
+        sys: &mut System,
+        addr: Address,
+        limit: u32,
+    ) -> Result<ppcjit::Block, InstructionFetchFault> {
         let _span = tracing::trace_span!("compiling new block", addr = ?sys.cpu.pc).entered();
 
         let mut count = 0;
+        let mut fetch_fault = None;
         let instructions = std::iter::from_fn(|| {
             if count >= limit {
                 return None;
             }
 
             let current = addr + 4 * count;
-            let Some(physical) = sys.translate_inst_addr(current) else {
-                tracing::error!("failed to translate {current} at {}", addr);
+            let mapping =
+                match sys.translate_instruction_mmu(current, TranslationEffect::Architectural) {
+                    Ok(mapping) => mapping,
+                    Err(fault) => {
+                        tracing::error!(?fault, "failed to translate {current} at {addr}");
+                        fetch_fault = Some(InstructionFetchFault::Translation(fault));
+                        return None;
+                    }
+                };
+            let physical = Address(mapping.physical);
+
+            let Some(ins) = self.icache.get(sys, physical) else {
+                let fault = InstructionFetchFault::Unbacked {
+                    effective: current,
+                    physical,
+                };
+                tracing::error!(
+                    ?fault,
+                    "instruction fetch reached unbacked physical storage"
+                );
+                fetch_fault = Some(fault);
                 return None;
             };
-
-            let ins = self.icache.get(sys, physical);
             count += 1;
 
             Some(ins)
@@ -869,7 +793,12 @@ impl Core {
         let block = match self.compiler.build(instructions) {
             Ok(b) => b,
             Err(e) => match e {
-                ppcjit::BuildError::EmptyBlock => panic!("built empty block at pc {}", sys.cpu.pc),
+                ppcjit::BuildError::EmptyBlock => {
+                    if let Some(fault) = fetch_fault {
+                        return Err(fault);
+                    }
+                    panic!("built empty block at pc {}", sys.cpu.pc)
+                }
                 ppcjit::BuildError::Builder { source } => {
                     panic!("block builder error at pc {}: {}", sys.cpu.pc, source)
                 }
@@ -893,7 +822,7 @@ impl Core {
             "block sequence built"
         );
 
-        block
+        Ok(block)
     }
 
     #[inline(always)]
@@ -916,7 +845,18 @@ impl Core {
             None => {
                 std::hint::cold_path();
 
-                compiled = self.compile(sys, sys.cpu.pc, max_instructions);
+                compiled = match self.compile(sys, sys.cpu.pc, max_instructions) {
+                    Ok(block) => block,
+                    Err(fault) => {
+                        if !raise_instruction_fetch_fault(sys, fault) {
+                            panic!(
+                                "instruction fetch reached non-architectural host storage at {}: {fault:?}",
+                                sys.cpu.pc
+                            );
+                        }
+                        return Info::default();
+                    }
+                };
                 compiled.as_ptr()
             }
         };
@@ -967,8 +907,20 @@ impl Core {
                 self.settings.instr_per_block
             };
 
-            let block = self.compile(sys, sys.cpu.pc, instructions);
-            self.blocks.insert(logical, sys.cpu.pc, block);
+            match self.compile(sys, sys.cpu.pc, instructions) {
+                Ok(block) => {
+                    self.blocks.insert(logical, sys.cpu.pc, block);
+                }
+                Err(fault) => {
+                    if !raise_instruction_fetch_fault(sys, fault) {
+                        panic!(
+                            "instruction fetch reached non-architectural host storage at {}: {fault:?}",
+                            sys.cpu.pc
+                        );
+                    }
+                    return Info::default();
+                }
+            }
         }
 
         self.uncached_exec(sys, target_cycles, max_instructions, force_no_link)
@@ -1017,7 +969,7 @@ impl CpuCore for Core {
 #[cfg(test)]
 mod tests {
     use lazuli::gekko::disasm::{Extensions, Ins};
-    use lazuli::gekko::{Bat, CondReg};
+    use lazuli::gekko::{Bat, CondReg, SPR};
     use lazuli::modules::audio::NopAudioModule;
     use lazuli::modules::debug::NopDebugModule;
     use lazuli::modules::disk::NopDiskModule;
@@ -1068,6 +1020,36 @@ mod tests {
         31 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(rb) << 11 | 150 << 1 | 1
     }
 
+    fn lwz(rd: u8, ra: u8, displacement: i16) -> u32 {
+        32 << 26 | u32::from(rd) << 21 | u32::from(ra) << 16 | u32::from(displacement as u16)
+    }
+
+    fn stw(rs: u8, ra: u8, displacement: i16) -> u32 {
+        36 << 26 | u32::from(rs) << 21 | u32::from(ra) << 16 | u32::from(displacement as u16)
+    }
+
+    fn mtspr(rs: u8, spr: u16) -> u32 {
+        let encoded = (u32::from(spr) & 0x1f) << 16 | (u32::from(spr) >> 5) << 11;
+        31 << 26 | u32::from(rs) << 21 | encoded | 467 << 1
+    }
+
+    fn psq(opcode: u32, fr: u8, ra: u8, displacement: i16, w: bool, gqr: u8) -> u32 {
+        opcode << 26
+            | u32::from(fr) << 21
+            | u32::from(ra) << 16
+            | u32::from(w) << 15
+            | u32::from(gqr & 7) << 12
+            | u32::from(displacement as u16 & 0x0fff)
+    }
+
+    fn psq_l(fd: u8, ra: u8, displacement: i16, w: bool, gqr: u8) -> u32 {
+        psq(56, fd, ra, displacement, w, gqr)
+    }
+
+    fn psq_st(fs: u8, ra: u8, displacement: i16, w: bool, gqr: u8) -> u32 {
+        psq(60, fs, ra, displacement, w, gqr)
+    }
+
     fn bat(upper: u32, lower: u32) -> Bat {
         Bat::from_bits(u64::from(upper) << 32 | u64::from(lower))
     }
@@ -1109,40 +1091,18 @@ mod tests {
     }
 
     #[test]
-    fn locked_cache_dma_invalidates_the_physical_destination() {
-        let ram_address = Address(0x0000_2000);
-        let cache_address = Address(0xe000_4000);
-        let mut reservation = gekko::LoadStoreReservation::default();
+    fn native_mtspr_decrementer_uses_global_time_base_phase() {
+        let mut system = test_system();
+        system.scheduler.cancel(lazuli::system::gx::cmd::process);
+        system.scheduler.advance(5);
+        system.cpu.user.gpr[3] = 2;
 
-        reservation.reserve(ram_address + 4);
-        invalidate_dcache_dma_destination(
-            &mut reservation,
-            gekko::DmaDirection::FromCacheToRam,
-            ram_address,
-            cache_address,
-            32,
-        );
-        assert!(!reservation.is_valid());
+        run_one(&mut system, mtspr(3, SPR::DEC as u16));
 
-        reservation.reserve(cache_address + 4);
-        invalidate_dcache_dma_destination(
-            &mut reservation,
-            gekko::DmaDirection::FromRamToCache,
-            ram_address,
-            cache_address,
-            32,
-        );
-        assert!(!reservation.is_valid());
-
-        reservation.reserve(ram_address + 4);
-        invalidate_dcache_dma_destination(
-            &mut reservation,
-            gekko::DmaDirection::FromRamToCache,
-            ram_address,
-            cache_address,
-            32,
-        );
-        assert!(reservation.is_valid());
+        assert_eq!(system.cpu.supervisor.misc.dec, 2);
+        assert_eq!(system.lazy.last_updated_dec, 0);
+        assert_eq!(system.scheduler.elapsed(), 6);
+        assert_eq!(system.scheduler.until_next(), Some(30));
     }
 
     #[test]
@@ -1252,5 +1212,280 @@ mod tests {
         assert_eq!(sys.read_phys_slow::<u32>(address), 0xaabb_ccdd);
         assert!(!sys.cpu.reservation.is_valid());
         assert!(sys.cpu.user.cr.fields()[7].eq());
+    }
+
+    #[test]
+    fn native_scalar_hooks_publish_precise_data_storage_causes() {
+        let effective = Address(0x9000_1000);
+
+        let mut load = test_system();
+        load.cpu
+            .supervisor
+            .config
+            .msr
+            .set_data_addr_translation(true);
+        load.cpu.supervisor.config.msr.set_exception_prefix(false);
+        load.cpu.user.gpr[3] = effective.value();
+        load.cpu.user.gpr[4] = 0xdead_beef;
+        run_one(&mut load, lwz(4, 3, 0));
+        assert_eq!(load.cpu.pc, Address(0x0000_0300));
+        assert_eq!(load.cpu.supervisor.exception.srr[0], 0);
+        assert_eq!(load.cpu.supervisor.exception.dar, effective.value());
+        assert_eq!(load.cpu.supervisor.exception.dsisr, 0x4000_0000);
+        assert_eq!(load.cpu.user.gpr[4], 0xdead_beef);
+
+        let mut store = test_system();
+        store
+            .cpu
+            .supervisor
+            .config
+            .msr
+            .set_data_addr_translation(true);
+        store.cpu.supervisor.config.msr.set_exception_prefix(false);
+        store.cpu.user.gpr[3] = effective.value();
+        store.cpu.user.gpr[4] = 0x1122_3344;
+        run_one(&mut store, stw(4, 3, 0));
+        assert_eq!(store.cpu.pc, Address(0x0000_0300));
+        assert_eq!(store.cpu.supervisor.exception.srr[0], 0);
+        assert_eq!(store.cpu.supervisor.exception.dar, effective.value());
+        assert_eq!(store.cpu.supervisor.exception.dsisr, 0x4200_0000);
+    }
+
+    #[test]
+    fn native_data_accesses_publish_protection_direct_store_and_quantized_causes() {
+        let protected = Address(0x9000_0020);
+
+        for (instruction, expected) in [(lwz(4, 3, 0), 0x0800_0000), (stw(4, 3, 0), 0x0a00_0000)] {
+            let mut sys = test_system();
+            sys.cpu
+                .supervisor
+                .config
+                .msr
+                .set_data_addr_translation(true);
+            sys.cpu.supervisor.config.msr.set_exception_prefix(false);
+            sys.cpu.supervisor.memory.dbat[0] = bat(0x9000_0002, 0x0000_0000);
+            sys.cpu.user.gpr[3] = protected.value();
+            sys.cpu.user.gpr[4] = 0x1122_3344;
+            run_one(&mut sys, instruction);
+            assert_eq!(sys.cpu.pc, Address(0x0000_0300));
+            assert_eq!(sys.cpu.supervisor.exception.srr[0], 0);
+            assert_eq!(sys.cpu.supervisor.exception.dar, protected.value());
+            assert_eq!(sys.cpu.supervisor.exception.dsisr, expected);
+        }
+
+        let direct_store = Address(0x9000_1000);
+        for (instruction, expected) in [(lwz(4, 3, 0), 0x0400_0000), (stw(4, 3, 0), 0x0600_0000)] {
+            let mut sys = test_system();
+            sys.cpu
+                .supervisor
+                .config
+                .msr
+                .set_data_addr_translation(true);
+            sys.cpu.supervisor.config.msr.set_exception_prefix(false);
+            sys.cpu.supervisor.memory.sr[9] = 0x8000_0000;
+            sys.cpu.user.gpr[3] = direct_store.value();
+            sys.cpu.user.gpr[4] = 0x5566_7788;
+            run_one(&mut sys, instruction);
+            assert_eq!(sys.cpu.pc, Address(0x0000_0300));
+            assert_eq!(sys.cpu.supervisor.exception.srr[0], 0);
+            assert_eq!(sys.cpu.supervisor.exception.dar, direct_store.value());
+            assert_eq!(sys.cpu.supervisor.exception.dsisr, expected);
+        }
+
+        let paged = Address(0x9000_2000);
+        for (instruction, expected) in [
+            (psq_l(1, 3, 0, true, 0), 0x4000_0000),
+            (psq_st(1, 3, 0, true, 0), 0x4200_0000),
+        ] {
+            let mut sys = test_system();
+            sys.cpu
+                .supervisor
+                .config
+                .msr
+                .set_data_addr_translation(true);
+            sys.cpu.supervisor.config.msr.set_float_available(true);
+            sys.cpu.supervisor.config.msr.set_exception_prefix(false);
+            sys.cpu.user.gpr[3] = paged.value();
+            run_one(&mut sys, instruction);
+            assert_eq!(sys.cpu.pc, Address(0x0000_0300));
+            assert_eq!(sys.cpu.supervisor.exception.srr[0], 0);
+            assert_eq!(sys.cpu.supervisor.exception.dar, paged.value());
+            assert_eq!(sys.cpu.supervisor.exception.dsisr, expected);
+        }
+    }
+
+    #[test]
+    fn first_instruction_page_fault_enters_isi_and_retries_after_rfi() {
+        const RFI: u32 = 0x4c00_0064;
+        const NOP: u32 = 0x6000_0000;
+
+        let mut sys = test_system();
+        let effective = Address(0x8000_1000);
+        let physical_page = 0x0000_2000;
+        let segment = 0x0012_3456;
+        sys.cpu.pc = effective;
+        sys.cpu
+            .supervisor
+            .config
+            .msr
+            .set_instr_addr_translation(true);
+        sys.cpu.supervisor.config.msr.set_exception_prefix(false);
+        sys.cpu.supervisor.memory.sr[8] = segment;
+        sys.write_phys_slow(Address(0x400), RFI);
+
+        let mut core = Core::new(Settings {
+            instr_per_block: 1,
+            codegen: ppcjit::CodegenSettings::default(),
+            cache_path: None,
+        });
+        let fault = core.step(&mut sys);
+        assert_eq!(fault.executed_instructions, 0);
+        assert_eq!(sys.cpu.pc, Address(0x0000_0400));
+        assert_eq!(sys.cpu.supervisor.exception.srr[0], effective.value());
+        assert_eq!(
+            sys.cpu.supervisor.exception.srr[1] & gekko::Exception::SPECIAL_SRR1_BITS_MASK,
+            0x4000_0000
+        );
+
+        let vector = system::mmu::page_table_vector(effective.value(), segment, 0);
+        sys.write_phys_slow(Address(vector.primary_pteg), vector.primary_pte0);
+        sys.write_phys_slow(Address(vector.primary_pteg + 4), physical_page | 2);
+        sys.write_phys_slow(Address(physical_page), NOP);
+
+        let returned = core.step(&mut sys);
+        assert_eq!(returned.executed_instructions, 1);
+        assert_eq!(sys.cpu.pc, effective);
+        assert!(sys.cpu.supervisor.config.msr.instr_addr_translation());
+
+        let retried = core.step(&mut sys);
+        assert_eq!(retried.executed_instructions, 1);
+        assert_eq!(sys.cpu.pc, effective + 4);
+        assert_eq!(
+            sys.read_phys_slow::<u32>(Address(vector.primary_pteg + 4)),
+            physical_page | 0x0100 | 2
+        );
+    }
+
+    #[test]
+    fn first_instruction_permission_faults_publish_exact_isi_causes() {
+        let effective = Address(0x9000_1000);
+
+        for segment in [0x8000_0000, 0x1000_0000] {
+            let mut sys = test_system();
+            sys.cpu.pc = effective;
+            sys.cpu
+                .supervisor
+                .config
+                .msr
+                .set_instr_addr_translation(true);
+            sys.cpu.supervisor.config.msr.set_exception_prefix(false);
+            sys.cpu.supervisor.memory.sr[9] = segment;
+
+            let mut core = Core::new(Settings {
+                instr_per_block: 1,
+                codegen: ppcjit::CodegenSettings::default(),
+                cache_path: None,
+            });
+            let fault = core.step(&mut sys);
+            assert_eq!(fault.executed_instructions, 0);
+            assert_eq!(sys.cpu.pc, Address(0x0000_0400));
+            assert_eq!(sys.cpu.supervisor.exception.srr[0], effective.value());
+            assert_eq!(
+                sys.cpu.supervisor.exception.srr[1] & gekko::Exception::SPECIAL_SRR1_BITS_MASK,
+                0x1000_0000
+            );
+        }
+
+        let mut protected = test_system();
+        protected.cpu.pc = effective;
+        protected
+            .cpu
+            .supervisor
+            .config
+            .msr
+            .set_instr_addr_translation(true);
+        protected
+            .cpu
+            .supervisor
+            .config
+            .msr
+            .set_exception_prefix(false);
+        protected.cpu.supervisor.memory.ibat[0] = bat(0x9000_0002, 0x0000_0000);
+        let mut core = Core::new(Settings {
+            instr_per_block: 1,
+            codegen: ppcjit::CodegenSettings::default(),
+            cache_path: None,
+        });
+        let fault = core.step(&mut protected);
+        assert_eq!(fault.executed_instructions, 0);
+        assert_eq!(protected.cpu.pc, Address(0x0000_0400));
+        assert_eq!(protected.cpu.supervisor.exception.srr[0], effective.value());
+        assert_eq!(
+            protected.cpu.supervisor.exception.srr[1] & gekko::Exception::SPECIAL_SRR1_BITS_MASK,
+            0x0800_0000
+        );
+
+        let mut guarded = test_system();
+        let segment = 0x0012_3456;
+        let physical_page = 0x0000_2000;
+        guarded.cpu.pc = effective;
+        guarded
+            .cpu
+            .supervisor
+            .config
+            .msr
+            .set_instr_addr_translation(true);
+        guarded
+            .cpu
+            .supervisor
+            .config
+            .msr
+            .set_exception_prefix(false);
+        guarded.cpu.supervisor.memory.sr[9] = segment;
+        let vector = system::mmu::page_table_vector(effective.value(), segment, 0);
+        guarded.write_phys_slow(Address(vector.primary_pteg), vector.primary_pte0);
+        guarded.write_phys_slow(Address(vector.primary_pteg + 4), physical_page | 0x0a);
+        let mut core = Core::new(Settings {
+            instr_per_block: 1,
+            codegen: ppcjit::CodegenSettings::default(),
+            cache_path: None,
+        });
+        let fault = core.step(&mut guarded);
+        assert_eq!(fault.executed_instructions, 0);
+        assert_eq!(guarded.cpu.pc, Address(0x0000_0400));
+        assert_eq!(guarded.cpu.supervisor.exception.srr[0], effective.value());
+        assert_eq!(
+            guarded.cpu.supervisor.exception.srr[1] & gekko::Exception::SPECIAL_SRR1_BITS_MASK,
+            0x1000_0000
+        );
+    }
+
+    #[test]
+    fn translated_unbacked_instruction_storage_never_becomes_zero_code() {
+        let mut sys = test_system();
+        let effective = Address(0x9000_0000);
+        let physical = Address(0x1000_0000);
+        sys.cpu.pc = effective;
+        sys.cpu
+            .supervisor
+            .config
+            .msr
+            .set_instr_addr_translation(true);
+        sys.cpu.supervisor.memory.ibat[0] = bat(0x9000_0002, 0x1000_0002);
+
+        let mut core = Core::new(Settings {
+            instr_per_block: 1,
+            codegen: ppcjit::CodegenSettings::default(),
+            cache_path: None,
+        });
+        let result = core.compile(&mut sys, effective, 1);
+        assert_eq!(
+            result.err(),
+            Some(InstructionFetchFault::Unbacked {
+                effective,
+                physical,
+            })
+        );
+        assert_eq!(sys.cpu.pc, effective);
     }
 }

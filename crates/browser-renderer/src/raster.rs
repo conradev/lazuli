@@ -68,7 +68,7 @@ pub(crate) fn gx_non_aa_raster_coord_28_4(
     }
     // 2^31 is exactly representable in f32 whereas i32::MAX is not. Keep the
     // upper comparison exclusive so the subsequent cast has defined range.
-    if scaled < i32::MIN as f32 || scaled >= 2_147_483_648.0 {
+    if scaled < i32::MIN as f32 || scaled >= i32::MAX as f32 {
         return Err(GxRasterError::CoordinateOverflow);
     }
     let truncated = scaled as i32;
@@ -299,7 +299,7 @@ impl GxRasterAttributePlaneF32 {
 /// Canonicalizes one screen-linear raster channel like the GX software path:
 /// clamp to the unsigned eight-bit range, then truncate toward zero.
 pub(crate) fn gx_raster_channel_u8(value: f32) -> u8 {
-    if !(value > 0.0) {
+    if value.is_nan() || value <= 0.0 {
         return 0;
     }
     if value >= u8::MAX as f32 {

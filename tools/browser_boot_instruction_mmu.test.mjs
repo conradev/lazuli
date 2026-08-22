@@ -128,6 +128,7 @@ function makeContext() {
     cycles: 1_000,
     darOffset: 0x88,
     dataFastmemRebuilds: 0,
+    dataFastmemMsrSignature: null,
     dispatches: 7,
     exceptionCounts: new Map(),
     exceptionFirstByVector: {},
@@ -157,6 +158,7 @@ function makeContext() {
       () => ({ entries: [null, null], lru: 0 }),
     ),
     instructionTranslationSignature: null,
+    instructionTranslationMsrSignature: null,
     lastCpuSignature: 1,
     lastUnmappedAccess: null,
     lastPc: 0x80001000,
@@ -188,11 +190,20 @@ function makeContext() {
     srr0Offset: 0x80,
     srr1Offset: 0x84,
     view: new DataView(buffer),
+    beginCriticalStorageFault() {},
+    observeCriticalStorageFaultHandlerReturn() {},
   };
   context.decrementerPending = false;
   context.runtimeEventDueAtOrBefore = () => false;
   context.rebuildDataFastmem = () => {
+    const signature = context.view.getUint32(
+      context.cpu + context.msrOffset,
+      true,
+    ) & 0x4010;
+    const changed = context.dataFastmemMsrSignature !== signature;
+    context.dataFastmemMsrSignature = signature;
     context.dataFastmemRebuilds += 1;
+    return changed;
   };
   context.drainGxFifoStaging = () => {
     context.view.setUint32(context.gxFifoStagingMeta, 0, true);
@@ -605,10 +616,131 @@ test("exception entry switches namespaces before vector lookup and reuses the pr
   assert.equal(context.compiledBlock(oldPc), resumeBlock);
 });
 
+test("EE-only MSR hooks skip both translation signature builders", () => {
+  const context = makeContext();
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00008030, true);
+  context.rebuildDataFastmem();
+  context.synchronizeInstructionAddressSpace("seed");
+
+  let dataSynchronizations = 0;
+  let instructionSynchronizations = 0;
+  let handlerReturnObservations = 0;
+  const rebuildDataFastmem = context.rebuildDataFastmem;
+  const synchronizeInstructionAddressSpace =
+    context.synchronizeInstructionAddressSpace;
+  context.rebuildDataFastmem = () => {
+    dataSynchronizations += 1;
+    return rebuildDataFastmem();
+  };
+  context.synchronizeInstructionAddressSpace = (...arguments_) => {
+    instructionSynchronizations += 1;
+    return synchronizeInstructionAddressSpace(...arguments_);
+  };
+  context.observeCriticalStorageFaultHandlerReturn = () => {
+    handlerReturnObservations += 1;
+  };
+
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00000030, true);
+  assert.equal(context.msrChanged(), 1, "EE disable may remain linked");
+  assert.deepEqual(
+    { dataSynchronizations, instructionSynchronizations },
+    { dataSynchronizations: 0, instructionSynchronizations: 0 },
+  );
+  assert.equal(handlerReturnObservations, 1);
+
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00008030, true);
+  context.runtimeEventDueAtOrBefore = () => true;
+  assert.equal(
+    context.msrChanged(),
+    0,
+    "EE enable still exits when an event is due",
+  );
+  assert.deepEqual(
+    { dataSynchronizations, instructionSynchronizations },
+    { dataSynchronizations: 0, instructionSynchronizations: 0 },
+    "interrupt-only hooks must not rebuild translation arrays",
+  );
+  assert.equal(
+    handlerReturnObservations,
+    2,
+    "fault-return health remains observable on the fast path",
+  );
+});
+
+test("MSR translation masks rebuild exactly the affected address spaces", () => {
+  const cases = [
+    {
+      label: "first call",
+      seed: false,
+      target: 0x00008030,
+      dataSynchronizations: 1,
+      instructionSynchronizations: 1,
+    },
+    {
+      label: "DR only",
+      seed: true,
+      target: 0x00008020,
+      dataSynchronizations: 1,
+      instructionSynchronizations: 0,
+    },
+    {
+      label: "IR only",
+      seed: true,
+      target: 0x00008010,
+      dataSynchronizations: 0,
+      instructionSynchronizations: 1,
+    },
+    {
+      label: "PR",
+      seed: true,
+      target: 0x0000c030,
+      dataSynchronizations: 1,
+      instructionSynchronizations: 1,
+    },
+  ];
+
+  for (const expected of cases) {
+    const context = makeContext();
+    context.view.setUint32(context.cpu + context.msrOffset, 0x00008030, true);
+    if (expected.seed) {
+      context.rebuildDataFastmem();
+      context.synchronizeInstructionAddressSpace("seed");
+    }
+    let dataSynchronizations = 0;
+    let instructionSynchronizations = 0;
+    const rebuildDataFastmem = context.rebuildDataFastmem;
+    const synchronizeInstructionAddressSpace =
+      context.synchronizeInstructionAddressSpace;
+    context.rebuildDataFastmem = () => {
+      dataSynchronizations += 1;
+      return rebuildDataFastmem();
+    };
+    context.synchronizeInstructionAddressSpace = (...arguments_) => {
+      instructionSynchronizations += 1;
+      return synchronizeInstructionAddressSpace(...arguments_);
+    };
+
+    context.view.setUint32(
+      context.cpu + context.msrOffset,
+      expected.target,
+      true,
+    );
+    assert.equal(context.msrChanged(), 0, `${expected.label} must exit`);
+    assert.deepEqual(
+      { dataSynchronizations, instructionSynchronizations },
+      {
+        dataSynchronizations: expected.dataSynchronizations,
+        instructionSynchronizations: expected.instructionSynchronizations,
+      },
+      expected.label,
+    );
+  }
+});
+
 test("MSR changes continue only across translation-stable interrupt boundaries", () => {
   const context = makeContext();
-  context.rebuildDataFastmem = () => false;
   context.view.setUint32(context.cpu + context.msrOffset, 0x00008032, true);
+  context.rebuildDataFastmem();
   context.synchronizeInstructionAddressSpace("seed");
 
   context.view.setUint32(context.cpu + context.msrOffset, 0x00000032, true);
@@ -656,16 +788,14 @@ test("MSR changes continue only across translation-stable interrupt boundaries",
   );
   context.runtimeEventDueAtOrBefore = () => false;
 
-  context.view.setUint32(context.cpu + context.msrOffset, 0x00000032, true);
-  context.rebuildDataFastmem = () => true;
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00000022, true);
   assert.equal(
     context.msrChanged(),
     0,
     "a data translation change must leave the linked region",
   );
 
-  context.rebuildDataFastmem = () => false;
-  context.view.setUint32(context.cpu + context.msrOffset, 0x00000012, true);
+  context.view.setUint32(context.cpu + context.msrOffset, 0x00000002, true);
   assert.equal(
     context.msrChanged(),
     0,
@@ -675,8 +805,8 @@ test("MSR changes continue only across translation-stable interrupt boundaries",
 
 test("EE-enable hooks decide continuation at the linked region's exact published cycle", () => {
   const context = makeContext();
-  context.rebuildDataFastmem = () => false;
   context.view.setUint32(context.cpu + context.msrOffset, 0x00008032, true);
+  context.rebuildDataFastmem();
   context.synchronizeInstructionAddressSpace("seed");
   context.regionRunning = true;
   context.view.setUint32(

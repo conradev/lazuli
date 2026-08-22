@@ -86,6 +86,187 @@ impl BlockBuilder<'_> {
         }
     }
 
+    fn secondary_fastmem_pointer(
+        &mut self,
+        addr: ir::Value,
+        write: bool,
+        access_bytes: u32,
+    ) -> ir::Value {
+        let config = self
+            .frontend
+            .secondary_fastmem
+            .expect("secondary fastmem pointer requested without a configuration");
+        debug_assert!(config.page_shift > 0 && config.page_shift < 32);
+        debug_assert!(config.set_count.is_power_of_two());
+        debug_assert!(access_bytes > 0 && access_bytes <= 1_u32 << config.page_shift);
+
+        let control_address = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.fmem_ptr, i64::from(config.control_offset));
+        let enabled = self
+            .bd
+            .ins()
+            .load(ir::types::I32, MEMFLAGS, control_address, 0);
+        let enabled = self.bd.ins().icmp_imm(IntCC::NotEqual, enabled, 0);
+
+        let page = self.bd.ins().ushr_imm(addr, i64::from(config.page_shift));
+        let set = self
+            .bd
+            .ins()
+            .band_imm(page, i64::from(config.set_count - 1));
+        let set = self.extend_to_pointer_type(set);
+        let lru_table_offset = self.bd.ins().imul_imm(set, 4);
+        let first_entry_offset = self.bd.ins().imul_imm(set, 8);
+        let second_entry_offset = self.bd.ins().iadd_imm(first_entry_offset, 4);
+
+        let tag_base = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.fmem_ptr, i64::from(config.tag_offset));
+        let first_tag_address = self.bd.ins().iadd(tag_base, first_entry_offset);
+        let second_tag_address = self.bd.ins().iadd(tag_base, second_entry_offset);
+        let first_tag = self
+            .bd
+            .ins()
+            .load(ir::types::I32, MEMFLAGS, first_tag_address, 0);
+        let second_tag = self
+            .bd
+            .ins()
+            .load(ir::types::I32, MEMFLAGS, second_tag_address, 0);
+        let expected_tag = self.bd.ins().iadd_imm(page, 1);
+        let first_matches = self.bd.ins().icmp(IntCC::Equal, first_tag, expected_tag);
+        let second_matches = self.bd.ins().icmp(IntCC::Equal, second_tag, expected_tag);
+        let tag_matches = self.bd.ins().bor(first_matches, second_matches);
+        let entry_offset =
+            self.bd
+                .ins()
+                .select(first_matches, first_entry_offset, second_entry_offset);
+
+        let page_mask = (1_u32 << config.page_shift) - 1;
+        let page_offset = self.bd.ins().band_imm(addr, i64::from(page_mask));
+        let maximum_offset = (1_u32 << config.page_shift) - access_bytes;
+        let access_fits = self.bd.ins().icmp_imm(
+            IntCC::UnsignedLessThanOrEqual,
+            page_offset,
+            i64::from(maximum_offset),
+        );
+
+        let pointer_table_offset = if write {
+            config.write_pointer_offset
+        } else {
+            config.read_pointer_offset
+        };
+        let pointer_base = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.fmem_ptr, i64::from(pointer_table_offset));
+        let pointer_address = self.bd.ins().iadd(pointer_base, entry_offset);
+        let pointer = self
+            .bd
+            .ins()
+            .load(self.consts.ptr_type, MEMFLAGS, pointer_address, 0);
+        let pointer_present = self.bd.ins().icmp_imm(IntCC::NotEqual, pointer, 0);
+
+        let valid = self.bd.ins().band(enabled, tag_matches);
+        let valid = self.bd.ins().band(valid, access_fits);
+        let valid = self.bd.ins().band(valid, pointer_present);
+
+        // Match the MPC750-shaped two-way data TLB used by the checked slow
+        // translator. A hit makes the opposite way the next replacement;
+        // failed or disabled probes preserve the current replacement word.
+        let lru_base = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.fmem_ptr, i64::from(config.lru_offset));
+        let lru_address = self.bd.ins().iadd(lru_base, lru_table_offset);
+        let old_lru = self.bd.ins().load(ir::types::I32, MEMFLAGS, lru_address, 0);
+        let hit_lru = self.bd.ins().uextend(ir::types::I32, first_matches);
+        let next_lru = self.bd.ins().select(valid, hit_lru, old_lru);
+        self.bd.ins().store(MEMFLAGS, next_lru, lru_address, 0);
+
+        // These counters make the sidecar's value auditable in retained browser
+        // evidence. Only primary-LUT misses with an enabled translated mapping
+        // count; disabled real-mode probes leave the counters unchanged.
+        let hit_count_offset = if write {
+            config.write_hit_count_offset
+        } else {
+            config.read_hit_count_offset
+        };
+        let hit_count_address = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.fmem_ptr, i64::from(hit_count_offset));
+        let miss_count_address = self
+            .bd
+            .ins()
+            .iadd_imm(self.consts.fmem_ptr, i64::from(config.miss_count_offset));
+        let count_address = self
+            .bd
+            .ins()
+            .select(valid, hit_count_address, miss_count_address);
+        let count = self
+            .bd
+            .ins()
+            .load(ir::types::I32, MEMFLAGS, count_address, 0);
+        let increment = self.bd.ins().uextend(ir::types::I32, enabled);
+        let count = self.bd.ins().iadd(count, increment);
+        self.bd.ins().store(MEMFLAGS, count, count_address, 0);
+
+        let page_offset = self.extend_to_pointer_type(page_offset);
+        let pointer = self.bd.ins().iadd(pointer, page_offset);
+        let zero = self.bd.ins().iconst(self.consts.ptr_type, 0);
+        self.bd.ins().select(valid, pointer, zero)
+    }
+
+    fn scalar_fastmem_pointer(
+        &mut self,
+        addr: ir::Value,
+        primary_page: ir::Value,
+        write: bool,
+        access_bytes: u32,
+    ) -> ir::Value {
+        let primary_block = self.bd.create_block();
+        let secondary_block = self.bd.create_block();
+        let continue_block = self.bd.create_block();
+        self.bd
+            .append_block_param(continue_block, self.consts.ptr_type);
+        self.bd
+            .ins()
+            .brif(primary_page, primary_block, &[], secondary_block, &[]);
+        self.bd.seal_block(primary_block);
+        self.bd.seal_block(secondary_block);
+
+        self.switch_to_bb(primary_block);
+        let page_offset = self.bd.ins().band_imm(addr, (1 << 17) - 1);
+        let access_fits = self.bd.ins().icmp_imm(
+            IntCC::UnsignedLessThanOrEqual,
+            page_offset,
+            i64::from((1_u32 << 17) - access_bytes),
+        );
+        let offset = self.extend_to_pointer_type(page_offset);
+        let candidate = self.bd.ins().iadd(primary_page, offset);
+        let zero = self.bd.ins().iconst(self.consts.ptr_type, 0);
+        let pointer = self.bd.ins().select(access_fits, candidate, zero);
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(pointer)]);
+
+        self.switch_to_bb(secondary_block);
+        let pointer = if self.frontend.secondary_fastmem.is_some() {
+            self.secondary_fastmem_pointer(addr, write, access_bytes)
+        } else {
+            self.bd.ins().iconst(self.consts.ptr_type, 0)
+        };
+        self.bd
+            .ins()
+            .jump(continue_block, &[ir::BlockArg::Value(pointer)]);
+
+        self.bd.seal_block(continue_block);
+        self.switch_to_bb(continue_block);
+        self.bd.block_params(continue_block)[0]
+    }
+
     fn indexed_effective_address(&mut self, ins: Ins) -> ir::Value {
         let rb = self.get(ins.gpr_b());
         if ins.field_ra() == 0 {
@@ -180,7 +361,7 @@ impl BlockBuilder<'_> {
             self.bd
                 .ins()
                 .stack_addr(self.consts.ptr_type, self.consts.read_stack_slot, 0);
-        self.publish_hook_cycle_offset();
+        self.publish_checked_memory_hook_cycle_offset();
         let inst = self.bd.ins().call(
             self.hooks.load_reserve,
             &[self.consts.ctx_ptr, addr, stack_slot_addr],
@@ -193,7 +374,7 @@ impl BlockBuilder<'_> {
     }
 
     fn store_conditional_i32(&mut self, addr: ir::Value, value: ir::Value) -> ir::Value {
-        self.publish_hook_cycle_offset();
+        self.publish_checked_memory_hook_cycle_offset();
         let inst = self.bd.ins().call(
             self.hooks.store_conditional,
             &[self.consts.ctx_ptr, addr, value],
@@ -280,7 +461,7 @@ impl BlockBuilder<'_> {
                 .ins()
                 .stack_addr(self.consts.ptr_type, self.consts.read_stack_slot, 0);
 
-        self.publish_hook_cycle_offset();
+        self.publish_checked_memory_hook_cycle_offset();
         let inst = self
             .bd
             .ins()
@@ -295,7 +476,7 @@ impl BlockBuilder<'_> {
 
     pub fn slow_mem_store<P: ReadWriteAble>(&mut self, addr: ir::Value, value: ir::Value) {
         let func = P::write_hook(self);
-        self.publish_hook_cycle_offset();
+        self.publish_checked_memory_hook_cycle_offset();
         let inst = self
             .bd
             .ins()
@@ -342,6 +523,7 @@ impl BlockBuilder<'_> {
             .bd
             .ins()
             .load(self.consts.ptr_type, MEMFLAGS_READONLY, lut_ptr, 0);
+        let ptr = self.scalar_fastmem_pointer(addr, ptr, false, P::IR_TYPE.bytes());
 
         let fast_block = self.bd.create_block();
         let slow_block = self.bd.create_block();
@@ -355,9 +537,6 @@ impl BlockBuilder<'_> {
 
         // fast
         self.switch_to_bb(fast_block);
-        let offset = self.bd.ins().band_imm(addr, (1 << 17) - 1);
-        let offset = self.extend_to_pointer_type(offset);
-        let ptr = self.bd.ins().iadd(ptr, offset);
         let value = self.bd.ins().load(P::IR_TYPE, MEMFLAGS, ptr, 0);
         let value = if P::IR_TYPE != ir::types::I8 {
             self.bd.ins().bswap(value)
@@ -404,6 +583,7 @@ impl BlockBuilder<'_> {
             .bd
             .ins()
             .load(self.consts.ptr_type, MEMFLAGS_READONLY, lut_ptr, 0);
+        let ptr = self.scalar_fastmem_pointer(addr, ptr, true, P::IR_TYPE.bytes());
 
         let fast_block = self.bd.create_block();
         let slow_block = self.bd.create_block();
@@ -416,9 +596,6 @@ impl BlockBuilder<'_> {
 
         // fast
         self.switch_to_bb(fast_block);
-        let offset = self.bd.ins().band_imm(addr, ((1u64 << 17) - 1) as i64);
-        let offset = self.extend_to_pointer_type(offset);
-        let ptr = self.bd.ins().iadd(ptr, offset);
         let value_bswap = if P::IR_TYPE != ir::types::I8 {
             self.bd.ins().bswap(value)
         } else {
@@ -444,7 +621,7 @@ impl BlockBuilder<'_> {
                 .ins()
                 .stack_addr(self.consts.ptr_type, self.consts.read_stack_slot, 0);
 
-        self.publish_hook_cycle_offset();
+        self.publish_checked_memory_hook_cycle_offset();
         let inst = self.bd.ins().call(
             self.hooks.read_quant,
             &[self.consts.ctx_ptr, addr, gqr, stack_slot_addr],
@@ -483,7 +660,7 @@ impl BlockBuilder<'_> {
         gqr: ir::Value,
         value: ir::Value,
     ) -> ir::Value {
-        self.publish_hook_cycle_offset();
+        self.publish_checked_memory_hook_cycle_offset();
         let inst = self.bd.ins().call(
             self.hooks.write_quant,
             &[self.consts.ctx_ptr, addr, gqr, value],

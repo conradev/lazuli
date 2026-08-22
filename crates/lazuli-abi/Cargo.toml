@@ -1,0 +1,9 @@
+[package]
+name = "lazuli-abi"
+description = "Versioned shared-memory ABI for Lazuli's browser WebAssembly runtime"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[lints]
+workspace = true

@@ -2,21 +2,27 @@
 
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
   assertGenericFrontend,
   buildWeb,
+  requireUnselectedGameFidelitySnapshot,
   withoutDebugUi,
 } from "./build_web.mjs";
 import {
   RELEASE_SCHEMA,
+  RELEASE_BOOTSTRAP_URLS,
+  RESIDENT_RUNTIME_ABI,
+  RESIDENT_RUNTIME_CHOICE,
+  ROLLBACK_RELEASE_SCHEMA,
   WASM_CHUNK_SIZE,
   releaseIdentityPayload,
   sha256Hex,
   validateRelease,
+  verifyAssetBytes,
 } from "../web/release.mjs";
 
 const temporaryDirectories = [];
@@ -48,6 +54,54 @@ const genericDiscSourceConfig = `const defaultDiscSourceConfig = false
         ? { kind: "boot-assets" }
         : null;`;
 
+async function fixtureAsset(directory, bytes, prefix, extension) {
+  const sha256 = await sha256Hex(bytes);
+  const descriptor = {
+    url: `/assets/${prefix}-${sha256}.${extension}`,
+    sha256,
+    bytes: bytes.byteLength,
+  };
+  await mkdir(join(directory, "assets"), { recursive: true });
+  await writeFile(join(directory, descriptor.url.slice(1)), bytes);
+  return descriptor;
+}
+
+async function rollbackFixture(directory) {
+  const commit = "f".repeat(40);
+  const repository = "https://github.com/conradev/lazuli";
+  const bytes = label => Buffer.from(label);
+  const backendBytes = bytes("schema-3 backend");
+  const release = {
+    schema: ROLLBACK_RELEASE_SCHEMA,
+    source: {
+      repository,
+      commit,
+      tree: `${repository}/tree/${commit}`,
+      archive: `${repository}/archive/${commit}.tar.gz`,
+      license: {
+        expression: "GPL-3.0-only",
+        text: "/LICENSE.txt",
+        source: `${repository}/blob/${commit}/licenses/GPL-3.0-only.txt`,
+      },
+    },
+    frontend: await fixtureAsset(directory, bytes("schema-3 frontend"), "rollback-frontend", "html"),
+    renderer: {
+      javascript: await fixtureAsset(directory, bytes("schema-3 renderer js"), "rollback-renderer", "js"),
+      wasm: await fixtureAsset(directory, bytes("schema-3 renderer wasm"), "rollback-renderer-wasm", "wasm"),
+    },
+    dsp: await fixtureAsset(directory, bytes("schema-3 dsp"), "rollback-dsp", "wasm"),
+    backend: {
+      url: "/ppcwasmjit.wasm",
+      sha256: await sha256Hex(backendBytes),
+      bytes: backendBytes.byteLength,
+      chunkSize: WASM_CHUNK_SIZE,
+      chunks: [await fixtureAsset(directory, backendBytes, "rollback-backend", "wasm.chunk")],
+    },
+  };
+  release.releaseId = await sha256Hex(JSON.stringify(releaseIdentityPayload(release)));
+  return release;
+}
+
 test("release builder accepts only a generic generated frontend", () => {
   assert.doesNotThrow(() => assertGenericFrontend(genericDiscSourceConfig));
   assert.throws(
@@ -70,12 +124,22 @@ test("release builder accepts only a generic generated frontend", () => {
   );
 });
 
+test("release ABI gate rejects a fidelity snapshot before authenticated title selection", () => {
+  assert.doesNotThrow(() => requireUnselectedGameFidelitySnapshot({
+    core_game_fidelity_snapshot: () => 0,
+  }, "before"));
+  assert.throws(() => requireUnselectedGameFidelitySnapshot({
+    core_game_fidelity_snapshot: () => 8,
+  }, "before"), /exposed a game-fidelity snapshot before authenticated title selection/);
+});
+
 test("builds a deterministic licensed release from a generic generated frontend", async () => {
   const directory = await mkdtemp(join(tmpdir(), "lazuli-web-build-"));
   temporaryDirectories.push(directory);
   const appPath = join(directory, "index.html");
-  const wasmPath = join(directory, "ppcwasmjit.wasm");
-  const dspPath = join(directory, "browser_dsp.wasm");
+  const corePath = join(directory, "browser_machine.wasm");
+  const dispatcherPath = join(directory, "resident_dispatcher.wasm");
+  const coordinatorPath = join(directory, "core_run_coordinator.wasm");
   const rendererJavascriptPath = join(directory, "browser_renderer.js");
   const rendererWasmPath = join(directory, "browser_renderer_bg.wasm");
   const outputPath = join(directory, "dist");
@@ -94,15 +158,20 @@ test("builds a deterministic licensed release from a generic generated frontend"
 <details id="diagnostics"><button id="stop-runner">Stop</button></details>
 <!-- LAZULI DEBUG UI END -->
 <script type="module">import initRenderer from "/browser_renderer.js";
-new URL("/ppcwasmjit.wasm", location.href);
-new URL("/browser_dsp.wasm", location.href);
+const residentReleaseRuntime = __LAZULI_RESIDENT_RELEASE_RUNTIME__;
+const residentWorker = new Worker(residentReleaseRuntime.worker.url, { type: "module" });
+const residentArtifacts = {
+  core: residentReleaseRuntime.core.url,
+  dispatcher: residentReleaseRuntime.dispatcher.url,
+  coordinator: residentReleaseRuntime.coordinator.url,
+};
+void residentWorker; void residentArtifacts;
 ${genericDiscSourceConfig}
 </script><footer>${sourceAnchor}</footer></main></body>`,
   );
-  const wasm = Buffer.alloc(WASM_CHUNK_SIZE * 2 + 17);
-  for (let index = 0; index < wasm.length; index += 1) wasm[index] = index * 31 & 0xff;
-  await writeFile(wasmPath, wasm);
-  const dspWasm = Buffer.from("browser DSP wasm fixture");
+  const coreWasm = Buffer.from("feature-on browser machine wasm fixture");
+  const dispatcherWasm = Buffer.from("resident dispatcher wasm fixture");
+  const coordinatorWasm = Buffer.from("run coordinator wasm fixture");
   const rendererWasm = Buffer.from("renderer wasm fixture");
   const rendererJavascript = [
     "let wasm;",
@@ -113,37 +182,51 @@ ${genericDiscSourceConfig}
     "",
   ].join("\n");
   await Promise.all([
-    writeFile(dspPath, dspWasm),
+    writeFile(corePath, coreWasm),
+    writeFile(dispatcherPath, dispatcherWasm),
+    writeFile(coordinatorPath, coordinatorWasm),
     writeFile(rendererJavascriptPath, rendererJavascript),
     writeFile(rendererWasmPath, rendererWasm),
   ]);
 
   const commit = "0123456789abcdef0123456789abcdef01234567";
-  const release = await buildWeb({ appPath, wasmPath, dspPath, outputPath, commit });
+  const rollbackRelease = await rollbackFixture(directory);
+  const buildOptions = {
+    appPath,
+    corePath,
+    dispatcherPath,
+    coordinatorPath,
+    rollbackRelease,
+    rollbackDirectory: directory,
+    outputPath,
+    commit,
+    runtimeAbiVerifier: () => ({ ...RESIDENT_RUNTIME_ABI }),
+  };
+  const release = await buildWeb(buildOptions);
   await validateRelease(release);
-  assert.equal(release.backend.chunks.length, 3);
-  assert.deepEqual(release.backend.chunks.map(chunk => chunk.bytes), [
-    WASM_CHUNK_SIZE,
-    WASM_CHUNK_SIZE,
-    17,
-  ]);
+  assert.equal(release.runtime.choice, RESIDENT_RUNTIME_CHOICE);
+  assert.deepEqual(release.runtime.abi, RESIDENT_RUNTIME_ABI);
+  assert.equal(release.rollback.release.releaseId, rollbackRelease.releaseId);
   assert.equal(
     release.releaseId,
     await sha256Hex(JSON.stringify(releaseIdentityPayload(release))),
   );
+  for (const [name, url] of Object.entries(RELEASE_BOOTSTRAP_URLS)) {
+    assert.equal(release.bootstrap[name].url, url);
+    const builtBytes = await readFile(join(outputPath, url.slice(1)));
+    const sourceBytes = await readFile(new URL(`../web${url}`, import.meta.url));
+    assert.deepEqual(builtBytes, sourceBytes);
+    await verifyAssetBytes(release.bootstrap[name], builtBytes);
+  }
 
-  const rebuilt = Buffer.concat(await Promise.all(release.backend.chunks.map(async chunk =>
-    readFile(join(outputPath, chunk.url.slice(1)))
-  )));
-  assert.deepEqual(rebuilt, wasm);
+  assert.deepEqual(
+    await readFile(join(outputPath, release.runtime.core.url.slice(1))),
+    coreWasm,
+  );
   const builtRendererWasm = await readFile(
     join(outputPath, release.renderer.wasm.url.slice(1)),
   );
   assert.deepEqual(builtRendererWasm, rendererWasm);
-  assert.deepEqual(
-    await readFile(join(outputPath, release.dsp.url.slice(1))),
-    dspWasm,
-  );
   const builtRendererJavascript = await readFile(
     join(outputPath, release.renderer.javascript.url.slice(1)),
     "utf8",
@@ -177,8 +260,30 @@ ${genericDiscSourceConfig}
   assert.match(frontend, /<main>Play<\/main>/);
   assert.ok(frontend.includes(release.renderer.javascript.url));
   assert.ok(!frontend.includes("/browser_renderer.js"));
-  assert.ok(frontend.includes(release.dsp.url));
   assert.ok(!frontend.includes("/browser_dsp.wasm"));
+  assert.ok(frontend.includes(release.runtime.worker.url));
+  assert.ok(frontend.includes(release.runtime.core.url));
+  assert.ok(frontend.includes(release.runtime.dispatcher.url));
+  assert.ok(frontend.includes(release.runtime.coordinator.url));
+  assert.ok(!frontend.includes("__LAZULI_RESIDENT_RELEASE_RUNTIME__"));
+  const packagedWorker = await readFile(
+    join(outputPath, release.runtime.worker.url.slice(1)),
+    "utf8",
+  );
+  assert.ok(packagedWorker.includes(`from "${release.runtime.adapter.url}"`));
+  assert.ok(!packagedWorker.includes('from "./resident-machine.mjs"'));
+  for (const rollbackAsset of [
+    rollbackRelease.frontend,
+    rollbackRelease.renderer.javascript,
+    rollbackRelease.renderer.wasm,
+    rollbackRelease.dsp,
+    ...rollbackRelease.backend.chunks,
+  ]) {
+    assert.deepEqual(
+      await readFile(join(outputPath, rollbackAsset.url.slice(1))),
+      await readFile(join(directory, rollbackAsset.url.slice(1))),
+    );
+  }
 
   const [sourcePage, thirdPartyNotices, vendoredFontLicense] = await Promise.all([
     readFile(join(outputPath, "source", "index.html"), "utf8"),
@@ -225,13 +330,17 @@ ${genericDiscSourceConfig}
   assert.doesNotMatch(sourcePage, /This release is GPL-3\.0-only\./);
 
   const firstManifest = await readFile(join(outputPath, "release.json"), "utf8");
-  const secondRelease = await buildWeb({ appPath, wasmPath, dspPath, outputPath, commit });
+  const secondRelease = await buildWeb(buildOptions);
   assert.equal(secondRelease.releaseId, release.releaseId);
   assert.equal(await readFile(join(outputPath, "release.json"), "utf8"), firstManifest);
-  await writeFile(dspPath, Buffer.from("changed browser DSP wasm fixture"));
-  const changedDspRelease = await buildWeb({ appPath, wasmPath, dspPath, outputPath, commit });
-  assert.notEqual(changedDspRelease.dsp.sha256, release.dsp.sha256);
-  assert.notEqual(changedDspRelease.releaseId, release.releaseId);
+  const residentFrontend = await readFile(appPath, "utf8");
+  await writeFile(appPath, residentFrontend.replace("__LAZULI_RESIDENT_RELEASE_RUNTIME__", "{}"));
+  await assert.rejects(buildWeb(buildOptions), /exactly one resident runtime marker/);
+  await writeFile(appPath, residentFrontend);
+  await writeFile(corePath, Buffer.from("changed feature-on browser machine wasm fixture"));
+  const changedCoreRelease = await buildWeb(buildOptions);
+  assert.notEqual(changedCoreRelease.runtime.core.sha256, release.runtime.core.sha256);
+  assert.notEqual(changedCoreRelease.releaseId, release.releaseId);
   const headers = await readFile(join(outputPath, "_headers"), "utf8");
   assert.match(headers, /\/release\.json\n  Cache-Control: no-store/);
   assert.match(headers, /\/source\/\n  Cache-Control: no-store/);
@@ -240,7 +349,12 @@ ${genericDiscSourceConfig}
     /\/THIRD-PARTY-NOTICES\.txt\n  Cache-Control: no-store/,
   );
   assert.doesNotMatch(headers, /^\/app(?:\.html)?$/m);
+  assert.equal(
+    await readFile(join(outputPath, "_redirects"), "utf8"),
+    "# SPDX-License-Identifier: GPL-3.0-only\n/ /index.html 200\n",
+  );
   const rootFiles = await readdir(outputPath);
+  assert.ok(rootFiles.includes("_redirects"));
   assert.ok(rootFiles.includes("THIRD-PARTY-NOTICES.txt"));
   assert.ok(rootFiles.includes("source"));
   assert.ok(!rootFiles.includes("source.html"));
@@ -251,40 +365,6 @@ ${genericDiscSourceConfig}
   assert.ok(!rootFiles.includes("browser_renderer.js"), "renderer JavaScript must be content-addressed");
   assert.ok(!rootFiles.includes("browser_renderer_bg.wasm"), "renderer wasm must be content-addressed");
   assert.ok(!rootFiles.includes("browser_dsp.wasm"), "DSP wasm must be content-addressed");
-});
-
-test("release validation requires both renderer assets", async () => {
-  const hash = "0".repeat(64);
-  const commit = "0".repeat(40);
-  const release = {
-    schema: RELEASE_SCHEMA,
-    releaseId: hash,
-    source: {
-      repository: "https://github.com/conradev/lazuli",
-      commit,
-      tree: `https://github.com/conradev/lazuli/tree/${commit}`,
-      archive: `https://github.com/conradev/lazuli/archive/${commit}.tar.gz`,
-      license: {
-        expression: "GPL-3.0-only",
-        text: "/LICENSE.txt",
-        source: `https://github.com/conradev/lazuli/blob/${commit}/licenses/GPL-3.0-only.txt`,
-      },
-    },
-    frontend: { url: `/assets/frontend-${hash}.html`, sha256: hash, bytes: 1 },
-    backend: {
-      url: "/ppcwasmjit.wasm",
-      sha256: hash,
-      bytes: 1,
-      chunkSize: WASM_CHUNK_SIZE,
-      chunks: [{ url: `/assets/backend-${hash}.wasm.chunk`, sha256: hash, bytes: 1 }],
-    },
-  };
-  await assert.rejects(validateRelease(release), /renderer is missing/);
-  release.renderer = {
-    javascript: { url: `/assets/browser-renderer-${hash}.js`, sha256: hash, bytes: 1 },
-    wasm: { url: `/assets/browser-renderer-wasm-${hash}.wasm`, sha256: hash, bytes: 1 },
-  };
-  await assert.rejects(validateRelease(release), /DSP wasm is missing/);
 });
 
 test("preserves historical schema-1 and schema-2 release identities", async () => {
@@ -328,8 +408,10 @@ test("rejects a non-exact source revision", async () => {
   await assert.rejects(
     buildWeb({
       appPath: "missing",
-      wasmPath: "missing",
-      dspPath: "missing",
+      corePath: "missing",
+      dispatcherPath: "missing",
+      coordinatorPath: "missing",
+      rollbackReleasePath: "missing",
       outputPath: "dist",
       commit: "HEAD",
     }),
@@ -474,7 +556,7 @@ test("public shell exposes no compatibility route parameters", async () => {
   );
 });
 
-test("public shell requires a schema-3 worker and never launches a stored release", async () => {
+test("public shell requires the schema-4 resident worker and never launches a stored release", async () => {
   const shell = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
   assert.match(
     shell,
@@ -483,22 +565,24 @@ test("public shell requires a schema-3 worker and never launches a stored releas
   assert.doesNotMatch(shell, /import .*release\.mjs/);
   assert.match(shell, /fetch\("\/\.gekko\/worker-status"/);
   assert.match(shell, /worker\?\.releaseSchema === EXPECTED_RELEASE_SCHEMA/);
+  assert.match(shell, /worker\?\.runtimeChoice === EXPECTED_RUNTIME_CHOICE/);
   assert.match(
     shell,
     /await navigator\.serviceWorker\.ready;\s*return waitForCompatibleController\(\);/,
   );
   assert.match(shell, /release\?\.schema !== EXPECTED_RELEASE_SCHEMA/);
+  assert.match(shell, /release\?\.runtime\?\.choice !== EXPECTED_RUNTIME_CHOICE/);
   assert.match(shell, /requireCompatibleRelease\(await response\.json\(\)\)/);
   assert.match(shell, /result\.release = requireCompatibleRelease\(result\.release\)/);
   assert.match(shell, /selectStagedRelease\(latest, staged\)/);
   assert.doesNotMatch(shell, /saved\s*\|\|=/);
-  assert.match(shell, /mandatory WebGPU service worker did not take control/);
+  assert.match(shell, /mandatory resident service worker did not take control/);
   assert.doesNotMatch(shell, /verified saved release while the network-dependent upgrade waits/);
 });
 
 test("service worker keeps bootstrap modules available across schema upgrades", async () => {
   const worker = await readFile(new URL("../web/sw.js", import.meta.url), "utf8");
-  assert.match(worker, /BOOTSTRAP_CACHE = "gekko-bootstrap-v2"/);
+  assert.match(worker, /BOOTSTRAP_CACHE = "gekko-bootstrap-v3"/);
   assert.match(worker, /BOOTSTRAP_ASSETS\.includes\(url\.pathname\)/);
   assert.match(worker, /validateStoredRelease\(record\.release\)/);
 });

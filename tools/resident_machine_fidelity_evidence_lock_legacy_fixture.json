@@ -1,0 +1,153 @@
+{
+  "schema": "lazuli-resident-renderer-fidelity-evidence-lock-v2",
+  "evidenceMode": "first-renderer-owned-presented-xfb-with-durable-probe-checkpoints-and-machine-evidence-v1",
+  "corpus": {
+    "workspacePath": "tools/compatibility/games/corpus.json",
+    "bytes": 4356,
+    "sha256": "43597e441ab8c38adb18beed8ac34895a8496cac8ac2112ef4cb27c7504f4fc6"
+  },
+  "selectedGame": {
+    "key": "warioware-usa",
+    "priority": 1,
+    "bytes": 889225792,
+    "sha256": "b8c33924afed0fec165afc3fe0d6e8dddfcdef53842fcae180560b3b904b4a81"
+  },
+  "artifacts": {
+    "browser_machine.wasm": {
+      "bytes": 14945876,
+      "sha256": "e7249e3ccf22d5321cc8f90d2f8f1b9a3f695eefe6e3d66cb29c15bfad7d7de0"
+    },
+    "resident_dispatcher.wasm": {
+      "bytes": 361408,
+      "sha256": "a6c963bab8b9591315dbb94ea6ba6085bd57870fdde933894fba6fb4af43abbe"
+    },
+    "core_run_coordinator.wasm": {
+      "bytes": 362,
+      "sha256": "e0e22adfecbeb4e07b9fdd7c55c35edb3d9512b9e78a87dec52304cf6463a183"
+    },
+    "browser_renderer.js": {
+      "bytes": 81486,
+      "sha256": "83cb322bb7d02e8062a7bb8804d76c94adc45c193950837f342444d9c6fb327d"
+    },
+    "browser_renderer_bg.wasm": {
+      "bytes": 866635,
+      "sha256": "94cdf5ecfc8665af81208bf96dce7f1b1d640526139eb9efa6b7d520e4104b9c"
+    }
+  },
+  "sources": {
+    "web/resident-machine.mjs": {
+      "bytes": 35627,
+      "sha256": "50293f699e13ac85caa601b6ac79727ecd21f4bc40a308b9213359114aea16f8"
+    },
+    "web/resident-machine-worker.mjs": {
+      "bytes": 7373,
+      "sha256": "7b03d574c2bbe29f2ed3c2f22e1b1a7591d510f14036b4bd1ec4d2b714f264bf"
+    },
+    "tools/resident_machine_first_frame.html": {
+      "bytes": 785,
+      "sha256": "e0f8775c0ad6d2aa8a56c722e52a7bbde9aa3532290908743b68f25a624f530d"
+    },
+    "tools/resident_machine_first_frame.mjs": {
+      "bytes": 39607,
+      "sha256": "7d28f3b75df9e701e2a74d61f995515ee606189e29b1111379f0c1a51ee088c0"
+    },
+    "tools/resident_machine_evidence_v1.mjs": {
+      "bytes": 36491,
+      "sha256": "ed4c5779cbe323782b8ae09ad92a02783e3ae4d6bb54681647ba9fec5961d2b5"
+    },
+    "tools/resident_machine_first_frame_report.mjs": {
+      "bytes": 42185,
+      "sha256": "1bad85eb00cdbdb2fe792493512f4ef29ca37b2aae70e16aed3a8c4b5d798f4a"
+    },
+    "tools/resident_machine_fidelity_checkpoints.mjs": {
+      "bytes": 12233,
+      "sha256": "d535788aa6beb6ddcd80aab931fd5b020d1e2010798e2a3bf7bcf1b0cf9c9dd1"
+    },
+    "tools/resident_machine_fidelity_checkpoint_worker.mjs": {
+      "bytes": 4721,
+      "sha256": "28b4e7ec3777c107714a950eac4d5d245047573f9faa199be9f8ec5c4b33f087"
+    },
+    "tools/resident_machine_fidelity_checkpoint_report.mjs": {
+      "bytes": 14318,
+      "sha256": "b4bc61532dbb66ffd5a7ff63a973c20fd781593a574c5f098532add725a2232d"
+    },
+    "tools/resident_machine_fidelity_lock.mjs": {
+      "bytes": 13187,
+      "sha256": "fb04930f9c5258aa51b690317a73262a99bd3a77173f7a463eb2be894c3506a4"
+    },
+    "tools/resident_machine_fidelity_combined_report.mjs": {
+      "bytes": 11329,
+      "sha256": "f30a2c770f3e3ea31598fa23965a06dc32ffa92f02c57e8e180c155a852ff589"
+    },
+    "tools/resident_machine_fidelity_server.py": {
+      "bytes": 24341,
+      "sha256": "cd24aa60cc7c66226a52c8240ed0b9610da97aa58453cdce0672cb9564a3b5a0"
+    },
+    "tools/resident_machine_fidelity_watchdog.py": {
+      "bytes": 5248,
+      "sha256": "52d441beaa9bc5d547d69fb958745a57f0bd6810bbaf620d76015f8b69da2285"
+    },
+    "tools/resident_machine_corpus_server.py": {
+      "bytes": 15784,
+      "sha256": "7a094e410825618dcaa17e77d66fe64166740aaeca56bd8562f423d9c8fa08d9"
+    },
+    "crates/lazuli-abi/src/lib.rs": {
+      "bytes": 117198,
+      "sha256": "f566e3afc4f5f90242657225fb8330b19842ae03acf75886870b640120180d2a"
+    }
+  },
+  "hostPolicy": {
+    "transport": "immutable-http-range",
+    "maxRangeBytes": 67108864,
+    "semanticArguments": 0,
+    "checkpointBodyCap": 4096
+  },
+  "runPolicy": {
+    "instructionUpperCap": "100000000",
+    "executedCycleUpperCap": "250000000",
+    "sliceCycleUpperCap": "1000000",
+    "blockUpperCap": 16384,
+    "totalHostCallCap": 65535,
+    "totalColdInstallCap": 65535,
+    "maxBootReads": 8192,
+    "bootTimeoutMs": 180000,
+    "sliceTimeoutMs": 180000,
+    "runTimeoutMs": 600000,
+    "externalWallTimeoutMs": 600000,
+    "zeroProgressSliceCap": 4096
+  },
+  "checkpointPolicy": {
+    "checkpointTimeoutMs": 10000,
+    "checkpointRecordCap": 65535,
+    "probeEventRunCap": 32768,
+    "probeEventPerSubmissionCap": 402,
+    "opaqueProbeWords": 6,
+    "fsyncEveryRecord": true
+  },
+  "rendererProbe": {
+    "feature": "resident-render-probe",
+    "featureDefaultOff": true,
+    "hook": "globalThis.__lazuliResidentRenderProbe",
+    "rawFeatureWasmImports": 329,
+    "servedFeatureWasmImports": 330,
+    "featureHookImports": 1,
+    "rawDefaultWasmImports": 328,
+    "servedDefaultWasmImports": 329,
+    "defaultHookImports": 0,
+    "servedHookImportModule": "./browser_renderer_bg.js",
+    "servedHookImportField": "__wbg___lazuliResidentRenderProbe_718a3217ded92d15",
+    "servedHookImportKind": "function",
+    "progressSamplesPerStreamCap": 65,
+    "terminalQueueSubmitsPerRequestCap": 1,
+    "wideCountEncoding": "saturating-u32",
+    "javascriptWordInterpretations": 0
+  },
+  "machineEvidence": {
+    "abiVersion": 1,
+    "byteLength": 816,
+    "wordLength": 204,
+    "tag": "LZME",
+    "encoding": "base64",
+    "browserWordInterpretations": 0
+  }
+}

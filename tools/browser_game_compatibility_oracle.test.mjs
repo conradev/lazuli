@@ -321,6 +321,61 @@ function sample(offset = 0, surface = "local-debug") {
   };
 }
 
+function addResolvedStorageFaults(value, {
+  dataPage = 1_600,
+  dataProtection = 147,
+  instructionPage = 113,
+  instructionProtection = 0,
+} = {}) {
+  const data = dataPage + dataProtection;
+  const instruction = instructionPage + instructionProtection;
+  const raised = data + instruction;
+  value.report.exceptions.counts["0x0300"] = data;
+  value.report.exceptions.counts["0x0400"] = instruction;
+  const lastIsInstruction = instruction !== 0;
+  const lastIsProtection = lastIsInstruction
+    ? instructionProtection !== 0
+    : dataProtection !== 0;
+  const classification = lastIsInstruction
+    ? lastIsProtection
+      ? "instruction-protection-fault"
+      : "instruction-page-fault"
+    : lastIsProtection
+      ? "data-protection-fault"
+      : "data-page-fault";
+  value.report.exceptions.criticalStorageFaults = {
+    schema: "lazuli-critical-storage-fault-health-v1",
+    raised,
+    handlerReturns: raised,
+    resolved: raised,
+    recurrences: 0,
+    nested: 0,
+    classifications: {
+      "data-page-fault": dataPage,
+      "data-protection-fault": dataProtection,
+      "instruction-page-fault": instructionPage,
+      "instruction-protection-fault": instructionProtection,
+      unsupported: 0,
+    },
+    maxHandlerDispatches: 37,
+    maxHandlerCycles: 901,
+    pending: null,
+    lastResolved: {
+      address: lastIsInstruction ? "0x7fc0f7a4" : "0x7f3f0000",
+      attempts: 1,
+      cause: lastIsProtection ? "0x08000000" : "0x40000000",
+      classification,
+      handlerCycles: 700,
+      handlerDispatches: 31,
+      pc: lastIsInstruction ? "0x7fc0f7a4" : "0x7fc23b98",
+      reason: "retry-dispatch-complete",
+      sequence: raised,
+      vector: lastIsInstruction ? "0x0400" : "0x0300",
+    },
+  };
+  return value;
+}
+
 function makeInvisible(value, { blackAndWhite = false } = {}) {
   const selected = value.report.rendering.selectedXfb;
   const pixels = selected.width * selected.height;
@@ -345,6 +400,7 @@ test("strict snapshot accepts private local WebGPU evidence", () => {
     progress: {
       controllerAppliedSequence: 2,
       cycles: 100_000_000,
+      dataStorageFaults: 0,
       diskReads: 30,
       dispatches: 500_000,
       dspBudgetedInstructions: 8_333_333,
@@ -353,6 +409,7 @@ test("strict snapshot accepts private local WebGPU evidence", () => {
       gxCommands: 529,
       hostPresentations: 2,
       instructions: 14_000_000,
+      instructionStorageFaults: 0,
       presentationSerial: 2,
       primitives: 2,
       rendererPresents: 11,
@@ -364,6 +421,74 @@ test("strict snapshot accepts private local WebGPU evidence", () => {
     schema: GAME_COMPATIBILITY_RUNTIME_SCHEMA,
     surface: "local-debug",
   });
+});
+
+test("snapshot accepts only fully returned and retry-resolved VM storage faults", () => {
+  const value = addResolvedStorageFaults(sample());
+  const verified = verifyGameCompatibilitySnapshot({ ...value, game: game() });
+  assert.equal(verified.progress.dataStorageFaults, 1_747);
+  assert.equal(verified.progress.instructionStorageFaults, 113);
+
+  const cases = [
+    [
+      candidate => { delete candidate.report.exceptions.criticalStorageFaults; },
+      /criticalStorageFaults.*expected an object/,
+    ],
+    [
+      candidate => { candidate.report.exceptions.criticalStorageFaults.handlerReturns -= 1; },
+      /handlerReturns/,
+    ],
+    [
+      candidate => { candidate.report.exceptions.criticalStorageFaults.resolved -= 1; },
+      /resolved/,
+    ],
+    [
+      candidate => { candidate.report.exceptions.criticalStorageFaults.recurrences = 1; },
+      /recurrences/,
+    ],
+    [
+      candidate => { candidate.report.exceptions.criticalStorageFaults.nested = 1; },
+      /nested/,
+    ],
+    [
+      candidate => {
+        candidate.report.exceptions.criticalStorageFaults.pending = {
+          phase: "handler",
+        };
+      },
+      /pending/,
+    ],
+    [
+      candidate => {
+        const health = candidate.report.exceptions.criticalStorageFaults;
+        health.classifications.unsupported = 1;
+        health.classifications["data-page-fault"] -= 1;
+      },
+      /unsupported|data-sum/,
+    ],
+    [
+      candidate => {
+        candidate.report.exceptions.criticalStorageFaults
+          .lastResolved.cause = "0x10000000";
+      },
+      /syndrome/,
+    ],
+    [
+      candidate => {
+        candidate.report.exceptions.criticalStorageFaults
+          .lastResolved.sequence -= 1;
+      },
+      /sequence/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const invalid = addResolvedStorageFaults(sample());
+    mutate(invalid);
+    assert.throws(
+      () => verifyGameCompatibilitySnapshot({ ...invalid, game: game() }),
+      pattern,
+    );
+  }
 });
 
 test("public-root evidence requires a local file upload", () => {
@@ -422,7 +547,10 @@ test("snapshot fails closed on renderer, device, queue, GX, and XFB faults", () 
     [value => { value.report.deviceEvents.diskDeviceError = 1; }, /diskDeviceError/],
     [value => { value.report.deviceEvents.dspAudioDmaStart = 0; }, /dspAudioDmaStart/],
     [value => { value.report.deviceEvents.dspAudioDmaBlock = 0; }, /dspAudioDmaBlock/],
-    [value => { value.report.exceptions.counts["0x0300"] = 1; }, /0x0300/],
+    [
+      value => { value.report.exceptions.counts["0x0300"] = 1; },
+      /0x0300|criticalStorageFaults/,
+    ],
     [value => { value.report.diskCommands.lastError = "0x00000001"; }, /lastError/],
     [value => { value.report.controller.queueOverflows = 1; }, /queueOverflows/],
     [value => { value.report.serialInterface.unknownOutputCommands = 1; }, /unknownOutputCommands/],
@@ -819,6 +947,7 @@ test("window requires 120 fields, 64 completed viewport frames, and every gamepl
     delta: {
       controllerAppliedSequence: 2,
       cycles: 1_000_000_000,
+      dataStorageFaults: 0,
       diskReads: 1,
       dispatches: 1_000_000,
       dspBudgetedInstructions: 83_333_333,
@@ -827,6 +956,7 @@ test("window requires 120 fields, 64 completed viewport frames, and every gamepl
       gxCommands: 1_000,
       hostPresentations: 70,
       instructions: 20_000_000,
+      instructionStorageFaults: 0,
       presentationSerial: 70,
       primitives: 300,
       rendererPresents: 140,
@@ -931,6 +1061,7 @@ test("first-visible gate tolerates boot frames then sustains direct WebGPU outpu
     delta: {
       controllerAppliedSequence: 2,
       cycles: 1_000_000_000,
+      dataStorageFaults: 0,
       diskReads: 1,
       dispatches: 1_000_000,
       dspBudgetedInstructions: 83_333_334,
@@ -939,6 +1070,7 @@ test("first-visible gate tolerates boot frames then sustains direct WebGPU outpu
       gxCommands: 1_000,
       hostPresentations: 70,
       instructions: 20_000_000,
+      instructionStorageFaults: 0,
       presentationSerial: 70,
       primitives: 300,
       rendererPresents: 140,

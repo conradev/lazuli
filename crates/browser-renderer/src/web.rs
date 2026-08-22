@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Range;
@@ -9,6 +9,7 @@ use std::task::{Context, Poll, Waker};
 
 use bytemuck::{Pod, Zeroable};
 use js_sys::{Array, Float32Array, Object, Promise, Reflect, Uint8Array, Uint32Array};
+use lazuli_abi::RenderReceiptStatus;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -17,18 +18,26 @@ use wgpu::util::DeviceExt;
 
 use crate::clip::{GxExactPreparationFailure, gx_exact_draw_raster_geometry};
 use crate::packet::{
-    GxCopyKind, GxCopyState, GxEfbPeekState, GxFramePacket, GxIndirectTevState,
-    GxTriangleAction,
+    GxCopyKind, GxCopyState, GxEfbPeekState, GxFramePacket, GxIndirectTevState, GxTriangleAction,
 };
 use crate::raster::{
     GxRasterAttributePlaneF32, gx_non_aa_raster_color_rgba8, gx_normalized_raster_channel_u8,
 };
+use crate::receipt_bridge::{
+    ResidentPresentationOutcome, ResidentReceiptBridge, ResidentReceiptTicket,
+    ResidentRenderOutcome, ResidentRenderWork, ResidentTextureMaterialization,
+};
+#[cfg(feature = "resident-render-probe")]
+use crate::render_probe::{
+    self, ResidentRenderProbeStage, ResidentRenderProbeWork, primitive_ordered_gpu_draws,
+    saturating_u32, saturating_usize_u32, should_sample_progress,
+};
 use crate::tev::{
-    MANAGED_TEX_COORD_SIDECAR_WORDS, MAX_TEV_TEXTURES, ManagedSidecarCapacityOutcome,
-    TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS, TEV_VERTEX_FLOATS, TevPipelineLayoutKind,
-    IndirectTevState, managed_sidecar_capacity_outcome, managed_tex_coord_sidecar_record,
-    managed_tex_coord_sidecar_record_base, required_texture_coords,
-    required_texture_coords_with_indirect, required_texture_maps,
+    IndirectTevState, MANAGED_TEX_COORD_SIDECAR_WORDS, MAX_TEV_TEXTURES,
+    ManagedSidecarCapacityOutcome, TEV_DRAW_STATE_BYTES, TEV_TEXTURE_METADATA_WORDS,
+    TEV_VERTEX_FLOATS, TevPipelineLayoutKind, managed_sidecar_capacity_outcome,
+    managed_tex_coord_sidecar_record, managed_tex_coord_sidecar_record_base,
+    required_texture_coords, required_texture_coords_with_indirect, required_texture_maps,
     required_texture_maps_with_indirect, shader_source as tev_shader_source,
     tev_pipeline_layout_kind, validate_draw_transport,
 };
@@ -873,12 +882,7 @@ impl IndirectTevUniform {
                     state.matrices[5],
                     required_coord_mask,
                 ],
-                [
-                    state.matrices[6],
-                    state.matrices[7],
-                    state.matrices[8],
-                    1,
-                ],
+                [state.matrices[6], state.matrices[7], state.matrices[8], 1],
             ],
             commands: std::array::from_fn(|row| {
                 std::array::from_fn(|column| state.commands[row * 4 + column])
@@ -1279,6 +1283,29 @@ struct PendingEfbPeekReadback {
     state: GxEfbPeekState,
 }
 
+enum PendingResidentGxCompletion {
+    Failed(RenderReceiptStatus),
+    Texture {
+        expected: Option<ResidentTextureMaterialization>,
+        readback: Option<PendingEfbTextureCopyReadback>,
+    },
+    Xfb,
+    EfbPeek {
+        expected: GxEfbPeekState,
+        readback: PendingEfbPeekReadback,
+    },
+}
+
+#[cfg(feature = "resident-render-probe")]
+const fn resident_render_probe_work(work: ResidentRenderWork) -> ResidentRenderProbeWork {
+    match work {
+        ResidentRenderWork::ViPresent { .. } => ResidentRenderProbeWork::ViPresent,
+        ResidentRenderWork::TextureCopy { .. } => ResidentRenderProbeWork::TextureCopy,
+        ResidentRenderWork::XfbCopy { .. } => ResidentRenderProbeWork::XfbCopy,
+        ResidentRenderWork::EfbPeek { .. } => ResidentRenderProbeWork::EfbPeek,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Primitive {
     Triangles,
@@ -1662,6 +1689,7 @@ pub struct WebGpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     failure_state: RendererFailureState,
+    resident_receipts: Rc<RefCell<ResidentReceiptBridge>>,
     metrics: Rc<Cell<RendererMetrics>>,
     // This 40-entry observer is cold; do not make every hot metric update copy it.
     exact_required_preparation_rejection_counts: Cell<ExactRequiredPreparationRejectionCounts>,
@@ -2178,6 +2206,59 @@ fn vi_field_parity(value: &str) -> Option<ViFieldParity> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct XfbPresentationOutcome {
+    accepted: bool,
+    presented: bool,
+    status: &'static str,
+    pair_epoch: u32,
+    presentation_serial: Option<u64>,
+}
+
+impl XfbPresentationOutcome {
+    const fn rejected(status: &'static str, pair_epoch: u32) -> Self {
+        Self {
+            accepted: false,
+            presented: false,
+            status,
+            pair_epoch,
+            presentation_serial: None,
+        }
+    }
+
+    const fn staged(status: &'static str, pair_epoch: u32) -> Self {
+        Self {
+            accepted: true,
+            presented: false,
+            status,
+            pair_epoch,
+            presentation_serial: None,
+        }
+    }
+
+    const fn presented(status: &'static str, pair_epoch: u32, serial: u64) -> Self {
+        Self {
+            accepted: true,
+            presented: true,
+            status,
+            pair_epoch,
+            presentation_serial: Some(serial),
+        }
+    }
+}
+
+fn xfb_presentation_result_from_outcome(
+    outcome: XfbPresentationOutcome,
+) -> Result<Object, JsValue> {
+    xfb_presentation_result(
+        outcome.accepted,
+        outcome.presented,
+        outcome.status,
+        outcome.pair_epoch,
+        outcome.presentation_serial,
+    )
+}
+
 fn xfb_presentation_result(
     accepted: bool,
     presented: bool,
@@ -2622,6 +2703,131 @@ async fn finish_efb_peek_readbacks(
     Ok(receipts)
 }
 
+fn resident_receipt_js_value(
+    bridge: &Rc<RefCell<ResidentReceiptBridge>>,
+    ticket: ResidentReceiptTicket,
+    outcome: Result<ResidentRenderOutcome, RenderReceiptStatus>,
+) -> Result<JsValue, JsValue> {
+    let bytes = match outcome {
+        Ok(outcome) => bridge
+            .try_borrow_mut()
+            .map_err(|_| JsValue::from_str("resident renderer receipt coordinator is borrowed"))?
+            .complete(ticket, outcome),
+        Err(status) => bridge
+            .try_borrow_mut()
+            .map_err(|_| JsValue::from_str("resident renderer receipt coordinator is borrowed"))?
+            .fail(ticket, status),
+    }
+    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    Ok(Uint8Array::from(bytes.as_slice()).into())
+}
+
+fn resident_receipt_promise(
+    bridge: &Rc<RefCell<ResidentReceiptBridge>>,
+    ticket: ResidentReceiptTicket,
+    outcome: Result<ResidentRenderOutcome, RenderReceiptStatus>,
+) -> Promise {
+    match resident_receipt_js_value(bridge, ticket, outcome) {
+        Ok(value) => Promise::resolve(&value),
+        Err(error) => Promise::reject(&error),
+    }
+}
+
+fn resident_sync_failure_status(failure_state: &RendererFailureState) -> RenderReceiptStatus {
+    match failure_state.failure() {
+        Some(failure) if failure.starts_with("WebGPU device lost") => {
+            RenderReceiptStatus::DeviceLost
+        }
+        Some(_) => RenderReceiptStatus::HostError,
+        None => RenderReceiptStatus::Rejected,
+    }
+}
+
+fn resident_async_failure_status(failure_state: &RendererFailureState) -> RenderReceiptStatus {
+    match failure_state.failure() {
+        Some(failure) if failure.starts_with("WebGPU device lost") => {
+            RenderReceiptStatus::DeviceLost
+        }
+        _ => RenderReceiptStatus::HostError,
+    }
+}
+
+fn resident_texture_readback_matches(
+    pending: &PendingEfbTextureCopyReadback,
+    expected: ResidentTextureMaterialization,
+) -> bool {
+    pending.destination == expected.terminal.destination
+        && pending.generation == expected.terminal.generation
+        && pending.width == expected.terminal.output_width
+        && pending.height == expected.terminal.output_height
+        && pending.stride == expected.terminal.stride
+        && pending.copy_format == expected.copy_format
+        && pending.base_format == expected.base_format
+        && pending.layout == expected.layout
+}
+
+async fn finish_resident_texture_readback(
+    pending: PendingEfbTextureCopyReadback,
+    expected: ResidentTextureMaterialization,
+    failure_state: &RendererFailureState,
+) -> Result<Vec<u8>, RenderReceiptStatus> {
+    if !resident_texture_readback_matches(&pending, expected) {
+        return Err(RenderReceiptStatus::HostError);
+    }
+    let Some(expected_len) = expected.payload_len() else {
+        return Err(RenderReceiptStatus::HostError);
+    };
+    if BufferMap::new(&pending.buffer).await.is_err() {
+        failure_state.record("WebGPU resident texture-copy map failed".to_owned());
+        return Err(resident_async_failure_status(failure_state));
+    }
+    let bytes = {
+        let mapped = pending.buffer.slice(..).get_mapped_range();
+        if mapped.len() != expected_len {
+            drop(mapped);
+            pending.buffer.unmap();
+            failure_state.record(format!(
+                "WebGPU resident texture-copy map returned an invalid byte length: expected {expected_len}"
+            ));
+            return Err(resident_async_failure_status(failure_state));
+        }
+        let bytes = mapped.to_vec();
+        drop(mapped);
+        pending.buffer.unmap();
+        bytes
+    };
+    Ok(bytes)
+}
+
+async fn finish_resident_efb_peek(
+    pending: PendingEfbPeekReadback,
+    expected: GxEfbPeekState,
+    failure_state: &RendererFailureState,
+) -> Result<u32, RenderReceiptStatus> {
+    if pending.state != expected {
+        return Err(RenderReceiptStatus::HostError);
+    }
+    if BufferMap::new(&pending.buffer).await.is_err() {
+        failure_state.record("WebGPU resident EFB-peek map failed".to_owned());
+        return Err(resident_async_failure_status(failure_state));
+    }
+    let value = {
+        let mapped = pending.buffer.slice(..).get_mapped_range();
+        if mapped.len() != size_of::<u32>() {
+            drop(mapped);
+            pending.buffer.unmap();
+            failure_state
+                .record("WebGPU resident EFB-peek map returned an invalid byte length".to_owned());
+            return Err(resident_async_failure_status(failure_state));
+        }
+        let value = u32::from_le_bytes([mapped[0], mapped[1], mapped[2], mapped[3]]);
+        drop(mapped);
+        pending.buffer.unmap();
+        value
+    };
+    Ok(value)
+}
+
 fn interleave_presented_xfb_fields(
     top: &[u8],
     bottom: &[u8],
@@ -2666,6 +2872,10 @@ impl WebGpuRenderer {
 
     pub fn reset(&mut self) -> Result<(), JsValue> {
         self.record_wasm_bridge_call(0);
+        self.resident_receipts
+            .try_borrow_mut()
+            .map_err(|_| JsValue::from_str("resident renderer receipt coordinator is borrowed"))?
+            .reset();
         // Pending fields own XFB surfaces. Release them before any fallible
         // health check so reset never strands pair state in a failed renderer.
         self.vi_field_pairs.reset();
@@ -2712,10 +2922,9 @@ impl WebGpuRenderer {
     }
 
     fn exact_required_rejection_snapshot(&self) -> ExactRequiredRejectionSnapshot {
-        ExactRequiredRejectionSnapshot::capture(
-            self.metrics.get(),
-            self.exact_required_preparation_rejection_counts.get(),
-        )
+        let metrics = self.metrics.get();
+        let preparation_rejections = self.exact_required_preparation_rejection_counts.get();
+        ExactRequiredRejectionSnapshot::capture(&metrics, &preparation_rejections)
     }
 
     fn host_phase_timer(&self, phase: RendererHostPhase) -> RendererPhaseTimer {
@@ -2969,6 +3178,295 @@ impl WebGpuRenderer {
             ensure_renderer_healthy(&failure_state)?;
             let receipts = finish_efb_peek_readbacks(pending, &failure_state).await?;
             Ok(receipts.into())
+        })
+    }
+
+    /// Execute one Rust-authored renderer request and return one canonical ABI receipt.
+    ///
+    /// JavaScript relays the opaque request bytes, their Rust-issued request flags, and their
+    /// Rust-issued sequence. Terminal kind, generation, texture layout, VI selection, and every
+    /// receipt field remain decoded and authored by Rust.
+    pub fn submit_resident_render(
+        &mut self,
+        source_request: Uint8Array,
+        request_flags: u32,
+        sequence_lo: u32,
+        sequence_hi: u32,
+    ) -> Promise {
+        let request_bytes = source_request.to_vec();
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::begin(sequence_lo, sequence_hi, request_bytes.len(), request_flags);
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::event(
+            ResidentRenderProbeStage::ReceiptParseBegin,
+            saturating_usize_u32(request_bytes.len()),
+            0,
+            0,
+        );
+        let sequence = u64::from(sequence_lo) | (u64::from(sequence_hi) << 32);
+        let ticket = match self
+            .resident_receipts
+            .try_borrow_mut()
+            .map_err(|_| JsValue::from_str("resident renderer receipt coordinator is borrowed"))
+            .and_then(|mut bridge| {
+                bridge
+                    .begin(request_flags, sequence, &request_bytes)
+                    .map_err(|error| JsValue::from_str(&error.to_string()))
+            }) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                #[cfg(feature = "resident-render-probe")]
+                {
+                    render_probe::event(
+                        ResidentRenderProbeStage::ReceiptParseEnd,
+                        0,
+                        ResidentRenderProbeWork::Unknown as u32,
+                        saturating_usize_u32(request_bytes.len()),
+                    );
+                    render_probe::finish_sync_prefix();
+                }
+                return Promise::reject(&error);
+            }
+        };
+
+        #[cfg(feature = "resident-render-probe")]
+        {
+            let work = resident_render_probe_work(ticket.work());
+            render_probe::set_work(work);
+            render_probe::event(
+                ResidentRenderProbeStage::ReceiptParseEnd,
+                1,
+                work as u32,
+                saturating_usize_u32(request_bytes.len()),
+            );
+        }
+        let promise = match ticket.work() {
+            ResidentRenderWork::ViPresent { .. } => {
+                self.submit_resident_vi(ticket, request_bytes.len())
+            }
+            ResidentRenderWork::TextureCopy { .. }
+            | ResidentRenderWork::XfbCopy { .. }
+            | ResidentRenderWork::EfbPeek { .. } => self.submit_resident_gx(ticket, request_bytes),
+        };
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::finish_sync_prefix();
+        promise
+    }
+
+    fn submit_resident_gx(
+        &mut self,
+        ticket: ResidentReceiptTicket,
+        request_bytes: Vec<u8>,
+    ) -> Promise {
+        let work = ticket.work();
+        let texture_readback_start = self.pending_efb_texture_copy_readbacks.len();
+        let peek_readback_start = self.pending_efb_peek_readbacks.len();
+        let render = self.submit_gx_frame_bytes(request_bytes, Vec::new());
+        let readback_accounting_valid = self.pending_efb_texture_copy_readbacks.len()
+            >= texture_readback_start
+            && self.pending_efb_peek_readbacks.len() >= peek_readback_start;
+        let mut texture_readbacks = if readback_accounting_valid {
+            self.pending_efb_texture_copy_readbacks
+                .split_off(texture_readback_start)
+        } else {
+            Vec::new()
+        };
+        let mut peek_readbacks = if readback_accounting_valid {
+            self.pending_efb_peek_readbacks
+                .split_off(peek_readback_start)
+        } else {
+            Vec::new()
+        };
+
+        let pending = if !readback_accounting_valid {
+            PendingResidentGxCompletion::Failed(RenderReceiptStatus::HostError)
+        } else if render.is_err() {
+            PendingResidentGxCompletion::Failed(resident_sync_failure_status(&self.failure_state))
+        } else {
+            match work {
+                ResidentRenderWork::TextureCopy {
+                    terminal,
+                    materialization,
+                } => {
+                    let cache_matches = materialization.is_none_or(|expected| {
+                        self.efb_copy_cache
+                            .get(&terminal.destination)
+                            .is_some_and(|cached| {
+                                cached.generation == terminal.generation
+                                    && cached.width == terminal.output_width
+                                    && cached.height == terminal.output_height
+                                    && cached.base_format == Some(expected.base_format)
+                            })
+                    });
+                    if !work.accepts_readback_counts(texture_readbacks.len(), peek_readbacks.len())
+                        || !cache_matches
+                    {
+                        PendingResidentGxCompletion::Failed(RenderReceiptStatus::HostError)
+                    } else {
+                        PendingResidentGxCompletion::Texture {
+                            expected: materialization,
+                            readback: texture_readbacks.pop(),
+                        }
+                    }
+                }
+                ResidentRenderWork::XfbCopy { terminal } => {
+                    let cache_matches =
+                        self.xfb_cache
+                            .get(&terminal.destination)
+                            .is_some_and(|copy| {
+                                copy.metadata.destination == terminal.destination
+                                    && copy.metadata.generation == terminal.generation
+                                    && copy.metadata.stride == terminal.stride
+                                    && copy.metadata.height == terminal.output_height
+                                    && copy.output_width == terminal.output_width
+                                    && copy.output_height == terminal.output_height
+                            });
+                    if !work.accepts_readback_counts(texture_readbacks.len(), peek_readbacks.len())
+                        || !cache_matches
+                    {
+                        PendingResidentGxCompletion::Failed(RenderReceiptStatus::HostError)
+                    } else {
+                        PendingResidentGxCompletion::Xfb
+                    }
+                }
+                ResidentRenderWork::EfbPeek { state } => {
+                    if !work.accepts_readback_counts(texture_readbacks.len(), peek_readbacks.len())
+                    {
+                        PendingResidentGxCompletion::Failed(RenderReceiptStatus::HostError)
+                    } else if let Some(readback) = peek_readbacks.pop() {
+                        PendingResidentGxCompletion::EfbPeek {
+                            expected: state,
+                            readback,
+                        }
+                    } else {
+                        PendingResidentGxCompletion::Failed(RenderReceiptStatus::HostError)
+                    }
+                }
+                ResidentRenderWork::ViPresent { .. } => {
+                    PendingResidentGxCompletion::Failed(RenderReceiptStatus::HostError)
+                }
+            }
+        };
+
+        let queue = self.queue.clone();
+        let failure_state = self.failure_state.clone();
+        let bridge = Rc::clone(&self.resident_receipts);
+        future_to_promise(async move {
+            QueueDrain::new(&queue).await;
+            let outcome = match pending {
+                PendingResidentGxCompletion::Failed(status) => Err(status),
+                PendingResidentGxCompletion::Texture {
+                    expected: None,
+                    readback: None,
+                } => Ok(ResidentRenderOutcome::TextureCopy(Vec::new())),
+                PendingResidentGxCompletion::Texture {
+                    expected: Some(expected),
+                    readback: Some(readback),
+                } => finish_resident_texture_readback(readback, expected, &failure_state)
+                    .await
+                    .map(ResidentRenderOutcome::TextureCopy),
+                PendingResidentGxCompletion::Texture { .. } => Err(RenderReceiptStatus::HostError),
+                PendingResidentGxCompletion::Xfb => Ok(ResidentRenderOutcome::XfbCopy),
+                PendingResidentGxCompletion::EfbPeek { expected, readback } => {
+                    finish_resident_efb_peek(readback, expected, &failure_state)
+                        .await
+                        .map(ResidentRenderOutcome::EfbPeek)
+                }
+            };
+            let outcome = if failure_state.failure().is_some() {
+                Err(resident_async_failure_status(&failure_state))
+            } else {
+                outcome
+            };
+            resident_receipt_js_value(&bridge, ticket, outcome)
+        })
+    }
+
+    fn submit_resident_vi(
+        &mut self,
+        ticket: ResidentReceiptTicket,
+        request_byte_len: usize,
+    ) -> Promise {
+        let ResidentRenderWork::ViPresent { request } = ticket.work() else {
+            return resident_receipt_promise(
+                &self.resident_receipts,
+                ticket,
+                Err(RenderReceiptStatus::HostError),
+            );
+        };
+        self.record_wasm_bridge_call(request_byte_len);
+        let mode = match request.mode() {
+            Ok(lazuli_abi::ViPresentationMode::Progressive) => ViPresentationMode::Progressive,
+            Ok(lazuli_abi::ViPresentationMode::SingleField) => ViPresentationMode::SingleField,
+            Ok(lazuli_abi::ViPresentationMode::Interlaced) => ViPresentationMode::Interlaced,
+            Err(_) => {
+                return resident_receipt_promise(
+                    &self.resident_receipts,
+                    ticket,
+                    Err(RenderReceiptStatus::HostError),
+                );
+            }
+        };
+        let parity = match request.parity() {
+            Ok(lazuli_abi::ViFieldParity::Top) => ViFieldParity::Top,
+            Ok(lazuli_abi::ViFieldParity::Bottom) => ViFieldParity::Bottom,
+            Err(_) => {
+                return resident_receipt_promise(
+                    &self.resident_receipts,
+                    ticket,
+                    Err(RenderReceiptStatus::HostError),
+                );
+            }
+        };
+        let presentation = self
+            .begin_xfb_presentation()
+            .and_then(|()| {
+                self.present_xfb_typed(
+                    request.selected_address,
+                    request.expected_generation,
+                    request.selected_row,
+                    mode,
+                    parity,
+                    request.pair_epoch,
+                    request.output_width,
+                    request.output_height,
+                    request.field_stride_bytes,
+                    request.field_height,
+                    request.row_repeat,
+                    false,
+                    false,
+                )
+            })
+            .map_err(|_| resident_sync_failure_status(&self.failure_state))
+            .and_then(|outcome| {
+                if outcome.pair_epoch != request.pair_epoch {
+                    return Err(RenderReceiptStatus::HostError);
+                }
+                match (
+                    outcome.accepted,
+                    outcome.presented,
+                    outcome.presentation_serial,
+                ) {
+                    (false, false, None) => Ok(ResidentPresentationOutcome::Rejected),
+                    (true, false, None) => Ok(ResidentPresentationOutcome::Staged),
+                    (true, true, Some(serial)) => {
+                        Ok(ResidentPresentationOutcome::Presented { serial })
+                    }
+                    _ => Err(RenderReceiptStatus::HostError),
+                }
+            });
+
+        let queue = self.queue.clone();
+        let failure_state = self.failure_state.clone();
+        let bridge = Rc::clone(&self.resident_receipts);
+        future_to_promise(async move {
+            QueueDrain::new(&queue).await;
+            let outcome = if failure_state.failure().is_some() {
+                Err(resident_async_failure_status(&failure_state))
+            } else {
+                presentation.map(ResidentRenderOutcome::ViPresent)
+            };
+            resident_receipt_js_value(&bridge, ticket, outcome)
         })
     }
 
@@ -3228,14 +3726,37 @@ impl WebGpuRenderer {
         source_packet: Uint8Array,
         source_pre_clears: Option<Uint32Array>,
     ) -> Result<Array, JsValue> {
-        let packet_bytes = source_packet.to_vec();
-        let pre_clear_words = source_pre_clears
-            .map(|source| source.to_vec())
-            .unwrap_or_default();
+        self.submit_gx_frame_bytes(
+            source_packet.to_vec(),
+            source_pre_clears
+                .map(|source| source.to_vec())
+                .unwrap_or_default(),
+        )
+    }
+
+    fn submit_gx_frame_bytes(
+        &mut self,
+        packet_bytes: Vec<u8>,
+        pre_clear_words: Vec<u32>,
+    ) -> Result<Array, JsValue> {
         let pre_clears = gx_pre_clears(&pre_clear_words)?;
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::event(
+            ResidentRenderProbeStage::ExecutionParseBegin,
+            saturating_usize_u32(packet_bytes.len()),
+            0,
+            0,
+        );
         let packet = GxFramePacket::parse(&packet_bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let header = *packet.header();
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::event(
+            ResidentRenderProbeStage::ExecutionParseEnd,
+            header.draw_count,
+            header.texture_count,
+            header.total_vertex_count,
+        );
         let texture_copy_plan = if header.copy_kind == GxCopyKind::Texture {
             texture_copy_plan_for_source(
                 header.source_x,
@@ -3285,9 +3806,24 @@ impl WebGpuRenderer {
         for draw in packet.draws() {
             source_vertices.extend(draw.vertex_floats());
         }
+        #[cfg(feature = "resident-render-probe")]
+        let exact_preparation_ordinal = Cell::new(0_u64);
         let prepared_exact_draws = packet
             .draws()
             .map(|draw| {
+                #[cfg(feature = "resident-render-probe")]
+                {
+                    let ordinal = exact_preparation_ordinal.get().saturating_add(1);
+                    exact_preparation_ordinal.set(ordinal);
+                    if should_sample_progress(ordinal, u64::from(header.draw_count)) {
+                        render_probe::event(
+                            ResidentRenderProbeStage::ExactPreparationProgress,
+                            saturating_u32(ordinal),
+                            header.draw_count,
+                            draw.record.vertex_count,
+                        );
+                    }
+                }
                 let vertex_start = draw.record.vertex_relative_offset as usize / size_of::<f32>();
                 let vertex_len = draw.record.vertex_count as usize * TEV_VERTEX_FLOATS;
                 let mut sampler_states = [GxSamplerState::default(); MAX_TEV_TEXTURES];
@@ -3313,10 +3849,32 @@ impl WebGpuRenderer {
                 )
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::event(
+            ResidentRenderProbeStage::WorkEstimate,
+            header.draw_count,
+            header.total_vertex_count,
+            saturating_u32(predicted_packet_primitive_ordered_gpu_draws(
+                &packet,
+                &prepared_exact_draws,
+            )),
+        );
+        #[cfg(feature = "resident-render-probe")]
+        let texture_preflight_total =
+            predicted_packet_texture_preflights(&packet, &prepared_exact_draws);
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::event(
+            ResidentRenderProbeStage::TexturePreflightProgress,
+            0,
+            saturating_u32(texture_preflight_total),
+            0,
+        );
         // Resolve every texture consumed by a prepared route before beginning
         // the segment. Authoritative no-ops and depth-only routes neither
         // validate nor protect irrelevant packet resources.
         let mut packet_texture_keys = HashSet::new();
+        #[cfg(feature = "resident-render-probe")]
+        let texture_preflight_completed = Cell::new(0_u64);
         for (draw, prepared_exact) in packet.draws().zip(&prepared_exact_draws) {
             if !draw_requires_texture_preflight(draw, prepared_exact.as_ref()) {
                 continue;
@@ -3371,6 +3929,19 @@ impl WebGpuRenderer {
                 )
                 .map_err(|error| JsValue::from_str(&error))?;
                 packet_texture_keys.insert(texture.key);
+                #[cfg(feature = "resident-render-probe")]
+                {
+                    let completed = texture_preflight_completed.get().saturating_add(1);
+                    texture_preflight_completed.set(completed);
+                    if should_sample_progress(completed, texture_preflight_total) {
+                        render_probe::event(
+                            ResidentRenderProbeStage::TexturePreflightProgress,
+                            saturating_u32(completed),
+                            saturating_u32(texture_preflight_total),
+                            saturating_usize_u32(packet_texture_keys.len()),
+                        );
+                    }
+                }
             }
         }
         drop(packet_parse_timer);
@@ -3392,6 +3963,15 @@ impl WebGpuRenderer {
         let gx_frame_execution_timer = self.host_phase_timer(RendererHostPhase::GxFrameExecution);
         let render = (|| {
             self.begin_segment_inner()?;
+            #[cfg(feature = "resident-render-probe")]
+            render_probe::event(
+                ResidentRenderProbeStage::DrawExecutionProgress,
+                0,
+                header.draw_count,
+                saturating_usize_u32(self.tev_draw_bindings.len()),
+            );
+            #[cfg(feature = "resident-render-probe")]
+            let draw_execution_completed = Cell::new(0_u64);
             for (draw, prepared_exact) in packet.draws().zip(&prepared_exact_draws) {
                 let vertex_start = draw.record.vertex_relative_offset as usize / size_of::<f32>();
                 let vertex_len = draw.record.vertex_count as usize * TEV_VERTEX_FLOATS;
@@ -3457,6 +4037,19 @@ impl WebGpuRenderer {
                     draw.record.scissor_width,
                     draw.record.scissor_height,
                 )?;
+                #[cfg(feature = "resident-render-probe")]
+                {
+                    let completed = draw_execution_completed.get().saturating_add(1);
+                    draw_execution_completed.set(completed);
+                    if should_sample_progress(completed, u64::from(header.draw_count)) {
+                        render_probe::event(
+                            ResidentRenderProbeStage::DrawExecutionProgress,
+                            saturating_u32(completed),
+                            header.draw_count,
+                            saturating_usize_u32(self.tev_draw_bindings.len()),
+                        );
+                    }
+                }
             }
 
             match header.copy_kind {
@@ -3675,9 +4268,8 @@ impl WebGpuRenderer {
             );
         }
 
-        let (required_maps, required_coords) =
-            tev_resource_requirements(tev_state, indirect_tev)
-                .map_err(|error| JsValue::from_str(&error))?;
+        let (required_maps, required_coords) = tev_resource_requirements(tev_state, indirect_tev)
+            .map_err(|error| JsValue::from_str(&error))?;
         let sampler_states =
             tev_sampler_states(textures).map_err(|error| JsValue::from_str(&error))?;
         let sampler_mode0 = sampler_states.map(|state| state.mode0);
@@ -4260,7 +4852,11 @@ impl WebGpuRenderer {
             metrics.buffers_created = metrics.buffers_created.saturating_add(3);
             metrics.bind_groups_created = metrics.bind_groups_created.saturating_add(2);
         });
+        #[cfg(feature = "resident-render-probe")]
+        let probe_queue_ordinal = render_probe::queue_submit_begin();
         self.queue.submit([encoder.finish()]);
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::queue_submit_end(probe_queue_ordinal);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
@@ -4365,7 +4961,11 @@ impl WebGpuRenderer {
         });
         let mut encoder = self.flush_geometry_with_pre_clears(pre_clears)?;
         let (Some((width, height)), Some(plan)) = (clipped, plan) else {
+            #[cfg(feature = "resident-render-probe")]
+            let probe_queue_ordinal = render_probe::queue_submit_begin();
             self.queue.submit([encoder.finish()]);
+            #[cfg(feature = "resident-render-probe")]
+            render_probe::queue_submit_end(probe_queue_ordinal);
             update_renderer_metrics(&self.metrics, |metrics| {
                 metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
             });
@@ -4512,7 +5112,11 @@ impl WebGpuRenderer {
                 copy_state,
             )?;
         }
+        #[cfg(feature = "resident-render-probe")]
+        let probe_queue_ordinal = render_probe::queue_submit_begin();
         self.queue.submit([encoder.finish()]);
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::queue_submit_end(probe_queue_ordinal);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
@@ -4671,7 +5275,11 @@ impl WebGpuRenderer {
         let Some((width, source_height)) =
             clipped_copy_extent(source_x, source_y, width, source_height)
         else {
+            #[cfg(feature = "resident-render-probe")]
+            let probe_queue_ordinal = render_probe::queue_submit_begin();
             self.queue.submit([encoder.finish()]);
+            #[cfg(feature = "resident-render-probe")]
+            render_probe::queue_submit_end(probe_queue_ordinal);
             update_renderer_metrics(&self.metrics, |metrics| {
                 metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
             });
@@ -4765,7 +5373,11 @@ impl WebGpuRenderer {
                 copy_state,
             )?;
         }
+        #[cfg(feature = "resident-render-probe")]
+        let probe_queue_ordinal = render_probe::queue_submit_begin();
         self.queue.submit([encoder.finish()]);
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::queue_submit_end(probe_queue_ordinal);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
@@ -4814,10 +5426,7 @@ impl WebGpuRenderer {
         capture_sustained_surface_history: bool,
     ) -> Result<Object, JsValue> {
         self.record_wasm_bridge_call(0);
-        self.ensure_healthy()?;
-        update_renderer_metrics(&self.metrics, |metrics| {
-            metrics.present_xfb_calls = metrics.present_xfb_calls.saturating_add(1);
-        });
+        self.begin_xfb_presentation()?;
         if pair_epoch == 0 {
             return xfb_presentation_result(
                 false,
@@ -4845,16 +5454,63 @@ impl WebGpuRenderer {
                 None,
             );
         };
+        xfb_presentation_result_from_outcome(self.present_xfb_typed(
+            selected_address,
+            expected_generation,
+            selected_row,
+            mode,
+            parity,
+            pair_epoch,
+            output_width,
+            output_height,
+            field_stride_bytes,
+            field_height,
+            row_repeat,
+            capture_surface,
+            capture_sustained_surface_history,
+        )?)
+    }
+}
+
+impl WebGpuRenderer {
+    fn begin_xfb_presentation(&self) -> Result<(), JsValue> {
+        self.ensure_healthy()?;
+        update_renderer_metrics(&self.metrics, |metrics| {
+            metrics.present_xfb_calls = metrics.present_xfb_calls.saturating_add(1);
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_xfb_typed(
+        &mut self,
+        selected_address: u32,
+        expected_generation: u32,
+        selected_row: u32,
+        mode: ViPresentationMode,
+        parity: ViFieldParity,
+        pair_epoch: u32,
+        output_width: u32,
+        output_height: u32,
+        field_stride_bytes: u32,
+        field_height: u32,
+        row_repeat: u32,
+        capture_surface: bool,
+        capture_sustained_surface_history: bool,
+    ) -> Result<XfbPresentationOutcome, JsValue> {
+        if pair_epoch == 0 {
+            return Ok(XfbPresentationOutcome::rejected(
+                "vi-field-invalid-epoch",
+                pair_epoch,
+            ));
+        }
         if selected_address == 0 || expected_generation == 0 {
             self.vi_field_pairs
                 .reject_unavailable_member(mode, pair_epoch, parity);
-            return xfb_presentation_result(
-                false,
-                false,
+            return Ok(XfbPresentationOutcome::rejected(
                 "vi-field-xfb-unavailable",
                 pair_epoch,
-                None,
-            );
+            ));
         }
         let Some((surface, metadata, cached_width, cached_height)) = self
             .xfb_cache
@@ -4878,13 +5534,10 @@ impl WebGpuRenderer {
         else {
             self.vi_field_pairs
                 .reject_unavailable_member(mode, pair_epoch, parity);
-            return xfb_presentation_result(
-                false,
-                false,
+            return Ok(XfbPresentationOutcome::rejected(
                 "vi-field-xfb-unavailable",
                 pair_epoch,
-                None,
-            );
+            ));
         };
         if output_width == 0
             || output_width > GX_MAX_COPY_DIMENSION
@@ -4892,13 +5545,10 @@ impl WebGpuRenderer {
             || output_height > GX_MAX_COPY_DIMENSION
             || output_width != cached_width
         {
-            return xfb_presentation_result(
-                false,
-                false,
+            return Ok(XfbPresentationOutcome::rejected(
                 "vi-field-invalid-geometry",
                 pair_epoch,
-                None,
-            );
+            ));
         }
         let Some(scanout) = xfb_scanout_plan(
             metadata,
@@ -4908,13 +5558,10 @@ impl WebGpuRenderer {
             row_repeat,
             output_height,
         ) else {
-            return xfb_presentation_result(
-                false,
-                false,
+            return Ok(XfbPresentationOutcome::rejected(
                 "vi-field-invalid-geometry",
                 pair_epoch,
-                None,
-            );
+            ));
         };
         let descriptor = ViFieldDescriptor {
             mode,
@@ -4933,10 +5580,10 @@ impl WebGpuRenderer {
         let status = outcome.telemetry_code();
         match outcome {
             ViFieldPairOutcome::Awaiting(_) => {
-                xfb_presentation_result(true, false, status, pair_epoch, None)
+                Ok(XfbPresentationOutcome::staged(status, pair_epoch))
             }
             ViFieldPairOutcome::Rejected(_) => {
-                xfb_presentation_result(false, false, status, pair_epoch, None)
+                Ok(XfbPresentationOutcome::rejected(status, pair_epoch))
             }
             ViFieldPairOutcome::Ready(frame) => {
                 let ready_epoch = frame.pair_epoch();
@@ -4945,13 +5592,15 @@ impl WebGpuRenderer {
                     capture_surface,
                     capture_sustained_surface_history,
                 )?;
-                xfb_presentation_result(true, true, status, ready_epoch, Some(presentation_serial))
+                Ok(XfbPresentationOutcome::presented(
+                    status,
+                    ready_epoch,
+                    presentation_serial,
+                ))
             }
         }
     }
-}
 
-impl WebGpuRenderer {
     fn present_host_xfb_frame(
         &mut self,
         frame: ViHostFrame<CachedXfbSurface>,
@@ -5130,7 +5779,11 @@ impl WebGpuRenderer {
                 .push(capture)
                 .map_err(|error| JsValue::from_str(&error.to_string()))?;
         }
+        #[cfg(feature = "resident-render-probe")]
+        let probe_queue_ordinal = render_probe::queue_submit_begin();
         self.queue.submit([encoder.finish()]);
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::queue_submit_end(probe_queue_ordinal);
         update_renderer_metrics(&self.metrics, |metrics| {
             metrics.queue_submissions = metrics.queue_submissions.saturating_add(1);
         });
@@ -5461,6 +6114,7 @@ impl WebGpuRenderer {
             device,
             queue,
             failure_state,
+            resident_receipts: Rc::new(RefCell::new(ResidentReceiptBridge::default())),
             metrics: Rc::new(Cell::new(RendererMetrics::default())),
             exact_required_preparation_rejection_counts: Cell::new(
                 ExactRequiredPreparationRejectionCounts::default(),
@@ -5585,6 +6239,29 @@ impl WebGpuRenderer {
         &mut self,
         pre_clears: &[GxPreClear],
     ) -> Result<wgpu::CommandEncoder, JsValue> {
+        #[cfg(feature = "resident-render-probe")]
+        let probe_primitive_ordered_gpu_draws = self
+            .commands
+            .iter()
+            .filter(|command| command.state.early_depth == GxEarlyDepthPlan::PrimitiveOrdered)
+            .fold(0_u64, |total, command| {
+                let primitive = command
+                    .state
+                    .pipeline
+                    .expect("primitive-ordered command has a color pipeline")
+                    .primitive;
+                total.saturating_add(primitive_ordered_gpu_draws(
+                    u64::from(command.vertices.end - command.vertices.start),
+                    u64::from(primitive_vertex_width(primitive)),
+                ))
+            });
+        #[cfg(feature = "resident-render-probe")]
+        render_probe::event(
+            ResidentRenderProbeStage::FlushBegin,
+            saturating_usize_u32(self.commands.len()),
+            saturating_usize_u32(self.tev_vertices.len()),
+            saturating_u32(probe_primitive_ordered_gpu_draws),
+        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5657,7 +6334,26 @@ impl WebGpuRenderer {
             .iter()
             .filter_map(|command| command.state.pipeline)
             .collect::<HashSet<_>>();
+        #[cfg(feature = "resident-render-probe")]
+        let probe_tev_pipeline_total = tev_pipeline_keys
+            .iter()
+            .filter(|key| !self.pipelines.tev_geometry.contains_key(key))
+            .count() as u64;
+        #[cfg(feature = "resident-render-probe")]
+        let mut probe_tev_pipeline_creations = 0_u64;
         for key in tev_pipeline_keys {
+            #[cfg(feature = "resident-render-probe")]
+            if !self.pipelines.tev_geometry.contains_key(&key) {
+                probe_tev_pipeline_creations = probe_tev_pipeline_creations.saturating_add(1);
+                if should_sample_progress(probe_tev_pipeline_creations, probe_tev_pipeline_total) {
+                    render_probe::event(
+                        ResidentRenderProbeStage::PipelineCreationProgress,
+                        saturating_u32(probe_tev_pipeline_creations),
+                        saturating_u32(probe_tev_pipeline_total),
+                        1,
+                    );
+                }
+            }
             if self.pipelines.prepare_tev_geometry(&self.device, key) {
                 update_renderer_metrics(&self.metrics, |metrics| {
                     metrics.render_pipelines_created =
@@ -5670,7 +6366,29 @@ impl WebGpuRenderer {
             .iter()
             .filter_map(|command| command.state.depth_commit)
             .collect::<HashSet<_>>();
+        #[cfg(feature = "resident-render-probe")]
+        let probe_depth_pipeline_total = depth_commit_keys
+            .iter()
+            .filter(|key| !self.pipelines.early_depth_commit.contains_key(key))
+            .count() as u64;
+        #[cfg(feature = "resident-render-probe")]
+        let mut probe_depth_pipeline_creations = 0_u64;
         for key in depth_commit_keys {
+            #[cfg(feature = "resident-render-probe")]
+            if !self.pipelines.early_depth_commit.contains_key(&key) {
+                probe_depth_pipeline_creations = probe_depth_pipeline_creations.saturating_add(1);
+                if should_sample_progress(
+                    probe_depth_pipeline_creations,
+                    probe_depth_pipeline_total,
+                ) {
+                    render_probe::event(
+                        ResidentRenderProbeStage::PipelineCreationProgress,
+                        saturating_u32(probe_depth_pipeline_creations),
+                        saturating_u32(probe_depth_pipeline_total),
+                        2,
+                    );
+                }
+            }
             if self.pipelines.prepare_early_depth_commit(&self.device, key) {
                 update_renderer_metrics(&self.metrics, |metrics| {
                     metrics.render_pipelines_created =
@@ -5682,6 +6400,8 @@ impl WebGpuRenderer {
         let mut managed_early_depth_primitives = 0_u64;
         let mut early_depth_only_commands = 0_u64;
         let mut depth_commit_draws = 0_u64;
+        #[cfg(feature = "resident-render-probe")]
+        let mut probe_primitive_ordinal = 0_u64;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("browser GX geometry pass"),
@@ -5774,6 +6494,21 @@ impl WebGpuRenderer {
                             pass.draw(vertices.clone(), 0..1);
                             pass.set_pipeline(commit);
                             pass.draw(vertices, 0..1);
+                            #[cfg(feature = "resident-render-probe")]
+                            {
+                                probe_primitive_ordinal = probe_primitive_ordinal.saturating_add(1);
+                                if should_sample_progress(
+                                    probe_primitive_ordinal,
+                                    probe_primitive_ordered_gpu_draws / 2,
+                                ) {
+                                    render_probe::event(
+                                        ResidentRenderProbeStage::PrimitiveEmissionProgress,
+                                        saturating_u32(probe_primitive_ordinal.saturating_mul(2)),
+                                        saturating_u32(probe_primitive_ordered_gpu_draws),
+                                        primitive_vertex_width(primitive),
+                                    );
+                                }
+                            }
                             managed_early_depth_primitives =
                                 managed_early_depth_primitives.saturating_add(1);
                             depth_commit_draws = depth_commit_draws.saturating_add(1);
@@ -6924,6 +7659,79 @@ fn draw_requires_texture_preflight(
     early_depth != GxEarlyDepthPlan::DepthOnly
 }
 
+#[cfg(feature = "resident-render-probe")]
+fn predicted_packet_primitive_ordered_gpu_draws(
+    packet: &GxFramePacket<'_>,
+    prepared_exact_draws: &[Option<PreparedExactDraw>],
+) -> u64 {
+    packet
+        .draws()
+        .zip(prepared_exact_draws)
+        .fold(0_u64, |total, (draw, prepared_exact)| {
+            let prepared_exact = prepared_exact.as_ref();
+            if prepared_exact
+                .and_then(PreparedExactDraw::authoritative_noop)
+                .is_some()
+                || prepared_exact.is_some_and(PreparedExactDraw::is_required)
+            {
+                return total;
+            }
+            let early_depth = gx_early_depth_plan(
+                draw.record.z_mode,
+                draw.record.blend_mode,
+                draw.record.alpha_test,
+                draw.record.fragment_tail.pixel_control,
+            );
+            if early_depth != GxEarlyDepthPlan::PrimitiveOrdered {
+                return total;
+            }
+            let expanded_vertices = prepared_exact
+                .and_then(PreparedExactDraw::qualified)
+                .and_then(|exact| exact.managed_vertices.as_ref())
+                .map_or_else(
+                    || {
+                        expanded_index_count(
+                            draw.record.topology,
+                            draw.record.vertex_count as usize,
+                        )
+                        .unwrap_or(0)
+                    },
+                    Vec::len,
+                );
+            let primitive_width = match draw.record.topology {
+                5 | 6 => 2,
+                7 => 1,
+                _ => 3,
+            };
+            total.saturating_add(primitive_ordered_gpu_draws(
+                expanded_vertices as u64,
+                primitive_width,
+            ))
+        })
+}
+
+#[cfg(feature = "resident-render-probe")]
+fn predicted_packet_texture_preflights(
+    packet: &GxFramePacket<'_>,
+    prepared_exact_draws: &[Option<PreparedExactDraw>],
+) -> u64 {
+    packet
+        .draws()
+        .zip(prepared_exact_draws)
+        .filter(|(draw, prepared_exact)| {
+            draw_requires_texture_preflight(*draw, prepared_exact.as_ref())
+        })
+        .fold(0_u64, |total, (draw, _)| {
+            total.saturating_add(
+                draw.record
+                    .textures
+                    .iter()
+                    .filter(|slot| slot.texture.is_some())
+                    .count() as u64,
+            )
+        })
+}
+
 fn exact_geometry_is_raster_empty(
     source_vertices: &[f32],
     expanded: &[usize],
@@ -8032,9 +8840,9 @@ mod tests {
         BlendComponentState, CopyClearUniform, CullMode, DRAW_FRAGMENT_DEPTH_ENCODING_SHIFT,
         DRAW_FRAGMENT_FLAG_FOG, DRAW_FRAGMENT_FLAG_LATE_Z_TEXTURE, DRAW_FRAGMENT_FLAG_RGBA6,
         DepthCommitPipelineKey, DrawUniform, EFB_TEXTURE_COPY_SHADER, EfbTextureCopyUniform,
-        ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT, IndirectTevUniform,
+        ExactAuthoritativeNoop, GX_MANAGED_S17_7_RAW_LIMIT,
         GX_NON_AA_TO_WEBGPU_POSITION_CORRECTION_EFB, GxExactPreparationFailure, GxRasterPoint28_4,
-        GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding,
+        GxRasterScissor, GxRasterSetup, GxRasterTriangle28_4, GxRasterWinding, IndirectTevUniform,
         MANAGED_COVERAGE_DUMMY_ATTRIBUTE_PAYLOAD, MANAGED_COVERAGE_VERTEX_ATTRIBUTES,
         MANAGED_TEX_COORD_SIDECAR_WORDS, ManagedCoverageEvidence, ManagedSidecarCapacityOutcome,
         PipelineKey, PreparedExactDraw, Primitive, QualifiedExactDraw, REQUIRED_WEBGPU_FEATURES,
@@ -8049,8 +8857,8 @@ mod tests {
         managed_sidecar_capacity_outcome, managed_tex_coord_sidecar_record,
         managed_vertices_with_sidecar_record_base, merge_contiguous_draw_range,
         prepare_managed_coverage_vertices, rgba8_mip_uploads,
-        source_triangle_depth_and_rasters_are_bitwise_flat, tev_vertex_from_source,
-        tev_resource_requirements, texture_base_format_code, texture_copy_format_code,
+        source_triangle_depth_and_rasters_are_bitwise_flat, tev_resource_requirements,
+        tev_vertex_from_source, texture_base_format_code, texture_copy_format_code,
         texture_copy_plan_for_source,
     };
     use crate::clip::{GxClipError, GxExactGeometryError};
@@ -10562,9 +11370,28 @@ mod tests {
             ]
         );
         assert_eq!(state.gen_mode, 0x00ab_cdef, "packet keeps raw BP GEN_MODE");
-        assert_eq!(uniform.matrix_rows[0], [state.matrices[0], state.matrices[1], state.matrices[2], state.imask]);
-        assert_eq!(uniform.matrix_rows[1], [state.matrices[3], state.matrices[4], state.matrices[5], 0x82]);
-        assert_eq!(uniform.matrix_rows[2], [state.matrices[6], state.matrices[7], state.matrices[8], 1]);
+        assert_eq!(
+            uniform.matrix_rows[0],
+            [
+                state.matrices[0],
+                state.matrices[1],
+                state.matrices[2],
+                state.imask
+            ]
+        );
+        assert_eq!(
+            uniform.matrix_rows[1],
+            [
+                state.matrices[3],
+                state.matrices[4],
+                state.matrices[5],
+                0x82
+            ]
+        );
+        assert_eq!(
+            uniform.matrix_rows[2],
+            [state.matrices[6], state.matrices[7], state.matrices[8], 1]
+        );
         assert_eq!(uniform.commands[0], state.commands[0..4]);
         assert_eq!(uniform.commands[3], state.commands[12..16]);
         assert_ne!(uniform, IndirectTevUniform::default());
@@ -10596,10 +11423,7 @@ mod tests {
         indirect.commands[0] = 1 << 7;
         indirect.iref = 3 << 3;
         let (maps, coords) = tev_resource_requirements(&direct, Some(&indirect)).unwrap();
-        assert_eq!(
-            maps,
-            [true, false, false, false, false, false, false, true]
-        );
+        assert_eq!(maps, [true, false, false, false, false, false, false, true]);
         assert_eq!(
             coords,
             [false, false, false, true, false, true, true, false]
@@ -10607,12 +11431,21 @@ mod tests {
 
         indirect.xf_num_tex_gens = 0;
         let (maps, coords) = tev_resource_requirements(&direct, Some(&indirect)).unwrap();
-        assert_eq!(maps, [true, false, false, false, false, false, false, false]);
+        assert_eq!(
+            maps,
+            [true, false, false, false, false, false, false, false]
+        );
         assert_eq!(coords, [false; MAX_TEV_TEXTURES]);
 
         let (legacy_maps, legacy_coords) = tev_resource_requirements(&direct, None).unwrap();
-        assert_eq!(legacy_maps, [false, false, false, false, false, false, false, true]);
-        assert_eq!(legacy_coords, [false, false, false, false, false, false, true, false]);
+        assert_eq!(
+            legacy_maps,
+            [false, false, false, false, false, false, false, true]
+        );
+        assert_eq!(
+            legacy_coords,
+            [false, false, false, false, false, false, true, false]
+        );
     }
 
     #[test]

@@ -5,9 +5,7 @@ use std::{mem, slice};
 
 use gekko::disasm::{Extensions, Ins};
 
-use crate::{Jit, RegionBlock, link_region};
-
-const HOOK_CYCLE_OFFSET: i32 = 8;
+use crate::{Jit, RESIDENT_HOOK_CYCLE_OFFSET, RegionBlock, link_region};
 
 #[derive(Default)]
 struct Output {
@@ -48,16 +46,7 @@ pub unsafe extern "C" fn ppcwasmjit_free_words(pointer: u32, word_count: u32) {
     });
 }
 
-/// Compiles the supplied PPC words into one WebAssembly basic block.
-///
-/// Returns one on success and zero on failure. The result and error accessors remain valid until
-/// the next compile call.
-///
-/// # Safety
-///
-/// The pointer must address word_count initialized u32 values in this module's linear memory.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ppcwasmjit_compile(pointer: u32, word_count: u32) -> u32 {
+unsafe fn compile_with(pointer: u32, word_count: u32, mut jit: Jit) -> u32 {
     // SAFETY: The caller promises the allocation contains word_count initialized words.
     let words =
         unsafe { slice::from_raw_parts(pointer as usize as *const u32, word_count as usize) };
@@ -66,7 +55,7 @@ pub unsafe extern "C" fn ppcwasmjit_compile(pointer: u32, word_count: u32) -> u3
         .copied()
         .map(|code| Ins::new(code, Extensions::gekko_broadway()));
 
-    match Jit::with_slow_memory_hook_cycle_offset(HOOK_CYCLE_OFFSET).build(instructions) {
+    match jit.build(instructions) {
         Ok(block) => {
             let maximum_executed = block.metadata().executed.pack();
             let pattern = block.metadata().pattern as u32;
@@ -87,6 +76,46 @@ pub unsafe extern "C" fn ppcwasmjit_compile(pointer: u32, word_count: u32) -> u3
             });
             0
         }
+    }
+}
+
+/// Compiles the supplied PPC words against the temporary JavaScript hook oracle.
+///
+/// Returns one on success and zero on failure. The result and error accessors remain valid until
+/// the next compile call.
+///
+/// # Safety
+///
+/// The pointer must address word_count initialized u32 values in this module's linear memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ppcwasmjit_compile(pointer: u32, word_count: u32) -> u32 {
+    // SAFETY: This export forwards the caller's allocation contract unchanged.
+    unsafe {
+        compile_with(
+            pointer,
+            word_count,
+            Jit::with_slow_memory_hook_cycle_offset(RESIDENT_HOOK_CYCLE_OFFSET),
+        )
+    }
+}
+
+/// Compiles the supplied PPC words with synchronous hooks owned by the Rust/Wasm machine.
+///
+/// This additive export produces blocks whose memory and `user_*` function imports all resolve
+/// from module `lazuli`. The oracle export remains available until production cutover completes.
+///
+/// # Safety
+///
+/// The pointer must address word_count initialized u32 values in this module's linear memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ppcwasmjit_compile_resident(pointer: u32, word_count: u32) -> u32 {
+    // SAFETY: This export forwards the caller's allocation contract unchanged.
+    unsafe {
+        compile_with(
+            pointer,
+            word_count,
+            Jit::with_slow_memory_resident_hook_cycles(),
+        )
     }
 }
 

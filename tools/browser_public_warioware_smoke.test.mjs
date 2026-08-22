@@ -10,23 +10,15 @@ import {
   waitForCoherentPublicWarioWareSnapshot,
   validatePublicWarioWareSmokeEvidence,
 } from "./browser_public_warioware_smoke.mjs";
+import {
+  compactSchema4ReleaseIdentityFixture,
+} from "./browser_public_release_identity.test_fixture.mjs";
 
 function activeRelease() {
-  return {
-    schema: 3,
-    releaseId: "1".repeat(64),
+  return compactSchema4ReleaseIdentityFixture({
+    assetHash: "b".repeat(64),
     commit: "2".repeat(40),
-    frontend: {
-      url: `/assets/frontend-${"b".repeat(64)}.html`,
-      sha256: "b".repeat(64),
-      bytes: 1_000,
-    },
-    dsp: {
-      url: `/assets/browser-dsp-${"c".repeat(64)}.wasm`,
-      sha256: "c".repeat(64),
-      bytes: 2_000,
-    },
-  };
+  });
 }
 
 function validEvidence() {
@@ -445,22 +437,38 @@ test("public WarioWare smoke rejects a mutable frontend path", () => {
   );
 });
 
-test("public WarioWare smoke requires the schema-3 DSP identity", () => {
-  const missing = validEvidence();
-  delete missing.release.dsp;
-  missing.terminalRelease = structuredClone(missing.release);
-  assert.throws(
-    () => validatePublicWarioWareSmokeEvidence(missing),
-    /\$\.release\.dsp/,
-  );
-
-  const stale = validEvidence();
-  stale.release.schema = 2;
-  stale.terminalRelease.schema = 2;
-  assert.throws(
-    () => validatePublicWarioWareSmokeEvidence(stale),
-    /\$\.release\.schema: expected release schema 3/,
-  );
+test("public WarioWare smoke requires the exact compact schema-4 identity", () => {
+  const cases = [
+    [
+      value => { delete value.runtime.coordinator; },
+      /\$\.release\.runtime.*coordinator/,
+    ],
+    [
+      value => { value.runtime.abi.machineEvidenceBytes += 1; },
+      /\$\.release\.runtime\.abi\.machineEvidenceBytes/,
+    ],
+    [
+      value => { value.bootstrap.document.url = "/"; },
+      /\$\.release\.bootstrap\.document\.url/,
+    ],
+    [
+      value => { delete value.rollback.release.releaseId; },
+      /\$\.release\.rollback\.release.*releaseId/,
+    ],
+    [
+      value => { value.schema = 3; },
+      /\$\.release\.schema: expected release schema 4/,
+    ],
+  ];
+  for (const [mutate, pattern] of cases) {
+    const evidence = validEvidence();
+    mutate(evidence.release);
+    evidence.terminalRelease = structuredClone(evidence.release);
+    assert.throws(
+      () => validatePublicWarioWareSmokeEvidence(evidence),
+      pattern,
+    );
+  }
 });
 
 test("public WarioWare smoke binds its same-origin iframe to the active release", () => {

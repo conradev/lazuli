@@ -231,6 +231,11 @@ test("compiled blocks retain only their executable staged-word prefix", () => {
       );
       return { fault: null, wordCount: staged.length };
     },
+    volatileReadStabilityGpr(pattern, instructionWords) {
+      assert.equal(pattern, 0);
+      assert.deepEqual(Array.from(instructionWords), staged.slice(0, 2));
+      return null;
+    },
   };
   const compiler = {
     memory: { buffer: compilerBuffer },

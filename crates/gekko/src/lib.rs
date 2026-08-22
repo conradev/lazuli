@@ -1241,6 +1241,12 @@ impl Cpu {
         self.raise_exception(Exception::Program);
         self.supervisor.exception.srr[1] |= cause.srr1_bits();
     }
+
+    /// Takes an instruction-storage exception and records its architectural cause in SRR1.
+    pub fn raise_instruction_storage_exception(&mut self, cause: u32) {
+        self.raise_exception(Exception::ISI);
+        self.supervisor.exception.srr[1] |= cause & Exception::SPECIAL_SRR1_BITS_MASK;
+    }
 }
 
 /// A General Purpose Register.
@@ -1757,5 +1763,24 @@ mod tests {
                 cause.srr1_bits()
             );
         }
+    }
+
+    #[test]
+    fn instruction_storage_exception_preserves_pc_and_exact_cause() {
+        let mut cpu = Cpu {
+            pc: Address(0x8000_1234),
+            ..Cpu::default()
+        };
+        cpu.supervisor.config.msr.set_exception_prefix(false);
+        cpu.supervisor.exception.srr[1] = Exception::SPECIAL_SRR1_BITS_MASK;
+
+        cpu.raise_instruction_storage_exception(0x4000_0000);
+
+        assert_eq!(cpu.pc, Address(0x0000_0400));
+        assert_eq!(cpu.supervisor.exception.srr[0], 0x8000_1234);
+        assert_eq!(
+            cpu.supervisor.exception.srr[1] & Exception::SPECIAL_SRR1_BITS_MASK,
+            0x4000_0000
+        );
     }
 }

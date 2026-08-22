@@ -457,7 +457,7 @@ test("runner excludes the poll from regions and accelerates before compilation",
   );
 
   const integration = source.indexOf(
-    "if (await accelerateAiSrcInitSampleCounterWait(pc))",
+    "const aiSrcInitAcceleration = pendingAiSrcInitSampleCounterWaitAcceleration(pc);",
   );
   assert.notEqual(integration, -1);
   const compilation = source.indexOf('stage = "compile"', integration);
@@ -465,7 +465,7 @@ test("runner excludes the poll from regions and accelerates before compilation",
   assert.ok(integration < compilation);
   assert.match(
     source.slice(integration, compilation),
-    /await finishTerminalControllerScenario\(\);\s*continue;/,
+    /if \(aiSrcInitAcceleration !== false && await aiSrcInitAcceleration\) \{\s*const terminalCompletion = pendingTerminalControllerScenarioCompletion\(\);\s*if \(terminalCompletion !== false\) await terminalCompletion;\s*continue;/,
   );
 
   const accelerator = extractFunction("accelerateAiSrcInitSampleCounterWait");

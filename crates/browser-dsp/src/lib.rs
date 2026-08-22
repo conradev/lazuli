@@ -2,28 +2,23 @@
 //!
 //! The browser owns one WebAssembly memory. This module imports that memory and maps the existing
 //! MEM1 and DSP-interface windows plus one in-memory ARAM window without copying them. The host
-//! must instantiate at [`MEMORY_INITIAL_PAGES`], initialize once, grow to
-//! [`MEMORY_MAXIMUM_PAGES`], and only then execute or create persistent JavaScript views.
+//! must instantiate at [`LEGACY_MEMORY_INITIAL_PAGES`], initialize once, grow to
+//! [`LEGACY_MEMORY_MAXIMUM_PAGES`], and only then execute or create persistent JavaScript views.
+//!
+//! This standalone bridge is transitional. It owns the allocator range beginning at
+//! [`RUNTIME_BASE`] and therefore must not coexist with another Rust module importing the same
+//! memory and global base. The unified browser machine must fold `dspint` into its own runtime.
 
 #[cfg(any(target_arch = "wasm32", test))]
 use dspint::Interpreter;
 use dspint::{DspBus, DspControl, DspDma, DspMailbox};
-
-pub const ABI_VERSION: u32 = 1;
-pub const WASM_PAGE_BYTES: usize = 64 * 1024;
-pub const MEMORY_INITIAL_PAGES: usize = 688;
-pub const MEMORY_MAXIMUM_PAGES: usize = 720;
-pub const MEMORY_BYTES: usize = MEMORY_MAXIMUM_PAGES * WASM_PAGE_BYTES;
-
-pub const MAIN_RAM_OFFSET: usize = 0x0010_0000;
-pub const MAIN_RAM_BYTES: usize = 0x0180_0000;
-pub const MMIO_OFFSET: usize = MAIN_RAM_OFFSET + MAIN_RAM_BYTES;
-pub const MMIO_BYTES: usize = 0x0002_0000;
-pub const MACHINE_RESERVED_END: usize = 0x01a0_0000;
-pub const ARAM_OFFSET: usize = MACHINE_RESERVED_END;
-pub const ARAM_BYTES: usize = 0x0100_0000;
-pub const RUNTIME_BASE: usize = ARAM_OFFSET + ARAM_BYTES;
-pub const RUNTIME_END: usize = MEMORY_BYTES;
+pub use lazuli_abi::ABI_VERSION;
+pub use lazuli_abi::memory::{
+    ARAM_BYTES, ARAM_OFFSET, IPL_BYTES, IPL_OFFSET, L2C_BYTES, L2C_OFFSET, LEGACY_MEMORY_BYTES,
+    LEGACY_MEMORY_INITIAL_PAGES, LEGACY_MEMORY_MAXIMUM_PAGES, LEGACY_RUNTIME_END,
+    MACHINE_RESERVED_END, MAIN_RAM_BYTES, MAIN_RAM_OFFSET, MMIO_BYTES, MMIO_OFFSET, RUNTIME_BASE,
+    WASM_PAGE_BYTES,
+};
 
 const CPU_MAILBOX_OFFSET: usize = 0x5000;
 const DSP_MAILBOX_OFFSET: usize = 0x5004;
@@ -48,10 +43,13 @@ const DSP_COEF_BYTES: &[u8; 4096] = include_bytes!(concat!(
     "/../../resources/dsp_coef.bin"
 ));
 
-const _: () = assert!(MMIO_OFFSET + MMIO_BYTES <= MACHINE_RESERVED_END);
+const _: () = assert!(MMIO_OFFSET + MMIO_BYTES <= L2C_OFFSET);
+const _: () = assert!(L2C_OFFSET + L2C_BYTES <= MACHINE_RESERVED_END);
+const _: () = assert!(MACHINE_RESERVED_END == IPL_OFFSET);
+const _: () = assert!(IPL_OFFSET + IPL_BYTES == ARAM_OFFSET);
 const _: () = assert!(ARAM_OFFSET + ARAM_BYTES == RUNTIME_BASE);
-const _: () = assert!(RUNTIME_BASE < MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES);
-const _: () = assert!(MEMORY_INITIAL_PAGES < MEMORY_MAXIMUM_PAGES);
+const _: () = assert!(RUNTIME_BASE < LEGACY_MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES);
+const _: () = assert!(LEGACY_MEMORY_INITIAL_PAGES < LEGACY_MEMORY_MAXIMUM_PAGES);
 
 /// Observes a completed DSP-to-MEM1 transfer after all bytes are visible.
 pub trait MainRamWriteObserver {
@@ -224,9 +222,10 @@ mod wasm_abi {
     use dspint::{DspBusFault, DspBusOperation, DspDma, ExecOutcome, ExecStopReason};
 
     use super::{
-        ABI_VERSION, ARAM_BYTES, ARAM_OFFSET, BrowserBus, MAIN_RAM_BYTES, MAIN_RAM_OFFSET,
-        MEMORY_BYTES, MEMORY_INITIAL_PAGES, MEMORY_MAXIMUM_PAGES, MMIO_BYTES, MMIO_OFFSET,
-        MainRamWriteObserver, RUNTIME_BASE, RUNTIME_END, initialized_interpreter,
+        ABI_VERSION, ARAM_BYTES, ARAM_OFFSET, BrowserBus, IPL_BYTES, IPL_OFFSET, L2C_BYTES,
+        L2C_OFFSET, LEGACY_MEMORY_BYTES, LEGACY_MEMORY_INITIAL_PAGES, LEGACY_MEMORY_MAXIMUM_PAGES,
+        LEGACY_RUNTIME_END, MAIN_RAM_BYTES, MAIN_RAM_OFFSET, MMIO_BYTES, MMIO_OFFSET,
+        MainRamWriteObserver, RUNTIME_BASE, initialized_interpreter,
     };
 
     const STOP_INSTRUCTION_BUDGET: u32 = 0;
@@ -282,7 +281,7 @@ mod wasm_abi {
         fn exec(&mut self, budget: u32) -> u32 {
             // SAFETY: The imported-memory minimum puts all three ranges in-bounds and they are
             // pairwise disjoint from each other and the module runtime. The browser seals memory
-            // at its 45 MiB maximum before execution; the synchronous callback is forbidden from
+            // at its 48 MiB maximum before execution; the synchronous callback is forbidden from
             // growing memory or re-entering this module while these mutable slices are live.
             let (main_ram, mmio, aram) = unsafe {
                 (
@@ -340,17 +339,17 @@ mod wasm_abi {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn browser_dsp_memory_initial_pages() -> u32 {
-        MEMORY_INITIAL_PAGES as u32
+        LEGACY_MEMORY_INITIAL_PAGES as u32
     }
 
     #[unsafe(no_mangle)]
     pub extern "C" fn browser_dsp_memory_maximum_pages() -> u32 {
-        MEMORY_MAXIMUM_PAGES as u32
+        LEGACY_MEMORY_MAXIMUM_PAGES as u32
     }
 
     #[unsafe(no_mangle)]
     pub extern "C" fn browser_dsp_memory_bytes() -> u32 {
-        MEMORY_BYTES as u32
+        LEGACY_MEMORY_BYTES as u32
     }
 
     #[unsafe(no_mangle)]
@@ -374,6 +373,26 @@ mod wasm_abi {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn browser_dsp_l2c_offset() -> u32 {
+        L2C_OFFSET as u32
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn browser_dsp_l2c_bytes() -> u32 {
+        L2C_BYTES as u32
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn browser_dsp_ipl_offset() -> u32 {
+        IPL_OFFSET as u32
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn browser_dsp_ipl_bytes() -> u32 {
+        IPL_BYTES as u32
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn browser_dsp_aram_offset() -> u32 {
         ARAM_OFFSET as u32
     }
@@ -390,7 +409,7 @@ mod wasm_abi {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn browser_dsp_runtime_end() -> u32 {
-        RUNTIME_END as u32
+        LEGACY_RUNTIME_END as u32
     }
 
     #[unsafe(no_mangle)]
@@ -399,7 +418,7 @@ mod wasm_abi {
             if runtime.is_some() {
                 return INIT_ALREADY_INITIALIZED;
             }
-            if memory_size::<0>() != MEMORY_INITIAL_PAGES {
+            if memory_size::<0>() != LEGACY_MEMORY_INITIAL_PAGES {
                 return INIT_WRONG_MEMORY_SIZE;
             }
             *runtime = Some(Runtime::new());
@@ -413,7 +432,7 @@ mod wasm_abi {
             let Some(runtime) = runtime.as_mut() else {
                 return 0;
             };
-            if memory_size::<0>() != MEMORY_MAXIMUM_PAGES {
+            if memory_size::<0>() != LEGACY_MEMORY_MAXIMUM_PAGES {
                 runtime.memory_not_sealed = true;
                 return 0;
             }
@@ -509,35 +528,40 @@ mod tests {
     }
 
     #[test]
-    fn fixed_layout_has_one_disjoint_mem1_and_aram() {
+    fn fixed_layout_has_disjoint_mem1_ipl_and_aram() {
         let (
             memory_initial_bytes,
             memory_bytes,
             main_ram_end,
             mmio_end,
             machine_reserved_end,
+            ipl_offset,
+            ipl_end,
             aram_offset,
             aram_end,
             runtime_base,
             runtime_end,
         ) = std::hint::black_box((
-            MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES,
-            MEMORY_BYTES,
+            LEGACY_MEMORY_INITIAL_PAGES * WASM_PAGE_BYTES,
+            LEGACY_MEMORY_BYTES,
             MAIN_RAM_OFFSET + MAIN_RAM_BYTES,
             MMIO_OFFSET + MMIO_BYTES,
             MACHINE_RESERVED_END,
+            IPL_OFFSET,
+            IPL_OFFSET + IPL_BYTES,
             ARAM_OFFSET,
             ARAM_OFFSET + ARAM_BYTES,
             RUNTIME_BASE,
-            RUNTIME_END,
+            LEGACY_RUNTIME_END,
         ));
-        assert_eq!(memory_initial_bytes, 0x02b0_0000);
-        assert_eq!(memory_bytes, 0x02d0_0000);
+        assert_eq!(memory_initial_bytes, 0x02d0_0000);
+        assert_eq!(memory_bytes, 0x0300_0000);
         assert_eq!(main_ram_end, MMIO_OFFSET);
         assert!(mmio_end <= machine_reserved_end);
-        assert_eq!(machine_reserved_end, aram_offset);
+        assert_eq!(machine_reserved_end, ipl_offset);
+        assert_eq!(ipl_end, aram_offset);
         assert_eq!(aram_end, runtime_base);
-        assert_eq!(runtime_end - runtime_base, 3 * 1024 * 1024);
+        assert_eq!(runtime_end - runtime_base, 4 * 1024 * 1024);
     }
 
     #[test]

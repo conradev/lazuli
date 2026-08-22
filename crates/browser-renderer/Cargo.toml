@@ -11,6 +11,13 @@ crate-type = ["cdylib", "rlib"]
 [lints]
 workspace = true
 
+[features]
+resident-render-probe = []
+
+[dependencies]
+lazuli-abi = { workspace = true }
+lzgx-packet = { workspace = true }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bytemuck = { version = "1.22", features = ["derive"] }
 js-sys = "0.3.91"

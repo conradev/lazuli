@@ -768,7 +768,7 @@ test("runner fences the call loop and accelerates before compilation", () => {
     "one-shot status helper calls should remain eligible for region linking",
   );
   const integration = source.indexOf(
-    "if (await accelerateDspSendMailboxWait(pc))",
+    "const dspSendAcceleration = pendingDspSendMailboxWaitAcceleration(pc);",
   );
   assert.notEqual(integration, -1);
   const compilation = source.indexOf('stage = "compile"', integration);
@@ -776,7 +776,7 @@ test("runner fences the call loop and accelerates before compilation", () => {
   assert.ok(integration < compilation);
   assert.match(
     source.slice(integration, compilation),
-    /await finishTerminalControllerScenario\(\);\s*continue;/,
+    /if \(dspSendAcceleration !== false && await dspSendAcceleration\) \{\s*const terminalCompletion = pendingTerminalControllerScenarioCompletion\(\);\s*if \(terminalCompletion !== false\) await terminalCompletion;\s*continue;/,
   );
 });
 

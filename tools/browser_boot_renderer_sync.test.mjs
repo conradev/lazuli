@@ -1792,7 +1792,7 @@ test("guest execution waits for renderer completion before another block", () =>
   );
   assert.match(
     source,
-    /while \(rendererFramesInFlight\.size !== 0 \|\| rendererFailure !== null\) \{\s*await honorRendererBackpressure\(\);\s*if \(runnerStopRequested\) break;\s*serviceVideoPresentation\(cycles\);\s*\}\s*if \(runnerPaused \|\| runnerStopRequested\) await honorRunnerControl\(\);\s*await finishTerminalControllerScenario\(\);/,
+    /while \(rendererFramesInFlight\.size !== 0 \|\| rendererFailure !== null\) \{\s*await honorRendererBackpressure\(\);\s*if \(runnerStopRequested\) break;\s*serviceVideoPresentation\(cycles\);\s*\}\s*if \(runnerPaused \|\| runnerStopRequested\) await honorRunnerControl\(\);\s*const initialTerminalCompletion = pendingTerminalControllerScenarioCompletion\(\);\s*if \(initialTerminalCompletion !== false\) await initialTerminalCompletion;/,
     "a final renderer acknowledgement may service an unrequested VI pair before terminal drain",
   );
   assert.match(source, /postGxFrame\(2, frame\)/);

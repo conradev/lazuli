@@ -932,5 +932,8 @@ test("browser worker routes successful SI publications through the scenario engi
   assert.match(source, /const scenarioOwnsInput = scenarioButtons !== null;/);
   assert.match(source, /scenarioOwnsInput \? 0x80 : controllerState\.stickX/);
   assert.match(source, /entry\.release\.polls === 0/);
-  assert.match(source, /await finishTerminalControllerScenario\(\);/);
+  assert.match(
+    source,
+    /const initialTerminalCompletion = pendingTerminalControllerScenarioCompletion\(\);\s*if \(initialTerminalCompletion !== false\) await initialTerminalCompletion;/,
+  );
 });

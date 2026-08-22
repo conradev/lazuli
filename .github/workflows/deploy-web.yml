@@ -1,90 +1,562 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
-name: Deploy web
+name: Release web
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      action:
+        description: Inactive canary upload, explicit promotion, or explicit rollback
+        required: true
+        type: choice
+        default: canary
+        options:
+          - canary
+          - promote
+          - rollback
+      canary_run_id:
+        description: Promotion/rollback only; exact successful canary workflow run carrying immutable version evidence
+        required: false
+        type: string
+      fidelity_run_id:
+        description: Promotion only; exact successful self-hosted run carrying immutable all-seven fidelity evidence
+        required: false
+        type: string
+      expected_release_id:
+        description: Promotion/rollback only; exact schema-4 release SHA-256 currently under review/live
+        required: false
+        type: string
+      expected_rollback_release_id:
+        description: Exact schema-3 production release SHA-256 authenticated as rollback
+        required: true
+        type: string
+      rollback_metadata_run_id:
+        description: Canary only after schema-4 is live; prior canary run carrying its authenticated rollback mapping
+        required: false
+        type: string
+      rollback_version_id:
+        description: Initial canary only; exact live Cloudflare Worker UUID for the pinned schema-3 rollback
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: deploy-gekko-free
-  cancel-in-progress: true
+  group: release-gekko-free
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTC_BOOTSTRAP: "1"
   RUSTFLAGS: -Z threads=4 -Z share-generics=y
+  WEB_ROLLOUT_PRODUCTION_ORIGIN: https://gekko.free
+  WEB_ROLLOUT_CANARY_ORIGIN: https://resident-canary-gekko-free.${{ vars.CLOUDFLARE_WORKERS_SUBDOMAIN }}.workers.dev
+  WEB_ROLLOUT_CANARY_RUN_ID: ${{ inputs.canary_run_id }}
+  WEB_ROLLOUT_FIDELITY_RUN_ID: ${{ inputs.fidelity_run_id }}
+  WEB_ROLLOUT_ROLLBACK_METADATA_RUN_ID: ${{ inputs.rollback_metadata_run_id }}
+  WEB_ROLLOUT_EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+  WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID: ${{ inputs.expected_rollback_release_id }}
+  WEB_ROLLOUT_ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+  WEB_ROLLOUT_CHECKED_OUT_COMMIT: ${{ github.sha }}
 
 jobs:
-  deploy:
-    name: Build and deploy gekko.free
+  canary:
+    if: inputs.action == 'canary'
+    name: Build and upload inactive canary
     runs-on: ubuntu-latest
     environment: production
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        run: rustup target add wasm32-unknown-unknown
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2.7.7
-      - name: Build browser compiler
-        run: cargo build --release --target wasm32-unknown-unknown -p ppcwasmjit
-      - name: Test browser DSP
-        run: cargo test -p browser-dsp
-      - name: Build browser DSP
-        run: cargo build --release --target wasm32-unknown-unknown -p browser-dsp
-      - name: Validate browser DSP ABI
-        run: node tools/browser_dsp_wasm_contract.mjs target/wasm32-unknown-unknown/release/browser_dsp.wasm
-      - name: Test browser renderer
-        run: cargo test -p browser-renderer
-      - name: Build browser renderer
-        run: cargo build --release --target wasm32-unknown-unknown -p browser-renderer
-      - name: Install pinned wasm-bindgen CLI
-        run: cargo install --locked --version 0.2.114 wasm-bindgen-cli
-      - name: Generate browser renderer bindings
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate canary inputs
+        run: node tools/web_rollout_inputs.mjs canary
+      - name: Authenticate prior rollback-metadata workflow run
+        if: inputs.rollback_metadata_run_id != ''
+        uses: actions/github-script@v8
+        env:
+          AUTHENTICATED_RUN_ID: ${{ inputs.rollback_metadata_run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: process.env.AUTHENTICATED_RUN_ID,
+            });
+            if (run.conclusion !== "success" || run.event !== "workflow_dispatch" ||
+                run.path !== ".github/workflows/deploy-web.yml" ||
+                run.repository.full_name !== process.env.GITHUB_REPOSITORY) {
+              core.setFailed("Rollback metadata did not come from an exact successful Release web dispatch.");
+            }
+      - name: Download prior authenticated rollback mapping
+        if: inputs.rollback_metadata_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: schema4-canary-candidate
+          path: target/prior-canary
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.rollback_metadata_run_id }}
+      - name: Verify prior authenticated rollback mapping
+        if: inputs.rollback_metadata_run_id != ''
+        id: prior_metadata
         run: >-
-          wasm-bindgen
-          --target web
-          --out-dir target/gekko-web
-          --out-name browser_renderer
-          target/wasm32-unknown-unknown/release/browser_renderer.wasm
-      - name: Generate generic frontend
-        run: >-
-          cargo run --release -p ppcwasmjit --example browser_boot --
-          target/gekko-web/index.html
-          target/wasm32-unknown-unknown/release/ppcwasmjit.wasm
-      - name: Build static release
-        run: >-
-          node tools/build_web.mjs
-          --app target/gekko-web/index.html
-          --wasm target/wasm32-unknown-unknown/release/ppcwasmjit.wasm
-          --dsp target/wasm32-unknown-unknown/release/browser_dsp.wasm
-          --output web/dist
-          --commit "$GITHUB_SHA"
-      - name: Test static release
-        run: >-
-          node --test
-          tools/browser_boot_*.test.mjs
-          tools/browser_disc_source.test.mjs
-          tools/browser_game_compatibility_*.test.mjs
-          tools/browser_game_first_playable_*.test.mjs
-          tools/browser_public_cdp.test.mjs
-          tools/browser_public_smb_screencast.test.mjs
-          tools/browser_public_smb_screencast_oracle.test.mjs
-          tools/browser_public_smb_sustained.test.mjs
-          tools/browser_public_warioware_smoke.test.mjs
-          tools/build_web.test.mjs
-          tools/deploy_web.test.mjs
-          tools/web_dist.test.mjs
-          web/sw.test.mjs
-      - name: Deploy static assets
+          node tools/cloudflare_release_metadata.mjs verify
+          --metadata target/prior-canary/target/cloudflare-version.json
+          --worker-name gekko-free
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Select exact production predecessor and rollback versions
+        id: predecessor
+        env:
+          INITIAL_ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          INHERITED_RELEASE_ID: ${{ steps.prior_metadata.outputs.release_id }}
+          INHERITED_VERSION_ID: ${{ steps.prior_metadata.outputs.version_id }}
+          INHERITED_ROLLBACK_VERSION_ID: ${{ steps.prior_metadata.outputs.rollback_version_id }}
+        run: |
+          if [[ -n "$INITIAL_ROLLBACK_VERSION_ID" ]]; then
+            echo "schema=3" >> "$GITHUB_OUTPUT"
+            echo "release_id=$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID" >> "$GITHUB_OUTPUT"
+            echo "version_id=$INITIAL_ROLLBACK_VERSION_ID" >> "$GITHUB_OUTPUT"
+            echo "rollback_version_id=$INITIAL_ROLLBACK_VERSION_ID" >> "$GITHUB_OUTPUT"
+          else
+            echo "schema=4" >> "$GITHUB_OUTPUT"
+            echo "release_id=$INHERITED_RELEASE_ID" >> "$GITHUB_OUTPUT"
+            echo "version_id=$INHERITED_VERSION_ID" >> "$GITHUB_OUTPUT"
+            echo "rollback_version_id=$INHERITED_ROLLBACK_VERSION_ID" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Read production predecessor version before authentication
+        id: predecessor_status_before
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: web
-          command: deploy
+          command: deployments status --json
           wranglerVersion: "4.112.0"
+      - name: Pin production to exact predecessor version before authentication
+        env:
+          CLOUDFLARE_DEPLOYMENT_STATUS: ${{ steps.predecessor_status_before.outputs.command-output }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs assert-production
+          --status-env CLOUDFLARE_DEPLOYMENT_STATUS
+          --expect-version-id "${{ steps.predecessor.outputs.version_id }}"
+      - name: Authenticate production predecessor shell and executable bytes
+        run: >-
+          node tools/web_release_smoke.mjs
+          --origin "$WEB_ROLLOUT_PRODUCTION_ORIGIN"
+          --expect-schema "${{ steps.predecessor.outputs.schema }}"
+          --expect-release-id "${{ steps.predecessor.outputs.release_id }}"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+      - name: Fetch exact authenticated schema-3 rollback
+        run: >-
+          node tools/fetch_web_rollback.mjs
+          --origin "$WEB_ROLLOUT_PRODUCTION_ORIGIN"
+          --expect-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+          --output target/rollback-web
+      - name: Re-read production predecessor version after authentication
+        id: predecessor_status_after
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deployments status --json
+          wranglerVersion: "4.112.0"
+      - name: Reject a production race during predecessor authentication
+        env:
+          CLOUDFLARE_DEPLOYMENT_STATUS: ${{ steps.predecessor_status_after.outputs.command-output }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs assert-production
+          --status-env CLOUDFLARE_DEPLOYMENT_STATUS
+          --expect-version-id "${{ steps.predecessor.outputs.version_id }}"
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustup toolchain install nightly-2026-02-24 --profile minimal --component rustfmt
+      - name: Test resident machine and renderer
+        run: >-
+          cargo +1.95.0 test --locked
+          -p lazuli
+          -p lazuli-abi
+          -p browser-machine
+          -p browser-renderer
+          -p ppcwasmjit
+          --features browser-machine/game-fidelity-probes
+      - name: Check production Rust formatting and lints
+        run: |
+          cargo +nightly-2026-02-24 fmt --all -- --check
+          cargo +1.95.0 clippy --locked -p disks -p lazuli -p lazuli-abi -p ppcwasmjit -p browser-machine -p browser-renderer --features browser-machine/game-fidelity-probes --lib -- -D warnings
+      - name: Build default-off resident core rejection vector
+        run: >-
+          cargo +1.95.0 build --locked
+          --profile release-dist
+          --target wasm32-unknown-unknown
+          --target-dir target/schema4-default-off
+          -p browser-machine
+      - name: Build feature-on resident core
+        run: >-
+          cargo +1.95.0 build --locked
+          --profile release-dist
+          --target wasm32-unknown-unknown
+          --target-dir target/schema4-feature-on
+          -p browser-machine
+          --features game-fidelity-probes
+      - name: Generate resident dispatcher and coordinator
+        run: |
+          mkdir -p target/gekko-web
+          cargo +1.95.0 run --locked --profile release-dist --target-dir target/schema4-dispatcher-build -p ppcwasmjit --example resident_dispatcher -- target/gekko-web/resident_dispatcher.wasm
+          cargo +1.95.0 run --locked --profile release-dist --target-dir target/schema4-coordinator-build -p browser-machine --example core_run_coordinator -- target/gekko-web/core_run_coordinator.wasm
+      - name: Validate exact resident Wasm and adapter contracts
+        run: |
+          node tools/browser_machine_wasm_contract.mjs target/schema4-feature-on/wasm32-unknown-unknown/release-dist/browser_machine.wasm
+          cargo +1.95.0 run --locked --profile release-dist -p browser-machine --example game_fidelity_wasm_contract -- enabled target/schema4-feature-on/wasm32-unknown-unknown/release-dist/browser_machine.wasm
+          cargo +1.95.0 run --locked --profile release-dist -p browser-machine --example game_fidelity_wasm_contract -- disabled target/schema4-default-off/wasm32-unknown-unknown/release-dist/browser_machine.wasm
+          node tools/resident_dispatcher_wasm_contract.mjs target/gekko-web/resident_dispatcher.wasm
+          node tools/resident_machine_adapter_contract.mjs target/schema4-feature-on/wasm32-unknown-unknown/release-dist/browser_machine.wasm target/gekko-web/resident_dispatcher.wasm target/gekko-web/core_run_coordinator.wasm
+          node tools/build_web_resident_abi_contract.mjs target/schema4-feature-on/wasm32-unknown-unknown/release-dist/browser_machine.wasm target/schema4-default-off/wasm32-unknown-unknown/release-dist/browser_machine.wasm target/gekko-web/resident_dispatcher.wasm target/gekko-web/core_run_coordinator.wasm
+      - name: Build browser renderer
+        run: >-
+          cargo +1.95.0 build --locked
+          --profile release-dist
+          --target wasm32-unknown-unknown
+          --target-dir target/schema4-renderer
+          -p browser-renderer
+      - name: Install pinned wasm-bindgen CLI
+        run: >-
+          cargo +1.95.0 install --locked --version 0.2.114
+          --root target/schema4-wasm-bindgen-cli
+          wasm-bindgen-cli
+      - name: Generate browser renderer bindings
+        run: >-
+          target/schema4-wasm-bindgen-cli/bin/wasm-bindgen
+          --target web
+          --out-dir target/gekko-web
+          --out-name browser_renderer
+          target/schema4-renderer/wasm32-unknown-unknown/release-dist/browser_renderer.wasm
+      - name: Generate resident production frontend
+        run: >-
+          cargo +1.95.0 run --locked --profile release-dist
+          --target-dir target/schema4-frontend-build
+          -p ppcwasmjit --example browser_boot --
+          target/gekko-web/index.html
+          --resident-release
+      - name: Build immutable schema-4 release
+        id: release
+        run: |
+          node tools/build_web.mjs --app target/gekko-web/index.html --core target/schema4-feature-on/wasm32-unknown-unknown/release-dist/browser_machine.wasm --dispatcher target/gekko-web/resident_dispatcher.wasm --coordinator target/gekko-web/core_run_coordinator.wasm --rollback-release target/rollback-web/release.json --rollback-directory target/rollback-web --output web/dist --commit "$GITHUB_SHA" | tee target/schema4-release-id.txt
+          release_id="$(tr -d '\n' < target/schema4-release-id.txt)"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+      - name: Test immutable release and rollout contracts
+        run: >-
+          node --test
+          web/release.test.mjs
+          web/sw.test.mjs
+          tools/browser_resident_frontend.test.mjs
+          tools/build_web.test.mjs
+          tools/deploy_web.test.mjs
+          tools/resident_machine_production_fidelity_bundle.test.mjs
+          tools/resident_machine_production_fidelity_gate.test.mjs
+          tools/web_release_rollout.test.mjs
+          tools/web_dist.test.mjs
+      - name: Ensure version previews without changing production version
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs ensure-preview
+          --account-id-env CLOUDFLARE_ACCOUNT_ID
+          --token-env CLOUDFLARE_API_TOKEN
+          --worker-name gekko-free
+      - name: Upload inactive Cloudflare version
+        id: cloudflare_upload
+        uses: cloudflare/wrangler-action@v3
+        env:
+          WRANGLER_OUTPUT_FILE_PATH: ${{ github.workspace }}/target/wrangler-version-upload.ndjson
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: versions upload --preview-alias resident-canary
+          wranglerVersion: "4.112.0"
+      - name: Capture immutable Cloudflare release evidence
+        id: cloudflare_version
+        run: >-
+          node tools/cloudflare_release_metadata.mjs capture
+          --wrangler-output target/wrangler-version-upload.ndjson
+          --release-manifest web/dist/release.json
+          --rollback-version-id "${{ steps.predecessor.outputs.rollback_version_id }}"
+          --predecessor-schema "${{ steps.predecessor.outputs.schema }}"
+          --predecessor-release-id "${{ steps.predecessor.outputs.release_id }}"
+          --predecessor-version-id "${{ steps.predecessor.outputs.version_id }}"
+          --worker-name gekko-free
+          --expect-preview-alias-origin "$WEB_ROLLOUT_CANARY_ORIGIN"
+          --output target/cloudflare-version.json
+          --github-output "$GITHUB_OUTPUT"
+      - name: Smoke exact immutable canary version
+        run: >-
+          node tools/web_release_smoke.mjs
+          --origin "${{ steps.cloudflare_version.outputs.preview_origin }}"
+          --expect-schema 4
+          --expect-release-id "${{ steps.release.outputs.release_id }}"
+          --expect-source-commit "$GITHUB_SHA"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+          --attempts 30
+          --retry-ms 2000
+      - name: Persist full immutable candidate, predecessor, and rollback mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema4-canary-candidate
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+          path: |
+            web/dist
+            target/schema4-release-id.txt
+            target/rollback-web/release.json
+            target/cloudflare-version.json
+
+  promote:
+    if: inputs.action == 'promote'
+    name: Promote exact canary to production
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate promotion inputs
+        run: node tools/web_rollout_inputs.mjs promote
+      - name: Authenticate exact successful candidate and fidelity workflow runs
+        uses: actions/github-script@v8
+        env:
+          AUTHENTICATED_CANARY_RUN_ID: ${{ inputs.canary_run_id }}
+          AUTHENTICATED_FIDELITY_RUN_ID: ${{ inputs.fidelity_run_id }}
+          AUTHENTICATED_SOURCE_COMMIT: ${{ github.sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const expected = [
+              [process.env.AUTHENTICATED_CANARY_RUN_ID, ".github/workflows/deploy-web.yml"],
+              [process.env.AUTHENTICATED_FIDELITY_RUN_ID, ".github/workflows/capture-web-fidelity.yml"],
+            ];
+            for (const [runId, workflowPath] of expected) {
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId,
+              });
+              if (run.conclusion !== "success" || run.event !== "workflow_dispatch" ||
+                  run.path !== workflowPath || run.head_sha !== process.env.AUTHENTICATED_SOURCE_COMMIT ||
+                  run.repository.full_name !== process.env.GITHUB_REPOSITORY) {
+                core.setFailed(`Run ${runId} is not the exact successful ${workflowPath} source run.`);
+              }
+            }
+      - name: Download exact successful canary evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: schema4-canary-candidate
+          path: target/canary
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.canary_run_id }}
+      - name: Download exact successful all-seven fidelity evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: schema4-production-fidelity-evidence
+          path: target/fidelity
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.fidelity_run_id }}
+      - name: Verify authenticated candidate and rollback version mapping
+        id: cloudflare_version
+        run: >-
+          node tools/cloudflare_release_metadata.mjs verify
+          --metadata target/canary/target/cloudflare-version.json
+          --release-manifest target/canary/web/dist/release.json
+          --worker-name gekko-free
+          --expect-source-commit "$GITHUB_SHA"
+          --expect-release-id "$WEB_ROLLOUT_EXPECTED_RELEASE_ID"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Re-smoke exact immutable canary version
+        run: >-
+          node tools/web_release_smoke.mjs
+          --origin "${{ steps.cloudflare_version.outputs.preview_origin }}"
+          --expect-schema 4
+          --expect-release-id "$WEB_ROLLOUT_EXPECTED_RELEASE_ID"
+          --expect-source-commit "$GITHUB_SHA"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+      - name: Revalidate all-seven production fidelity attestation
+        run: >-
+          node tools/resident_machine_production_fidelity_gate.mjs
+          --attestation target/fidelity/attestation.json
+          --release-manifest target/canary/web/dist/release.json
+          --repository "$GITHUB_WORKSPACE"
+      - name: Prove production still matches authenticated predecessor
+        run: >-
+          node tools/web_release_smoke.mjs
+          --origin "$WEB_ROLLOUT_PRODUCTION_ORIGIN"
+          --expect-schema "${{ steps.cloudflare_version.outputs.predecessor_schema }}"
+          --expect-release-id "${{ steps.cloudflare_version.outputs.predecessor_release_id }}"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+      - name: Read production version immediately before promotion
+        id: predecessor_status
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deployments status --json
+          wranglerVersion: "4.112.0"
+      - name: Pin production to exact predecessor before promotion
+        env:
+          CLOUDFLARE_DEPLOYMENT_STATUS: ${{ steps.predecessor_status.outputs.command-output }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs assert-production
+          --status-env CLOUDFLARE_DEPLOYMENT_STATUS
+          --expect-version-id "${{ steps.cloudflare_version.outputs.predecessor_version_id }}"
+      - name: Promote exact immutable version at 100 percent
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: versions deploy ${{ steps.cloudflare_version.outputs.version_id }}@100% --message promote-${{ inputs.expected_release_id }} -y
+          wranglerVersion: "4.112.0"
+      - name: Read production version after promotion
+        id: candidate_status_after
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deployments status --json
+          wranglerVersion: "4.112.0"
+      - name: Prove exact candidate version is live after promotion
+        env:
+          CLOUDFLARE_DEPLOYMENT_STATUS: ${{ steps.candidate_status_after.outputs.command-output }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs assert-production
+          --status-env CLOUDFLARE_DEPLOYMENT_STATUS
+          --expect-version-id "${{ steps.cloudflare_version.outputs.version_id }}"
+      - name: Post-promote production smoke
+        run: >-
+          node tools/web_release_smoke.mjs
+          --origin "$WEB_ROLLOUT_PRODUCTION_ORIGIN"
+          --expect-schema 4
+          --expect-release-id "$WEB_ROLLOUT_EXPECTED_RELEASE_ID"
+          --expect-source-commit "$GITHUB_SHA"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+          --attempts 30
+          --retry-ms 2000
+
+  rollback:
+    if: inputs.action == 'rollback'
+    name: Roll back to exact schema-3 Cloudflare version
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Validate rollback inputs
+        run: node tools/web_rollout_inputs.mjs rollback
+      - name: Authenticate exact successful promoted-candidate workflow run
+        uses: actions/github-script@v8
+        env:
+          AUTHENTICATED_RUN_ID: ${{ inputs.canary_run_id }}
+          AUTHENTICATED_SOURCE_COMMIT: ${{ github.sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: process.env.AUTHENTICATED_RUN_ID,
+            });
+            if (run.conclusion !== "success" || run.event !== "workflow_dispatch" ||
+                run.path !== ".github/workflows/deploy-web.yml" ||
+                run.head_sha !== process.env.AUTHENTICATED_SOURCE_COMMIT ||
+                run.repository.full_name !== process.env.GITHUB_REPOSITORY) {
+              core.setFailed("Rollback candidate did not come from the exact successful source run.");
+            }
+      - name: Download exact promoted canary evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: schema4-canary-candidate
+          path: target/canary
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.canary_run_id }}
+      - name: Verify authenticated candidate and rollback version mapping
+        id: cloudflare_version
+        run: >-
+          node tools/cloudflare_release_metadata.mjs verify
+          --metadata target/canary/target/cloudflare-version.json
+          --release-manifest target/canary/web/dist/release.json
+          --worker-name gekko-free
+          --expect-source-commit "$GITHUB_SHA"
+          --expect-release-id "$WEB_ROLLOUT_EXPECTED_RELEASE_ID"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Confirm exact schema-4 release before rollback
+        run: >-
+          node tools/web_release_smoke.mjs
+          --origin "$WEB_ROLLOUT_PRODUCTION_ORIGIN"
+          --expect-schema 4
+          --expect-release-id "$WEB_ROLLOUT_EXPECTED_RELEASE_ID"
+          --expect-source-commit "$GITHUB_SHA"
+          --expect-rollback-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+      - name: Read production version immediately before rollback
+        id: candidate_status
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deployments status --json
+          wranglerVersion: "4.112.0"
+      - name: Pin production to exact candidate before rollback
+        env:
+          CLOUDFLARE_DEPLOYMENT_STATUS: ${{ steps.candidate_status.outputs.command-output }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs assert-production
+          --status-env CLOUDFLARE_DEPLOYMENT_STATUS
+          --expect-version-id "${{ steps.cloudflare_version.outputs.version_id }}"
+      - name: Roll back exact immutable Cloudflare version
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: rollback ${{ steps.cloudflare_version.outputs.rollback_version_id }} --message rollback-to-${{ inputs.expected_rollback_release_id }}
+          wranglerVersion: "4.112.0"
+      - name: Read production version after rollback
+        id: rollback_status_after
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deployments status --json
+          wranglerVersion: "4.112.0"
+      - name: Prove exact rollback version is live after rollback
+        env:
+          CLOUDFLARE_DEPLOYMENT_STATUS: ${{ steps.rollback_status_after.outputs.command-output }}
+        run: >-
+          node tools/cloudflare_release_metadata.mjs assert-production
+          --status-env CLOUDFLARE_DEPLOYMENT_STATUS
+          --expect-version-id "${{ steps.cloudflare_version.outputs.rollback_version_id }}"
+      - name: Prove schema-3 shell, worker, and assets are live
+        run: >-
+          node tools/web_release_smoke.mjs
+          --origin "$WEB_ROLLOUT_PRODUCTION_ORIGIN"
+          --expect-schema 3
+          --expect-release-id "$WEB_ROLLOUT_EXPECTED_ROLLBACK_RELEASE_ID"
+          --attempts 30
+          --retry-ms 2000
