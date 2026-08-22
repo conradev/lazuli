@@ -12,12 +12,21 @@ import {
   validateResidentFirstFrameReport,
 } from "./resident_machine_first_frame_report.mjs";
 import {
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
+import {
+  fidelityNavigationPolicyFromSteps,
+  productionFidelityNavigationPolicy,
+} from "./resident_machine_fidelity_navigation.mjs";
 
 const SHA = "a".repeat(64);
+const PRODUCTION_EVIDENCE_LOCK = Object.freeze({
+  schema: "lazuli-resident-renderer-fidelity-evidence-lock-v3",
+  sha256: "e".repeat(64),
+});
 
 function artifact(bytes, sha256) {
   return { bytes, sha256 };
@@ -122,6 +131,7 @@ export function residentFirstFrameReportFixture() {
       evidenceMode: "first-renderer-owned-presented-xfb",
       instructionUpperCap: "100000000",
       executedCycleUpperCap: "250000000",
+      canonicalCycleUpperCap: "250000000",
       sliceCycleUpperCap: "1000000",
       blockUpperCap: 16384,
       totalHostCallCap: 65535,
@@ -130,6 +140,7 @@ export function residentFirstFrameReportFixture() {
       bootTimeoutMs: 180000,
       sliceTimeoutMs: 180000,
       runTimeoutMs: 600000,
+      externalWallTimeoutMs: 600000,
       zeroProgressSliceCap: 4096,
     },
     artifacts: {
@@ -186,10 +197,12 @@ export function residentFirstFrameReportFixture() {
       run: {
         wallMs: 20,
         slices: 2,
-        rustBoundaries: 2,
+        rustBoundaries: 1,
+        adapterCapBoundaries: 0,
         rustStopBoundaries: 0,
         instructionCapBoundaries: 0,
         executedCycleCapBoundaries: 0,
+        canonicalCycleCapBoundaries: 0,
         hostCallCapBoundaries: 0,
         coldInstallCapBoundaries: 0,
         workerTimeoutBoundaries: 0,
@@ -200,12 +213,14 @@ export function residentFirstFrameReportFixture() {
         servicedHostCalls: 2,
         coldInstalls: 3,
         executedCycles: "2000",
+        canonicalCycles: "2000",
         executedInstructions: "1000",
-        outcomeDetails: { "0": 2 },
+        outcomeDetails: { "0": 1 },
         complete: true,
         goalReached: true,
         instructionUpperCap: "100000000",
         executedCycleUpperCap: "250000000",
+        canonicalCycleUpperCap: "250000000",
         instructionsPerSecond: 50000,
         cyclesPerSecond: 100000,
       },
@@ -298,6 +313,7 @@ export function residentFirstFrameReportFixture() {
         rustStops: 0,
         instructionCaps: 0,
         executedCycleCaps: 0,
+        canonicalCycleCaps: 0,
         hostCallCaps: 0,
         coldInstallCaps: 0,
         workerTimeouts: 0,
@@ -320,6 +336,8 @@ export function residentFirstFrameReportFixture() {
         maximumProbeEventsPerSubmission: 1,
         probeRelayFailures: 0,
         kindCounts: {},
+        navigationStepRecords: 0,
+        navigationArmRecordSha256: null,
         firstRecordSha256: SHA,
         lastRecordSha256: SHA,
         lastServerSequence: 4,
@@ -346,6 +364,38 @@ export function residentFirstFrameReportFixture() {
     },
     captureOrderContract: [...FIRST_FRAME_CAPTURE_ORDER],
   };
+}
+
+function productionFirstFrameReportFixture() {
+  const report = residentFirstFrameReportFixture();
+  report.evidenceLock = structuredClone(PRODUCTION_EVIDENCE_LOCK);
+  Object.assign(report.policy, {
+    instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+    executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+    canonicalCycleUpperCap: PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+    sliceCycleUpperCap: "8000000",
+    blockUpperCap: 131_072,
+    totalHostCallCap: 65_535,
+    totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+    maxBootReads: 8_192,
+    bootTimeoutMs: 180_000,
+    sliceTimeoutMs: 180_000,
+    runTimeoutMs: 7_200_000,
+    externalWallTimeoutMs: 7_200_000,
+    zeroProgressSliceCap: 4_096,
+    navigationPolicy: productionFidelityNavigationPolicy(report.corpus.selectedGameKey),
+  });
+  Object.assign(report.game.run, {
+    instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+    executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+    canonicalCycleUpperCap: PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+  });
+  report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
+  report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
+  report.capabilityBoundary.rendererProbeEventsExpected = 0;
+  report.game.fidelityCheckpoints.probeEventCount = 0;
+  report.game.fidelityCheckpoints.maximumProbeEventsPerSubmission = 0;
+  return report;
 }
 
 function cloned(value) {
@@ -393,6 +443,41 @@ test("complete first-presented-XFB evidence satisfies the strict schema", () => 
   );
 });
 
+test("MachineEvidence outer slices admit only reported internal host and cold continuations", () => {
+  const coveredContinuation = residentFirstFrameReportFixture();
+  mutateEvidenceWords(
+    coveredContinuation.game.adapterDiagnostics.final.machineEvidence,
+    [[29, coveredContinuation.game.run.slices + 1]],
+  );
+  assert.doesNotThrow(() => validateResidentFirstFrameReport(
+    coveredContinuation,
+    { requireComplete: true },
+  ));
+
+  const belowIssuedSlices = residentFirstFrameReportFixture();
+  mutateEvidenceWords(
+    belowIssuedSlices.game.adapterDiagnostics.final.machineEvidence,
+    [[29, belowIssuedSlices.game.run.slices - 1]],
+  );
+  assert.throws(
+    () => validateResidentFirstFrameReport(belowIssuedSlices, { requireComplete: true }),
+    /outer-slice delta.*expected 2 through 7/,
+  );
+
+  const aboveReportedServices = residentFirstFrameReportFixture();
+  const maximumCovered = aboveReportedServices.game.run.slices
+    + aboveReportedServices.game.run.servicedHostCalls
+    + aboveReportedServices.game.run.coldInstalls;
+  mutateEvidenceWords(
+    aboveReportedServices.game.adapterDiagnostics.final.machineEvidence,
+    [[29, maximumCovered + 1]],
+  );
+  assert.throws(
+    () => validateResidentFirstFrameReport(aboveReportedServices, { requireComplete: true }),
+    /outer-slice delta.*expected 2 through 7/,
+  );
+});
+
 test("an explicit exact artifact set can qualify a different immutable package", () => {
   const report = residentFirstFrameReportFixture();
   report.artifacts.artifacts["browser_machine.wasm"] = artifact(1234, SHA);
@@ -437,26 +522,26 @@ test("standalone v2 validation retains the u16 cold-install ceiling", () => {
 });
 
 test("production validation requires an exact v3 lock reference and zero client probes", () => {
-  const report = residentFirstFrameReportFixture();
-  const expectedEvidenceLock = {
-    schema: "lazuli-resident-renderer-fidelity-evidence-lock-v3",
-    sha256: "e".repeat(64),
-  };
-  report.evidenceLock = structuredClone(expectedEvidenceLock);
-  report.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
-  report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
-  report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
-  report.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
-  report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
-  report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
-  report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
-  report.capabilityBoundary.rendererProbeEventsExpected = 0;
-  report.game.fidelityCheckpoints.probeEventCount = 0;
-  report.game.fidelityCheckpoints.maximumProbeEventsPerSubmission = 0;
+  const report = productionFirstFrameReportFixture();
+  const expectedEvidenceLock = structuredClone(PRODUCTION_EVIDENCE_LOCK);
   assert.doesNotThrow(() => validateResidentFirstFrameReport(report, {
     requireComplete: true,
     expectedEvidenceLock,
   }));
+  assert.equal(report.policy.instructionUpperCap, "16000000000");
+  assert.equal(report.policy.executedCycleUpperCap, "32000000000");
+  assert.equal(report.policy.canonicalCycleUpperCap, "32000000000");
+  assert.equal(report.policy.sliceCycleUpperCap, "8000000");
+  assert.equal(report.policy.blockUpperCap, 131_072);
+  assert.equal(report.policy.runTimeoutMs, 7_200_000);
+  assert.equal(report.policy.externalWallTimeoutMs, 7_200_000);
+  assert.equal(report.policy.navigationPolicy.steps.length, 34);
+  assert.deepEqual(report.policy.navigationPolicy.steps.at(-1), {
+    minimumCanonicalDelay: "24324300",
+    buttons: 0,
+    stickXyCxy: 0x8080_8080,
+    triggerLrab: 0,
+  });
   report.policy.instructionUpperCap = "100000000";
   report.game.run.instructionUpperCap = "100000000";
   assert.throws(() => validateResidentFirstFrameReport(report, {
@@ -465,6 +550,47 @@ test("production validation requires an exact v3 lock reference and zero client 
   }), /instructionUpperCap/);
   report.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
   report.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
+
+  report.policy.canonicalCycleUpperCap = "250000000";
+  report.game.run.canonicalCycleUpperCap = "250000000";
+  assert.throws(() => validateResidentFirstFrameReport(report, {
+    requireComplete: true,
+    expectedEvidenceLock,
+  }), /canonicalCycleUpperCap/);
+  report.policy.canonicalCycleUpperCap = PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP;
+  report.game.run.canonicalCycleUpperCap = PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP;
+
+  for (const [field, stale] of [
+    ["sliceCycleUpperCap", "1000000"],
+    ["runTimeoutMs", 600_000],
+    ["externalWallTimeoutMs", 600_000],
+  ]) {
+    const downgraded = cloned(report);
+    downgraded.policy[field] = stale;
+    assert.throws(() => validateResidentFirstFrameReport(downgraded, {
+      requireComplete: true,
+      expectedEvidenceLock,
+    }), new RegExp(field));
+  }
+
+  const wrongSameTitleNavigation = cloned(report);
+  wrongSameTitleNavigation.policy.navigationPolicy = fidelityNavigationPolicyFromSteps(
+    "warioware-usa",
+    [],
+  );
+  assert.throws(() => validateResidentFirstFrameReport(wrongSameTitleNavigation, {
+    requireComplete: true,
+    expectedEvidenceLock,
+  }), /navigationPolicy/);
+
+  const wrongNavigationTitle = cloned(report);
+  wrongNavigationTitle.policy.navigationPolicy = productionFidelityNavigationPolicy(
+    "luigis-mansion-usa",
+  );
+  assert.throws(() => validateResidentFirstFrameReport(wrongNavigationTitle, {
+    requireComplete: true,
+    expectedEvidenceLock,
+  }), /navigationPolicy\.gameKey/);
 
   report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP + 1;
   assert.throws(() => validateResidentFirstFrameReport(report, {
@@ -542,22 +668,8 @@ test("production capture order inserts only durable first-frame ownership", () =
     FIRST_FRAME_CAPTURE_ORDER,
   );
 
-  const expectedEvidenceLock = {
-    schema: "lazuli-resident-renderer-fidelity-evidence-lock-v3",
-    sha256: "e".repeat(64),
-  };
-  const production = residentFirstFrameReportFixture();
-  production.evidenceLock = structuredClone(expectedEvidenceLock);
-  production.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
-  production.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
-  production.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
-  production.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
-  production.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
-  production.capabilityBoundary.rendererProbeEventsExpected = 0;
-  production.game.fidelityCheckpoints.probeEventCount = 0;
-  production.game.fidelityCheckpoints.maximumProbeEventsPerSubmission = 0;
-  production.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
-  production.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
+  const expectedEvidenceLock = structuredClone(PRODUCTION_EVIDENCE_LOCK);
+  const production = productionFirstFrameReportFixture();
   assert.doesNotThrow(() => validateResidentFirstFrameReport(production, {
     requireComplete: true,
     expectedEvidenceLock,
@@ -663,8 +775,10 @@ async function observeRustRunHarness() {
     servicedHostCalls: 0,
     coldInstalls: 0,
     rustBoundaries: 0,
+    adapterCapBoundaries: 0,
     rustStopBoundaries: 0,
     executedCycles: 0n,
+    canonicalCycles: 0n,
     executedInstructions: 0n,
     outcomeDetails: Object.create(null),
     zeroProgressSlices: 0,
@@ -681,8 +795,17 @@ test("semantic idle cycle progress does not consume the zero-progress slice budg
     boundary: "rust",
     hostCalls: 0,
     coldInstalls: 0,
-    outcome: { reason: 0, detail: 0, executedCycles: "100", executedInstructions: "0" },
+    scheduler: {
+      delta: {
+        canonicalCycles: "100",
+        executedCycles: "100",
+        executedInstructions: "0",
+        retiredBlocks: "1",
+      },
+    },
+    outcome: { reason: 0, detail: 0 },
   });
+  assert.equal(run.canonicalCycles, 100n);
   assert.equal(run.executedCycles, 100n);
   assert.equal(run.executedInstructions, 0n);
   assert.equal(run.zeroProgressSlices, 0);
@@ -696,7 +819,15 @@ test("authenticated host and cold work reset consecutive zero progress", async (
     boundary: "rust",
     hostCalls,
     coldInstalls,
-    outcome: { reason: 0, detail: 0, executedCycles: "0", executedInstructions: "0" },
+    scheduler: {
+      delta: {
+        canonicalCycles: "0",
+        executedCycles: "0",
+        executedInstructions: "0",
+        retiredBlocks: "0",
+      },
+    },
+    outcome: { reason: 0, detail: 0 },
   });
 
   observeRustRun(run, result(0, 0));
@@ -921,7 +1052,13 @@ test("production page keeps query, ownership ACK, reuse, and controller APIs fai
     source,
     /productionCaptureRequested\s*\? PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP\s*:\s*"100000000"/,
   );
-  assert.equal(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP, "1250000000");
+  assert.match(
+    source,
+    /productionCaptureRequested\s*\? PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP\s*:\s*executedCycleUpperCapDefault/,
+  );
+  assert.equal(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP, "16000000000");
+  assert.equal(PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP, "32000000000");
+  assert.equal(PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP, "32000000000");
 
   const observationStart = source.indexOf("async captureFidelityObservation(message)");
   const observationEnd = source.indexOf("\n  async render(message)", observationStart);
@@ -941,10 +1078,10 @@ test("production page keeps query, ownership ACK, reuse, and controller APIs fai
   const apiStart = source.indexOf("function installProductionCaptureApi(client, game)");
   const apiEnd = source.indexOf("\nasync function main()", apiStart);
   const api = source.slice(apiStart, apiEnd);
-  assert.match(api, /operator: \(\.\.\.arguments_\) =>/);
+  assert.match(api, /navigation: \(\.\.\.arguments_\) =>/);
   assert.match(api, /arguments_\.length !== 0/);
-  assert.match(api, /await client\.publishOperatorController\(\)/);
-  assert.doesNotMatch(api, /publishOperatorController\(controller\)/);
+  assert.match(api, /await client\.publishNavigationController\(\)/);
+  assert.doesNotMatch(api, /publishNavigationController\(controller\)/);
 
   const witnessStart = source.indexOf("async captureControllerWitness(message)");
   const witnessEnd = source.indexOf("\n  async stepRun()", witnessStart);

@@ -7,6 +7,7 @@
 
 #![no_std]
 
+use core::cmp::Ordering;
 use core::fmt;
 use core::mem::size_of;
 
@@ -993,7 +994,7 @@ impl RenderReceipt {
 /// Fixed little-endian words for one unsigned 64-bit evidence value.
 ///
 /// Keeping the split explicit makes the record layout identical on native test hosts and wasm32.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EvidenceU64 {
     pub lo: u32,
@@ -1012,6 +1013,18 @@ impl EvidenceU64 {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.lo as u64 | ((self.hi as u64) << 32)
+    }
+}
+
+impl Ord for EvidenceU64 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.hi.cmp(&other.hi).then_with(|| self.lo.cmp(&other.lo))
+    }
+}
+
+impl PartialOrd for EvidenceU64 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -2770,6 +2783,28 @@ mod tests {
     }
 
     #[test]
+    fn evidence_u64_orders_the_numeric_value_across_low_word_rollover() {
+        let values = [
+            0,
+            1,
+            u64::from(u32::MAX) - 1,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::from(u32::MAX) + 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for left in values {
+            for right in values {
+                assert_eq!(
+                    EvidenceU64::new(left).cmp(&EvidenceU64::new(right)),
+                    left.cmp(&right),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn machine_di_evidence_requires_exact_command_and_host_balances() {
         let mut di = MachineDiEvidenceV1::new();
         assert!(di.has_canonical_shape());
@@ -2913,6 +2948,21 @@ mod tests {
             source_raw: MachineSiPollSource::Periodic as u32,
         };
         assert!(record.has_canonical_shape());
+
+        // Retained XFB and SI chronology plus semantic-idle accounting remain earlier than the
+        // scheduler when its low word rolls over. The split representation must compare the
+        // complete numeric u64, not the `lo` field before `hi`.
+        let rollover_cycle = u64::from(u32::MAX) + 1;
+        let mut rollover = record;
+        rollover.scheduler.canonical_cycle = EvidenceU64::new(rollover_cycle);
+        rollover.scheduler.executed_cycles = EvidenceU64::new(rollover_cycle);
+        rollover.xfb_vi.render_completion_cycle = EvidenceU64::new(rollover_cycle - 3);
+        rollover.si.scheduled_cycle = EvidenceU64::new(rollover_cycle - 2);
+        rollover.si.observed_cycle = EvidenceU64::new(rollover_cycle - 1);
+        rollover.semantic_idle_cycles = EvidenceU64::new(rollover_cycle - 4);
+        rollover.semantic_idle_jumps = 1;
+        assert!(rollover.has_canonical_shape());
+
         let mut bytes = [0_u8; MachineEvidenceV1::BYTE_LEN];
         assert!(record.encode_le(&mut bytes));
         assert_eq!(MachineEvidenceV1::decode_le(&bytes), Some(record));

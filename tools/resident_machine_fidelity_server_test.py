@@ -23,8 +23,12 @@ from resident_machine_fidelity_server import (
     DURABLE_RECORD_SCHEMA,
     FidelityCheckpointError,
     FidelityCheckpointJournal,
+    PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+    PRODUCTION_FIDELITY_EMPTY_NAVIGATION_SCRIPT_SHA256,
     PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+    PRODUCTION_FIDELITY_GAME_KEYS,
     PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+    PRODUCTION_FIDELITY_NAVIGATION_AUTHORITIES,
     PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
     PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
     canonical_json,
@@ -44,9 +48,70 @@ HOST_SHA = "f" * 64
 REQUEST_SHA = "a" * 64
 RECEIPT_SHA = "b" * 64
 MACHINE_SESSION_ID = "87654321-4321-4321-8321-cba987654321"
+
+
+def navigation_policy(
+    steps: list[dict[str, object]],
+    game_key: str = GAME_KEY,
+) -> dict[str, object]:
+    return {
+        "schema": "lazuli-resident-pre-baseline-navigation-v1",
+        "gameKey": game_key,
+        "algorithm": "locked-si-observed-not-before-publication-v1",
+        "cycleOrigin": "durable-first-frame-canonical-scheduler-cycle",
+        "controllerEncoding": "gamecube-packed-controller-v1",
+        "targetAnchor": "prior-si-observed-cycle",
+        "receiptSource": "periodic",
+        "periodicSiCycles": "8108100",
+        "maximumReceiptLatencyCycles": "16108100",
+        "maximumPublications": PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+        "scriptSha256": sha256_hex(canonical_json(steps)),
+        "steps": steps,
+    }
+
+
+def javascript_production_navigation_policies() -> dict[str, dict[str, object]]:
+    project_root = Path(__file__).resolve().parent.parent
+    javascript = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                "import { PRODUCTION_FIDELITY_GAME_KEYS as keys, "
+                "productionFidelityNavigationPolicy as policy } from "
+                "'./tools/resident_machine_fidelity_navigation.mjs';"
+                "process.stdout.write(JSON.stringify(Object.fromEntries("
+                "keys.map(key => [key, policy(key)]))));"
+            ),
+        ],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(javascript.stdout)
+
+
+EMPTY_NAVIGATION_POLICY = navigation_policy([])
+TWO_STEP_NAVIGATION_POLICY = navigation_policy([
+    {
+        "minimumCanonicalDelay": "20",
+        "buttons": 0x0100,
+        "stickXyCxy": 0x8080_8080,
+        "triggerLrab": 0x00FF_0000,
+    },
+    {
+        "minimumCanonicalDelay": "20",
+        "buttons": 0,
+        "stickXyCxy": 0x8080_8080,
+        "triggerLrab": 0,
+    },
+])
 CAPTURE_RUN_POLICY = {
-    "instructionUpperCap": "100",
-    "executedCycleUpperCap": "200",
+    "instructionUpperCap": "1000",
+    "executedCycleUpperCap": "1000",
+    "canonicalCycleUpperCap": "1000",
     "sliceCycleUpperCap": "10",
     "blockUpperCap": 16,
     "totalHostCallCap": 20,
@@ -54,30 +119,82 @@ CAPTURE_RUN_POLICY = {
     "maxBootReads": 8,
     "bootTimeoutMs": 1_000,
     "sliceTimeoutMs": 1_000,
-    "runTimeoutMs": 10_000,
-    "externalWallTimeoutMs": 10_000,
+    "runTimeoutMs": 7_200_000,
+    "externalWallTimeoutMs": 7_200_000,
     "zeroProgressSliceCap": 4,
     "workerUrl": "/worker.mjs",
+    "navigationPolicy": EMPTY_NAVIGATION_POLICY,
 }
 
 
-def capture_run_summary(accepted: bool = False) -> dict[str, object]:
-    return {
-        "schema": "lazuli-resident-cumulative-run-summary-v1",
+def capture_run_summary(
+    accepted: bool = False,
+    operator_publications: int = 0,
+    **overrides: object,
+) -> dict[str, object]:
+    summary = {
+        "schema": "lazuli-resident-cumulative-run-summary-v2",
         "issuedRunCalls": 2 if accepted else 0,
-        "reportedExecutedCycles": "20" if accepted else "0",
-        "reportedExecutedInstructions": "40" if accepted else "0",
+        "canonicalCycle": "100" if accepted else "0",
+        "reportedCanonicalCycles": "100" if accepted else "0",
+        "reportedExecutedCycles": "100" if accepted else "0",
+        "reportedExecutedInstructions": "200" if accepted else "0",
+        "reportedRetiredBlocks": "10" if accepted else "0",
         "reportedHostCalls": 2 if accepted else 0,
         "reportedColdInstalls": 0,
         "zeroProgressSlices": 0,
         "consecutiveZeroProgressSlices": 0,
         "maximumConsecutiveZeroProgressSlices": 0,
-        "operatorPublications": 0,
+        "operatorPublications": operator_publications,
         "witnessPublications": 1 if accepted else 0,
         "elapsedWallMs": 20 if accepted else 0,
-        "wallTimeoutMs": 10_000,
+        "wallTimeoutMs": 7_200_000,
         "accepted": accepted,
     }
+    summary.update(overrides)
+    return summary
+
+
+def progressed_run_summary(
+    canonical_cycle: int,
+    issued_run_calls: int,
+    *,
+    operator_publications: int = 0,
+    witness_publications: int = 0,
+    accepted: bool = False,
+) -> dict[str, object]:
+    return capture_run_summary(
+        accepted,
+        operator_publications,
+        issuedRunCalls=issued_run_calls,
+        canonicalCycle=str(canonical_cycle),
+        reportedCanonicalCycles=str(canonical_cycle),
+        reportedExecutedCycles=str(canonical_cycle),
+        reportedExecutedInstructions=str(canonical_cycle * 2),
+        reportedRetiredBlocks=str(issued_run_calls),
+        reportedHostCalls=issued_run_calls,
+        witnessPublications=witness_publications,
+        elapsedWallMs=issued_run_calls * 10,
+    )
+
+
+def expected_si_packet(step: dict[str, object]) -> tuple[int, int]:
+    buttons = int(step["buttons"])
+    sticks = int(step["stickXyCxy"])
+    triggers = int(step["triggerLrab"])
+    word_0 = (
+        ((buttons >> 8) & 0xFF) << 24
+        | (((buttons & 0xFF) | 0x80) & 0xFF) << 16
+        | (sticks & 0xFF) << 8
+        | ((sticks >> 8) & 0xFF)
+    )
+    word_1 = (
+        ((sticks >> 16) & 0xFF) << 24
+        | ((sticks >> 24) & 0xFF) << 16
+        | (triggers & 0xFF) << 8
+        | ((triggers >> 8) & 0xFF)
+    )
+    return word_0, word_1
 
 
 def common(sequence: int, kind: str) -> dict[str, object]:
@@ -141,7 +258,10 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             allow_capture_annotations=True,
         )
 
-    def append_capture_initialization(self) -> int:
+    def append_capture_initialization(
+        self,
+        run_policy: dict[str, object] = CAPTURE_RUN_POLICY,
+    ) -> int:
         self.append({
             **common(1, "capture-machine-initialized"),
             "machineSessionId": MACHINE_SESSION_ID,
@@ -151,7 +271,7 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             "machineEvidenceEnvelopeSha256": "a" * 64,
             "machineEvidenceOpaqueBytes": 816,
             "machineEvidenceOpaqueSha256": "b" * 64,
-            "runPolicy": CAPTURE_RUN_POLICY,
+            "runPolicy": run_policy,
             "runSummary": capture_run_summary(),
         })
         return 2
@@ -188,7 +308,13 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
         self,
         *,
         baseline_same_receipt: bool,
-    ) -> tuple[int, dict[str, object], dict[str, object], dict[str, object]]:
+    ) -> tuple[
+        int,
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ]:
         sequence, first_receipt, _ = self.append_render(
             self.append_capture_initialization(),
             identity(),
@@ -235,7 +361,118 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             "firstFrameRendererRecordSha256": first_ack["recordSha256"],
             "baselineRecordSha256": baseline_ack["recordSha256"],
         })
-        return sequence + 1, first_receipt, baseline_ack, report_ack
+        arm_ack = self.append({
+            **common(sequence + 1, "navigation-armed"),
+            "machineSessionId": MACHINE_SESSION_ID,
+            "firstFrameReportRecordSha256": report_ack["recordSha256"],
+            "scriptSha256": EMPTY_NAVIGATION_POLICY["scriptSha256"],
+            "runCallOrigin": 1,
+            "canonicalCycleOrigin": "10",
+            "siPollIndexOrigin": "0",
+            "stepCount": 0,
+            "runSummary": progressed_run_summary(10, 1),
+        })
+        return sequence + 2, first_receipt, baseline_ack, report_ack, arm_ack
+
+    def append_nonempty_navigation_arm(
+        self,
+    ) -> tuple[int, dict[str, object], dict[str, object], dict[str, object]]:
+        run_policy = {**CAPTURE_RUN_POLICY, "navigationPolicy": TWO_STEP_NAVIGATION_POLICY}
+        sequence, first_receipt, _ = self.append_render(
+            self.append_capture_initialization(run_policy),
+            identity(),
+        )
+        first_ack = self.append({
+            **common(sequence, "first-frame-renderer-owned"),
+            "machineSessionId": MACHINE_SESSION_ID,
+            **first_receipt,
+            "readbackMetadataBytes": 128,
+            "readbackMetadataSha256": "1" * 64,
+            "rgbaBytes": 640 * 480 * 4,
+            "rgbaSha256": "2" * 64,
+        })
+        report_ack = self.append({
+            **common(sequence + 1, "first-frame-report-bound"),
+            "machineSessionId": MACHINE_SESSION_ID,
+            "reportBytes": 4096,
+            "reportSha256": "9" * 64,
+            "machineEvidenceEnvelopeBytes": 1200,
+            "machineEvidenceEnvelopeSha256": "a" * 64,
+            "machineEvidenceOpaqueBytes": 816,
+            "machineEvidenceOpaqueSha256": "b" * 64,
+            "firstFrameRendererRecordSha256": first_ack["recordSha256"],
+            "baselineRecordSha256": None,
+        })
+        arm_ack = self.append({
+            **common(sequence + 2, "navigation-armed"),
+            "machineSessionId": MACHINE_SESSION_ID,
+            "firstFrameReportRecordSha256": report_ack["recordSha256"],
+            "scriptSha256": TWO_STEP_NAVIGATION_POLICY["scriptSha256"],
+            "runCallOrigin": 1,
+            "canonicalCycleOrigin": "10",
+            "siPollIndexOrigin": "0",
+            "stepCount": 2,
+            "runSummary": progressed_run_summary(10, 1),
+        })
+        return sequence + 3, first_receipt, report_ack, arm_ack
+
+    def append_navigation_step(
+        self,
+        sequence: int,
+        report_ack: dict[str, object],
+        arm_ack: dict[str, object],
+        step_index: int,
+        prior_observed_cycle: int,
+        **overrides: object,
+    ) -> tuple[int, dict[str, object], int]:
+        step = TWO_STEP_NAVIGATION_POLICY["steps"][step_index]
+        assert isinstance(step, dict)
+        target = prior_observed_cycle + int(step["minimumCanonicalDelay"])
+        publication = target + step_index + 1
+        scheduled = publication + 1
+        observed = scheduled + 1
+        packet_word_0, packet_word_1 = expected_si_packet(step)
+        payload = {
+            **common(sequence, "navigation-step-received"),
+            "machineSessionId": MACHINE_SESSION_ID,
+            "firstFrameReportRecordSha256": report_ack["recordSha256"],
+            "navigationArmRecordSha256": arm_ack["recordSha256"],
+            "scriptSha256": TWO_STEP_NAVIGATION_POLICY["scriptSha256"],
+            "runCallOrigin": 1,
+            "canonicalCycleOrigin": "10",
+            "stepIndex": step_index,
+            "sequenceLo": step_index + 1,
+            "sequenceHi": 0,
+            "minimumCanonicalDelay": step["minimumCanonicalDelay"],
+            "targetCanonicalCycle": str(target),
+            "publicationCanonicalCycle": str(publication),
+            "publicationOvershootCycles": str(step_index + 1),
+            "buttons": step["buttons"],
+            "stickXyCxy": step["stickXyCxy"],
+            "triggerLrab": step["triggerLrab"],
+            "status": 1,
+            "siPollIndex": str(step_index + 1),
+            "siScheduledCycle": str(scheduled),
+            "siObservedCycle": str(observed),
+            "siAppliedSequenceLo": step_index + 1,
+            "siAppliedSequenceHi": 0,
+            "siPacketWord0": packet_word_0,
+            "siPacketWord1": packet_word_1,
+            "siSource": 0,
+            "priorSiPollIndex": str(step_index),
+            "siControllerMode": 3,
+            "siButtons": step["buttons"],
+            "siStickXyCxy": step["stickXyCxy"],
+            "siTriggerLrab": step["triggerLrab"],
+            "runSummary": progressed_run_summary(
+                observed,
+                step_index + 2,
+                operator_publications=step_index + 1,
+            ),
+            **overrides,
+        }
+        acknowledgement = self.append(payload)
+        return sequence + 1, acknowledgement, observed
 
     def test_capture_initialization_requires_complete_boot_within_locked_cap(self) -> None:
         self.reset_capture_journal()
@@ -418,8 +655,12 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
         for same_receipt in (True, False):
             with self.subTest(same_receipt=same_receipt):
                 self.reset_capture_journal(f"capture-{same_receipt}.jsonl")
-                sequence, _, baseline_ack, report_ack = self.append_capture_prefix(
+                sequence, _, baseline_ack, report_ack, arm_ack = self.append_capture_prefix(
                     baseline_same_receipt=same_receipt
+                )
+                self.assertLess(
+                    baseline_ack["serverSequence"],
+                    arm_ack["serverSequence"],
                 )
                 witness_ack = self.append({
                     **common(sequence, "controller-witness-published"),
@@ -436,6 +677,13 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                     "machineEvidenceEnvelopeSha256": "c" * 64,
                     "machineEvidenceOpaqueBytes": 816,
                     "machineEvidenceOpaqueSha256": "d" * 64,
+                    "navigationScriptSha256": EMPTY_NAVIGATION_POLICY["scriptSha256"],
+                    "navigationStepCount": 0,
+                    "navigationArmRecordSha256": arm_ack["recordSha256"],
+                    "lastNavigationStepRecordSha256": None,
+                    "runSummary": progressed_run_summary(
+                        10, 2, witness_publications=1
+                    ),
                 })
                 sequence += 1
                 accepted_identity = identity()
@@ -461,11 +709,132 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                     "baselineRecordSha256": baseline_ack["recordSha256"],
                     "acceptedRecordSha256": accepted_ack["recordSha256"],
                     **artifacts,
-                    "runSummary": capture_run_summary(True),
+                    "runSummary": progressed_run_summary(
+                        100, 4, witness_publications=1, accepted=True
+                    ),
+                    "navigationScriptSha256": EMPTY_NAVIGATION_POLICY["scriptSha256"],
+                    "navigationStepCount": 0,
+                    "navigationArmRecordSha256": arm_ack["recordSha256"],
+                    "lastNavigationStepRecordSha256": None,
                 })
                 self.assertEqual(self.journal.terminal_record_sha256, terminal["recordSha256"])
                 with self.assertRaisesRegex(FidelityCheckpointError, "terminal"):
                     self.append({**common(sequence + 2, "pre-submit"), **identity()})
+
+    def test_nonempty_navigation_requires_repeated_receipts_before_baseline(self) -> None:
+        self.reset_capture_journal("navigation-valid.jsonl")
+        sequence, _, report_ack, arm_ack = self.append_nonempty_navigation_arm()
+        step_acks: list[dict[str, object]] = []
+        observed = 10
+        for step_index in range(2):
+            sequence, step_ack, observed = self.append_navigation_step(
+                sequence,
+                report_ack,
+                arm_ack,
+                step_index,
+                observed,
+            )
+            step_acks.append(step_ack)
+        baseline_identity = identity()
+        baseline_identity.update(relayRequestId=8, renderCallOrdinal=4, sequenceLo=7)
+        sequence, baseline_receipt, _ = self.append_render(sequence, baseline_identity)
+        baseline_ack = self.append({
+            **common(sequence, "fidelity-baseline-owned"),
+            "machineSessionId": MACHINE_SESSION_ID,
+            **baseline_receipt,
+            "phase": 1,
+            **fidelity_artifacts("3"),
+            "readbackMetadataBytes": 128,
+            "readbackMetadataSha256": "7" * 64,
+            "rgbaBytes": 640 * 480 * 4,
+            "rgbaSha256": "8" * 64,
+            "requestedButtons": 0x0100,
+            "requestedStickXyCxy": 0x80808080,
+            "requestedTriggerLrab": 0x00FF0000,
+        })
+        self.assertLess(arm_ack["serverSequence"], step_acks[0]["serverSequence"])
+        self.assertLess(step_acks[1]["serverSequence"], baseline_ack["serverSequence"])
+        self.assertEqual(len(self.journal.navigation_transcript), 2)
+
+        with self.assertRaisesRegex(
+            FidelityCheckpointError,
+            "complete durable navigation transcript|navigation authority",
+        ):
+            self.append({
+                **common(sequence + 1, "controller-witness-published"),
+                "machineSessionId": MACHINE_SESSION_ID,
+                "baselineRecordSha256": baseline_ack["recordSha256"],
+                "firstFrameReportRecordSha256": report_ack["recordSha256"],
+                "sequenceLo": 1,
+                "sequenceHi": 0,
+                "buttons": 0x0100,
+                "stickXyCxy": 0x80808080,
+                "triggerLrab": 0x00FF0000,
+                "status": 1,
+                "machineEvidenceEnvelopeBytes": 1200,
+                "machineEvidenceEnvelopeSha256": "c" * 64,
+                "machineEvidenceOpaqueBytes": 816,
+                "machineEvidenceOpaqueSha256": "d" * 64,
+                "navigationScriptSha256": TWO_STEP_NAVIGATION_POLICY["scriptSha256"],
+                "navigationStepCount": 1,
+                "navigationArmRecordSha256": arm_ack["recordSha256"],
+                "lastNavigationStepRecordSha256": step_acks[-1]["recordSha256"],
+                "runSummary": progressed_run_summary(
+                    observed,
+                    4,
+                    operator_publications=2,
+                    witness_publications=1,
+                ),
+            })
+
+        self.reset_capture_journal("navigation-incomplete.jsonl")
+        sequence, _, report_ack, arm_ack = self.append_nonempty_navigation_arm()
+        sequence, _, _ = self.append_navigation_step(
+            sequence, report_ack, arm_ack, 0, 10
+        )
+        baseline_identity = identity()
+        baseline_identity.update(relayRequestId=8, renderCallOrdinal=4, sequenceLo=7)
+        sequence, baseline_receipt, _ = self.append_render(sequence, baseline_identity)
+        with self.assertRaisesRegex(FidelityCheckpointError, "complete locked navigation transcript"):
+            self.append({
+                **common(sequence, "fidelity-baseline-owned"),
+                "machineSessionId": MACHINE_SESSION_ID,
+                **baseline_receipt,
+                "phase": 1,
+                **fidelity_artifacts("3"),
+                "readbackMetadataBytes": 128,
+                "readbackMetadataSha256": "7" * 64,
+                "rgbaBytes": 4,
+                "rgbaSha256": "8" * 64,
+                "requestedButtons": 0x0100,
+                "requestedStickXyCxy": 0x80808080,
+                "requestedTriggerLrab": 0x00FF0000,
+            })
+
+        self.reset_capture_journal("navigation-tamper.jsonl")
+        sequence, _, report_ack, arm_ack = self.append_nonempty_navigation_arm()
+        sequence, _, observed = self.append_navigation_step(
+            sequence, report_ack, arm_ack, 0, 10
+        )
+        with self.assertRaisesRegex(FidelityCheckpointError, "chronology|controller state"):
+            self.append_navigation_step(
+                sequence,
+                report_ack,
+                arm_ack,
+                1,
+                observed,
+                targetCanonicalCycle="54",
+            )
+        with self.assertRaisesRegex(FidelityCheckpointError, "script order"):
+            self.append_navigation_step(
+                sequence,
+                report_ack,
+                arm_ack,
+                1,
+                observed,
+                stepIndex=0,
+            )
+        self.assertEqual(len(self.journal.navigation_transcript), 1)
 
     def test_capture_annotations_reject_splices_cardinality_and_bad_joins(self) -> None:
         self.reset_capture_journal()
@@ -536,7 +905,7 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
 
     def test_capture_terminal_rejects_artifact_substitution(self) -> None:
         self.reset_capture_journal()
-        sequence, _, baseline_ack, report_ack = self.append_capture_prefix(
+        sequence, _, baseline_ack, report_ack, arm_ack = self.append_capture_prefix(
             baseline_same_receipt=True
         )
         witness_ack = self.append({
@@ -554,6 +923,11 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             "machineEvidenceEnvelopeSha256": "c" * 64,
             "machineEvidenceOpaqueBytes": 816,
             "machineEvidenceOpaqueSha256": "d" * 64,
+            "navigationScriptSha256": EMPTY_NAVIGATION_POLICY["scriptSha256"],
+            "navigationStepCount": 0,
+            "navigationArmRecordSha256": arm_ack["recordSha256"],
+            "lastNavigationStepRecordSha256": None,
+            "runSummary": progressed_run_summary(10, 2, witness_publications=1),
         })
         sequence += 1
         accepted_identity = identity()
@@ -582,7 +956,13 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                 "baselineRecordSha256": baseline_ack["recordSha256"],
                 "acceptedRecordSha256": accepted_ack["recordSha256"],
                 **substituted,
-                "runSummary": capture_run_summary(True),
+                "runSummary": progressed_run_summary(
+                    100, 4, witness_publications=1, accepted=True
+                ),
+                "navigationScriptSha256": EMPTY_NAVIGATION_POLICY["scriptSha256"],
+                "navigationStepCount": 0,
+                "navigationArmRecordSha256": arm_ack["recordSha256"],
+                "lastNavigationStepRecordSha256": None,
             })
 
     def test_locked_source_snapshot_survives_mutation_after_start(self) -> None:
@@ -880,11 +1260,13 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                 "--eval",
                 (
                     "import { PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP as cycle, "
+                    "PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP as canonical, "
                     "PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP as instruction, "
                     "PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP as operator, "
                     "PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP as cold } from "
                     "'./tools/resident_machine_fidelity_checkpoints.mjs';"
-                    "process.stdout.write(JSON.stringify({cycle, instruction, operator, cold}));"
+                    "process.stdout.write(JSON.stringify({cycle, canonical, instruction, "
+                    "operator, cold}));"
                 ),
             ],
             cwd=project_root,
@@ -898,6 +1280,10 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
         )
         self.assertEqual(
+            int(javascript_authority["canonical"]),
+            PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+        )
+        self.assertEqual(
             int(javascript_authority["instruction"]),
             PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
         )
@@ -909,13 +1295,33 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             javascript_authority["operator"],
             PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
         )
+        javascript_navigation = javascript_production_navigation_policies()
+        self.assertEqual(tuple(javascript_navigation), PRODUCTION_FIDELITY_GAME_KEYS)
+        self.assertEqual(
+            {
+                game_key: (policy["scriptSha256"], len(policy["steps"]))
+                for game_key, policy in javascript_navigation.items()
+            },
+            PRODUCTION_FIDELITY_NAVIGATION_AUTHORITIES,
+        )
+        self.assertEqual(
+            {
+                policy["scriptSha256"]
+                for game_key, policy in javascript_navigation.items()
+                if game_key != "warioware-usa"
+            },
+            {PRODUCTION_FIDELITY_EMPTY_NAVIGATION_SCRIPT_SHA256},
+        )
         policy = {
             **CAPTURE_RUN_POLICY,
             "instructionUpperCap": str(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP),
             "executedCycleUpperCap": str(PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP),
+            "canonicalCycleUpperCap": str(PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP),
             "totalColdInstallCap": PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
         }
         self.assertIs(validate_capture_run_policy(policy, "$.runPolicy"), policy)
+        self.assertEqual(policy["runTimeoutMs"], 120 * 60 * 1000)
+        self.assertEqual(policy["externalWallTimeoutMs"], 120 * 60 * 1000)
         summary = capture_run_summary(True)
         summary["reportedColdInstalls"] = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
         self.assertIs(
@@ -936,6 +1342,7 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             validate_capture_run_summary(summary, policy, "$.runSummary", True)
 
     def test_production_evidence_lock_requires_exact_continuous_capture_policy(self) -> None:
+        javascript_navigation = javascript_production_navigation_policies()
         lock = {
             "schema": "lazuli-resident-renderer-fidelity-evidence-lock-v3",
             "evidenceMode": (
@@ -949,13 +1356,27 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             "sources": {},
             "hostPolicy": {},
             "runPolicy": {
+                **CAPTURE_RUN_POLICY,
                 "instructionUpperCap": str(
                     PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP
                 ),
                 "executedCycleUpperCap": str(
                     PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP
                 ),
+                "canonicalCycleUpperCap": str(
+                    PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP
+                ),
+                "sliceCycleUpperCap": "8000000",
+                "blockUpperCap": 131_072,
+                "totalHostCallCap": 65_535,
                 "totalColdInstallCap": PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+                "maxBootReads": 8_192,
+                "bootTimeoutMs": 180_000,
+                "sliceTimeoutMs": 180_000,
+                "runTimeoutMs": 7_200_000,
+                "externalWallTimeoutMs": 7_200_000,
+                "zeroProgressSliceCap": 4_096,
+                "navigationPolicy": javascript_navigation[GAME_KEY],
             },
             "checkpointPolicy": {},
             "capturePolicy": production_capture_policy(GAME_KEY),
@@ -970,6 +1391,55 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             },
         }
         self.assertIs(validate_evidence_lock(lock), lock)
+        for game_key in PRODUCTION_FIDELITY_GAME_KEYS:
+            title_lock = json.loads(json.dumps(lock))
+            title_lock["run"]["gameKey"] = game_key
+            title_lock["runPolicy"]["navigationPolicy"] = javascript_navigation[game_key]
+            title_lock["capturePolicy"] = production_capture_policy(game_key)
+            self.assertIs(validate_evidence_lock(title_lock), title_lock)
+
+        empty_wario = json.loads(json.dumps(lock))
+        empty_wario["runPolicy"]["navigationPolicy"] = navigation_policy([])
+        with self.assertRaisesRegex(ValueError, "production navigation policy"):
+            validate_evidence_lock(empty_wario)
+
+        alternate_wario = json.loads(json.dumps(lock))
+        alternate_steps = alternate_wario["runPolicy"]["navigationPolicy"]["steps"]
+        alternate_steps[0]["minimumCanonicalDelay"] = "4000000001"
+        alternate_wario["runPolicy"]["navigationPolicy"]["scriptSha256"] = sha256_hex(
+            canonical_json(alternate_steps)
+        )
+        with self.assertRaisesRegex(ValueError, "production navigation policy"):
+            validate_evidence_lock(alternate_wario)
+
+        nonempty_empty_title = json.loads(json.dumps(lock))
+        nonempty_empty_title["run"]["gameKey"] = "luigis-mansion-usa"
+        nonempty_empty_title["runPolicy"]["navigationPolicy"] = navigation_policy(
+            TWO_STEP_NAVIGATION_POLICY["steps"],
+            "luigis-mansion-usa",
+        )
+        nonempty_empty_title["capturePolicy"] = production_capture_policy(
+            "luigis-mansion-usa"
+        )
+        with self.assertRaisesRegex(ValueError, "production navigation policy"):
+            validate_evidence_lock(nonempty_empty_title)
+
+        unsupported_title = json.loads(json.dumps(lock))
+        unsupported_title["run"]["gameKey"] = "unfrozen-title"
+        unsupported_title["runPolicy"]["navigationPolicy"] = navigation_policy(
+            [],
+            "unfrozen-title",
+        )
+        with self.assertRaisesRegex(ValueError, "no frozen production navigation authority"):
+            validate_evidence_lock(unsupported_title)
+
+        changed_navigation_cardinality = json.loads(json.dumps(lock))
+        changed_navigation_cardinality["capturePolicy"][
+            "requiredCheckpointCardinality"
+        ]["navigation-step-received"] = 33
+        with self.assertRaisesRegex(ValueError, "capture navigation cardinality"):
+            validate_evidence_lock(changed_navigation_cardinality)
+
         changed_instruction_cap = json.loads(json.dumps(lock))
         changed_instruction_cap["runPolicy"]["instructionUpperCap"] = "100000000"
         with self.assertRaisesRegex(ValueError, "production instruction cap"):
@@ -978,20 +1448,25 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
         changed_cycle_cap["runPolicy"]["executedCycleUpperCap"] = "250000000"
         with self.assertRaisesRegex(ValueError, "production executed-cycle cap"):
             validate_evidence_lock(changed_cycle_cap)
+        changed_canonical_cap = json.loads(json.dumps(lock))
+        changed_canonical_cap["runPolicy"]["canonicalCycleUpperCap"] = "250000000"
+        with self.assertRaisesRegex(ValueError, "production canonical-cycle cap"):
+            validate_evidence_lock(changed_canonical_cap)
+        changed_wall_cap = json.loads(json.dumps(lock))
+        changed_wall_cap["runPolicy"]["externalWallTimeoutMs"] = 3_600_000
+        with self.assertRaisesRegex(ValueError, "production wall cap"):
+            validate_evidence_lock(changed_wall_cap)
         changed_cap = json.loads(json.dumps(lock))
         changed_cap["runPolicy"]["totalColdInstallCap"] = 65_535
         with self.assertRaisesRegex(ValueError, "production cold-install cap"):
             validate_evidence_lock(changed_cap)
         for mutate in (
-            lambda value: value["capturePolicy"].pop("genericOperatorPolicy"),
-            lambda value: value["capturePolicy"]["genericOperatorPolicy"].update(
+            lambda value: value["capturePolicy"].pop("lockedNavigationPolicy"),
+            lambda value: value["capturePolicy"]["lockedNavigationPolicy"].update(
                 maximumPublications=64
             ),
-            lambda value: value["capturePolicy"]["genericOperatorPolicy"]["a"].update(
-                buttons=0
-            ),
-            lambda value: value["capturePolicy"]["requiredCheckpointCardinality"].update(
-                {"capture-machine-initialized": 0}
+            lambda value: value["capturePolicy"]["lockedNavigationPolicy"].update(
+                armPhase="phase-0-or-baseline"
             ),
             lambda value: value["capturePolicy"]["cumulativeRunLedger"].update(
                 startsAt="resident-init"
@@ -1054,7 +1529,7 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
 
     def test_capture_fsync_failure_restores_all_milestone_state(self) -> None:
         self.reset_capture_journal()
-        sequence, _, baseline_ack, report_ack = self.append_capture_prefix(
+        sequence, _, baseline_ack, report_ack, arm_ack = self.append_capture_prefix(
             baseline_same_receipt=True
         )
         length_before = self.path.stat().st_size
@@ -1071,6 +1546,12 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             self.journal.baseline_record_sha256,
             self.journal.baseline_requested_controller,
             self.journal.first_frame_report_record_sha256,
+            self.journal.navigation_arm_record_sha256,
+            self.journal.navigation_run_call_origin,
+            self.journal.navigation_cycle_origin,
+            self.journal.navigation_si_poll_index_origin,
+            self.journal.navigation_transcript,
+            self.journal.navigation_step_record_sha256s,
             self.journal.witness_record_sha256,
             self.journal.accepted_record_sha256,
             self.journal.accepted_artifacts,
@@ -1092,6 +1573,11 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
             "machineEvidenceEnvelopeSha256": "c" * 64,
             "machineEvidenceOpaqueBytes": 816,
             "machineEvidenceOpaqueSha256": "d" * 64,
+            "navigationScriptSha256": EMPTY_NAVIGATION_POLICY["scriptSha256"],
+            "navigationStepCount": 0,
+            "navigationArmRecordSha256": arm_ack["recordSha256"],
+            "lastNavigationStepRecordSha256": None,
+            "runSummary": progressed_run_summary(10, 2, witness_publications=1),
         }
         with patch(
             "resident_machine_fidelity_server.os.fsync",
@@ -1114,6 +1600,12 @@ class FidelityCheckpointJournalTests(unittest.TestCase):
                 self.journal.baseline_record_sha256,
                 self.journal.baseline_requested_controller,
                 self.journal.first_frame_report_record_sha256,
+                self.journal.navigation_arm_record_sha256,
+                self.journal.navigation_run_call_origin,
+                self.journal.navigation_cycle_origin,
+                self.journal.navigation_si_poll_index_origin,
+                self.journal.navigation_transcript,
+                self.journal.navigation_step_record_sha256s,
                 self.journal.witness_record_sha256,
                 self.journal.accepted_record_sha256,
                 self.journal.accepted_artifacts,

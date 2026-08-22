@@ -10,15 +10,23 @@ import {
   ResidentCaptureRunLedger,
 } from "../web/resident-machine-worker.mjs";
 import {
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
+import {
+  fidelityNavigationPolicyFromSteps,
+  productionFidelityNavigationPolicy,
+} from "./resident_machine_fidelity_navigation.mjs";
+
+const EMPTY_NAVIGATION_POLICY = fidelityNavigationPolicyFromSteps("warioware-usa", []);
 
 const CAPTURE_RUN_POLICY = Object.freeze({
   instructionUpperCap: "100",
   executedCycleUpperCap: "100",
+  canonicalCycleUpperCap: "100",
   sliceCycleUpperCap: "10",
   blockUpperCap: 16,
   totalHostCallCap: 8,
@@ -30,7 +38,180 @@ const CAPTURE_RUN_POLICY = Object.freeze({
   externalWallTimeoutMs: 10_000,
   zeroProgressSliceCap: 2,
   workerUrl: "/worker.mjs",
+  navigationPolicy: EMPTY_NAVIGATION_POLICY,
 });
+
+function schedulerPoint({
+  canonicalCycle = 0n,
+  executedCycles = canonicalCycle,
+  executedInstructions = canonicalCycle,
+  retiredBlocks = canonicalCycle,
+} = {}) {
+  return Object.freeze({
+    canonicalCycle: BigInt(canonicalCycle),
+    executedCycles: BigInt(executedCycles),
+    executedInstructions: BigInt(executedInstructions),
+    retiredBlocks: BigInt(retiredBlocks),
+  });
+}
+
+function serializedSchedulerPoint(value) {
+  return Object.fromEntries(Object.entries(value).map(([field, raw]) => [field, raw.toString()]));
+}
+
+function schedulerInterval(start, {
+  canonicalCycles = 0n,
+  executedCycles = canonicalCycles,
+  executedInstructions = executedCycles,
+  retiredBlocks = canonicalCycles === 0n ? 0n : 1n,
+} = {}) {
+  const delta = {
+    canonicalCycle: BigInt(canonicalCycles),
+    executedCycles: BigInt(executedCycles),
+    executedInstructions: BigInt(executedInstructions),
+    retiredBlocks: BigInt(retiredBlocks),
+  };
+  const end = Object.fromEntries(Object.entries(start).map(([field, value]) => [
+    field,
+    value + delta[field],
+  ]));
+  return Object.freeze({
+    schema: "lazuli-resident-authenticated-scheduler-interval-v1",
+    start: serializedSchedulerPoint(start),
+    end: serializedSchedulerPoint(end),
+    delta: {
+      canonicalCycles: delta.canonicalCycle.toString(),
+      executedCycles: delta.executedCycles.toString(),
+      executedInstructions: delta.executedInstructions.toString(),
+      retiredBlocks: delta.retiredBlocks.toString(),
+    },
+  });
+}
+
+function intervalEnd(interval) {
+  return schedulerPoint(Object.fromEntries(
+    Object.entries(interval.end).map(([field, value]) => [field, BigInt(value)]),
+  ));
+}
+
+function expectedSiPacket(controller, mode = 3) {
+  const buttons = controller.buttons >>> 0;
+  const sticks = controller.stickXyCxy >>> 0;
+  const triggers = controller.triggerLrab >>> 0;
+  const word0 = (
+    ((buttons >>> 8) & 0xff) << 24
+    | (((buttons & 0xff) | 0x80) & 0xff) << 16
+    | (sticks & 0xff) << 8
+    | ((sticks >>> 8) & 0xff)
+  ) >>> 0;
+  const cStickX = (sticks >>> 16) & 0xff;
+  const cStickY = (sticks >>> 24) & 0xff;
+  const triggerL = triggers & 0xff;
+  const triggerR = (triggers >>> 8) & 0xff;
+  const analogA = (triggers >>> 16) & 0xff;
+  const analogB = (triggers >>> 24) & 0xff;
+  const low = mode === 0 || (mode >= 5 && mode <= 7)
+    ? [cStickX, cStickY, (triggerL & 0xf0) | (triggerR >>> 4),
+      (analogA & 0xf0) | (analogB >>> 4)]
+    : mode === 1
+      ? [(cStickX & 0xf0) | (cStickY >>> 4), triggerL, triggerR,
+        (analogA & 0xf0) | (analogB >>> 4)]
+      : mode === 2
+        ? [(cStickX & 0xf0) | (cStickY >>> 4),
+          (triggerL & 0xf0) | (triggerR >>> 4), analogA, analogB]
+        : mode === 4
+          ? [cStickX, cStickY, analogA, analogB]
+          : [cStickX, cStickY, triggerL, triggerR];
+  return {
+    word0,
+    word1: (low[0] << 24 | low[1] << 16 | low[2] << 8 | low[3]) >>> 0,
+  };
+}
+
+function siAuthority({
+  pollIndex,
+  scheduledCycle,
+  observedCycle = scheduledCycle,
+  sequenceLo,
+  sequenceHi = 0,
+  controller,
+  source = 0,
+  controllerMode = 3,
+  overrides = {},
+}) {
+  const packet = expectedSiPacket(controller, controllerMode);
+  return {
+    schema: "lazuli-resident-authenticated-si-publication-v1",
+    pollIndex: BigInt(pollIndex).toString(),
+    scheduledCycle: BigInt(scheduledCycle).toString(),
+    observedCycle: BigInt(observedCycle).toString(),
+    appliedSequenceLo: sequenceLo,
+    appliedSequenceHi: sequenceHi,
+    packetWord0: packet.word0,
+    packetWord1: packet.word1,
+    source,
+    controllerMode,
+    buttons: controller.buttons,
+    stickXyCxy: controller.stickXyCxy,
+    triggerLrab: controller.triggerLrab,
+    ...overrides,
+  };
+}
+
+function readyAuthority(point = schedulerPoint(), si = null) {
+  return {
+    scheduler: point,
+    si: si === null ? null : {
+      pollIndex: BigInt(si.pollIndex),
+      scheduledCycle: BigInt(si.scheduledCycle),
+      observedCycle: BigInt(si.observedCycle),
+      appliedSequenceLo: si.appliedSequenceLo,
+      appliedSequenceHi: si.appliedSequenceHi,
+      packetWord0: si.packetWord0,
+      packetWord1: si.packetWord1,
+      source: si.source,
+      controllerMode: si.controllerMode,
+      buttons: si.buttons,
+      stickXyCxy: si.stickXyCxy,
+      triggerLrab: si.triggerLrab,
+    },
+  };
+}
+
+function rustResult(start, delta = {}, {
+  si = null,
+  hostCalls = 0,
+  coldInstalls = 0,
+  reason = 0,
+  detail = 0,
+  boundary = "rust",
+  cap = undefined,
+} = {}) {
+  const scheduler = schedulerInterval(start, delta);
+  const result = {
+    boundary,
+    scheduler,
+    si,
+    hostCalls,
+    coldInstalls,
+  };
+  if (boundary === "rust") {
+    result.cycleUpperCap = BigInt(delta.canonicalCycles ?? 0n);
+    result.outcome = {
+      reason,
+      detail,
+      executedCycles: BigInt(delta.executedCycles ?? delta.canonicalCycles ?? 0n),
+      executedInstructions: BigInt(
+        delta.executedInstructions ?? delta.executedCycles ?? delta.canonicalCycles ?? 0n,
+      ),
+    };
+  } else if (boundary === "adapter-cap") {
+    result.cap = cap;
+  } else if (boundary === "fidelity") {
+    result.phase = 5;
+  }
+  return result;
+}
 
 function fakeScope() {
   const messages = [];
@@ -104,6 +285,8 @@ function workerHarness({
   let phase = 0;
   let requestedController = null;
   let renderer = null;
+  let currentAuthority = schedulerPoint();
+  let currentSi = null;
   const publishCalls = [];
   const adapter = {
     closed: false,
@@ -122,15 +305,37 @@ function workerHarness({
         },
       };
     },
-    async runSlice() {
+    captureAuthority() {
+      return readyAuthority(currentAuthority, currentSi);
+    },
+    async runSlice(options = {}) {
+      const delta = {
+        canonicalCycles: 1n,
+        executedCycles: 1n,
+        executedInstructions: 1n,
+        retiredBlocks: 1n,
+      };
+      const scheduler = schedulerInterval(currentAuthority, delta);
+      currentAuthority = intervalEnd(scheduler);
       if (runAccepted) {
         await renderer.submit_resident_render(Uint8Array.of(1, 2), 3, 4, 5);
         await renderer.observe_resident_fidelity(fidelityState(5));
-        return { boundary: "fidelity", phase: 5, hostCalls: 1, coldInstalls: 0 };
+        return {
+          boundary: "fidelity",
+          phase: 5,
+          scheduler,
+          si: currentSi,
+          hostCalls: 1,
+          coldInstalls: 0,
+        };
       }
       return {
         boundary: "rust",
-        cycleUpperCap: 1n,
+        cycleUpperCap: options.cycleUpperCap ?? 1n,
+        scheduler,
+        si: currentSi,
+        hostCalls: 0,
+        coldInstalls: 0,
         outcome: {
           reason: 0,
           detail: 0,
@@ -164,16 +369,48 @@ function workerHarness({
       phase = nextPhase;
       requestedController = nextRequestedController;
     },
+    setAuthority(nextAuthority, nextSi = currentSi) {
+      currentAuthority = nextAuthority;
+      currentSi = nextSi;
+    },
   };
 }
 
-async function initializeCapture(harness, requestId = 1) {
-  harness.scope.receive(captureInitMessage(requestId));
+async function initializeCapture(harness, requestId = 1, overrides = {}) {
+  harness.scope.receive(captureInitMessage(requestId, overrides));
   return waitForWorkerMessage(
     harness.scope,
     message => message.type === "resident-ready" && message.requestId === requestId,
     "resident-ready",
   );
+}
+
+async function armNavigation(harness, requestId = 2) {
+  harness.scope.receive({ type: "resident-controller-navigation-arm", requestId });
+  const checkpoint = await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-controller-navigation-arm-checkpoint"
+      && message.requestId === requestId,
+    "navigation arm checkpoint",
+  );
+  assert.equal(
+    harness.scope.messages.some(({ message }) =>
+      message.type === "resident-controller-navigation-arm-result"
+      && message.requestId === requestId),
+    false,
+  );
+  harness.scope.receive({
+    type: "resident-controller-navigation-arm-checkpoint-ack",
+    requestId,
+  });
+  const result = await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-controller-navigation-arm-result"
+      && message.requestId === requestId,
+    "navigation arm result",
+  );
+  assert.equal(result.navigation.scriptSha256, checkpoint.navigation.scriptSha256);
+  return result;
 }
 
 function captureInitMessage(requestId = 1, overrides = {}) {
@@ -211,19 +448,46 @@ async function initializeLegacy(harness, requestId = 1) {
   );
 }
 
-test("capture run ledger is cumulative, stable, and fail-closed at frozen caps", () => {
+function runLedger(ledger, delta = {}, resultOptions = {}, issueOverrides = {}) {
+  const canonicalCycles = BigInt(delta.canonicalCycles ?? 0n);
+  const issued = ledger.issue({
+    cycleUpperCap: (canonicalCycles === 0n ? 1n : canonicalCycles).toString(),
+    ...issueOverrides,
+  });
+  const result = rustResult(issued.schedulerStart, delta, resultOptions);
+  ledger.accept(result);
+  return { issued, result, end: intervalEnd(result.scheduler) };
+}
+
+function smallNavigationPolicy(steps) {
+  return {
+    ...CAPTURE_RUN_POLICY,
+    navigationPolicy: fidelityNavigationPolicyFromSteps("warioware-usa", steps),
+  };
+}
+
+test("capture run ledger exposes exact v2 cumulative scheduler authority", () => {
   let now = 10;
   const ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => now);
   assert.throws(() => ledger.summary(), /not started at resident-ready/);
   assert.throws(() => ledger.issue({}), /not started at resident-ready/);
+  const origin = schedulerPoint({
+    canonicalCycle: 100n,
+    executedCycles: 40n,
+    executedInstructions: 20n,
+    retiredBlocks: 4n,
+  });
   now = 5_010;
-  ledger.startAtReady();
-  assert.throws(() => ledger.startAtReady(), /start was not one-shot/);
+  ledger.startAtReady(readyAuthority(origin));
+  assert.throws(() => ledger.startAtReady(readyAuthority(origin)), /start was not one-shot/);
   assert.deepEqual(ledger.summary(), {
-    schema: "lazuli-resident-cumulative-run-summary-v1",
+    schema: "lazuli-resident-cumulative-run-summary-v2",
     issuedRunCalls: 0,
+    canonicalCycle: "100",
+    reportedCanonicalCycles: "0",
     reportedExecutedCycles: "0",
     reportedExecutedInstructions: "0",
+    reportedRetiredBlocks: "0",
     reportedHostCalls: 0,
     reportedColdInstalls: 0,
     zeroProgressSlices: 0,
@@ -236,363 +500,412 @@ test("capture run ledger is cumulative, stable, and fail-closed at frozen caps",
     accepted: false,
   });
 
-  let issued = ledger.issue({
-    cycleUpperCap: "9",
+  now = 5_011;
+  runLedger(ledger, {
+    canonicalCycles: 9n,
+    executedCycles: 7n,
+    executedInstructions: 5n,
+    retiredBlocks: 3n,
+  }, { hostCalls: 2, coldInstalls: 1 }, {
     blockUpperCap: 8,
     maxHostCalls: 3,
     maxColdInstalls: 2,
   });
-  assert.equal(issued.cycleUpperCap, 9n);
-  now = 5_011;
-  ledger.accept({
-    boundary: "rust",
-    hostCalls: 2,
-    coldInstalls: 1,
-    outcome: { reason: 0, detail: 0, executedCycles: 9n, executedInstructions: 40n },
+  assert.deepEqual({
+    canonicalCycle: ledger.summary().canonicalCycle,
+    reportedCanonicalCycles: ledger.summary().reportedCanonicalCycles,
+    reportedExecutedCycles: ledger.summary().reportedExecutedCycles,
+    reportedExecutedInstructions: ledger.summary().reportedExecutedInstructions,
+    reportedRetiredBlocks: ledger.summary().reportedRetiredBlocks,
+    reportedHostCalls: ledger.summary().reportedHostCalls,
+    reportedColdInstalls: ledger.summary().reportedColdInstalls,
+  }, {
+    canonicalCycle: "109",
+    reportedCanonicalCycles: "9",
+    reportedExecutedCycles: "7",
+    reportedExecutedInstructions: "5",
+    reportedRetiredBlocks: "3",
+    reportedHostCalls: 2,
+    reportedColdInstalls: 1,
   });
-  assert.throws(
-    () => ledger.issue({ cycleUpperCap: "11" }),
-    /remaining slice cap/,
-  );
-  issued = ledger.issue({ cycleUpperCap: "10", maxHostCalls: 6, maxColdInstalls: 7 });
-  assert.equal(issued.maxHostCalls, 6);
+
+  const terminal = ledger.issue({
+    cycleUpperCap: "1",
+    maxHostCalls: 6,
+    maxColdInstalls: 7,
+  });
   now = 5_012;
-  ledger.accept({
+  ledger.accept(rustResult(terminal.schedulerStart, {
+    canonicalCycles: 1n,
+    executedCycles: 1n,
+    executedInstructions: 1n,
+    retiredBlocks: 1n,
+  }, {
     boundary: "fidelity",
-    phase: 5,
     hostCalls: 6,
     coldInstalls: 7,
-  });
+  }));
   assert.equal(ledger.summary().accepted, true);
   assert.equal(ledger.summary().reportedHostCalls, 8);
+  assert.equal(ledger.summary().reportedColdInstalls, 8);
   assert.throws(() => ledger.issue({}), /Accepted boundary/);
 });
 
-test("capture run ledger supports the v3 cumulative instruction and cold authorities", () => {
-  const productionPolicy = {
+test("capture run ledger enforces canonical slices and accumulates retired blocks", () => {
+  const policy = {
     ...CAPTURE_RUN_POLICY,
-    instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
-    executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
-    totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+    canonicalCycleUpperCap: "15",
+    executedCycleUpperCap: "100",
+    instructionUpperCap: "100",
+    sliceCycleUpperCap: "10",
+    blockUpperCap: 4,
   };
-  const ledger = new ResidentCaptureRunLedger(productionPolicy, () => 0);
-  ledger.startAtReady();
-  for (let index = 0; index < 16; index += 1) {
-    const issued = ledger.issue({ maxColdInstalls: 65_535 });
-    assert.equal(issued.maxColdInstalls, 65_535);
-    ledger.accept({
-      boundary: "rust",
-      coldInstalls: 65_535,
-      outcome: { reason: 0, detail: 0, executedCycles: 1n, executedInstructions: 1n },
-    });
-  }
-  const terminal = ledger.issue({});
-  assert.equal(terminal.maxColdInstalls, 15);
-  ledger.accept({ boundary: "fidelity", phase: 5, coldInstalls: 15 });
-  assert.equal(
-    ledger.summary().reportedColdInstalls,
-    PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
-  );
-  assert.equal(ledger.summary().accepted, true);
+  let ledger = new ResidentCaptureRunLedger(policy, () => 0);
+  ledger.startAtReady(readyAuthority());
+  runLedger(ledger, {
+    canonicalCycles: 10n,
+    executedCycles: 7n,
+    executedInstructions: 6n,
+    retiredBlocks: 4n,
+  }, { detail: 1 }, { blockUpperCap: 4 });
+  assert.equal(ledger.summary().reportedCanonicalCycles, "10");
+  assert.equal(ledger.summary().reportedRetiredBlocks, "4");
+  const tail = ledger.issue({ blockUpperCap: 4 });
+  assert.equal(tail.cycleUpperCap, 5n);
+  assert.throws(() => ledger.accept(rustResult(tail.schedulerStart, {
+    canonicalCycles: 5n,
+    executedCycles: 3n,
+    executedInstructions: 2n,
+    retiredBlocks: 4n,
+  }, { detail: 0 })), /canonical-cycle cap exhausted/);
+  assert.equal(ledger.summary().reportedCanonicalCycles, "15");
+  assert.equal(ledger.summary().reportedRetiredBlocks, "8");
 
-  const exhausted = new ResidentCaptureRunLedger(productionPolicy, () => 0);
-  exhausted.startAtReady();
-  exhausted.issue({});
-  assert.throws(() => exhausted.accept({
-    boundary: "rust",
-    coldInstalls: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
-    outcome: { reason: 0, detail: 0, executedCycles: 1n, executedInstructions: 1n },
-  }), /cumulative cold-install cap exhausted/);
-  assert.equal(
-    exhausted.summary().reportedColdInstalls,
-    PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
-  );
+  ledger = new ResidentCaptureRunLedger(policy, () => 0);
+  ledger.startAtReady(readyAuthority());
+  let issued = ledger.issue({ cycleUpperCap: "5", blockUpperCap: 4 });
+  assert.throws(() => ledger.accept(rustResult(issued.schedulerStart, {
+    canonicalCycles: 6n,
+    retiredBlocks: 1n,
+  })), /issued canonical scheduler budget/);
 
-  const raisedInstructionAuthority = new ResidentCaptureRunLedger(productionPolicy, () => 0);
-  raisedInstructionAuthority.startAtReady();
-  raisedInstructionAuthority.issue({});
-  raisedInstructionAuthority.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 0,
-      executedCycles: 1n,
-      executedInstructions: 100_000_001n,
-    },
-  });
-  assert.equal(
-    raisedInstructionAuthority.summary().reportedExecutedInstructions,
-    "100000001",
-  );
-
-  const instructionOvershoot = new ResidentCaptureRunLedger(productionPolicy, () => 0);
-  instructionOvershoot.startAtReady();
-  instructionOvershoot.issue({});
-  assert.throws(() => instructionOvershoot.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 0,
-      executedCycles: 1n,
-      executedInstructions: BigInt(PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP) + 1n,
-    },
-  }), /cumulative instruction cap overshot/);
+  ledger = new ResidentCaptureRunLedger(policy, () => 0);
+  ledger.startAtReady(readyAuthority());
+  issued = ledger.issue({ cycleUpperCap: "5", blockUpperCap: 4 });
+  assert.throws(() => ledger.accept(rustResult(issued.schedulerStart, {
+    canonicalCycles: 5n,
+    retiredBlocks: 5n,
+  })), /issued canonical scheduler budget/);
 });
 
-test("capture run ledger classifies only a full truncated CycleBudget tail as terminal", () => {
-  const ordinarySlicePolicy = {
-    ...CAPTURE_RUN_POLICY,
-    executedCycleUpperCap: "2500000",
-    sliceCycleUpperCap: "1000000",
-  };
-  let ledger = new ResidentCaptureRunLedger(ordinarySlicePolicy, () => 0);
-  ledger.startAtReady();
-  assert.equal(ledger.issue({}).cycleUpperCap, 1_000_000n);
-  ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 1_000_000n,
-      executedInstructions: 1n,
-    },
-  });
-  assert.equal(ledger.summary().reportedExecutedCycles, "1000000");
-
-  const tailPolicy = {
-    ...CAPTURE_RUN_POLICY,
-    executedCycleUpperCap: "15",
-    sliceCycleUpperCap: "10",
-  };
-  const ledgerAtTail = (overrides = {}) => {
-    const ledger = new ResidentCaptureRunLedger({ ...tailPolicy, ...overrides }, () => 0);
-    ledger.startAtReady();
-    ledger.issue({});
-    ledger.accept({
-      boundary: "rust",
-      outcome: {
-        reason: 0,
-        detail: 1,
-        executedCycles: 10n,
-        executedInstructions: 1n,
-      },
-    });
-    return ledger;
-  };
-
-  ledger = ledgerAtTail({ instructionUpperCap: "4" });
-  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 0n,
-      executedInstructions: 0n,
-    },
-  }), /capture cumulative executed-cycle cap cannot retire the next block/);
-  assert.equal(ledger.summary().zeroProgressSlices, 0);
-
-  ledger = ledgerAtTail();
-  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 3n,
-      executedInstructions: 2n,
-    },
-  }), /capture cumulative executed-cycle cap cannot retire the next block/);
-  assert.equal(ledger.summary().reportedExecutedCycles, "13");
-  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
-  assert.equal(ledger.summary().zeroProgressSlices, 0);
-
-  ledger = ledgerAtTail();
-  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 5n,
-      executedInstructions: 2n,
-    },
-  }), /capture cumulative executed-cycle cap exhausted/);
-  assert.equal(ledger.summary().reportedExecutedCycles, "15");
-  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
-
-  ledger = ledgerAtTail({ instructionUpperCap: "3" });
-  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 3n,
-      executedInstructions: 2n,
-    },
-  }), /capture cumulative instruction cap exhausted/);
-  assert.equal(ledger.summary().reportedExecutedCycles, "13");
-  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
-
-  ledger = ledgerAtTail({ instructionUpperCap: "2" });
-  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 3n,
-      executedInstructions: 2n,
-    },
-  }), /capture cumulative instruction cap exhausted/);
-  assert.equal(ledger.summary().reportedExecutedCycles, "13");
-  assert.equal(ledger.summary().reportedExecutedInstructions, "3");
-
-  ledger = ledgerAtTail();
-  assert.equal(ledger.issue({ cycleUpperCap: "4" }).cycleUpperCap, 4n);
-  ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 0n,
-      executedInstructions: 0n,
-    },
-  });
-  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
-
-  ledger = ledgerAtTail();
-  assert.equal(ledger.issue({}).cycleUpperCap, 5n);
-  ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 0,
-      executedCycles: 0n,
-      executedInstructions: 0n,
-    },
-  });
-  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
-  assert.equal(ledger.issue({}).cycleUpperCap, 5n, "BlockBudget tail was not resumable");
-
-  ledger = ledgerAtTail();
-  ledger.issue({});
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 5,
-      detail: 0xffff_ffff,
-      executedCycles: 0n,
-      executedInstructions: 0n,
-    },
-  }), /Rust resident run stopped with reason 5, detail 4294967295/);
-  assert.equal(ledger.summary().zeroProgressSlices, 0);
-
-  const exactSlicePolicy = {
-    ...CAPTURE_RUN_POLICY,
-    executedCycleUpperCap: "10",
-    sliceCycleUpperCap: "10",
-  };
-  ledger = new ResidentCaptureRunLedger(exactSlicePolicy, () => 0);
-  ledger.startAtReady();
-  assert.equal(ledger.issue({}).cycleUpperCap, 10n);
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: {
-      reason: 0,
-      detail: 1,
-      executedCycles: 10n,
-      executedInstructions: 1n,
-    },
-  }), /capture cumulative executed-cycle cap exhausted/);
-});
-
-test("capture run ledger validates Rust reason/detail before terminal classification", () => {
+test("capture run ledger validates Rust outcomes, zero progress, and wall exhaustion", () => {
   const rejectOutcome = (outcome, pattern) => {
     const ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => 0);
-    ledger.startAtReady();
-    ledger.issue({});
-    assert.throws(() => ledger.accept({
-      boundary: "rust",
-      outcome: {
-        executedCycles: 0n,
-        executedInstructions: 0n,
-        ...outcome,
-      },
-    }), pattern);
+    ledger.startAtReady(readyAuthority());
+    const issued = ledger.issue({ cycleUpperCap: "1" });
+    assert.throws(() => ledger.accept(rustResult(issued.schedulerStart, {}, {
+      ...outcome,
+    })), pattern);
   };
-
   rejectOutcome({ reason: "0", detail: 0 }, /reason was not an exact u32/);
   rejectOutcome({ reason: 7, detail: 0 }, /reason was outside the RunReason ABI/);
   rejectOutcome({ reason: 0, detail: "1" }, /detail was not an exact u32/);
   rejectOutcome({ reason: 0, detail: 9 }, /outside the RunOutcomeDetail ABI/);
-  rejectOutcome({ reason: 5, detail: 0x1_0000_0000 }, /detail was not an exact u32/);
-});
 
-test("authenticated host and cold work reset cumulative zero-progress accounting", () => {
-  const ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => 0);
-  const zeroRustResult = (work = {}) => ({
-    boundary: "rust",
-    ...work,
-    outcome: {
-      reason: 0,
-      detail: 2,
-      executedCycles: 0n,
-      executedInstructions: 0n,
-    },
-  });
-  ledger.startAtReady();
-
-  ledger.issue({});
-  ledger.accept(zeroRustResult());
+  let ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => 0);
+  ledger.startAtReady(readyAuthority());
+  runLedger(ledger);
   assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
+  assert.throws(() => runLedger(ledger), /zero-progress cap exhausted/);
+  assert.equal(ledger.summary().maximumConsecutiveZeroProgressSlices, 2);
 
-  ledger.issue({});
-  ledger.accept(zeroRustResult({ hostCalls: 1 }));
-  assert.equal(ledger.summary().zeroProgressSlices, 1);
-  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 0);
-
-  ledger.issue({});
-  ledger.accept(zeroRustResult());
-  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 1);
-
-  ledger.issue({});
-  ledger.accept(zeroRustResult({ coldInstalls: 1 }));
-  assert.equal(ledger.summary().zeroProgressSlices, 2);
-  assert.equal(ledger.summary().consecutiveZeroProgressSlices, 0);
-  assert.equal(ledger.summary().maximumConsecutiveZeroProgressSlices, 1);
-});
-
-test("capture run ledger rejects overshoot, zero progress, and deadline exhaustion", () => {
   let now = 0;
-  let ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => now);
-  ledger.startAtReady();
-  ledger.issue({ cycleUpperCap: "5" });
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: { reason: 0, detail: 0, executedCycles: 6n, executedInstructions: 1n },
-  }), /issued cycle budget/);
-
   ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => now);
-  ledger.startAtReady();
-  ledger.issue({});
-  ledger.accept({
-    boundary: "rust",
-    outcome: { reason: 0, detail: 1, executedCycles: 0n, executedInstructions: 0n },
-  });
-  ledger.issue({});
-  assert.throws(() => ledger.accept({
-    boundary: "rust",
-    outcome: { reason: 0, detail: 1, executedCycles: 0n, executedInstructions: 0n },
-  }), /zero-progress cap exhausted/);
-
-  now = 0;
-  ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => now);
-  ledger.startAtReady();
+  ledger.startAtReady(readyAuthority());
   now = 10_000;
   assert.throws(() => ledger.issue({}), /wall-time cap exhausted/);
+});
+
+test("intermediate navigation checkpoints project host and cold authority before commit", () => {
+  const a = { buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 };
+  const neutral = { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 };
+  const ledger = new ResidentCaptureRunLedger(smallNavigationPolicy([
+    { minimumCanonicalDelay: "5", ...a },
+    { minimumCanonicalDelay: "3", ...neutral },
+  ]), () => 0);
+  ledger.startAtReady(readyAuthority(schedulerPoint({ canonicalCycle: 100n })));
+  const armed = ledger.armNavigation(0);
+  assert.equal(armed.canonicalCycleOrigin, "100");
+  runLedger(ledger, { canonicalCycles: 5n, retiredBlocks: 1n });
+  const publication = ledger.recordNavigationPublication({ sequenceLo: 1, sequenceHi: 0 }, 1);
+  assert.equal(publication.targetCanonicalCycle, "105");
+
+  const issued = ledger.issue({
+    cycleUpperCap: "2",
+    maxHostCalls: 4,
+    maxColdInstalls: 4,
+  });
+  const scheduler = schedulerInterval(issued.schedulerStart, {
+    canonicalCycles: 2n,
+    executedCycles: 1n,
+    executedInstructions: 1n,
+    retiredBlocks: 1n,
+  });
+  const si = siAuthority({
+    pollIndex: 1n,
+    scheduledCycle: 106n,
+    observedCycle: 107n,
+    sequenceLo: 1,
+    controller: a,
+    controllerMode: 3,
+  });
+  const checkpoint = ledger.observeIntermediateAuthority({
+    scheduler,
+    si,
+    hostCalls: 2,
+    coldInstalls: 3,
+  });
+  assert.equal(checkpoint.navigation.durableSteps, 1);
+  assert.equal(checkpoint.navigation.pendingPublication, null);
+  assert.equal(checkpoint.runSummary.canonicalCycle, "107");
+  assert.equal(checkpoint.runSummary.reportedCanonicalCycles, "7");
+  assert.equal(checkpoint.runSummary.reportedHostCalls, 2);
+  assert.equal(checkpoint.runSummary.reportedColdInstalls, 3);
+  assert.equal(checkpoint.runSummary.operatorPublications, 1);
+  assert.equal(ledger.summary().canonicalCycle, "105");
+  assert.equal(ledger.summary().reportedHostCalls, 0);
+  assert.equal(ledger.summary().reportedColdInstalls, 0);
+  assert.equal(ledger.summary().operatorPublications, 0);
+
+  ledger.commitNavigationCheckpoint();
+  ledger.accept(rustResult(issued.schedulerStart, {
+    canonicalCycles: 2n,
+    executedCycles: 1n,
+    executedInstructions: 1n,
+    retiredBlocks: 1n,
+  }, { si, hostCalls: 2, coldInstalls: 3 }));
+  assert.equal(ledger.summary().canonicalCycle, "107");
+  assert.equal(ledger.summary().reportedHostCalls, 2);
+  assert.equal(ledger.summary().reportedColdInstalls, 3);
+  assert.equal(ledger.summary().operatorPublications, 1);
+});
+
+function pendingReceiptHarness() {
+  const neutral = { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 };
+  const ledger = new ResidentCaptureRunLedger(smallNavigationPolicy([
+    { minimumCanonicalDelay: "5", ...neutral },
+  ]), () => 0);
+  const readySi = siAuthority({
+    pollIndex: 1n,
+    scheduledCycle: 0n,
+    observedCycle: 0n,
+    sequenceLo: 0,
+    controller: neutral,
+  });
+  ledger.startAtReady(readyAuthority(schedulerPoint(), readySi));
+  ledger.armNavigation(0);
+  runLedger(ledger, {
+    canonicalCycles: 10n,
+    executedCycles: 1n,
+    executedInstructions: 1n,
+    retiredBlocks: 1n,
+  }, { si: readySi });
+  const publication = ledger.recordNavigationPublication({ sequenceLo: 1, sequenceHi: 0 }, 1);
+  const issued = ledger.issue({ cycleUpperCap: "1" });
+  const scheduler = schedulerInterval(issued.schedulerStart, {
+    canonicalCycles: 1n,
+    executedCycles: 1n,
+    executedInstructions: 1n,
+    retiredBlocks: 1n,
+  });
+  const si = siAuthority({
+    pollIndex: 2n,
+    scheduledCycle: 11n,
+    observedCycle: 11n,
+    sequenceLo: 1,
+    controller: neutral,
+  });
+  return { ledger, publication, scheduler, si, neutral };
+}
+
+test("navigation rejects early input and accepts a bounded unaligned publication", () => {
+  const neutral = { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 };
+  const ledger = new ResidentCaptureRunLedger(smallNavigationPolicy([
+    { minimumCanonicalDelay: "5", ...neutral },
+  ]), () => 0);
+  ledger.startAtReady(readyAuthority());
+  ledger.armNavigation(0);
+  assert.throws(
+    () => ledger.recordNavigationPublication({ sequenceLo: 1, sequenceHi: 0 }, 1),
+    /before its canonical target/,
+  );
+  runLedger(ledger, {
+    canonicalCycles: 10n,
+    executedCycles: 1n,
+    executedInstructions: 1n,
+    retiredBlocks: 1n,
+  });
+  const publication = ledger.recordNavigationPublication({ sequenceLo: 1, sequenceHi: 0 }, 1);
+  assert.equal(publication.targetCanonicalCycle, "5");
+  assert.equal(publication.publicationCanonicalCycle, "10");
+  assert.equal(publication.publicationOvershootCycles, "5");
+  assert.ok(BigInt(publication.publicationOvershootCycles) <= 10n);
+});
+
+test("navigation SI receipts authenticate sequence, source, mode, semantics, packet, and poll", () => {
+  const cases = [
+    {
+      name: "skipped sequence",
+      mutate: si => ({ ...si, appliedSequenceLo: 2 }),
+      pattern: /skipped the pending navigation controller sequence/,
+    },
+    {
+      name: "non-periodic source",
+      mutate: si => ({ ...si, source: 1 }),
+      pattern: /not a periodic SI publication/,
+    },
+    {
+      name: "invalid controller mode",
+      mutate: si => ({ ...si, controllerMode: 8 }),
+      pattern: /chronology changed/,
+    },
+    {
+      name: "semantic drift",
+      mutate: si => ({ ...si, buttons: 1 }),
+      pattern: /semantic state/,
+    },
+    {
+      name: "packet drift",
+      mutate: si => ({ ...si, packetWord0: si.packetWord0 ^ 1 }),
+      pattern: /packet does not match/,
+    },
+    {
+      name: "stale poll",
+      mutate: si => ({ ...si, pollIndex: "1" }),
+      pattern: /did not advance/,
+    },
+    {
+      name: "pre-publication schedule",
+      mutate: si => ({ ...si, scheduledCycle: "9", observedCycle: "11" }),
+      pattern: /scheduled before its controller publication/,
+    },
+  ];
+  for (const { name, mutate, pattern } of cases) {
+    const { ledger, scheduler, si } = pendingReceiptHarness();
+    assert.throws(() => ledger.observeIntermediateAuthority({
+      scheduler,
+      si: mutate(si),
+      hostCalls: 0,
+      coldInstalls: 0,
+    }), pattern, name);
+  }
+
+  const { ledger, scheduler, si } = pendingReceiptHarness();
+  assert.equal(ledger.observeIntermediateAuthority({
+    scheduler,
+    si: { ...si, appliedSequenceLo: 0 },
+    hostCalls: 0,
+    coldInstalls: 0,
+  }), null, "an older SI sequence must not acknowledge the pending controller");
+});
+
+test("all 34 Wario publications end in a durable neutral SI receipt before Baseline", () => {
+  const navigationPolicy = productionFidelityNavigationPolicy("warioware-usa");
+  assert.equal(navigationPolicy.steps.length, 34);
+  const ledger = new ResidentCaptureRunLedger({
+    ...CAPTURE_RUN_POLICY,
+    instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+    executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+    canonicalCycleUpperCap: PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+    sliceCycleUpperCap: "5000000000",
+    blockUpperCap: 100,
+    totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+    navigationPolicy,
+  }, () => 0);
+  ledger.startAtReady(readyAuthority());
+  ledger.armNavigation(0);
+  let currentSi = null;
+
+  for (let index = 0; index < navigationPolicy.steps.length; index += 1) {
+    const target = ledger.nextNavigationTarget();
+    const current = BigInt(ledger.summary().canonicalCycle);
+    runLedger(ledger, {
+      canonicalCycles: target - current,
+      executedCycles: target - current,
+      executedInstructions: (target - current) / 2n,
+      retiredBlocks: 1n,
+    }, { si: currentSi });
+    const publication = ledger.recordNavigationPublication({
+      sequenceLo: index + 1,
+      sequenceHi: 0,
+    }, 1);
+    const issued = ledger.issue({ cycleUpperCap: "1" });
+    const receiptCycle = BigInt(publication.publicationCanonicalCycle) + 1n;
+    const si = siAuthority({
+      pollIndex: BigInt(index + 1),
+      scheduledCycle: receiptCycle,
+      observedCycle: receiptCycle,
+      sequenceLo: index + 1,
+      controller: navigationPolicy.steps[index],
+      controllerMode: index % 8,
+    });
+    ledger.accept(rustResult(issued.schedulerStart, {
+      canonicalCycles: 1n,
+      executedCycles: 1n,
+      executedInstructions: 1n,
+      retiredBlocks: 1n,
+    }, { si }));
+    const checkpoint = ledger.pendingNavigationCheckpoint();
+    assert.equal(checkpoint.navigationStep.stepIndex, index);
+    assert.equal(checkpoint.navigationStep.siAppliedSequenceLo, index + 1);
+    assert.equal(checkpoint.navigationStep.siSource, 0);
+    assert.equal(checkpoint.navigationStep.siControllerMode, index % 8);
+    ledger.commitNavigationCheckpoint();
+    currentSi = si;
+  }
+
+  const navigation = ledger.navigationSnapshot();
+  const terminal = navigation.transcript.at(-1);
+  assert.equal(navigation.durableSteps, 34);
+  assert.equal(navigation.complete, true);
+  assert.equal(navigation.pendingPublication, null);
+  assert.equal(navigation.nextTargetCanonicalCycle, null);
+  assert.deepEqual({
+    buttons: terminal.siButtons,
+    stickXyCxy: terminal.siStickXyCxy,
+    triggerLrab: terminal.siTriggerLrab,
+  }, {
+    buttons: 0,
+    stickXyCxy: 0x8080_8080,
+    triggerLrab: 0,
+  });
+  assert.equal(ledger.summary().operatorPublications, 34);
+  assert.doesNotThrow(() => ledger.assertNavigationComplete());
+});
+
+test("empty navigation scripts arm at Baseline but nonempty scripts are phase-zero-only", () => {
+  let ledger = new ResidentCaptureRunLedger(CAPTURE_RUN_POLICY, () => 0);
+  assert.throws(() => ledger.armNavigation(1), /not started at resident-ready/);
+  ledger.startAtReady(readyAuthority());
+  assert.throws(() => ledger.assertNavigationComplete(), /requires armed navigation policy/);
+  const empty = ledger.armNavigation(1);
+  assert.equal(empty.stepCount, 0);
+  assert.equal(empty.durableSteps, 0);
+  assert.equal(empty.complete, true);
+  assert.doesNotThrow(() => ledger.assertNavigationComplete());
+  assert.throws(() => ledger.armNavigation(1), /already armed/);
+
+  ledger = new ResidentCaptureRunLedger(smallNavigationPolicy([
+    {
+      minimumCanonicalDelay: "1",
+      buttons: 0,
+      stickXyCxy: 0x8080_8080,
+      triggerLrab: 0,
+    },
+  ]), () => 0);
+  ledger.startAtReady(readyAuthority());
+  assert.throws(() => ledger.armNavigation(1), /only in phase 0/);
+  assert.equal(ledger.armNavigation(0).complete, false);
 });
 
 test("capture Worker starts its wall deadline at resident-ready after boot", async () => {
@@ -820,7 +1133,7 @@ test("capture ready exposes only the Worker-generated machine session", async ()
   assert.equal(ready.machineSessionId, machineSessionId);
   assert.deepEqual(ready.diagnostics.machineEvidence, ready.fidelityState.machineEvidence);
   assert.equal(ready.diagnostics.machineEvidence.payload, "ready-machine-evidence");
-  assert.equal(ready.runSummary.schema, "lazuli-resident-cumulative-run-summary-v1");
+  assert.equal(ready.runSummary.schema, "lazuli-resident-cumulative-run-summary-v2");
   assert.equal(ready.runSummary.issuedRunCalls, 0);
 
   const supplied = workerHarness();
@@ -899,191 +1212,163 @@ test("legacy resident-input remains available without a capture ledger", async (
   assert.deepEqual(harness.publishCalls, [{ sequenceLo: 1, sequenceHi: 0, ...packed }]);
 });
 
-test("atomic operator input is phase-zero-only and requires the mandatory state poll", async () => {
-  const harness = workerHarness();
-  await initializeCapture(harness);
-  const packed = {
-    buttons: 0,
-    stickXyCxy: 0x8080_8080,
-    triggerLrab: 0,
-  };
-  harness.scope.receive({
-    type: "resident-controller-operator",
-    requestId: 2,
-  });
+test("locked navigation is Worker-owned, target-gated, and poll-serialized", async () => {
+  const neutral = { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 };
+  const runPolicy = smallNavigationPolicy([
+    { minimumCanonicalDelay: "1", ...neutral },
+  ]);
+  let harness = workerHarness({ publishStatus: 1 });
+  await initializeCapture(harness, 1, { runPolicy });
+  let armed = await armNavigation(harness, 2);
+  assert.equal(armed.navigation.schema, "lazuli-resident-navigation-runtime-v2");
+  assert.equal(armed.navigation.runCallOrigin, 0);
+  assert.equal(armed.navigation.canonicalCycleOrigin, "0");
+  assert.equal(armed.navigation.durableSteps, 0);
+
+  harness.scope.receive({ type: "resident-controller-navigation", requestId: 3 });
+  const early = await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-error" && message.requestId === 3,
+    "early navigation rejection",
+  );
+  assert.match(early.error, /before its canonical target/);
+  assert.deepEqual(harness.publishCalls, []);
+
+  harness = workerHarness({ publishStatus: 1 });
+  await initializeCapture(harness, 1, { runPolicy });
+  armed = await armNavigation(harness, 2);
+  assert.equal(armed.navigation.durableSteps, 0);
+  harness.scope.receive({ type: "resident-run", requestId: 4 });
+  const run = await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-run-result" && message.requestId === 4,
+    "navigation target run",
+  );
+  assert.equal(run.runSummary.canonicalCycle, "1");
+  harness.scope.receive({ type: "resident-fidelity-state", requestId: 5 });
+  await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-fidelity-state-result" && message.requestId === 5,
+    "post-run fidelity poll",
+  );
+
+  harness.scope.receive({ type: "resident-controller-navigation", requestId: 6 });
   const result = await waitForWorkerMessage(
     harness.scope,
-    message => message.type === "resident-controller-operator-result"
-      && message.requestId === 2,
-    "operator result",
+    message => message.type === "resident-controller-navigation-result"
+      && message.requestId === 6,
+    "locked navigation result",
   );
-  assert.deepEqual(result, {
-    type: "resident-controller-operator-result",
-    requestId: 2,
-    sequenceLo: 1,
-    sequenceHi: 0,
-    ...packed,
-    status: 9,
-    machineSessionId: result.machineSessionId,
-    runSummary: result.runSummary,
-  });
-  assert.match(result.machineSessionId, /^[0-9a-f]{8}-/i);
-  assert.equal(result.runSummary.operatorPublications, 1);
   assert.deepEqual(harness.publishCalls, [{
     sequenceLo: 1,
     sequenceHi: 0,
-    ...packed,
+    ...neutral,
   }]);
+  assert.equal(result.navigationStep.stepIndex, 0);
+  assert.equal(result.navigationStep.targetCanonicalCycle, "1");
+  assert.equal(result.navigation.pendingPublication.stepIndex, 0);
+  assert.equal(result.navigation.durableSteps, 0);
+  assert.equal(result.runSummary.operatorPublications, 0);
 
-  harness.scope.receive({
-    type: "resident-controller-operator",
-    requestId: 3,
-  });
-  const error = await waitForWorkerMessage(
+  harness.scope.receive({ type: "resident-controller-navigation", requestId: 7 });
+  const missingPoll = await waitForWorkerMessage(
     harness.scope,
-    message => message.type === "resident-error" && message.requestId === 3,
-    "mandatory poll rejection",
+    message => message.type === "resident-error" && message.requestId === 7,
+    "mandatory navigation poll rejection",
   );
-  assert.match(error.error, /must be polled after the prior command boundary/);
-  assert.equal(harness.publishCalls.length, 1);
+  assert.match(missingPoll.error, /must be polled after the prior command boundary/);
 });
 
-test("atomic operator exhausts at 65 with a retained terminal neutral state", async () => {
-  const harness = workerHarness();
-  await initializeCapture(harness);
+test("locked navigation rejects caller words, backpressure, and Baseline crossing", async () => {
   const neutral = { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 };
-  const a = { buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 };
-  for (let index = 0; index < PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP; index += 1) {
-    const requestId = 2 + index * 2;
-    harness.scope.receive({ type: "resident-controller-operator", requestId });
-    const result = await waitForWorkerMessage(
-      harness.scope,
-      message => message.type === "resident-controller-operator-result"
-        && message.requestId === requestId,
-      `derived operator ${index}`,
-    );
-    assert.deepEqual(
-      { buttons: result.buttons, stickXyCxy: result.stickXyCxy, triggerLrab: result.triggerLrab },
-      index % 2 === 0 ? neutral : a,
-    );
-    assert.equal(result.runSummary.operatorPublications, index + 1);
-    harness.scope.receive({ type: "resident-fidelity-state", requestId: requestId + 1 });
-    await waitForWorkerMessage(
-      harness.scope,
-      message => message.type === "resident-fidelity-state-result"
-        && message.requestId === requestId + 1,
-      `derived operator ${index} state poll`,
-    );
-  }
-  assert.equal(harness.publishCalls.length, 65);
-  assert.deepEqual(harness.publishCalls[63], {
-    sequenceLo: 64,
-    sequenceHi: 0,
-    ...a,
-  });
-  assert.deepEqual(harness.publishCalls[64], {
-    sequenceLo: 65,
-    sequenceHi: 0,
-    ...neutral,
-  });
+  const runPolicy = smallNavigationPolicy([
+    { minimumCanonicalDelay: "1", ...neutral },
+  ]);
 
-  harness.scope.receive({ type: "resident-controller-operator", requestId: 132 });
-  const exhausted = await waitForWorkerMessage(
+  let harness = workerHarness({ publishStatus: 1 });
+  await initializeCapture(harness, 1, { runPolicy });
+  await armNavigation(harness, 2);
+  harness.scope.receive({ type: "resident-run", requestId: 3 });
+  await waitForWorkerMessage(
     harness.scope,
-    message => message.type === "resident-error" && message.requestId === 132,
-    "exhausted operator rejection",
+    message => message.type === "resident-run-result" && message.requestId === 3,
+    "caller-word target run",
   );
-  assert.match(exhausted.error, /operator publication cap exhausted/);
-  assert.equal(harness.publishCalls.length, 65);
-  assert.deepEqual(harness.publishCalls.at(-1), {
-    sequenceLo: 65,
-    sequenceHi: 0,
-    ...neutral,
-  });
-});
-
-test("atomic operator rejects caller-supplied state and parity", async () => {
-  const harness = workerHarness();
-  await initializeCapture(harness);
-  harness.scope.receive({
-    type: "resident-controller-operator",
-    requestId: 2,
-    buttons: 0x0100,
-    stickXyCxy: 0x8080_8080,
-    triggerLrab: 0x00ff_0000,
-  });
-  const error = await waitForWorkerMessage(
+  harness.scope.receive({ type: "resident-fidelity-state", requestId: 4 });
+  await waitForWorkerMessage(
     harness.scope,
-    message => message.type === "resident-error" && message.requestId === 2,
-    "caller-supplied operator rejection",
+    message => message.type === "resident-fidelity-state-result" && message.requestId === 4,
+    "caller-word target poll",
+  );
+  harness.scope.receive({
+    type: "resident-controller-navigation",
+    requestId: 5,
+    buttons: neutral.buttons,
+  });
+  let error = await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-error" && message.requestId === 5,
+    "caller-supplied navigation rejection",
   );
   assert.match(error.error, /cannot supply controller state/);
   assert.deepEqual(harness.publishCalls, []);
-});
 
-test("backpressured atomic operator is rejected and does not increment the ledger", async () => {
-  const harness = workerHarness({ publishStatus: 0 });
-  const ready = await initializeCapture(harness);
-  harness.scope.receive({
-    type: "resident-controller-operator",
-    requestId: 2,
-  });
-  const error = await waitForWorkerMessage(
+  harness = workerHarness({ publishStatus: 0 });
+  const ready = await initializeCapture(harness, 1, { runPolicy });
+  await armNavigation(harness, 2);
+  harness.scope.receive({ type: "resident-run", requestId: 3 });
+  await waitForWorkerMessage(
     harness.scope,
-    message => message.type === "resident-error" && message.requestId === 2,
-    "backpressured operator rejection",
+    message => message.type === "resident-run-result" && message.requestId === 3,
+    "backpressure target run",
   );
-  assert.match(error.error, /backpressured/);
-  harness.scope.receive({ type: "resident-fidelity-state", requestId: 3 });
-  const stateError = await waitForWorkerMessage(
+  harness.scope.receive({ type: "resident-fidelity-state", requestId: 4 });
+  await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-fidelity-state-result" && message.requestId === 4,
+    "backpressure target poll",
+  );
+  harness.scope.receive({ type: "resident-controller-navigation", requestId: 5 });
+  error = await waitForWorkerMessage(
+    harness.scope,
+    message => message.type === "resident-error" && message.requestId === 5,
+    "backpressured navigation rejection",
+  );
+  assert.match(error.error, /not exactly Queued/);
+  assert.equal(ready.runSummary.operatorPublications, 0);
+
+  harness = workerHarness({ publishStatus: 1 });
+  await initializeCapture(harness, 1, { runPolicy });
+  await armNavigation(harness, 2);
+  harness.setFidelityState(1, neutral);
+  harness.scope.receive({ type: "resident-controller-navigation", requestId: 3 });
+  error = await waitForWorkerMessage(
     harness.scope,
     message => message.type === "resident-error" && message.requestId === 3,
-    "backpressured operator terminal fault",
+    "post-Baseline navigation rejection",
   );
-  assert.match(stateError.error, /backpressured/);
-  assert.equal(ready.runSummary.operatorPublications, 0);
+  assert.match(error.error, /allowed only before Baseline/);
+  assert.deepEqual(harness.publishCalls, []);
 });
 
-test("atomic operator input cannot cross the Rust Baseline phase", async () => {
-  const harness = workerHarness();
+test("empty navigation can arm at Baseline and has no synthetic controller publication", async () => {
+  const harness = workerHarness({ publishStatus: 1 });
   await initializeCapture(harness);
   harness.setFidelityState(1, {
     buttons: 1,
     stickXyCxy: 0x8080_8001,
     triggerLrab: 0,
   });
-  harness.scope.receive({
-    type: "resident-controller-operator",
-    requestId: 2,
-  });
-  const error = await waitForWorkerMessage(
-    harness.scope,
-    message => message.type === "resident-error" && message.requestId === 2,
-    "post-Baseline operator rejection",
-  );
-  assert.match(error.error, /allowed only before Baseline/);
+  const armed = await armNavigation(harness, 2);
+  assert.equal(armed.navigation.stepCount, 0);
+  assert.equal(armed.navigation.complete, true);
+  assert.equal(armed.runSummary.operatorPublications, 0);
   assert.deepEqual(harness.publishCalls, []);
 });
-
 test("atomic witness publishes Rust Baseline words once and blocks on durable ACK", async () => {
   const harness = workerHarness();
   await initializeCapture(harness);
-  harness.scope.receive({
-    type: "resident-controller-operator",
-    requestId: 2,
-  });
-  await waitForWorkerMessage(
-    harness.scope,
-    message => message.type === "resident-controller-operator-result"
-      && message.requestId === 2,
-    "operator result",
-  );
-  harness.scope.receive({ type: "resident-fidelity-state", requestId: 3 });
-  await waitForWorkerMessage(
-    harness.scope,
-    message => message.type === "resident-fidelity-state-result" && message.requestId === 3,
-    "operator state poll",
-  );
+  await armNavigation(harness, 2);
 
   const requested = {
     buttons: 1,
@@ -1104,7 +1389,7 @@ test("atomic witness publishes Rust Baseline words once and blocks on durable AC
     false,
   );
   assert.deepEqual(harness.publishCalls.at(-1), {
-    sequenceLo: 2,
+    sequenceLo: 1,
     sequenceHi: 0,
     ...requested,
   });
@@ -1116,7 +1401,7 @@ test("atomic witness publishes Rust Baseline words once and blocks on durable AC
     triggerLrab: checkpoint.triggerLrab,
     status: checkpoint.status,
   }, {
-    sequenceLo: 2,
+    sequenceLo: 1,
     sequenceHi: 0,
     ...requested,
     status: 9,
@@ -1146,12 +1431,13 @@ test("atomic witness publishes Rust Baseline words once and blocks on durable AC
     "one-shot witness rejection",
   );
   assert.match(repeated.error, /already published/);
-  assert.equal(harness.publishCalls.length, 2);
+  assert.equal(harness.publishCalls.length, 1);
 });
 
 test("witness checkpoint rejection permanently faults capture", async () => {
   const harness = workerHarness();
   await initializeCapture(harness);
+  await armNavigation(harness, 20);
   harness.setFidelityState(1, {
     buttons: 1,
     stickXyCxy: 0x8080_8001,
@@ -1185,6 +1471,7 @@ test("witness checkpoint rejection permanently faults capture", async () => {
 test("close rejects a witness awaiting durable ACK and worker lifetime cannot reinitialize", async () => {
   const harness = workerHarness();
   await initializeCapture(harness);
+  await armNavigation(harness, 20);
   harness.setFidelityState(1, {
     buttons: 1,
     stickXyCxy: 0x8080_8001,

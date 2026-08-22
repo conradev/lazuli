@@ -5,10 +5,12 @@ import initRenderer, {
 } from "/resident-artifacts/browser_renderer.js";
 import {
   FIDELITY_CHECKPOINT_SCHEMA,
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   ResidentFidelityCheckpointClient,
+  captureNavigationRuntime,
 } from "/tools/resident_machine_fidelity_checkpoints.mjs";
 
 const REPORT_SCHEMA = "lazuli-rust-resident-first-visible-xfb-evidence-v1";
@@ -99,6 +101,9 @@ const executedCycleUpperCapDefault = productionCaptureRequested
 const instructionUpperCapDefault = productionCaptureRequested
   ? PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP
   : "100000000";
+const canonicalCycleUpperCapDefault = productionCaptureRequested
+  ? PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP
+  : executedCycleUpperCapDefault;
 const totalColdInstallMaximum = productionCaptureRequested
   ? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
   : 65_535;
@@ -107,8 +112,19 @@ const policy = Object.freeze({
   evidenceMode: "first-renderer-owned-presented-xfb",
   instructionUpperCap: boundedBigInt("instructionCap", instructionUpperCapDefault),
   executedCycleUpperCap: boundedBigInt("executedCycleCap", executedCycleUpperCapDefault),
-  sliceCycleUpperCap: BigInt(boundedInteger("sliceCycleCap", 1_000_000, 1, 1_000_000)),
-  blockUpperCap: boundedInteger("blockCap", 16_384, 1, 16_384),
+  canonicalCycleUpperCap: boundedBigInt("canonicalCycleCap", canonicalCycleUpperCapDefault),
+  sliceCycleUpperCap: BigInt(boundedInteger(
+    "sliceCycleCap",
+    productionCaptureRequested ? 8_000_000 : 1_000_000,
+    1,
+    8_000_000,
+  )),
+  blockUpperCap: boundedInteger(
+    "blockCap",
+    productionCaptureRequested ? 131_072 : 16_384,
+    1,
+    131_072,
+  ),
   totalHostCallCap: boundedInteger("hostCallCap", 65_535, 1, 65_535),
   totalColdInstallCap: boundedInteger(
     "coldInstallCap",
@@ -119,7 +135,18 @@ const policy = Object.freeze({
   maxBootReads: boundedInteger("bootReadCap", 8_192, 1, 65_535),
   bootTimeoutMs: boundedInteger("bootTimeoutMs", 180_000, 1_000, 600_000),
   sliceTimeoutMs: boundedInteger("sliceTimeoutMs", 180_000, 1_000, 600_000),
-  runTimeoutMs: boundedInteger("runTimeoutMs", 600_000, 1_000, 1_800_000),
+  runTimeoutMs: boundedInteger(
+    "runTimeoutMs",
+    productionCaptureRequested ? 7_200_000 : 600_000,
+    1_000,
+    7_200_000,
+  ),
+  externalWallTimeoutMs: boundedInteger(
+    "externalWallTimeoutMs",
+    productionCaptureRequested ? 7_200_000 : 600_000,
+    1_000,
+    7_200_000,
+  ),
   zeroProgressSliceCap: boundedInteger("zeroProgressSliceCap", 4_096, 1, 65_535),
 });
 
@@ -228,13 +255,16 @@ function copiedRunSummary(value, label, accepted = null) {
   const expected = [
     "accepted",
     "consecutiveZeroProgressSlices",
+    "canonicalCycle",
     "elapsedWallMs",
     "issuedRunCalls",
     "maximumConsecutiveZeroProgressSlices",
     "operatorPublications",
     "reportedColdInstalls",
+    "reportedCanonicalCycles",
     "reportedExecutedCycles",
     "reportedExecutedInstructions",
+    "reportedRetiredBlocks",
     "reportedHostCalls",
     "schema",
     "wallTimeoutMs",
@@ -252,12 +282,15 @@ function copiedRunSummary(value, label, accepted = null) {
       boundary: "capture-run-summary-error",
     });
   }
-  if (value.schema !== "lazuli-resident-cumulative-run-summary-v1") {
+  if (value.schema !== "lazuli-resident-cumulative-run-summary-v2") {
     throw new ResidentFirstFrameError(`${label} schema changed`, {
       boundary: "capture-run-summary-error",
     });
   }
-  for (const field of ["reportedExecutedCycles", "reportedExecutedInstructions"]) {
+  for (const field of [
+    "canonicalCycle", "reportedCanonicalCycles", "reportedExecutedCycles",
+    "reportedExecutedInstructions", "reportedRetiredBlocks",
+  ]) {
     if (typeof value[field] !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value[field])) {
       throw new ResidentFirstFrameError(`${label} ${field} changed`, {
         boundary: "capture-run-summary-error",
@@ -265,7 +298,8 @@ function copiedRunSummary(value, label, accepted = null) {
     }
   }
   for (const field of expected.filter(field => ![
-    "accepted", "reportedExecutedCycles", "reportedExecutedInstructions", "schema",
+    "accepted", "canonicalCycle", "reportedCanonicalCycles", "reportedExecutedCycles",
+    "reportedExecutedInstructions", "reportedRetiredBlocks", "schema",
   ].includes(field))) {
     if (!Number.isSafeInteger(value[field]) || value[field] < 0) {
       throw new ResidentFirstFrameError(`${label} ${field} changed`, {
@@ -279,6 +313,50 @@ function copiedRunSummary(value, label, accepted = null) {
     });
   }
   return Object.freeze(structuredClone(value));
+}
+
+function copiedNavigationRuntime(
+  value,
+  label,
+  navigationPolicy,
+  prior = null,
+  sliceCycleUpperCap = "8000000",
+) {
+  if (value === null) {
+    if (prior !== null) {
+      throw new ResidentFirstFrameError(`${label} lost armed navigation authority`, {
+        boundary: "navigation-runtime-error",
+      });
+    }
+    return null;
+  }
+  let copied;
+  try {
+    copied = captureNavigationRuntime(
+      value,
+      { navigationPolicy, sliceCycleUpperCap },
+      label,
+    );
+  } catch (error) {
+    throw new ResidentFirstFrameError(`${label} is invalid: ${String(error)}`, {
+      boundary: "navigation-runtime-error",
+    });
+  }
+  if (prior !== null && (
+    copied.scriptSha256 !== prior.scriptSha256
+    || copied.stepCount !== prior.stepCount
+    || copied.runCallOrigin !== prior.runCallOrigin
+    || copied.canonicalCycleOrigin !== prior.canonicalCycleOrigin
+    || copied.siPollIndexOrigin !== prior.siPollIndexOrigin
+    || copied.durableSteps < prior.durableSteps
+    || canonicalFidelityJson(copied.transcript.slice(0, prior.durableSteps))
+      !== canonicalFidelityJson(prior.transcript)
+  )) {
+    throw new ResidentFirstFrameError(`${label} rewrote prior navigation authority`, {
+      boundary: "navigation-runtime-error",
+    });
+  }
+  return copied;
 }
 
 function base64(bytes) {
@@ -512,7 +590,7 @@ class ResidentFirstFrameError extends Error {
 }
 
 class ResidentWorkerClient {
-  constructor(worker, renderer, checkpoints, captureFidelity = false) {
+  constructor(worker, renderer, checkpoints, captureFidelity = false, navigationPolicy = null) {
     this.worker = worker;
     this.renderer = renderer;
     this.checkpoints = checkpoints;
@@ -537,6 +615,8 @@ class ResidentWorkerClient {
     this.machineSessionId = null;
     this.runSummary = null;
     this.firstFrameReportJson = null;
+    this.navigationPolicy = navigationPolicy === null ? null : structuredClone(navigationPolicy);
+    this.navigationAuthority = null;
     this.preWitnessMachineEvidence = null;
     this.terminalState = null;
     worker.addEventListener("message", event => this.handle(event.data ?? {}));
@@ -987,27 +1067,236 @@ class ResidentWorkerClient {
       });
     }
     this.runSummary = copiedRunSummary(response.runSummary, `${label} run summary`, accepted);
+    if (!Object.hasOwn(response, "navigation")) {
+      throw new ResidentFirstFrameError(`${label} omitted Worker navigation authority`, {
+        boundary: "navigation-runtime-error",
+      });
+    }
+    this.navigationAuthority = copiedNavigationRuntime(
+      response.navigation,
+      `${label} navigation runtime`,
+      this.navigationPolicy,
+      this.navigationAuthority,
+    );
+    if (
+      this.navigationAuthority !== null
+      && this.runSummary.operatorPublications !== this.navigationAuthority.durableSteps
+    ) {
+      throw new ResidentFirstFrameError(`${label} navigation/run counters diverged`, {
+        boundary: "navigation-runtime-error",
+      });
+    }
     return this.runSummary;
   }
 
-  async publishOperatorController() {
+  async armNavigationPolicy() {
+    if (this.firstFrameReportJson === null || this.navigationAuthority !== null) {
+      throw new ResidentFirstFrameError("navigation arm requires the one durable first-frame report", {
+        boundary: "navigation-arm-ordering-error",
+      });
+    }
     const response = await this.request({
-      type: "resident-controller-operator",
-    }, "atomic generic operator controller publication", policy.sliceTimeoutMs);
-    if (response.type !== "resident-controller-operator-result") {
+      type: "resident-controller-navigation-arm",
+    }, "atomic locked navigation arm", policy.sliceTimeoutMs);
+    if (response.type !== "resident-controller-navigation-arm-result") {
       throw new ResidentFirstFrameError(
-        `unexpected atomic operator response ${String(response.type)}`,
+        `unexpected navigation arm response ${String(response.type)}`,
         { boundary: "worker-protocol-error" },
       );
     }
-    const status = u32(response.status, "atomic operator status");
-    const state = await this.queryFidelityState("post-operator fidelity state");
+    this.acceptWorkerAuthority(response, "atomic navigation arm result", false);
+    if (
+      !Number.isSafeInteger(response.runCallOrigin)
+      || response.runCallOrigin !== this.runSummary.issuedRunCalls
+      || typeof response.canonicalCycleOrigin !== "string"
+      || response.canonicalCycleOrigin !== this.runSummary.canonicalCycle
+      || typeof response.scriptSha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(response.scriptSha256)
+      || !Number.isSafeInteger(response.stepCount)
+      || response.stepCount < 0
+      || response.stepCount > 65
+      || this.navigationAuthority === null
+      || response.scriptSha256 !== this.navigationAuthority.scriptSha256
+      || response.stepCount !== this.navigationAuthority.stepCount
+      || response.runCallOrigin !== this.navigationAuthority.runCallOrigin
+      || response.canonicalCycleOrigin !== this.navigationAuthority.canonicalCycleOrigin
+      || this.navigationAuthority.durableSteps !== 0
+      || this.navigationAuthority.pendingPublication !== null
+    ) {
+      throw new ResidentFirstFrameError("navigation arm authority changed", {
+        boundary: "worker-protocol-error",
+      });
+    }
+    return this.navigationAuthority;
+  }
+
+  async publishNavigationController() {
+    if (this.navigationAuthority === null) {
+      throw new ResidentFirstFrameError("navigation policy was not armed", {
+        boundary: "navigation-arm-ordering-error",
+      });
+    }
+    const priorDurableSteps = this.navigationAuthority.durableSteps;
+    const response = await this.request({
+      type: "resident-controller-navigation",
+    }, "atomic locked navigation controller publication", policy.sliceTimeoutMs);
+    if (response.type !== "resident-controller-navigation-result") {
+      throw new ResidentFirstFrameError(
+        `unexpected atomic navigation response ${String(response.type)}`,
+        { boundary: "worker-protocol-error" },
+      );
+    }
+    this.acceptWorkerAuthority(response, "atomic navigation result", false);
+    const navigationStep = response.navigationStep;
+    if (
+      this.navigationAuthority === null
+      || this.navigationAuthority.durableSteps !== priorDurableSteps
+      || this.navigationAuthority.pendingPublication === null
+      || navigationStep === null
+      || typeof navigationStep !== "object"
+      || canonicalFidelityJson(navigationStep)
+        !== canonicalFidelityJson(this.navigationAuthority.pendingPublication)
+    ) {
+      throw new ResidentFirstFrameError("navigation publication authority changed", {
+        boundary: "worker-protocol-error",
+      });
+    }
+    const state = await this.queryFidelityState("post-navigation fidelity state");
     return Object.freeze({
-      sequenceLo: u32(response.sequenceLo, "operator sequence low"),
-      sequenceHi: u32(response.sequenceHi, "operator sequence high"),
-      status,
+      ...structuredClone(navigationStep),
       phase: state.phase,
     });
+  }
+
+  async captureNavigationArmCheckpoint(message) {
+    try {
+      if (
+        !this.captureFidelity
+        || this.machineSessionId === null
+        || this.firstFrameReportJson === null
+        || this.navigationAuthority !== null
+      ) {
+        throw new ResidentFirstFrameError(
+          "navigation arm checkpoint arrived outside the durable first-frame boundary",
+          { boundary: "navigation-arm-ordering-error" },
+        );
+      }
+      if (message.machineSessionId !== this.machineSessionId) {
+        throw new ResidentFirstFrameError("navigation arm checkpoint changed machine session", {
+          boundary: "capture-session-error",
+        });
+      }
+      const runSummary = copiedRunSummary(
+        message.runSummary,
+        "navigation arm checkpoint run summary",
+        false,
+      );
+      const navigation = copiedNavigationRuntime(
+        message.navigation,
+        "navigation arm checkpoint runtime",
+        this.navigationPolicy,
+      );
+      if (
+        navigation === null
+        || navigation.durableSteps !== 0
+        || navigation.pendingPublication !== null
+        || navigation.runCallOrigin !== runSummary.issuedRunCalls
+        || navigation.canonicalCycleOrigin !== runSummary.canonicalCycle
+        || message.runCallOrigin !== navigation.runCallOrigin
+        || message.canonicalCycleOrigin !== navigation.canonicalCycleOrigin
+        || message.scriptSha256 !== navigation.scriptSha256
+        || message.stepCount !== navigation.stepCount
+      ) {
+        throw new ResidentFirstFrameError("navigation arm checkpoint changed locked authority", {
+          boundary: "navigation-runtime-error",
+        });
+      }
+      await this.checkpoints.navigationArmed({
+        machineSessionId: this.machineSessionId,
+        navigation,
+        runSummary,
+      });
+      this.runSummary = runSummary;
+      this.navigationAuthority = navigation;
+      if (!this.closed) {
+        this.worker.postMessage({
+          type: "resident-controller-navigation-arm-checkpoint-ack",
+          requestId: message.requestId,
+        });
+      }
+    } catch (error) {
+      this.captureFailure = String(error?.stack ?? error);
+      if (!this.closed) {
+        this.worker.postMessage({
+          type: "resident-controller-navigation-arm-checkpoint-error",
+          requestId: message.requestId,
+          error: this.captureFailure,
+        });
+      }
+      this.failAll(error);
+    }
+  }
+
+  async captureNavigationCheckpoint(message) {
+    try {
+      if (!this.captureFidelity || this.machineSessionId === null) {
+        throw new ResidentFirstFrameError("navigation checkpoint arrived outside capture", {
+          boundary: "fidelity-protocol-error",
+        });
+      }
+      if (message.machineSessionId !== this.machineSessionId) {
+        throw new ResidentFirstFrameError("navigation checkpoint changed machine session", {
+          boundary: "capture-session-error",
+        });
+      }
+      const runSummary = copiedRunSummary(
+        message.runSummary,
+        "navigation checkpoint run summary",
+        false,
+      );
+      const navigation = copiedNavigationRuntime(
+        message.navigation,
+        "navigation checkpoint runtime",
+        this.navigationPolicy,
+        this.navigationAuthority,
+      );
+      if (
+        navigation === null
+        || navigation.durableSteps !== (this.navigationAuthority?.durableSteps ?? 0) + 1
+        || runSummary.operatorPublications !== navigation.durableSteps
+        || canonicalFidelityJson(message.navigationStep)
+          !== canonicalFidelityJson(navigation.transcript.at(-1))
+        || this.firstFrameReportJson === null
+      ) {
+        throw new ResidentFirstFrameError("navigation checkpoint changed locked authority", {
+          boundary: "navigation-runtime-error",
+        });
+      }
+      await this.checkpoints.navigationStepReceived({
+        machineSessionId: this.machineSessionId,
+        navigationStep: navigation.transcript.at(-1),
+        navigation,
+        runSummary,
+      });
+      this.runSummary = runSummary;
+      this.navigationAuthority = navigation;
+      if (!this.closed) {
+        this.worker.postMessage({
+          type: "resident-controller-navigation-checkpoint-ack",
+          requestId: message.requestId,
+        });
+      }
+    } catch (error) {
+      this.captureFailure = String(error?.stack ?? error);
+      if (!this.closed) {
+        this.worker.postMessage({
+          type: "resident-controller-navigation-checkpoint-error",
+          requestId: message.requestId,
+          error: this.captureFailure,
+        });
+      }
+      this.failAll(error);
+    }
   }
 
   async publishRequestedController() {
@@ -1053,9 +1342,25 @@ class ResidentWorkerClient {
           boundary: "capture-session-error",
         });
       }
-      copiedRunSummary(message.runSummary, "witness checkpoint run summary", false);
+      const runSummary = copiedRunSummary(
+        message.runSummary,
+        "witness checkpoint run summary",
+        false,
+      );
+      const navigation = copiedNavigationRuntime(
+        message.navigation,
+        "witness checkpoint navigation runtime",
+        this.navigationPolicy,
+        this.navigationAuthority,
+      );
       const state = copiedFidelityState(message.state, "witness checkpoint state");
-      if (state.phase !== 1 || this.firstFrameReportJson === null) {
+      if (
+        state.phase !== 1
+        || this.firstFrameReportJson === null
+        || navigation === null
+        || !navigation.complete
+        || runSummary.operatorPublications !== navigation.durableSteps
+      ) {
         throw new ResidentFirstFrameError("witness checkpoint lacked durable Baseline/report", {
           boundary: "baseline-lost-before-witness",
         });
@@ -1074,6 +1379,8 @@ class ResidentWorkerClient {
         status: u32(message.status, "witness status"),
         machineEvidenceEnvelope: machine.envelope,
         machineEvidenceOpaque: machine.opaque,
+        navigation,
+        runSummary,
       });
       this.preWitnessMachineEvidence = state.machineEvidence;
       if (!this.closed) {
@@ -1174,6 +1481,9 @@ class ResidentWorkerClient {
       phase: current?.phase ?? 0,
       machineSessionId: this.machineSessionId,
       runSummary: structuredClone(this.runSummary),
+      navigation: this.navigationAuthority === null
+        ? null
+        : structuredClone(this.navigationAuthority),
       machineEvidence: current?.machineEvidence ?? null,
       gameFidelity: current?.record ?? null,
       artifacts: Object.freeze({
@@ -1227,6 +1537,7 @@ class ResidentWorkerClient {
       machineEvidenceEnvelope: machine.envelope,
       machineEvidenceOpaque: machine.opaque,
       runSummary: this.runSummary,
+      navigation: this.navigationAuthority,
     });
     this.terminalState = state;
     const capture = this.captureState(this.gameKey);
@@ -1258,6 +1569,14 @@ class ResidentWorkerClient {
     }
     if (message.type === "resident-fidelity-observation") {
       void this.captureFidelityObservation(message);
+      return;
+    }
+    if (message.type === "resident-controller-navigation-checkpoint") {
+      void this.captureNavigationCheckpoint(message);
+      return;
+    }
+    if (message.type === "resident-controller-navigation-arm-checkpoint") {
+      void this.captureNavigationArmCheckpoint(message);
       return;
     }
     if (message.type === "resident-controller-witness-checkpoint") {
@@ -1308,9 +1627,11 @@ function newRunEvidence() {
     wallMs: 0,
     slices: 0,
     rustBoundaries: 0,
+    adapterCapBoundaries: 0,
     rustStopBoundaries: 0,
     instructionCapBoundaries: 0,
     executedCycleCapBoundaries: 0,
+    canonicalCycleCapBoundaries: 0,
     hostCallCapBoundaries: 0,
     coldInstallCapBoundaries: 0,
     workerTimeoutBoundaries: 0,
@@ -1321,6 +1642,7 @@ function newRunEvidence() {
     servicedHostCalls: 0,
     coldInstalls: 0,
     executedCycles: 0n,
+    canonicalCycles: 0n,
     executedInstructions: 0n,
     outcomeDetails: Object.create(null),
   };
@@ -1333,9 +1655,11 @@ function finalizedRun(run, complete, goalReached) {
     complete,
     goalReached,
     executedCycles: run.executedCycles.toString(),
+    canonicalCycles: run.canonicalCycles.toString(),
     executedInstructions: run.executedInstructions.toString(),
     instructionUpperCap: policy.instructionUpperCap.toString(),
     executedCycleUpperCap: policy.executedCycleUpperCap.toString(),
+    canonicalCycleUpperCap: policy.canonicalCycleUpperCap.toString(),
     instructionsPerSecond: seconds === 0 ? 0 : Number(run.executedInstructions) / seconds,
     cyclesPerSecond: seconds === 0 ? 0 : Number(run.executedCycles) / seconds,
   });
@@ -1355,47 +1679,64 @@ function observeRustRun(run, result) {
   run.slices += 1;
   run.servicedHostCalls += hostCallDelta;
   run.coldInstalls += coldInstallDelta;
+  const delta = result.scheduler?.delta;
+  if (
+    delta === null
+    || typeof delta !== "object"
+    || !["canonicalCycles", "executedCycles", "executedInstructions", "retiredBlocks"]
+      .every(field => typeof delta[field] === "string" && /^(?:0|[1-9][0-9]*)$/.test(delta[field]))
+  ) {
+    throw new ResidentFirstFrameError("run result omitted authenticated scheduler accounting", {
+      boundary: "scheduler-authority-error",
+    });
+  }
+  const canonicalDelta = BigInt(delta.canonicalCycles);
+  const cycleDelta = BigInt(delta.executedCycles);
+  const instructionDelta = BigInt(delta.executedInstructions);
+  run.canonicalCycles += canonicalDelta;
+  run.executedCycles += cycleDelta;
+  run.executedInstructions += instructionDelta;
   if (result.boundary !== "rust") {
     if (result.boundary === "host-call-cap") {
       run.hostCallCapBoundaries += 1;
     } else if (result.boundary === "cold-install-cap") {
       run.coldInstallCapBoundaries += 1;
+    } else if (result.boundary === "adapter-cap") {
+      run.adapterCapBoundaries += 1;
+    } else if (result.boundary === "fidelity") {
+      // Accepted is a hard Rust-owned boundary with the same scheduler accounting contract.
     } else {
       throw new ResidentFirstFrameError(
         `unknown adapter boundary ${String(result.boundary)}`,
         { boundary: "unknown-adapter-boundary" },
       );
     }
-    throw new ResidentFirstFrameError(
-      `${result.boundary} reached; partial Rust counters are not observable`,
-      {
+    if (result.boundary === "host-call-cap" || result.boundary === "cold-install-cap") {
+      throw new ResidentFirstFrameError(`${result.boundary} reached`, {
         boundary: result.boundary,
-        unobservablePartialRustCounters: true,
+        unobservablePartialRustCounters: false,
         hostCalls: hostCallDelta,
         coldInstalls: coldInstallDelta,
-      },
-    );
+      });
+    }
+  } else {
+    run.rustBoundaries += 1;
+    const reason = Number(result.outcome.reason);
+    const detail = Number(result.outcome.detail);
+    if (reason !== 0) {
+      run.rustStopBoundaries += 1;
+      throw new ResidentFirstFrameError(
+        `Rust resident run stopped with reason ${reason}, detail ${detail}`,
+        { boundary: "rust-stop", reason, detail },
+      );
+    }
+    const key = String(detail);
+    run.outcomeDetails[key] = (run.outcomeDetails[key] ?? 0) + 1;
   }
-
-  run.rustBoundaries += 1;
-  const reason = Number(result.outcome.reason);
-  const detail = Number(result.outcome.detail);
-  if (reason !== 0) {
-    run.rustStopBoundaries += 1;
-    throw new ResidentFirstFrameError(
-      `Rust resident run stopped with reason ${reason}, detail ${detail}`,
-      { boundary: "rust-stop", reason, detail },
-    );
-  }
-  const cycleDelta = BigInt(result.outcome.executedCycles);
-  const instructionDelta = BigInt(result.outcome.executedInstructions);
-  run.executedCycles += cycleDelta;
-  run.executedInstructions += instructionDelta;
-  const key = String(detail);
-  run.outcomeDetails[key] = (run.outcomeDetails[key] ?? 0) + 1;
   if (
     instructionDelta === 0n
     && cycleDelta === 0n
+    && canonicalDelta === 0n
     && hostCallDelta === 0
     && coldInstallDelta === 0
   ) {
@@ -1440,6 +1781,13 @@ async function runUntilFirstPresentedXfb(client) {
           "executed-cycle upper cap reached before first presented XFB",
         );
       }
+      if (run.canonicalCycles >= policy.canonicalCycleUpperCap) {
+        capFailure(
+          run,
+          "canonicalCycleCap",
+          "canonical-cycle upper cap reached before first presented XFB",
+        );
+      }
       if (run.servicedHostCalls >= policy.totalHostCallCap) {
         capFailure(run, "hostCallCap", "total host-call cap reached before accepted evidence");
       }
@@ -1447,7 +1795,11 @@ async function runUntilFirstPresentedXfb(client) {
         capFailure(run, "coldInstallCap", "total cold-install cap reached before accepted evidence");
       }
 
-      const remainingCycles = policy.executedCycleUpperCap - run.executedCycles;
+      const remainingExecutedCycles = policy.executedCycleUpperCap - run.executedCycles;
+      const remainingCanonicalCycles = policy.canonicalCycleUpperCap - run.canonicalCycles;
+      const remainingCycles = remainingExecutedCycles < remainingCanonicalCycles
+        ? remainingExecutedCycles
+        : remainingCanonicalCycles;
       const requestedCycles = remainingCycles < policy.sliceCycleUpperCap
         ? remainingCycles
         : policy.sliceCycleUpperCap;
@@ -1486,6 +1838,9 @@ async function runUntilFirstPresentedXfb(client) {
       }
       if (run.executedCycles > policy.executedCycleUpperCap) {
         capFailure(run, "executedCycleCap", "executed-cycle upper cap was crossed by the last slice");
+      }
+      if (run.canonicalCycles > policy.canonicalCycleUpperCap) {
+        capFailure(run, "canonicalCycleCap", "canonical-cycle upper cap was crossed by the last slice");
       }
       if (run.servicedHostCalls > policy.totalHostCallCap) {
         capFailure(run, "hostCallCap", "total host-call cap was crossed by the last slice");
@@ -1580,10 +1935,14 @@ function requireEvidenceLockMatchesPage(evidence, hostManifest, artifactManifest
     bootTimeoutMs: policy.bootTimeoutMs,
     sliceTimeoutMs: policy.sliceTimeoutMs,
     runTimeoutMs: policy.runTimeoutMs,
-    externalWallTimeoutMs: 600_000,
+    externalWallTimeoutMs: policy.externalWallTimeoutMs,
     zeroProgressSliceCap: policy.zeroProgressSliceCap,
   };
-  if (production) expectedRunPolicy.workerUrl = lock.release?.executionAssets?.worker?.url;
+  if (production) {
+    expectedRunPolicy.canonicalCycleUpperCap = policy.canonicalCycleUpperCap.toString();
+    expectedRunPolicy.workerUrl = lock.release?.executionAssets?.worker?.url;
+    expectedRunPolicy.navigationPolicy = lock.runPolicy.navigationPolicy;
+  }
   exact(lock.runPolicy, expectedRunPolicy, "run policy");
   exact(lock.checkpointPolicy, {
     checkpointTimeoutMs: fidelityCheckpointPolicy.checkpointTimeoutMs,
@@ -1682,6 +2041,7 @@ function failureCounts(error, client, transportBefore, transportAfter) {
     rustStops: boundary === "rust-stop" ? 1 : 0,
     instructionCaps: boundary === "instruction-cap" ? 1 : 0,
     executedCycleCaps: boundary === "executed-cycle-cap" ? 1 : 0,
+    canonicalCycleCaps: boundary === "canonical-cycle-cap" ? 1 : 0,
     hostCallCaps: boundary === "host-call-cap" ? 1 : 0,
     coldInstallCaps: boundary === "cold-install-cap" ? 1 : 0,
     workerTimeouts: new Set(["boot-timeout", "worker-request-timeout", "run-timeout"])
@@ -1715,7 +2075,13 @@ async function runGame(game, renderer, checkpoints, workerUrl) {
     rendererBefore = rendererSnapshot(renderer);
     phase = "worker-setup";
     worker = new Worker(workerUrl, { type: "module" });
-    client = new ResidentWorkerClient(worker, renderer, checkpoints, productionCapture);
+    client = new ResidentWorkerClient(
+      worker,
+      renderer,
+      checkpoints,
+      productionCapture,
+      productionCapture ? pageProductionContext.lock.runPolicy.navigationPolicy : null,
+    );
     client.gameKey = game.key;
     phase = "initialization";
     const bootStartedAtMs = performance.now();
@@ -1769,7 +2135,7 @@ async function runGame(game, renderer, checkpoints, workerUrl) {
       client.readyMachineEvidence = readyState.machineEvidence;
       client.lastFidelityState = readyState;
       client.runSummary = copiedRunSummary(ready.runSummary, "ready run summary", false);
-      if (client.runSummary.issuedRunCalls !== 0) {
+      if (client.runSummary.issuedRunCalls !== 0 || ready.navigation !== null) {
         throw new ResidentFirstFrameError("capture Worker ran before ready ownership", {
           boundary: "capture-ready-state-error",
         });
@@ -1977,11 +2343,11 @@ function installProductionCaptureApi(client, game) {
       await client.stepRun();
       return state();
     }),
-    operator: (...arguments_) => serialize(async () => {
+    navigation: (...arguments_) => serialize(async () => {
       if (arguments_.length !== 0) {
-        throw new Error("production fidelity operator derives its state inside the Worker");
+        throw new Error("production fidelity navigation derives its state inside the Worker");
       }
-      await client.publishOperatorController();
+      await client.publishNavigationController();
       return state();
     }),
     publishWitness: () => serialize(async () => {
@@ -2080,7 +2446,11 @@ async function main() {
         ...policy,
         instructionUpperCap: policy.instructionUpperCap.toString(),
         executedCycleUpperCap: policy.executedCycleUpperCap.toString(),
+        canonicalCycleUpperCap: policy.canonicalCycleUpperCap.toString(),
         sliceCycleUpperCap: policy.sliceCycleUpperCap.toString(),
+        ...(evidenceLock.production ? {
+          navigationPolicy: pageProductionContext.lock.runPolicy.navigationPolicy,
+        } : {}),
       },
       fidelityCheckpointPolicy,
       evidenceLock: {
@@ -2121,6 +2491,7 @@ async function main() {
         throw new Error("production capture did not reach its frozen first-frame prefix");
       }
       await activeProductionCapture.client.bindFirstFrameReport(finalReport);
+      await activeProductionCapture.client.armNavigationPolicy();
       installProductionCaptureApi(activeProductionCapture.client, game);
     }
     publish(finalReport);

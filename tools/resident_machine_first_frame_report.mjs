@@ -10,9 +10,15 @@ import {
   validateMachineEvidenceV1Transition,
 } from "./resident_machine_evidence_v1.mjs";
 import {
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+  PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
+import {
+  productionFidelityNavigationPolicy,
+  validateFidelityNavigationPolicy,
+} from "./resident_machine_fidelity_navigation.mjs";
 
 export const FIRST_FRAME_REPORT_SCHEMA =
   "lazuli-rust-resident-first-visible-xfb-evidence-v1";
@@ -298,13 +304,14 @@ function validateArtifacts(value, expectedArtifacts = EXPECTED_ARTIFACTS) {
   }
 }
 
-function validatePolicy(value, maximumColdInstallCap) {
+function validatePolicy(value, maximumColdInstallCap, productionLock) {
   const policy = object(value, "$.policy");
   exactKeys(policy, [
     "transport",
     "evidenceMode",
     "instructionUpperCap",
     "executedCycleUpperCap",
+    "canonicalCycleUpperCap",
     "sliceCycleUpperCap",
     "blockUpperCap",
     "totalHostCallCap",
@@ -313,7 +320,9 @@ function validatePolicy(value, maximumColdInstallCap) {
     "bootTimeoutMs",
     "sliceTimeoutMs",
     "runTimeoutMs",
+    "externalWallTimeoutMs",
     "zeroProgressSliceCap",
+    ...(productionLock ? ["navigationPolicy"] : []),
   ], "$.policy");
   exact(policy.transport, "frozen-resident-machine-worker", "$.policy.transport");
   exact(
@@ -323,16 +332,28 @@ function validatePolicy(value, maximumColdInstallCap) {
   );
   const instructionCap = positiveDecimal(policy.instructionUpperCap, "$.policy.instructionUpperCap");
   const cycleCap = positiveDecimal(policy.executedCycleUpperCap, "$.policy.executedCycleUpperCap");
-  const sliceCap = positiveDecimal(policy.sliceCycleUpperCap, "$.policy.sliceCycleUpperCap", 1_000_000n);
+  const canonicalCycleCap = positiveDecimal(
+    policy.canonicalCycleUpperCap,
+    "$.policy.canonicalCycleUpperCap",
+  );
+  const sliceCap = positiveDecimal(
+    policy.sliceCycleUpperCap,
+    "$.policy.sliceCycleUpperCap",
+    8_000_000n,
+  );
   if (sliceCap > cycleCap) fail("$.policy.sliceCycleUpperCap", "cannot exceed total cycle cap");
+  if (sliceCap > canonicalCycleCap) {
+    fail("$.policy.sliceCycleUpperCap", "cannot exceed total canonical-cycle cap");
+  }
   const bounded = [
-    ["blockUpperCap", 1, 16_384],
+    ["blockUpperCap", 1, 131_072],
     ["totalHostCallCap", 1, 65_535],
     ["totalColdInstallCap", 1, maximumColdInstallCap],
     ["maxBootReads", 1, 65_535],
     ["bootTimeoutMs", 1_000, 600_000],
     ["sliceTimeoutMs", 1_000, 600_000],
-    ["runTimeoutMs", 1_000, 1_800_000],
+    ["runTimeoutMs", 1_000, 7_200_000],
+    ["externalWallTimeoutMs", 1_000, 7_200_000],
     ["zeroProgressSliceCap", 1, 65_535],
   ];
   for (const [field, minimum, maximum] of bounded) {
@@ -341,7 +362,10 @@ function validatePolicy(value, maximumColdInstallCap) {
       fail(`$.policy.${field}`, `expected ${minimum} through ${maximum}`);
     }
   }
-  return { policy, instructionCap, cycleCap };
+  const navigationPolicy = productionLock
+    ? validateFidelityNavigationPolicy(policy.navigationPolicy)
+    : null;
+  return { policy, instructionCap, cycleCap, canonicalCycleCap, navigationPolicy };
 }
 
 function validateTransport(value, game, bootReads, diReads) {
@@ -557,16 +581,36 @@ function validateTerminalEnvelope(
     exact(evidenceLock.sha256, expectedEvidenceLock.sha256, "$.evidenceLock.sha256");
   }
   const productionLock = evidenceLock.schema === PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA;
-  const { policy, instructionCap, cycleCap } = validatePolicy(
+  const {
+    policy,
+    instructionCap,
+    cycleCap,
+    canonicalCycleCap,
+    navigationPolicy,
+  } = validatePolicy(
     report.policy,
     productionLock ? PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP : 65_535,
+    productionLock,
   );
   if (productionLock) {
-    exact(
-      policy.instructionUpperCap,
-      PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
-      "$.policy.instructionUpperCap",
-    );
+    const frozenProductionPolicy = {
+      instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
+      executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
+      canonicalCycleUpperCap: PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+      sliceCycleUpperCap: "8000000",
+      blockUpperCap: 131_072,
+      totalHostCallCap: 65_535,
+      totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
+      maxBootReads: 8_192,
+      bootTimeoutMs: 180_000,
+      sliceTimeoutMs: 180_000,
+      runTimeoutMs: 7_200_000,
+      externalWallTimeoutMs: 7_200_000,
+      zeroProgressSliceCap: 4_096,
+    };
+    for (const [field, expected] of Object.entries(frozenProductionPolicy)) {
+      exact(policy[field], expected, `$.policy.${field}`);
+    }
   }
   validateArtifacts(report.artifacts, expectedArtifacts);
 
@@ -578,6 +622,18 @@ function validateTerminalEnvelope(
   }
   const expectedGame = EXPECTED_GAMES[corpus.selectedGameKey];
   if (!expectedGame) fail("$.corpus.selectedGameKey", "game is outside the frozen corpus");
+  if (productionLock) {
+    exact(
+      navigationPolicy.gameKey,
+      corpus.selectedGameKey,
+      "$.policy.navigationPolicy.gameKey",
+    );
+    exact(
+      JSON.stringify(navigationPolicy),
+      JSON.stringify(productionFidelityNavigationPolicy(corpus.selectedGameKey)),
+      "$.policy.navigationPolicy",
+    );
+  }
 
   const checkpoint = object(report.fidelityCheckpointPolicy, "$.fidelityCheckpointPolicy");
   exactKeys(checkpoint, [
@@ -687,12 +743,29 @@ function validateTerminalEnvelope(
     "memoryViewsReacquiredByFrozenAdapterAfterAwait",
     ...(productionLock ? ["rendererProbeEventsExpected"] : []),
   ], "$.capabilityBoundary");
-  return { policy, instructionCap, cycleCap, corpus, expectedGame, productionLock, captureOrder };
+  return {
+    policy,
+    instructionCap,
+    cycleCap,
+    canonicalCycleCap,
+    corpus,
+    expectedGame,
+    productionLock,
+    captureOrder,
+  };
 }
 
 function validateCompleteReport(report, options) {
   exact(report.status, "complete", "$.status");
-  const { policy, instructionCap, cycleCap, corpus, expectedGame, captureOrder } =
+  const {
+    policy,
+    instructionCap,
+    cycleCap,
+    canonicalCycleCap,
+    corpus,
+    expectedGame,
+    captureOrder,
+  } =
     validateTerminalEnvelope(report, options);
 
   const result = object(report.game, "$.game");
@@ -735,9 +808,11 @@ function validateCompleteReport(report, options) {
     "wallMs",
     "slices",
     "rustBoundaries",
+    "adapterCapBoundaries",
     "rustStopBoundaries",
     "instructionCapBoundaries",
     "executedCycleCapBoundaries",
+    "canonicalCycleCapBoundaries",
     "hostCallCapBoundaries",
     "coldInstallCapBoundaries",
     "workerTimeoutBoundaries",
@@ -748,12 +823,14 @@ function validateCompleteReport(report, options) {
     "servicedHostCalls",
     "coldInstalls",
     "executedCycles",
+    "canonicalCycles",
     "executedInstructions",
     "outcomeDetails",
     "complete",
     "goalReached",
     "instructionUpperCap",
     "executedCycleUpperCap",
+    "canonicalCycleUpperCap",
     "instructionsPerSecond",
     "cyclesPerSecond",
   ], "$.game.run");
@@ -761,20 +838,42 @@ function validateCompleteReport(report, options) {
   exact(run.goalReached, true, "$.game.run.goalReached");
   const runInstructions = positiveDecimal(run.executedInstructions, "$.game.run.executedInstructions");
   const runCycles = positiveDecimal(run.executedCycles, "$.game.run.executedCycles");
+  const runCanonicalCycles = positiveDecimal(
+    run.canonicalCycles,
+    "$.game.run.canonicalCycles",
+  );
   exact(run.instructionUpperCap, policy.instructionUpperCap, "$.game.run.instructionUpperCap");
   exact(run.executedCycleUpperCap, policy.executedCycleUpperCap, "$.game.run.executedCycleUpperCap");
+  exact(
+    run.canonicalCycleUpperCap,
+    policy.canonicalCycleUpperCap,
+    "$.game.run.canonicalCycleUpperCap",
+  );
   if (runInstructions > instructionCap) fail("$.game.run.executedInstructions", "exceeded fixed cap");
   if (runCycles > cycleCap) fail("$.game.run.executedCycles", "exceeded fixed cap");
+  if (runCanonicalCycles > canonicalCycleCap) {
+    fail("$.game.run.canonicalCycles", "exceeded fixed cap");
+  }
   const runWallMs = finiteNonNegative(run.wallMs, "$.game.run.wallMs");
   if (runWallMs <= 0 || runWallMs > policy.runTimeoutMs) {
     fail("$.game.run.wallMs", "run completed outside the fixed wall bound");
   }
   const slices = positiveInteger(run.slices, "$.game.run.slices");
-  exact(run.rustBoundaries, slices, "$.game.run.rustBoundaries");
+  const rustBoundaries = nonNegativeInteger(run.rustBoundaries, "$.game.run.rustBoundaries");
+  const adapterCapBoundaries = nonNegativeInteger(
+    run.adapterCapBoundaries,
+    "$.game.run.adapterCapBoundaries",
+  );
+  exact(
+    rustBoundaries + adapterCapBoundaries + 1,
+    slices,
+    "$.game.run accepted-boundary projection",
+  );
   zeroFields(run, [
     "rustStopBoundaries",
     "instructionCapBoundaries",
     "executedCycleCapBoundaries",
+    "canonicalCycleCapBoundaries",
     "hostCallCapBoundaries",
     "coldInstallCapBoundaries",
     "workerTimeoutBoundaries",
@@ -799,7 +898,7 @@ function validateCompleteReport(report, options) {
   if (coldInstalls > policy.totalColdInstallCap) fail("$.game.run.coldInstalls", "exceeded cold cap");
   const details = object(run.outcomeDetails, "$.game.run.outcomeDetails");
   exactKeys(details, ["0"], "$.game.run.outcomeDetails");
-  exact(details["0"], slices, "$.game.run.outcomeDetails.0");
+  exact(details["0"], rustBoundaries, "$.game.run.outcomeDetails.0");
   derivedRate(
     run.instructionsPerSecond,
     runInstructions,
@@ -860,7 +959,7 @@ function validateCompleteReport(report, options) {
   );
   exact(
     machineEvidence.deltas.canonicalCycle,
-    run.executedCycles,
+    run.canonicalCycles,
     "$.game machine-evidence canonical-cycle delta",
   );
   exact(
@@ -873,11 +972,21 @@ function validateCompleteReport(report, options) {
     run.executedInstructions,
     "$.game machine-evidence executed-instruction delta",
   );
-  exact(
-    machineEvidence.deltas.completedOuterSlices,
-    String(slices),
-    "$.game machine-evidence outer-slice delta",
-  );
+  const completedOuterSlices = BigInt(machineEvidence.deltas.completedOuterSlices);
+  const minimumOuterSlices = BigInt(slices);
+  // One JS adapter slice can continue through additional Rust core_run outer slices only when
+  // it services authenticated host or cold-compile work. Complete reports forbid either cap exit,
+  // so those reported services provide a finite upper bound without adding another schema field.
+  const maximumOuterSlices = BigInt(slices + hostCalls + coldInstalls);
+  if (
+    completedOuterSlices < minimumOuterSlices
+    || completedOuterSlices > maximumOuterSlices
+  ) {
+    fail(
+      "$.game machine-evidence outer-slice delta",
+      `expected ${minimumOuterSlices} through ${maximumOuterSlices}`,
+    );
+  }
   exact(
     machineEvidence.after.gx.renderer.renderRequestsIssued,
     String(rendererCalls),
@@ -996,6 +1105,7 @@ function validateCompleteReport(report, options) {
     "rustStops",
     "instructionCaps",
     "executedCycleCaps",
+    "canonicalCycleCaps",
     "hostCallCaps",
     "coldInstallCaps",
     "workerTimeouts",
@@ -1026,6 +1136,8 @@ function validateCheckpointClientShape(value, path) {
     "maximumProbeEventsPerSubmission",
     "probeRelayFailures",
     "kindCounts",
+    "navigationStepRecords",
+    "navigationArmRecordSha256",
     "firstRecordSha256",
     "lastRecordSha256",
     "lastServerSequence",
@@ -1034,6 +1146,22 @@ function validateCheckpointClientShape(value, path) {
     "failure",
   ], path);
   exact(checkpoint.schema, FIDELITY_CHECKPOINT_SCHEMA, `${path}.schema`);
+  const kindCounts = object(checkpoint.kindCounts, `${path}.kindCounts`);
+  const navigationStepRecords = nonNegativeInteger(
+    checkpoint.navigationStepRecords,
+    `${path}.navigationStepRecords`,
+  );
+  exact(
+    navigationStepRecords,
+    kindCounts["navigation-step-received"] ?? 0,
+    `${path}.navigationStepRecords`,
+  );
+  if (checkpoint.navigationArmRecordSha256 === null) {
+    exact(kindCounts["navigation-armed"] ?? 0, 0, `${path}.kindCounts.navigation-armed`);
+  } else {
+    sha256(checkpoint.navigationArmRecordSha256, `${path}.navigationArmRecordSha256`);
+    exact(kindCounts["navigation-armed"], 1, `${path}.kindCounts.navigation-armed`);
+  }
   return checkpoint;
 }
 
@@ -1114,6 +1242,7 @@ function validateFailedReport(report, options) {
     "rustStops",
     "instructionCaps",
     "executedCycleCaps",
+    "canonicalCycleCaps",
     "hostCallCaps",
     "coldInstallCaps",
     "workerTimeouts",

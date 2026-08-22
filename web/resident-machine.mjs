@@ -19,6 +19,8 @@ const COMPILE_REQUEST_BYTES = 84;
 const HOST_REQUEST_BYTES = 52;
 const RUN_OUTCOME_BYTES = 40;
 const GAME_FIDELITY_RECORD_BYTES = 384;
+const CAPTURE_AUTHORITY_RECORD_BYTES = 108;
+const CAPTURE_AUTHORITY_MAGIC = 0x4c5a_4341;
 const RESIDENT_INSTALL_COMMITTED = 0x4c5a_434d;
 const RESIDENT_INSTALL_CANCELLED = 0x4c5a_4341;
 const RUN_REASON_COMPILE_REQUIRED = 1;
@@ -103,6 +105,8 @@ const REQUIRED_CORE_FUNCTIONS = [
   "core_di_staging_ptr",
   "core_di_complete",
   "core_input_publish",
+  "core_capture_authority_bytes",
+  "core_capture_authority_snapshot",
   "core_render_pending_count",
   "core_render_request_ptr",
   "core_render_complete",
@@ -303,6 +307,44 @@ function gameFidelityState(core, memory, byteLength, machineEvidenceBytes) {
       memory,
       machineEvidenceBytes,
     ),
+  });
+}
+
+function schedulerInterval(start, end) {
+  const delta = Object.freeze({
+    canonicalCycles: (end.canonicalCycle - start.canonicalCycle).toString(),
+    executedCycles: (end.executedCycles - start.executedCycles).toString(),
+    executedInstructions: (end.executedInstructions - start.executedInstructions).toString(),
+    retiredBlocks: (end.retiredBlocks - start.retiredBlocks).toString(),
+  });
+  return Object.freeze({
+    schema: "lazuli-resident-authenticated-scheduler-interval-v1",
+    start: Object.freeze(Object.fromEntries(
+      Object.entries(start).map(([field, value]) => [field, value.toString()]),
+    )),
+    end: Object.freeze(Object.fromEntries(
+      Object.entries(end).map(([field, value]) => [field, value.toString()]),
+    )),
+    delta,
+  });
+}
+
+function serializedSiAuthority(si) {
+  if (si === null) return null;
+  return Object.freeze({
+    schema: "lazuli-resident-authenticated-si-publication-v1",
+    pollIndex: si.pollIndex.toString(),
+    scheduledCycle: si.scheduledCycle.toString(),
+    observedCycle: si.observedCycle.toString(),
+    appliedSequenceLo: si.appliedSequenceLo,
+    appliedSequenceHi: si.appliedSequenceHi,
+    packetWord0: si.packetWord0,
+    packetWord1: si.packetWord1,
+    source: si.source,
+    controllerMode: si.controllerMode,
+    buttons: si.buttons,
+    stickXyCxy: si.stickXyCxy,
+    triggerLrab: si.triggerLrab,
   });
 }
 
@@ -642,6 +684,14 @@ export class ResidentMachineAdapter {
       core.core_game_fidelity_bytes(),
       "Rust game fidelity byte length",
     );
+    const captureAuthorityBytes = checkedPositiveU32(
+      core.core_capture_authority_bytes(),
+      "Rust capture authority byte length",
+    );
+    check(
+      captureAuthorityBytes === CAPTURE_AUTHORITY_RECORD_BYTES,
+      `Rust capture authority byte length is ${captureAuthorityBytes}, expected ${CAPTURE_AUTHORITY_RECORD_BYTES}`,
+    );
     check(
       gameFidelityBytes === GAME_FIDELITY_RECORD_BYTES,
       `Rust game fidelity byte length is ${gameFidelityBytes}, expected ${GAME_FIDELITY_RECORD_BYTES}`,
@@ -702,6 +752,7 @@ export class ResidentMachineAdapter {
       rawContainer: options.rawContainer,
       machineEvidenceBytes,
       gameFidelityBytes,
+      captureAuthorityBytes,
       captureFidelity: options.captureFidelity === true,
     });
   }
@@ -715,6 +766,7 @@ export class ResidentMachineAdapter {
     rawContainer,
     machineEvidenceBytes = 0,
     gameFidelityBytes = 0,
+    captureAuthorityBytes = CAPTURE_AUTHORITY_RECORD_BYTES,
     captureFidelity = false,
   }) {
     this.memory = memory;
@@ -730,6 +782,14 @@ export class ResidentMachineAdapter {
     this.gameFidelityBytes = checkedU32(
       gameFidelityBytes,
       "Rust game fidelity byte length",
+    );
+    this.captureAuthorityBytes = checkedU32(
+      captureAuthorityBytes,
+      "Rust capture authority byte length",
+    );
+    check(
+      this.captureAuthorityBytes === CAPTURE_AUTHORITY_RECORD_BYTES,
+      "Rust capture authority record ABI changed",
     );
     check(typeof captureFidelity === "boolean", "captureFidelity must be a boolean");
     this.captureFidelity = captureFidelity;
@@ -902,23 +962,77 @@ export class ResidentMachineAdapter {
       options.maxColdInstalls ?? DEFAULT_MAX_COLD_INSTALLS,
       "run cold-install cap",
     );
+    const onAuthority = options.onAuthority ?? null;
+    check(
+      onAuthority === null || typeof onAuthority === "function",
+      "run authority observer must be a function",
+    );
+
+    const authorityStart = this.captureAuthority();
+    const schedulerStart = authorityStart.scheduler;
+    let authorityNow = authorityStart;
+    const finish = result => {
+      const schedulerEnd = authorityNow.scheduler;
+      const canonicalDelta = schedulerEnd.canonicalCycle - schedulerStart.canonicalCycle;
+      const blockDelta = schedulerEnd.retiredBlocks - schedulerStart.retiredBlocks;
+      check(canonicalDelta <= cycleUpperCap, "resident adapter exceeded its outer cycle cap");
+      check(blockDelta <= BigInt(blockUpperCap), "resident adapter exceeded its outer block cap");
+      return Object.freeze({
+        ...result,
+        scheduler: schedulerInterval(schedulerStart, schedulerEnd),
+        si: serializedSiAuthority(authorityNow.si),
+      });
+    };
 
     this.running = true;
     let hostCalls = 0;
     let coldInstalls = 0;
     try {
       for (;;) {
+        const schedulerNow = authorityNow.scheduler;
+        const consumedCycles = schedulerNow.canonicalCycle - schedulerStart.canonicalCycle;
+        const consumedBlocks = schedulerNow.retiredBlocks - schedulerStart.retiredBlocks;
+        check(consumedCycles <= cycleUpperCap, "resident adapter outer cycle cap overshot");
+        check(consumedBlocks <= BigInt(blockUpperCap), "resident adapter outer block cap overshot");
+        if (consumedCycles === cycleUpperCap || consumedBlocks === BigInt(blockUpperCap)) {
+          return finish({
+            boundary: "adapter-cap",
+            cap: consumedCycles === cycleUpperCap ? "cycle" : "block",
+            hostCalls,
+            coldInstalls,
+          });
+        }
+        const remainingCycles = cycleUpperCap - consumedCycles;
+        const remainingBlocks = Number(BigInt(blockUpperCap) - consumedBlocks);
         this.retryControllerInput();
         if (hostCalls < maximumHostCalls) {
           const di = await this.#serviceDiReads(maximumHostCalls - hostCalls);
           hostCalls += di.calls;
           if (di.pending !== 0) {
-            return Object.freeze({ boundary: "host-call-cap", hostCalls, coldInstalls });
+            return finish({ boundary: "host-call-cap", hostCalls, coldInstalls });
           }
         }
 
-        const outcomePointer = this.coordinator.core_run(cycleUpperCap, blockUpperCap) >>> 0;
+        const outcomePointer = this.coordinator.core_run(remainingCycles, remainingBlocks) >>> 0;
         const outcome = readRunOutcome(this.core, this.memory, outcomePointer);
+        authorityNow = this.captureAuthority();
+        const schedulerAfterRun = authorityNow.scheduler;
+        check(
+          schedulerAfterRun.canonicalCycle - schedulerStart.canonicalCycle <= cycleUpperCap,
+          "resident coordinator crossed the outer cycle cap",
+        );
+        check(
+          schedulerAfterRun.retiredBlocks - schedulerStart.retiredBlocks <= BigInt(blockUpperCap),
+          "resident coordinator crossed the outer block cap",
+        );
+        if (onAuthority !== null) {
+          await onAuthority(Object.freeze({
+            scheduler: schedulerInterval(schedulerStart, schedulerAfterRun),
+            si: serializedSiAuthority(authorityNow.si),
+            hostCalls,
+            coldInstalls,
+          }));
+        }
         // A DI read published before a new plan can leave the consumed post-install
         // CompileRequired outcome readable. A DI read published while finishing a real segment,
         // however, accompanies authoritative accounting that must be returned. Bypass only the
@@ -928,7 +1042,7 @@ export class ResidentMachineAdapter {
           && outcome.requestPointer === 0
           && (this.core.core_pending_compile_request_bytes() >>> 0) === 0) {
           if (hostCalls >= maximumHostCalls) {
-            return Object.freeze({ boundary: "host-call-cap", hostCalls, coldInstalls });
+            return finish({ boundary: "host-call-cap", hostCalls, coldInstalls });
           }
           continue;
         }
@@ -942,13 +1056,13 @@ export class ResidentMachineAdapter {
           coldInstalls += 1;
           this.totalColdInstalls += 1;
           if (coldInstalls >= maximumColdInstalls) {
-            return Object.freeze({ boundary: "cold-install-cap", hostCalls, coldInstalls });
+            return finish({ boundary: "cold-install-cap", hostCalls, coldInstalls });
           }
           continue;
         }
         if (outcome.reason === RUN_REASON_HOST_REQUEST) {
           if (hostCalls >= maximumHostCalls) {
-            return Object.freeze({ boundary: "host-call-cap", hostCalls, coldInstalls });
+            return finish({ boundary: "host-call-cap", hostCalls, coldInstalls });
           }
           check(this.renderer, "Rust issued render work without a renderer bridge");
           let fidelityBoundary = null;
@@ -975,7 +1089,7 @@ export class ResidentMachineAdapter {
           hostCalls += 1;
           this.totalRenderCalls += 1;
           if (fidelityBoundary !== null) {
-            return Object.freeze({
+            return finish({
               boundary: "fidelity",
               phase: fidelityBoundary.phase,
               hostCalls,
@@ -985,7 +1099,7 @@ export class ResidentMachineAdapter {
           continue;
         }
         this.retryControllerInput();
-        return Object.freeze({
+        return finish({
           boundary: "rust",
           outcome,
           hostCalls,
@@ -997,6 +1111,60 @@ export class ResidentMachineAdapter {
     } finally {
       this.running = false;
     }
+  }
+
+  captureAuthority() {
+    check(!this.closed, "machine is closed");
+    const pointer = this.core.core_capture_authority_snapshot() >>> 0;
+    const snapshot = copyMemory(
+      this.memory,
+      pointer,
+      this.captureAuthorityBytes,
+      "Rust capture authority",
+    );
+    const view = new DataView(snapshot.buffer, snapshot.byteOffset, snapshot.byteLength);
+    const word = index => view.getUint32(index * 4, true);
+    check(word(0) === CAPTURE_AUTHORITY_MAGIC, "Rust capture authority magic changed");
+    check(word(1) === 2, "Rust capture authority version changed");
+    check(word(2) === CAPTURE_AUTHORITY_RECORD_BYTES, "Rust capture authority size changed");
+    check(word(26) === 0, "Rust capture authority reserved word is nonzero");
+    const scheduler = Object.freeze({
+      canonicalCycle: joinU64(word(3), word(4)),
+      executedCycles: joinU64(word(5), word(6)),
+      executedInstructions: joinU64(word(7), word(8)),
+      retiredBlocks: joinU64(word(9), word(10)),
+    });
+    const pollIndex = joinU64(word(11), word(12));
+    const si = pollIndex === 0n ? null : Object.freeze({
+      pollIndex,
+      scheduledCycle: joinU64(word(13), word(14)),
+      observedCycle: joinU64(word(15), word(16)),
+      appliedSequenceLo: word(17),
+      appliedSequenceHi: word(18),
+      packetWord0: word(19),
+      packetWord1: word(20),
+      source: word(21),
+      controllerMode: word(22),
+      buttons: word(23),
+      stickXyCxy: word(24),
+      triggerLrab: word(25),
+    });
+    if (si !== null) {
+      check(si.scheduledCycle <= si.observedCycle, "Rust SI authority chronology is invalid");
+      check(si.observedCycle <= scheduler.canonicalCycle, "Rust SI authority exceeds scheduler time");
+      check(si.source <= 1, "Rust SI authority source is unknown");
+      check(si.controllerMode <= 0xff, "Rust SI authority controller mode is invalid");
+      check(si.buttons <= 0xffff, "Rust SI authority controller buttons are invalid");
+    } else {
+      check(
+        word(13) === 0 && word(14) === 0 && word(15) === 0 && word(16) === 0 &&
+          word(17) === 0 && word(18) === 0 && word(19) === 0 && word(20) === 0 &&
+          word(21) === 0 && word(22) === 0 && word(23) === 0 && word(24) === 0 &&
+          word(25) === 0,
+        "Rust empty SI authority is not pristine",
+      );
+    }
+    return Object.freeze({ scheduler, si });
   }
 
   publishController(sequenceLo, sequenceHi, buttons, stickXyCxy, triggerLrab) {

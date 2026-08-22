@@ -12,7 +12,11 @@ import {
 import {
   PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
 } from "./resident_machine_fidelity_lock.mjs";
+import {
+  fidelityNavigationPolicyFromSteps,
+} from "./resident_machine_fidelity_navigation.mjs";
 
+const GAME_KEY = "warioware-usa";
 const RUN_ID = "12345678-1234-4234-9234-123456789abc";
 const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
@@ -21,9 +25,25 @@ const LOCK_SHA = "e".repeat(64);
 const SHA_C = "c".repeat(64);
 const SHA_D = "d".repeat(64);
 const MACHINE_SESSION_ID = "87654321-4321-4321-8321-cba987654321";
+const EMPTY_NAVIGATION_POLICY = fidelityNavigationPolicyFromSteps(GAME_KEY, []);
+const TWO_STEP_NAVIGATION_POLICY = fidelityNavigationPolicyFromSteps(GAME_KEY, [
+  {
+    minimumCanonicalDelay: "20",
+    buttons: 0x0100,
+    stickXyCxy: 0x8080_8080,
+    triggerLrab: 0x00ff_0000,
+  },
+  {
+    minimumCanonicalDelay: "20",
+    buttons: 0,
+    stickXyCxy: 0x8080_8080,
+    triggerLrab: 0,
+  },
+]);
 const CAPTURE_RUN_POLICY = Object.freeze({
-  instructionUpperCap: "100",
-  executedCycleUpperCap: "200",
+  instructionUpperCap: "1000",
+  executedCycleUpperCap: "1000",
+  canonicalCycleUpperCap: "1000",
   sliceCycleUpperCap: "10",
   blockUpperCap: 16,
   totalHostCallCap: 20,
@@ -31,18 +51,22 @@ const CAPTURE_RUN_POLICY = Object.freeze({
   maxBootReads: 8,
   bootTimeoutMs: 1_000,
   sliceTimeoutMs: 1_000,
-  runTimeoutMs: 10_000,
-  externalWallTimeoutMs: 10_000,
+  runTimeoutMs: 7_200_000,
+  externalWallTimeoutMs: 7_200_000,
   zeroProgressSliceCap: 4,
   workerUrl: "/worker.mjs",
+  navigationPolicy: EMPTY_NAVIGATION_POLICY,
 });
 
-function captureRunSummary(accepted = false, operatorPublications = 0) {
+function captureRunSummary(accepted = false, operatorPublications = 0, overrides = {}) {
   return {
-    schema: "lazuli-resident-cumulative-run-summary-v1",
+    schema: "lazuli-resident-cumulative-run-summary-v2",
     issuedRunCalls: accepted ? 2 : 0,
-    reportedExecutedCycles: accepted ? "20" : "0",
-    reportedExecutedInstructions: accepted ? "40" : "0",
+    canonicalCycle: accepted ? "100" : "0",
+    reportedCanonicalCycles: accepted ? "100" : "0",
+    reportedExecutedCycles: accepted ? "100" : "0",
+    reportedExecutedInstructions: accepted ? "200" : "0",
+    reportedRetiredBlocks: accepted ? "10" : "0",
     reportedHostCalls: accepted ? 2 : 0,
     reportedColdInstalls: 0,
     zeroProgressSlices: 0,
@@ -51,8 +75,9 @@ function captureRunSummary(accepted = false, operatorPublications = 0) {
     operatorPublications,
     witnessPublications: accepted ? 1 : 0,
     elapsedWallMs: accepted ? 20 : 0,
-    wallTimeoutMs: 10_000,
+    wallTimeoutMs: 7_200_000,
     accepted,
+    ...overrides,
   };
 }
 
@@ -86,7 +111,7 @@ function payload(clientSequence, kind, fields) {
   return {
     schema: "lazuli-resident-renderer-fidelity-checkpoint-v1",
     runId: RUN_ID,
-    gameKey: "warioware-usa",
+    gameKey: GAME_KEY,
     clientSequence,
     kind,
     ...fields,
@@ -170,10 +195,49 @@ function appendResolvedReceipt(builder, submission, receiptSha256 = SHA_B) {
   };
 }
 
+function expectedSiPacket(step, mode = 3) {
+  const word0 = (
+    ((step.buttons >>> 8) & 0xff) << 24
+    | (((step.buttons & 0xff) | 0x80) & 0xff) << 16
+    | (step.stickXyCxy & 0xff) << 8
+    | ((step.stickXyCxy >>> 8) & 0xff)
+  ) >>> 0;
+  const cStickX = (step.stickXyCxy >>> 16) & 0xff;
+  const cStickY = (step.stickXyCxy >>> 24) & 0xff;
+  const triggerL = step.triggerLrab & 0xff;
+  const triggerR = (step.triggerLrab >>> 8) & 0xff;
+  const word1 = mode === 3
+    ? (cStickX << 24 | cStickY << 16 | triggerL << 8 | triggerR) >>> 0
+    : 0;
+  return { word0, word1 };
+}
+
+function progressedRunSummary({
+  canonicalCycle,
+  issuedRunCalls,
+  operatorPublications = 0,
+  witnessPublications = 0,
+  accepted = false,
+}) {
+  const cycle = BigInt(canonicalCycle);
+  return captureRunSummary(accepted, operatorPublications, {
+    issuedRunCalls,
+    canonicalCycle: cycle.toString(),
+    reportedCanonicalCycles: cycle.toString(),
+    reportedExecutedCycles: cycle.toString(),
+    reportedExecutedInstructions: (cycle * 2n).toString(),
+    reportedRetiredBlocks: String(issuedRunCalls),
+    reportedHostCalls: issuedRunCalls,
+    witnessPublications,
+    elapsedWallMs: issuedRunCalls * 10,
+  });
+}
+
 function productionJournal({
   distinctBaselineReceipt = false,
-  operatorPublications = 0,
+  navigationPolicy = EMPTY_NAVIGATION_POLICY,
 } = {}) {
+  const runPolicy = Object.freeze({ ...CAPTURE_RUN_POLICY, navigationPolicy });
   const builder = new ProductionJournalBuilder();
   const initialized = builder.append("capture-machine-initialized", {
     machineSessionId: MACHINE_SESSION_ID,
@@ -183,7 +247,7 @@ function productionJournal({
     machineEvidenceEnvelopeSha256: SHA_C,
     machineEvidenceOpaqueBytes: 816,
     machineEvidenceOpaqueSha256: SHA_D,
-    runPolicy: CAPTURE_RUN_POLICY,
+    runPolicy,
     runSummary: captureRunSummary(false),
   });
   const firstReceipt = appendResolvedReceipt(builder, identity());
@@ -192,26 +256,7 @@ function productionJournal({
     machineSessionId: MACHINE_SESSION_ID,
     ...readbackFields(),
   });
-  const baselineReceipt = distinctBaselineReceipt
-    ? appendResolvedReceipt(builder, identity({
-      relayRequestId: 2,
-      renderCallOrdinal: 2,
-      sequenceLo: 30,
-      sequenceHi: 40,
-      opaqueRequestSha256: SHA_C,
-    }), SHA_C)
-    : firstReceipt;
-  const baseline = builder.append("fidelity-baseline-owned", {
-    ...baselineReceipt,
-    machineSessionId: MACHINE_SESSION_ID,
-    phase: 1,
-    ...fidelityArtifactFields(),
-    ...readbackFields(),
-    requestedButtons: 1,
-    requestedStickXyCxy: 0x8080_8001,
-    requestedTriggerLrab: 0,
-  });
-  const report = builder.append("first-frame-report-bound", {
+  const appendReport = baselineRecordSha256 => builder.append("first-frame-report-bound", {
     machineSessionId: MACHINE_SESSION_ID,
     reportBytes: 4_096,
     reportSha256: SHA_A,
@@ -220,8 +265,118 @@ function productionJournal({
     machineEvidenceOpaqueBytes: 816,
     machineEvidenceOpaqueSha256: SHA_D,
     firstFrameRendererRecordSha256: firstFrame.recordSha256,
-    baselineRecordSha256: baseline.recordSha256,
+    baselineRecordSha256,
   });
+  const appendArm = report => builder.append("navigation-armed", {
+    machineSessionId: MACHINE_SESSION_ID,
+    firstFrameReportRecordSha256: report.recordSha256,
+    scriptSha256: navigationPolicy.scriptSha256,
+    runCallOrigin: 1,
+    canonicalCycleOrigin: "10",
+    siPollIndexOrigin: "0",
+    stepCount: navigationPolicy.steps.length,
+    runSummary: progressedRunSummary({ canonicalCycle: "10", issuedRunCalls: 1 }),
+  });
+
+  let baselineReceipt = firstReceipt;
+  let baseline;
+  let report;
+  let arm;
+  let lastNavigationObservedCycle = "10";
+  const navigationSteps = [];
+  if (navigationPolicy.steps.length === 0) {
+    if (distinctBaselineReceipt) {
+      baselineReceipt = appendResolvedReceipt(builder, identity({
+        relayRequestId: 2,
+        renderCallOrdinal: 2,
+        sequenceLo: 30,
+        sequenceHi: 40,
+        opaqueRequestSha256: SHA_C,
+      }), SHA_C);
+    }
+    baseline = builder.append("fidelity-baseline-owned", {
+      ...baselineReceipt,
+      machineSessionId: MACHINE_SESSION_ID,
+      phase: 1,
+      ...fidelityArtifactFields(),
+      ...readbackFields(),
+      requestedButtons: 1,
+      requestedStickXyCxy: 0x8080_8001,
+      requestedTriggerLrab: 0,
+    });
+    report = appendReport(baseline.recordSha256);
+    arm = appendArm(report);
+  } else {
+    report = appendReport(null);
+    arm = appendArm(report);
+    let priorObserved = 10n;
+    navigationPolicy.steps.forEach((step, stepIndex) => {
+      const target = priorObserved + BigInt(step.minimumCanonicalDelay);
+      const publication = target + BigInt(stepIndex + 1);
+      const scheduled = publication + 1n;
+      const observed = scheduled + 1n;
+      const packet = expectedSiPacket(step);
+      const stepRecord = builder.append("navigation-step-received", {
+        machineSessionId: MACHINE_SESSION_ID,
+        firstFrameReportRecordSha256: report.recordSha256,
+        navigationArmRecordSha256: arm.recordSha256,
+        scriptSha256: navigationPolicy.scriptSha256,
+        runCallOrigin: 1,
+        canonicalCycleOrigin: "10",
+        stepIndex,
+        sequenceLo: stepIndex + 1,
+        sequenceHi: 0,
+        minimumCanonicalDelay: step.minimumCanonicalDelay,
+        targetCanonicalCycle: target.toString(),
+        publicationCanonicalCycle: publication.toString(),
+        publicationOvershootCycles: String(stepIndex + 1),
+        buttons: step.buttons,
+        stickXyCxy: step.stickXyCxy,
+        triggerLrab: step.triggerLrab,
+        status: 1,
+        siPollIndex: String(stepIndex + 1),
+        siScheduledCycle: scheduled.toString(),
+        siObservedCycle: observed.toString(),
+        siAppliedSequenceLo: stepIndex + 1,
+        siAppliedSequenceHi: 0,
+        siPacketWord0: packet.word0,
+        siPacketWord1: packet.word1,
+        siSource: 0,
+        priorSiPollIndex: String(stepIndex),
+        siControllerMode: 3,
+        siButtons: step.buttons,
+        siStickXyCxy: step.stickXyCxy,
+        siTriggerLrab: step.triggerLrab,
+        runSummary: progressedRunSummary({
+          canonicalCycle: observed,
+          issuedRunCalls: stepIndex + 2,
+          operatorPublications: stepIndex + 1,
+        }),
+      });
+      navigationSteps.push(stepRecord);
+      priorObserved = observed;
+      lastNavigationObservedCycle = observed.toString();
+    });
+    baselineReceipt = appendResolvedReceipt(builder, identity({
+      relayRequestId: 2,
+      renderCallOrdinal: 2,
+      sequenceLo: 30,
+      sequenceHi: 40,
+      opaqueRequestSha256: SHA_C,
+    }), SHA_C);
+    baseline = builder.append("fidelity-baseline-owned", {
+      ...baselineReceipt,
+      machineSessionId: MACHINE_SESSION_ID,
+      phase: 1,
+      ...fidelityArtifactFields(),
+      ...readbackFields(),
+      requestedButtons: 1,
+      requestedStickXyCxy: 0x8080_8001,
+      requestedTriggerLrab: 0,
+    });
+  }
+  const navigationStepCount = navigationSteps.length;
+  const lastNavigationStepRecordSha256 = navigationSteps.at(-1)?.recordSha256 ?? null;
   const witness = builder.append("controller-witness-published", {
     machineSessionId: MACHINE_SESSION_ID,
     baselineRecordSha256: baseline.recordSha256,
@@ -236,12 +391,23 @@ function productionJournal({
     machineEvidenceEnvelopeSha256: SHA_C,
     machineEvidenceOpaqueBytes: 816,
     machineEvidenceOpaqueSha256: SHA_D,
+    navigationScriptSha256: navigationPolicy.scriptSha256,
+    navigationStepCount,
+    navigationArmRecordSha256: arm.recordSha256,
+    lastNavigationStepRecordSha256,
+    runSummary: progressedRunSummary({
+      canonicalCycle: lastNavigationObservedCycle,
+      issuedRunCalls: navigationStepCount + 2,
+      operatorPublications: navigationStepCount,
+      witnessPublications: 1,
+    }),
   });
+  const acceptedOrdinal = baselineReceipt === firstReceipt ? 2 : 3;
   const acceptedReceipt = appendResolvedReceipt(builder, identity({
-    relayRequestId: distinctBaselineReceipt ? 3 : 2,
-    renderCallOrdinal: distinctBaselineReceipt ? 3 : 2,
-    sequenceLo: distinctBaselineReceipt ? 50 : 30,
-    sequenceHi: distinctBaselineReceipt ? 60 : 40,
+    relayRequestId: acceptedOrdinal,
+    renderCallOrdinal: acceptedOrdinal,
+    sequenceLo: acceptedOrdinal === 2 ? 30 : 50,
+    sequenceHi: acceptedOrdinal === 2 ? 40 : 60,
     opaqueRequestSha256: SHA_D,
   }), SHA_D);
   const accepted = builder.append("fidelity-accepted-owned", {
@@ -258,7 +424,17 @@ function productionJournal({
     baselineRecordSha256: baseline.recordSha256,
     acceptedRecordSha256: accepted.recordSha256,
     ...fidelityArtifactFields(),
-    runSummary: captureRunSummary(true, operatorPublications),
+    runSummary: progressedRunSummary({
+      canonicalCycle: "100",
+      issuedRunCalls: navigationStepCount + 4,
+      operatorPublications: navigationStepCount,
+      witnessPublications: 1,
+      accepted: true,
+    }),
+    navigationScriptSha256: navigationPolicy.scriptSha256,
+    navigationStepCount,
+    navigationArmRecordSha256: arm.recordSha256,
+    lastNavigationStepRecordSha256,
   });
   return {
     records: builder.value,
@@ -267,6 +443,8 @@ function productionJournal({
       firstFrame: firstFrame.recordSha256,
       baseline: baseline.recordSha256,
       report: report.recordSha256,
+      arm: arm.recordSha256,
+      navigationSteps: navigationSteps.map(record => record.recordSha256),
       witness: witness.recordSha256,
       accepted: accepted.recordSha256,
       terminal: terminal.recordSha256,
@@ -468,6 +646,14 @@ test("production journal accepts one continuous same-receipt Baseline chain", ()
     firstFrameRendererRecordSha256: fixture.refs.firstFrame,
     baselineRecordSha256: fixture.refs.baseline,
     firstFrameReportRecordSha256: fixture.refs.report,
+    navigationArmRecordSha256: fixture.refs.arm,
+    navigationRunCallOrigin: 1,
+    navigationCanonicalCycleOrigin: "10",
+    navigationSiPollIndexOrigin: "0",
+    navigationScriptSha256: EMPTY_NAVIGATION_POLICY.scriptSha256,
+    navigationStepCount: 0,
+    lastNavigationStepRecordSha256: null,
+    navigationTranscript: [],
     witnessRecordSha256: fixture.refs.witness,
     witness: {
       sequenceLo: 1,
@@ -485,24 +671,84 @@ test("production journal accepts one continuous same-receipt Baseline chain", ()
     terminalRecordSha256: fixture.refs.terminal,
     runPolicy: CAPTURE_RUN_POLICY,
     initialRunSummary: captureRunSummary(false),
-    terminalRunSummary: captureRunSummary(true),
+    terminalRunSummary: progressedRunSummary({
+      canonicalCycle: "100",
+      issuedRunCalls: 4,
+      witnessPublications: 1,
+      accepted: true,
+    }),
   });
 });
 
-test("production journal accepts 65 operator publications and rejects 66", () => {
+test("production journal binds operator publications to durable navigation cardinality", () => {
   assert.equal(PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP, 65);
   const accepted = productionJournal({
-    operatorPublications: PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+    navigationPolicy: TWO_STEP_NAVIGATION_POLICY,
   });
   assert.equal(
     validateProduction(accepted.records).capture.terminalRunSummary.operatorPublications,
-    65,
+    2,
   );
-  const rejected = rebuiltWithMutation(accepted.records, payloads => {
+  const cardinalityDrift = rebuiltWithMutation(accepted.records, payloads => {
+    payloads.find(entry => entry.kind === "fidelity-terminal")
+      .runSummary.operatorPublications = 3;
+  });
+  assert.throws(() => validateProduction(cardinalityDrift), /terminal navigation authority changed/);
+
+  const overCap = rebuiltWithMutation(accepted.records, payloads => {
     payloads.find(entry => entry.kind === "fidelity-terminal")
       .runSummary.operatorPublications = 66;
   });
-  assert.throws(() => validateProduction(rejected), /exceeded frozen cumulative authority/);
+  assert.throws(() => validateProduction(overCap), /exceeded the frozen cumulative authority/);
+});
+
+test("nonempty navigation arms before Baseline and retains repeated SI receipts", () => {
+  const fixture = productionJournal({ navigationPolicy: TWO_STEP_NAVIGATION_POLICY });
+  const summary = validateProduction(fixture.records);
+  assert.equal(summary.capture.navigationStepCount, 2);
+  assert.equal(summary.capture.navigationTranscript.length, 2);
+  assert.deepEqual(
+    fixture.records.filter(record => record.payload.kind === "navigation-step-received")
+      .map(record => record.payload.stepIndex),
+    [0, 1],
+  );
+  const armIndex = fixture.records.findIndex(record => record.payload.kind === "navigation-armed");
+  const baselineIndex = fixture.records.findIndex(
+    record => record.payload.kind === "fidelity-baseline-owned",
+  );
+  const stepIndexes = fixture.records.flatMap((record, index) =>
+    record.payload.kind === "navigation-step-received" ? [index] : []
+  );
+  assert.ok(armIndex < stepIndexes[0]);
+  assert.ok(stepIndexes[1] < baselineIndex);
+
+  const transcriptRewrite = rebuiltWithMutation(fixture.records, payloads => {
+    payloads.find(entry =>
+      entry.kind === "navigation-step-received" && entry.stepIndex === 1
+    ).targetCanonicalCycle = "54";
+  });
+  assert.throws(() => validateProduction(transcriptRewrite), /locked publication|chronology/);
+
+  const repeatedIndex = rebuiltWithMutation(fixture.records, payloads => {
+    payloads.find(entry =>
+      entry.kind === "navigation-step-received" && entry.stepIndex === 1
+    ).stepIndex = 0;
+  });
+  assert.throws(() => validateProduction(repeatedIndex), /locked publication|script order/);
+});
+
+test("empty navigation records Baseline before its required durable arm", () => {
+  const fixture = productionJournal();
+  validateProduction(fixture.records);
+  const baselineIndex = fixture.records.findIndex(
+    record => record.payload.kind === "fidelity-baseline-owned",
+  );
+  const armIndex = fixture.records.findIndex(record => record.payload.kind === "navigation-armed");
+  assert.ok(baselineIndex < armIndex);
+  assert.equal(
+    fixture.records.filter(record => record.payload.kind === "navigation-step-received").length,
+    0,
+  );
 });
 
 test("production journal rejects incomplete or over-cap ready boot authority", () => {

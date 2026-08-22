@@ -35,12 +35,16 @@ import {
   parseFidelityCheckpointJsonl,
   validateFidelityCheckpointJournal,
 } from "./resident_machine_fidelity_checkpoint_report.mjs";
+import {
+  captureNavigationRuntime,
+  captureRunSummary,
+} from "./resident_machine_fidelity_checkpoints.mjs";
 import { validateMachineEvidenceV1Envelope } from "./resident_machine_evidence_v1.mjs";
 
 export const PRODUCTION_FIDELITY_CAPTURE_STATE_SCHEMA =
   "lazuli-production-fidelity-capture-state-v1";
 export const PRODUCTION_FIDELITY_RUN_FRAGMENT_SCHEMA =
-  "lazuli-resident-production-fidelity-run-fragment-v1";
+  "lazuli-resident-production-fidelity-run-fragment-v2";
 
 const CAPTURE_PAGE_PATH = "/tools/resident_machine_first_frame.html";
 const MACHINE_EVIDENCE_BYTES = 816;
@@ -414,21 +418,32 @@ export function orderCaptureInputs(corpus, lockInputs, journalPaths, captureUrls
   });
 }
 
-export function operatorPublicationDue(policy, runBoundary, publicationCount) {
-  if (!Number.isSafeInteger(runBoundary) || runBoundary < 0) {
-    fail("operator run boundary index must be a safe non-negative integer");
-  }
-  if (!Number.isSafeInteger(publicationCount) || publicationCount < 0) {
-    fail("operator publication count must be a safe non-negative integer");
-  }
-  if (policy.runBoundaryOrigin !== "post-first-frame-report-local-zero") {
-    fail("operator run boundary origin changed");
-  }
-  if (policy.maximumPublications !== PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP) {
-    fail("operator publication cap changed");
-  }
-  return runBoundary % policy.runBoundaryInterval === 0
-    && publicationCount < policy.maximumPublications;
+export function navigationPublicationDue(policy, navigation, runSummary) {
+  if (
+    policy?.algorithm !== "locked-si-observed-not-before-publication-v1"
+    || policy?.cycleOrigin !== "durable-first-frame-canonical-scheduler-cycle"
+    || policy?.targetAnchor !== "prior-si-observed-cycle"
+    || policy?.maximumPublications !== PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP
+    || !Array.isArray(policy?.steps)
+  ) fail("navigation policy authority changed");
+  if (
+    navigation?.scriptSha256 !== policy.scriptSha256
+    || navigation?.stepCount !== policy.steps.length
+    || !Number.isSafeInteger(navigation?.durableSteps)
+    || navigation.durableSteps < 0
+    || navigation.durableSteps > policy.steps.length
+    || runSummary?.operatorPublications !== navigation.durableSteps
+    || typeof runSummary?.canonicalCycle !== "string"
+    || !/^(?:0|[1-9][0-9]*)$/.test(runSummary.canonicalCycle)
+  ) fail("navigation publication accounting changed");
+  if (navigation.pendingPublication !== null) return false;
+  const next = policy.steps[navigation.durableSteps] ?? null;
+  if (next === null) return false;
+  if (
+    typeof navigation.nextTargetCanonicalCycle !== "string"
+    || !/^(?:0|[1-9][0-9]*)$/.test(navigation.nextTargetCanonicalCycle)
+  ) fail("navigation next canonical target changed");
+  return BigInt(runSummary.canonicalCycle) >= BigInt(navigation.nextTargetCanonicalCycle);
 }
 
 export function selectRetainedPreWitnessMachineEvidence(captureState) {
@@ -694,13 +709,14 @@ function captureCall(method, argument) {
   })()`;
 }
 
-function validateCaptureState(value, game, label) {
+function validateCaptureState(value, game, label, runPolicy) {
   exactKeys(value, [
     "schema",
     "gameKey",
     "phase",
     "machineSessionId",
     "runSummary",
+    "navigation",
     "machineEvidence",
     "gameFidelity",
     "artifacts",
@@ -713,7 +729,12 @@ function validateCaptureState(value, game, label) {
   if (typeof value.machineSessionId !== "string" || !UUID_PATTERN.test(value.machineSessionId)) {
     fail(`${label}.machineSessionId is not a UUID`);
   }
-  object(value.runSummary, `${label}.runSummary`);
+  try {
+    captureRunSummary(value.runSummary, runPolicy, `${label}.runSummary`, value.phase === 5);
+    captureNavigationRuntime(value.navigation, runPolicy, `${label}.navigation`);
+  } catch (error) {
+    fail(`${label} locked runtime authority changed: ${String(error)}`);
+  }
   object(value.artifacts, `${label}.artifacts`);
   const summary = decodeMachineEvidence(value.machineEvidence, game, `${label}.machineEvidence`);
   return Object.freeze({ state: value, summary });
@@ -726,11 +747,12 @@ async function evaluateCapture(
   game,
   requestTimeoutMs,
   navigationBinding,
+  runPolicy,
 ) {
   await assertNavigationBinding(session, navigationBinding, requestTimeoutMs);
   const value = await session.evaluate(captureCall(method, argument), requestTimeoutMs);
   await assertNavigationBinding(session, navigationBinding, requestTimeoutMs);
-  return validateCaptureState(value, game, `${game.key}.${method}`);
+  return validateCaptureState(value, game, `${game.key}.${method}`, runPolicy);
 }
 
 function exactEnvelope(value, label, expectedBytes) {
@@ -974,6 +996,7 @@ export function productionFidelityRunFragment(runValue) {
     "preWitnessMachineEvidence",
     "terminalMachineEvidence",
     "gameFidelityRecord",
+    "navigationTranscript",
     "operatorPublications",
     "frames",
   ], "run fragment run");
@@ -1063,6 +1086,7 @@ async function writeGameLeaves(
   journalBytes,
   capturedAt,
   operatorPublicationCount,
+  navigationTranscriptValue,
 ) {
   const prefix = `games/${String(input.game.priority).padStart(2, "0")}-${input.game.key}`;
   const leaf = (name, bytes) => writePrivateLeafAtomic(root, `${prefix}/${name}`, bytes);
@@ -1081,6 +1105,7 @@ async function writeGameLeaves(
     acceptedMetadata,
     acceptedRgba,
     firstVisible,
+    navigationTranscript,
   ] = await Promise.all([
     leaf("evidence-lock.json", input.lockBytes),
     leaf("checkpoint-journal.jsonl", journalBytes),
@@ -1096,6 +1121,7 @@ async function writeGameLeaves(
     leaf("accepted-readback-metadata.json", canonicalBytes(artifacts.acceptedMetadata)),
     leaf("accepted.rgba", artifacts.acceptedRgba),
     leaf("first-visible.rgba", artifacts.firstVisibleRgba),
+    leaf("navigation-transcript.json", canonicalBytes(navigationTranscriptValue)),
   ]);
   const run = Object.freeze({
     key: input.game.key,
@@ -1112,8 +1138,10 @@ async function writeGameLeaves(
     preWitnessMachineEvidence,
     terminalMachineEvidence,
     gameFidelityRecord,
+    navigationTranscript,
     operatorPublications: Object.freeze({
-      algorithm: input.lock.capturePolicy.genericOperatorPolicy.algorithm,
+      algorithm: input.lock.runPolicy.navigationPolicy.algorithm,
+      scriptSha256: input.lock.runPolicy.navigationPolicy.scriptSha256,
       count: operatorPublicationCount,
     }),
     frames: Object.freeze({
@@ -1137,12 +1165,19 @@ async function captureOne(session, input, options, navigationBinding) {
       input.game,
       options.requestTimeoutMs,
       navigationBinding,
+      input.lock.runPolicy,
     );
     if (current.state.phase !== 0 && current.state.phase !== 1) {
       fail(`${input.game.key} initial snapshot was neither phase 0 nor Baseline`);
     }
     const sessionId = current.state.machineSessionId;
-    let operatorPublications = 0;
+    let operatorPublications = current.state.navigation.durableSteps;
+    const navigationPolicy = input.lock.runPolicy.navigationPolicy;
+    if (
+      current.state.navigation.scriptSha256 !== navigationPolicy.scriptSha256
+      || current.state.navigation.stepCount !== navigationPolicy.steps.length
+      || operatorPublications !== 0
+    ) fail(`${input.game.key} navigation policy was not pristinely armed`);
 
     const initialArtifacts = object(current.state.artifacts, `${input.game.key}.initialArtifacts`);
     if (typeof initialArtifacts.firstFrameReportJson !== "string") {
@@ -1180,23 +1215,22 @@ async function captureOne(session, input, options, navigationBinding) {
       if (current.state.phase === 1) baselineObserved = true;
       if (steps >= options.stepCap) fail(`${input.game.key} exhausted the controller step cap`);
       if (current.state.phase === 0) {
-        const publishOperator = operatorPublicationDue(
-          input.lock.capturePolicy.genericOperatorPolicy,
-          steps,
-          operatorPublications,
-        );
-        if (publishOperator) {
+        if (navigationPublicationDue(
+          navigationPolicy,
+          current.state.navigation,
+          current.state.runSummary,
+        )) {
           current = await evaluateCapture(
             session,
-            "operator",
+            "navigation",
             undefined,
             input.game,
             options.requestTimeoutMs,
             navigationBinding,
+            input.lock.runPolicy,
           );
-          operatorPublications += 1;
           if (current.state.phase !== 0) {
-            fail(`${input.game.key} left phase 0 during generic operator publication`);
+            fail(`${input.game.key} left phase 0 during locked navigation publication`);
           }
         }
       }
@@ -1207,7 +1241,9 @@ async function captureOne(session, input, options, navigationBinding) {
         input.game,
         options.requestTimeoutMs,
         navigationBinding,
+        input.lock.runPolicy,
       );
+      operatorPublications = current.state.navigation.durableSteps;
       steps += 1;
       if (current.state.machineSessionId !== sessionId) fail(`${input.game.key} changed machine session`);
     }
@@ -1219,8 +1255,12 @@ async function captureOne(session, input, options, navigationBinding) {
       input.game,
       options.requestTimeoutMs,
       navigationBinding,
+      input.lock.runPolicy,
     );
     if (current.state.phase !== 1) fail(`${input.game.key} witness publication was not phase 1`);
+    if (operatorPublications !== navigationPolicy.steps.length) {
+      fail(`${input.game.key} reached Baseline before completing its locked navigation script`);
+    }
     if (current.state.machineSessionId !== sessionId) fail(`${input.game.key} changed machine session`);
     const retainedPreWitness = exactEnvelope(
       selectRetainedPreWitnessMachineEvidence(current.state),
@@ -1243,6 +1283,7 @@ async function captureOne(session, input, options, navigationBinding) {
         input.game,
         options.requestTimeoutMs,
         navigationBinding,
+        input.lock.runPolicy,
       );
       steps += 1;
       if (current.state.machineSessionId !== sessionId) fail(`${input.game.key} changed machine session`);
@@ -1256,6 +1297,7 @@ async function captureOne(session, input, options, navigationBinding) {
       input.game,
       options.requestTimeoutMs,
       navigationBinding,
+      input.lock.runPolicy,
     );
     finished = true;
     if (terminal.state.phase !== 5) fail(`${input.game.key} terminal query changed Accepted phase`);
@@ -1285,7 +1327,11 @@ async function captureOne(session, input, options, navigationBinding) {
     if (reportInputSamples !== 0) {
       fail(`${input.game.key} first-frame report must precede every operator publication`);
     }
-    return Object.freeze({ artifacts, operatorPublications });
+    return Object.freeze({
+      artifacts,
+      operatorPublications,
+      navigationTranscript: terminal.state.navigation.transcript,
+    });
   } finally {
     if (!finished) {
       await session.evaluate(captureCall("abort"), options.requestTimeoutMs).catch(() => {});
@@ -1366,6 +1412,7 @@ export async function runProductionFidelityCapture(options, {
             journalBytes,
             now().toISOString(),
             captured.operatorPublications,
+            captured.navigationTranscript,
           );
         }, { beforeGameNavigation, afterGameCapture });
         fragments.push(fragment);

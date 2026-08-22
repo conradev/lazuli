@@ -17,7 +17,7 @@ from pathlib import Path
 
 SCHEMA = "lazuli-resident-renderer-fidelity-watchdog-v1"
 COMPLETION_SCHEMA = "lazuli-resident-renderer-fidelity-watchdog-completion-v1"
-FIXED_WALL_MS = 600_000
+FIXED_WALL_MS = 7_200_000
 PROCESS_IDENTITY_TIMEOUT_SECONDS = 2.0
 
 
@@ -168,7 +168,7 @@ def main() -> None:
                 f"watchdog completion already exists: {arguments.completion}"
             )
     if arguments.deadline_unix_ms - arguments.start_unix_ms != FIXED_WALL_MS:
-        raise ValueError("watchdog deadline must be exactly start + 600000 ms")
+        raise ValueError("watchdog deadline must be exactly start + 7200000 ms")
     now_unix_ms = int(time.time() * 1_000)
     if arguments.start_unix_ms > now_unix_ms or arguments.deadline_unix_ms <= now_unix_ms:
         raise ValueError("watchdog must be armed after start and before the fixed deadline")

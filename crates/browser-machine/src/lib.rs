@@ -358,6 +358,47 @@ pub enum BrowserInputPublication {
     Equivalent = 3,
 }
 
+const CAPTURE_AUTHORITY_MAGIC: u32 = u32::from_be_bytes(*b"LZCA");
+
+/// Atomic, Rust-authenticated scheduler/SI snapshot for browser capture policy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct CaptureAuthorityV2 {
+    magic: u32,
+    version: u32,
+    bytes: u32,
+    canonical_cycle_lo: u32,
+    canonical_cycle_hi: u32,
+    executed_cycles_lo: u32,
+    executed_cycles_hi: u32,
+    executed_instructions_lo: u32,
+    executed_instructions_hi: u32,
+    retired_blocks_lo: u32,
+    retired_blocks_hi: u32,
+    si_poll_index_lo: u32,
+    si_poll_index_hi: u32,
+    si_scheduled_cycle_lo: u32,
+    si_scheduled_cycle_hi: u32,
+    si_observed_cycle_lo: u32,
+    si_observed_cycle_hi: u32,
+    si_applied_sequence_lo: u32,
+    si_applied_sequence_hi: u32,
+    si_packet_word_0: u32,
+    si_packet_word_1: u32,
+    si_source: u32,
+    si_controller_mode: u32,
+    si_buttons: u32,
+    si_stick_xy_cxy: u32,
+    si_trigger_lrab: u32,
+    reserved: u32,
+}
+
+const _: [(); 108] = [(); core::mem::size_of::<CaptureAuthorityV2>()];
+
+const fn split_u64(value: u64) -> [u32; 2] {
+    [value as u32, (value >> 32) as u32]
+}
+
 pub struct BrowserMachine {
     resident_context: ResidentContext,
     system: System,
@@ -392,6 +433,7 @@ pub struct BrowserMachine {
     #[cfg(any(target_arch = "wasm32", test))]
     disc_boot_wait_outcome: RunOutcome,
     machine_evidence: MachineEvidenceIntegration,
+    capture_authority_snapshot: CaptureAuthorityV2,
     /// SI evidence completed at an observed MMIO instruction cycle but not yet covered by the
     /// authenticated dispatcher report. `si::service_due` drains all work due at that cycle, so
     /// later hooks in the same instruction may only contribute evidence-empty summaries.
@@ -531,6 +573,7 @@ struct MachineEvidenceIntegration {
     graphics: GraphicsCounters,
     renderer: RenderCounters,
     si: SiCounters,
+    last_si_publication: Option<AuthenticatedSiPublication>,
     last_decoder_stats: DecoderStats,
     last_gx_stats: GxRuntimeStats,
     healthy: bool,
@@ -555,6 +598,7 @@ impl MachineEvidenceIntegration {
             graphics: GraphicsCounters::default(),
             renderer: RenderCounters::default(),
             si: SiCounters::default(),
+            last_si_publication: None,
             last_decoder_stats: DecoderStats::default(),
             last_gx_stats: GxRuntimeStats::default(),
             healthy: true,
@@ -576,6 +620,20 @@ impl MachineEvidenceIntegration {
 
     fn is_healthy(&self) -> bool {
         self.healthy && self.accumulator.fault().is_none()
+    }
+
+    fn scheduler_authority(&self) -> SchedulerCounters {
+        self.accumulator.scheduler_authority()
+    }
+
+    fn si_authority(&self) -> lazuli_abi::MachineSiEvidenceV1 {
+        self.accumulator.si_authority()
+    }
+
+    fn si_publication_authority(&self) -> Option<AuthenticatedSiPublication> {
+        self.is_healthy()
+            .then_some(self.last_si_publication)
+            .flatten()
     }
 
     fn accept_boot(&mut self, state: AuthenticatedBootState) {
@@ -1066,8 +1124,11 @@ impl MachineEvidenceIntegration {
             scheduled_cycle: publication.scheduled_cycle,
             observed_cycle: publication.observed_cycle,
             applied_sequence: publication.sequence,
+            state: publication.state,
+            mode: publication.mode,
             packet: publication.packet,
         });
+        self.last_si_publication = self.si.publication;
         self.accept_si();
     }
 
@@ -1173,6 +1234,7 @@ impl BrowserMachine {
             #[cfg(any(target_arch = "wasm32", test))]
             disc_boot_wait_outcome,
             machine_evidence,
+            capture_authority_snapshot: CaptureAuthorityV2::default(),
             pending_resident_si_summary: None,
             #[cfg(feature = "game-fidelity-probes")]
             game_fidelity: GameFidelityIntegration::default(),
@@ -2173,6 +2235,79 @@ impl BrowserMachine {
         self.machine_evidence.issue_snapshot()
     }
 
+    /// Issue one atomic scheduler/SI authority record without exposing guest memory or devices.
+    #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+    fn capture_authority_snapshot(&mut self) -> Option<&CaptureAuthorityV2> {
+        if !self.refresh_machine_evidence_scheduler(None) || !self.machine_evidence.is_healthy() {
+            return None;
+        }
+        let scheduler = self.machine_evidence.scheduler_authority();
+        let si = self.machine_evidence.si_authority();
+        let canonical_cycle = split_u64(scheduler.canonical_cycle);
+        let executed_cycles = split_u64(scheduler.executed_cycles);
+        let executed_instructions = split_u64(scheduler.executed_instructions);
+        let retired_blocks = split_u64(scheduler.retired_blocks);
+        let si_poll_index = split_u64(si.poll_index.get());
+        let si_scheduled_cycle = split_u64(si.scheduled_cycle.get());
+        let si_observed_cycle = split_u64(si.observed_cycle.get());
+        let si_applied_sequence = split_u64(si.applied_sequence.get());
+        let publication = self.machine_evidence.si_publication_authority();
+        if si.poll_index.get() != 0
+            && publication.is_none_or(|publication| {
+                publication.poll_index != si.poll_index.get()
+                    || publication.applied_sequence != si.applied_sequence.get()
+            })
+        {
+            return None;
+        }
+        let (controller_mode, buttons, stick_xy_cxy, trigger_lrab) =
+            publication.map_or((0, 0, 0, 0), |publication| {
+                let state = publication.state;
+                (
+                    u32::from(publication.mode),
+                    u32::from(state.buttons),
+                    u32::from(state.stick_x)
+                        | (u32::from(state.stick_y) << 8)
+                        | (u32::from(state.c_stick_x) << 16)
+                        | (u32::from(state.c_stick_y) << 24),
+                    u32::from(state.trigger_l)
+                        | (u32::from(state.trigger_r) << 8)
+                        | (u32::from(state.analog_a) << 16)
+                        | (u32::from(state.analog_b) << 24),
+                )
+            });
+        self.capture_authority_snapshot = CaptureAuthorityV2 {
+            magic: CAPTURE_AUTHORITY_MAGIC,
+            version: 2,
+            bytes: core::mem::size_of::<CaptureAuthorityV2>() as u32,
+            canonical_cycle_lo: canonical_cycle[0],
+            canonical_cycle_hi: canonical_cycle[1],
+            executed_cycles_lo: executed_cycles[0],
+            executed_cycles_hi: executed_cycles[1],
+            executed_instructions_lo: executed_instructions[0],
+            executed_instructions_hi: executed_instructions[1],
+            retired_blocks_lo: retired_blocks[0],
+            retired_blocks_hi: retired_blocks[1],
+            si_poll_index_lo: si_poll_index[0],
+            si_poll_index_hi: si_poll_index[1],
+            si_scheduled_cycle_lo: si_scheduled_cycle[0],
+            si_scheduled_cycle_hi: si_scheduled_cycle[1],
+            si_observed_cycle_lo: si_observed_cycle[0],
+            si_observed_cycle_hi: si_observed_cycle[1],
+            si_applied_sequence_lo: si_applied_sequence[0],
+            si_applied_sequence_hi: si_applied_sequence[1],
+            si_packet_word_0: si.packet_be_words[0],
+            si_packet_word_1: si.packet_be_words[1],
+            si_source: si.source_raw,
+            si_controller_mode: controller_mode,
+            si_buttons: buttons,
+            si_stick_xy_cxy: stick_xy_cxy,
+            si_trigger_lrab: trigger_lrab,
+            reserved: 0,
+        };
+        Some(&self.capture_authority_snapshot)
+    }
+
     #[cfg(feature = "game-fidelity-probes")]
     #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
     fn sample_game_fidelity_after_dispatch(&mut self) {
@@ -2557,6 +2692,7 @@ impl BrowserMachine {
         }
     }
 
+    #[cfg(any(target_arch = "wasm32", test))]
     fn si_summary_has_machine_evidence(summary: si::SerialServiceSummary) -> bool {
         summary.backpressured_polls != 0
             || summary.periodic_publication.is_some()
@@ -4396,6 +4532,7 @@ layout_getters! {
     (core_host_request_bytes, core::mem::size_of::<HostRequest>()),
     (core_host_completion_bytes, core::mem::size_of::<HostCompletion>()),
     (core_render_receipt_bytes, core::mem::size_of::<RenderReceipt>()),
+    (core_capture_authority_bytes, core::mem::size_of::<CaptureAuthorityV2>()),
     (core_disc_boot_max_chunk_bytes, MAX_BOOT_LOAD_CHUNK_BYTES),
     (core_di_max_chunk_bytes, MAX_COMMITTED_DISC_READ_BYTES),
     (core_memory_initial_pages, RESIDENT_MEMORY_INITIAL_PAGES),
@@ -4983,6 +5120,20 @@ mod wasm_abi {
                 ) as u32
             })
             .unwrap_or(BrowserInputPublication::Rejected as u32)
+    }
+
+    /// Issues one atomic Rust-owned scheduler/SI capture record in stable machine storage.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn core_capture_authority_snapshot() -> *const u8 {
+        MACHINE
+            .with(|machine| {
+                machine
+                    .capture_authority_snapshot()
+                    .map_or(core::ptr::null(), |snapshot| {
+                        core::ptr::from_ref(snapshot).cast()
+                    })
+            })
+            .unwrap_or(core::ptr::null())
     }
 
     /// Returns the number of exact renderer operations retained by Rust.
@@ -5999,14 +6150,15 @@ mod wasm_abi {
 pub use wasm_abi::{
     begin_resident_block_install, cancel_resident_block_install, commit_resident_block_install,
     core_address_space_generation_hi, core_address_space_generation_lo, core_begin_slice,
-    core_context_ptr, core_cpu_ptr, core_current_run_outcome, core_fastmem_ptr, core_finish_slice,
-    core_init, core_input_publish, core_last_compile_status, core_machine_evidence_bytes,
-    core_machine_evidence_snapshot, core_pending_compile_request_bytes, core_pending_module_bytes,
-    core_prepare_current_pc_compile, core_render_complete, core_render_pending_count,
-    core_render_request_ptr, user_0_3, user_0_4, user_0_5, user_0_6, user_0_7, user_0_8, user_0_9,
-    user_0_10, user_0_11, user_0_12, user_0_13, user_0_14, user_0_15, user_0_16, user_0_17,
-    user_0_18, user_0_19, user_0_20, user_0_21, user_0_22, user_0_23, user_0_24, user_0_25,
-    user_0_26, user_0_27, user_0_28, user_1_0, validate_instruction_page_dependency,
+    core_capture_authority_snapshot, core_context_ptr, core_cpu_ptr, core_current_run_outcome,
+    core_fastmem_ptr, core_finish_slice, core_init, core_input_publish, core_last_compile_status,
+    core_machine_evidence_bytes, core_machine_evidence_snapshot,
+    core_pending_compile_request_bytes, core_pending_module_bytes, core_prepare_current_pc_compile,
+    core_render_complete, core_render_pending_count, core_render_request_ptr, user_0_3, user_0_4,
+    user_0_5, user_0_6, user_0_7, user_0_8, user_0_9, user_0_10, user_0_11, user_0_12, user_0_13,
+    user_0_14, user_0_15, user_0_16, user_0_17, user_0_18, user_0_19, user_0_20, user_0_21,
+    user_0_22, user_0_23, user_0_24, user_0_25, user_0_26, user_0_27, user_0_28, user_1_0,
+    validate_instruction_page_dependency,
 };
 #[cfg(all(target_arch = "wasm32", feature = "game-fidelity-probes"))]
 pub use wasm_abi::{
@@ -8964,6 +9116,93 @@ mod tests {
         );
         assert!(!evidence.is_healthy());
         assert!(evidence.issue_snapshot().is_none());
+    }
+
+    #[test]
+    fn capture_authority_v2_has_exact_header_and_pristine_zero_si_payload() {
+        assert_eq!(core::mem::size_of::<CaptureAuthorityV2>(), 108);
+        let mut machine = BrowserMachine::from_system(test_system()).unwrap();
+
+        let authority = *machine.capture_authority_snapshot().unwrap();
+
+        assert_eq!(authority.magic, u32::from_be_bytes(*b"LZCA"));
+        assert_eq!(authority.version, 2);
+        assert_eq!(authority.bytes, 108);
+        assert_eq!(authority.si_poll_index_lo, 0);
+        assert_eq!(authority.si_poll_index_hi, 0);
+        assert_eq!(authority.si_scheduled_cycle_lo, 0);
+        assert_eq!(authority.si_scheduled_cycle_hi, 0);
+        assert_eq!(authority.si_observed_cycle_lo, 0);
+        assert_eq!(authority.si_observed_cycle_hi, 0);
+        assert_eq!(authority.si_applied_sequence_lo, 0);
+        assert_eq!(authority.si_applied_sequence_hi, 0);
+        assert_eq!(authority.si_packet_word_0, 0);
+        assert_eq!(authority.si_packet_word_1, 0);
+        assert_eq!(authority.si_source, 0);
+        assert_eq!(authority.si_controller_mode, 0);
+        assert_eq!(authority.si_buttons, 0);
+        assert_eq!(authority.si_stick_xy_cxy, 0);
+        assert_eq!(authority.si_trigger_lrab, 0);
+        assert_eq!(authority.reserved, 0);
+    }
+
+    #[test]
+    fn capture_authority_v2_retains_authenticated_mode_semantics_and_packet() {
+        let mut machine = BrowserMachine::from_system(test_system()).unwrap();
+        let state = si::ControllerInputState {
+            buttons: 0x1108,
+            stick_x: 0x12,
+            stick_y: 0x34,
+            c_stick_x: 0x56,
+            c_stick_y: 0x78,
+            trigger_l: 0x9a,
+            trigger_r: 0xbc,
+            analog_a: 0xde,
+            analog_b: 0xf0,
+        };
+
+        for mode in 0_u8..=7 {
+            let poll_index = u64::from(mode) + 1;
+            let sequence = 0x1_0000_0000_u64 + poll_index;
+            let packet = state.packet(mode);
+            machine.machine_evidence.record_si_publication(
+                lazuli_abi::MachineSiPollSource::Periodic,
+                si::ControllerPublication {
+                    source: si::ControllerPollSource::Periodic,
+                    poll_index,
+                    scheduled_cycle: 0,
+                    observed_cycle: 0,
+                    sequence,
+                    buttons: state.buttons,
+                    state,
+                    mode,
+                    packet,
+                },
+                0,
+                sequence,
+            );
+            assert!(machine.machine_evidence.is_healthy());
+
+            let authority = *machine.capture_authority_snapshot().unwrap();
+            assert_eq!(authority.si_poll_index_lo, poll_index as u32);
+            assert_eq!(authority.si_poll_index_hi, 0);
+            assert_eq!(authority.si_applied_sequence_lo, sequence as u32);
+            assert_eq!(authority.si_applied_sequence_hi, (sequence >> 32) as u32);
+            assert_eq!(
+                authority.si_packet_word_0,
+                u32::from_be_bytes(packet[0..4].try_into().unwrap())
+            );
+            assert_eq!(
+                authority.si_packet_word_1,
+                u32::from_be_bytes(packet[4..8].try_into().unwrap())
+            );
+            assert_eq!(authority.si_source, 0);
+            assert_eq!(authority.si_controller_mode, u32::from(mode));
+            assert_eq!(authority.si_buttons, u32::from(state.buttons));
+            assert_eq!(authority.si_stick_xy_cxy, 0x7856_3412);
+            assert_eq!(authority.si_trigger_lrab, 0xf0de_bc9a);
+            assert_eq!(authority.reserved, 0);
+        }
     }
 
     #[test]

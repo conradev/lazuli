@@ -26,6 +26,7 @@ import {
 } from "./resident_machine_corpus_report.mjs";
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
@@ -35,6 +36,9 @@ import {
   validateResidentProductionFidelityEvidenceLock,
   verifyResidentProductionFidelityEvidenceLockFiles,
 } from "./resident_machine_fidelity_lock.mjs";
+import {
+  productionFidelityNavigationPolicy,
+} from "./resident_machine_fidelity_navigation.mjs";
 import {
   PRODUCTION_FIDELITY_CAPTURE_PLAN_SCHEMA,
   runProductionFidelityBundle,
@@ -68,7 +72,7 @@ const CDP_REQUEST_TIMEOUT_MS = 180_000;
 const PROCESS_STOP_TIMEOUT_MS = 30_000;
 const WATCHDOG_ARM_TIMEOUT_MS = 30_000;
 const WATCHDOG_COMPLETE_TIMEOUT_MS = 30_000;
-const FIXED_FIDELITY_WALL_MS = 600_000;
+const FIXED_FIDELITY_WALL_MS = 7_200_000;
 const WATCHDOG_STATE_MAX_BYTES = 64 * 1024;
 const MAX_PROCESS_OUTPUT_BYTES = 128 * 1024;
 const UUID_PATTERN =
@@ -535,8 +539,9 @@ export function productionRendererFidelityEvidenceLock(authority) {
     runPolicy: {
       instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
       executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
-      sliceCycleUpperCap: "1000000",
-      blockUpperCap: 16_384,
+      canonicalCycleUpperCap: PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+      sliceCycleUpperCap: "8000000",
+      blockUpperCap: 131_072,
       totalHostCallCap: 65_535,
       totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
       maxBootReads: 8_192,
@@ -546,6 +551,7 @@ export function productionRendererFidelityEvidenceLock(authority) {
       externalWallTimeoutMs: FIXED_FIDELITY_WALL_MS,
       zeroProgressSliceCap: 4_096,
       workerUrl: authority.release.executionAssets.worker.url,
+      navigationPolicy: productionFidelityNavigationPolicy(gameKey),
     },
     checkpointPolicy: {
       checkpointTimeoutMs: 10_000,

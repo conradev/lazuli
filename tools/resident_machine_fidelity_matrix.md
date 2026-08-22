@@ -1,6 +1,6 @@
 # Rust-resident fidelity acceptance matrix
 
-Date: 2026-08-18. Development design and evidence inventory only; nothing here is deployed.
+Date: 2026-08-22. Development design and evidence inventory only; nothing here is deployed.
 
 ## Evidence boundary
 
@@ -114,19 +114,18 @@ must not be read or interpreted by the page, checkpoint Worker, or any new runti
 - Identity: `GZWE01`, revision 0, 889,225,792 bytes, SHA
   `b8c33924afed0fec165afc3fe0d6e8dddfcdef53842fcae180560b3b904b4a81`.
 - Corpus milestone: `live-microgame`.
-- Rust oracle ID/version: `warioware-repellion-a-v1`.
+- Rust oracle ID/version: `warioware-repellion-a-v2`.
 - Legacy projector:
   [`browser_game_first_playable_warioware.mjs`](browser_game_first_playable_warioware.mjs).
-- Required predicate: Repellion microgame ID `0x63`, player 0 active, no-card flow inactive, stable
-  mapped runtime and player, neutral baseline A bit, then a retained guest A (`0x0100`) receipt with
-  matching publication and applied sequence.
+- Required predicate: player 0 is running Repellion, exact microgame ID `0x63`, with no-card flow
+  inactive and stable mapped runtime, player, and active ID across baseline, receipt, and post. The
+  baseline has A released and result zero. The matching guest receipt holds A (`0x0100`) while the
+  result remains zero; the later post state has A released and a nonzero result.
 - Historical layout inputs include gameplay buttons at runtime `+0x4b160`, player-object pointer at
   runtime `+0x4b178`, and player-object result at object `+0x1230`.
-- **Unresolved title-state delta:** the legacy projector accepts any signed post-receipt result and
-  does not require it to differ from baseline zero. Its causal evidence is the guest receipt plus the
-  generic RGB change. Rust fidelity acceptance must either preserve this weaker claim explicitly or
-  add and separately validate a genuine Wario title-state transition before claiming the corpus
-  milestone's “changes guest game state” language.
+- This is a `P_CAUSAL_DELTA` witness: the accepted record binds the A-held receipt to Repellion's
+  subsequent A-release and zero-to-nonzero result transition before a later authenticated
+  presentation.
 
 ### 2. Luigi's Mansion
 

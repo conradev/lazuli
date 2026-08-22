@@ -271,6 +271,8 @@ pub(crate) struct AuthenticatedSiPublication {
     pub scheduled_cycle: u64,
     pub observed_cycle: u64,
     pub applied_sequence: u64,
+    pub state: lazuli::system::si::ControllerInputState,
+    pub mode: u8,
     pub packet: [u8; 8],
 }
 
@@ -350,6 +352,16 @@ impl MachineEvidence {
             si: MachineSiEvidenceV1::default(),
             fault: None,
         })
+    }
+
+    /// Rust-authenticated scheduler totals for narrow host-side capture budgeting.
+    pub(crate) const fn scheduler_authority(&self) -> SchedulerCounters {
+        self.scheduler
+    }
+
+    /// Latest Rust-authenticated guest-visible SI publication, or an all-zero record before one.
+    pub(crate) const fn si_authority(&self) -> MachineSiEvidenceV1 {
+        self.si
     }
 
     #[must_use]

@@ -26,6 +26,8 @@ import {
   PRODUCTION_FIDELITY_RUN_FRAGMENT_SCHEMA,
   canonicalCaptureJson,
 } from "./resident_machine_production_fidelity_capture.mjs";
+import { productionFidelityNavigationPolicy } from
+  "./resident_machine_fidelity_navigation.mjs";
 import { residentReleaseExecutionAssetsSha256 } from
   "./resident_machine_production_fidelity_gate.mjs";
 
@@ -138,6 +140,7 @@ const LEAF_BYTES = Object.freeze({
   "pre-witness-machine-evidence.json": Buffer.from("pre-witness"),
   "terminal-machine-evidence.json": Buffer.from("terminal-machine"),
   "terminal-game-fidelity.json": Buffer.from("terminal-fidelity"),
+  "navigation-transcript.json": Buffer.from("[]"),
   "first-visible.rgba": Buffer.from([1, 2, 3, 4]),
   "baseline-readback-metadata.json": Buffer.from("baseline-metadata"),
   "baseline.rgba": Buffer.from([5, 6, 7, 8]),
@@ -151,6 +154,7 @@ async function writeRunFragment(captureRoot, game, index, release) {
   for (const [filename, bytes] of Object.entries(LEAF_BYTES)) {
     refs[filename] = await writeContained(captureRoot, `${prefix}/${filename}`, bytes);
   }
+  const navigationPolicy = productionFidelityNavigationPolicy(game.key);
   const run = {
     key: game.key,
     runId: `${String(index + 1).padStart(8, "0")}-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
@@ -166,7 +170,12 @@ async function writeRunFragment(captureRoot, game, index, release) {
     preWitnessMachineEvidence: refs["pre-witness-machine-evidence.json"],
     terminalMachineEvidence: refs["terminal-machine-evidence.json"],
     gameFidelityRecord: refs["terminal-game-fidelity.json"],
-    operatorPublications: { algorithm: "alternating-neutral-a-v1", count: 0 },
+    navigationTranscript: refs["navigation-transcript.json"],
+    operatorPublications: {
+      algorithm: navigationPolicy.algorithm,
+      scriptSha256: navigationPolicy.scriptSha256,
+      count: navigationPolicy.steps.length,
+    },
     frames: {
       firstVisible: refs["first-visible.rgba"],
       baseline: {

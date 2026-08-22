@@ -10,6 +10,11 @@ import {
   expectedFidelityHostIdentitySha256,
   validateResidentFidelityEvidenceLock,
 } from "./resident_machine_fidelity_lock.mjs";
+import {
+  captureNavigationRuntime,
+  captureRunPolicy,
+  captureRunSummary,
+} from "./resident_machine_fidelity_checkpoints.mjs";
 
 const CHECKPOINT_SCHEMA = "lazuli-resident-renderer-fidelity-checkpoint-v1";
 const RECORD_SCHEMA = "lazuli-resident-renderer-fidelity-durable-record-v1";
@@ -46,18 +51,13 @@ const FIDELITY_ARTIFACT_FIELDS = [
   "machineEvidenceOpaqueBytes",
   "machineEvidenceOpaqueSha256",
 ];
-const CAPTURE_RUN_POLICY_FIELDS = [
-  "instructionUpperCap", "executedCycleUpperCap", "sliceCycleUpperCap", "blockUpperCap",
-  "totalHostCallCap", "totalColdInstallCap", "maxBootReads", "bootTimeoutMs",
-  "sliceTimeoutMs", "runTimeoutMs", "externalWallTimeoutMs", "zeroProgressSliceCap",
-  "workerUrl",
-];
-const CAPTURE_RUN_SUMMARY_FIELDS = [
-  "schema", "issuedRunCalls", "reportedExecutedCycles", "reportedExecutedInstructions",
-  "reportedHostCalls", "reportedColdInstalls", "zeroProgressSlices",
-  "consecutiveZeroProgressSlices", "maximumConsecutiveZeroProgressSlices",
-  "operatorPublications", "witnessPublications", "elapsedWallMs", "wallTimeoutMs",
-  "accepted",
+const NAVIGATION_RECEIPT_FIELDS = [
+  "stepIndex", "sequenceLo", "sequenceHi", "minimumCanonicalDelay",
+  "targetCanonicalCycle", "publicationCanonicalCycle", "publicationOvershootCycles",
+  "buttons", "stickXyCxy", "triggerLrab", "status", "siPollIndex",
+  "siScheduledCycle", "siObservedCycle", "siAppliedSequenceLo", "siAppliedSequenceHi",
+  "siPacketWord0", "siPacketWord1", "siSource", "priorSiPollIndex",
+  "siControllerMode", "siButtons", "siStickXyCxy", "siTriggerLrab",
 ];
 const RECORD_FIELDS = [
   "schema",
@@ -121,54 +121,19 @@ function unsignedDecimal(value, path) {
 }
 
 function validateCaptureRunPolicy(value, path) {
-  const policy = object(value, path);
-  exactKeys(policy, CAPTURE_RUN_POLICY_FIELDS, path);
-  for (const field of ["instructionUpperCap", "executedCycleUpperCap", "sliceCycleUpperCap"]) {
-    unsignedDecimal(policy[field], `${path}.${field}`);
-    if (BigInt(policy[field]) === 0n) fail(`${path}.${field}`, "expected positive");
+  try {
+    return captureRunPolicy(value);
+  } catch (error) {
+    fail(path, String(error?.message ?? error));
   }
-  for (const field of CAPTURE_RUN_POLICY_FIELDS.filter(field => ![
-    "instructionUpperCap", "executedCycleUpperCap", "sliceCycleUpperCap", "workerUrl",
-  ].includes(field))) positiveInteger(policy[field], `${path}.${field}`);
-  if (typeof policy.workerUrl !== "string" || !policy.workerUrl.startsWith("/")) {
-    fail(`${path}.workerUrl`, "expected a same-origin absolute path");
-  }
-  if (BigInt(policy.sliceCycleUpperCap) > BigInt(policy.executedCycleUpperCap)) {
-    fail(`${path}.sliceCycleUpperCap`, "exceeded total cycle cap");
-  }
-  return policy;
 }
 
 function validateCaptureRunSummary(value, policy, path, accepted) {
-  const summary = object(value, path);
-  exactKeys(summary, CAPTURE_RUN_SUMMARY_FIELDS, path);
-  if (summary.schema !== "lazuli-resident-cumulative-run-summary-v1") {
-    fail(`${path}.schema`, "unexpected schema");
+  try {
+    return captureRunSummary(value, policy, path, accepted);
+  } catch (error) {
+    fail(path, String(error?.message ?? error));
   }
-  unsignedDecimal(summary.reportedExecutedCycles, `${path}.reportedExecutedCycles`);
-  unsignedDecimal(summary.reportedExecutedInstructions, `${path}.reportedExecutedInstructions`);
-  for (const field of [
-    "issuedRunCalls", "reportedHostCalls", "reportedColdInstalls", "zeroProgressSlices",
-    "consecutiveZeroProgressSlices", "maximumConsecutiveZeroProgressSlices",
-    "operatorPublications", "witnessPublications", "elapsedWallMs",
-  ]) nonnegativeInteger(summary[field], `${path}.${field}`);
-  positiveInteger(summary.wallTimeoutMs, `${path}.wallTimeoutMs`);
-  if (summary.accepted !== accepted) fail(`${path}.accepted`, `expected ${accepted}`);
-  const wallTimeout = Math.min(policy.runTimeoutMs, policy.externalWallTimeoutMs);
-  if (summary.wallTimeoutMs !== wallTimeout || summary.elapsedWallMs >= wallTimeout) {
-    fail(path, "wall authority changed or exhausted");
-  }
-  if (
-    BigInt(summary.reportedExecutedCycles) > BigInt(policy.executedCycleUpperCap)
-    || BigInt(summary.reportedExecutedInstructions) > BigInt(policy.instructionUpperCap)
-    || summary.reportedHostCalls > policy.totalHostCallCap
-    || summary.reportedColdInstalls > policy.totalColdInstallCap
-    || summary.consecutiveZeroProgressSlices >= policy.zeroProgressSliceCap
-    || summary.maximumConsecutiveZeroProgressSlices >= policy.zeroProgressSliceCap
-    || summary.operatorPublications > PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP
-    || summary.witnessPublications > 1
-  ) fail(path, "exceeded frozen cumulative authority");
-  return summary;
 }
 
 function sha256(value, path) {
@@ -357,6 +322,30 @@ function validatePayload(payloadValue, path, state) {
       "firstFrameRendererRecordSha256",
       "baselineRecordSha256",
     ], path);
+  } else if (payload.kind === "navigation-armed") {
+    exactKeys(payload, [
+      ...common,
+      "machineSessionId",
+      "firstFrameReportRecordSha256",
+      "scriptSha256",
+      "runCallOrigin",
+      "canonicalCycleOrigin",
+      "siPollIndexOrigin",
+      "stepCount",
+      "runSummary",
+    ], path);
+  } else if (payload.kind === "navigation-step-received") {
+    exactKeys(payload, [
+      ...common,
+      "machineSessionId",
+      "firstFrameReportRecordSha256",
+      "navigationArmRecordSha256",
+      "scriptSha256",
+      "runCallOrigin",
+      "canonicalCycleOrigin",
+      ...NAVIGATION_RECEIPT_FIELDS,
+      "runSummary",
+    ], path);
   } else if (payload.kind === "controller-witness-published") {
     exactKeys(payload, [
       ...common,
@@ -373,6 +362,11 @@ function validatePayload(payloadValue, path, state) {
       "machineEvidenceEnvelopeSha256",
       "machineEvidenceOpaqueBytes",
       "machineEvidenceOpaqueSha256",
+      "navigationScriptSha256",
+      "navigationStepCount",
+      "navigationArmRecordSha256",
+      "lastNavigationStepRecordSha256",
+      "runSummary",
     ], path);
   } else if (payload.kind === "fidelity-accepted-owned") {
     exactKeys(payload, [
@@ -396,6 +390,10 @@ function validatePayload(payloadValue, path, state) {
       "acceptedRecordSha256",
       ...FIDELITY_ARTIFACT_FIELDS,
       "runSummary",
+      "navigationScriptSha256",
+      "navigationStepCount",
+      "navigationArmRecordSha256",
+      "lastNavigationStepRecordSha256",
     ], path);
   } else {
     fail(`${path}.kind`, "unsupported checkpoint kind");
@@ -448,6 +446,9 @@ function validatePayload(payloadValue, path, state) {
     );
     if (readyOpaque.bytes !== 816) fail(`${path}.machineEvidenceOpaqueBytes`, "expected 816");
     const runPolicy = validateCaptureRunPolicy(payload.runPolicy, `${path}.runPolicy`);
+    if (runPolicy.navigationPolicy.gameKey !== payload.gameKey) {
+      fail(`${path}.runPolicy.navigationPolicy.gameKey`, "changed checkpoint game identity");
+    }
     if (bootReads > runPolicy.maxBootReads) {
       fail(`${path}.bootReads`, "exceeded the locked ready boot cap");
     }
@@ -459,8 +460,10 @@ function validatePayload(payloadValue, path, state) {
     );
     if (
       runSummary.issuedRunCalls !== 0
+      || runSummary.reportedCanonicalCycles !== "0"
       || runSummary.reportedExecutedCycles !== "0"
       || runSummary.reportedExecutedInstructions !== "0"
+      || runSummary.reportedRetiredBlocks !== "0"
       || runSummary.reportedHostCalls !== 0
       || runSummary.reportedColdInstalls !== 0
       || runSummary.zeroProgressSlices !== 0
@@ -575,6 +578,15 @@ function validatePayload(payloadValue, path, state) {
       if (state.firstFrameRendererRecordSha256 === null || state.baselineRecordSha256 !== null) {
         fail(path, "Baseline ownership cardinality/order changed");
       }
+      if (
+        state.navigationTranscript.length !== state.runPolicy.navigationPolicy.steps.length
+        || (
+          state.runPolicy.navigationPolicy.steps.length !== 0
+          && state.navigationArmRecordSha256 === null
+        )
+      ) {
+        fail(path, "Baseline ownership requires the complete locked navigation transcript");
+      }
       const allowedPrevious = [identity.receiptRecordSha256];
       if (sameIdentity(identity, state.firstFrameReceipt)) {
         allowedPrevious.push(state.firstFrameRendererRecordSha256);
@@ -645,6 +657,109 @@ function validatePayload(payloadValue, path, state) {
       fail(`${path}.baselineRecordSha256`, "did not describe the Baseline prefix state");
     }
     state.firstFrameReportRecordSha256 = state.currentRecordSha256;
+  } else if (payload.kind === "navigation-armed") {
+    if (state.capturePolicy === "forbidden") fail(path, "capture annotations are forbidden");
+    if (payload.machineSessionId !== state.machineSessionId) fail(path, "machine session changed");
+    const navigationPolicy = state.runPolicy.navigationPolicy;
+    if (
+      state.openIdentity !== null
+      || state.firstFrameReportRecordSha256 === null
+      || state.navigationArmRecordSha256 !== null
+      || state.witnessRecordSha256 !== null
+      || (state.baselineRecordSha256 !== null && navigationPolicy.steps.length !== 0)
+    ) fail(path, "navigation arm cardinality/order changed");
+    if (
+      payload.firstFrameReportRecordSha256 !== state.firstFrameReportRecordSha256
+      || payload.scriptSha256 !== navigationPolicy.scriptSha256
+      || payload.stepCount !== navigationPolicy.steps.length
+    ) fail(path, "navigation arm changed the locked script authority");
+    nonnegativeInteger(payload.runCallOrigin, `${path}.runCallOrigin`);
+    unsignedDecimal(payload.canonicalCycleOrigin, `${path}.canonicalCycleOrigin`);
+    unsignedDecimal(payload.siPollIndexOrigin, `${path}.siPollIndexOrigin`);
+    const runSummary = validateCaptureRunSummary(
+      payload.runSummary,
+      state.runPolicy,
+      `${path}.runSummary`,
+      false,
+    );
+    if (
+      runSummary.operatorPublications !== 0
+      || runSummary.witnessPublications !== 0
+      || payload.runCallOrigin !== runSummary.issuedRunCalls
+      || payload.canonicalCycleOrigin !== runSummary.canonicalCycle
+    ) fail(`${path}.runSummary`, "did not bind the first-frame scheduler authority");
+    state.navigationArmRecordSha256 = state.currentRecordSha256;
+    state.navigationRunCallOrigin = payload.runCallOrigin;
+    state.navigationCycleOrigin = payload.canonicalCycleOrigin;
+    state.navigationSiPollIndexOrigin = payload.siPollIndexOrigin;
+  } else if (payload.kind === "navigation-step-received") {
+    if (state.capturePolicy === "forbidden") fail(path, "capture annotations are forbidden");
+    if (payload.machineSessionId !== state.machineSessionId) fail(path, "machine session changed");
+    if (
+      state.openIdentity !== null
+      || state.firstFrameReportRecordSha256 === null
+      || state.navigationArmRecordSha256 === null
+      || state.baselineRecordSha256 !== null
+      || state.witnessRecordSha256 !== null
+    ) fail(path, "navigation SI receipt cardinality/order changed");
+    if (
+      payload.firstFrameReportRecordSha256 !== state.firstFrameReportRecordSha256
+      || payload.navigationArmRecordSha256 !== state.navigationArmRecordSha256
+      || payload.scriptSha256 !== state.runPolicy.navigationPolicy.scriptSha256
+      || payload.runCallOrigin !== state.navigationRunCallOrigin
+      || payload.canonicalCycleOrigin !== state.navigationCycleOrigin
+    ) fail(path, "navigation SI receipt changed its armed authority");
+    const stepIndex = state.navigationTranscript.length;
+    const step = Object.freeze(Object.fromEntries(
+      NAVIGATION_RECEIPT_FIELDS.map(field => [field, payload[field]]),
+    ));
+    const priorAnchor = stepIndex === 0
+      ? state.navigationCycleOrigin
+      : state.navigationTranscript.at(-1).siObservedCycle;
+    const nextStep = state.runPolicy.navigationPolicy.steps[stepIndex + 1] ?? null;
+    const runtime = {
+      schema: "lazuli-resident-navigation-runtime-v2",
+      scriptSha256: payload.scriptSha256,
+      stepCount: state.runPolicy.navigationPolicy.steps.length,
+      durableSteps: stepIndex + 1,
+      complete: stepIndex + 1 === state.runPolicy.navigationPolicy.steps.length,
+      runCallOrigin: payload.runCallOrigin,
+      canonicalCycleOrigin: payload.canonicalCycleOrigin,
+      siPollIndexOrigin: state.navigationSiPollIndexOrigin,
+      lastReceiptObservedCanonicalCycle: payload.siObservedCycle,
+      nextTargetCanonicalCycle: nextStep === null
+        ? null
+        : (BigInt(payload.siObservedCycle) + BigInt(nextStep.minimumCanonicalDelay)).toString(),
+      pendingPublication: null,
+      transcript: [...state.navigationTranscript, step],
+    };
+    let navigation;
+    try {
+      navigation = captureNavigationRuntime(runtime, state.runPolicy, `${path}.navigation`);
+    } catch (error) {
+      fail(path, String(error?.message ?? error));
+    }
+    if (
+      navigation.transcript.length !== stepIndex + 1
+      || step.targetCanonicalCycle !== (
+        BigInt(priorAnchor)
+        + BigInt(state.runPolicy.navigationPolicy.steps[stepIndex].minimumCanonicalDelay)
+      ).toString()
+    ) fail(path, "navigation SI receipt changed locked chronology");
+    const runSummary = validateCaptureRunSummary(
+      payload.runSummary,
+      state.runPolicy,
+      `${path}.runSummary`,
+      false,
+    );
+    if (
+      runSummary.operatorPublications !== stepIndex + 1
+      || runSummary.witnessPublications !== 0
+      || BigInt(runSummary.canonicalCycle) < BigInt(step.siObservedCycle)
+      || runSummary.issuedRunCalls < payload.runCallOrigin
+    ) fail(`${path}.runSummary`, "diverged from navigation SI receipt");
+    state.navigationTranscript.push(step);
+    state.navigationStepRecordSha256s.push(state.currentRecordSha256);
   } else if (payload.kind === "controller-witness-published") {
     if (state.capturePolicy === "forbidden") fail(path, "capture annotations are forbidden");
     if (payload.machineSessionId !== state.machineSessionId) fail(path, "machine session changed");
@@ -684,6 +799,25 @@ function validatePayload(payloadValue, path, state) {
     if (preWitnessMachine.bytes !== 816) {
       fail(`${path}.machineEvidenceOpaqueBytes`, "expected 816");
     }
+    const expectedLastNavigationRecord = state.navigationStepRecordSha256s.at(-1) ?? null;
+    if (
+      state.navigationArmRecordSha256 === null
+      || payload.navigationScriptSha256 !== state.runPolicy.navigationPolicy.scriptSha256
+      || payload.navigationStepCount !== state.navigationTranscript.length
+      || payload.navigationStepCount !== state.runPolicy.navigationPolicy.steps.length
+      || payload.navigationArmRecordSha256 !== state.navigationArmRecordSha256
+      || payload.lastNavigationStepRecordSha256 !== expectedLastNavigationRecord
+    ) fail(path, "controller witness lacked the durable navigation authority");
+    const witnessRunSummary = validateCaptureRunSummary(
+      payload.runSummary,
+      state.runPolicy,
+      `${path}.runSummary`,
+      false,
+    );
+    if (
+      witnessRunSummary.operatorPublications !== state.navigationTranscript.length
+      || witnessRunSummary.witnessPublications !== 1
+    ) fail(`${path}.runSummary`, "controller witness cumulative authority changed");
     state.witnessRecordSha256 = state.currentRecordSha256;
     state.witness = {
       sequenceLo: payload.sequenceLo,
@@ -727,6 +861,15 @@ function validatePayload(payloadValue, path, state) {
     if (terminalRunSummary.issuedRunCalls <= 0 || terminalRunSummary.witnessPublications !== 1) {
       fail(`${path}.runSummary`, "omitted run/witness authority");
     }
+    const expectedLastNavigationRecord = state.navigationStepRecordSha256s.at(-1) ?? null;
+    if (
+      state.navigationArmRecordSha256 === null
+      || payload.navigationScriptSha256 !== state.runPolicy.navigationPolicy.scriptSha256
+      || payload.navigationStepCount !== state.navigationTranscript.length
+      || payload.navigationStepCount !== terminalRunSummary.operatorPublications
+      || payload.navigationArmRecordSha256 !== state.navigationArmRecordSha256
+      || payload.lastNavigationStepRecordSha256 !== expectedLastNavigationRecord
+    ) fail(path, "terminal navigation authority changed");
     state.terminalRunSummary = structuredClone(terminalRunSummary);
     state.terminalRecordSha256 = state.currentRecordSha256;
   }
@@ -784,6 +927,12 @@ export function validateFidelityCheckpointJournal(
     baselineReceipt: null,
     baselineRequestedController: null,
     firstFrameReportRecordSha256: null,
+    navigationArmRecordSha256: null,
+    navigationRunCallOrigin: null,
+    navigationCycleOrigin: null,
+    navigationSiPollIndexOrigin: null,
+    navigationTranscript: [],
+    navigationStepRecordSha256s: [],
     witnessRecordSha256: null,
     witness: null,
     acceptedRecordSha256: null,
@@ -853,6 +1002,7 @@ export function validateFidelityCheckpointJournal(
     || state.machineInitializationRecordSha256 === null
     || state.baselineRecordSha256 === null
     || state.firstFrameReportRecordSha256 === null
+    || state.navigationArmRecordSha256 === null
     || state.witnessRecordSha256 === null
     || state.acceptedRecordSha256 === null
     || state.terminalRecordSha256 === null
@@ -887,6 +1037,14 @@ export function validateFidelityCheckpointJournal(
       firstFrameRendererRecordSha256: state.firstFrameRendererRecordSha256,
       baselineRecordSha256: state.baselineRecordSha256,
       firstFrameReportRecordSha256: state.firstFrameReportRecordSha256,
+      navigationArmRecordSha256: state.navigationArmRecordSha256,
+      navigationRunCallOrigin: state.navigationRunCallOrigin,
+      navigationCanonicalCycleOrigin: state.navigationCycleOrigin,
+      navigationSiPollIndexOrigin: state.navigationSiPollIndexOrigin,
+      navigationScriptSha256: state.runPolicy?.navigationPolicy.scriptSha256 ?? null,
+      navigationStepCount: state.navigationTranscript.length,
+      lastNavigationStepRecordSha256: state.navigationStepRecordSha256s.at(-1) ?? null,
+      navigationTranscript: Object.freeze(structuredClone(state.navigationTranscript)),
       witnessRecordSha256: state.witnessRecordSha256,
       witness: state.witness,
       acceptedRecordSha256: state.acceptedRecordSha256,

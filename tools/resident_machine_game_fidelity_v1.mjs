@@ -15,7 +15,6 @@ export const GAME_FIDELITY_V1_SUMMARY_SCHEMA =
 const ACCEPTED_PHASE = 5;
 const ACCEPTED_STATUS = 1;
 const COMMON_REQUIRED_PREDICATES = 0x07ffn;
-const WARIO_REQUIRED_PREDICATES = 0x0dffn;
 const CANONICAL_BASE64 =
   /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
@@ -23,11 +22,11 @@ export const GAME_FIDELITY_V1_PROJECTORS = Object.freeze([
   Object.freeze({
     key: "warioware-usa",
     projector: 1,
-    oracle: "warioware-repellion-a-v1",
+    oracle: "warioware-repellion-a-v2",
     identifier: "GZWE01",
     revision: 0,
     buttons: 0x0100,
-    requiredPredicates: WARIO_REQUIRED_PREDICATES,
+    requiredPredicates: COMMON_REQUIRED_PREDICATES,
   }),
   Object.freeze({
     key: "luigis-mansion-usa",

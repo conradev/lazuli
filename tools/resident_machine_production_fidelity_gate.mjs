@@ -16,10 +16,15 @@ import {
   validateMachineEvidenceV1Transition,
 } from "./resident_machine_evidence_v1.mjs";
 import { validateResidentCorpusEvidence } from "./resident_machine_corpus_report.mjs";
-import { parseFidelityCheckpointJsonl } from "./resident_machine_fidelity_checkpoint_report.mjs";
+import {
+  parseFidelityCheckpointJsonl,
+  validateFidelityCheckpointJournal,
+} from "./resident_machine_fidelity_checkpoint_report.mjs";
+import { captureRunSummary } from "./resident_machine_fidelity_checkpoints.mjs";
 import { validateCombinedResidentFidelityEvidence } from "./resident_machine_fidelity_combined_report.mjs";
 import {
   PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
+  expectedFidelityHostIdentitySha256,
   productionSourceAuthorityFromGit,
 } from "./resident_machine_fidelity_lock.mjs";
 import {
@@ -710,6 +715,7 @@ const CAPTURE_KINDS = Object.freeze([
   "first-frame-renderer-owned",
   "fidelity-baseline-owned",
   "first-frame-report-bound",
+  "navigation-armed",
   "controller-witness-published",
   "fidelity-accepted-owned",
   "fidelity-terminal",
@@ -896,25 +902,21 @@ function nonNegativeDecimal(value, location) {
 }
 
 function validateCumulativeRunSummary(value, lock, terminalMachine, location) {
-  const summary = object(value, location);
-  exactKeys(summary, [
-    "schema",
-    "issuedRunCalls",
-    "reportedExecutedCycles",
-    "reportedExecutedInstructions",
-    "reportedHostCalls",
-    "reportedColdInstalls",
-    "operatorPublications",
-    "witnessPublications",
-    "zeroProgressSlices",
-    "consecutiveZeroProgressSlices",
-    "maximumConsecutiveZeroProgressSlices",
-    "elapsedWallMs",
-    "wallTimeoutMs",
-    "accepted",
-  ], location);
-  exact(summary.schema, "lazuli-resident-cumulative-run-summary-v1", `${location}.schema`);
+  let summary;
+  try {
+    summary = captureRunSummary(value, lock.runPolicy, location, true);
+  } catch (error) {
+    fail(location, String(error?.message ?? error));
+  }
   positiveInteger(summary.issuedRunCalls, `${location}.issuedRunCalls`);
+  const canonicalCycle = nonNegativeDecimal(
+    summary.canonicalCycle,
+    `${location}.canonicalCycle`,
+  );
+  const reportedCanonicalCycles = nonNegativeDecimal(
+    summary.reportedCanonicalCycles,
+    `${location}.reportedCanonicalCycles`,
+  );
   const reportedCycles = nonNegativeDecimal(
     summary.reportedExecutedCycles,
     `${location}.reportedExecutedCycles`,
@@ -923,10 +925,30 @@ function validateCumulativeRunSummary(value, lock, terminalMachine, location) {
     summary.reportedExecutedInstructions,
     `${location}.reportedExecutedInstructions`,
   );
+  const reportedRetiredBlocks = nonNegativeDecimal(
+    summary.reportedRetiredBlocks,
+    `${location}.reportedRetiredBlocks`,
+  );
   const instructionCap = BigInt(lock.runPolicy.instructionUpperCap);
-  const cycleCap = BigInt(lock.runPolicy.executedCycleUpperCap);
-  if (reportedCycles > terminalMachine.executedCycles || reportedCycles > cycleCap) {
-    fail(`${location}.reportedExecutedCycles`, "exceeded terminal MachineEvidence or the lock cap");
+  const executedCycleCap = BigInt(lock.runPolicy.executedCycleUpperCap);
+  const canonicalCycleCap = BigInt(lock.runPolicy.canonicalCycleUpperCap);
+  if (canonicalCycle !== terminalMachine.canonicalCycle) {
+    fail(`${location}.canonicalCycle`, "differed from terminal MachineEvidence");
+  }
+  if (
+    reportedCanonicalCycles > canonicalCycle
+    || reportedCanonicalCycles > canonicalCycleCap
+  ) {
+    fail(
+      `${location}.reportedCanonicalCycles`,
+      "exceeded the terminal scheduler cycle or the lock cap",
+    );
+  }
+  if (reportedCycles > terminalMachine.executedCycles || reportedCycles > executedCycleCap) {
+    fail(
+      `${location}.reportedExecutedCycles`,
+      "exceeded terminal MachineEvidence or the lock cap",
+    );
   }
   if (
     reportedInstructions > terminalMachine.executedInstructions
@@ -937,56 +959,29 @@ function validateCumulativeRunSummary(value, lock, terminalMachine, location) {
       "exceeded terminal MachineEvidence or the lock cap",
     );
   }
-  if (terminalMachine.executedCycles > cycleCap) {
-    fail(`${location}.terminalExecutedCycles`, "exceeded the immutable lock cap");
+  if (
+    reportedRetiredBlocks
+      > BigInt(summary.issuedRunCalls) * BigInt(lock.runPolicy.blockUpperCap)
+  ) {
+    fail(`${location}.reportedRetiredBlocks`, "exceeded the issued per-run block authority");
   }
-  if (terminalMachine.executedInstructions > instructionCap) {
-    fail(`${location}.terminalExecutedInstructions`, "exceeded the immutable lock cap");
-  }
-  nonNegativeInteger(
-    summary.reportedHostCalls,
-    `${location}.reportedHostCalls`,
-    lock.runPolicy.totalHostCallCap,
-  );
-  nonNegativeInteger(
-    summary.reportedColdInstalls,
-    `${location}.reportedColdInstalls`,
-    lock.runPolicy.totalColdInstallCap,
-  );
   exact(
-    lock.capturePolicy.genericOperatorPolicy.maximumPublications,
+    lock.runPolicy.navigationPolicy.maximumPublications,
     PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
     `${location}.operatorPublicationCap`,
   );
-  nonNegativeInteger(
-    summary.operatorPublications,
-    `${location}.operatorPublications`,
-    PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
-  );
   exact(summary.witnessPublications, 1, `${location}.witnessPublications`);
-  for (const field of [
-    "zeroProgressSlices",
-    "consecutiveZeroProgressSlices",
-    "maximumConsecutiveZeroProgressSlices",
-  ]) nonNegativeInteger(summary[field], `${location}.${field}`);
   if (
     summary.consecutiveZeroProgressSlices > summary.maximumConsecutiveZeroProgressSlices
     || summary.maximumConsecutiveZeroProgressSlices > summary.zeroProgressSlices
     || summary.maximumConsecutiveZeroProgressSlices >= lock.runPolicy.zeroProgressSliceCap
   ) fail(location, "zero-progress accounting or cap is invalid");
-  nonNegativeInteger(summary.elapsedWallMs, `${location}.elapsedWallMs`);
-  exact(
-    summary.wallTimeoutMs,
-    Math.min(lock.runPolicy.runTimeoutMs, lock.runPolicy.externalWallTimeoutMs),
-    `${location}.wallTimeoutMs`,
-  );
-  if (summary.elapsedWallMs >= summary.wallTimeoutMs) {
-    fail(`${location}.elapsedWallMs`, "exceeded the immutable wall timeout");
-  }
-  exact(summary.accepted, true, `${location}.accepted`);
   return Object.freeze({
+    canonicalCycle,
+    reportedCanonicalCycles,
     reportedCycles,
     reportedInstructions,
+    reportedRetiredBlocks,
     operatorPublications: summary.operatorPublications,
   });
 }
@@ -1099,6 +1094,7 @@ async function validateGameRun(
     "preWitnessMachineEvidence",
     "terminalMachineEvidence",
     "gameFidelityRecord",
+    "navigationTranscript",
     "frames",
   ], location);
   exact(run.key, game.key, `${location}.key`);
@@ -1111,7 +1107,11 @@ async function validateGameRun(
   }
   exact(run.releaseId, release.releaseId, `${location}.releaseId`);
   exact(run.executionAssetsSha256, assetsSha256, `${location}.executionAssetsSha256`);
-  exactKeys(run.operatorPublications, ["algorithm", "count"], `${location}.operatorPublications`);
+  exactKeys(
+    run.operatorPublications,
+    ["algorithm", "scriptSha256", "count"],
+    `${location}.operatorPublications`,
+  );
   exactKeys(run.frames, ["firstVisible", "baseline", "later"], `${location}.frames`);
 
   const [
@@ -1124,6 +1124,7 @@ async function validateGameRun(
     preWitnessFile,
     terminalFile,
     fidelityFile,
+    navigationTranscriptFile,
     firstVisibleFile,
   ] = await Promise.all([
     loadReference(baseDirectory, run.evidenceLock, `${location}.evidenceLock`),
@@ -1168,6 +1169,11 @@ async function validateGameRun(
       run.gameFidelityRecord,
       384,
       `${location}.gameFidelityRecord`,
+    ),
+    loadCanonicalJsonReference(
+      baseDirectory,
+      run.navigationTranscript,
+      `${location}.navigationTranscript`,
     ),
     loadReference(baseDirectory, run.frames.firstVisible, `${location}.frames.firstVisible`),
   ]);
@@ -1224,6 +1230,32 @@ async function validateGameRun(
   });
   exact(combined.runId, run.runId, `${location}.checkpointJournal.runId`);
   exact(combined.gameKey, game.key, `${location}.checkpointJournal.gameKey`);
+  const checkpointSummary = validateFidelityCheckpointJournal(records, {
+    requireResolved: true,
+    probeEventCap: lock.checkpointPolicy.probeEventRunCap,
+    evidenceLockSha256: lockFile.reference.sha256,
+    expectedHostIdentitySha256: expectedFidelityHostIdentitySha256(
+      lock,
+      lockFile.reference.sha256,
+      expectedLockAuthority,
+    ),
+    probeEventPolicy: "forbidden",
+    capturePolicy: "required",
+  });
+  const retainedNavigationTranscript = array(
+    navigationTranscriptFile.value,
+    `${location}.navigationTranscript`,
+  );
+  exactJson(
+    retainedNavigationTranscript,
+    checkpointSummary.capture.navigationTranscript,
+    `${location}.navigationTranscript`,
+  );
+  exact(
+    retainedNavigationTranscript.length,
+    lock.runPolicy.navigationPolicy.steps.length,
+    `${location}.navigationTranscript.length`,
+  );
   exact(report.corpus.selectedGameKey, game.key, `${location}.firstFrameReport.corpus.selectedGameKey`);
   exact(report.game.game.bytes, game.bytes, `${location}.firstFrameReport.game.bytes`);
   exact(report.game.game.sha256, game.image.sha256, `${location}.firstFrameReport.game.sha256`);
@@ -1239,21 +1271,34 @@ async function validateGameRun(
   const firstOwned = capture["first-frame-renderer-owned"];
   const baselineOwned = capture["fidelity-baseline-owned"];
   const reportBound = capture["first-frame-report-bound"];
+  const navigationArm = capture["navigation-armed"];
   const witness = capture["controller-witness-published"];
   const acceptedOwned = capture["fidelity-accepted-owned"];
   const terminal = capture["fidelity-terminal"];
+  const navigationSteps = records
+    .map((record, recordIndex) => ({ record, index: recordIndex }))
+    .filter(entry => entry.record.payload.kind === "navigation-step-received");
+  exact(
+    navigationSteps.length,
+    lock.runPolicy.navigationPolicy.steps.length,
+    `${location}.checkpointJournal.navigation-step-received.cardinality`,
+  );
   exactJson(
     initialized.record.payload.runPolicy,
     lock.runPolicy,
     `${location}.checkpointJournal.capture-machine-initialized.runPolicy`,
   );
+  const readyMachine = machineWords(readyEnvelope);
   exactJson(
     initialized.record.payload.runSummary,
     {
-      schema: "lazuli-resident-cumulative-run-summary-v1",
+      schema: "lazuli-resident-cumulative-run-summary-v2",
       issuedRunCalls: 0,
+      canonicalCycle: readyMachine.canonicalCycle.toString(),
+      reportedCanonicalCycles: "0",
       reportedExecutedCycles: "0",
       reportedExecutedInstructions: "0",
+      reportedRetiredBlocks: "0",
       reportedHostCalls: 0,
       reportedColdInstalls: 0,
       zeroProgressSlices: 0,
@@ -1288,6 +1333,31 @@ async function validateGameRun(
     `${location}.checkpointJournal.report.firstFrameRendererRecordSha256`,
   );
   exact(
+    navigationArm.record.payload.firstFrameReportRecordSha256,
+    reportBound.record.recordSha256,
+    `${location}.checkpointJournal.navigation-armed.firstFrameReportRecordSha256`,
+  );
+  exact(
+    navigationArm.record.payload.scriptSha256,
+    lock.runPolicy.navigationPolicy.scriptSha256,
+    `${location}.checkpointJournal.navigation-armed.scriptSha256`,
+  );
+  exact(
+    navigationArm.record.payload.stepCount,
+    lock.runPolicy.navigationPolicy.steps.length,
+    `${location}.checkpointJournal.navigation-armed.stepCount`,
+  );
+  exact(
+    navigationArm.record.payload.runCallOrigin,
+    navigationArm.record.payload.runSummary.issuedRunCalls,
+    `${location}.checkpointJournal.navigation-armed.runCallOrigin`,
+  );
+  exact(
+    navigationArm.record.payload.canonicalCycleOrigin,
+    navigationArm.record.payload.runSummary.canonicalCycle,
+    `${location}.checkpointJournal.navigation-armed.canonicalCycleOrigin`,
+  );
+  exact(
     witness.record.payload.baselineRecordSha256,
     baselineOwned.record.recordSha256,
     `${location}.checkpointJournal.witness.baselineRecordSha256`,
@@ -1312,6 +1382,49 @@ async function validateGameRun(
     acceptedOwned.record.recordSha256,
     `${location}.checkpointJournal.terminal.acceptedRecordSha256`,
   );
+  for (const [stepIndex, entry] of navigationSteps.entries()) {
+    exact(
+      entry.record.payload.stepIndex,
+      stepIndex,
+      `${location}.checkpointJournal.navigation-step-received[${stepIndex}].stepIndex`,
+    );
+    exact(
+      entry.record.payload.navigationArmRecordSha256,
+      navigationArm.record.recordSha256,
+      `${location}.checkpointJournal.navigation-step-received[${stepIndex}].navigationArmRecordSha256`,
+    );
+    exact(
+      entry.record.payload.scriptSha256,
+      lock.runPolicy.navigationPolicy.scriptSha256,
+      `${location}.checkpointJournal.navigation-step-received[${stepIndex}].scriptSha256`,
+    );
+  }
+  const lastNavigationStepRecordSha256 = navigationSteps.at(-1)?.record.recordSha256 ?? null;
+  for (const [entry, entryLocation] of [
+    [witness, "controller-witness-published"],
+    [terminal, "fidelity-terminal"],
+  ]) {
+    exact(
+      entry.record.payload.navigationScriptSha256,
+      lock.runPolicy.navigationPolicy.scriptSha256,
+      `${location}.checkpointJournal.${entryLocation}.navigationScriptSha256`,
+    );
+    exact(
+      entry.record.payload.navigationStepCount,
+      navigationSteps.length,
+      `${location}.checkpointJournal.${entryLocation}.navigationStepCount`,
+    );
+    exact(
+      entry.record.payload.navigationArmRecordSha256,
+      navigationArm.record.recordSha256,
+      `${location}.checkpointJournal.${entryLocation}.navigationArmRecordSha256`,
+    );
+    exact(
+      entry.record.payload.lastNavigationStepRecordSha256,
+      lastNavigationStepRecordSha256,
+      `${location}.checkpointJournal.${entryLocation}.lastNavigationStepRecordSha256`,
+    );
+  }
 
   exactJournalArtifact(
     initialized.record.payload,
@@ -1363,6 +1476,21 @@ async function validateGameRun(
 
   const reportEnvelope = report.game.adapterDiagnostics.final.machineEvidence;
   const reportMachine = machineWords(reportEnvelope);
+  exact(
+    navigationArm.record.payload.runCallOrigin,
+    report.game.run.slices,
+    `${location}.checkpointJournal.navigation-armed.runCallOrigin`,
+  );
+  exact(
+    BigInt(navigationArm.record.payload.canonicalCycleOrigin),
+    reportMachine.canonicalCycle,
+    `${location}.checkpointJournal.navigation-armed.canonicalCycleOrigin`,
+  );
+  exact(
+    BigInt(navigationArm.record.payload.siPollIndexOrigin),
+    reportMachine.si.pollIndex,
+    `${location}.checkpointJournal.navigation-armed.siPollIndexOrigin`,
+  );
   const terminalSummary = validateMachineEvidenceV1PublicationEnvelope(terminalEnvelope, {
     path: `${location}.terminalMachineEvidence`,
     expectedBoot: boot,
@@ -1589,6 +1717,56 @@ async function validateGameRun(
     terminalMachine.machineEpoch,
     `${location}.baselineGameFidelityRecord.machineEpoch`,
   );
+  if (retainedNavigationTranscript.length !== 0) {
+    const finalNavigation = retainedNavigationTranscript.at(-1);
+    const finalNavigationReceiptCycle = BigInt(finalNavigation.siObservedCycle);
+    if (
+      finalNavigationReceiptCycle > baselineRecord.armCycle
+      || finalNavigationReceiptCycle > baselineMachine.canonicalCycle
+    ) {
+      fail(
+        `${location}.navigationTranscript`,
+        "final authenticated SI receipt followed the Rust Baseline boundary",
+      );
+    }
+    const finalNavigationSequence = BigInt(finalNavigation.sequenceLo)
+      | BigInt(finalNavigation.sequenceHi) << 32n;
+    for (const [machine, machineLocation] of [
+      [baselineMachine, "baselineMachineEvidence"],
+      [preWitnessMachine, "preWitnessMachineEvidence"],
+    ]) {
+      exact(
+        machine.si.appliedSequence,
+        finalNavigationSequence,
+        `${location}.${machineLocation}.si.appliedSequence`,
+      );
+      exact(
+        machine.si.lastReceivedSequence,
+        finalNavigationSequence,
+        `${location}.${machineLocation}.si.lastReceivedSequence`,
+      );
+      if (
+        machine.si.pollIndex < BigInt(finalNavigation.siPollIndex)
+        || machine.si.observedCycle < finalNavigationReceiptCycle
+      ) {
+        fail(
+          `${location}.${machineLocation}.si`,
+          "preceded the final authenticated navigation receipt",
+        );
+      }
+      exact(
+        machine.si.packet.readUInt32BE(0),
+        finalNavigation.siPacketWord0,
+        `${location}.${machineLocation}.si.packetWord0`,
+      );
+      exact(
+        machine.si.packet.readUInt32BE(4),
+        finalNavigation.siPacketWord1,
+        `${location}.${machineLocation}.si.packetWord1`,
+      );
+      exact(machine.si.source, "periodic", `${location}.${machineLocation}.si.source`);
+    }
+  }
   if (baselineRecord.armCycle > baselineMachine.canonicalCycle) {
     fail(`${location}.baselineGameFidelityRecord.cycles.arm`, "followed its durable machine state");
   }
@@ -1693,8 +1871,13 @@ async function validateGameRun(
   }
   exact(
     run.operatorPublications.algorithm,
-    lock.capturePolicy.genericOperatorPolicy.algorithm,
+    lock.runPolicy.navigationPolicy.algorithm,
     `${location}.operatorPublications.algorithm`,
+  );
+  exact(
+    run.operatorPublications.scriptSha256,
+    lock.runPolicy.navigationPolicy.scriptSha256,
+    `${location}.operatorPublications.scriptSha256`,
   );
   nonNegativeInteger(
     run.operatorPublications.count,
@@ -1707,9 +1890,39 @@ async function validateGameRun(
     terminalMachine,
     `${location}.checkpointJournal.fidelity-terminal.runSummary`,
   );
+  if (
+    terminalMachine.canonicalCycle < readyMachine.canonicalCycle
+    || terminalMachine.executedCycles < readyMachine.executedCycles
+    || terminalMachine.executedInstructions < readyMachine.executedInstructions
+  ) {
+    fail(
+      `${location}.checkpointJournal.fidelity-terminal.runSummary`,
+      "terminal Rust authority regressed from resident-ready",
+    );
+  }
+  exact(
+    runSummary.reportedCanonicalCycles,
+    terminalMachine.canonicalCycle - readyMachine.canonicalCycle,
+    `${location}.checkpointJournal.fidelity-terminal.runSummary.reportedCanonicalCycles`,
+  );
+  exact(
+    runSummary.reportedCycles,
+    terminalMachine.executedCycles - readyMachine.executedCycles,
+    `${location}.checkpointJournal.fidelity-terminal.runSummary.reportedExecutedCycles`,
+  );
+  exact(
+    runSummary.reportedInstructions,
+    terminalMachine.executedInstructions - readyMachine.executedInstructions,
+    `${location}.checkpointJournal.fidelity-terminal.runSummary.reportedExecutedInstructions`,
+  );
   exact(
     run.operatorPublications.count,
     runSummary.operatorPublications,
+    `${location}.operatorPublications.count`,
+  );
+  exact(
+    run.operatorPublications.count,
+    lock.runPolicy.navigationPolicy.steps.length,
     `${location}.operatorPublications.count`,
   );
   const witnessSequence = BigInt(witness.record.payload.sequenceLo)

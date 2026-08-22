@@ -66,15 +66,27 @@ function putHostRequest(memory, pointer, record) {
   record.forEach((value, index) => view.setUint32(pointer + index * 4, value >>> 0, true));
 }
 
+function putPristineCaptureAuthority(memory, pointer) {
+  const bytes = 108;
+  new Uint8Array(memory.buffer, pointer, bytes).fill(0);
+  const view = new DataView(memory.buffer, pointer, bytes);
+  view.setUint32(0, 0x4c5a_4341, true);
+  view.setUint32(4, 2, true);
+  view.setUint32(8, bytes, true);
+}
+
 async function verifyRunCapClamping() {
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 1 });
   const outcomePointer = 0x1000;
+  const captureAuthorityPointer = 0x2000;
   putHostRequest(memory, outcomePointer, [1, 40, 0, 1, 0, 0, 0, 0, 0, 0]);
+  putPristineCaptureAuthority(memory, captureAuthorityPointer);
   const coordinatorCalls = [];
   const adapter = new ResidentMachineAdapter({
     memory,
     core: {
       core_abi_version() { return 1; },
+      core_capture_authority_snapshot() { return captureAuthorityPointer; },
       core_di_pending_count() { return 0; },
     },
     dispatcher: { blocks: { length: 1 } },
@@ -421,12 +433,14 @@ async function verifyDiPublishedDuringCoordinatorRun() {
   const staleOutcomePointer = 0x1000;
   const completedOutcomePointer = 0x1100;
   const stagingPointer = 0x2000;
+  const captureAuthorityPointer = 0x3000;
   const descriptor = [7, 0, 11, 0, 0x40, 0, 4];
   const payload = Uint8Array.from([0xca, 0xfe, 0xba, 0xbe]);
   // This is the exact transient Rust state after an install commits: the old CompileRequired
   // outcome remains readable, but its request pointer and authoritative host copy are consumed.
   putHostRequest(memory, staleOutcomePointer, [1, 40, 1, 2, 5, 0, 3, 0, 0, 0]);
   putHostRequest(memory, completedOutcomePointer, [1, 40, 0, 2, 9, 0, 7, 0, 0, 0]);
+  putPristineCaptureAuthority(memory, captureAuthorityPointer);
 
   let pending = 0;
   let coordinatorCalls = 0;
@@ -435,6 +449,7 @@ async function verifyDiPublishedDuringCoordinatorRun() {
   let publishDiWithCompletedOutcome = false;
   const core = {
     core_abi_version() { return 1; },
+    core_capture_authority_snapshot() { return captureAuthorityPointer; },
     core_di_pending_count() { return pending; },
     core_di_request_epoch_lo() { return descriptor[0]; },
     core_di_request_epoch_hi() { return descriptor[1]; },

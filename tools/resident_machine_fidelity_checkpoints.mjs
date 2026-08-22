@@ -4,8 +4,9 @@ export const FIDELITY_CHECKPOINT_SCHEMA =
   "lazuli-resident-renderer-fidelity-checkpoint-v1";
 export const FIDELITY_CHECKPOINT_ACK_SCHEMA =
   "lazuli-resident-renderer-fidelity-checkpoint-ack-v1";
-export const PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP = "1250000000";
-export const PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = "2500000000";
+export const PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP = "16000000000";
+export const PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = "32000000000";
+export const PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP = "32000000000";
 export const PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP = 0x000f_ffff;
 export const PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP = 65;
 
@@ -39,6 +40,7 @@ function nonnegativeInteger(value, label) {
 const CAPTURE_RUN_POLICY_FIELDS = Object.freeze([
   "instructionUpperCap",
   "executedCycleUpperCap",
+  "canonicalCycleUpperCap",
   "sliceCycleUpperCap",
   "blockUpperCap",
   "totalHostCallCap",
@@ -50,12 +52,16 @@ const CAPTURE_RUN_POLICY_FIELDS = Object.freeze([
   "externalWallTimeoutMs",
   "zeroProgressSliceCap",
   "workerUrl",
+  "navigationPolicy",
 ]);
 const CAPTURE_RUN_SUMMARY_FIELDS = Object.freeze([
   "schema",
   "issuedRunCalls",
+  "canonicalCycle",
+  "reportedCanonicalCycles",
   "reportedExecutedCycles",
   "reportedExecutedInstructions",
+  "reportedRetiredBlocks",
   "reportedHostCalls",
   "reportedColdInstalls",
   "zeroProgressSlices",
@@ -86,11 +92,68 @@ function decimalString(value, label) {
   return value;
 }
 
-function captureRunPolicy(value) {
+function captureNavigationPolicy(value, label) {
+  exactObjectKeys(value, [
+    "schema", "gameKey", "algorithm", "cycleOrigin", "controllerEncoding",
+    "targetAnchor", "receiptSource", "periodicSiCycles", "maximumReceiptLatencyCycles",
+    "maximumPublications", "scriptSha256", "steps",
+  ], label);
+  if (value.schema !== "lazuli-resident-pre-baseline-navigation-v1") {
+    throw new Error(`${label} schema changed`);
+  }
+  if (typeof value.gameKey !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value.gameKey)) {
+    throw new Error(`${label} gameKey changed`);
+  }
+  if (value.algorithm !== "locked-si-observed-not-before-publication-v1") {
+    throw new Error(`${label} algorithm changed`);
+  }
+  if (
+    value.cycleOrigin !== "durable-first-frame-canonical-scheduler-cycle"
+    || value.controllerEncoding !== "gamecube-packed-controller-v1"
+    || value.targetAnchor !== "prior-si-observed-cycle"
+    || value.receiptSource !== "periodic"
+    || value.periodicSiCycles !== "8108100"
+    || value.maximumReceiptLatencyCycles !== "16108100"
+    || value.maximumPublications !== PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP
+    || typeof value.scriptSha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.scriptSha256)
+    || !Array.isArray(value.steps)
+    || value.steps.length > value.maximumPublications
+  ) throw new Error(`${label} authority changed`);
+  const steps = value.steps.map((step, index) => {
+    const stepLabel = `${label}.steps[${index}]`;
+    exactObjectKeys(step, [
+      "minimumCanonicalDelay", "buttons", "stickXyCxy", "triggerLrab",
+    ], stepLabel);
+    decimalString(step.minimumCanonicalDelay, `${stepLabel} minimum canonical delay`);
+    if (BigInt(step.minimumCanonicalDelay) === 0n) {
+      throw new Error(`${stepLabel} minimum canonical delay must be positive`);
+    }
+    for (const field of ["buttons", "stickXyCxy", "triggerLrab"]) {
+      uint32(step[field], `${stepLabel} ${field}`);
+    }
+    if ((step.buttons & ~0x0000_1f7f) !== 0) {
+      throw new Error(`${stepLabel} buttons include reserved bits`);
+    }
+    return Object.freeze(structuredClone(step));
+  });
+  if (steps.length !== 0) {
+    const terminal = steps.at(-1);
+    if (
+      terminal.buttons !== 0
+      || terminal.stickXyCxy !== 0x8080_8080
+      || terminal.triggerLrab !== 0
+    ) throw new Error(`${label} does not end neutral`);
+  }
+  return Object.freeze({ ...structuredClone(value), steps: Object.freeze(steps) });
+}
+
+export function captureRunPolicy(value) {
   exactObjectKeys(value, CAPTURE_RUN_POLICY_FIELDS, "capture runPolicy");
   const result = structuredClone(value);
   for (const field of [
-    "instructionUpperCap", "executedCycleUpperCap", "sliceCycleUpperCap",
+    "instructionUpperCap", "executedCycleUpperCap", "canonicalCycleUpperCap",
+    "sliceCycleUpperCap",
   ]) {
     decimalString(result[field], `capture runPolicy ${field}`);
     if (BigInt(result[field]) === 0n) throw new Error(`capture runPolicy ${field} must be positive`);
@@ -103,20 +166,30 @@ function captureRunPolicy(value) {
   if (typeof result.workerUrl !== "string" || !result.workerUrl.startsWith("/")) {
     throw new Error("capture runPolicy workerUrl must be a same-origin absolute path");
   }
-  if (BigInt(result.sliceCycleUpperCap) > BigInt(result.executedCycleUpperCap)) {
-    throw new Error("capture runPolicy slice cycle cap exceeds total cycle cap");
+  if (
+    BigInt(result.sliceCycleUpperCap) > BigInt(result.executedCycleUpperCap)
+    || BigInt(result.sliceCycleUpperCap) > BigInt(result.canonicalCycleUpperCap)
+  ) {
+    throw new Error("capture runPolicy slice cycle cap exceeds a total cycle cap");
   }
+  result.navigationPolicy = captureNavigationPolicy(
+    result.navigationPolicy,
+    "capture runPolicy navigationPolicy",
+  );
   return Object.freeze(result);
 }
 
-function captureRunSummary(value, policy, label, accepted) {
+export function captureRunSummary(value, policy, label, accepted) {
   exactObjectKeys(value, CAPTURE_RUN_SUMMARY_FIELDS, label);
   const result = structuredClone(value);
-  if (result.schema !== "lazuli-resident-cumulative-run-summary-v1") {
+  if (result.schema !== "lazuli-resident-cumulative-run-summary-v2") {
     throw new Error(`${label} schema changed`);
   }
+  decimalString(result.canonicalCycle, `${label} canonical cycle`);
+  decimalString(result.reportedCanonicalCycles, `${label} reported canonical cycles`);
   decimalString(result.reportedExecutedCycles, `${label} reported executed cycles`);
   decimalString(result.reportedExecutedInstructions, `${label} reported executed instructions`);
+  decimalString(result.reportedRetiredBlocks, `${label} reported retired blocks`);
   for (const field of [
     "issuedRunCalls", "reportedHostCalls", "reportedColdInstalls", "zeroProgressSlices",
     "consecutiveZeroProgressSlices", "maximumConsecutiveZeroProgressSlices",
@@ -131,7 +204,8 @@ function captureRunSummary(value, policy, label, accepted) {
     throw new Error(`${label} wall authority changed or exhausted`);
   }
   if (
-    BigInt(result.reportedExecutedCycles) > BigInt(policy.executedCycleUpperCap)
+    BigInt(result.reportedCanonicalCycles) > BigInt(policy.canonicalCycleUpperCap)
+    || BigInt(result.reportedExecutedCycles) > BigInt(policy.executedCycleUpperCap)
     || BigInt(result.reportedExecutedInstructions) > BigInt(policy.instructionUpperCap)
     || result.reportedHostCalls > policy.totalHostCallCap
     || result.reportedColdInstalls > policy.totalColdInstallCap
@@ -143,6 +217,175 @@ function captureRunSummary(value, policy, label, accepted) {
     throw new Error(`${label} exceeded the frozen cumulative authority`);
   }
   return Object.freeze(result);
+}
+
+function expectedNavigationSiPacket(step, mode) {
+  const word0 = (
+    ((step.buttons >>> 8) & 0xff) << 24
+    | (((step.buttons & 0xff) | 0x80) & 0xff) << 16
+    | (step.stickXyCxy & 0xff) << 8
+    | ((step.stickXyCxy >>> 8) & 0xff)
+  ) >>> 0;
+  const cStickX = (step.stickXyCxy >>> 16) & 0xff;
+  const cStickY = (step.stickXyCxy >>> 24) & 0xff;
+  const triggerL = step.triggerLrab & 0xff;
+  const triggerR = (step.triggerLrab >>> 8) & 0xff;
+  const analogA = (step.triggerLrab >>> 16) & 0xff;
+  const analogB = (step.triggerLrab >>> 24) & 0xff;
+  const low = mode === 0 || (mode >= 5 && mode <= 7)
+    ? [cStickX, cStickY, (triggerL & 0xf0) | (triggerR >>> 4),
+      (analogA & 0xf0) | (analogB >>> 4)]
+    : mode === 1
+      ? [(cStickX & 0xf0) | (cStickY >>> 4), triggerL, triggerR,
+        (analogA & 0xf0) | (analogB >>> 4)]
+      : mode === 2
+        ? [(cStickX & 0xf0) | (cStickY >>> 4),
+          (triggerL & 0xf0) | (triggerR >>> 4), analogA, analogB]
+        : mode === 4
+          ? [cStickX, cStickY, analogA, analogB]
+          : [cStickX, cStickY, triggerL, triggerR];
+  const word1 = (low[0] << 24 | low[1] << 16 | low[2] << 8 | low[3]) >>> 0;
+  return { word0, word1 };
+}
+
+export function captureNavigationRuntime(value, runPolicy, label) {
+  const policy = runPolicy.navigationPolicy;
+  exactObjectKeys(value, [
+    "schema", "scriptSha256", "stepCount", "durableSteps", "complete",
+    "runCallOrigin", "canonicalCycleOrigin", "siPollIndexOrigin",
+    "lastReceiptObservedCanonicalCycle",
+    "nextTargetCanonicalCycle", "pendingPublication", "transcript",
+  ], label);
+  if (
+    value.schema !== "lazuli-resident-navigation-runtime-v2"
+    || value.scriptSha256 !== policy.scriptSha256
+    || value.stepCount !== policy.steps.length
+    || nonnegativeInteger(value.durableSteps, `${label} durable steps`) > value.stepCount
+    || typeof value.complete !== "boolean"
+    || nonnegativeInteger(value.runCallOrigin, `${label} run-call origin`) < 0
+    || decimalString(value.canonicalCycleOrigin, `${label} canonical-cycle origin`) === null
+    || decimalString(value.siPollIndexOrigin, `${label} SI poll-index origin`) === null
+    || !Array.isArray(value.transcript)
+    || value.transcript.length !== value.durableSteps
+  ) throw new Error(`${label} authority changed`);
+  let priorSequence = -1n;
+  let priorPollIndex = BigInt(value.siPollIndexOrigin);
+  let priorAnchor = BigInt(value.canonicalCycleOrigin);
+  const transcript = value.transcript.map((entry, index) => {
+    const entryLabel = `${label}.transcript[${index}]`;
+    exactObjectKeys(entry, [
+      "stepIndex", "sequenceLo", "sequenceHi", "minimumCanonicalDelay",
+      "targetCanonicalCycle", "publicationCanonicalCycle", "publicationOvershootCycles",
+      "buttons", "stickXyCxy", "triggerLrab", "status", "siPollIndex",
+      "siScheduledCycle", "siObservedCycle", "siAppliedSequenceLo", "siAppliedSequenceHi",
+      "siPacketWord0", "siPacketWord1", "siSource", "priorSiPollIndex",
+      "siControllerMode", "siButtons", "siStickXyCxy", "siTriggerLrab",
+    ], entryLabel);
+    const step = policy.steps[index];
+    const sequenceLo = uint32(entry.sequenceLo, `${entryLabel} sequenceLo`);
+    const sequenceHi = uint32(entry.sequenceHi, `${entryLabel} sequenceHi`);
+    const sequence = BigInt(sequenceHi) << 32n | BigInt(sequenceLo);
+    const target = priorAnchor + BigInt(step.minimumCanonicalDelay);
+    const publication = BigInt(decimalString(
+      entry.publicationCanonicalCycle,
+      `${entryLabel} publication canonical cycle`,
+    ));
+    const overshoot = BigInt(decimalString(
+      entry.publicationOvershootCycles,
+      `${entryLabel} publication overshoot`,
+    ));
+    const scheduled = BigInt(decimalString(entry.siScheduledCycle, `${entryLabel} SI scheduled`));
+    const observed = BigInt(decimalString(entry.siObservedCycle, `${entryLabel} SI observed`));
+    const mode = uint32(entry.siControllerMode, `${entryLabel} SI controller mode`);
+    const packet = expectedNavigationSiPacket(step, mode);
+    const pollIndex = BigInt(decimalString(entry.siPollIndex, `${entryLabel} SI poll index`));
+    const priorRecordedPoll = BigInt(decimalString(
+      entry.priorSiPollIndex,
+      `${entryLabel} prior SI poll index`,
+    ));
+    if (
+      entry.stepIndex !== index
+      || entry.minimumCanonicalDelay !== step.minimumCanonicalDelay
+      || decimalString(entry.targetCanonicalCycle, `${entryLabel} target canonical cycle`)
+        !== target.toString()
+      || publication < target
+      || overshoot !== publication - target
+      || overshoot > BigInt(runPolicy.sliceCycleUpperCap)
+      || uint32(entry.buttons, `${entryLabel} buttons`) !== step.buttons
+      || uint32(entry.stickXyCxy, `${entryLabel} sticks`) !== step.stickXyCxy
+      || uint32(entry.triggerLrab, `${entryLabel} triggers`) !== step.triggerLrab
+      || entry.status !== 1
+      || sequence <= priorSequence
+      || priorRecordedPoll < priorPollIndex
+      || pollIndex <= priorRecordedPoll
+      || scheduled < publication
+      || observed < scheduled
+      || scheduled - publication > BigInt(policy.periodicSiCycles)
+      || observed - publication > BigInt(policy.maximumReceiptLatencyCycles)
+      || uint32(entry.siAppliedSequenceLo, `${entryLabel} SI sequenceLo`) !== sequenceLo
+      || uint32(entry.siAppliedSequenceHi, `${entryLabel} SI sequenceHi`) !== sequenceHi
+      || uint32(entry.siPacketWord0, `${entryLabel} SI packet word 0`) !== packet.word0
+      || uint32(entry.siPacketWord1, `${entryLabel} SI packet word 1`) !== packet.word1
+      || entry.siSource !== 0
+      || mode > 7
+      || uint32(entry.siButtons, `${entryLabel} SI buttons`) !== step.buttons
+      || uint32(entry.siStickXyCxy, `${entryLabel} SI sticks`) !== step.stickXyCxy
+      || uint32(entry.siTriggerLrab, `${entryLabel} SI triggers`) !== step.triggerLrab
+    ) throw new Error(`${entryLabel} changed its locked publication`);
+    priorSequence = sequence;
+    priorPollIndex = pollIndex;
+    priorAnchor = observed;
+    return Object.freeze(structuredClone(entry));
+  });
+  const expectedLast = transcript.length === 0 ? null : priorAnchor.toString();
+  const nextStep = policy.steps[transcript.length] ?? null;
+  const expectedNext = nextStep === null
+    ? null
+    : (priorAnchor + BigInt(nextStep.minimumCanonicalDelay)).toString();
+  if (
+    value.lastReceiptObservedCanonicalCycle !== expectedLast
+    || value.nextTargetCanonicalCycle !== expectedNext
+    || value.complete !== (value.durableSteps === value.stepCount && value.pendingPublication === null)
+  ) throw new Error(`${label} derived chronology changed`);
+  if (value.pendingPublication !== null) {
+    if (value.durableSteps >= value.stepCount) throw new Error(`${label} has a terminal pending step`);
+    const pending = value.pendingPublication;
+    const pendingLabel = `${label}.pendingPublication`;
+    exactObjectKeys(pending, [
+      "stepIndex", "sequenceLo", "sequenceHi", "minimumCanonicalDelay",
+      "targetCanonicalCycle", "publicationCanonicalCycle", "publicationOvershootCycles",
+      "buttons", "stickXyCxy", "triggerLrab", "status", "priorSiPollIndex",
+    ], pendingLabel);
+    const step = policy.steps[value.durableSteps];
+    const target = priorAnchor + BigInt(step.minimumCanonicalDelay);
+    const publication = BigInt(decimalString(
+      pending.publicationCanonicalCycle,
+      `${pendingLabel} publication canonical cycle`,
+    ));
+    const pendingSequenceLo = uint32(pending.sequenceLo, `${pendingLabel} sequenceLo`);
+    const pendingSequenceHi = uint32(pending.sequenceHi, `${pendingLabel} sequenceHi`);
+    const pendingSequence = BigInt(pendingSequenceHi) << 32n | BigInt(pendingSequenceLo);
+    const pendingPriorPoll = BigInt(decimalString(
+      pending.priorSiPollIndex,
+      `${pendingLabel} prior SI poll index`,
+    ));
+    if (
+      pending.stepIndex !== value.durableSteps
+      || pending.minimumCanonicalDelay !== step.minimumCanonicalDelay
+      || pending.targetCanonicalCycle !== target.toString()
+      || BigInt(decimalString(pending.publicationOvershootCycles, `${pendingLabel} overshoot`))
+        !== publication - target
+      || publication < target
+      || publication - target > BigInt(runPolicy.sliceCycleUpperCap)
+      || pending.buttons !== step.buttons
+      || pending.stickXyCxy !== step.stickXyCxy
+      || pending.triggerLrab !== step.triggerLrab
+      || pending.status !== 1
+      || pendingSequence <= priorSequence
+      || pendingPriorPoll < priorPollIndex
+    ) throw new Error(`${pendingLabel} changed its locked publication`);
+  }
+  return Object.freeze({ ...structuredClone(value), transcript: Object.freeze(transcript) });
 }
 
 function digest(value, label) {
@@ -294,6 +537,11 @@ export class ResidentFidelityCheckpointClient {
     this.baselineRecordSha256 = null;
     this.baselineRequestedController = null;
     this.firstFrameReportRecordSha256 = null;
+    this.navigationArmRecordSha256 = null;
+    this.navigationStepRecordSha256s = [];
+    this.navigationTranscript = [];
+    this.navigationRunCallOrigin = null;
+    this.navigationCycleOrigin = null;
     this.witnessRecordSha256 = null;
     this.acceptedRecordSha256 = null;
     this.acceptedArtifacts = null;
@@ -630,6 +878,19 @@ export class ResidentFidelityCheckpointClient {
     if (kind === "fidelity-baseline-owned" && this.baselineRecordSha256 !== null) {
       throw new Error("Baseline ownership was already checkpointed");
     }
+    if (
+      kind === "fidelity-baseline-owned"
+      && this.captureRunPolicy !== null
+      && (
+        this.navigationTranscript.length !== this.captureRunPolicy.navigationPolicy.steps.length
+        || (
+          this.captureRunPolicy.navigationPolicy.steps.length !== 0
+          && this.navigationArmRecordSha256 === null
+        )
+      )
+    ) {
+      throw new Error("Baseline ownership requires the complete locked navigation transcript");
+    }
     if (kind === "fidelity-accepted-owned") {
       if (this.acceptedRecordSha256 !== null) {
         throw new Error("Accepted ownership was already checkpointed");
@@ -762,12 +1023,165 @@ export class ResidentFidelityCheckpointClient {
     return ack;
   }
 
+  async navigationArmed(value) {
+    if (this.firstFrameReportRecordSha256 === null) {
+      throw new Error("navigation arm requires the durable first-frame report");
+    }
+    if (
+      this.navigationArmRecordSha256 !== null
+      || (
+        this.baselineRecordSha256 !== null
+        && this.captureRunPolicy.navigationPolicy.steps.length !== 0
+      )
+    ) {
+      throw new Error("navigation arm was not one-shot before Baseline");
+    }
+    if (value.machineSessionId !== this.machineSessionId) {
+      throw new Error("navigation arm changed the capture machine session");
+    }
+    const navigation = captureNavigationRuntime(
+      value.navigation,
+      this.captureRunPolicy,
+      "navigation arm runtime",
+    );
+    const runSummary = captureRunSummary(
+      value.runSummary,
+      this.captureRunPolicy,
+      "navigation arm cumulative run summary",
+      false,
+    );
+    if (
+      navigation.durableSteps !== 0
+      || navigation.pendingPublication !== null
+      || navigation.runCallOrigin !== runSummary.issuedRunCalls
+      || navigation.canonicalCycleOrigin !== runSummary.canonicalCycle
+      || runSummary.operatorPublications !== 0
+      || runSummary.witnessPublications !== 0
+    ) {
+      throw new Error("navigation arm did not bind the first-frame scheduler authority");
+    }
+    const ack = await this.append("navigation-armed", {
+      machineSessionId: this.machineSessionId,
+      firstFrameReportRecordSha256: this.firstFrameReportRecordSha256,
+      scriptSha256: navigation.scriptSha256,
+      runCallOrigin: navigation.runCallOrigin,
+      canonicalCycleOrigin: navigation.canonicalCycleOrigin,
+      siPollIndexOrigin: navigation.siPollIndexOrigin,
+      stepCount: navigation.stepCount,
+      runSummary,
+    });
+    this.throwIfFailed();
+    this.navigationArmRecordSha256 = ack.recordSha256;
+    this.navigationRunCallOrigin = navigation.runCallOrigin;
+    this.navigationCycleOrigin = navigation.canonicalCycleOrigin;
+    return ack;
+  }
+
+  async navigationStepReceived(value) {
+    if (this.firstFrameReportRecordSha256 === null || this.navigationArmRecordSha256 === null) {
+      throw new Error("navigation SI receipt requires the durable first-frame report");
+    }
+    if (
+      this.baselineRecordSha256 !== null
+      || this.witnessRecordSha256 !== null
+      || this.acceptedRecordSha256 !== null
+    ) {
+      throw new Error("navigation SI receipt must precede Baseline and the controller witness");
+    }
+    if (value.machineSessionId !== this.machineSessionId) {
+      throw new Error("navigation SI receipt changed the capture machine session");
+    }
+    const policy = this.captureRunPolicy.navigationPolicy;
+    const stepIndex = this.navigationTranscript.length;
+    const expected = policy.steps[stepIndex];
+    if (expected === undefined) {
+      throw new Error("navigation SI receipt exceeded the locked script");
+    }
+    const navigation = captureNavigationRuntime(
+      value.navigation,
+      this.captureRunPolicy,
+      "navigation SI receipt runtime",
+    );
+    const runCallOrigin = navigation.runCallOrigin;
+    const canonicalCycleOrigin = navigation.canonicalCycleOrigin;
+    if (this.navigationRunCallOrigin === null) {
+      this.navigationRunCallOrigin = runCallOrigin;
+      this.navigationCycleOrigin = canonicalCycleOrigin;
+    } else if (
+      runCallOrigin !== this.navigationRunCallOrigin
+      || canonicalCycleOrigin !== this.navigationCycleOrigin
+    ) {
+      throw new Error("navigation SI receipt changed its armed origin");
+    }
+    const step = navigation.transcript.at(-1);
+    if (
+      navigation.durableSteps !== stepIndex + 1
+      || JSON.stringify(navigation.transcript.slice(0, -1))
+        !== JSON.stringify(this.navigationTranscript)
+      || JSON.stringify(value.navigationStep) !== JSON.stringify(step)
+      || step.minimumCanonicalDelay !== expected.minimumCanonicalDelay
+    ) {
+      throw new Error("navigation SI receipt changed its exact locked step");
+    }
+    const runSummary = captureRunSummary(
+      value.runSummary,
+      this.captureRunPolicy,
+      "navigation cumulative run summary",
+      false,
+    );
+    if (
+      runSummary.operatorPublications !== stepIndex + 1
+      || runSummary.witnessPublications !== 0
+      || BigInt(runSummary.canonicalCycle) < BigInt(step.siObservedCycle)
+      || runSummary.issuedRunCalls < runCallOrigin
+    ) {
+      throw new Error("navigation cumulative authority diverged from its SI receipt");
+    }
+    const durableStep = Object.freeze(structuredClone(step));
+    const ack = await this.append("navigation-step-received", {
+      machineSessionId: this.machineSessionId,
+      firstFrameReportRecordSha256: this.firstFrameReportRecordSha256,
+      navigationArmRecordSha256: this.navigationArmRecordSha256,
+      scriptSha256: navigation.scriptSha256,
+      runCallOrigin,
+      canonicalCycleOrigin,
+      ...durableStep,
+      runSummary,
+    });
+    this.throwIfFailed();
+    this.navigationTranscript.push(durableStep);
+    this.navigationStepRecordSha256s.push(ack.recordSha256);
+    return ack;
+  }
+
   async controllerWitnessPublished(value) {
     if (this.baselineRecordSha256 === null || this.firstFrameReportRecordSha256 === null) {
       throw new Error("controller witness requires durable Baseline and first-frame report");
     }
     if (this.witnessRecordSha256 !== null) {
       throw new Error("controller witness was already checkpointed");
+    }
+    const navigation = captureNavigationRuntime(
+      value.navigation,
+      this.captureRunPolicy,
+      "controller witness navigation runtime",
+    );
+    const runSummary = captureRunSummary(
+      value.runSummary,
+      this.captureRunPolicy,
+      "controller witness cumulative run summary",
+      false,
+    );
+    if (
+      !navigation.complete
+      || navigation.runCallOrigin !== (this.navigationRunCallOrigin ?? navigation.runCallOrigin)
+      || navigation.canonicalCycleOrigin
+        !== (this.navigationCycleOrigin ?? navigation.canonicalCycleOrigin)
+      || JSON.stringify(navigation.transcript) !== JSON.stringify(this.navigationTranscript)
+      || runSummary.operatorPublications !== navigation.durableSteps
+      || runSummary.witnessPublications !== 1
+    ) {
+      throw new Error("controller witness lacked the complete durable navigation authority");
     }
     if (
       value.buttons !== this.baselineRequestedController?.requestedButtons
@@ -803,6 +1217,11 @@ export class ResidentFidelityCheckpointClient {
       machineEvidenceEnvelopeSha256: machineEvidenceEnvelope.sha256,
       machineEvidenceOpaqueBytes: machineEvidenceOpaque.bytes,
       machineEvidenceOpaqueSha256: machineEvidenceOpaque.sha256,
+      navigationScriptSha256: navigation.scriptSha256,
+      navigationStepCount: navigation.durableSteps,
+      navigationArmRecordSha256: this.navigationArmRecordSha256,
+      lastNavigationStepRecordSha256: this.navigationStepRecordSha256s.at(-1) ?? null,
+      runSummary,
     });
     this.throwIfFailed();
     this.witnessRecordSha256 = ack.recordSha256;
@@ -843,6 +1262,18 @@ export class ResidentFidelityCheckpointClient {
     if (runSummary.issuedRunCalls <= 0 || runSummary.witnessPublications !== 1) {
       throw new Error("terminal cumulative run summary omitted run/witness authority");
     }
+    const navigation = captureNavigationRuntime(
+      value.navigation,
+      this.captureRunPolicy,
+      "terminal navigation runtime",
+    );
+    if (
+      !navigation.complete
+      || navigation.durableSteps !== runSummary.operatorPublications
+      || JSON.stringify(navigation.transcript) !== JSON.stringify(this.navigationTranscript)
+    ) {
+      throw new Error("terminal navigation runtime differed from the durable transcript");
+    }
     const ack = await this.append("fidelity-terminal", {
       machineSessionId: this.machineSessionId,
       phase: 5,
@@ -850,6 +1281,10 @@ export class ResidentFidelityCheckpointClient {
       acceptedRecordSha256: this.acceptedRecordSha256,
       ...artifactFields,
       runSummary,
+      navigationScriptSha256: navigation.scriptSha256,
+      navigationStepCount: navigation.durableSteps,
+      navigationArmRecordSha256: this.navigationArmRecordSha256,
+      lastNavigationStepRecordSha256: this.navigationStepRecordSha256s.at(-1) ?? null,
     });
     this.throwIfFailed();
     this.terminalRecordSha256 = ack.recordSha256;
@@ -874,6 +1309,8 @@ export class ResidentFidelityCheckpointClient {
       maximumProbeEventsPerSubmission: this.maximumProbeEventsPerSubmission,
       probeRelayFailures: this.probeRelayFailures,
       kindCounts: Object.freeze({ ...this.kindCounts }),
+      navigationStepRecords: this.navigationStepRecordSha256s.length,
+      navigationArmRecordSha256: this.navigationArmRecordSha256,
       firstRecordSha256: this.firstRecordSha256,
       lastRecordSha256: this.lastRecordSha256,
       lastServerSequence: this.lastServerSequence,

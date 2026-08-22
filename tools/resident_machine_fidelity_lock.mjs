@@ -10,13 +10,21 @@ import { fileURLToPath } from "node:url";
 
 import { validateRelease } from "../web/release.mjs";
 import {
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
 } from "./resident_machine_fidelity_checkpoints.mjs";
+import {
+  PRODUCTION_FIDELITY_NAVIGATION_ALGORITHM,
+  PRODUCTION_FIDELITY_NAVIGATION_PUBLICATION_CAP,
+  PRODUCTION_FIDELITY_NAVIGATION_SCHEMA,
+  productionFidelityNavigationPolicy,
+} from "./resident_machine_fidelity_navigation.mjs";
 
 export {
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
@@ -70,6 +78,7 @@ export const PRODUCTION_SOURCE_PATHS = Object.freeze([
     && source !== "web/resident-machine-worker.mjs"
   ),
   "tools/resident_machine_game_fidelity_v1.mjs",
+  "tools/resident_machine_fidelity_navigation.mjs",
   "tools/resident_machine_production_fidelity_capture.mjs",
   "tools/resident_machine_production_fidelity_local.mjs",
   "tools/resident_machine_production_fidelity_bundle.mjs",
@@ -216,7 +225,7 @@ export function productionFidelityCapturePolicy(gameKey) {
     captureMachineInitializedBeforeProgress: true,
     cumulativeRunCapsAfterAuthenticatedReady: true,
     cumulativeRunLedger: {
-      schema: "lazuli-resident-cumulative-run-summary-v1",
+      schema: "lazuli-resident-cumulative-run-summary-v2",
       policySource: "locked-runPolicy",
       startsAt: "resident-ready",
       endsAt: "fidelity-accepted-owned",
@@ -228,22 +237,36 @@ export function productionFidelityCapturePolicy(gameKey) {
     minimumPresentationDeltaFromFirstFrame: 64,
     fidelityStatePollAfterEveryRun: true,
     observationAckAfterDurableOwnership: true,
+    navigationArmCheckpointAckBeforeProgress: true,
+    navigationReceiptCheckpointAckBeforeFurtherProgress: true,
     witnessCheckpointAckBeforeProgress: true,
     acceptedIsHardMachineProgressBoundary: true,
     terminalStateQueryOnlyAfterAccepted: true,
     terminalOpaqueArtifactsEqualAccepted: true,
     firstFrameReportUsesPreBindingJournalPrefix: true,
     sameReceiptBaselineReusesFirstFrameReadback: true,
-    genericOperatorInputBeforeBaseline: true,
-    genericOperatorPolicy: {
-      algorithm: "alternating-neutral-a-v1",
-      runBoundaryOrigin: "post-first-frame-report-local-zero",
-      runBoundaryInterval: 8,
-      maximumPublications: PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
-      startsWith: "neutral",
-      neutral: { buttons: 0, stickXyCxy: 0x8080_8080, triggerLrab: 0 },
-      a: { buttons: 0x0100, stickXyCxy: 0x8080_8080, triggerLrab: 0x00ff_0000 },
+    lockedNavigationInputBeforeBaseline:
+      productionFidelityNavigationPolicy(gameKey).steps.length !== 0,
+    lockedNavigationPolicy: {
+      schema: PRODUCTION_FIDELITY_NAVIGATION_SCHEMA,
+      algorithm: PRODUCTION_FIDELITY_NAVIGATION_ALGORITHM,
+      policySource: "locked-runPolicy.navigationPolicy",
+      commandTimeControllerWords: 0,
+      workerOwnedSequenceNumbers: true,
+      armPhase: productionFidelityNavigationPolicy(gameKey).steps.length === 0
+        ? "phase-0-or-baseline"
+        : "phase-0",
+      publicationPhase: 0,
+      maximumPublications: PRODUCTION_FIDELITY_NAVIGATION_PUBLICATION_CAP,
+      completeScriptBeforeBaseline: true,
+      terminalNeutralRequired: true,
+      firstFrameCanonicalOriginBound: true,
+      notBeforePriorAuthenticatedSiObservedCycle: true,
+      maximumOvershootSource: "locked-runPolicy.sliceCycleUpperCap",
+      exactQueuedStatusRequired: true,
+      periodicSiReceiptRequired: true,
     },
+    durableNavigationTranscript: true,
     rustRequestedWitnessOnly: true,
     artifactDigestPolicy: {
       json: "recursive-key-canonical-utf8",
@@ -257,11 +280,14 @@ export function productionFidelityCapturePolicy(gameKey) {
       opaqueRecords: "decoded-canonical-padded-base64",
       metadata: "recursive-key-canonical-utf8",
       rgba: "raw-owned-bytes",
+      navigationTranscript: "recursive-key-canonical-utf8",
     },
     requiredCheckpointCardinality: {
       "capture-machine-initialized": 1,
       "first-frame-renderer-owned": 1,
       "first-frame-report-bound": 1,
+      "navigation-armed": 1,
+      "navigation-step-received": productionFidelityNavigationPolicy(gameKey).steps.length,
       "fidelity-baseline-owned": 1,
       "controller-witness-published": 1,
       "fidelity-accepted-owned": 1,
@@ -273,7 +299,14 @@ export function productionFidelityCapturePolicy(gameKey) {
       ["capture-machine-initialized", "first-frame-report-bound"],
       ["first-frame-renderer-owned", "first-frame-report-bound"],
       ["first-frame-renderer-owned", "fidelity-baseline-owned"],
+      ["first-frame-report-bound", "navigation-armed"],
+      ...(productionFidelityNavigationPolicy(gameKey).steps.length === 0 ? [] : [
+        ["navigation-armed", "fidelity-baseline-owned"],
+        ["navigation-armed", "navigation-step-received"],
+        ["navigation-step-received", "fidelity-baseline-owned"],
+      ]),
       ["first-frame-report-bound", "controller-witness-published"],
+      ["navigation-armed", "controller-witness-published"],
       ["fidelity-baseline-owned", "controller-witness-published"],
       ["controller-witness-published", "fidelity-accepted-owned"],
       ["fidelity-accepted-owned", "fidelity-terminal"],
@@ -353,7 +386,11 @@ export function validateResidentFidelityEvidenceLock(value) {
   };
   exactKeys(lock.runPolicy, Object.keys(exactRunPolicy), "$.runPolicy");
   for (const [field, expected] of Object.entries(exactRunPolicy)) {
-    exact(lock.runPolicy[field], expected, `$.runPolicy.${field}`);
+    if (field === "navigationPolicy") {
+      exactCanonical(lock.runPolicy[field], expected, `$.runPolicy.${field}`);
+    } else {
+      exact(lock.runPolicy[field], expected, `$.runPolicy.${field}`);
+    }
   }
 
   const exactCheckpointPolicy = {
@@ -532,21 +569,27 @@ export function validateResidentProductionFidelityEvidenceLock(value, expectedAu
   const exactRunPolicy = {
     instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
     executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
-    sliceCycleUpperCap: "1000000",
-    blockUpperCap: 16_384,
+    canonicalCycleUpperCap: PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+    sliceCycleUpperCap: "8000000",
+    blockUpperCap: 131_072,
     totalHostCallCap: 65_535,
     totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
     maxBootReads: 8_192,
     bootTimeoutMs: 180_000,
     sliceTimeoutMs: 180_000,
-    runTimeoutMs: 600_000,
-    externalWallTimeoutMs: 600_000,
+    runTimeoutMs: 7_200_000,
+    externalWallTimeoutMs: 7_200_000,
     zeroProgressSliceCap: 4_096,
     workerUrl: lock.release.executionAssets.worker.url,
+    navigationPolicy: productionFidelityNavigationPolicy(lock.run.gameKey),
   };
   exactKeys(lock.runPolicy, Object.keys(exactRunPolicy), "$.runPolicy");
   for (const [field, expected] of Object.entries(exactRunPolicy)) {
-    exact(lock.runPolicy[field], expected, `$.runPolicy.${field}`);
+    if (field === "navigationPolicy") {
+      exactCanonical(lock.runPolicy[field], expected, `$.runPolicy.${field}`);
+    } else {
+      exact(lock.runPolicy[field], expected, `$.runPolicy.${field}`);
+    }
   }
 
   const exactCheckpointPolicy = {

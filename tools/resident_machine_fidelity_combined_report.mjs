@@ -46,7 +46,9 @@ function exact(actual, expected, location) {
 }
 
 function exactJson(actual, expected, location) {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(location, "did not match lock");
+  if (canonicalFidelityJson(actual) !== canonicalFidelityJson(expected)) {
+    fail(location, "did not match lock");
+  }
 }
 
 function sha256Bytes(value) {
@@ -78,9 +80,10 @@ function kindCounts(records) {
 
 function validateReportPolicy(report, lock) {
   const policy = object(report.policy, "$.report.policy");
+  const production = lock.schema === PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA;
   const expectedRunPolicy = { ...lock.runPolicy };
   delete expectedRunPolicy.workerUrl;
-  exactJson({
+  const actualRunPolicy = {
     instructionUpperCap: policy.instructionUpperCap,
     executedCycleUpperCap: policy.executedCycleUpperCap,
     sliceCycleUpperCap: policy.sliceCycleUpperCap,
@@ -91,9 +94,26 @@ function validateReportPolicy(report, lock) {
     bootTimeoutMs: policy.bootTimeoutMs,
     sliceTimeoutMs: policy.sliceTimeoutMs,
     runTimeoutMs: policy.runTimeoutMs,
-    externalWallTimeoutMs: 600_000,
+    externalWallTimeoutMs: policy.externalWallTimeoutMs,
     zeroProgressSliceCap: policy.zeroProgressSliceCap,
-  }, expectedRunPolicy, "$.report.policy");
+    ...(production ? {
+      canonicalCycleUpperCap: policy.canonicalCycleUpperCap,
+      navigationPolicy: policy.navigationPolicy,
+    } : {}),
+  };
+  exactJson(actualRunPolicy, expectedRunPolicy, "$.report.policy");
+  if (!production) {
+    exact(
+      policy.canonicalCycleUpperCap,
+      policy.executedCycleUpperCap,
+      "$.report.policy.canonicalCycleUpperCap",
+    );
+    exact(
+      Object.hasOwn(policy, "navigationPolicy"),
+      false,
+      "$.report.policy.navigationPolicy",
+    );
+  }
   exact(policy.transport, "frozen-resident-machine-worker", "$.report.policy.transport");
   exact(
     policy.evidenceMode,

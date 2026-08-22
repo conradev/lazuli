@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 
 import {
   PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
-  productionFidelityCapturePolicy,
 } from "./resident_machine_fidelity_lock.mjs";
 import {
   PRODUCTION_FIDELITY_RUN_FRAGMENT_SCHEMA,
@@ -17,7 +16,7 @@ import {
   closeDedicatedCaptureTarget,
   createDedicatedCaptureTarget,
   formatProductionFidelityCaptureFailure,
-  operatorPublicationDue,
+  navigationPublicationDue,
   orderCaptureInputs,
   parseCaptureArguments,
   preparePrivateCaptureDirectory,
@@ -35,6 +34,9 @@ import {
   writePrivateLeafAtomic,
 } from "./resident_machine_production_fidelity_capture.mjs";
 import { readGameCompatibilityCorpus } from "./browser_game_compatibility_corpus.mjs";
+import {
+  productionFidelityNavigationPolicy,
+} from "./resident_machine_fidelity_navigation.mjs";
 
 function sevenCorpus() {
   return {
@@ -478,22 +480,52 @@ test("target creation failure preserves close failure and closes the browser ses
   ]);
 });
 
-test("verified generic operator policy schedules only at deterministic run boundaries", () => {
-  const policy = productionFidelityCapturePolicy("warioware-usa").genericOperatorPolicy;
+test("locked navigation publishes only after its canonical target and durable receipt", () => {
+  const policy = productionFidelityNavigationPolicy("warioware-usa");
   assert.equal(policy.maximumPublications, PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP);
-  assert.equal(operatorPublicationDue(policy, 0, 0), true);
-  assert.equal(operatorPublicationDue(policy, 1, 1), false);
-  assert.equal(operatorPublicationDue(policy, 8, 1), true);
-  assert.equal(operatorPublicationDue(policy, 512, 64), true);
-  assert.equal(operatorPublicationDue(policy, 512, 65), false);
-  assert.equal(operatorPublicationDue(policy, 520, 65), false);
+  const navigation = {
+    scriptSha256: policy.scriptSha256,
+    stepCount: policy.steps.length,
+    durableSteps: 0,
+    pendingPublication: null,
+    nextTargetCanonicalCycle: "100",
+  };
+  assert.equal(navigationPublicationDue(policy, navigation, {
+    operatorPublications: 0,
+    canonicalCycle: "99",
+  }), false);
+  assert.equal(navigationPublicationDue(policy, navigation, {
+    operatorPublications: 0,
+    canonicalCycle: "100",
+  }), true);
+  assert.equal(navigationPublicationDue(policy, {
+    ...navigation,
+    pendingPublication: { stepIndex: 0 },
+  }, {
+    operatorPublications: 0,
+    canonicalCycle: "100",
+  }), false);
+  assert.equal(navigationPublicationDue(policy, {
+    ...navigation,
+    durableSteps: policy.steps.length,
+    nextTargetCanonicalCycle: null,
+  }, {
+    operatorPublications: policy.steps.length,
+    canonicalCycle: "999",
+  }), false);
   assert.throws(
-    () => operatorPublicationDue({ ...policy, maximumPublications: 64 }, 512, 64),
-    /publication cap changed/,
+    () => navigationPublicationDue({ ...policy, maximumPublications: 64 }, navigation, {
+      operatorPublications: 0,
+      canonicalCycle: "100",
+    }),
+    /policy authority changed/,
   );
   assert.throws(
-    () => operatorPublicationDue({ ...policy, runBoundaryOrigin: "boot" }, 0, 0),
-    /origin changed/,
+    () => navigationPublicationDue(policy, navigation, {
+      operatorPublications: 1,
+      canonicalCycle: "100",
+    }),
+    /publication accounting changed/,
   );
   const spelling = canonicalCaptureJson(policy);
   for (let index = 0; index < 7; index += 1) {
@@ -610,7 +642,12 @@ test("run fragment has only the agreed direct evidence refs and metadata frames"
     preWitnessMachineEvidence: reference("pre-witness-machine-evidence.json"),
     terminalMachineEvidence: reference("terminal-machine-evidence.json"),
     gameFidelityRecord: reference("terminal-game-fidelity.json"),
-    operatorPublications: { algorithm: "alternating-neutral-a-v1", count: 12 },
+    navigationTranscript: reference("navigation-transcript.json"),
+    operatorPublications: {
+      algorithm: "locked-si-observed-not-before-publication-v1",
+      scriptSha256: "d".repeat(64),
+      count: 12,
+    },
     frames: {
       firstVisible: reference("first-visible.rgba"),
       baseline: {
@@ -749,9 +786,9 @@ test("controller source is title-blind, attaches only, and decodes machine evide
   assert.match(source, /validateMachineEvidenceV1Envelope/);
   assert.match(source, /lazuliProductionFidelityCapture/);
   assert.match(source, /lost Rust Baseline before witness publication/);
-  assert.match(source, /"operator",\s+undefined,/);
-  assert.doesNotMatch(source, /"operator",\s+controller,/);
-  for (const method of ["snapshot", "step", "operator", "publishWitness", "finish", "abort"]) {
+  assert.match(source, /"navigation",\s+undefined,/);
+  assert.doesNotMatch(source, /"navigation",\s+controller,/);
+  for (const method of ["snapshot", "step", "navigation", "publishWitness", "finish", "abort"]) {
     assert.match(source, new RegExp(`\\"${method}\\"`));
   }
 });

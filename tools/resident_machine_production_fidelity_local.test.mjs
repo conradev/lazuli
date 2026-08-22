@@ -19,6 +19,7 @@ import test from "node:test";
 import { canonicalCaptureJson } from "./resident_machine_production_fidelity_capture.mjs";
 import {
   PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA,
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
@@ -26,6 +27,9 @@ import {
   PRODUCTION_SOURCE_PATHS,
   validateResidentProductionFidelityEvidenceLock,
 } from "./resident_machine_fidelity_lock.mjs";
+import {
+  productionFidelityNavigationPolicy,
+} from "./resident_machine_fidelity_navigation.mjs";
 import {
   PRODUCTION_FIDELITY_WALL_DEADLINE_ERROR_CODE,
   ProductionFidelityWallDeadlineError,
@@ -54,7 +58,7 @@ const SHA = "a".repeat(64);
 const SOURCE_COMMIT = "b".repeat(40);
 const PERFORMANCE_RUN_ID = "10000000-0000-4000-8000-000000000001";
 const WATCHDOG_START_UNIX_MS = 1_800_000_000_000;
-const WATCHDOG_DEADLINE_UNIX_MS = WATCHDOG_START_UNIX_MS + 600_000;
+const WATCHDOG_DEADLINE_UNIX_MS = WATCHDOG_START_UNIX_MS + 7_200_000;
 const WATCHDOG_URL = "http://127.0.0.1:8123/tools/resident_machine_first_frame.html"
   + "?capture=fidelity&game=game-1";
 const WATCHDOG_BROWSER_IDENTITY = "Chrome --user-data-dir=/private/watchdog-profile";
@@ -319,7 +323,10 @@ test("local controller emits canonical production v2 and schema-ordered v3 locks
   const performanceBytes = Buffer.from(canonicalCaptureJson(performanceLock));
   assert.equal(performanceBytes.toString(), canonicalCaptureJson(JSON.parse(performanceBytes)));
 
-  const fidelityLock = productionRendererFidelityEvidenceLock(base);
+  const fidelityAuthority = structuredClone(base);
+  fidelityAuthority.run.gameKey = "warioware-usa";
+  fidelityAuthority.selectedGame.key = "warioware-usa";
+  const fidelityLock = productionRendererFidelityEvidenceLock(fidelityAuthority);
   assert.equal(fidelityLock.schema, PRODUCTION_FIDELITY_EVIDENCE_LOCK_SCHEMA);
   assert.equal(
     fidelityLock.runPolicy.instructionUpperCap,
@@ -330,27 +337,47 @@ test("local controller emits canonical production v2 and schema-ordered v3 locks
     PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   );
   assert.equal(
+    fidelityLock.runPolicy.canonicalCycleUpperCap,
+    PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+  );
+  assert.equal(fidelityLock.runPolicy.sliceCycleUpperCap, "8000000");
+  assert.equal(fidelityLock.runPolicy.runTimeoutMs, 120 * 60 * 1000);
+  assert.equal(fidelityLock.runPolicy.externalWallTimeoutMs, 120 * 60 * 1000);
+  assert.equal(
     fidelityLock.runPolicy.totalColdInstallCap,
     PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
   );
-  assert.equal(validateResidentProductionFidelityEvidenceLock(fidelityLock, base), fidelityLock);
+  assert.deepEqual(
+    fidelityLock.runPolicy.navigationPolicy,
+    productionFidelityNavigationPolicy("warioware-usa"),
+  );
+  assert.equal(
+    validateResidentProductionFidelityEvidenceLock(fidelityLock, fidelityAuthority),
+    fidelityLock,
+  );
   const staleCycleAuthority = structuredClone(fidelityLock);
   staleCycleAuthority.runPolicy.executedCycleUpperCap = "250000000";
   assert.throws(
-    () => validateResidentProductionFidelityEvidenceLock(staleCycleAuthority, base),
+    () => validateResidentProductionFidelityEvidenceLock(staleCycleAuthority, fidelityAuthority),
     /executedCycleUpperCap/,
   );
   const staleInstructionAuthority = structuredClone(fidelityLock);
   staleInstructionAuthority.runPolicy.instructionUpperCap = "100000000";
   assert.throws(
-    () => validateResidentProductionFidelityEvidenceLock(staleInstructionAuthority, base),
+    () => validateResidentProductionFidelityEvidenceLock(
+      staleInstructionAuthority,
+      fidelityAuthority,
+    ),
     /instructionUpperCap/,
   );
-  const staleOperatorAuthority = structuredClone(fidelityLock);
-  staleOperatorAuthority.capturePolicy.genericOperatorPolicy.maximumPublications = 64;
+  const staleNavigationAuthority = structuredClone(fidelityLock);
+  staleNavigationAuthority.capturePolicy.lockedNavigationPolicy.maximumPublications = 64;
   assert.throws(
-    () => validateResidentProductionFidelityEvidenceLock(staleOperatorAuthority, base),
-    /genericOperatorPolicy/,
+    () => validateResidentProductionFidelityEvidenceLock(
+      staleNavigationAuthority,
+      fidelityAuthority,
+    ),
+    /lockedNavigationPolicy/,
   );
   const fidelityBytes = schemaOrderedLockBytes(fidelityLock);
   assert.deepEqual(Object.keys(JSON.parse(fidelityBytes).sources), [...PRODUCTION_SOURCE_PATHS]);
@@ -483,7 +510,7 @@ test("CLI failure formatting recursively preserves aggregate order and typed dea
   );
   const formatted = formatProductionFidelityFailure(outer);
   const primaryIndex = formatted.indexOf("capture Runtime.evaluate connection closed");
-  const deadlineIndex = formatted.indexOf("production fidelity fixed 600000 ms wall deadline");
+  const deadlineIndex = formatted.indexOf("production fidelity fixed 7200000 ms wall deadline");
   const cleanupIndex = formatted.indexOf("Target.closeTarget connection closed");
   assert.ok(primaryIndex > 0);
   assert.ok(deadlineIndex > primaryIndex);

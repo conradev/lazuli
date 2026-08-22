@@ -70,6 +70,21 @@ fn exact_authenticated_identity_is_the_only_projector_selector() {
 }
 
 #[test]
+fn wario_repellion_a_v2_preserves_the_projector_and_predicate_contract() {
+    let probe = GameFidelityProbe::select(
+        AuthenticatedDiscIdentity {
+            id: *b"GZWE01",
+            revision: 0,
+        },
+        1,
+    )
+    .unwrap();
+    assert_eq!(probe.projector() as u32, 1);
+    assert_eq!(probe.projector().oracle_id(), "warioware-repellion-a-v2");
+    assert_eq!(probe.record().required_predicates(), 0x07ff);
+}
+
+#[test]
 fn rust_authors_the_exact_generic_controller_witness_for_all_seven_projectors() {
     let wario = ControllerInputState {
         buttons: 0x0100,
@@ -796,6 +811,139 @@ fn all_seven_projectors_accept_only_the_complete_authenticated_path() {
 }
 
 #[test]
+fn wario_repellion_a_v2_accepts_only_exact_microgame_0x63() {
+    let id = ProjectorId::WarioWareRepellionA;
+    let mut memory = baseline_fixture(id);
+    let probe = run_acceptance(id, &mut memory);
+    assert_eq!(probe.record().phase(), ProbePhase::Accepted);
+    assert_eq!(probe.record().required_predicates(), 0x07ff);
+    assert_eq!(probe.record().passed_predicates() & 0x07ff, 0x07ff);
+    assert_ne!(probe.record().passed_predicates() & (1 << 9), 0);
+    assert_eq!(probe.record().passed_predicates() & (1 << 11), 0);
+
+    for active_game in [0, 1, 0x62, 0x64, 0x117, 0x118, u32::MAX] {
+        let mut memory = baseline_fixture(id);
+        memory.u32(0x8029_5ed0, active_game);
+        let mut probe = selected_probe(id);
+        assert_eq!(
+            probe.arm(
+                &memory,
+                ArmObservation {
+                    cycle: 100,
+                    controller_poll_index: 10,
+                    controller_applied_sequence: 5,
+                    presentation_cycle: 90,
+                    presentation: baseline_presentation(),
+                },
+            ),
+            Err(FailureCode::Predicate),
+            "{active_game:#x}",
+        );
+        assert_eq!(probe.record().phase(), ProbePhase::Failed);
+    }
+}
+
+#[test]
+fn wario_repellion_a_v2_binds_the_same_id_across_receipt_and_post() {
+    let id = ProjectorId::WarioWareRepellionA;
+
+    let mut receipt_drift = baseline_fixture(id);
+    let mut probe = armed_probe(id, &receipt_drift);
+    probe.observe_publication(valid_publication(id)).unwrap();
+    set_receipt(id, &mut receipt_drift);
+    receipt_drift.u32(0x8029_5ed0, 0x64);
+    assert_eq!(
+        probe.observe_guest_receipt(
+            &receipt_drift,
+            GuestReceipt {
+                cycle: 130,
+                poll_index: 11,
+                applied_sequence: 6,
+            },
+        ),
+        Err(FailureCode::Predicate),
+    );
+
+    let mut post_drift = baseline_fixture(id);
+    let mut probe = probe_through_receipt(id, &mut post_drift);
+    set_post(id, &mut post_drift);
+    post_drift.u32(0x8029_5ed0, 0x64);
+    assert_eq!(
+        probe.observe_post(&post_drift, 150),
+        Err(FailureCode::Predicate),
+    );
+}
+
+#[test]
+fn wario_repellion_a_v2_requires_the_causal_result_transition_after_a_release() {
+    let id = ProjectorId::WarioWareRepellionA;
+
+    let released_at_receipt = baseline_fixture(id);
+    let mut probe = armed_probe(id, &released_at_receipt);
+    probe.observe_publication(valid_publication(id)).unwrap();
+    assert_eq!(
+        probe.observe_guest_receipt(
+            &released_at_receipt,
+            GuestReceipt {
+                cycle: 130,
+                poll_index: 11,
+                applied_sequence: 6,
+            },
+        ),
+        Err(FailureCode::Predicate),
+        "the receipt must observe the guest holding A",
+    );
+    assert_eq!(probe.record().failed_predicates(), 1 << 6);
+
+    let mut changed_at_receipt = baseline_fixture(id);
+    let mut probe = armed_probe(id, &changed_at_receipt);
+    probe.observe_publication(valid_publication(id)).unwrap();
+    set_receipt(id, &mut changed_at_receipt);
+    changed_at_receipt.i32(0x802a_a230, 1);
+    assert_eq!(
+        probe.observe_guest_receipt(
+            &changed_at_receipt,
+            GuestReceipt {
+                cycle: 130,
+                poll_index: 11,
+                applied_sequence: 6,
+            },
+        ),
+        Err(FailureCode::Predicate),
+        "the result must still be zero when the guest is observed holding A",
+    );
+    assert_eq!(probe.record().failed_predicates(), 1 << 6);
+
+    let mut held_at_post = baseline_fixture(id);
+    let mut probe = probe_through_receipt(id, &mut held_at_post);
+    held_at_post.i32(0x802a_a230, 1);
+    assert_eq!(
+        probe.observe_post(&held_at_post, 150),
+        Err(FailureCode::Predicate),
+        "the post state must release A",
+    );
+    assert_eq!(probe.record().failed_predicates(), 1 << 8);
+
+    let mut unchanged_at_post = baseline_fixture(id);
+    let mut probe = probe_through_receipt(id, &mut unchanged_at_post);
+    unchanged_at_post.u16(0x802f_6580, 0);
+    assert_eq!(
+        probe.observe_post(&unchanged_at_post, 150),
+        Err(FailureCode::Predicate),
+        "an A release without a nonzero result is not a causal gameplay delta",
+    );
+    assert_eq!(probe.record().failed_predicates(), 1 << 9);
+
+    let mut negative_result_at_post = baseline_fixture(id);
+    let mut probe = probe_through_receipt(id, &mut negative_result_at_post);
+    negative_result_at_post.u16(0x802f_6580, 0);
+    negative_result_at_post.i32(0x802a_a230, -1);
+    assert_eq!(probe.observe_post(&negative_result_at_post, 150), Ok(()));
+    assert_eq!(probe.record().phase(), ProbePhase::Posted);
+    assert_ne!(probe.record().passed_predicates() & (1 << 9), 0);
+}
+
+#[test]
 fn canonical_record_is_fixed_size_and_packs_authenticated_presentations() {
     let mut memory = baseline_fixture(ProjectorId::WarioWareRepellionA);
     let probe = run_acceptance(ProjectorId::WarioWareRepellionA, &mut memory);
@@ -972,7 +1120,7 @@ fn every_title_milestone_predicate_fails_closed_on_drift() {
     for (_, _, id) in IDENTITIES {
         let mut memory = baseline_fixture(id);
         match id {
-            ProjectorId::WarioWareRepellionA => memory.u32(0x8029_5ed0, 0x62),
+            ProjectorId::WarioWareRepellionA => memory.u32(0x8029_5ed0, 0x118),
             ProjectorId::LuigisMansionFoyerLeft => memory.u32(0x804d_80a0, 1),
             ProjectorId::WindWakerOutsetLeft => memory.u8(0x803c_9d46, 43),
             ProjectorId::MeleeActiveMatchLeft => memory.u8(0x8047_9d30, 1),

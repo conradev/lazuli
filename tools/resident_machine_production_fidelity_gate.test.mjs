@@ -20,6 +20,7 @@ import { residentFirstFrameReportFixture } from "./resident_machine_first_frame_
 import { PRODUCTION_FIRST_FRAME_CAPTURE_ORDER } from "./resident_machine_first_frame_report.mjs";
 import { canonicalFidelityJson } from "./resident_machine_fidelity_checkpoint_report.mjs";
 import {
+  PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
   PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
   PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
@@ -29,6 +30,7 @@ import {
   productionFidelityLockAuthorityFromFiles,
   verifyResidentProductionFidelityEvidenceLockFiles,
 } from "./resident_machine_fidelity_lock.mjs";
+import { productionFidelityNavigationPolicy } from "./resident_machine_fidelity_navigation.mjs";
 import {
   PRODUCTION_FIDELITY_ATTESTATION_SCHEMA,
   residentReleaseExecutionAssetsSha256,
@@ -188,6 +190,71 @@ function controllerPacket(controller) {
   ]);
 }
 
+function navigationPacket(controller, mode = 3) {
+  const stick = [0, 8, 16, 24].map(shift => controller.stickXyCxy >>> shift & 0xff);
+  const trigger = [0, 8, 16, 24].map(shift => controller.triggerLrab >>> shift & 0xff);
+  const buttons = (controller.buttons | 0x0080) & 0xffff;
+  const prefix = [buttons >>> 8, buttons & 0xff, stick[0], stick[1]];
+  const low = mode === 0 || (mode >= 5 && mode <= 7)
+    ? [stick[2], stick[3], trigger[0] & 0xf0 | trigger[1] >>> 4,
+      trigger[2] & 0xf0 | trigger[3] >>> 4]
+    : mode === 1
+      ? [stick[2] & 0xf0 | stick[3] >>> 4, trigger[0], trigger[1],
+        trigger[2] & 0xf0 | trigger[3] >>> 4]
+      : mode === 2
+        ? [stick[2] & 0xf0 | stick[3] >>> 4,
+          trigger[0] & 0xf0 | trigger[1] >>> 4, trigger[2], trigger[3]]
+        : mode === 4
+          ? [stick[2], stick[3], trigger[2], trigger[3]]
+          : [stick[2], stick[3], trigger[0], trigger[1]];
+  const packet = Buffer.from([...prefix, ...low]);
+  return {
+    word0: packet.readUInt32BE(0),
+    word1: packet.readUInt32BE(4),
+  };
+}
+
+function navigationTranscript(policy, canonicalCycleOrigin, siPollIndexOrigin) {
+  let priorAnchor = BigInt(canonicalCycleOrigin);
+  let priorPollIndex = BigInt(siPollIndexOrigin);
+  return policy.steps.map((step, stepIndex) => {
+    const target = priorAnchor + BigInt(step.minimumCanonicalDelay);
+    const sequence = BigInt(stepIndex + 1);
+    const pollIndex = priorPollIndex + 1n;
+    const mode = 3;
+    const packet = navigationPacket(step, mode);
+    const entry = {
+      stepIndex,
+      sequenceLo: Number(sequence & 0xffff_ffffn),
+      sequenceHi: Number(sequence >> 32n),
+      minimumCanonicalDelay: step.minimumCanonicalDelay,
+      targetCanonicalCycle: target.toString(),
+      publicationCanonicalCycle: target.toString(),
+      publicationOvershootCycles: "0",
+      buttons: step.buttons,
+      stickXyCxy: step.stickXyCxy,
+      triggerLrab: step.triggerLrab,
+      status: 1,
+      siPollIndex: pollIndex.toString(),
+      siScheduledCycle: target.toString(),
+      siObservedCycle: target.toString(),
+      siAppliedSequenceLo: Number(sequence & 0xffff_ffffn),
+      siAppliedSequenceHi: Number(sequence >> 32n),
+      siPacketWord0: packet.word0,
+      siPacketWord1: packet.word1,
+      siSource: 0,
+      priorSiPollIndex: priorPollIndex.toString(),
+      siControllerMode: mode,
+      siButtons: step.buttons,
+      siStickXyCxy: step.stickXyCxy,
+      siTriggerLrab: step.triggerLrab,
+    };
+    priorAnchor = target;
+    priorPollIndex = pollIndex;
+    return entry;
+  });
+}
+
 function terminalMachineEnvelope(projector, controller, presentation, {
   snapshotSerial = 7,
   canonicalCycle = 3_000,
@@ -198,6 +265,8 @@ function terminalMachineEnvelope(projector, controller, presentation, {
   appliedSequence = 10,
   renderCompletionCycle = 2_160,
   pollIndex = 13,
+  siScheduledCycle = 2_110,
+  siObservedCycle = 2_120,
 } = {}) {
   const words = new Uint32Array(204);
   words[0] = 1;
@@ -253,8 +322,8 @@ function terminalMachineEnvelope(projector, controller, presentation, {
   words[131] = 2;
   words[132] = 1;
   putU64(words, 133, pollIndex);
-  putU64(words, 135, 2_110);
-  putU64(words, 137, 2_120);
+  putU64(words, 135, siScheduledCycle);
+  putU64(words, 137, siObservedCycle);
   putU64(words, 139, lastReceivedSequence);
   putU64(words, 141, appliedSequence);
   putU64(words, 143, pollIndex);
@@ -328,6 +397,17 @@ function setPresentation(bytes, word, summary) {
   bytes.writeUInt32LE(summary.outputHeight, (word + 7) * 4);
 }
 
+function causalWitnessCycles(armCycle) {
+  const publication = Math.max(2_110, Number(armCycle) + 10);
+  return Object.freeze({
+    publication,
+    observation: publication + 10,
+    receipt: publication + 20,
+    post: publication + 40,
+    laterPresentation: publication + 50,
+  });
+}
+
 function acceptedFidelityEnvelope(projector, controller, baselinePresentation, laterPresentation, {
   armCycle = 2_100,
   armAppliedSequence = 0,
@@ -336,14 +416,15 @@ function acceptedFidelityEnvelope(projector, controller, baselinePresentation, l
   const envelope = gameFidelityEnvelope(projector);
   const bytes = Buffer.from(envelope.payload, "base64");
   const put = (word, value) => bytes.writeBigUInt64LE(BigInt(value), word * 4);
+  const cycles = causalWitnessCycles(armCycle);
   put(16, 1);
   put(18, armCycle);
   put(20, Math.min(armCycle, 2_050));
-  put(22, 2_110);
-  put(24, 2_120);
-  put(26, 2_130);
-  put(28, 2_150);
-  put(30, 2_160);
+  put(22, cycles.publication);
+  put(24, cycles.observation);
+  put(26, cycles.receipt);
+  put(28, cycles.post);
+  put(30, cycles.laterPresentation);
   put(32, armAppliedSequence);
   put(34, publicationSequence);
   put(36, publicationSequence);
@@ -467,21 +548,23 @@ function releaseAuthority(release, releaseBytes) {
   };
 }
 
-function firstFrameRunPolicy(workerUrl) {
+function firstFrameRunPolicy(workerUrl, gameKey) {
   return {
     instructionUpperCap: PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP,
     executedCycleUpperCap: PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP,
-    sliceCycleUpperCap: "1000000",
-    blockUpperCap: 16_384,
+    canonicalCycleUpperCap: PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP,
+    sliceCycleUpperCap: "8000000",
+    blockUpperCap: 131_072,
     totalHostCallCap: 65_535,
     totalColdInstallCap: PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP,
     maxBootReads: 8_192,
     bootTimeoutMs: 180_000,
     sliceTimeoutMs: 180_000,
-    runTimeoutMs: 600_000,
-    externalWallTimeoutMs: 600_000,
+    runTimeoutMs: 7_200_000,
+    externalWallTimeoutMs: 7_200_000,
     zeroProgressSliceCap: 4_096,
     workerUrl,
+    navigationPolicy: productionFidelityNavigationPolicy(gameKey),
   };
 }
 
@@ -546,7 +629,7 @@ function fidelityLock(
     artifacts: structuredClone(artifacts),
     sources: structuredClone(sources),
     hostPolicy: hostPolicy(),
-    runPolicy: firstFrameRunPolicy(authority.executionAssets.worker.url),
+    runPolicy: firstFrameRunPolicy(authority.executionAssets.worker.url, projector.key),
     checkpointPolicy: checkpointPolicy(),
     capturePolicy: structuredClone(productionFidelityCapturePolicy(projector.key)),
     rendererProbe: {
@@ -612,42 +695,72 @@ function receiptAnnotation(identity, receipt) {
   };
 }
 
-function cumulativeRunSummary(operatorPublications = 0) {
+function machineCounter(envelope, word) {
+  return Buffer.from(envelope.payload, "base64").readBigUInt64LE(word * 4);
+}
+
+function cumulativeRunSummary({
+  readyMachine,
+  currentMachine = null,
+  canonicalCycle = currentMachine === null ? null : machineCounter(currentMachine, 19),
+  executedCycles = currentMachine === null ? null : machineCounter(currentMachine, 21),
+  executedInstructions = currentMachine === null ? null : machineCounter(currentMachine, 23),
+  issuedRunCalls = 4,
+  reportedRetiredBlocks = BigInt(issuedRunCalls),
+  reportedHostCalls = 8,
+  reportedColdInstalls = 2,
+  operatorPublications = 0,
+  witnessPublications = 1,
+  elapsedWallMs = 10_000,
+  accepted = true,
+}) {
+  const readyCanonicalCycle = machineCounter(readyMachine, 19);
+  const readyExecutedCycles = machineCounter(readyMachine, 21);
+  const readyExecutedInstructions = machineCounter(readyMachine, 23);
+  if (
+    canonicalCycle === null
+    || executedCycles === null
+    || executedInstructions === null
+    || canonicalCycle < readyCanonicalCycle
+    || executedCycles < readyExecutedCycles
+    || executedInstructions < readyExecutedInstructions
+  ) throw new Error("synthetic cumulative run summary regressed from resident-ready");
   return {
-    schema: "lazuli-resident-cumulative-run-summary-v1",
-    issuedRunCalls: 4,
-    reportedExecutedCycles: "2500",
-    reportedExecutedInstructions: "1500",
-    reportedHostCalls: 8,
-    reportedColdInstalls: 2,
+    schema: "lazuli-resident-cumulative-run-summary-v2",
+    issuedRunCalls,
+    canonicalCycle: canonicalCycle.toString(),
+    reportedCanonicalCycles: (canonicalCycle - readyCanonicalCycle).toString(),
+    reportedExecutedCycles: (executedCycles - readyExecutedCycles).toString(),
+    reportedExecutedInstructions: (
+      executedInstructions - readyExecutedInstructions
+    ).toString(),
+    reportedRetiredBlocks: BigInt(reportedRetiredBlocks).toString(),
+    reportedHostCalls,
+    reportedColdInstalls,
     operatorPublications,
-    witnessPublications: 1,
+    witnessPublications,
     zeroProgressSlices: 0,
     consecutiveZeroProgressSlices: 0,
     maximumConsecutiveZeroProgressSlices: 0,
-    elapsedWallMs: 10_000,
-    wallTimeoutMs: 600_000,
-    accepted: true,
+    elapsedWallMs,
+    wallTimeoutMs: 7_200_000,
+    accepted,
   };
 }
 
-function pristineRunSummary() {
-  return {
-    schema: "lazuli-resident-cumulative-run-summary-v1",
+function pristineRunSummary(readyMachine) {
+  return cumulativeRunSummary({
+    readyMachine,
+    currentMachine: readyMachine,
     issuedRunCalls: 0,
-    reportedExecutedCycles: "0",
-    reportedExecutedInstructions: "0",
+    reportedRetiredBlocks: 0,
     reportedHostCalls: 0,
     reportedColdInstalls: 0,
     operatorPublications: 0,
     witnessPublications: 0,
-    zeroProgressSlices: 0,
-    consecutiveZeroProgressSlices: 0,
-    maximumConsecutiveZeroProgressSlices: 0,
     elapsedWallMs: 0,
-    wallTimeoutMs: 600_000,
     accepted: false,
-  };
+  });
 }
 
 async function createSourceRepository(directory) {
@@ -825,20 +938,41 @@ async function buildAttestationFixture(t, {
     const projector = GAME_FIDELITY_V1_PROJECTORS[index];
     const corpusGame = corpus.games[index];
     const runId = `${String(index + 1).padStart(8, "0")}-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
-    const baselineMode = baselineModes[index] ?? "same-pre";
-    const armCycle = armCycles[index] ?? (baselineMode === "distinct-post" ? 2_100 : 1_700);
+    const navigationPolicy = productionFidelityNavigationPolicy(projector.key);
+    const lockedOperatorPublicationCount = navigationPolicy.steps.length;
+    const baselineMode = baselineModes[index]
+      ?? (lockedOperatorPublicationCount === 0 ? "same-pre" : "distinct-post");
+    if (lockedOperatorPublicationCount !== 0 && baselineMode !== "distinct-post") {
+      throw new Error("nonempty synthetic navigation requires a post-navigation Baseline");
+    }
+    const navigationMinimumCycles = navigationPolicy.steps.reduce(
+      (total, step) => total + BigInt(step.minimumCanonicalDelay),
+      0n,
+    );
+    const armCycle = armCycles[index] ?? (
+      lockedOperatorPublicationCount === 0
+        ? (baselineMode === "distinct-post" ? 2_100 : 1_700)
+        : Number(navigationMinimumCycles + 100_000_000n)
+    );
     const armPresentationCycle = Math.min(armCycle, 2_050);
-    const operatorPublicationCount = operatorPublicationCounts[index] ?? 0;
+    const operatorPublicationCount = lockedOperatorPublicationCount;
+    const attestedOperatorPublicationCount = operatorPublicationCounts[index]
+      ?? operatorPublicationCount;
     const witnessSequence = operatorPublicationCount + 1;
     if (!new Set(["same-pre", "distinct-pre", "distinct-post"]).has(baselineMode)) {
       throw new Error(`unsupported Baseline mode ${baselineMode}`);
     }
     const report = residentFirstFrameReportFixture();
-    report.policy.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
-    report.policy.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
-    report.policy.totalColdInstallCap = PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP;
+    const runPolicy = firstFrameRunPolicy(
+      authority.executionAssets.worker.url,
+      projector.key,
+    );
+    const reportRunPolicy = structuredClone(runPolicy);
+    delete reportRunPolicy.workerUrl;
+    Object.assign(report.policy, reportRunPolicy);
     report.game.run.instructionUpperCap = PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP;
     report.game.run.executedCycleUpperCap = PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP;
+    report.game.run.canonicalCycleUpperCap = PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP;
     report.game.firstPresentedXfb.captureOrder = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
     report.captureOrderContract = [...PRODUCTION_FIRST_FRAME_CAPTURE_ORDER];
     report.game.inputSamples = reportInputSampleCounts[index] ?? 0;
@@ -914,8 +1048,8 @@ async function buildAttestationFixture(t, {
         {
           scheduledCycle: Math.max(0, observedCycle - 10),
           observedCycle,
-          lastReceivedSequence: operatorPublicationCount,
-          appliedSequence: operatorPublicationCount,
+          lastReceivedSequence: 0,
+          appliedSequence: 0,
         },
       );
     }
@@ -962,21 +1096,58 @@ async function buildAttestationFixture(t, {
     const fidelity = validateGameFidelityV1Envelope(fidelityEnvelope, {
       expectedGameKey: projector.key,
     });
+    const reportMachineEnvelope = report.game.adapterDiagnostics.final.machineEvidence;
+    const reportCanonicalCycle = machineCounter(reportMachineEnvelope, 19);
+    const reportSiPollIndex = machineCounter(reportMachineEnvelope, 133);
+    const navigationEntries = navigationTranscript(
+      navigationPolicy,
+      reportCanonicalCycle,
+      reportSiPollIndex,
+    );
+    const finalNavigationReceiptCycle = navigationEntries.length === 0
+      ? reportCanonicalCycle
+      : BigInt(navigationEntries.at(-1).siObservedCycle);
+    const finalNavigationPollIndex = navigationEntries.length === 0
+      ? (
+          baselineMode === "distinct-post"
+            ? (reportSiPollIndex < 9n ? 9n : reportSiPollIndex + 1n)
+            : reportSiPollIndex
+        )
+      : BigInt(navigationEntries.at(-1).siPollIndex);
+    const baselineCanonicalCycle = Math.max(
+      2_200,
+      Number(finalNavigationReceiptCycle + 1_000n),
+      armCycle,
+    );
+    const preWitnessCanonicalCycle = Math.max(2_500, baselineCanonicalCycle + 1_000);
+    const witnessCycles = causalWitnessCycles(armCycle);
+    const terminalCanonicalCycle = Math.max(
+      3_000,
+      preWitnessCanonicalCycle + 1_000,
+      witnessCycles.laterPresentation + 1_000,
+    );
+    const navigationTerminalController = navigationPolicy.steps.at(-1) ?? {
+      buttons: 0,
+      stickXyCxy: 0x8080_8080,
+      triggerLrab: 0,
+    };
     const baselineMachine = baselineMode === "distinct-post"
       ? terminalMachineEnvelope(
           projector,
-          controller,
+          navigationTerminalController,
           baselinePresentation,
           {
             snapshotSerial: baselineSnapshotSerials[index] ?? 5,
-            canonicalCycle: 2_200,
+            canonicalCycle: baselineCanonicalCycle,
             executedInstructions: 1_400,
             viFields: 2,
             presentedFrames: 2,
             lastReceivedSequence: operatorPublicationCount,
             appliedSequence: operatorPublicationCount,
             renderCompletionCycle: armPresentationCycle,
-            pollIndex: 11,
+            pollIndex: Number(finalNavigationPollIndex),
+            siScheduledCycle: Number(finalNavigationReceiptCycle),
+            siObservedCycle: Number(finalNavigationReceiptCycle),
           },
         )
       : preReportBaselineMachineEnvelope(
@@ -989,18 +1160,20 @@ async function buildAttestationFixture(t, {
         );
     const preWitnessMachine = terminalMachineEnvelope(
       projector,
-      controller,
+      navigationTerminalController,
       baselinePresentation,
       {
         snapshotSerial: 6,
-        canonicalCycle: 2_500,
+        canonicalCycle: preWitnessCanonicalCycle,
         executedInstructions: 1_500,
         viFields: 1 + (preWitnessViDeltas[index] ?? 120),
         presentedFrames: 1 + (preWitnessPresentationDeltas[index] ?? 64),
         lastReceivedSequence: operatorPublicationCount,
         appliedSequence: operatorPublicationCount,
         renderCompletionCycle: armPresentationCycle,
-        pollIndex: 12,
+        pollIndex: Number(finalNavigationPollIndex + 1n),
+        siScheduledCycle: Number(finalNavigationReceiptCycle),
+        siObservedCycle: Number(finalNavigationReceiptCycle),
       },
     );
     const terminalMachine = terminalMachineEnvelope(
@@ -1008,8 +1181,14 @@ async function buildAttestationFixture(t, {
       controller,
       laterPresentation,
       {
+        canonicalCycle: terminalCanonicalCycle,
+        executedInstructions: 2_000,
         lastReceivedSequence: witnessSequence,
         appliedSequence: witnessSequence,
+        renderCompletionCycle: witnessCycles.laterPresentation,
+        pollIndex: Number(finalNavigationPollIndex + 2n),
+        siScheduledCycle: witnessCycles.publication,
+        siObservedCycle: witnessCycles.receipt,
       },
     );
     if (terminalMachineMutators[index]) {
@@ -1105,8 +1284,11 @@ async function buildAttestationFixture(t, {
       bootStatus: 3,
       bootReads: 5,
       ...readyArtifactFields,
-      runPolicy: firstFrameRunPolicy(authority.executionAssets.worker.url),
-      runSummary: pristineRunSummary(),
+      runPolicy: firstFrameRunPolicy(
+        authority.executionAssets.worker.url,
+        projector.key,
+      ),
+      runSummary: pristineRunSummary(readyMachine),
     });
     add("pre-submit", firstIdentity);
     add("submit-returned", {
@@ -1205,6 +1387,56 @@ async function buildAttestationFixture(t, {
       firstFrameRendererRecordSha256: firstOwned.recordSha256,
       baselineRecordSha256: baselineOwned?.recordSha256 ?? null,
     });
+    const navigationRunCallOrigin = report.game.run.slices;
+    const navigationCanonicalCycleOrigin = reportCanonicalCycle.toString();
+    const navigationSiPollIndexOrigin = reportSiPollIndex.toString();
+    const navigationArm = add("navigation-armed", {
+      machineSessionId: runId,
+      firstFrameReportRecordSha256: reportBound.recordSha256,
+      scriptSha256: navigationPolicy.scriptSha256,
+      runCallOrigin: navigationRunCallOrigin,
+      canonicalCycleOrigin: navigationCanonicalCycleOrigin,
+      siPollIndexOrigin: navigationSiPollIndexOrigin,
+      stepCount: navigationEntries.length,
+      runSummary: cumulativeRunSummary({
+        readyMachine,
+        currentMachine: reportMachineEnvelope,
+        issuedRunCalls: navigationRunCallOrigin,
+        reportedRetiredBlocks: navigationRunCallOrigin,
+        reportedHostCalls: report.game.run.servicedHostCalls,
+        reportedColdInstalls: report.game.run.coldInstalls,
+        operatorPublications: 0,
+        witnessPublications: 0,
+        elapsedWallMs: 1,
+        accepted: false,
+      }),
+    });
+    const navigationStepRecords = navigationEntries.map((entry, stepIndex) => add(
+      "navigation-step-received",
+      {
+        machineSessionId: runId,
+        firstFrameReportRecordSha256: reportBound.recordSha256,
+        navigationArmRecordSha256: navigationArm.recordSha256,
+        scriptSha256: navigationPolicy.scriptSha256,
+        runCallOrigin: navigationRunCallOrigin,
+        canonicalCycleOrigin: navigationCanonicalCycleOrigin,
+        ...entry,
+        runSummary: cumulativeRunSummary({
+          readyMachine,
+          canonicalCycle: BigInt(entry.siObservedCycle),
+          executedCycles: BigInt(entry.siObservedCycle),
+          executedInstructions: machineCounter(readyMachine, 23) + BigInt(stepIndex + 1),
+          issuedRunCalls: navigationRunCallOrigin + stepIndex + 1,
+          reportedRetiredBlocks: navigationRunCallOrigin + stepIndex + 1,
+          reportedHostCalls: report.game.run.servicedHostCalls,
+          reportedColdInstalls: report.game.run.coldInstalls,
+          operatorPublications: stepIndex + 1,
+          witnessPublications: 0,
+          elapsedWallMs: stepIndex + 2,
+          accepted: false,
+        }),
+      },
+    ));
     if (baselineMode === "distinct-post") addDistinctBaseline();
     const witness = add("controller-witness-published", {
       machineSessionId: runId,
@@ -1217,6 +1449,21 @@ async function buildAttestationFixture(t, {
       triggerLrab: controller.triggerLrab,
       status: witnessStatusOverrides[index] ?? 1,
       ...envelopeArtifactFields("machineEvidence", retainedPreWitnessMachine),
+      navigationScriptSha256: navigationPolicy.scriptSha256,
+      navigationStepCount: navigationEntries.length,
+      navigationArmRecordSha256: navigationArm.recordSha256,
+      lastNavigationStepRecordSha256:
+        navigationStepRecords.at(-1)?.recordSha256 ?? null,
+      runSummary: cumulativeRunSummary({
+        readyMachine,
+        currentMachine: retainedPreWitnessMachine,
+        issuedRunCalls: navigationRunCallOrigin + navigationEntries.length + 1,
+        reportedRetiredBlocks: navigationRunCallOrigin + navigationEntries.length + 1,
+        operatorPublications: navigationEntries.length,
+        witnessPublications: 1,
+        elapsedWallMs: navigationEntries.length + 3,
+        accepted: false,
+      }),
     });
     const acceptedIdentity = {
       ...firstIdentity,
@@ -1256,7 +1503,21 @@ async function buildAttestationFixture(t, {
       acceptedRecordSha256: accepted.recordSha256,
       ...envelopeArtifactFields("gameFidelity", fidelityEnvelope),
       ...envelopeArtifactFields("machineEvidence", terminalMachine),
-      runSummary: cumulativeRunSummary(operatorPublicationCount),
+      runSummary: cumulativeRunSummary({
+        readyMachine,
+        currentMachine: terminalMachine,
+        issuedRunCalls: navigationRunCallOrigin + navigationEntries.length + 2,
+        reportedRetiredBlocks: navigationRunCallOrigin + navigationEntries.length + 2,
+        operatorPublications: navigationEntries.length,
+        witnessPublications: 1,
+        elapsedWallMs: navigationEntries.length + 4,
+        accepted: true,
+      }),
+      navigationScriptSha256: navigationPolicy.scriptSha256,
+      navigationStepCount: navigationEntries.length,
+      navigationArmRecordSha256: navigationArm.recordSha256,
+      lastNavigationStepRecordSha256:
+        navigationStepRecords.at(-1)?.recordSha256 ?? null,
     });
     const journalBytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`);
     const [
@@ -1271,6 +1532,7 @@ async function buildAttestationFixture(t, {
       preWitnessRef,
       terminalRef,
       fidelityRef,
+      navigationTranscriptRef,
       baselineMetadataRef,
       laterMetadataRef,
     ] = await Promise.all([
@@ -1289,6 +1551,11 @@ async function buildAttestationFixture(t, {
       ),
       writeCanonicalEvidence(directory, `${prefix}-terminal-machine.json`, terminalMachine),
       writeCanonicalEvidence(directory, `${prefix}-game-fidelity.json`, fidelityEnvelope),
+      writeCanonicalEvidence(
+        directory,
+        `${prefix}-navigation-transcript.json`,
+        navigationEntries,
+      ),
       writeCanonicalEvidence(directory, `${prefix}-baseline-metadata.json`, baselineMetadata),
       writeCanonicalEvidence(directory, `${prefix}-later-metadata.json`, laterMetadata),
     ]);
@@ -1299,8 +1566,9 @@ async function buildAttestationFixture(t, {
       releaseId: release.releaseId,
       executionAssetsSha256,
       operatorPublications: {
-        algorithm: "alternating-neutral-a-v1",
-        count: operatorPublicationCount,
+        algorithm: navigationPolicy.algorithm,
+        scriptSha256: navigationPolicy.scriptSha256,
+        count: attestedOperatorPublicationCount,
       },
       evidenceLock: lockRef,
       checkpointJournal: journalRef,
@@ -1311,6 +1579,7 @@ async function buildAttestationFixture(t, {
       preWitnessMachineEvidence: preWitnessRef,
       terminalMachineEvidence: terminalRef,
       gameFidelityRecord: fidelityRef,
+      navigationTranscript: navigationTranscriptRef,
       frames: {
         firstVisible: firstRef,
         baseline: {
@@ -1437,9 +1706,7 @@ test("production gate rejects the retired v3 instruction authority", async t => 
 
 test("same receipt and distinct pre/post-report Baselines preserve exact causal joins", async t => {
   const fixture = await buildAttestationFixture(t, {
-    baselineModes: ["same-pre", "distinct-pre", "distinct-post"],
-    armCycles: [1_700, 1_900, 2_100],
-    operatorPublicationCounts: [0, 0, 2],
+    baselineModes: ["distinct-post", "same-pre", "distinct-pre", "distinct-post"],
   });
   const summary = await validateProductionFidelityAttestationFiles({
     attestationPath: fixture.attestationPath,
@@ -1452,11 +1719,11 @@ test("same receipt and distinct pre/post-report Baselines preserve exact causal 
 
 test("report-final MachineEvidence is ordered at its durable report binding", async t => {
   const fixture = await buildAttestationFixture(t, {
-    baselineSnapshotSerials: [5],
+    baselineSnapshotSerials: [4],
   });
   await assert.rejects(
     validateFixture(fixture),
-    /games\[0\]\.firstFrameReport: snapshot serial did not increase/,
+    /games\[0\]\.baselineMachineEvidence: snapshot serial did not increase/,
   );
 });
 
@@ -1472,8 +1739,8 @@ test("retained ready MachineEvidence exactly reuses the report-ready envelope", 
 
 test("same-receipt Baseline metadata and RGBA must be byte-identical to first ownership", async t => {
   for (const options of [
-    { sameReceiptRgbaMismatchIndex: 0 },
-    { sameReceiptMetadataMismatchIndex: 0 },
+    { sameReceiptRgbaMismatchIndex: 1 },
+    { sameReceiptMetadataMismatchIndex: 1 },
   ]) {
     const fixture = await buildAttestationFixture(t, options);
     await assert.rejects(
@@ -1515,7 +1782,7 @@ test("the retained pre-witness leaf cannot be replaced by fresh post-publication
       corpusPath: CORPUS_PATH,
       repositoryPath: fixture.repositoryPath,
     }),
-    /durable pre-publication state/,
+    /preWitnessMachineEvidence\.si\.appliedSequence|durable pre-publication state/,
   );
 });
 
@@ -2040,7 +2307,6 @@ test("operator provenance and the cumulative run ledger are exact and cap-bound"
 
   const terminalNeutral = await buildAttestationFixture(t, {
     baselineModes: ["distinct-post"],
-    operatorPublicationCounts: [65],
   });
   await validateFixture(terminalNeutral);
 
@@ -2050,8 +2316,8 @@ test("operator provenance and the cumulative run ledger are exact and cap-bound"
   await assert.rejects(validateFixture(preBindingOperator), /operatorPublications\.count/);
 
   const postBindingArm = await buildAttestationFixture(t, {
-    baselineModes: ["distinct-post"],
-    armCycles: [1_900],
+    baselineModes: [undefined, "distinct-post"],
+    armCycles: [undefined, 1_900],
   });
   await assert.rejects(validateFixture(postBindingArm), /did not follow report binding/);
 
@@ -2070,8 +2336,8 @@ test("operator provenance and the cumulative run ledger are exact and cap-bound"
     summary => { summary.consecutiveZeroProgressSlices = 2; summary.maximumConsecutiveZeroProgressSlices = 1; },
     summary => { summary.zeroProgressSlices = 0; summary.maximumConsecutiveZeroProgressSlices = 1; },
     summary => { summary.zeroProgressSlices = 4_096; summary.maximumConsecutiveZeroProgressSlices = 4_096; },
-    summary => { summary.elapsedWallMs = 600_000; },
-    summary => { summary.wallTimeoutMs = 599_999; },
+    summary => { summary.elapsedWallMs = 7_200_001; },
+    summary => { summary.wallTimeoutMs = 7_199_999; },
     summary => { summary.witnessPublications = 0; },
     summary => { summary.operatorPublications = 1; },
   ];
@@ -2081,7 +2347,10 @@ test("operator provenance and the cumulative run ledger are exact and cap-bound"
       mutate(payloads.find(payload => payload.kind === "fidelity-terminal").runSummary);
       return payloads;
     });
-    await assert.rejects(validateFixture(fixture), /runSummary|operatorPublications/);
+    await assert.rejects(
+      validateFixture(fixture),
+      /runSummary|operatorPublications|terminal navigation authority/,
+    );
   }
 });
 
@@ -2121,7 +2390,7 @@ test("authenticated terminal execution rejects a cycle beyond the production cap
   });
   await assert.rejects(
     validateFixture(fixture),
-    /terminalExecutedCycles.*immutable lock cap/,
+    /frozen cumulative authority|terminalExecutedCycles.*immutable lock cap/,
   );
 });
 
@@ -2134,7 +2403,7 @@ test("authenticated terminal execution rejects instructions beyond the productio
   });
   await assert.rejects(
     validateFixture(fixture),
-    /terminalExecutedInstructions.*immutable lock cap/,
+    /frozen cumulative authority|terminalExecutedInstructions.*immutable lock cap/,
   );
 });
 
@@ -2149,7 +2418,7 @@ test("terminal SI may advance beyond receipt while scheduledCycle remains non-mo
   assert.equal(summary.ok, true);
 
   const tooEarly = await buildAttestationFixture(t, {
-    fidelityMutators: [bytes => bytes.writeUInt32LE(14, 44 * 4)],
+    fidelityMutators: [bytes => bytes.writeUInt32LE(37, 44 * 4)],
   });
   await assert.rejects(
     validateProductionFidelityAttestationFiles({

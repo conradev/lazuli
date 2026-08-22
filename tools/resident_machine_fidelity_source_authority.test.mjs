@@ -29,6 +29,7 @@ const LOCAL_CAPTURE_STATIC_SOURCE_PATHS = Object.freeze([
   "tools/browser_game_compatibility_corpus.mjs",
   "tools/resident_machine_corpus_report.mjs",
   "tools/resident_machine_fidelity_lock.mjs",
+  "tools/resident_machine_fidelity_navigation.mjs",
   "tools/resident_machine_production_fidelity_bundle.mjs",
   "tools/resident_machine_production_fidelity_capture.mjs",
   "tools/resident_machine_production_fidelity_gate.mjs",

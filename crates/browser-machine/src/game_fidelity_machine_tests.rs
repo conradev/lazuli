@@ -294,10 +294,18 @@ fn typed_si_receipt_and_authenticated_vi_complete_a_stable_opaque_snapshot() {
         "an equal-cycle zero-work boundary is not yet a post sample",
     );
     integration.sample_after_dispatch(&mut system, publication.observed_cycle + 2);
+    assert_eq!(
+        integration.phase(),
+        Some(ProbePhase::Received),
+        "holding A with an unchanged result must keep waiting for the causal post state",
+    );
+    put_u16(&mut system, RUNTIME + 0x4b160, 0);
+    put_i32(&mut system, PLAYER + 0x1230, 1);
+    integration.sample_after_dispatch(&mut system, publication.observed_cycle + 3);
     assert_eq!(integration.phase(), Some(ProbePhase::Posted));
     integration.accept_authenticated_vi(
         &mut system,
-        presentation(publication.observed_cycle + 2, 11, 21, 2, 2),
+        presentation(publication.observed_cycle + 3, 11, 21, 2, 2),
     );
     assert_eq!(
         integration.phase(),
@@ -306,7 +314,7 @@ fn typed_si_receipt_and_authenticated_vi_complete_a_stable_opaque_snapshot() {
     );
     integration.accept_authenticated_vi(
         &mut system,
-        presentation(publication.observed_cycle + 3, 11, 21, 1, 2),
+        presentation(publication.observed_cycle + 4, 11, 21, 1, 2),
     );
     assert_eq!(
         integration.phase(),
@@ -315,7 +323,7 @@ fn typed_si_receipt_and_authenticated_vi_complete_a_stable_opaque_snapshot() {
     );
     integration.accept_authenticated_vi(
         &mut system,
-        presentation(publication.observed_cycle + 4, 12, 22, 3, 2),
+        presentation(publication.observed_cycle + 5, 12, 22, 3, 2),
     );
     assert_eq!(integration.phase(), Some(ProbePhase::Accepted));
 

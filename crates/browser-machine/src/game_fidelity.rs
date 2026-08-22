@@ -27,7 +27,6 @@ const P_POST_LIFETIME: u64 = 1 << 7;
 pub(crate) const P_POST_ADVANCE: u64 = 1 << 8;
 const P_CAUSAL_DELTA: u64 = 1 << 9;
 pub(crate) const P_PRESENTATION: u64 = 1 << 10;
-const P_WARIO_WEAK_RECEIPT: u64 = 1 << 11;
 
 const COMMON_REQUIRED: u64 = P_IDENTITY
     | P_MILESTONE
@@ -40,7 +39,6 @@ const COMMON_REQUIRED: u64 = P_IDENTITY
     | P_POST_ADVANCE
     | P_CAUSAL_DELTA
     | P_PRESENTATION;
-const WARIO_REQUIRED: u64 = (COMMON_REQUIRED & !P_CAUSAL_DELTA) | P_WARIO_WEAK_RECEIPT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mem1ReadFault {
@@ -80,7 +78,7 @@ impl ProjectorId {
     #[cfg(test)]
     pub const fn oracle_id(self) -> &'static str {
         match self {
-            Self::WarioWareRepellionA => "warioware-repellion-a-v1",
+            Self::WarioWareRepellionA => "warioware-repellion-a-v2",
             Self::LuigisMansionFoyerLeft => "luigis-mansion-foyer-left-v1",
             Self::WindWakerOutsetLeft => "wind-waker-outset-left-v1",
             Self::MeleeActiveMatchLeft => "melee-active-match-left-v1",
@@ -216,7 +214,7 @@ const PROJECTORS: [ProjectorSpec; 7] = [
         },
         id: ProjectorId::WarioWareRepellionA,
         expected_input: WARIO_A_INPUT,
-        required: WARIO_REQUIRED,
+        required: COMMON_REQUIRED,
     },
     ProjectorSpec {
         identity: AuthenticatedDiscIdentity {
@@ -520,6 +518,7 @@ fn determinant(vectors: [Vec3; 3]) -> f32 {
 
 #[derive(Clone, Debug)]
 struct WarioState {
+    active_game: u32,
     runtime: u32,
     player: u32,
     result: i32,
@@ -554,11 +553,15 @@ fn project_wario<M: CheckedMem1>(memory: &M, stage: ProjectionStage) -> ProbeRes
             P_BASELINE_NEUTRAL,
         )?,
         ProjectionStage::Receipt => require(
-            buttons & 0x0100 != 0,
+            buttons & 0x0100 != 0 && result == 0,
             FailureCode::Predicate,
             P_RECEIPT_INPUT,
         )?,
-        ProjectionStage::Post => {}
+        ProjectionStage::Post => require(
+            buttons & 0x0100 == 0,
+            FailureCode::Predicate,
+            P_POST_ADVANCE,
+        )?,
     }
 
     // Exported projection hashes describe reduced title semantics, not where the title happened
@@ -568,11 +571,13 @@ fn project_wario<M: CheckedMem1>(memory: &M, stage: ProjectionStage) -> ProbeRes
     push_i32(&mut canonical, card_state);
     push_u16(&mut canonical, buttons);
     push_i32(&mut canonical, result);
-    let mut lifetime = Vec::with_capacity(8);
+    let mut lifetime = Vec::with_capacity(12);
+    push_u32(&mut lifetime, active_game);
     push_u32(&mut lifetime, runtime);
     push_u32(&mut lifetime, player);
     Ok(projection(
         TitleState::Wario(WarioState {
+            active_game,
             runtime,
             player,
             result,
@@ -1619,13 +1624,18 @@ fn validate_post(
             require(
                 a.runtime == b.runtime
                     && a.runtime == c.runtime
+                    && a.active_game == b.active_game
+                    && a.active_game == c.active_game
                     && a.player == b.player
-                    && a.player == c.player
-                    && a.result == 0,
+                    && a.player == c.player,
                 FailureCode::Lifetime,
-                P_WARIO_WEAK_RECEIPT,
+                P_POST_LIFETIME,
             )?;
-            let _signed_results = (b.result, c.result);
+            require(
+                a.result == 0 && b.result == 0 && c.result != 0,
+                FailureCode::Predicate,
+                P_CAUSAL_DELTA,
+            )?;
         }
         (TitleState::Luigi(a), TitleState::Luigi(b), TitleState::Luigi(c)) => {
             require(
@@ -2223,12 +2233,7 @@ impl GameFidelityProbe {
         }
         self.post_cycle = cycle;
         self.post = Some(post);
-        self.passed |= P_POST_LIFETIME | P_POST_ADVANCE;
-        if self.spec.id == ProjectorId::WarioWareRepellionA {
-            self.passed |= P_WARIO_WEAK_RECEIPT;
-        } else {
-            self.passed |= P_CAUSAL_DELTA;
-        }
+        self.passed |= P_POST_LIFETIME | P_POST_ADVANCE | P_CAUSAL_DELTA;
         self.phase = ProbePhase::Posted;
         Ok(())
     }

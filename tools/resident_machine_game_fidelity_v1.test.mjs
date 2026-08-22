@@ -154,6 +154,16 @@ test("all seven accepted Rust records decode under their exact projector contrac
   }
 });
 
+test("Wario preserves projector one, the common causal mask, and the Repellion v2 oracle", () => {
+  const wario = GAME_FIDELITY_V1_PROJECTORS[0];
+  assert.equal(wario.key, "warioware-usa");
+  assert.equal(wario.projector, 1);
+  assert.equal(wario.oracle, "warioware-repellion-a-v2");
+  assert.equal(wario.requiredPredicates, 0x07ffn);
+  assert.notEqual(wario.requiredPredicates & 1n << 9n, 0n);
+  assert.equal(wario.requiredPredicates & 1n << 11n, 0n);
+});
+
 test("decoder rejects noncanonical envelopes and non-accepted records", () => {
   const fixture = gameFidelityEnvelope();
   for (const changed of [
@@ -174,7 +184,7 @@ test("projector identity, predicate bitmap, input witness, and hashes fail close
   for (const [changed, pattern] of [
     [mutateWord(fixture, 6, 2), /identity/],
     [mutateByte(fixture, 32, "G".charCodeAt(0) | 0x80), /identity/],
-    [mutateWord(fixture, 10, 0x07ff), /requiredPredicates/],
+    [mutateWord(fixture, 10, 0x0dff), /requiredPredicates/],
     [mutateWord(fixture, 12, 0), /passedPredicates/],
     [mutateWord(fixture, 14, 1), /failedPredicates/],
     [mutateWord(fixture, 16, 0), /machineEpoch/],

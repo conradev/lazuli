@@ -26,10 +26,33 @@ ACK_SCHEMA = "lazuli-resident-renderer-fidelity-checkpoint-ack-v1"
 CHECKPOINT_PATH = "/resident-fidelity/checkpoints"
 EVIDENCE_LOCK_SCHEMA = "lazuli-resident-renderer-fidelity-evidence-lock-v2"
 PRODUCTION_EVIDENCE_LOCK_SCHEMA = "lazuli-resident-renderer-fidelity-evidence-lock-v3"
-PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP = 1_250_000_000
-PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = 2_500_000_000
+PRODUCTION_FIDELITY_INSTRUCTION_UPPER_CAP = 16_000_000_000
+PRODUCTION_FIDELITY_EXECUTED_CYCLE_UPPER_CAP = 32_000_000_000
+PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP = 32_000_000_000
 PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP = 0x000F_FFFF
 PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP = 65
+PRODUCTION_FIDELITY_GAME_KEYS = (
+    "warioware-usa",
+    "luigis-mansion-usa",
+    "wind-waker-usa",
+    "melee-usa-rev-2",
+    "f-zero-gx-usa",
+    "metroid-prime-usa-rev-2",
+    "rogue-leader-usa",
+)
+PRODUCTION_FIDELITY_EMPTY_NAVIGATION_SCRIPT_SHA256 = (
+    "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+)
+PRODUCTION_FIDELITY_NAVIGATION_AUTHORITIES = {
+    "warioware-usa": (
+        "84abad2615ea1c94e9389fde3fa1d25e65a91653df85cc140a9fd49bff9a0d9e",
+        34,
+    ),
+    **{
+        game_key: (PRODUCTION_FIDELITY_EMPTY_NAVIGATION_SCRIPT_SHA256, 0)
+        for game_key in PRODUCTION_FIDELITY_GAME_KEYS[1:]
+    },
+}
 EVIDENCE_LOCK_PATH = "/resident-fidelity/evidence-lock.json"
 DEFAULT_BODY_CAP = 4_096
 DEFAULT_RECORD_CAP = 65_535
@@ -83,6 +106,7 @@ FIDELITY_ARTIFACT_FIELDS = {
 CAPTURE_RUN_POLICY_FIELDS = {
     "instructionUpperCap",
     "executedCycleUpperCap",
+    "canonicalCycleUpperCap",
     "sliceCycleUpperCap",
     "blockUpperCap",
     "totalHostCallCap",
@@ -94,12 +118,62 @@ CAPTURE_RUN_POLICY_FIELDS = {
     "externalWallTimeoutMs",
     "zeroProgressSliceCap",
     "workerUrl",
+    "navigationPolicy",
+}
+CAPTURE_NAVIGATION_POLICY_FIELDS = {
+    "schema",
+    "gameKey",
+    "algorithm",
+    "cycleOrigin",
+    "controllerEncoding",
+    "targetAnchor",
+    "receiptSource",
+    "periodicSiCycles",
+    "maximumReceiptLatencyCycles",
+    "maximumPublications",
+    "scriptSha256",
+    "steps",
+}
+CAPTURE_NAVIGATION_STEP_FIELDS = {
+    "minimumCanonicalDelay",
+    "buttons",
+    "stickXyCxy",
+    "triggerLrab",
+}
+NAVIGATION_RECEIPT_FIELDS = {
+    "stepIndex",
+    "sequenceLo",
+    "sequenceHi",
+    "minimumCanonicalDelay",
+    "targetCanonicalCycle",
+    "publicationCanonicalCycle",
+    "publicationOvershootCycles",
+    "buttons",
+    "stickXyCxy",
+    "triggerLrab",
+    "status",
+    "siPollIndex",
+    "siScheduledCycle",
+    "siObservedCycle",
+    "siAppliedSequenceLo",
+    "siAppliedSequenceHi",
+    "siPacketWord0",
+    "siPacketWord1",
+    "siSource",
+    "priorSiPollIndex",
+    "siControllerMode",
+    "siButtons",
+    "siStickXyCxy",
+    "siTriggerLrab",
 }
 CAPTURE_RUN_SUMMARY_FIELDS = {
     "schema",
     "issuedRunCalls",
+    "canonicalCycle",
+    "reportedCanonicalCycles",
     "reportedExecutedCycles",
     "reportedExecutedInstructions",
+    "reportedRetiredBlocks",
     "reportedHostCalls",
     "reportedColdInstalls",
     "zeroProgressSlices",
@@ -141,6 +215,10 @@ class FidelityCheckpointError(ValueError):
 
 
 def production_capture_policy(game_key: str) -> dict[str, Any]:
+    navigation_authority = PRODUCTION_FIDELITY_NAVIGATION_AUTHORITIES.get(game_key)
+    if navigation_authority is None:
+        raise ValueError(f"no frozen production navigation authority for {game_key!r}")
+    _, navigation_step_count = navigation_authority
     return {
         "mode": "continuous-single-worker-machine-v1",
         "pageQuery": {
@@ -154,7 +232,7 @@ def production_capture_policy(game_key: str) -> dict[str, Any]:
         "captureMachineInitializedBeforeProgress": True,
         "cumulativeRunCapsAfterAuthenticatedReady": True,
         "cumulativeRunLedger": {
-            "schema": "lazuli-resident-cumulative-run-summary-v1",
+            "schema": "lazuli-resident-cumulative-run-summary-v2",
             "policySource": "locked-runPolicy",
             "startsAt": "resident-ready",
             "endsAt": "fidelity-accepted-owned",
@@ -166,30 +244,33 @@ def production_capture_policy(game_key: str) -> dict[str, Any]:
         "minimumPresentationDeltaFromFirstFrame": 64,
         "fidelityStatePollAfterEveryRun": True,
         "observationAckAfterDurableOwnership": True,
+        "navigationArmCheckpointAckBeforeProgress": True,
+        "navigationReceiptCheckpointAckBeforeFurtherProgress": True,
         "witnessCheckpointAckBeforeProgress": True,
         "acceptedIsHardMachineProgressBoundary": True,
         "terminalStateQueryOnlyAfterAccepted": True,
         "terminalOpaqueArtifactsEqualAccepted": True,
         "firstFrameReportUsesPreBindingJournalPrefix": True,
         "sameReceiptBaselineReusesFirstFrameReadback": True,
-        "genericOperatorInputBeforeBaseline": True,
-        "genericOperatorPolicy": {
-            "algorithm": "alternating-neutral-a-v1",
-            "runBoundaryOrigin": "post-first-frame-report-local-zero",
-            "runBoundaryInterval": 8,
+        "lockedNavigationInputBeforeBaseline": navigation_step_count != 0,
+        "lockedNavigationPolicy": {
+            "schema": "lazuli-resident-pre-baseline-navigation-v1",
+            "algorithm": "locked-si-observed-not-before-publication-v1",
+            "policySource": "locked-runPolicy.navigationPolicy",
+            "commandTimeControllerWords": 0,
+            "workerOwnedSequenceNumbers": True,
+            "armPhase": "phase-0" if navigation_step_count else "phase-0-or-baseline",
+            "publicationPhase": 0,
             "maximumPublications": PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP,
-            "startsWith": "neutral",
-            "neutral": {
-                "buttons": 0,
-                "stickXyCxy": 0x80808080,
-                "triggerLrab": 0,
-            },
-            "a": {
-                "buttons": 0x0100,
-                "stickXyCxy": 0x80808080,
-                "triggerLrab": 0x00FF0000,
-            },
+            "completeScriptBeforeBaseline": True,
+            "terminalNeutralRequired": True,
+            "firstFrameCanonicalOriginBound": True,
+            "notBeforePriorAuthenticatedSiObservedCycle": True,
+            "maximumOvershootSource": "locked-runPolicy.sliceCycleUpperCap",
+            "exactQueuedStatusRequired": True,
+            "periodicSiReceiptRequired": True,
         },
+        "durableNavigationTranscript": True,
         "rustRequestedWitnessOnly": True,
         "artifactDigestPolicy": {
             "json": "recursive-key-canonical-utf8",
@@ -203,11 +284,14 @@ def production_capture_policy(game_key: str) -> dict[str, Any]:
             "opaqueRecords": "decoded-canonical-padded-base64",
             "metadata": "recursive-key-canonical-utf8",
             "rgba": "raw-owned-bytes",
+            "navigationTranscript": "recursive-key-canonical-utf8",
         },
         "requiredCheckpointCardinality": {
             "capture-machine-initialized": 1,
             "first-frame-renderer-owned": 1,
             "first-frame-report-bound": 1,
+            "navigation-armed": 1,
+            "navigation-step-received": navigation_step_count,
             "fidelity-baseline-owned": 1,
             "controller-witness-published": 1,
             "fidelity-accepted-owned": 1,
@@ -219,7 +303,14 @@ def production_capture_policy(game_key: str) -> dict[str, Any]:
             ["capture-machine-initialized", "first-frame-report-bound"],
             ["first-frame-renderer-owned", "first-frame-report-bound"],
             ["first-frame-renderer-owned", "fidelity-baseline-owned"],
+            ["first-frame-report-bound", "navigation-armed"],
+            *([
+                ["navigation-armed", "fidelity-baseline-owned"],
+                ["navigation-armed", "navigation-step-received"],
+                ["navigation-step-received", "fidelity-baseline-owned"],
+            ] if navigation_step_count else []),
             ["first-frame-report-bound", "controller-witness-published"],
+            ["navigation-armed", "controller-witness-published"],
             ["fidelity-baseline-owned", "controller-witness-published"],
             ["controller-witness-published", "fidelity-accepted-owned"],
             ["fidelity-accepted-owned", "fidelity-terminal"],
@@ -278,11 +369,45 @@ def validate_evidence_lock(value: object) -> dict[str, Any]:
         ):
             raise ValueError("--evidence-lock has an invalid production executed-cycle cap")
         if (
+            run_policy.get("canonicalCycleUpperCap")
+            != str(PRODUCTION_FIDELITY_CANONICAL_CYCLE_UPPER_CAP)
+        ):
+            raise ValueError("--evidence-lock has an invalid production canonical-cycle cap")
+        if run_policy.get("sliceCycleUpperCap") != "8000000" \
+                or run_policy.get("blockUpperCap") != 131_072:
+            raise ValueError("--evidence-lock has an invalid production slice cap")
+        if run_policy.get("runTimeoutMs") != 7_200_000 \
+                or run_policy.get("externalWallTimeoutMs") != 7_200_000:
+            raise ValueError("--evidence-lock has an invalid production wall cap")
+        if (
             run_policy.get("totalColdInstallCap")
             != PRODUCTION_FIDELITY_TOTAL_COLD_INSTALL_CAP
         ):
             raise ValueError("--evidence-lock has an invalid production cold-install cap")
+        try:
+            validate_capture_run_policy(run_policy, "$.runPolicy")
+        except FidelityCheckpointError as error:
+            raise ValueError(f"--evidence-lock has an invalid production run policy: {error}") \
+                from error
+        if run_policy["navigationPolicy"]["gameKey"] != run["gameKey"]:
+            raise ValueError("--evidence-lock navigation title differs from its run identity")
+        navigation_policy = run_policy["navigationPolicy"]
+        navigation_authority = PRODUCTION_FIDELITY_NAVIGATION_AUTHORITIES.get(run["gameKey"])
+        if navigation_authority is None:
+            raise ValueError("--evidence-lock has no frozen production navigation authority")
+        expected_script_sha256, expected_step_count = navigation_authority
+        if navigation_policy["scriptSha256"] != expected_script_sha256 \
+                or len(navigation_policy["steps"]) != expected_step_count:
+            raise ValueError("--evidence-lock has an invalid production navigation policy")
         capture_policy = value.get("capturePolicy")
+        if not isinstance(capture_policy, dict) \
+                or not isinstance(capture_policy.get("requiredCheckpointCardinality"), dict) \
+                or capture_policy["requiredCheckpointCardinality"].get(
+                    "navigation-step-received"
+                ) != len(navigation_policy["steps"]):
+            raise ValueError(
+                "--evidence-lock capture navigation cardinality differs from its run policy"
+            )
         expected_capture_policy = production_capture_policy(run["gameKey"])
         if capture_policy != expected_capture_policy:
             raise ValueError("--evidence-lock has an invalid continuous capture policy")
@@ -334,22 +459,133 @@ def unsigned_decimal(value: object, path: str) -> str:
     return value
 
 
+def validate_capture_navigation_policy(value: object, path: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise FidelityCheckpointError(f"{path} must be an object")
+    exact_fields(value, CAPTURE_NAVIGATION_POLICY_FIELDS, path)
+    if value["schema"] != "lazuli-resident-pre-baseline-navigation-v1":
+        raise FidelityCheckpointError(f"{path}.schema is unexpected")
+    if not isinstance(value["gameKey"], str) \
+            or corpus_server.KEY_PATTERN.fullmatch(value["gameKey"]) is None:
+        raise FidelityCheckpointError(f"{path}.gameKey must be lowercase kebab-case")
+    if value["algorithm"] != "locked-si-observed-not-before-publication-v1":
+        raise FidelityCheckpointError(f"{path}.algorithm is unexpected")
+    if value["cycleOrigin"] != "durable-first-frame-canonical-scheduler-cycle":
+        raise FidelityCheckpointError(f"{path}.cycleOrigin is unexpected")
+    if value["controllerEncoding"] != "gamecube-packed-controller-v1":
+        raise FidelityCheckpointError(f"{path}.controllerEncoding is unexpected")
+    if value["targetAnchor"] != "prior-si-observed-cycle":
+        raise FidelityCheckpointError(f"{path}.targetAnchor is unexpected")
+    if value["receiptSource"] != "periodic":
+        raise FidelityCheckpointError(f"{path}.receiptSource is unexpected")
+    if value["periodicSiCycles"] != "8108100":
+        raise FidelityCheckpointError(f"{path}.periodicSiCycles is unexpected")
+    if value["maximumReceiptLatencyCycles"] != "16108100":
+        raise FidelityCheckpointError(f"{path}.maximumReceiptLatencyCycles is unexpected")
+    if value["maximumPublications"] != PRODUCTION_FIDELITY_OPERATOR_PUBLICATION_CAP:
+        raise FidelityCheckpointError(f"{path}.maximumPublications is unexpected")
+    sha256(value["scriptSha256"], f"{path}.scriptSha256")
+    steps = value["steps"]
+    if not isinstance(steps, list) or len(steps) > value["maximumPublications"]:
+        raise FidelityCheckpointError(f"{path}.steps exceeds the publication cap")
+    for index, step in enumerate(steps):
+        step_path = f"{path}.steps[{index}]"
+        if not isinstance(step, dict):
+            raise FidelityCheckpointError(f"{step_path} must be an object")
+        exact_fields(step, CAPTURE_NAVIGATION_STEP_FIELDS, step_path)
+        delay = int(unsigned_decimal(
+            step["minimumCanonicalDelay"],
+            f"{step_path}.minimumCanonicalDelay",
+        ))
+        if delay == 0:
+            raise FidelityCheckpointError(f"{step_path}.minimumCanonicalDelay must be positive")
+        for field in ("buttons", "stickXyCxy", "triggerLrab"):
+            uint32(step[field], f"{step_path}.{field}")
+        if step["buttons"] & ~0x0000_1F7F:
+            raise FidelityCheckpointError(f"{step_path}.buttons includes reserved bits")
+    if steps:
+        terminal = steps[-1]
+        if terminal != {
+            "minimumCanonicalDelay": terminal["minimumCanonicalDelay"],
+            "buttons": 0,
+            "stickXyCxy": 0x8080_8080,
+            "triggerLrab": 0,
+        }:
+            raise FidelityCheckpointError(f"{path}.steps does not terminate neutral")
+    if sha256_hex(canonical_json(steps)) != value["scriptSha256"]:
+        raise FidelityCheckpointError(f"{path}.scriptSha256 does not authenticate steps")
+    return value
+
+
+def expected_navigation_si_packet(step: dict[str, Any], mode: int) -> tuple[int, int]:
+    buttons = step["buttons"]
+    sticks = step["stickXyCxy"]
+    triggers = step["triggerLrab"]
+    word0 = (
+        ((buttons >> 8) & 0xFF) << 24
+        | (((buttons & 0xFF) | 0x80) & 0xFF) << 16
+        | (sticks & 0xFF) << 8
+        | ((sticks >> 8) & 0xFF)
+    )
+    c_stick_x = (sticks >> 16) & 0xFF
+    c_stick_y = (sticks >> 24) & 0xFF
+    trigger_l = triggers & 0xFF
+    trigger_r = (triggers >> 8) & 0xFF
+    analog_a = (triggers >> 16) & 0xFF
+    analog_b = (triggers >> 24) & 0xFF
+    if mode == 0 or 5 <= mode <= 7:
+        low = (
+            c_stick_x,
+            c_stick_y,
+            (trigger_l & 0xF0) | (trigger_r >> 4),
+            (analog_a & 0xF0) | (analog_b >> 4),
+        )
+    elif mode == 1:
+        low = (
+            (c_stick_x & 0xF0) | (c_stick_y >> 4),
+            trigger_l,
+            trigger_r,
+            (analog_a & 0xF0) | (analog_b >> 4),
+        )
+    elif mode == 2:
+        low = (
+            (c_stick_x & 0xF0) | (c_stick_y >> 4),
+            (trigger_l & 0xF0) | (trigger_r >> 4),
+            analog_a,
+            analog_b,
+        )
+    elif mode == 4:
+        low = (c_stick_x, c_stick_y, analog_a, analog_b)
+    else:
+        low = (c_stick_x, c_stick_y, trigger_l, trigger_r)
+    word1 = low[0] << 24 | low[1] << 16 | low[2] << 8 | low[3]
+    return word0, word1
+
+
 def validate_capture_run_policy(value: object, path: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise FidelityCheckpointError(f"{path} must be an object")
     exact_fields(value, CAPTURE_RUN_POLICY_FIELDS, path)
-    for field in ("instructionUpperCap", "executedCycleUpperCap", "sliceCycleUpperCap"):
+    for field in (
+        "instructionUpperCap",
+        "executedCycleUpperCap",
+        "canonicalCycleUpperCap",
+        "sliceCycleUpperCap",
+    ):
         unsigned_decimal(value[field], f"{path}.{field}")
         if int(value[field]) == 0:
             raise FidelityCheckpointError(f"{path}.{field} must be positive")
     for field in CAPTURE_RUN_POLICY_FIELDS - {
-        "instructionUpperCap", "executedCycleUpperCap", "sliceCycleUpperCap", "workerUrl"
+        "instructionUpperCap", "executedCycleUpperCap", "canonicalCycleUpperCap",
+        "sliceCycleUpperCap", "workerUrl", "navigationPolicy",
     }:
         positive_integer(value[field], f"{path}.{field}", 0x1F_FFFF_FFFF_FFFF)
     if not isinstance(value["workerUrl"], str) or not value["workerUrl"].startswith("/"):
         raise FidelityCheckpointError(f"{path}.workerUrl must be a same-origin absolute path")
-    if int(value["sliceCycleUpperCap"]) > int(value["executedCycleUpperCap"]):
+    if int(value["sliceCycleUpperCap"]) > int(value["executedCycleUpperCap"]) \
+            or int(value["sliceCycleUpperCap"]) > int(value["canonicalCycleUpperCap"]):
         raise FidelityCheckpointError(f"{path}.sliceCycleUpperCap exceeds total cycle cap")
+    validate_capture_navigation_policy(value["navigationPolicy"], f"{path}.navigationPolicy")
     return value
 
 
@@ -362,16 +598,19 @@ def validate_capture_run_summary(
     if not isinstance(value, dict):
         raise FidelityCheckpointError(f"{path} must be an object")
     exact_fields(value, CAPTURE_RUN_SUMMARY_FIELDS, path)
-    if value["schema"] != "lazuli-resident-cumulative-run-summary-v1":
+    if value["schema"] != "lazuli-resident-cumulative-run-summary-v2":
         raise FidelityCheckpointError(f"{path}.schema is unexpected")
+    unsigned_decimal(value["canonicalCycle"], f"{path}.canonicalCycle")
+    unsigned_decimal(value["reportedCanonicalCycles"], f"{path}.reportedCanonicalCycles")
     unsigned_decimal(value["reportedExecutedCycles"], f"{path}.reportedExecutedCycles")
     unsigned_decimal(
         value["reportedExecutedInstructions"],
         f"{path}.reportedExecutedInstructions",
     )
+    unsigned_decimal(value["reportedRetiredBlocks"], f"{path}.reportedRetiredBlocks")
     for field in CAPTURE_RUN_SUMMARY_FIELDS - {
-        "schema", "reportedExecutedCycles", "reportedExecutedInstructions", "accepted",
-        "wallTimeoutMs",
+        "schema", "canonicalCycle", "reportedCanonicalCycles", "reportedExecutedCycles",
+        "reportedExecutedInstructions", "reportedRetiredBlocks", "accepted", "wallTimeoutMs",
     }:
         nonnegative_integer(value[field], f"{path}.{field}")
     positive_integer(value["wallTimeoutMs"], f"{path}.wallTimeoutMs", 0x1F_FFFF_FFFF_FFFF)
@@ -381,7 +620,8 @@ def validate_capture_run_summary(
     if value["wallTimeoutMs"] != wall_timeout or value["elapsedWallMs"] >= wall_timeout:
         raise FidelityCheckpointError(f"{path} wall authority changed or exhausted")
     if (
-        int(value["reportedExecutedCycles"]) > int(policy["executedCycleUpperCap"])
+        int(value["reportedCanonicalCycles"]) > int(policy["canonicalCycleUpperCap"])
+        or int(value["reportedExecutedCycles"]) > int(policy["executedCycleUpperCap"])
         or int(value["reportedExecutedInstructions"]) > int(policy["instructionUpperCap"])
         or value["reportedHostCalls"] > policy["totalHostCallCap"]
         or value["reportedColdInstalls"] > policy["totalColdInstallCap"]
@@ -580,6 +820,38 @@ def validate_checkpoint(payload: object) -> tuple[dict[str, Any], dict[str, obje
             },
             "$",
         )
+    elif kind == "navigation-armed":
+        exact_fields(
+            payload,
+            COMMON_FIELDS
+            | {
+                "machineSessionId",
+                "firstFrameReportRecordSha256",
+                "scriptSha256",
+                "runCallOrigin",
+                "canonicalCycleOrigin",
+                "siPollIndexOrigin",
+                "stepCount",
+                "runSummary",
+            },
+            "$",
+        )
+    elif kind == "navigation-step-received":
+        exact_fields(
+            payload,
+            COMMON_FIELDS
+            | NAVIGATION_RECEIPT_FIELDS
+            | {
+                "machineSessionId",
+                "firstFrameReportRecordSha256",
+                "navigationArmRecordSha256",
+                "scriptSha256",
+                "runCallOrigin",
+                "canonicalCycleOrigin",
+                "runSummary",
+            },
+            "$",
+        )
     elif kind == "controller-witness-published":
         exact_fields(
             payload,
@@ -598,6 +870,11 @@ def validate_checkpoint(payload: object) -> tuple[dict[str, Any], dict[str, obje
                 "machineEvidenceEnvelopeSha256",
                 "machineEvidenceOpaqueBytes",
                 "machineEvidenceOpaqueSha256",
+                "navigationScriptSha256",
+                "navigationStepCount",
+                "navigationArmRecordSha256",
+                "lastNavigationStepRecordSha256",
+                "runSummary",
             },
             "$",
         )
@@ -629,6 +906,10 @@ def validate_checkpoint(payload: object) -> tuple[dict[str, Any], dict[str, obje
                 "baselineRecordSha256",
                 "acceptedRecordSha256",
                 "runSummary",
+                "navigationScriptSha256",
+                "navigationStepCount",
+                "navigationArmRecordSha256",
+                "lastNavigationStepRecordSha256",
             },
             "$",
         )
@@ -678,6 +959,8 @@ def validate_checkpoint(payload: object) -> tuple[dict[str, Any], dict[str, obje
         if payload["machineEvidenceOpaqueBytes"] != 816:
             raise FidelityCheckpointError("$.machineEvidenceOpaqueBytes must be exactly 816")
         run_policy = validate_capture_run_policy(payload["runPolicy"], "$.runPolicy")
+        if run_policy["navigationPolicy"]["gameKey"] != payload["gameKey"]:
+            raise FidelityCheckpointError("$.runPolicy.navigationPolicy.gameKey changed title")
         if payload["bootReads"] > run_policy["maxBootReads"]:
             raise FidelityCheckpointError("$.bootReads exceeded the locked ready boot cap")
         run_summary = validate_capture_run_summary(
@@ -685,8 +968,10 @@ def validate_checkpoint(payload: object) -> tuple[dict[str, Any], dict[str, obje
         )
         if (
             run_summary["issuedRunCalls"] != 0
+            or run_summary["reportedCanonicalCycles"] != "0"
             or run_summary["reportedExecutedCycles"] != "0"
             or run_summary["reportedExecutedInstructions"] != "0"
+            or run_summary["reportedRetiredBlocks"] != "0"
             or run_summary["reportedHostCalls"] != 0
             or run_summary["reportedColdInstalls"] != 0
             or run_summary["zeroProgressSlices"] != 0
@@ -739,12 +1024,52 @@ def validate_checkpoint(payload: object) -> tuple[dict[str, Any], dict[str, obje
             sha256(payload["baselineRecordSha256"], "$.baselineRecordSha256")
         return payload, None
 
+    if kind == "navigation-armed":
+        sha256(payload["firstFrameReportRecordSha256"], "$.firstFrameReportRecordSha256")
+        sha256(payload["scriptSha256"], "$.scriptSha256")
+        nonnegative_integer(payload["runCallOrigin"], "$.runCallOrigin")
+        unsigned_decimal(payload["canonicalCycleOrigin"], "$.canonicalCycleOrigin")
+        unsigned_decimal(payload["siPollIndexOrigin"], "$.siPollIndexOrigin")
+        nonnegative_integer(payload["stepCount"], "$.stepCount")
+        return payload, None
+
+    if kind == "navigation-step-received":
+        sha256(payload["firstFrameReportRecordSha256"], "$.firstFrameReportRecordSha256")
+        sha256(payload["navigationArmRecordSha256"], "$.navigationArmRecordSha256")
+        sha256(payload["scriptSha256"], "$.scriptSha256")
+        nonnegative_integer(payload["runCallOrigin"], "$.runCallOrigin")
+        unsigned_decimal(payload["canonicalCycleOrigin"], "$.canonicalCycleOrigin")
+        nonnegative_integer(payload["stepIndex"], "$.stepIndex")
+        for field in (
+            "sequenceLo", "sequenceHi", "buttons", "stickXyCxy", "triggerLrab",
+            "siAppliedSequenceLo", "siAppliedSequenceHi", "siPacketWord0",
+            "siPacketWord1", "siSource", "siControllerMode", "siButtons",
+            "siStickXyCxy", "siTriggerLrab",
+        ):
+            uint32(payload[field], f"$.{field}")
+        for field in (
+            "minimumCanonicalDelay", "targetCanonicalCycle", "publicationCanonicalCycle",
+            "publicationOvershootCycles", "siPollIndex", "siScheduledCycle",
+            "siObservedCycle", "priorSiPollIndex",
+        ):
+            unsigned_decimal(payload[field], f"$.{field}")
+        positive_integer(payload["status"], "$.status", 0xFFFF_FFFF)
+        return payload, None
+
     if kind == "controller-witness-published":
         sha256(payload["baselineRecordSha256"], "$.baselineRecordSha256")
         sha256(payload["firstFrameReportRecordSha256"], "$.firstFrameReportRecordSha256")
         for field in ("sequenceLo", "sequenceHi", "buttons", "stickXyCxy", "triggerLrab"):
             uint32(payload[field], f"$.{field}")
         positive_integer(payload["status"], "$.status")
+        sha256(payload["navigationScriptSha256"], "$.navigationScriptSha256")
+        sha256(payload["navigationArmRecordSha256"], "$.navigationArmRecordSha256")
+        nonnegative_integer(payload["navigationStepCount"], "$.navigationStepCount")
+        if payload["lastNavigationStepRecordSha256"] is not None:
+            sha256(
+                payload["lastNavigationStepRecordSha256"],
+                "$.lastNavigationStepRecordSha256",
+            )
         validate_byte_artifact(
             payload,
             "machineEvidenceEnvelopeBytes",
@@ -768,6 +1093,14 @@ def validate_checkpoint(payload: object) -> tuple[dict[str, Any], dict[str, obje
             raise FidelityCheckpointError("$.phase must be 5")
         sha256(payload["baselineRecordSha256"], "$.baselineRecordSha256")
         sha256(payload["acceptedRecordSha256"], "$.acceptedRecordSha256")
+        sha256(payload["navigationScriptSha256"], "$.navigationScriptSha256")
+        sha256(payload["navigationArmRecordSha256"], "$.navigationArmRecordSha256")
+        nonnegative_integer(payload["navigationStepCount"], "$.navigationStepCount")
+        if payload["lastNavigationStepRecordSha256"] is not None:
+            sha256(
+                payload["lastNavigationStepRecordSha256"],
+                "$.lastNavigationStepRecordSha256",
+            )
         validate_fidelity_artifacts(payload)
         return payload, None
 
@@ -847,6 +1180,12 @@ class FidelityCheckpointJournal:
         self.baseline_record_sha256: str | None = None
         self.baseline_requested_controller: dict[str, int] | None = None
         self.first_frame_report_record_sha256: str | None = None
+        self.navigation_arm_record_sha256: str | None = None
+        self.navigation_run_call_origin: int | None = None
+        self.navigation_cycle_origin: str | None = None
+        self.navigation_si_poll_index_origin: str | None = None
+        self.navigation_transcript: list[dict[str, Any]] = []
+        self.navigation_step_record_sha256s: list[str] = []
         self.witness_record_sha256: str | None = None
         self.accepted_record_sha256: str | None = None
         self.accepted_artifacts: dict[str, object] | None = None
@@ -893,6 +1232,8 @@ class FidelityCheckpointJournal:
             "first-frame-renderer-owned",
             "fidelity-baseline-owned",
             "first-frame-report-bound",
+            "navigation-armed",
+            "navigation-step-received",
             "controller-witness-published",
             "fidelity-accepted-owned",
             "fidelity-terminal",
@@ -966,6 +1307,13 @@ class FidelityCheckpointJournal:
                 raise FidelityCheckpointError("Baseline resolved receipt identity changed")
             if self.first_frame_renderer_record_sha256 is None or self.baseline_record_sha256 is not None:
                 raise FidelityCheckpointError("Baseline ownership cardinality/order changed")
+            assert self.capture_run_policy is not None
+            navigation_steps = self.capture_run_policy["navigationPolicy"]["steps"]
+            if len(self.navigation_transcript) != len(navigation_steps) \
+                    or (navigation_steps and self.navigation_arm_record_sha256 is None):
+                raise FidelityCheckpointError(
+                    "Baseline ownership requires the complete locked navigation transcript"
+                )
             allowed_previous = {identity["receiptRecordSha256"]}
             if identity == self.first_frame_receipt:
                 allowed_previous.add(self.first_frame_renderer_record_sha256)
@@ -996,6 +1344,131 @@ class FidelityCheckpointJournal:
                 raise FidelityCheckpointError("first-frame report did not join renderer ownership")
             if payload["baselineRecordSha256"] != self.baseline_record_sha256:
                 raise FidelityCheckpointError("first-frame report Baseline prefix join changed")
+        elif kind == "navigation-armed":
+            if not self.allow_capture_annotations or self.open_submission is not None:
+                raise FidelityCheckpointError(
+                    "navigation arm requires production capture with no open submission"
+                )
+            assert self.capture_run_policy is not None
+            navigation_policy = self.capture_run_policy["navigationPolicy"]
+            if self.first_frame_report_record_sha256 is None \
+                    or self.navigation_arm_record_sha256 is not None \
+                    or self.witness_record_sha256 is not None \
+                    or (self.baseline_record_sha256 is not None
+                        and navigation_policy["steps"]):
+                raise FidelityCheckpointError("navigation arm cardinality/order changed")
+            if payload["firstFrameReportRecordSha256"] \
+                    != self.first_frame_report_record_sha256 \
+                    or payload["scriptSha256"] != navigation_policy["scriptSha256"] \
+                    or payload["stepCount"] != len(navigation_policy["steps"]):
+                raise FidelityCheckpointError("navigation arm changed locked script authority")
+            run_summary = validate_capture_run_summary(
+                payload["runSummary"],
+                self.capture_run_policy,
+                "$.runSummary",
+                False,
+            )
+            if run_summary["operatorPublications"] != 0 \
+                    or run_summary["witnessPublications"] != 0 \
+                    or payload["runCallOrigin"] != run_summary["issuedRunCalls"] \
+                    or payload["canonicalCycleOrigin"] != run_summary["canonicalCycle"]:
+                raise FidelityCheckpointError(
+                    "navigation arm did not bind first-frame scheduler authority"
+                )
+        elif kind == "navigation-step-received":
+            if not self.allow_capture_annotations or self.open_submission is not None:
+                raise FidelityCheckpointError(
+                    "navigation SI receipt requires production capture with no open submission"
+                )
+            if self.first_frame_report_record_sha256 is None \
+                    or self.navigation_arm_record_sha256 is None \
+                    or self.baseline_record_sha256 is not None \
+                    or self.witness_record_sha256 is not None:
+                raise FidelityCheckpointError("navigation SI receipt cardinality/order changed")
+            if payload["firstFrameReportRecordSha256"] \
+                    != self.first_frame_report_record_sha256 \
+                    or payload["navigationArmRecordSha256"] \
+                    != self.navigation_arm_record_sha256 \
+                    or payload["runCallOrigin"] != self.navigation_run_call_origin \
+                    or payload["canonicalCycleOrigin"] != self.navigation_cycle_origin:
+                raise FidelityCheckpointError("navigation SI receipt changed armed authority")
+            assert self.capture_run_policy is not None
+            assert self.navigation_si_poll_index_origin is not None
+            navigation_policy = self.capture_run_policy["navigationPolicy"]
+            step_index = len(self.navigation_transcript)
+            if payload["scriptSha256"] != navigation_policy["scriptSha256"] \
+                    or payload["stepIndex"] != step_index \
+                    or step_index >= len(navigation_policy["steps"]):
+                raise FidelityCheckpointError("navigation SI receipt changed locked script order")
+            expected_step = navigation_policy["steps"][step_index]
+            prior_anchor = (
+                int(self.navigation_cycle_origin)
+                if not self.navigation_transcript
+                else int(self.navigation_transcript[-1]["siObservedCycle"])
+            )
+            target = prior_anchor + int(expected_step["minimumCanonicalDelay"])
+            publication = int(payload["publicationCanonicalCycle"])
+            overshoot = int(payload["publicationOvershootCycles"])
+            sequence = payload["sequenceHi"] << 32 | payload["sequenceLo"]
+            prior_sequence = (
+                -1
+                if not self.navigation_transcript
+                else self.navigation_transcript[-1]["sequenceHi"] << 32
+                | self.navigation_transcript[-1]["sequenceLo"]
+            )
+            prior_accepted_poll = (
+                int(self.navigation_si_poll_index_origin)
+                if not self.navigation_transcript
+                else int(self.navigation_transcript[-1]["siPollIndex"])
+            )
+            prior_recorded_poll = int(payload["priorSiPollIndex"])
+            poll_index = int(payload["siPollIndex"])
+            scheduled = int(payload["siScheduledCycle"])
+            observed = int(payload["siObservedCycle"])
+            mode = payload["siControllerMode"]
+            packet_word_0, packet_word_1 = expected_navigation_si_packet(expected_step, mode)
+            if payload["minimumCanonicalDelay"] != expected_step["minimumCanonicalDelay"] \
+                    or payload["targetCanonicalCycle"] != str(target) \
+                    or publication < target \
+                    or overshoot != publication - target \
+                    or overshoot > int(self.capture_run_policy["sliceCycleUpperCap"]) \
+                    or payload["buttons"] != expected_step["buttons"] \
+                    or payload["stickXyCxy"] != expected_step["stickXyCxy"] \
+                    or payload["triggerLrab"] != expected_step["triggerLrab"] \
+                    or payload["status"] != 1 \
+                    or sequence <= prior_sequence \
+                    or prior_recorded_poll < prior_accepted_poll \
+                    or poll_index <= prior_recorded_poll \
+                    or scheduled < publication \
+                    or observed < scheduled \
+                    or scheduled - publication > int(navigation_policy["periodicSiCycles"]) \
+                    or observed - publication \
+                    > int(navigation_policy["maximumReceiptLatencyCycles"]) \
+                    or payload["siAppliedSequenceLo"] != payload["sequenceLo"] \
+                    or payload["siAppliedSequenceHi"] != payload["sequenceHi"] \
+                    or payload["siPacketWord0"] != packet_word_0 \
+                    or payload["siPacketWord1"] != packet_word_1 \
+                    or payload["siSource"] != 0 \
+                    or mode > 7 \
+                    or payload["siButtons"] != expected_step["buttons"] \
+                    or payload["siStickXyCxy"] != expected_step["stickXyCxy"] \
+                    or payload["siTriggerLrab"] != expected_step["triggerLrab"]:
+                raise FidelityCheckpointError(
+                    "navigation SI receipt changed locked chronology or controller state"
+                )
+            run_summary = validate_capture_run_summary(
+                payload["runSummary"],
+                self.capture_run_policy,
+                "$.runSummary",
+                False,
+            )
+            if run_summary["operatorPublications"] != step_index + 1 \
+                    or run_summary["witnessPublications"] != 0 \
+                    or int(run_summary["canonicalCycle"]) < observed \
+                    or run_summary["issuedRunCalls"] < payload["runCallOrigin"]:
+                raise FidelityCheckpointError(
+                    "navigation SI receipt diverged from cumulative run authority"
+                )
         elif kind == "controller-witness-published":
             if not self.allow_capture_annotations or self.open_submission is not None:
                 raise FidelityCheckpointError(
@@ -1008,6 +1481,30 @@ class FidelityCheckpointJournal:
             if payload["baselineRecordSha256"] != self.baseline_record_sha256 \
                     or payload["firstFrameReportRecordSha256"] != self.first_frame_report_record_sha256:
                 raise FidelityCheckpointError("controller witness authority join changed")
+            assert self.capture_run_policy is not None
+            navigation_policy = self.capture_run_policy["navigationPolicy"]
+            expected_navigation_count = len(navigation_policy["steps"])
+            expected_last_navigation = (
+                self.navigation_step_record_sha256s[-1]
+                if self.navigation_step_record_sha256s else None
+            )
+            if payload["navigationScriptSha256"] != navigation_policy["scriptSha256"] \
+                    or payload["navigationStepCount"] != expected_navigation_count \
+                    or len(self.navigation_transcript) != expected_navigation_count \
+                    or payload["navigationArmRecordSha256"] \
+                    != self.navigation_arm_record_sha256 \
+                    or payload["lastNavigationStepRecordSha256"] != expected_last_navigation:
+                raise FidelityCheckpointError(
+                    "controller witness lacked the complete durable navigation transcript"
+                )
+            witness_summary = validate_capture_run_summary(
+                payload["runSummary"], self.capture_run_policy, "$.runSummary", False
+            )
+            if witness_summary["operatorPublications"] != expected_navigation_count \
+                    or witness_summary["witnessPublications"] != 1:
+                raise FidelityCheckpointError(
+                    "controller witness cumulative navigation authority changed"
+                )
             assert self.baseline_requested_controller is not None
             if payload["buttons"] != self.baseline_requested_controller["buttons"] \
                     or payload["stickXyCxy"] != self.baseline_requested_controller["stickXyCxy"] \
@@ -1060,6 +1557,21 @@ class FidelityCheckpointJournal:
                 raise FidelityCheckpointError(
                     "$.runSummary omitted run/witness authority"
                 )
+            navigation_policy = self.capture_run_policy["navigationPolicy"]
+            expected_navigation_count = len(navigation_policy["steps"])
+            expected_last_navigation = (
+                self.navigation_step_record_sha256s[-1]
+                if self.navigation_step_record_sha256s else None
+            )
+            if payload["navigationScriptSha256"] != navigation_policy["scriptSha256"] \
+                    or payload["navigationStepCount"] != expected_navigation_count \
+                    or terminal_run_summary["operatorPublications"] != expected_navigation_count \
+                    or payload["navigationArmRecordSha256"] \
+                    != self.navigation_arm_record_sha256 \
+                    or payload["lastNavigationStepRecordSha256"] != expected_last_navigation:
+                raise FidelityCheckpointError(
+                    "terminal checkpoint changed durable navigation authority"
+                )
 
     def _commit_capture_state(
         self,
@@ -1100,6 +1612,16 @@ class FidelityCheckpointJournal:
             }
         elif kind == "first-frame-report-bound":
             self.first_frame_report_record_sha256 = record_sha256
+        elif kind == "navigation-armed":
+            self.navigation_arm_record_sha256 = record_sha256
+            self.navigation_run_call_origin = payload["runCallOrigin"]
+            self.navigation_cycle_origin = payload["canonicalCycleOrigin"]
+            self.navigation_si_poll_index_origin = payload["siPollIndexOrigin"]
+        elif kind == "navigation-step-received":
+            self.navigation_transcript.append({
+                field: payload[field] for field in NAVIGATION_RECEIPT_FIELDS
+            })
+            self.navigation_step_record_sha256s.append(record_sha256)
         elif kind == "controller-witness-published":
             self.witness_record_sha256 = record_sha256
         elif kind == "fidelity-accepted-owned":
@@ -1145,6 +1667,12 @@ class FidelityCheckpointJournal:
                 self.baseline_record_sha256,
                 self.baseline_requested_controller,
                 self.first_frame_report_record_sha256,
+                self.navigation_arm_record_sha256,
+                self.navigation_run_call_origin,
+                self.navigation_cycle_origin,
+                self.navigation_si_poll_index_origin,
+                self.navigation_transcript,
+                self.navigation_step_record_sha256s,
                 self.witness_record_sha256,
                 self.accepted_record_sha256,
                 self.accepted_artifacts,
@@ -1190,6 +1718,12 @@ class FidelityCheckpointJournal:
                     self.baseline_record_sha256,
                     self.baseline_requested_controller,
                     self.first_frame_report_record_sha256,
+                    self.navigation_arm_record_sha256,
+                    self.navigation_run_call_origin,
+                    self.navigation_cycle_origin,
+                    self.navigation_si_poll_index_origin,
+                    self.navigation_transcript,
+                    self.navigation_step_record_sha256s,
                     self.witness_record_sha256,
                     self.accepted_record_sha256,
                     self.accepted_artifacts,

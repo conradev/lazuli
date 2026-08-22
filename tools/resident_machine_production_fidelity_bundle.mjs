@@ -69,6 +69,7 @@ const RUN_REFERENCE_PATHS = Object.freeze({
   preWitnessMachineEvidence: "pre-witness-machine-evidence.json",
   terminalMachineEvidence: "terminal-machine-evidence.json",
   gameFidelityRecord: "terminal-game-fidelity.json",
+  navigationTranscript: "navigation-transcript.json",
 });
 
 function fail(message) {

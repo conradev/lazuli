@@ -181,6 +181,8 @@ export function deriveResidentRuntimeAbi(coreBytes, dispatcherBytes, coordinator
     "core_host_request_bytes",
     "core_machine_evidence_bytes",
     "core_machine_evidence_snapshot",
+    "core_capture_authority_bytes",
+    "core_capture_authority_snapshot",
     "core_game_fidelity_bytes",
     "core_game_fidelity_requested_buttons",
     "core_game_fidelity_requested_stick_xy_cxy",
@@ -205,10 +207,14 @@ export function deriveResidentRuntimeAbi(coreBytes, dispatcherBytes, coordinator
     "core_game_fidelity_requested_trigger_lrab",
     "core_game_fidelity_phase",
     "core_game_fidelity_snapshot",
+    "core_capture_authority_bytes",
+    "core_capture_authority_snapshot",
   ]) {
     check(core[name].length === 0, `resident core ${name} signature is not zero-argument`);
   }
   requireUnselectedGameFidelitySnapshot(core, "before");
+  const captureAuthorityBytes = core.core_capture_authority_bytes() >>> 0;
+  check(captureAuthorityBytes === 108, "resident core capture-authority ABI changed");
   const abi = {
     coreVersion: core.core_abi_version() >>> 0,
     compileRequestBytes: core.core_compile_request_bytes() >>> 0,
@@ -241,6 +247,7 @@ export function deriveResidentRuntimeAbi(coreBytes, dispatcherBytes, coordinator
   exactAdapterConstant(adapterSource, "COMPILE_REQUEST_BYTES", abi.compileRequestBytes);
   exactAdapterConstant(adapterSource, "HOST_REQUEST_BYTES", abi.hostRequestBytes);
   exactAdapterConstant(adapterSource, "RUN_OUTCOME_BYTES", abi.runOutcomeBytes);
+  exactAdapterConstant(adapterSource, "CAPTURE_AUTHORITY_RECORD_BYTES", captureAuthorityBytes);
   exactAdapterConstant(
     adapterSource,
     "RESIDENT_MEMORY_INITIAL_PAGES",
